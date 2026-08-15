@@ -497,7 +497,7 @@ async function pollEvents() {
   try {
     const result = await request(`/api/events?after=${lastEvent}&meta=1`); $("connectionStatus").textContent = "Connected"; $("connectionStatus").className = "status-pass";
     if (result.gap) { appendEvent("connection", `${result.gap} older event(s) were dropped.`); announce(`${result.gap} older run events were dropped.`, true); }
-    for (const event of result.events) { lastEvent = Math.max(lastEvent, event.sequence); const detail = event.payload?.error || event.payload?.summary || event.kind; appendEvent(event.node || event.kind, detail); nodeStatuses.set(String(event.node || ""), event.kind === "failure" || event.kind === "run_error" ? "Failed" : event.kind === "node_start" ? "Running" : "Updated"); if (event.kind.startsWith("qa_")) applyCheckEvent(event); }
+    for (const event of result.events) { lastEvent = Math.max(lastEvent, event.sequence); const detail = event.payload?.error || event.payload?.summary || event.kind; appendEvent(event.node || event.kind, detail); nodeStatuses.set(String(event.node || ""), event.kind === "failure" || event.kind === "run_error" ? "Failed" : event.kind === "node_start" ? "Running" : "Updated"); if (event.kind.startsWith("qa_")) applyCheckEvent(event); if (event.kind === "agent_message") applyTeamEvent(event); }
     if (result.events.length) {
       const now = Date.now();
       renderNodes(); await refreshUsage();
@@ -535,7 +535,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") refreshChecks(); if (name === "workflow") fitGraph(); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") refreshChecks(); if (name === "workflow") { fitGraph(); refreshTeamNotes(); } }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -695,6 +695,48 @@ async function refreshUnstable() {
   } catch (error) { showError(error.message); }
 }
 
+/* ---- Team notes: what the agents told each other ---- */
+
+let teamNotes = [];
+
+async function refreshTeamNotes() {
+  try {
+    const answer = await request("/api/team?limit=100");
+    teamNotes = (answer.notes || []).map((note) => ({sequence: note.sequence, from: note.from, to: note.to, subject: note.subject}));
+    renderTeamNotes();
+  } catch (_) { /* the panel stays empty until a run writes something */ }
+}
+
+function applyTeamEvent(event) {
+  if (event.kind !== "agent_message") return;
+  const note = event.payload || {};
+  teamNotes.push({sequence: note.sequence, from: note.from, to: note.to, subject: note.subject});
+  teamNotes = teamNotes.slice(-100);
+  renderTeamNotes();
+  announce(`${note.from} wrote to ${note.to}: ${note.subject}`);
+}
+
+function renderTeamNotes() {
+  const board = $("teamBoard");
+  board.replaceChildren();
+  $("teamCount").textContent = teamNotes.length
+    ? `${teamNotes.length} note${teamNotes.length === 1 ? "" : "s"}`
+    : "No notes yet";
+  if (!teamNotes.length) {
+    const empty = make("li", "team-note empty-state");
+    empty.append(make("p", "", "The agents have not written to each other yet. Notes appear here while a run is going, and stay after it ends."));
+    board.append(empty);
+    return;
+  }
+  for (const note of teamNotes) {
+    const item = make("li", "team-note");
+    const who = make("p", "team-who");
+    who.append(make("strong", "", note.from || "an agent"), make("span", "", " told "), make("strong", "", note.to || "everyone"));
+    item.append(who, make("p", "", note.subject || ""));
+    board.append(item);
+  }
+}
+
 function applyCheckEvent(event) {
   if (event.kind === "qa_started") { $("checkStatus").textContent = "Running."; return; }
   if (event.kind === "qa_error") { $("checkStatus").textContent = `Could not run: ${event.payload?.error || "unknown reason"}`; return; }
@@ -734,7 +776,7 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
-  try { const value = await request("/api/bootstrap"); token = value.token; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); await validate(); await refreshUsage(); await refreshCheckup(); await refreshChecks(); pollEvents(); } catch (error) { showError(error.message); }
+  try { const value = await request("/api/bootstrap"); token = value.token; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await refreshCheckup(); await refreshChecks(); await refreshTeamNotes(); pollEvents(); } catch (error) { showError(error.message); }
 }
 
 boot();

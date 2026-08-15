@@ -52,11 +52,13 @@ TOOL_KINDS = {
     "generic": "test",
 }
 MERGE_OUTPUT_CONTRACTS = {"implementation_plan"}
+# Every agent kind may write notes to the others. A note is text: reading one
+# never runs anything, so it does not widen what an agent can do to the project.
 GRAPH_AGENT_CAPABILITIES = {
-    "planner": {"workspace.read"},
-    "coder": {"workspace.read", "workspace.write"},
-    "evaluator": {"workspace.read"},
-    "merge": {"workspace.read"},
+    "planner": {"workspace.read", "team.message"},
+    "coder": {"workspace.read", "workspace.write", "team.message"},
+    "evaluator": {"workspace.read", "team.message"},
+    "merge": {"workspace.read", "team.message"},
 }
 
 PRODUCTION_STATE_ROOTS = {

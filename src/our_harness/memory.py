@@ -804,6 +804,41 @@ class MemoryStore:
         rows = self.connection.execute("SELECT * FROM events WHERE run_id=? ORDER BY sequence", (run_id,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
 
+    def agent_conversation(self, run_id: str = "", limit: int = 200) -> list[dict[str, Any]]:
+        """Every note the agents wrote, newest run first when no run is named."""
+
+        bounded = max(1, min(int(limit), 1000))
+        if run_id:
+            rows = self.connection.execute(
+                "SELECT run_id,node_id,payload_json,created_at FROM events "
+                "WHERE run_id=? AND kind='agent_message' ORDER BY sequence LIMIT ?",
+                (run_id, bounded),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT run_id,node_id,payload_json,created_at FROM events "
+                "WHERE kind='agent_message' ORDER BY sequence DESC LIMIT ?",
+                (bounded,),
+            ).fetchall()
+            rows = list(reversed(rows))
+        notes: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            notes.append({
+                "run_id": row["run_id"],
+                "sequence": payload.get("sequence"),
+                "from": payload.get("from") or row["node_id"],
+                "to": payload.get("to"),
+                "subject": payload.get("subject"),
+                "created_at": row["created_at"],
+            })
+        return notes
+
     def record_agent_prompt_version(
         self,
         role: str,

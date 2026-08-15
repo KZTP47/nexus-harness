@@ -229,6 +229,24 @@ with that instruction, and the rest of the suite runs as usual.
 
 See [docs/QA.md](docs/QA.md).
 
+## Agents that talk to each other
+
+A run can use several agents. The arrows of a workflow already say who works
+next. Team notes cover the rest: an agent can write a short note to another
+agent in the same run, or to everyone.
+
+```json
+{"to": "coder", "subject": "The parser caches by file name",
+ "body": "Two files with the same name share a cache slot. Key on the full path."}
+```
+
+A note is text. Reading one never runs anything, so talking does not widen what
+an agent can do to your project. The board is bounded, an agent may only write
+to an agent that is really in the run, and every note shows up in the **Team
+notes** panel and in the stored run history.
+
+See [docs/TEAM_NOTES.md](docs/TEAM_NOTES.md).
+
 ## Control panel
 
 Run:
@@ -273,6 +291,7 @@ Read [docs/SECURITY.md](docs/SECURITY.md) before running on an untrusted reposit
 ## More documentation
 
 - [Checks and the test lab](docs/QA.md)
+- [Team notes: how the agents talk](docs/TEAM_NOTES.md)
 - [The desktop app](docs/DESKTOP.md)
 - [Source binding audit](docs/AUDIT.md)
 - [Architecture](docs/ARCHITECTURE.md)

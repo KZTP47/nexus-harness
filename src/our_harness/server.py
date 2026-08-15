@@ -437,6 +437,17 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self._json(memory.usage_records(after, limit, query.get("run_id", [""])[0][:256]))
                 else:
                     self._json(memory.prompt_lineage(after, limit, query.get("name", [""])[0][:256]))
+        elif parsed.path == "/api/team":
+            try:
+                self._require_token()
+            except HarnessError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            run_id = query.get("run_id", [""])[0][:256]
+            limit = self._bounded_query_int(query, "limit", 100, 1000) or 1
+            with MemoryStore(self.server.config) as memory:
+                self._json({"notes": memory.agent_conversation(run_id, limit)})
         elif parsed.path in {"/api/qa/suite", "/api/qa/history", "/api/qa/result", "/api/checkup"}:
             try:
                 self._require_token()

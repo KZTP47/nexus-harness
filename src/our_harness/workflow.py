@@ -33,6 +33,7 @@ from .graphs import (
 )
 from .indexer import WorkspaceIndexer
 from .memory import MemoryStore
+from .messaging import MessageBoard
 from .models import (
     ChatCompletionsContinuation,
     ChangePlan,
@@ -932,6 +933,29 @@ def _restore_scheduler_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     return restored
 
 
+AGENT_NODE_TYPES = ("planner", "coder", "evaluator", "merge")
+
+
+def _message_board(
+    graph: dict[str, Any], snapshot: object = None, redact: Any = None
+) -> MessageBoard:
+    """One board per run, holding every agent in that run as a participant."""
+
+    participants = [
+        str(node["id"])
+        for node in graph.get("nodes", [])
+        if isinstance(node, dict) and str(node.get("type")) in AGENT_NODE_TYPES
+    ]
+    if isinstance(snapshot, dict) and snapshot:
+        board = MessageBoard.restore(snapshot, redact=redact)
+        if set(board.participants) == set(participants):
+            return board
+        # The frozen graph decides who is in the run. A snapshot that names a
+        # different set belongs to another graph, so start clean rather than
+        # letting a stale name look like a live agent.
+    return MessageBoard(participants, redact=redact)
+
+
 class HarnessApplication:
     def __init__(self, config: LoadedConfig, sink: EventSink | None = None):
         self.config = config
@@ -1400,6 +1424,12 @@ class HarnessApplication:
             lambda kind, node, payload: self.emit(run_id, kind, node, payload),
             run_id=run_id,
         )
+        board = _message_board(
+            selected_graph,
+            resume.state["runtime"].get("message_board") if resume is not None else None,
+            self.memory.redact_text,
+        )
+        self.agent_tool_session.attach_message_board(board)
         if resume is not None:
             runtime = resume.state["runtime"]
             self.agent_tool_session.restore_budget_state(runtime.get("tool_budget", {}))
@@ -1420,6 +1450,7 @@ class HarnessApplication:
                 "provider_usage": self.provider_usage,
                 "dry_run": dry_run,
                 "tool_budget": self.agent_tool_session.budget_state() if self.agent_tool_session is not None else {},
+                "message_board": board.snapshot(),
             }
             retained_state = {
                 "workflow": _checkpoint_workflow_state(state, self.memory.redact_text),
@@ -1937,6 +1968,12 @@ class HarnessApplication:
             lambda kind, node, payload: self.emit(run_id, kind, node, payload),
             run_id=run_id,
         )
+        board = _message_board(
+            selected_graph,
+            resume.state["runtime"].get("message_board") if resume is not None else None,
+            self.memory.redact_text,
+        )
+        self.agent_tool_session.attach_message_board(board)
         if resume is not None:
             self.agent_tool_session.restore_budget_state(resume.state["runtime"].get("tool_budget", {}))
         active_programmatic_sessions: set[str] = set()
@@ -1961,6 +1998,7 @@ class HarnessApplication:
                 "provider_usage": self.provider_usage,
                 "dry_run": dry_run,
                 "tool_budget": self.agent_tool_session.budget_state(),
+                "message_board": board.snapshot(),
             }
             candidate = RunCheckpoint.create(
                 run_id=run_id,
@@ -3007,7 +3045,12 @@ class HarnessApplication:
         session = self.agent_tool_session
         coverage = getattr(compiled, "manifest", {}).get("workspace_coverage", {})
         complete_workspace = isinstance(coverage, dict) and coverage.get("complete") is True
-        if session is None or (complete_workspace and not require_tools):
+        # A small project needs no discovery tools, but the agents must still be
+        # able to write to each other. The loop costs no extra provider call
+        # when the agent answers straight away, so keep it whenever a board is
+        # attached.
+        can_talk = session is not None and session.has_message_board()
+        if session is None or (complete_workspace and not require_tools and not can_talk):
             return self._request(compiled, prompt, temperature, deadline=deadline, response_format=response_format, node=node)
         route = self._resolve_provider_route(node)
         graph_node = self._active_graph_nodes.get(node, {})
@@ -3032,7 +3075,7 @@ class HarnessApplication:
                 raise HarnessError(f"Agent {node} requested a tool outside its capabilities: {call['name']}")
             return session.execute(node, call["call_id"], call["name"], call["arguments"])
 
-        instructions = tool_loop_instructions(definitions)
+        instructions = tool_loop_instructions(definitions, session.waiting_messages(node))
         transcript: list[dict[str, Any]] = []
         envelope_format = ResponseFormat(
             f"{response_format.name}_action_v1",

@@ -167,6 +167,11 @@ th { position: sticky; top: 0; background: var(--panel-strong); }
 .status-skipped::before { content: "-"; }
 .metric-good::before { content: "OK "; }
 .metric-bad::before { content: "X "; }
+.team-board { display: grid; gap: 8px; max-height: 300px; overflow: auto; margin: 10px 0 0; padding: 0; list-style: none; }
+.team-note { padding: 9px 11px; border: 1px solid var(--line); border-left: 4px solid var(--cyan); border-radius: 10px; background: rgba(1,15,21,.55); }
+.team-note p { margin: 0; }
+.team-who { color: var(--muted); font-size: .8rem; }
+.team-note p + p { margin-top: 4px; }
 .tab-guide { display: grid; grid-template-columns: minmax(120px, auto) 1fr; gap: 6px 16px; margin: 0; }
 .tab-guide dt { font-weight: 750; }
 .tab-guide dd { margin: 0; color: var(--muted); }
