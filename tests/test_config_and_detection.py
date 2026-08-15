@@ -668,6 +668,51 @@ class DetectionTests(unittest.TestCase):
             self.assertIn(["npm", "run", "test"], combined_commands(stacks, "test"))
             self.assertIn(["go", "test", "./..."], combined_commands(stacks, "test"))
 
+    def test_a_beginner_project_with_only_test_files_is_still_python(self) -> None:
+        """Someone learning has a couple of files and a test, and no packaging file."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            (root / "test_calc.py").write_text("import unittest\n", encoding="utf-8")
+            stacks = detect_project(root)
+            self.assertEqual([item.stack for item in stacks], ["python"])
+            self.assertEqual(stacks[0].evidence, ["test_calc.py"])
+            self.assertEqual(combined_commands(stacks, "test"), [["python", "-m", "unittest", "discover"]])
+
+    def test_tests_in_a_tests_folder_are_found_too(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "tests").mkdir()
+            (root / "tests" / "calc_test.py").write_text("import unittest\n", encoding="utf-8")
+            stacks = detect_project(root)
+            self.assertEqual([item.stack for item in stacks], ["python"])
+            self.assertEqual(stacks[0].evidence, ["tests/calc_test.py"])
+
+    def test_a_packaging_file_still_wins_over_the_guess(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
+            (root / "test_calc.py").write_text("import unittest\n", encoding="utf-8")
+            stacks = detect_project(root)
+            self.assertEqual([item.stack for item in stacks], ["python"])
+            self.assertEqual(stacks[0].evidence, ["pyproject.toml"])
+            self.assertGreater(stacks[0].confidence, 0.6)
+
+    def test_python_files_without_any_test_are_still_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "calc.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            self.assertEqual([item.stack for item in detect_project(root)], ["unknown"])
+
+    def test_the_listed_evidence_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(30):
+                (root / f"test_{index}.py").write_text("import unittest\n", encoding="utf-8")
+            stacks = detect_project(root)
+            self.assertLessEqual(len(stacks[0].evidence), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

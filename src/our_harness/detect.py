@@ -44,6 +44,21 @@ def _node_detection(root: Path) -> Detection | None:
     return Detection(stack, evidence, commands, lint, build, 0.95)
 
 
+def _python_test_files(root: Path, limit: int = 8) -> list[str]:
+    """Python test files in the project root or a tests folder, if any."""
+
+    found: list[str] = []
+    for folder in (root, root / "tests", root / "test"):
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.glob("test_*.py")) + sorted(folder.glob("*_test.py")):
+            if path.is_file():
+                found.append(path.relative_to(root).as_posix())
+            if len(found) >= limit:
+                return found
+    return found
+
+
 def detect_project(root: Path) -> list[Detection]:
     detections: list[Detection] = []
     node = _node_detection(root)
@@ -54,6 +69,19 @@ def detect_project(root: Path) -> list[Detection]:
         test = [["python", "-m", "pytest"]] if (root / "pytest.ini").exists() or (root / "tests").exists() else [["python", "-m", "unittest", "discover"]]
         lint = [["python", "-m", "ruff", "check", "."]] if shutil.which("ruff") else []
         detections.append(Detection("python", python_markers, test, lint, [], 0.9))
+    elif _python_test_files(root):
+        # Someone learning starts with a couple of files and a test, and no
+        # packaging file at all. The tests are right there, so use them.
+        detections.append(
+            Detection(
+                "python",
+                _python_test_files(root),
+                [["python", "-m", "unittest", "discover"]],
+                [],
+                [],
+                0.6,
+            )
+        )
     if (root / "Cargo.toml").exists():
         detections.append(Detection("rust", ["Cargo.toml"], [["cargo", "test"]], [["cargo", "clippy", "--all-targets"]], [["cargo", "build"]], 1.0))
     if (root / "go.mod").exists():
