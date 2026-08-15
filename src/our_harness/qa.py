@@ -1491,6 +1491,127 @@ def flaky_report(
     return report
 
 
+def _median(values: Sequence[int]) -> float:
+    """The middle value, which one odd result cannot drag around."""
+
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if not ordered:
+        return 0.0
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def check_health(
+    config: LoadedConfig,
+    suite: QaSuite | None = None,
+    runs: Sequence[Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Look at the recorded runs and say what to do about the checks.
+
+    Every finding is something a person can act on, and every one says why it
+    was raised. A check with too little history is left alone.
+    """
+
+    history = list(runs if runs is not None else load_history(config))
+    minimum = int(config.get("qa.flaky_min_runs", 5))
+    seen: dict[str, list[dict[str, Any]]] = {}
+    for run in history:
+        for case in run.get("cases") or []:
+            case_id = str(case.get("id") or "")
+            if case_id:
+                seen.setdefault(case_id, []).append(dict(case))
+
+    findings: list[dict[str, Any]] = []
+    for entry in flaky_report(config, history):
+        findings.append({
+            "id": entry["id"],
+            "problem": "keeps changing its mind",
+            "why": f"{entry['why']}. It failed {entry['failures']} of {entry['runs']} runs.",
+            "what_to_do": (
+                "Find what differs between runs, such as a time, a port, a temporary file, or "
+                "another check running beside it. A check that only works sometimes hides real faults."
+            ),
+            "weight": 3 + entry["instability"],
+        })
+
+    unstable_ids = {item["id"] for item in findings}
+    for case_id, records in sorted(seen.items()):
+        ran = [item for item in records if str(item.get("status")) != STATUS_SKIPPED]
+        if case_id in unstable_ids or len(ran) < minimum:
+            continue
+        statuses = [str(item.get("status")) for item in ran]
+        if all(status == STATUS_FAILED for status in statuses):
+            findings.append({
+                "id": case_id,
+                "problem": "has never passed",
+                "why": f"It failed all {len(ran)} recorded runs.",
+                "what_to_do": (
+                    "Either fix what it is checking, or change the check if it asks for the wrong "
+                    "thing. A check that always fails stops telling you anything."
+                ),
+                "weight": 5.0,
+            })
+            continue
+        durations = [int(item.get("duration_ms") or 0) for item in ran]
+        # A run time moves about with whatever else the machine is doing, so
+        # only say a check got slower when every recent run is slow. One slow
+        # run at the end proves nothing, and a wrong claim about someone's
+        # tests is worse than saying nothing at all.
+        window = len(durations) // 3
+        if window >= 2:
+            was = _median(durations[:window])
+            slowest_recent = min(durations[-window:])
+            if was >= 100 and slowest_recent >= was * 2 and slowest_recent - was >= 1000:
+                findings.append({
+                    "id": case_id,
+                    "problem": "got a lot slower",
+                    "why": (
+                        f"Each of its last {window} runs took at least "
+                        f"{round(slowest_recent / 1000, 1)} seconds. Its first {window} runs "
+                        f"took about {round(was / 1000, 1)} seconds."
+                    ),
+                    "what_to_do": (
+                        "Look at what the check runs. A check that grows slower every week ends up "
+                        "being skipped, and then it is not protecting anything."
+                    ),
+                    "weight": 2.0,
+                })
+
+    skipped_only = [
+        case_id for case_id, records in sorted(seen.items())
+        if len(records) >= minimum and all(str(item.get("status")) == STATUS_SKIPPED for item in records)
+    ]
+    for case_id in skipped_only:
+        findings.append({
+            "id": case_id,
+            "problem": "never actually runs",
+            "why": f"It was skipped in all {len(seen[case_id])} recorded runs.",
+            "what_to_do": (
+                "Install what it needs, or take it out. A check that never runs gives no cover."
+            ),
+            "weight": 4.0,
+        })
+
+    if suite is not None and history:
+        known = set(seen)
+        for case in suite.cases:
+            if case.id not in known:
+                findings.append({
+                    "id": case.id,
+                    "problem": "has never been run",
+                    "why": "It is in the suite but does not appear in any recorded run.",
+                    "what_to_do": "Run the whole suite once so this check has a history to judge.",
+                    "weight": 1.0,
+                })
+
+    findings.sort(key=lambda item: (-float(item["weight"]), item["id"]))
+    for item in findings:
+        item.pop("weight", None)
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Reports
 # ---------------------------------------------------------------------------

@@ -210,6 +210,26 @@ passed and failed, and its failure rate sits between `qa.flaky_threshold` and
 one minus that number. A check that always fails is broken, not unstable, so it
 is left out.
 
+## What to do about your checks
+
+```bash
+harness qa advise
+```
+
+The harness watches how your checks behave across runs and says which ones need
+attention, why, and what to do. It only speaks about a check with enough
+history, and it says nothing about a check that is behaving.
+
+| It says | It means |
+|---|---|
+| has never passed | It failed every recorded run. Fix what it checks, or fix the check. |
+| keeps changing its mind | It has both passed and failed. Something differs between runs. |
+| never actually runs | It was skipped every time. Install what it needs, or take it out. |
+| got a lot slower | It takes at least twice as long as it used to, and at least a second more. |
+| has never been run | It is in the suite but has no history yet. |
+
+The same list appears in the Checks tab of the control panel.
+
 ## Asking a model for new checks
 
 ```bash

@@ -706,6 +706,22 @@ async function createSuite() {
 async function refreshUnstable() {
   try {
     const history = await request("/api/qa/history");
+    const advice = $("adviceList");
+    advice.replaceChildren();
+    if (!(history.advice || []).length) {
+      const item = make("li", "step done");
+      const head = make("div", "step-head");
+      head.append(make("span", "step-mark", "Good"), make("strong", "", "Nothing needs attention"));
+      item.append(head, make("p", "", "Your checks look healthy, or there is not enough history yet. Run them a few more times and look again."));
+      advice.append(item);
+    }
+    for (const finding of history.advice || []) {
+      const item = make("li", "step todo");
+      const head = make("div", "step-head");
+      head.append(make("span", "step-mark", "Look"), make("strong", "", `${finding.id} ${finding.problem}`));
+      item.append(head, make("p", "", finding.why), make("p", "field-help", finding.what_to_do));
+      advice.append(item);
+    }
     const body = $("unstableBody");
     body.replaceChildren();
     if (!history.unstable.length) {

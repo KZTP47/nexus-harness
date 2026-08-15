@@ -574,6 +574,26 @@ def command_qa(args: argparse.Namespace) -> int:
         print(f"\nStopped after {_count(batches, 'change')}.")
         return 0
 
+    if command == "advise":
+        try:
+            suite = qa.load_suite(config, getattr(args, "suite", None))
+        except HarnessError:
+            suite = None
+        findings = qa.check_health(config, suite)
+        if args.json:
+            _print_json(findings)
+            return 0
+        if not findings:
+            print("Nothing to report. Your checks look healthy, or there is not enough history yet.")
+            print("Run them a few more times and ask again.")
+            return 0
+        print(f"{_count(len(findings), 'thing')} worth looking at:\n")
+        for finding in findings:
+            print(f"  {finding['id']} {finding['problem']}")
+            print(f"    Why: {finding['why']}")
+            print(f"    What to do: {finding['what_to_do']}\n")
+        return 0
+
     if command == "flaky":
         report = qa.flaky_report(config)
         if args.json:
@@ -909,6 +929,10 @@ def parser() -> argparse.ArgumentParser:
     qa_watch.add_argument("--skip-first", action="store_true", help="Wait for a change before the first run")
     qa_watch.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
     qa_watch.set_defaults(handler=command_qa)
+    qa_advise = qa_sub.add_parser("advise", help="Say what to do about the checks, based on past runs")
+    qa_advise.add_argument("--suite", help="Suite file to read instead of the configured one")
+    qa_advise.add_argument("--json", action="store_true")
+    qa_advise.set_defaults(handler=command_qa)
     qa_flaky = qa_sub.add_parser("flaky", help="Name the cases whose result keeps changing")
     qa_flaky.add_argument("--json", action="store_true")
     qa_flaky.set_defaults(handler=command_qa)

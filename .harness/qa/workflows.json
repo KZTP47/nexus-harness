@@ -126,6 +126,21 @@
           "target": "#unstableBody"
         },
         {
+          "do": "expect_visible",
+          "target": "#adviceList",
+          "note": "The panel says what to do about the checks"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#adviceList li .step-mark",
+          "note": "Each line is marked in words, not only colour"
+        },
+        {
+          "do": "expect_text",
+          "target": "#unstableTitle",
+          "text": "What to do about your checks"
+        },
+        {
           "do": "click",
           "target": "#runChecks",
           "note": "Run the checks from the panel"

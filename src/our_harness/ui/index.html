@@ -107,14 +107,15 @@
     <section class="glass data-panel" aria-labelledby="unstableTitle">
       <div class="section-heading">
         <div>
-          <h2 id="unstableTitle">Checks that keep changing their mind</h2>
-          <p>A check that passes some runs and fails others cannot be trusted yet. Run the checks a few times to fill this in.</p>
+          <h2 id="unstableTitle">What to do about your checks</h2>
+          <p>The harness watches how your checks behave over time and says which ones need attention. Run them a few times to fill this in.</p>
         </div>
         <button id="refreshUnstable" type="button">Refresh</button>
       </div>
+      <ol id="adviceList" class="step-list"></ol>
       <div class="table-scroll">
         <table>
-          <caption class="sr-only">Unstable checks</caption>
+          <caption class="sr-only">Checks whose result keeps changing</caption>
           <thead><tr><th scope="col">Check</th><th scope="col">Runs</th><th scope="col">Failed</th><th scope="col">How unstable</th><th scope="col">Why it is listed</th></tr></thead>
           <tbody id="unstableBody"></tbody>
         </table>

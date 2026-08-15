@@ -78,6 +78,7 @@ harness qa init                     Write a starter check suite from detected co
 harness qa list                     Show every check in the suite
 harness qa run [--tag|--case ...]   Run the checks side by side and report
 harness qa watch                    Run the checks again whenever a file changes
+harness qa advise                   Say what to do about the checks, from past runs
 harness qa flaky                    Name checks whose result keeps changing
 harness qa generate|candidates      Ask a model for new checks and read them back
 harness qa accept|reject <id> ...   Decide on a proposed check

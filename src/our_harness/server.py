@@ -469,9 +469,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/qa/suite":
                 self._json(self._qa_suite())
             elif parsed.path == "/api/qa/history":
+                try:
+                    suite = qalab.load_suite(self.server.config)
+                except HarnessError:
+                    suite = None
                 self._json({
                     "runs": qalab.load_history(self.server.config)[-25:],
                     "unstable": qalab.flaky_report(self.server.config),
+                    "advice": qalab.check_health(self.server.config, suite),
                 })
             elif parsed.path == "/api/qa/result":
                 self._json({"result": self.server.qa_result, "running": self.server.qa_lock.locked()})

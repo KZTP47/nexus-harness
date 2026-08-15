@@ -518,6 +518,142 @@ class HistoryTests(unittest.TestCase):
         self.assertTrue(all(run["passed"] for run in stored))
 
 
+class CheckHealthTests(unittest.TestCase):
+    """What the harness says about its own checks after watching them run."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        self.config = isolated_config(self.root, flaky_min_runs=4, flaky_threshold=0.2)
+        self.addCleanup(self.temporary.cleanup)
+
+    def runs(self, count: int, **cases: tuple) -> list[dict]:
+        history = []
+        for index in range(count):
+            record = []
+            for case_id, values in cases.items():
+                status, duration = values[index] if isinstance(values[0], tuple) else values
+                record.append({"id": case_id, "status": status, "duration_ms": duration})
+            history.append({"run_id": f"r{index}", "cases": record})
+        return history
+
+    def by_id(self, findings: list[dict]) -> dict[str, dict]:
+        return {item["id"]: item for item in findings}
+
+    def test_a_healthy_check_is_never_mentioned(self) -> None:
+        history = self.runs(6, steady=("passed", 30))
+        self.assertEqual(qa.check_health(self.config, None, history), [])
+
+    def test_a_check_that_never_passes_is_called_out(self) -> None:
+        history = self.runs(6, broken=("failed", 20))
+        found = self.by_id(qa.check_health(self.config, None, history))["broken"]
+        self.assertEqual(found["problem"], "has never passed")
+        self.assertIn("failed all 6", found["why"])
+        self.assertIn("fix", found["what_to_do"])
+
+    def test_a_check_that_alternates_is_called_out_once(self) -> None:
+        history = self.runs(
+            6, wobbly=[("passed", 10), ("failed", 10), ("passed", 10), ("failed", 10), ("passed", 10), ("failed", 10)]
+        )
+        findings = qa.check_health(self.config, None, history)
+        self.assertEqual([item["id"] for item in findings], ["wobbly"])
+        self.assertEqual(findings[0]["problem"], "keeps changing its mind")
+
+    def test_a_check_that_only_ever_skips_is_called_out(self) -> None:
+        history = self.runs(6, absent=("skipped", 1))
+        found = self.by_id(qa.check_health(self.config, None, history))["absent"]
+        self.assertEqual(found["problem"], "never actually runs")
+
+    def test_a_check_that_got_much_slower_is_called_out(self) -> None:
+        history = self.runs(
+            6, slow=[("passed", 200), ("passed", 200), ("passed", 220), ("passed", 4000), ("passed", 4100), ("passed", 4200)]
+        )
+        found = self.by_id(qa.check_health(self.config, None, history))["slow"]
+        self.assertEqual(found["problem"], "got a lot slower")
+        self.assertIn("0.2 seconds", found["why"])
+        self.assertIn("at least 4.1 seconds", found["why"])
+
+    def test_one_slow_run_at_the_end_is_not_called_a_slowdown(self) -> None:
+        """A busy machine makes one run slow. That is not a trend."""
+
+        history = self.runs(
+            6, blip=[("passed", 100), ("passed", 100), ("passed", 100), ("passed", 100), ("passed", 100), ("passed", 5000)]
+        )
+        self.assertEqual(qa.check_health(self.config, None, history), [])
+
+    def test_one_slow_run_in_the_middle_is_not_called_a_slowdown(self) -> None:
+        history = self.runs(
+            6, blip=[("passed", 100), ("passed", 9000), ("passed", 100), ("passed", 100), ("passed", 100), ("passed", 100)]
+        )
+        self.assertEqual(qa.check_health(self.config, None, history), [])
+
+    def test_a_slowdown_needs_enough_runs_to_see_a_trend(self) -> None:
+        """With five runs the windows are one run each, which proves nothing."""
+
+        history = self.runs(
+            5, slow=[("passed", 200), ("passed", 200), ("passed", 200), ("passed", 200), ("passed", 9000)]
+        )
+        self.assertEqual(qa.check_health(self.config, None, history), [])
+
+    def test_the_middle_value_is_used_so_one_odd_early_run_does_not_hide_a_slowdown(self) -> None:
+        history = self.runs(
+            9,
+            slow=[
+                ("passed", 200), ("passed", 200), ("passed", 9000),
+                ("passed", 200), ("passed", 200), ("passed", 200),
+                ("passed", 5000), ("passed", 5100), ("passed", 5200),
+            ],
+        )
+        found = self.by_id(qa.check_health(self.config, None, history))["slow"]
+        self.assertEqual(found["problem"], "got a lot slower")
+        self.assertIn("0.2 seconds", found["why"])
+
+    def test_a_small_slowdown_is_not_worth_mentioning(self) -> None:
+        history = self.runs(
+            6, fine=[("passed", 200), ("passed", 200), ("passed", 210), ("passed", 300), ("passed", 320), ("passed", 340)]
+        )
+        self.assertEqual(qa.check_health(self.config, None, history), [])
+
+    def test_a_fast_check_that_doubles_is_not_worth_mentioning(self) -> None:
+        history = self.runs(
+            6, quick=[("passed", 10), ("passed", 10), ("passed", 10), ("passed", 25), ("passed", 25), ("passed", 25)]
+        )
+        self.assertEqual(qa.check_health(self.config, None, history), [])
+
+    def test_too_little_history_says_nothing(self) -> None:
+        history = self.runs(2, broken=("failed", 10))
+        self.assertEqual(qa.check_health(self.config, None, history), [])
+
+    def test_a_check_in_the_suite_with_no_history_is_named(self) -> None:
+        suite = qa.parse_suite({"name": "d", "cases": [{"id": "brand-new", "kind": "file", "path": "x"}]})
+        history = self.runs(6, steady=("passed", 30))
+        found = self.by_id(qa.check_health(self.config, suite, history))["brand-new"]
+        self.assertEqual(found["problem"], "has never been run")
+
+    def test_nothing_is_said_about_a_suite_with_no_history_at_all(self) -> None:
+        suite = qa.parse_suite({"name": "d", "cases": [{"id": "brand-new", "kind": "file", "path": "x"}]})
+        self.assertEqual(qa.check_health(self.config, suite, []), [])
+
+    def test_the_worst_problem_is_listed_first(self) -> None:
+        history = self.runs(
+            6,
+            broken=("failed", 20),
+            absent=("skipped", 1),
+            slow=[("passed", 200), ("passed", 200), ("passed", 200), ("passed", 5000), ("passed", 5000), ("passed", 5000)],
+        )
+        findings = qa.check_health(self.config, None, history)
+        self.assertEqual([item["id"] for item in findings], ["broken", "absent", "slow"])
+
+    def test_every_finding_says_why_and_what_to_do(self) -> None:
+        history = self.runs(6, broken=("failed", 20), absent=("skipped", 1))
+        findings = qa.check_health(self.config, None, history)
+        self.assertTrue(findings)
+        for item in findings:
+            self.assertEqual(set(item), {"id", "problem", "why", "what_to_do"})
+            for field in ("problem", "why", "what_to_do"):
+                self.assertTrue(item[field].strip(), f"{item['id']} has an empty {field}")
+
+
 class ReportTests(unittest.TestCase):
     def result(self) -> qa.QaRunResult:
         return qa.QaRunResult(
