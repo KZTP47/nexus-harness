@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/our-harness/benchmark-result-v3.schema.json",
+  "title": "Our Harness benchmark result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "benchmark", "run", "harness", "environment", "deterministic_score", "deterministic_score_uncapped", "maximum_score", "critical_cap_applied", "critical_failures", "case_summary", "agentic_score", "agentic", "cases"],
+  "properties": {
+    "schema_version": {"const": 3},
+    "benchmark": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "manifest_sha256", "result_schema_sha256"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "version": {"type": "integer", "minimum": 1},
+        "manifest_sha256": {"$ref": "#/$defs/sha256"},
+        "result_schema_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "seed", "started_at", "elapsed_ms"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "seed": {"type": "integer", "minimum": 0},
+        "started_at": {"type": "string", "format": "date-time"},
+        "elapsed_ms": {"type": "integer", "minimum": 0}
+      }
+    },
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "artifact_sha256", "source_sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "source_sha256": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {"$ref": "#/$defs/sha256"},
+          "propertyNames": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["python", "python_implementation", "platform", "os", "os_release", "machine", "process_bits"],
+      "properties": {
+        "python": {"type": "string", "minLength": 1},
+        "python_implementation": {"type": "string", "minLength": 1},
+        "platform": {"type": "string", "minLength": 1},
+        "os": {"type": "string", "minLength": 1},
+        "os_release": {"type": "string"},
+        "machine": {"type": "string"},
+        "process_bits": {"type": "integer", "enum": [32, 64]}
+      }
+    },
+    "deterministic_score": {"type": "integer", "minimum": 0, "maximum": 100},
+    "deterministic_score_uncapped": {"type": "integer", "minimum": 0, "maximum": 100},
+    "maximum_score": {"const": 100},
+    "critical_cap_applied": {"type": "boolean"},
+    "critical_failures": {"type": "array", "items": {"type": "string"}},
+    "case_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "passed", "failed"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "passed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0}
+      }
+    },
+    "agentic_score": {"oneOf": [{"const": "not_run"}, {"type": "number", "minimum": 0, "maximum": 100}]},
+    "hqs": {"type": "number", "minimum": 0, "maximum": 100},
+    "agentic": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason"],
+          "properties": {"status": {"const": "not_run"}, "reason": {"type": "string"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "reason", "suite_id", "fixture_version", "fixture_sha256", "provider_profile_sha256", "repetitions", "attempts", "resolved", "score", "metrics", "tasks"],
+          "properties": {
+            "status": {"const": "completed"}, "reason": {"type": "string"}, "suite_id": {"type": "string"},
+            "fixture_version": {"type": "integer", "minimum": 1}, "fixture_sha256": {"$ref": "#/$defs/sha256"}, "provider_profile_sha256": {"$ref": "#/$defs/sha256"},
+            "repetitions": {"type": "integer", "minimum": 1, "maximum": 10}, "attempts": {"type": "integer", "minimum": 3},
+            "resolved": {"type": "integer", "minimum": 0}, "score": {"type": "number", "minimum": 0, "maximum": 100},
+            "metrics": {"$ref": "#/$defs/agenticMetrics"},
+            "tasks": {
+              "type": "array",
+              "minItems": 3,
+              "items": {"$ref": "#/$defs/agenticTask"}
+            }
+          }
+        }
+      ]
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "domain", "weight", "critical", "status", "elapsed_ms", "evidence"],
+        "properties": {
+          "id": {"type": "string"}, "domain": {"type": "string"}, "weight": {"type": "integer", "minimum": 1},
+          "critical": {"type": "boolean"}, "status": {"enum": ["pass", "fail"]}, "elapsed_ms": {"type": "integer", "minimum": 0},
+          "evidence": {"type": "object"}, "error": {"type": "string"}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "agentic": {
+            "properties": {"status": {"const": "completed"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["agentic"]
+      },
+      "then": {
+        "required": ["hqs"],
+        "properties": {"agentic_score": {"type": "number", "minimum": 0, "maximum": 100}}
+      },
+      "else": {
+        "not": {"required": ["hqs"]},
+        "properties": {"agentic_score": {"const": "not_run"}}
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "agenticMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["elapsed_ms", "provider_calls", "input_tokens", "output_tokens", "cached_input_tokens", "tool_calls", "tool_output_bytes"],
+      "properties": {
+        "elapsed_ms": {"type": "integer", "minimum": 0},
+        "provider_calls": {"type": "integer", "minimum": 0},
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "output_tokens": {"type": "integer", "minimum": 0},
+        "cached_input_tokens": {"type": "integer", "minimum": 0},
+        "tool_calls": {"type": "integer", "minimum": 0},
+        "tool_output_bytes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "agenticTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "repetition", "seed", "status", "score", "checks", "metrics", "diagnostics", "evidence"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "repetition": {"type": "integer", "minimum": 1, "maximum": 10},
+        "seed": {"type": "integer", "minimum": 0},
+        "status": {"enum": ["resolved", "failed"]},
+        "score": {"enum": [0, 100]},
+        "checks": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["workflow_complete", "public_tests", "hidden_tests", "exact_patch", "exact_tree", "allowed_scope_only", "forbidden_paths_unchanged", "public_tree_unchanged", "hidden_tree_unchanged"],
+          "properties": {
+            "workflow_complete": {"type": "boolean"},
+            "public_tests": {"type": "boolean"},
+            "hidden_tests": {"type": "boolean"},
+            "exact_patch": {"type": "boolean"},
+            "exact_tree": {"type": "boolean"},
+            "allowed_scope_only": {"type": "boolean"},
+            "forbidden_paths_unchanged": {"type": "boolean"},
+            "public_tree_unchanged": {"type": "boolean"},
+            "hidden_tree_unchanged": {"type": "boolean"}
+          }
+        },
+        "metrics": {"$ref": "#/$defs/agenticMetrics"},
+        "diagnostics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["schema_version", "trajectory", "candidate_patch_sha256", "candidate_patch_excerpt", "public_stdout", "public_stderr", "public_output_truncated"],
+          "properties": {
+            "schema_version": {"const": 1},
+            "trajectory": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["event_count", "failure_count", "sha256", "excerpt"],
+              "properties": {
+                "event_count": {"type": "integer", "minimum": 0},
+                "failure_count": {"type": "integer", "minimum": 0},
+                "sha256": {"$ref": "#/$defs/sha256"},
+                "excerpt": {"type": "string", "maxLength": 12100}
+              }
+            },
+            "candidate_patch_sha256": {"$ref": "#/$defs/sha256"},
+            "candidate_patch_excerpt": {"type": "string", "maxLength": 12100},
+            "public_stdout": {"type": "string", "maxLength": 4100},
+            "public_stderr": {"type": "string", "maxLength": 4100},
+            "public_output_truncated": {"type": "boolean"}
+          }
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["expected_tree_sha256", "actual_tree_sha256", "public_post_tree_sha256", "hidden_post_tree_sha256", "hidden_evaluator_sha256", "unsafe_paths", "public_exit_code", "hidden_exit_code", "provider_profile_sha256", "benchmark_config_sha256"],
+          "properties": {
+            "expected_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "actual_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "public_post_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "hidden_post_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "hidden_evaluator_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "unsafe_paths": {"type": "array", "items": {"type": "string"}},
+            "public_exit_code": {"type": ["integer", "null"]},
+            "hidden_exit_code": {"type": ["integer", "null"]},
+            "provider_profile_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "benchmark_config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "error": {"type": "string"}
+      }
+    }
+  }
+}

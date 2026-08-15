@@ -1,0 +1,250 @@
+{
+  "agentic": {
+    "reason": "No provider profile was supplied.",
+    "status": "not_run"
+  },
+  "agentic_score": "not_run",
+  "benchmark": {
+    "id": "our-harness-deterministic",
+    "manifest_sha256": "7ff2b5d7622ccc0e80e877a85cab99569c3731e8345d3774b24eb7f129370088",
+    "result_schema_sha256": "468c13b746202ae6d3928ff2cc97d6d4c2dcd10a5c67d23fe5c1405c5b457ef6",
+    "version": 3
+  },
+  "case_summary": {
+    "failed": 0,
+    "passed": 12,
+    "total": 12
+  },
+  "cases": [
+    {
+      "critical": true,
+      "domain": "stream",
+      "elapsed_ms": 0,
+      "evidence": {
+        "input_tokens": 4,
+        "text_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+      },
+      "id": "STR-002",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": false,
+      "domain": "context",
+      "elapsed_ms": 2,
+      "evidence": {
+        "limit_chars": 4500,
+        "prefix_sha256": "26f7be07cfc9f7732e23844c9ec4ea77ae87a7487548743ddf611c13a32bde40",
+        "total_chars": 4500
+      },
+      "id": "CTX-001",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": false,
+      "domain": "graph",
+      "elapsed_ms": 0,
+      "evidence": {
+        "cycle_rejected": true,
+        "selected_edge": "preferred"
+      },
+      "id": "GRF-002",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": true,
+      "domain": "safety",
+      "elapsed_ms": 40,
+      "evidence": {
+        "later_edit_preserved": true,
+        "stale_rejected": true
+      },
+      "id": "SAF-002",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": true,
+      "domain": "graph",
+      "elapsed_ms": 2,
+      "evidence": {
+        "failure_route_rejected": true,
+        "shortcut_rejected": true
+      },
+      "id": "GRF-001",
+      "status": "pass",
+      "weight": 10
+    },
+    {
+      "critical": false,
+      "domain": "stream",
+      "elapsed_ms": 0,
+      "evidence": {
+        "frames": 2,
+        "unicode_sha256": "3b60f6cb7c8282ad550505a77a9ccdbabb71fe20e90464562aee1fa618d90c93"
+      },
+      "id": "STR-001",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": false,
+      "domain": "index",
+      "elapsed_ms": 55,
+      "evidence": {
+        "removed": true,
+        "updated_sequence": [
+          1,
+          0,
+          1
+        ]
+      },
+      "id": "IDX-001",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": true,
+      "domain": "recovery",
+      "elapsed_ms": 106,
+      "evidence": {
+        "finalized": true,
+        "in_doubt_refused": true
+      },
+      "id": "REC-001",
+      "status": "pass",
+      "weight": 10
+    },
+    {
+      "critical": true,
+      "domain": "execution",
+      "elapsed_ms": 234,
+      "evidence": {
+        "captured_bytes": 2048,
+        "timed_out": true,
+        "timeout_duration_ms": 203
+      },
+      "id": "EXE-001",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": true,
+      "domain": "safety",
+      "elapsed_ms": 33,
+      "evidence": {
+        "outside_sha256": "aaa8d3c8d74ad3e8f6b1772aa9c7e0eaa528cb42fc93599ce2f125b00d4c424c",
+        "rejected": 4
+      },
+      "id": "SAF-001",
+      "status": "pass",
+      "weight": 10
+    },
+    {
+      "critical": false,
+      "domain": "index",
+      "elapsed_ms": 56,
+      "evidence": {
+        "dependencies": [
+          "tokens.py"
+        ],
+        "direct": "parser.py"
+      },
+      "id": "IDX-002",
+      "status": "pass",
+      "weight": 8
+    },
+    {
+      "critical": false,
+      "domain": "context",
+      "elapsed_ms": 56,
+      "evidence": {
+        "standards": 1,
+        "workspace_hits": 2
+      },
+      "id": "CTX-002",
+      "status": "pass",
+      "weight": 6
+    }
+  ],
+  "critical_cap_applied": false,
+  "critical_failures": [],
+  "deterministic_score": 100,
+  "deterministic_score_uncapped": 100,
+  "environment": {
+    "machine": "AMD64",
+    "os": "Windows",
+    "os_release": "10",
+    "platform": "win32",
+    "process_bits": 64,
+    "python": "3.14.4",
+    "python_implementation": "CPython"
+  },
+  "harness": {
+    "artifact_sha256": "369a2764b0bcc2bdac29951b3c344aabfa617f8d1b67980e85ea702f14b4c6ee",
+    "name": "our-harness-cli",
+    "source_sha256": {
+      "our_harness/__init__.py": "22c363330435753d2dbcc60f23b7c46e83e766b90b622343b7ca10ff6c47f049",
+      "our_harness/__main__.py": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d",
+      "our_harness/agent_tools.py": "068e9e09144d6513978a5ac21719d2d0ca4f4c817b6cdeed7fe44b2181e5458d",
+      "our_harness/audit.py": "f9860895ddff00c4a9920f2e44e40a5c635beb1f493a8ec64f517bf18d0198ba",
+      "our_harness/benchmark.py": "84ab76d973b51b0df16aa4c70f9eb8909fc0aa91cae2d488ea5b15b8ee709354",
+      "our_harness/changes.py": "6d8140b805d87881dd68867874c5fcd5dbbc0aeb18bfc4a114fb38f30bd4ee9f",
+      "our_harness/checkpoints.py": "953ac4dafbe92f4c097bd0538f14efc1a6fe6498c45756347a439048b97e8a3c",
+      "our_harness/cli.py": "55afc2f26ac7dfadb5d0d1cdcb594e9ebbaad3af98cd4baa5c380e64e3ca891c",
+      "our_harness/config.py": "60474e1e05e6fa5135591d972c87cf684f362cca94ca0c05158dd6006e6ce6c2",
+      "our_harness/context.py": "162568461b6db97d4c49c986358df6a3e5e7b4cbe907683af5837562e807c2ac",
+      "our_harness/cooperation.py": "036bc0cca051206ab76c0c53385f967b2726144f7bf9e1d6e7899b9447f3d65c",
+      "our_harness/detect.py": "8dd6debf8cf72bd6ad19d151d9a483a16e20b433094abd069251b5fb96a6bfab",
+      "our_harness/doctor.py": "113792ecb346424b1ca97eeaf0f92be56770eeca55544d91b6c74443739edaa4",
+      "our_harness/execution.py": "92433bd40cd89fcc988f1a5e8c70dc8bce6bde44272bc74f290e41cef68fc6f6",
+      "our_harness/external_benchmark.py": "94dcec7782f2ad50ae5d8a5122e96084874aebec14822b9e77124527b832546e",
+      "our_harness/gitops.py": "e5268accdfab8279f1e141ad02c6c0788a2eb0ab74cdc9a70ce972e14e53596a",
+      "our_harness/graphs.py": "cae6776723e867d23c3158ca53ef5f4b81b2e5eecd0f8928b600cc7a1705512f",
+      "our_harness/ignore_policy.py": "d875cc56ad4796b85b2c1c321779733471511ae34c313cddd21d62d99569afe2",
+      "our_harness/indexer.py": "ba2f0557e99871e34969ad2d811e831e32c68aec2efc44e7de44700a0645d823",
+      "our_harness/mcp.py": "61c713b8b124fa665036e32d21240dbe2b769f516cbbe020058f322421a0253b",
+      "our_harness/memory.py": "898d7ce010305473ca8ba271321d9627be818fb0761a686d2817e33659385316",
+      "our_harness/models.py": "051209a0e0b63da86c7e8a8e4bbd5227447d555bf2d90d75ffa8a8e92c1d4e8c",
+      "our_harness/plugins.py": "6e7e65ce6666293e83e82b1cccc5f56ecb8188f65b1fa4016a0a48a6b9aa9c9c",
+      "our_harness/programmatic_workspace.py": "eddf3d4ca1eea014ae0acf8ddbc224877fa67f973e6e40ba79462be21c30765a",
+      "our_harness/providers/__init__.py": "4146a27d4e093ad5d79e8d3d97cbfc25d8696b79d7dfb0fe78793bfdd51c35e5",
+      "our_harness/providers/base.py": "1ea1d7628e2f0f25922e9e941f8d7ba153a0a6bde057813a17fa460d1deb409f",
+      "our_harness/providers/catalog.py": "d34736be679e356e2f8ac517a782ddd9ee04c690c7d0d46d1982dfbfc51ad544",
+      "our_harness/providers/codex_cli.py": "fda94babfcd87288c6e794eb464d2acc42b8cfedb2fdb9e882c91127a7df1939",
+      "our_harness/providers/gemini.py": "e35ed994ae374f03ab900982873c9e513c6b6bc17dd7d241c191e653eaaca56e",
+      "our_harness/providers/registry.py": "63888d8a9768826e698e0ae2d652a4f903fd0eccff83671063d9fed650bc8f6c",
+      "our_harness/redaction.py": "1214e7aa08b3da1837ef3cf768c4e7e5446702262574dcbf7cfff669909e6fd4",
+      "our_harness/refinement.py": "113cd4dc02590bbba14b294050de8a237842e321577ae6d3be8697b4e6628af1",
+      "our_harness/resident.py": "58939de04aee8a688d60bebfb20fa218a25aa539c230117c71077d8c5afefff8",
+      "our_harness/review_panel.py": "9d33699a68ba3e8856b4faf3f53d4d30691096c7e63c439fd3ce1f99f7964cc3",
+      "our_harness/runstate.py": "58d98d388c6858e113b14325745e3d5a832ec8c4fb5cd30ee0fd8511fdf666aa",
+      "our_harness/safety.py": "8d2cc061739f62a5947ef627d3ac076447c1b43397ed51eb53c0ae024596d3d0",
+      "our_harness/server.py": "b3016ce34d4a5794b60976f5d7e8a56aa492b6a8e4cfff1731ee00403c02e074",
+      "our_harness/staged_coding.py": "df24314c7869e8d987ec88481875ed82543e982fe94246cd20d6bd753282c1f4",
+      "our_harness/templates/__init__.py": "2fc46323dd50e649d155e4877800eed3ca3e9bb8ba94a083fbea0dfc43409c7e",
+      "our_harness/templates/benchmark_agentic_fixtures.json": "3153a72764b88cc671710bd8f20c72070e07bef541e695d934d78458c4c3d3c6",
+      "our_harness/templates/benchmark_manifest.json": "7ff2b5d7622ccc0e80e877a85cab99569c3731e8345d3774b24eb7f129370088",
+      "our_harness/templates/benchmark_result.schema.json": "468c13b746202ae6d3928ff2cc97d6d4c2dcd10a5c67d23fe5c1405c5b457ef6",
+      "our_harness/templates/external_benchmark_manifest.json": "eaf2b9b90b0c3bf2ee12bfc44978120b375072b0cdadaf0b870a3f1286fa233c",
+      "our_harness/templates/gauntlet.json": "8ead9dedb4101c80e850b93be2e1007de0c4c2cdb1260cb487ee3d70e7f1d021",
+      "our_harness/ui/__init__.py": "3bebf543c77e624fea418245351f10575df32d43ada18c98947c2da3a380ae94",
+      "our_harness/ui/app.js": "47f4635062acfd538cdb5f3da2bc708ead566227b8722dc16c31f93983a58ed0",
+      "our_harness/ui/index.html": "bc7ed570ec2cad85c3a274c94f83fb0ded79401d80526bb0dff082a162a0c343",
+      "our_harness/ui/styles.css": "51da4630c29799b3c66cc229f233aa319aebe9fb134c7093a8376cb743e8e493",
+      "our_harness/usage.py": "c80a7fe65ee0b776c4947c7cceaeb214197ceb20f5474bb45f64c94c8bf39ae1",
+      "our_harness/workflow.py": "f623a59c721795f5dcf42ef5f835515239df4f89888222b7421b931a309150b9"
+    },
+    "version": "0.1.0"
+  },
+  "maximum_score": 100,
+  "run": {
+    "elapsed_ms": 592,
+    "id": "395860a55c4b24d9fb457005",
+    "seed": 17,
+    "started_at": "2026-08-15T03:12:00.224500+00:00"
+  },
+  "schema_version": 3
+}

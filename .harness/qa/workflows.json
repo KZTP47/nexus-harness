@@ -1,0 +1,401 @@
+{
+  "schema_version": 1,
+  "name": "control-panel-workflows",
+  "cases": [
+    {
+      "id": "guided-first-view",
+      "title": "A new user lands on the guided view and sees the next steps",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "expect_visible",
+          "target": "#startView",
+          "note": "The guided view is showing"
+        },
+        {
+          "do": "expect_text",
+          "target": "#startTitle",
+          "text": "Welcome"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checkupSteps li",
+          "note": "The setup steps are listed"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#workflowActions",
+          "note": "Expert buttons stay out of the way"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "guided-example-fills-the-box",
+      "title": "Clicking an example fills in the task box",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-example]",
+          "note": "Click the first example"
+        },
+        {
+          "do": "expect_text",
+          "target": "#quickTask",
+          "text": "failing test",
+          "note": "The box now holds text"
+        },
+        {
+          "do": "type",
+          "target": "#quickTask",
+          "text": "Tidy the parser",
+          "note": "A user can type their own"
+        }
+      ]
+    },
+    {
+      "id": "guided-empty-task-is-refused",
+      "title": "Starting with an empty task says what is missing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "type",
+          "target": "#quickTask",
+          "text": ""
+        },
+        {
+          "do": "click",
+          "target": "#quickRun"
+        },
+        {
+          "do": "expect_text",
+          "target": "#liveAlert",
+          "text": "Say what the harness should do"
+        }
+      ]
+    },
+    {
+      "id": "checks-view-lists-and-runs",
+      "title": "The checks view lists the checks and runs them",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "timeout_seconds": 180,
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checksView"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkBody",
+          "text": "README"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#unstableBody"
+        },
+        {
+          "do": "click",
+          "target": "#runChecks",
+          "note": "Run the checks from the panel"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "Running",
+          "note": "The panel says it started"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "checks passed",
+          "timeout_ms": 120000,
+          "note": "The panel reports the finished run"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkSummary",
+          "text": "All checks passed"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "nav-reaches-every-view",
+      "title": "Every tab opens and only one view shows at a time",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "nav"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#workflowView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#startView"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#workflowActions"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"memory\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#workflowView"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptsView"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#startView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#promptsView"
+        }
+      ]
+    },
+    {
+      "id": "workflow-graph-validates",
+      "title": "The built-in workflow passes validation",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "click",
+          "target": "#validateButton"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "Graph is executable",
+          "timeout_ms": 15000
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeList li"
+        }
+      ]
+    },
+    {
+      "id": "workflow-agent-dialog-opens-and-closes",
+      "title": "The add agent window opens, refuses empty input, and closes",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentDialog"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentType"
+        },
+        {
+          "do": "click",
+          "target": "#cancelAgent"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentDialog"
+        }
+      ]
+    },
+    {
+      "id": "workflow-zoom-controls-work",
+      "title": "The canvas zoom buttons change the zoom reading",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn"
+        },
+        {
+          "do": "expect_text",
+          "target": "#zoomValue",
+          "text": "%"
+        },
+        {
+          "do": "click",
+          "target": "#fitButton"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        }
+      ]
+    },
+    {
+      "id": "memory-and-prompt-views-load",
+      "title": "The memory and prompt views load without an error",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "memory"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"memory\"]"
+        },
+        {
+          "do": "click",
+          "target": "#refreshMemory"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryGraph"
+        },
+        {
+          "do": "type",
+          "target": "#memoryQuery",
+          "text": "harness"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]"
+        },
+        {
+          "do": "click",
+          "target": "#refreshPrompts"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptLineage"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "keyboard-only-reaches-the-graph",
+      "title": "A keyboard user can reach the graph and move a node",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "keyboard"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "press",
+          "target": "#nodeLayer .graph-node .node-body",
+          "key": "ArrowRight"
+        },
+        {
+          "do": "press",
+          "target": "#nodeLayer .graph-node .node-body",
+          "key": "Control+ArrowRight"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        }
+      ]
+    }
+  ]
+}

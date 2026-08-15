@@ -1,0 +1,10 @@
+config.local.json
+memory/
+runs/
+backups/
+checkpoints/
+cache/
+qa/runs/
+qa/tmp/
+qa/history.json
+qa/candidates.json

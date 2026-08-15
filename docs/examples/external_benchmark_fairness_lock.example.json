@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "model": {
+    "provider": "replace-before-run",
+    "name": "replace-before-run",
+    "temperature": 0,
+    "max_output_tokens": 4096
+  },
+  "dataset": {
+    "revision": "replace-with-hugging-face-dataset-revision"
+  },
+  "evaluator": {
+    "revision": "replace-with-swe-bench-git-commit"
+  },
+  "budgets": {
+    "max_turns": 40,
+    "wall_time_seconds": 1800,
+    "max_cost_usd": 3.0
+  },
+  "tool_policy": [
+    "shell-in-container",
+    "workspace-read-write",
+    "no-network-after-setup"
+  ],
+  "harnesses": [
+    {
+      "id": "our-harness",
+      "revision": "replace-with-source-commit-or-package-digest"
+    },
+    {
+      "id": "mini-swe-agent",
+      "revision": "replace-with-git-commit"
+    },
+    {
+      "id": "simple-strands-agent",
+      "revision": "replace-with-git-commit"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:">
+  <title>What is this?</title>
+  <link rel="stylesheet" href="shell.css">
+</head>
+<body>
+  <main>
+    <h1>What is this?</h1>
+    <p class="lead">Our Harness is a helper that works on your code with you. You say what you want in plain words. It reads the project, makes a plan, edits the files, runs your checks, and has a second model review the result.</p>
+    <h2>The four tabs</h2>
+    <ul>
+      <li><strong>Start here</strong> tells you what is still missing, and lets you ask for a change.</li>
+      <li><strong>Checks</strong> holds your tests. Each one says what to do and what a good result looks like.</li>
+      <li><strong>Workflow</strong> is for later. It shows the agents as boxes you can rewire.</li>
+      <li><strong>Memory</strong> and <strong>Prompt history</strong> show what the harness has learnt and how its instructions changed.</li>
+    </ul>
+    <h2>Where your work lives</h2>
+    <p>Everything runs on this machine. The harness keeps its own files in a folder named <code>.harness</code> inside your project. Nothing is uploaded unless you point it at a hosted model yourself.</p>
+    <h2>If a run goes wrong</h2>
+    <p>A failed run puts every file back the way it was. You can also make a snapshot at any time with <code>harness checkpoint create</code>.</p>
+    <div class="row"><button id="back" class="primary" type="button">Back to my project</button></div>
+  </main>
+  <script src="help.js"></script>
+</body>
+</html>

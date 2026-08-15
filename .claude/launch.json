@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "harness-ui",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "our_harness", "ui"],
+      "port": 8765
+    }
+  ]
+}

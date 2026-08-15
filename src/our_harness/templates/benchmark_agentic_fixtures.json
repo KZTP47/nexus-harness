@@ -1,0 +1,61 @@
+{
+  "schema_version": 2,
+  "suite_id": "our-harness-agentic-resolution",
+  "version": 2,
+  "tasks": [
+    {
+      "id": "ARS-001",
+      "title": "Clamp both bounds",
+      "task": "Fix bounded.py so clamp(value, lower, upper) rejects lower greater than upper and always clamps values to both inclusive bounds. Keep the public API unchanged and edit only bounded.py. Verification is evaluator-owned; return no verification commands.",
+      "allowed_paths": ["bounded.py"],
+      "forbidden_paths": ["README.md", "tests_public/test_bounded.py"],
+      "initial_files": {
+        "README.md": "# Bounded values\n\n`clamp` returns a value inside the inclusive lower and upper bounds.\n",
+        "bounded.py": "def clamp(value, lower, upper):\n    if lower > upper:\n        raise ValueError(\"lower must not exceed upper\")\n    return max(lower, value)\n",
+        "tests_public/test_bounded.py": "import unittest\n\nfrom bounded import clamp\n\n\nclass ClampTests(unittest.TestCase):\n    def test_lower_bound(self):\n        self.assertEqual(clamp(-2, 0, 10), 0)\n\n    def test_inside(self):\n        self.assertEqual(clamp(4, 0, 10), 4)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "expected_files": {
+        "README.md": "# Bounded values\n\n`clamp` returns a value inside the inclusive lower and upper bounds.\n",
+        "bounded.py": "def clamp(value, lower, upper):\n    if lower > upper:\n        raise ValueError(\"lower must not exceed upper\")\n    return max(lower, min(value, upper))\n",
+        "tests_public/test_bounded.py": "import unittest\n\nfrom bounded import clamp\n\n\nclass ClampTests(unittest.TestCase):\n    def test_lower_bound(self):\n        self.assertEqual(clamp(-2, 0, 10), 0)\n\n    def test_inside(self):\n        self.assertEqual(clamp(4, 0, 10), 4)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "hidden_evaluator": "import sys\nfrom pathlib import Path\nroot = Path(sys.argv[1]).resolve()\nsys.path.insert(0, str(root))\nfrom bounded import clamp\nassert clamp(99, 0, 10) == 10\nassert clamp(-9, -4, 7) == -4\ntry:\n    clamp(1, 3, 2)\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError('inverted bounds were accepted')\n"
+    },
+    {
+      "id": "ARS-002",
+      "title": "Validate chunk sizes",
+      "task": "Fix chunks.py so chunks(items, size) keeps returning lists for valid positive integer sizes, but raises ValueError for zero, negative, boolean, or non-integer sizes. Keep the public API unchanged and edit only chunks.py. Verification is evaluator-owned; return no verification commands.",
+      "allowed_paths": ["chunks.py"],
+      "forbidden_paths": ["README.md", "tests_public/test_chunks.py"],
+      "initial_files": {
+        "README.md": "# Chunks\n\n`chunks` splits a sequence into lists of a requested positive integer size.\n",
+        "chunks.py": "def chunks(items, size):\n    return [list(items[index:index + size]) for index in range(0, len(items), size)]\n",
+        "tests_public/test_chunks.py": "import unittest\n\nfrom chunks import chunks\n\n\nclass ChunkTests(unittest.TestCase):\n    def test_regular_chunks(self):\n        self.assertEqual(chunks([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]])\n\n    def test_empty(self):\n        self.assertEqual(chunks([], 3), [])\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "expected_files": {
+        "README.md": "# Chunks\n\n`chunks` splits a sequence into lists of a requested positive integer size.\n",
+        "chunks.py": "def chunks(items, size):\n    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:\n        raise ValueError(\"size must be a positive integer\")\n    return [list(items[index:index + size]) for index in range(0, len(items), size)]\n",
+        "tests_public/test_chunks.py": "import unittest\n\nfrom chunks import chunks\n\n\nclass ChunkTests(unittest.TestCase):\n    def test_regular_chunks(self):\n        self.assertEqual(chunks([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]])\n\n    def test_empty(self):\n        self.assertEqual(chunks([], 3), [])\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "hidden_evaluator": "import sys\nfrom pathlib import Path\nroot = Path(sys.argv[1]).resolve()\nsys.path.insert(0, str(root))\nfrom chunks import chunks\nassert chunks((1, 2, 3), 2) == [[1, 2], [3]]\nfor invalid in (0, -1, True, 1.5, '2'):\n    try:\n        chunks([1, 2], invalid)\n    except ValueError:\n        pass\n    else:\n        raise AssertionError(f'invalid size accepted: {invalid!r}')\n"
+    },
+    {
+      "id": "ARS-003",
+      "title": "Merge unsorted intervals",
+      "task": "Fix intervals.py so merge_intervals accepts unsorted two-item intervals, returns sorted merged lists, merges overlaps including shared endpoints, and leaves merely adjacent integer intervals separate. Empty input returns an empty list. Keep the public API unchanged and edit only intervals.py. Verification is evaluator-owned; return no verification commands.",
+      "allowed_paths": ["intervals.py"],
+      "forbidden_paths": ["README.md", "tests_public/test_intervals.py"],
+      "initial_files": {
+        "README.md": "# Intervals\n\n`merge_intervals` sorts intervals and merges overlaps.\n",
+        "intervals.py": "def merge_intervals(intervals):\n    merged = []\n    for start, end in intervals:\n        if merged and start <= merged[-1][1]:\n            merged[-1][1] = max(merged[-1][1], end)\n        else:\n            merged.append([start, end])\n    return merged\n",
+        "tests_public/test_intervals.py": "import unittest\n\nfrom intervals import merge_intervals\n\n\nclass IntervalTests(unittest.TestCase):\n    def test_sorted_overlap(self):\n        self.assertEqual(merge_intervals([(1, 4), (3, 7), (10, 12)]), [[1, 7], [10, 12]])\n\n    def test_empty(self):\n        self.assertEqual(merge_intervals([]), [])\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "expected_files": {
+        "README.md": "# Intervals\n\n`merge_intervals` sorts intervals and merges overlaps.\n",
+        "intervals.py": "def merge_intervals(intervals):\n    ordered = sorted((start, end) for start, end in intervals)\n    merged = []\n    for start, end in ordered:\n        if merged and start <= merged[-1][1]:\n            merged[-1][1] = max(merged[-1][1], end)\n        else:\n            merged.append([start, end])\n    return merged\n",
+        "tests_public/test_intervals.py": "import unittest\n\nfrom intervals import merge_intervals\n\n\nclass IntervalTests(unittest.TestCase):\n    def test_sorted_overlap(self):\n        self.assertEqual(merge_intervals([(1, 4), (3, 7), (10, 12)]), [[1, 7], [10, 12]])\n\n    def test_empty(self):\n        self.assertEqual(merge_intervals([]), [])\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "hidden_evaluator": "import sys\nfrom pathlib import Path\nroot = Path(sys.argv[1]).resolve()\nsys.path.insert(0, str(root))\nfrom intervals import merge_intervals\nassert merge_intervals([(8, 10), (1, 3), (2, 6)]) == [[1, 6], [8, 10]]\nassert merge_intervals([(1, 2), (3, 4)]) == [[1, 2], [3, 4]]\nassert merge_intervals([(5, 8), (2, 5)]) == [[2, 8]]\n"
+    }
+  ]
+}

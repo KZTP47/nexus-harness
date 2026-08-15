@@ -1,0 +1,36 @@
+{
+  "name": "our-harness-desktop",
+  "version": "0.1.0",
+  "description": "Desktop window for the Our Harness control panel",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "build": "electron-builder",
+    "smoke": "node smoke.js"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "local.ourharness.desktop",
+    "productName": "Our Harness",
+    "files": [
+      "main.js",
+      "preload.js",
+      "pages/**",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "mac": {
+      "target": "dmg"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}

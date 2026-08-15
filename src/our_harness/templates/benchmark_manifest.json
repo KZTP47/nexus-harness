@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "our-harness-deterministic",
+  "version": 3,
+  "description": "Provider-free behavioral checks plus an optional black-box agentic resolution suite.",
+  "scoring": {
+    "maximum": 100,
+    "case_pass": "full_weight",
+    "case_fail": "zero",
+    "critical_failure_cap": 49
+  },
+  "agentic": {
+    "suite_id": "our-harness-agentic-resolution",
+    "fixture_version": 2,
+    "tasks": 3,
+    "task_scoring": "behavioral_resolution_or_zero; exact_patch and exact_tree are diagnostics",
+    "hqs_formula": "0.40 * deterministic_score + 0.60 * agentic_score"
+  },
+  "cases": [
+    {"id": "SAF-001", "domain": "safety", "weight": 10, "critical": true, "summary": "Path confinement and reserved control roots"},
+    {"id": "SAF-002", "domain": "safety", "weight": 8, "critical": true, "summary": "Baseline and rollback conflict preservation"},
+    {"id": "REC-001", "domain": "recovery", "weight": 10, "critical": true, "summary": "Interrupted transaction classification and refusal"},
+    {"id": "CTX-001", "domain": "context", "weight": 8, "critical": false, "summary": "Stable prefix and complete request bound"},
+    {"id": "CTX-002", "domain": "context", "weight": 6, "critical": false, "summary": "Evidence and source hash manifest"},
+    {"id": "IDX-001", "domain": "index", "weight": 8, "critical": false, "summary": "Incremental index lifecycle"},
+    {"id": "IDX-002", "domain": "index", "weight": 8, "critical": false, "summary": "Dependency expansion"},
+    {"id": "GRF-001", "domain": "graph", "weight": 10, "critical": true, "summary": "Required-stage and failed-state routing invariants"},
+    {"id": "GRF-002", "domain": "graph", "weight": 8, "critical": false, "summary": "Edge order, variable transfer, and bounded cycles"},
+    {"id": "STR-001", "domain": "stream", "weight": 8, "critical": false, "summary": "Fragmented UTF-8 framing and buffer limit"},
+    {"id": "STR-002", "domain": "stream", "weight": 8, "critical": true, "summary": "Strict completion protocol and text cap"},
+    {"id": "EXE-001", "domain": "execution", "weight": 8, "critical": true, "summary": "Combined output and process timeout bounds"}
+  ]
+}

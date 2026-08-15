@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "our-harness-external-comparison",
+  "description": "Frozen plans for official SWE-bench evaluation and equal-budget harness comparisons.",
+  "suites": [
+    {
+      "id": "swebench-verified-mini-v1",
+      "dataset_name": "princeton-nlp/SWE-bench_Verified",
+      "split": "test",
+      "task_count": 50,
+      "source_task_count": 500,
+      "selection": "frozen_instance_ids",
+      "official_suite": false,
+      "note": "Our deterministic 50-task smoke subset. It is not an official SWE-bench split and cannot support a leaderboard claim."
+    },
+    {
+      "id": "swebench-dev",
+      "dataset_name": "princeton-nlp/SWE-bench",
+      "split": "dev",
+      "task_count": 225,
+      "selection": "full_split",
+      "official_suite": true,
+      "note": "Official SWE-bench development split. This is not SWE-bench Verified."
+    },
+    {
+      "id": "swebench-verified-full",
+      "dataset_name": "princeton-nlp/SWE-bench_Verified",
+      "split": "test",
+      "task_count": 500,
+      "selection": "full_split",
+      "official_suite": true,
+      "note": "The full official SWE-bench Verified test split required for comparative claims."
+    }
+  ],
+  "comparison_harnesses": [
+    {
+      "id": "our-harness",
+      "repository": "local source revision",
+      "revision_required": true
+    },
+    {
+      "id": "mini-swe-agent",
+      "repository": "https://github.com/SWE-agent/mini-swe-agent",
+      "revision_required": true
+    },
+    {
+      "id": "simple-strands-agent",
+      "repository": "https://github.com/strands-labs/benchmark-harnesses",
+      "revision_required": true
+    }
+  ],
+  "prediction_fields": ["instance_id", "model_name_or_path", "model_patch"],
+  "official_evaluator": {
+    "module": "swebench.harness.run_evaluation",
+    "repository": "https://github.com/SWE-bench/SWE-bench",
+    "revision_required": true
+  }
+}

@@ -1,0 +1,1 @@
+"""Static local UI assets."""
