@@ -123,7 +123,9 @@ def listed(config: LoadedConfig) -> list[SavedWorkflow]:
     if not base.is_dir():
         return []
     found: list[SavedWorkflow] = []
-    for path in sorted(base.glob("*.json")):
+    # Read every file, then cap by name order, so the cap never depends on how
+    # the file names happen to sort.
+    for path in sorted(base.glob("*.json"))[: MAX_WORKFLOWS * 2]:
         try:
             found.append(_read(path))
         except WorkflowError as exc:
@@ -139,9 +141,7 @@ def listed(config: LoadedConfig) -> list[SavedWorkflow]:
                     issues=(str(exc),),
                 )
             )
-        if len(found) >= MAX_WORKFLOWS:
-            break
-    return sorted(found, key=lambda item: item.name.casefold())
+    return sorted(found, key=lambda item: item.name.casefold())[:MAX_WORKFLOWS]
 
 
 def load(config: LoadedConfig, name: str) -> SavedWorkflow:
@@ -196,8 +196,24 @@ def delete(config: LoadedConfig, name: str) -> str:
 
 
 def rename(config: LoadedConfig, name: str, new_name: str) -> SavedWorkflow:
+    """Move one workflow to a new name, leaving no copy behind either way."""
+
     found = load(config, name)
+    if file_name(new_name) == file_name(name):
+        # Only the spelling changed, so rewrite the one file in place.
+        return save(config, new_name, found.graph)
     saved = save(config, new_name, found.graph, replace=False)
-    if file_name(new_name) != file_name(name):
+    try:
         delete(config, name)
+    except (WorkflowError, OSError):
+        # Writing the new one worked but removing the old one did not. Two
+        # copies would be worse than none, so undo and say what happened.
+        try:
+            (folder(config) / file_name(new_name)).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise WorkflowError(
+            f"{clean_name(name)} could not be renamed because the old file could not be "
+            "removed. Nothing was changed."
+        ) from None
     return saved

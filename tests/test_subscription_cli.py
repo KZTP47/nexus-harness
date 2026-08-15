@@ -85,6 +85,16 @@ sys.stderr.write("something went wrong\\n")
 raise SystemExit(3)
 '''
 
+ARGUMENT_ECHO = '''
+import json, sys
+arguments = sys.argv[1:]
+if "--version" in arguments and len(arguments) == 1:
+    print("1.0")
+    raise SystemExit(0)
+sys.stdin.read()
+print(json.dumps({"is_error": False, "result": json.dumps(arguments)}))
+'''
+
 SLOW_TOOL = '''
 import sys, time
 if "--version" in sys.argv[1:]:
@@ -109,9 +119,23 @@ class RecipeTests(unittest.TestCase):
             ["claude", "-p", "--output-format", "json"],
         )
 
-    def test_the_command_itself_is_never_dropped(self) -> None:
+    def test_a_model_argument_with_no_flag_in_front_is_refused(self) -> None:
+        """Dropping it would leave the tool with one fewer argument than expected."""
+
         recipe = CliRecipe(id="x", label="x", command=("tool",), arguments=("{model}",))
+        with self.assertRaises(HarnessError) as caught:
+            recipe.argv(["tool"], "")
+        self.assertIn("straight after a flag", str(caught.exception))
+
+    def test_a_flag_joined_to_the_model_by_an_equals_sign_works(self) -> None:
+        recipe = CliRecipe(id="x", label="x", command=("tool",), arguments=("--model={model}",))
+        self.assertEqual(recipe.argv(["tool"], "m"), ["tool", "--model=m"])
         self.assertEqual(recipe.argv(["tool"], ""), ["tool"])
+
+    def test_every_shipped_recipe_has_a_workable_argument_list(self) -> None:
+        for name in subscription_cli.SUBSCRIPTION_KINDS:
+            with self.subTest(name=name):
+                recipe_for(name).check()
 
     def test_every_shipped_recipe_says_how_to_install_its_tool(self) -> None:
         for name in subscription_cli.SUBSCRIPTION_KINDS:
@@ -210,12 +234,33 @@ class RunningTests(unittest.TestCase):
         self.assertIn("Install Claude Code", str(caught.exception))
 
     def test_the_arguments_can_be_changed_without_touching_the_code(self) -> None:
-        tool = fake_tool(self.folder, "faketool", CLAUDE_LIKE)
-        provider = self.provider("claude-cli", tool, arguments=["--version-check", "off", "-p"])
-        # The stand-in echoes back the words that are not flags, so the changed
-        # argument list really reached the child process.
-        answer = provider.complete(self.request("last line"))
-        self.assertEqual(answer.text, "last line")
+        """The stand-in reports its own argument list, so this proves what ran."""
+
+        tool = fake_tool(self.folder, "echotool", ARGUMENT_ECHO)
+        provider = self.provider(
+            "claude-cli", tool, arguments=["--set", "quiet", "-p", "--model", "{model}"]
+        )
+        answer = provider.complete(self.request())
+        self.assertEqual(
+            json.loads(answer.text),
+            ["--set", "quiet", "-p", "--model", "fake-model"],
+            "the configured arguments must be exactly what the child was given",
+        )
+
+    def test_the_built_in_arguments_are_what_the_child_really_gets(self) -> None:
+        tool = fake_tool(self.folder, "echotool", ARGUMENT_ECHO)
+        answer = self.provider("claude-cli", tool).complete(self.request())
+        self.assertEqual(
+            json.loads(answer.text),
+            ["-p", "--output-format", "json", "--model", "fake-model"],
+        )
+
+    def test_an_argument_shape_that_cannot_be_dropped_is_refused(self) -> None:
+        tool = fake_tool(self.folder, "echotool", ARGUMENT_ECHO)
+        provider = self.provider("claude-cli", tool, arguments=["out-{model}.txt"])
+        with self.assertRaises(HarnessError) as caught:
+            provider.complete(self.request())
+        self.assertIn("shape the harness cannot drop", str(caught.exception))
 
     def test_native_tool_calls_are_refused_with_a_clear_reason(self) -> None:
         tool = fake_tool(self.folder, "faketool", CLAUDE_LIKE)

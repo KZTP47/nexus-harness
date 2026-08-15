@@ -50,7 +50,34 @@ class CliRecipe:
     install_hint: str = ""
     verified: bool = False
 
+    def check(self) -> None:
+        """Refuse an argument list the harness could not honour.
+
+        A "{model}" argument only makes sense in one of two shapes: on its own
+        after a flag, or joined to a flag with an equals sign. Anything else
+        cannot be dropped cleanly when a request names no model, and silently
+        losing an argument is worse than saying so.
+        """
+
+        for position, argument in enumerate(self.arguments):
+            if "{model}" not in argument:
+                continue
+            if argument == "{model}":
+                if position == 0 or not self.arguments[position - 1].startswith("-"):
+                    raise HarnessError(
+                        f"{self.label}: a {{model}} argument must come straight after a flag, "
+                        "such as --model"
+                    )
+                continue
+            if not (argument.startswith("-") and "=" in argument):
+                raise HarnessError(
+                    f"{self.label}: {argument} holds {{model}} in a shape the harness cannot "
+                    "drop when no model is asked for. Write it as --flag {{model}} or "
+                    "--flag={{model}}."
+                )
+
     def argv(self, command: list[str], model: str) -> list[str]:
+        self.check()
         built: list[str] = list(command)
         for argument in self.arguments:
             if "{model}" not in argument:
@@ -59,9 +86,10 @@ class CliRecipe:
             if model:
                 built.append(argument.replace("{model}", model))
                 continue
-            # No model was asked for, so drop the value and the flag in front of
-            # it. Leaving a bare "--model" behind would confuse the tool.
-            if built and len(built) > len(command) and built[-1].startswith("-"):
+            # No model was asked for. A joined --flag={model} goes on its own;
+            # a bare {model} takes the flag in front of it too, because a
+            # dangling flag would confuse the tool.
+            if argument == "{model}" and built and len(built) > len(command):
                 built.pop()
         return built
 
@@ -204,7 +232,9 @@ class SubscriptionCLIProvider(Provider):
             return self.recipe
         if not isinstance(configured, list) or any(not isinstance(part, str) for part in configured):
             raise HarnessError(f"{self.recipe.label} arguments must be a list of words")
-        return CliRecipe(**{**self.recipe.__dict__, "arguments": tuple(configured)})
+        recipe = CliRecipe(**{**self.recipe.__dict__, "arguments": tuple(configured)})
+        recipe.check()
+        return recipe
 
     def _preflight(self, command: list[str], deadline_at: float) -> None:
         if self._checked:

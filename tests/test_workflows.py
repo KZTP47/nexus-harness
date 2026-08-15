@@ -232,3 +232,30 @@ class ServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RenameSafetyTests(unittest.TestCase):
+    """A rename must leave one copy, never two and never none."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        (self.root / ".harness").mkdir()
+        self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        workflows.save(self.config, "Old name", built_in_graph())
+        self.addCleanup(self.temporary.cleanup)
+
+    def test_a_rename_that_cannot_remove_the_old_file_changes_nothing(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(workflows, "delete", side_effect=OSError("in use")):
+            with self.assertRaises(HarnessError) as caught:
+                workflows.rename(self.config, "Old name", "New name")
+        self.assertIn("Nothing was changed", str(caught.exception))
+        self.assertEqual([item.name for item in workflows.listed(self.config)], ["Old name"])
+
+    def test_changing_only_the_spelling_keeps_one_file(self) -> None:
+        renamed = workflows.rename(self.config, "Old name", "OLD NAME")
+        self.assertEqual(renamed.name, "OLD NAME")
+        self.assertEqual([item.name for item in workflows.listed(self.config)], ["OLD NAME"])
+        self.assertEqual(len(list((self.root / ".harness" / "workflows").glob("*.json"))), 1)
