@@ -8,7 +8,8 @@
     "start": "electron .",
     "test": "node --test",
     "build": "electron-builder",
-    "smoke": "node smoke.js"
+    "smoke": "node smoke.js",
+    "smoke:packaged": "node packaged.smoke.js"
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -19,9 +20,13 @@
     "productName": "Our Harness",
     "files": [
       "main.js",
+      "server.js",
       "preload.js",
       "pages/**",
-      "package.json"
+      "package.json",
+      "!**/*.test.js",
+      "!smoke.js",
+      "!packaged.smoke.js"
     ],
     "win": {
       "target": "nsis"
@@ -31,6 +36,10 @@
     },
     "linux": {
       "target": "AppImage"
+    },
+    "directories": {
+      "output": "build-output"
     }
-  }
+  },
+  "author": "Our Harness"
 }

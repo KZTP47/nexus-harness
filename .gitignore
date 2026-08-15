@@ -14,6 +14,8 @@
 
 # Dependencies and build output
 node_modules/
+desktop/build-output/
+desktop/dist/
 .wheel-stage*/
 build/
 dist/

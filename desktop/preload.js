@@ -8,4 +8,5 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("harnessDesktop", {
   chooseProject: () => ipcRenderer.invoke("harness:chooseProject"),
   retry: () => ipcRenderer.invoke("harness:retry"),
+  showHelp: () => ipcRenderer.invoke("harness:help"),
 });

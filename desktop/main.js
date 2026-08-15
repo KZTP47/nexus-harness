@@ -158,6 +158,10 @@ function buildMenu() {
           label: "What is this?",
           click: () => showPage("help.html"),
         },
+        {
+          label: "Welcome screen",
+          click: () => showPage("welcome.html"),
+        },
       ],
     },
   ];
@@ -171,23 +175,30 @@ ipcMain.handle("harness:chooseProject", () => {
 });
 ipcMain.handle("harness:retry", () => {
   if (projectPath) openProject(projectPath);
+  else showPage("welcome.html");
   return projectPath;
 });
+ipcMain.handle("harness:help", () => {
+  showPage("help.html");
+  return true;
+});
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   buildMenu();
   createWindow();
+  // Show the window before anything else. A folder picker on top of a blank
+  // screen tells a first-time user nothing, and a dialog opened before the
+  // window is on screen blocks with nothing to look at.
+  showPage("welcome.html");
+  await new Promise((resolve) => {
+    if (!window || window.isVisible()) resolve();
+    else window.once("ready-to-show", resolve);
+  });
+
   const remembered = readSettings().lastProject;
-  const startAt = remembered && fs.existsSync(remembered) ? remembered : chooseProject("");
-  if (!startAt) {
-    showPage("problem.html", {
-      title: "No folder chosen",
-      detail: "Use Project, then Open another folder, to pick the folder you want to work on.",
-      log: "",
-    });
-    return;
+  if (remembered && fs.existsSync(remembered)) {
+    openProject(remembered);
   }
-  openProject(startAt);
 });
 
 app.on("activate", () => {

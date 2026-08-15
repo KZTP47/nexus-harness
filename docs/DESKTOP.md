@@ -20,20 +20,32 @@ npm install
 npm start
 ```
 
-The first time it opens, it asks which folder you want to work on. It remembers
-that choice. Use **Project, Open another folder** to change it.
+The first time it opens, it shows a short welcome page with one button. Press it
+and pick the folder you want to work on. It remembers that choice, so next time
+it goes straight there. Use **Project, Open another folder** to change it.
 
 ## Build an installer
 
 ```bash
 cd desktop
 npm run build
+npm run smoke:packaged
 ```
 
-This produces an NSIS installer on Windows, a DMG on macOS, and an AppImage on
-Linux. The installer carries the window only. Python and the harness package
-stay a separate install, because the harness is meant to run against the Python
-you already use for your project.
+The first command produces an NSIS installer on Windows, a DMG on macOS, and an
+AppImage on Linux, under `desktop/build-output`. The second opens the packed
+archive that installer ships and confirms every file the app loads is really
+inside it.
+
+That second step matters. The installer ships only the files named in
+`package.json`, and a file the app loads but nobody listed is simply missing at
+run time: the installed app dies on start with no window and no message. That
+happened once here, so `npm test` now also checks the list against what the code
+actually loads, and fails before anything is built.
+
+The installer carries the window only. Python and the harness package stay a
+separate install, because the harness is meant to run against the Python you
+already use for your project.
 
 ## How it finds Python
 
@@ -44,6 +56,12 @@ set, no other command is tried, so a typo is reported instead of quietly running
 a different Python.
 
 ## What it does at start
+
+It shows its window first, with a short welcome page and one button. Only then
+does it look for the folder you used last time. A folder picker on top of a
+blank screen tells a first-time user nothing, so the window always comes first.
+
+Once a folder is chosen:
 
 1. Starts `python -m our_harness --project <your folder> ui --port 0 --no-open-browser`.
 2. Waits for the server to print the address it bound to.
@@ -59,16 +77,19 @@ shows what it printed and offers to try again.
 
 - It never loads a page from outside this machine. A link to anywhere else opens
   in your own browser instead, where you can see the address first.
-- The page has no access to Node, the file system, or a shell. The only two
-  actions it can ask the app for are "choose a folder" and "try again".
+- The page has no access to Node, the file system, or a shell. The only three
+  actions it can ask the app for are "choose a folder", "try again", and "show
+  the help page".
 - It answers no to every browser permission request, such as camera or location.
 
 ## Testing it
 
 ```bash
 cd desktop
-npm test          # the start-up logic, with no window
-npm run smoke     # starts the real app and checks the window
+npm test              # the start-up logic and the installer file list, with no window
+npm run smoke         # starts the real app from source and checks the window
+npm run build         # makes the installer
+npm run smoke:packaged  # checks what the installer actually carries
 ```
 
 The smoke run needs Playwright, which the project root installs for its browser
