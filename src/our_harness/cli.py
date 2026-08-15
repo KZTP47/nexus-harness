@@ -13,7 +13,13 @@ from .audit import audit_distribution, audit_installed_distribution
 from .benchmark import DEFAULT_SEED, render_markdown, run_benchmark
 from .checkpoints import CheckpointManager
 from .changes import FileTransaction
-from .config import LoadedConfig, load_config, write_default_project_config
+from .config import (
+    LoadedConfig,
+    is_project_local_config_trusted,
+    load_config,
+    trust_project_local_config,
+    write_default_project_config,
+)
 from .detect import combined_commands, detect_project
 from .doctor import run_doctor
 from .graphs import GraphIssue, resolve_graph_execution_policy, resolve_workflow_policy, simulate_graph, validate_graph
@@ -356,6 +362,32 @@ def command_config_show(args: argparse.Namespace) -> int:
     config = _config(args)
     redacted = json.loads(json.dumps(config.data))
     _print_json({"project_root": str(config.project_root), "config": redacted, "provenance": config.provenance})
+    return 0
+
+
+def command_trust(args: argparse.Namespace) -> int:
+    """Say that the local config file in this project is yours and may be used."""
+
+    root = Path(args.project).resolve() if getattr(args, "project", None) else Path.cwd()
+    local = root / ".harness" / "config.local.json"
+    if not local.is_file():
+        raise HarnessError(
+            f"There is no {local}. Run 'harness init' first, or write the file yourself."
+        )
+    if args.show:
+        trusted = is_project_local_config_trusted(root, local)
+        print(f"{local}")
+        print("This file is trusted." if trusted else "This file is not trusted yet.")
+        return 0 if trusted else 1
+    print(local.read_text(encoding="utf-8"))
+    if not args.yes:
+        answer = input("Trust this file and let it set provider routes and commands? [y/N] ")
+        if answer.strip().lower() not in ("y", "yes"):
+            print("Left as it was.")
+            return 1
+    store = trust_project_local_config(root, local)
+    print(f"Trusted. Recorded in {store}")
+    print("Edit the file again and this goes back to untrusted, on purpose.")
     return 0
 
 
@@ -828,6 +860,10 @@ def parser() -> argparse.ArgumentParser:
     benchmark.set_defaults(handler=command_benchmark)
     show = sub.add_parser("config", help="Print effective config and setting sources")
     show.set_defaults(handler=command_config_show)
+    trust = sub.add_parser("trust", help="Say the local config file in this project is yours")
+    trust.add_argument("--yes", action="store_true", help="Do not ask first")
+    trust.add_argument("--show", action="store_true", help="Only say whether it is trusted")
+    trust.set_defaults(handler=command_trust)
     checkpoint = sub.add_parser("checkpoint", help="Create, list, or restore project safety snapshots")
     checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)
     checkpoint_create = checkpoint_sub.add_parser("create")

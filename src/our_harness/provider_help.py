@@ -157,6 +157,45 @@ def _hosted(
     )
 
 
+def _signed_in_tool(identifier: str, in_use: bool) -> ProviderOption:
+    """An assistant you already pay for, driven through its own command line."""
+
+    from .providers.subscription_cli import available, recipe_for
+
+    recipe = recipe_for(identifier)
+    summary = (
+        "Uses a seat your organisation already pays for. No key to get, "
+        "because the tool is already signed in."
+    )
+    found = available(identifier)
+    if found:
+        return ProviderOption(
+            id=identifier,
+            label=recipe.label,
+            summary=summary,
+            state=READY,
+            reason=f"The {recipe.command[0]} command was found at {found}.",
+            steps=(
+                "Add it as a provider route in your own local config, then run: harness trust",
+            ),
+            cost="Covered by your subscription, with that plan's limits.",
+            in_use=in_use,
+        )
+    return ProviderOption(
+        id=identifier,
+        label=recipe.label,
+        summary=summary,
+        state=NEEDS_SETUP,
+        reason=f"The {recipe.command[0]} command is not on this machine.",
+        steps=(
+            recipe.install_hint,
+            "Add it as a provider route in your own local config, then run: harness trust",
+        ),
+        cost="Covered by your subscription, with that plan's limits.",
+        in_use=in_use,
+    )
+
+
 def _codex_cli(in_use: bool) -> ProviderOption:
     found = shutil.which("codex")
     summary = "Reuses a ChatGPT sign-in you already have, through the codex command."
@@ -193,6 +232,8 @@ def provider_options(config: LoadedConfig) -> list[ProviderOption]:
     chosen = str(config.get("provider.name") or "")
     options = [
         _ollama(config, in_use=chosen == "ollama"),
+        _signed_in_tool("claude-cli", in_use=chosen == "claude-cli"),
+        _signed_in_tool("copilot-cli", in_use=chosen == "copilot-cli"),
         _hosted("anthropic", "Anthropic", "ANTHROPIC_API_KEY", "console.anthropic.com", chosen == "anthropic"),
         _hosted("openai", "OpenAI", "OPENAI_API_KEY", "platform.openai.com", chosen == "openai"),
         _hosted("gemini", "Google Gemini", "GEMINI_API_KEY", "aistudio.google.com", chosen == "gemini"),

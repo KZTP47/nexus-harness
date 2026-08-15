@@ -681,17 +681,28 @@ def validate_config(data: dict[str, Any]) -> None:
     if not _is_int(data.get("schema_version")) or data["schema_version"] != 1:
         raise HarnessError("Unsupported config schema_version; expected 1")
     provider = data["provider"]
-    provider_names = ("openai", "anthropic", "gemini", "ollama", "local", "openai-compatible")
+    provider_names = (
+        "openai", "anthropic", "gemini", "ollama", "local", "openai-compatible",
+        # Assistants you already pay for, driven through their own command line.
+        "claude-cli", "copilot-cli", "assistant-cli",
+    )
     profile_provider_names = (*provider_names, "codex-cli")
     if provider["name"] not in provider_names:
-        raise HarnessError("provider.name must be openai, anthropic, gemini, ollama, local, or openai-compatible")
+        raise HarnessError("provider.name must be one of: " + ", ".join(provider_names))
     if provider["api_mode"] not in ("auto", "responses", "chat-completions"):
         raise HarnessError("provider.api_mode must be auto, responses, or chat-completions")
     if provider["prompt_cache_retention"] not in ("", "in_memory", "24h"):
         raise HarnessError("provider.prompt_cache_retention must be empty, in_memory, or 24h")
-    for name in ("model", "endpoint"):
-        _require_string(provider[name], f"provider.{name}", allow_empty=False)
-    _validate_endpoint(provider["endpoint"])
+    subscription_kinds = ("claude-cli", "copilot-cli", "assistant-cli")
+    _require_string(provider["model"], "provider.model", allow_empty=provider["name"] in subscription_kinds)
+    if provider["name"] in subscription_kinds:
+        if provider["endpoint"]:
+            raise HarnessError(f"provider.endpoint must be empty for {provider['name']}")
+        if provider["api_key_env"]:
+            raise HarnessError(f"provider.api_key_env must be empty for {provider['name']}; it signs in on its own")
+    else:
+        _require_string(provider["endpoint"], "provider.endpoint", allow_empty=False)
+        _validate_endpoint(provider["endpoint"])
     for name in ("api_key_env", "prompt_cache_key", "prompt_cache_retention"):
         _require_string(provider[name], f"provider.{name}")
     if len(provider["prompt_cache_key"]) > 64:
@@ -734,7 +745,10 @@ def validate_config(data: dict[str, Any]) -> None:
             raise HarnessError(f"{dotted}.kind conflicts with name")
         _require_string(profile.get("model"), f"{dotted}.model", allow_empty=False)
         endpoint = _require_string(profile.get("endpoint", ""), f"{dotted}.endpoint")
-        if name != "codex-cli":
+        if name in ("claude-cli", "copilot-cli", "assistant-cli"):
+            if endpoint:
+                raise HarnessError(f"{dotted}.endpoint must be empty for {name}")
+        elif name != "codex-cli":
             if not endpoint:
                 raise HarnessError(f"{dotted}.endpoint must be a non-empty string")
             _validate_endpoint(endpoint, f"{dotted}.endpoint")

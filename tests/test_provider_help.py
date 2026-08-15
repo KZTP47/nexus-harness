@@ -50,7 +50,7 @@ class ProviderHelpTests(unittest.TestCase):
     def test_every_way_of_connecting_is_listed(self) -> None:
         self.assertEqual(
             set(self.by_id()),
-            {"ollama", "openai", "anthropic", "gemini", "codex-cli"},
+            {"ollama", "openai", "anthropic", "gemini", "codex-cli", "claude-cli", "copilot-cli"},
         )
 
     def test_a_bare_machine_has_nothing_ready_and_says_what_to_do(self) -> None:

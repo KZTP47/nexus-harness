@@ -55,6 +55,8 @@ harness init --yes --provider ollama
 | OpenAI | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
 | Anthropic | `ANTHROPIC_API_KEY` | `https://api.anthropic.com/v1` |
 | Gemini | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/v1beta` |
+| Claude Code | Existing `claude` sign-in, no key | Local subprocess |
+| GitHub Copilot | Existing `copilot` sign-in, no key | Local subprocess |
 | Codex CLI (optional named profile) | Existing `codex login` with ChatGPT | Local subprocess |
 | OpenAI-compatible | Configured by that server | `http://127.0.0.1:8000/v1` |
 | Local process | None unless the process requires one | Configured argv |
@@ -62,6 +64,19 @@ harness init --yes --provider ollama
 The OpenAI adapter calls the OpenAI API and needs an API key. It cannot turn a ChatGPT subscription into an API credential. The separate optional `codex-cli` named profile can reuse an existing local ChatGPT sign-in through `codex exec`. It remains subject to ChatGPT plan, workspace, model, and rate limits. Its usage is recorded as `subscription-unpriced`, with no dollar-cost estimate. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#optional-codex-cli-profile).
 
 Never put keys in `.harness/config.json`. Config stores the environment-variable name, not its value.
+
+### No API key at your organisation
+
+If you have Claude or GitHub Copilot seats but no keys, the harness can drive
+those tools' own command lines instead. Nothing to buy, no key anywhere:
+
+```json
+{"provider": {"name": "claude-cli", "model": "claude-sonnet-4-5", "endpoint": "", "api_key_env": ""}}
+```
+
+Put that in `.harness/config.local.json`, run `harness trust`, and you are done.
+Several assistants can work on one job at once, each on its own agent, and they
+can write notes to each other. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
 
 ## Commands
 
@@ -82,6 +97,7 @@ harness qa advise                   Say what to do about the checks, from past r
 harness qa flaky                    Name checks whose result keeps changing
 harness qa generate|candidates      Ask a model for new checks and read them back
 harness qa accept|reject <id> ...   Decide on a proposed check
+harness trust                       Say the local config file in this project is yours
 harness doctor                      Check provider, tools, config, and stack
 harness index                       Refresh workspace search and dependency edges
 harness memory search <query>       Search prior episodes and indexed files
@@ -299,6 +315,7 @@ Read [docs/SECURITY.md](docs/SECURITY.md) before running on an untrusted reposit
 ## More documentation
 
 - [Checks and the test lab](docs/QA.md)
+- [Using a subscription you already pay for](docs/SUBSCRIPTIONS.md)
 - [Plugins](docs/PLUGINS.md)
 - [Team notes: how the agents talk](docs/TEAM_NOTES.md)
 - [The desktop app](docs/DESKTOP.md)

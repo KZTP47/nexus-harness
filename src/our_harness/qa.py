@@ -2021,7 +2021,7 @@ def _json_object(text: str) -> dict[str, Any]:
     if not isinstance(text, str) or not text.strip():
         raise QaError("The model answered with nothing")
     stripped = text.strip()
-    fenced = re.findall(r"```(?:[a-zA-Z0-9_-]*)\n(.*?)```", stripped, re.DOTALL)
+    fenced = re.findall(r"```(?:[a-zA-Z0-9_-]*)\r?\n(.*?)```", stripped, re.DOTALL)
     candidates = [block.strip() for block in fenced]
     candidates.append(stripped)
     for candidate in candidates:

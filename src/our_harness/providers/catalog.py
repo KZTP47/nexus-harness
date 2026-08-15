@@ -33,6 +33,9 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
     "openai-compatible": ProviderCapabilities(True, False, True, True, True, False, True, False, False),
     "local": ProviderCapabilities(False, True, False, False, False, False, False, False, False),
     "codex-cli": ProviderCapabilities(False, True, False, False, False, False, False, True, False),
+    "claude-cli": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
+    "copilot-cli": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
+    "assistant-cli": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
 }
 
 

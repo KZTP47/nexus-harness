@@ -1425,6 +1425,10 @@ def create_provider(config: LoadedConfig) -> Provider:
         from .codex_cli import CodexCLIProvider
 
         return CodexCLIProvider(config)
+    if name in ("claude-cli", "copilot-cli", "assistant-cli"):
+        from .subscription_cli import SubscriptionCLIProvider
+
+        return SubscriptionCLIProvider(config, name)
     raise HarnessError(f"Unknown provider: {name}")
 
 
