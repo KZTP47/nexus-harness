@@ -76,7 +76,10 @@ function uniqueId(prefix) {
   return id;
 }
 
+function noteGraphEdit() { if (typeof markWorkflowChanged === "function") markWorkflowChanged(); }
+
 function pushHistory() {
+  noteGraphEdit();
   const snapshot = JSON.stringify(graph);
   if (undoStack[undoStack.length - 1] !== snapshot) undoStack.push(snapshot);
   if (undoStack.length > 50) undoStack.shift();
@@ -535,7 +538,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") refreshChecks(); if (name === "workflow") { fitGraph(); refreshTeamNotes(); } if (name === "history") refreshHistory(); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") refreshChecks(); if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -740,6 +743,131 @@ async function refreshUnstable() {
   } catch (error) { showError(error.message); }
 }
 
+/* ---- Workflows: keep several, and switch between them like tabs ---- */
+
+let savedWorkflows = [];
+let currentWorkflow = "";
+let workflowDirty = false;
+
+function markWorkflowChanged() {
+  workflowDirty = true;
+  renderWorkflowTabs();
+}
+
+async function refreshWorkflows() {
+  try {
+    const answer = await request("/api/workflows");
+    savedWorkflows = answer.workflows || [];
+    renderWorkflowTabs();
+  } catch (error) { showError(error.message); }
+}
+
+function renderWorkflowTabs() {
+  const strip = $("workflowTabs");
+  strip.replaceChildren();
+  if (!savedWorkflows.length) {
+    strip.append(make("p", "field-help", "No saved workflows yet. Press Save to keep this one."));
+  }
+  for (const item of savedWorkflows) {
+    const tab = make("button", `workflow-tab${item.name === currentWorkflow ? " current" : ""}`);
+    tab.type = "button";
+    tab.setAttribute("role", "tab");
+    tab.setAttribute("aria-selected", String(item.name === currentWorkflow));
+    tab.append(make("span", "", item.name));
+    tab.append(make("span", "tab-count", `${item.nodes} agents`));
+    if (!item.valid) {
+      tab.append(make("span", "tab-warning", "needs a fix"));
+      tab.title = item.issues.join("; ");
+    }
+    tab.addEventListener("click", () => openWorkflow(item.name));
+    strip.append(tab);
+  }
+  const status = $("workflowStatus");
+  if (!currentWorkflow) status.textContent = workflowDirty ? "Unsaved workflow." : "Not saved yet.";
+  else status.textContent = workflowDirty ? `${currentWorkflow}: changed, not saved.` : `${currentWorkflow}: saved.`;
+}
+
+async function openWorkflow(name) {
+  if (workflowDirty && !confirm(`Leave ${currentWorkflow || "this workflow"} without saving?`)) return;
+  try {
+    const answer = await request(`/api/workflows?name=${encodeURIComponent(name)}`);
+    pushHistory();
+    graph = migrateGraph(answer.workflow.graph);
+    currentWorkflow = answer.workflow.name;
+    workflowDirty = false;
+    selected = null;
+    focusedNodeId = graph.nodes[0]?.id || "";
+    nextId = graph.nodes.length + graph.edges.length + 1;
+    render();
+    fitGraph();
+    renderWorkflowTabs();
+    await validate();
+    announce(`Opened the workflow named ${currentWorkflow}.`);
+  } catch (error) { showError(error.message); }
+}
+
+async function saveWorkflow() {
+  const suggested = currentWorkflow || "My workflow";
+  const name = prompt("Save this workflow as:", suggested);
+  if (name === null) return;
+  const checked = await validate();
+  if (!checked.valid) {
+    showError("Fix the workflow before saving it. The problems are listed under Validation.");
+    return;
+  }
+  try {
+    const answer = await request("/api/workflows/save", {
+      method: "POST", body: JSON.stringify({name, graph}),
+    });
+    currentWorkflow = answer.saved.name;
+    workflowDirty = false;
+    await refreshWorkflows();
+    announce(`Saved the workflow named ${currentWorkflow}.`);
+  } catch (error) { showError(error.message); }
+}
+
+async function renameWorkflow() {
+  if (!currentWorkflow) { showError("Save this workflow first, then you can rename it."); return; }
+  const name = prompt(`Rename ${currentWorkflow} to:`, currentWorkflow);
+  if (name === null || name === currentWorkflow) return;
+  try {
+    const answer = await request("/api/workflows/rename", {
+      method: "POST", body: JSON.stringify({name: currentWorkflow, new_name: name}),
+    });
+    currentWorkflow = answer.saved.name;
+    await refreshWorkflows();
+    announce(`Renamed to ${currentWorkflow}.`);
+  } catch (error) { showError(error.message); }
+}
+
+async function deleteWorkflow() {
+  if (!currentWorkflow) { showError("There is no saved workflow open to delete."); return; }
+  if (!confirm(`Delete the workflow named ${currentWorkflow}? This cannot be undone.`)) return;
+  try {
+    await request("/api/workflows/delete", {
+      method: "POST", body: JSON.stringify({name: currentWorkflow}),
+    });
+    announce(`Deleted ${currentWorkflow}.`);
+    currentWorkflow = "";
+    await refreshWorkflows();
+  } catch (error) { showError(error.message); }
+}
+
+function newWorkflow() {
+  if (workflowDirty && !confirm("Start a new workflow without saving this one?")) return;
+  pushHistory();
+  graph = structuredClone(template);
+  currentWorkflow = "";
+  workflowDirty = false;
+  selected = null;
+  focusedNodeId = graph.nodes[0]?.id || "";
+  nextId = graph.nodes.length + graph.edges.length + 1;
+  render();
+  fitGraph();
+  renderWorkflowTabs();
+  announce("Started a new workflow from the built-in one.");
+}
+
 /* ---- History: what past runs did, step by step ---- */
 
 let historyRuns = [];
@@ -866,6 +994,7 @@ function bindEvents() {
   $("agentDialog").addEventListener("close", () => dialogInvoker?.focus?.());
   ["nodeLabel", "nodeProvider", "nodeModel", "nodeRoleName", "nodePrompt", "nodeRole", "mergeSlots", "mergeOutput"].forEach((id) => $(id).addEventListener("change", updateSelectedNode)); $("nodeCapabilities").addEventListener("change", updateSelectedNode); $("nodeAgentRef").addEventListener("change", () => { applyAgentAssignment($("nodeAgentRef"), $("nodeProvider"), $("nodeModel"), $("nodeRoleName"), $("nodeCapabilities")); updateSelectedNode(); });
   ["edgeMode", "edgeCondition", "edgeVariables", "edgeTargetSlot", "edgeReturnFields", "maxIterations", "temperatureDecay", "loopTimeout"].forEach((id) => $(id).addEventListener("change", updateSelectedEdge)); $("deleteNode").addEventListener("click", () => selected?.kind === "node" && removeNode(selected.id)); $("deleteEdge").addEventListener("click", () => selected?.kind === "edge" && removeEdge(selected.id));
+  $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
   $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("refreshUnstable").addEventListener("click", refreshUnstable); $("checkTag").addEventListener("change", renderChecks);
@@ -875,7 +1004,7 @@ function bindEvents() {
 
 async function boot() {
   bindEvents();
-  try { const value = await request("/api/bootstrap"); token = value.token; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await refreshCheckup(); await refreshChecks(); await refreshTeamNotes(); pollEvents(); } catch (error) { showError(error.message); }
+  try { const value = await request("/api/bootstrap"); token = value.token; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await refreshCheckup(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
 }
 
 boot();

@@ -151,6 +151,18 @@
     </aside>
 
     <main id="workspace" class="workspace" tabindex="-1">
+      <section class="glass workflow-bar" aria-labelledby="workflowBarTitle">
+        <h2 id="workflowBarTitle" class="sr-only">Your workflows</h2>
+        <div id="workflowTabs" class="workflow-tabs" role="tablist" aria-label="Saved workflows"></div>
+        <div class="workflow-actions">
+          <button id="newWorkflow" type="button">New</button>
+          <button id="saveWorkflow" class="primary" type="button">Save</button>
+          <button id="renameWorkflow" type="button">Rename</button>
+          <button id="deleteWorkflow" class="danger" type="button">Delete</button>
+        </div>
+        <output id="workflowStatus" class="workflow-status">Not saved yet.</output>
+      </section>
+
       <section class="canvas-toolbar glass" aria-label="Canvas controls">
         <button id="zoomOut" type="button" aria-label="Zoom out">−</button>
         <output id="zoomValue" aria-label="Current zoom">100%</output>

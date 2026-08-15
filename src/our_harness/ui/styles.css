@@ -167,6 +167,17 @@ th { position: sticky; top: 0; background: var(--panel-strong); }
 .status-skipped::before { content: "-"; }
 .metric-good::before { content: "OK "; }
 .metric-bad::before { content: "X "; }
+.workflow-bar { display: grid; gap: 8px; padding: 10px 12px; }
+.workflow-tabs { display: flex; flex-wrap: wrap; gap: 6px; align-items: stretch; }
+.workflow-tabs .field-help { margin: 4px 0; }
+.workflow-tab { display: grid; gap: 2px; padding: 6px 12px; text-align: left; line-height: 1.25; }
+.workflow-tab.current { color: #03202b; background: var(--cyan); font-weight: 800; }
+.workflow-tab .tab-count { font-size: .72rem; opacity: .8; }
+.workflow-tab .tab-warning { font-size: .72rem; font-weight: 700; color: var(--yellow); }
+.workflow-tab.current .tab-warning { color: #6b4a00; }
+.workflow-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.workflow-actions button { padding: 6px 12px; }
+.workflow-status { color: var(--muted); font-size: .84rem; }
 .model-setup { margin-top: 12px; }
 .model-setup > summary { margin-bottom: 8px; }
 .model-list { display: grid; gap: 10px; margin: 10px 0 0; padding: 0; list-style: none; }

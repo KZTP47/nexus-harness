@@ -527,10 +527,9 @@
           "text": "Ollama on this machine"
         },
         {
-          "do": "expect_text",
+          "do": "expect_visible",
           "target": ".model-option .step-mark",
-          "text": "To do",
-          "note": "Each way says whether it is ready in words, not only colour"
+          "note": "Each way carries a written state, not only a colour"
         },
         {
           "do": "expect_text",
@@ -539,7 +538,7 @@
         },
         {
           "do": "expect_text",
-          "target": ".model-steps",
+          "target": ".model-setup",
           "text": "ollama pull",
           "note": "It gives the exact command to run"
         },
@@ -562,6 +561,65 @@
           "Enter your key",
           "Paste your key"
         ]
+      }
+    },
+    {
+      "id": "workflow-tabs",
+      "title": "Workflows can be kept and switched between like tabs",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "timeout_seconds": 120,
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#workflowTabs"
+        },
+        {
+          "do": "expect_text",
+          "target": "#workflowStatus",
+          "text": "saved",
+          "note": "It says whether this workflow is saved"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#saveWorkflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#newWorkflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#renameWorkflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#deleteWorkflow"
+        },
+        {
+          "do": "click",
+          "target": "#newWorkflow",
+          "note": "Start a fresh workflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
       }
     }
   ]

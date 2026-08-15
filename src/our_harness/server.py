@@ -25,6 +25,7 @@ from .models import HarnessError
 from .plugins import check_kinds, load_plugins
 from .provider_help import setup_advice
 from .providers import ProviderRegistry
+from . import workflows as workflow_store
 from .workflow import HarnessApplication
 
 
@@ -440,6 +441,21 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self._json(memory.usage_records(after, limit, query.get("run_id", [""])[0][:256]))
                 else:
                     self._json(memory.prompt_lineage(after, limit, query.get("name", [""])[0][:256]))
+        elif parsed.path == "/api/workflows":
+            try:
+                self._require_token()
+            except HarnessError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            wanted = query.get("name", [""])[0][:64]
+            if wanted:
+                found = workflow_store.load(self.server.config, wanted)
+                self._json({"workflow": found.to_dict(include_graph=True)})
+            else:
+                self._json({
+                    "workflows": [item.to_dict() for item in workflow_store.listed(self.server.config)]
+                })
         elif parsed.path == "/api/timeline":
             try:
                 self._require_token()
@@ -530,6 +546,19 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self.server.release_run()
                     raise
                 self._json({"accepted": True}, HTTPStatus.ACCEPTED)
+            elif self.path == "/api/workflows/save":
+                saved = workflow_store.save(
+                    self.server.config, body.get("name", ""), body.get("graph", {})
+                )
+                self._json({"saved": saved.to_dict()})
+            elif self.path == "/api/workflows/delete":
+                removed = workflow_store.delete(self.server.config, body.get("name", ""))
+                self._json({"deleted": removed})
+            elif self.path == "/api/workflows/rename":
+                renamed = workflow_store.rename(
+                    self.server.config, body.get("name", ""), body.get("new_name", "")
+                )
+                self._json({"saved": renamed.to_dict()})
             elif self.path == "/api/qa/init":
                 config = self.server.config
                 detections = detect_project(config.project_root)

@@ -292,6 +292,21 @@ again on quit. See [docs/DESKTOP.md](docs/DESKTOP.md).
 cd desktop && npm install && npm start
 ```
 
+## Several workflows, like tabs
+
+Most people end up with more than one: a quick one for small fixes, a careful
+one with two reviewers, a different one for a different project. The **Workflow**
+tab keeps them side by side.
+
+**New** starts one from the built-in workflow. **Save** keeps the one on screen
+under a name. **Rename** and **Delete** do what they say. Clicking a tab opens
+that workflow, and the bar tells you whether what you are looking at has been
+saved. **Export JSON** and **Import JSON** move one between machines.
+
+Each is a plain file under `.harness/workflows`, so they can be read, edited and
+checked into a repository like anything else. A workflow the harness could not
+run is never saved: it tells you what is wrong instead.
+
 ## Workflow graph editor
 
 The server binds only to loopback. The canvas supports drag, pan, zoom, keyboard node movement, keyboard connection creation, edge conditions, selected state fields, and bounded cycle settings. A text connection list provides the same graph information without the canvas. **Simulate** explores graph state without project commands. **Start run** validates the current canvas as a production graph, submits its exact hash, and uses its reachable tool roles and repair-edge limits for real configured/detected checks.
