@@ -186,12 +186,34 @@ the same ignore rules the rest of the harness uses decide what is watched, so a
 |---|---|---|
 | `--interval` | `1.0` | Seconds between looks at the project. |
 | `--quiet` | `0.5` | Seconds of stillness before a run starts. |
-| `--tag` | none | Only run cases with this tag. May repeat. |
+| `--every` | off | Also run this often in seconds, even when nothing changed. |
+| `--tag` | none | Only run checks with this tag. May repeat. |
 | `--skip-first` | off | Wait for a change before the first run. |
-| `--max-runs` | none | Stop after this many change batches. |
+| `--max-runs` | none | Stop after this many runs. |
 
 A save that writes several files in a row counts as one change, so the checks
 run once, not once per file.
+
+### Running on a timer
+
+```bash
+harness qa watch --every 300
+```
+
+That runs the checks whenever you save, and also every five minutes even if
+nothing changed. It is useful when a check depends on something outside your
+project, such as a server that has to stay up.
+
+This runs only while the command is open. For a schedule that survives a
+restart, use the scheduler your computer already has and point it at
+`harness qa run`:
+
+- Windows: Task Scheduler, running `harness qa run --format junit --output reports/checks.xml`
+- macOS or Linux: a cron line such as `*/15 * * * * cd /path/to/project && harness qa run`
+
+The harness deliberately installs no schedule of its own. Something that starts
+your tests when you are not there should be set up by you, where you can see it
+and turn it off.
 
 ## Retries and unstable checks
 
@@ -247,6 +269,15 @@ validated in the same way as a hand-written case, then stored in
 Each proposal carries warnings in plain words, for example when a command starts
 with `rm`, when it holds `--force` or `install`, when it calls a site that is not
 on this machine, or when the case checks nothing at all.
+
+## Adding your own kind of check
+
+A plugin can add a kind of check, such as one that asks a database a question.
+Once it is turned on, that kind behaves exactly like a built-in one: it runs
+side by side with the rest, retries, reports, and appears in the control panel.
+
+See [PLUGINS.md](PLUGINS.md) and the working example in
+`examples/plugins/sqlite_check.py`.
 
 ## Settings
 

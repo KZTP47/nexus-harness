@@ -21,7 +21,7 @@ from .mcp import MCPClient, configured_server
 from .memory import MemoryStore
 from .models import HarnessError
 from .models import ProviderRequest
-from .plugins import load_plugins
+from .plugins import check_kinds, load_plugins
 from . import qa
 from .context import ContextCompiler
 from .refinement import RefinementManager
@@ -489,6 +489,7 @@ def _qa_write_report(config: LoadedConfig, result: qa.QaRunResult, args: argpars
 def command_qa(args: argparse.Namespace) -> int:
     config = _config(args)
     command = args.qa_command
+    kinds = check_kinds(config)
     if command == "init":
         detections = detect_project(config.project_root)
         combined = {
@@ -505,7 +506,7 @@ def command_qa(args: argparse.Namespace) -> int:
         return 0
 
     if command == "list":
-        suite = qa.load_suite(config, getattr(args, "suite", None))
+        suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
         if args.json:
             _print_json(suite.to_dict())
             return 0
@@ -516,8 +517,8 @@ def command_qa(args: argparse.Namespace) -> int:
         return 0
 
     if command == "run":
-        suite = qa.load_suite(config, getattr(args, "suite", None))
-        runner = qa.QaRunner(config)
+        suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
+        runner = qa.QaRunner(config, extra_kinds=kinds)
         result = runner.run(
             suite,
             tags=args.tag or (),
@@ -535,8 +536,8 @@ def command_qa(args: argparse.Namespace) -> int:
         return 0 if result.passed else 1
 
     if command == "watch":
-        suite = qa.load_suite(config, getattr(args, "suite", None))
-        runner = qa.QaRunner(config)
+        suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
+        runner = qa.QaRunner(config, extra_kinds=kinds)
         tags = args.tag or ()
         chosen = runner.select(suite, tags=tags)
         watcher = ProjectWatcher(
@@ -545,11 +546,13 @@ def command_qa(args: argparse.Namespace) -> int:
             quiet_seconds=args.quiet,
         )
         print(f"Watching {config.project_root} for changes.")
+        if args.every:
+            print(f"They also run every {args.every:g} seconds, whether anything changed or not.")
         print(f"{_count(len(chosen), 'check')} will run each time. Press Ctrl+C to stop.")
 
         def run_once(changes: Changes | None = None) -> bool:
             if changes is not None:
-                print(f"\n{changes.describe()}")
+                print(f"\n{changes.describe() if changes else 'nothing changed, running on the timer'}")
             result = runner.run(suite, tags=tags, write_artifacts=not args.no_artifacts)
             if not args.no_artifacts:
                 qa.record_history(config, result)
@@ -567,16 +570,17 @@ def command_qa(args: argparse.Namespace) -> int:
             batches = watcher.watch(
                 lambda changes: run_once(changes),
                 max_batches=args.max_runs,
+                repeat_seconds=args.every,
             )
         except KeyboardInterrupt:
             print("\nStopped watching.")
             return 0 if passed else 1
-        print(f"\nStopped after {_count(batches, 'change')}.")
+        print(f"\nStopped after {_count(batches, 'run')}.")
         return 0
 
     if command == "advise":
         try:
-            suite = qa.load_suite(config, getattr(args, "suite", None))
+            suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
         except HarnessError:
             suite = None
         findings = qa.check_health(config, suite)
@@ -600,9 +604,9 @@ def command_qa(args: argparse.Namespace) -> int:
             _print_json(report)
             return 0
         if not report:
-            print("No case looks unstable yet. Run the suite a few more times to build a history.")
+            print("No check looks unstable yet. Run them a few more times to build a history.")
             return 0
-        print("Cases whose result keeps changing:")
+        print("Checks whose result keeps changing:")
         for entry in report:
             print(
                 f"  {entry['id']}: failed {entry['failures']} of {entry['runs']} runs "
@@ -613,7 +617,7 @@ def command_qa(args: argparse.Namespace) -> int:
     if command == "generate":
         suite: qa.QaSuite | None
         try:
-            suite = qa.load_suite(config, getattr(args, "suite", None))
+            suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
         except HarnessError:
             suite = None
         detections = [item.to_dict() for item in detect_project(config.project_root)]
@@ -630,7 +634,7 @@ def command_qa(args: argparse.Namespace) -> int:
                 )
             )
         existing = [case.id for case in suite.cases] if suite else []
-        candidates = qa.parse_generated_cases(response.text, existing)
+        candidates = qa.parse_generated_cases(response.text, existing, kinds)
         path = qa.save_candidates(config, candidates, source=str(config.get("provider.model")))
         print(f"Saved {_count(len(candidates), 'proposed check')} to {path}")
         for item in candidates:
@@ -647,7 +651,7 @@ def command_qa(args: argparse.Namespace) -> int:
             _print_json(candidates)
             return 0
         if not candidates:
-            print("There are no proposed cases. Run 'harness qa generate' to ask the model for some.")
+            print("There are no proposed checks. Run 'harness qa generate' to ask the model for some.")
             return 0
         for item in candidates:
             case = item.get("case", {})
@@ -907,25 +911,26 @@ def parser() -> argparse.ArgumentParser:
     qa_init = qa_sub.add_parser("init", help="Write a starter suite from the detected project commands")
     qa_init.add_argument("--force", action="store_true", help="Replace an existing suite")
     qa_init.set_defaults(handler=command_qa)
-    qa_list = qa_sub.add_parser("list", help="Show every case in the suite")
+    qa_list = qa_sub.add_parser("list", help="Show every check in the suite")
     qa_list.add_argument("--suite", help="Suite file to read instead of the configured one")
     qa_list.add_argument("--json", action="store_true")
     qa_list.set_defaults(handler=command_qa)
-    qa_run = qa_sub.add_parser("run", help="Run the suite and report what happened")
+    qa_run = qa_sub.add_parser("run", help="Run every check and report what happened")
     qa_run.add_argument("--suite", help="Suite file to read instead of the configured one")
-    qa_run.add_argument("--tag", action="append", help="Only run cases with this tag; may repeat")
-    qa_run.add_argument("--case", action="append", help="Only run this case id; may repeat")
-    qa_run.add_argument("--workers", type=int, help="How many cases to run at the same time")
+    qa_run.add_argument("--tag", action="append", help="Only run checks with this tag; may repeat")
+    qa_run.add_argument("--case", action="append", help="Only run this check id; may repeat")
+    qa_run.add_argument("--workers", type=int, help="How many checks to run at the same time")
     qa_run.add_argument("--format", choices=qa.REPORT_FORMATS, default="markdown")
     qa_run.add_argument("--output", help="Write the report to this project-relative file")
     qa_run.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
     qa_run.set_defaults(handler=command_qa)
     qa_watch = qa_sub.add_parser("watch", help="Run the checks again whenever a project file changes")
     qa_watch.add_argument("--suite", help="Suite file to read instead of the configured one")
-    qa_watch.add_argument("--tag", action="append", help="Only run cases with this tag; may repeat")
+    qa_watch.add_argument("--tag", action="append", help="Only run checks with this tag; may repeat")
     qa_watch.add_argument("--interval", type=float, default=1.0, help="Seconds between looks at the project")
     qa_watch.add_argument("--quiet", type=float, default=0.5, help="Seconds of stillness before running")
-    qa_watch.add_argument("--max-runs", type=int, help="Stop after this many change batches")
+    qa_watch.add_argument("--every", type=float, help="Also run this often in seconds, even with no change")
+    qa_watch.add_argument("--max-runs", type=int, help="Stop after this many runs")
     qa_watch.add_argument("--skip-first", action="store_true", help="Wait for a change before the first run")
     qa_watch.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
     qa_watch.set_defaults(handler=command_qa)
@@ -933,22 +938,22 @@ def parser() -> argparse.ArgumentParser:
     qa_advise.add_argument("--suite", help="Suite file to read instead of the configured one")
     qa_advise.add_argument("--json", action="store_true")
     qa_advise.set_defaults(handler=command_qa)
-    qa_flaky = qa_sub.add_parser("flaky", help="Name the cases whose result keeps changing")
+    qa_flaky = qa_sub.add_parser("flaky", help="Name the checks whose result keeps changing")
     qa_flaky.add_argument("--json", action="store_true")
     qa_flaky.set_defaults(handler=command_qa)
-    qa_generate = qa_sub.add_parser("generate", help="Ask the model to propose new cases for review")
+    qa_generate = qa_sub.add_parser("generate", help="Ask the model to propose new checks for review")
     qa_generate.add_argument("--suite", help="Suite file to read instead of the configured one")
-    qa_generate.add_argument("--focus", help="What the new cases should cover")
+    qa_generate.add_argument("--focus", help="What the new checks should cover")
     qa_generate.add_argument("--limit", type=int, default=8)
     qa_generate.set_defaults(handler=command_qa)
-    qa_candidates = qa_sub.add_parser("candidates", help="Show proposed cases waiting for a decision")
+    qa_candidates = qa_sub.add_parser("candidates", help="Show proposed checks waiting for a decision")
     qa_candidates.add_argument("--json", action="store_true")
     qa_candidates.set_defaults(handler=command_qa)
-    qa_accept = qa_sub.add_parser("accept", help="Move proposed cases into the suite")
+    qa_accept = qa_sub.add_parser("accept", help="Move proposed checks into the suite")
     qa_accept.add_argument("case_id", nargs="+")
     qa_accept.add_argument("--suite", help="Suite file to write instead of the configured one")
     qa_accept.set_defaults(handler=command_qa)
-    qa_reject = qa_sub.add_parser("reject", help="Throw away proposed cases")
+    qa_reject = qa_sub.add_parser("reject", help="Throw away proposed checks")
     qa_reject.add_argument("case_id", nargs="+")
     qa_reject.set_defaults(handler=command_qa)
 

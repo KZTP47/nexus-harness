@@ -854,6 +854,187 @@ class CommandLineTests(unittest.TestCase):
         self.assertIn("harness qa init", captured.getvalue())
 
 
+class MessyModelAnswerTests(unittest.TestCase):
+    """A real model wraps its answer in prose and fences. Read it anyway."""
+
+    def cases(self, text: str) -> list[str]:
+        return [item["case"]["id"] for item in qa.parse_generated_cases(text)]
+
+    def test_prose_around_a_fenced_block_is_ignored(self) -> None:
+        answer = (
+            "Sure, here are two checks for your project.\n\n"
+            "```json\n"
+            '{"cases": [{"id": "readme", "kind": "file", "path": "README.md"},\n'
+            '           {"id": "build", "kind": "command", "command": ["make"]}]}\n'
+            "```\n\n"
+            "Let me know if you would like more."
+        )
+        self.assertEqual(self.cases(answer), ["readme", "build"])
+
+    def test_a_fence_with_no_language_still_works(self) -> None:
+        answer = '```\n{"cases": [{"id": "readme", "kind": "file", "path": "README.md"}]}\n```'
+        self.assertEqual(self.cases(answer), ["readme"])
+
+    def test_prose_with_no_fence_still_works(self) -> None:
+        answer = 'Here you go: {"cases": [{"id": "readme", "kind": "file", "path": "R.md"}]} Enjoy.'
+        self.assertEqual(self.cases(answer), ["readme"])
+
+    def test_a_single_case_object_is_understood(self) -> None:
+        self.assertEqual(self.cases('{"id": "solo", "kind": "file", "path": "x"}'), ["solo"])
+
+    def test_a_broken_fence_falls_back_to_the_whole_answer(self) -> None:
+        answer = 'thinking...\n```json\n{"cases": [{"id": "ok", "kind": "file", "path": "x"}]}'
+        self.assertEqual(self.cases(answer), ["ok"])
+
+    def test_each_kind_of_bad_answer_says_what_was_wrong(self) -> None:
+        for answer, expected in (
+            ("", "answered with nothing"),
+            ("   ", "answered with nothing"),
+            ("I could not think of any.", "did not hold a JSON object"),
+            ("here it is {not: valid json,,}", "not valid JSON"),
+            ('{"cases": []}', "proposed no cases"),
+            ('{"cases": "one two"}', "must hold a \"cases\" list"),
+        ):
+            with self.subTest(answer=answer[:20]), self.assertRaises(HarnessError) as caught:
+                qa.parse_generated_cases(answer)
+            self.assertIn(expected, str(caught.exception))
+
+    def test_a_case_with_the_wrong_shape_is_still_refused(self) -> None:
+        with self.assertRaises(HarnessError):
+            qa.parse_generated_cases('{"cases": [{"id": "x", "kind": "file"}]}')
+
+
+class GenerateCommandTests(unittest.TestCase):
+    """The whole generate, review, accept path through the real command line."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        (self.root / ".harness").mkdir()
+        (self.root / ".harness" / "config.json").write_text(
+            json.dumps({"schema_version": 1, "memory": {"enabled": False}}), encoding="utf-8"
+        )
+        (self.root / "README.md").write_text("# Demo\n", encoding="utf-8")
+        (self.root / "export.py").write_text("def export():\n    return 'csv'\n", encoding="utf-8")
+        self.addCleanup(self.temporary.cleanup)
+
+    def run_cli(self, *arguments: str, answer: str | None = None) -> tuple[int, str, str]:
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        from unittest import mock
+
+        from our_harness import cli
+        from our_harness.models import ProviderResponse
+
+        out, err = StringIO(), StringIO()
+        patch = (
+            mock.patch.object(
+                cli.HarnessApplication, "provider",
+                new_callable=mock.PropertyMock,
+                create=True,
+                return_value=_FakeProvider(answer),
+            )
+            if answer is not None
+            else None
+        )
+        if patch:
+            patch.start()
+            self.addCleanup(patch.stop)
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["--project", str(self.root), "qa", *arguments])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_generate_then_accept_puts_the_check_in_the_suite(self) -> None:
+        self.run_cli("init")
+        answer = (
+            "Here are the checks I suggest.\n\n```json\n"
+            '{"cases": [\n'
+            '  {"id": "export-works", "title": "The export command answers with csv",\n'
+            '   "kind": "command", "command": ["python", "-c", "import export; print(export.export())"],\n'
+            '   "expect": {"exit_code": 0, "stdout_contains": ["csv"]}},\n'
+            '  {"id": "export-file-exists", "kind": "file", "path": "export.py"}\n'
+            "]}\n```\n"
+        )
+        code, output, _ = self.run_cli("generate", "--focus", "the export command", answer=answer)
+        self.assertEqual(code, 0)
+        self.assertIn("Saved 2 proposed checks", output)
+        self.assertIn("export-works", output)
+        self.assertIn("Nothing runs until you accept it", output)
+
+        code, output, _ = self.run_cli("candidates")
+        self.assertEqual(code, 0)
+        self.assertIn("export-works", output)
+
+        code, output, _ = self.run_cli("list")
+        self.assertNotIn("export-works", output)
+
+        code, output, _ = self.run_cli("accept", "export-works")
+        self.assertEqual(code, 0)
+        self.assertIn("Added 1 check", output)
+
+        code, output, _ = self.run_cli("list")
+        self.assertIn("export-works", output)
+
+        code, output, _ = self.run_cli("candidates")
+        self.assertIn("export-file-exists", output)
+        self.assertNotIn("export-works", output)
+
+        code, output, _ = self.run_cli("run", "--case", "export-works")
+        self.assertEqual(code, 0, output)
+        self.assertIn("All checks passed", output)
+
+    def test_a_risky_proposal_is_shown_with_a_warning_and_can_be_rejected(self) -> None:
+        self.run_cli("init")
+        answer = json.dumps({"cases": [
+            {"id": "wipe-build", "kind": "command", "command": ["rm", "-rf", "build"]},
+        ]})
+        code, output, _ = self.run_cli("generate", answer=answer)
+        self.assertEqual(code, 0)
+        self.assertIn("warning:", output)
+        self.assertIn("rm", output)
+
+        code, output, _ = self.run_cli("reject", "wipe-build")
+        self.assertEqual(code, 0)
+        self.assertIn("Removed 1 proposed check", output)
+
+        code, output, _ = self.run_cli("candidates")
+        self.assertIn("no proposed checks", output.lower())
+
+        code, output, _ = self.run_cli("list")
+        self.assertNotIn("wipe-build", output)
+
+    def test_an_unreadable_answer_stops_before_anything_is_written(self) -> None:
+        self.run_cli("init")
+        code, _output, errors = self.run_cli("generate", answer="I have no ideas, sorry.")
+        self.assertEqual(code, 2)
+        self.assertIn("did not hold a JSON object", errors)
+        self.assertFalse((self.root / ".harness" / "qa" / "candidates.json").exists())
+
+    def test_a_proposal_that_reuses_an_existing_id_is_refused(self) -> None:
+        self.run_cli("init")
+        existing = qa.load_suite(LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {}))
+        answer = json.dumps({"cases": [
+            {"id": existing.cases[0].id, "kind": "file", "path": "README.md"},
+        ]})
+        code, _output, errors = self.run_cli("generate", answer=answer)
+        self.assertEqual(code, 2)
+        self.assertIn("reused an existing case id", errors)
+
+
+class _FakeProvider:
+    """Answers every request with one fixed text, as a real provider would."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.requests: list[object] = []
+
+    def complete(self, request):
+        from our_harness.models import ProviderResponse
+
+        self.requests.append(request)
+        return ProviderResponse(text=self.text)
+
+
 class ConfigTests(unittest.TestCase):
     def test_the_default_qa_section_is_valid(self) -> None:
         validate_config(copy.deepcopy(DEFAULT_CONFIG))

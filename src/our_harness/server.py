@@ -22,7 +22,7 @@ from .doctor import run_doctor
 from .graphs import migrate_graph, resolve_graph_execution_policy, resolve_workflow_policy, simulate_graph, validate_graph
 from .memory import MemoryStore
 from .models import HarnessError
-from .plugins import load_plugins
+from .plugins import check_kinds, load_plugins
 from .provider_help import setup_advice
 from .providers import ProviderRegistry
 from .workflow import HarnessApplication
@@ -97,7 +97,9 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.run_lock = threading.Lock()
         self.qa_lock = threading.Lock()
         self.qa_result: dict[str, Any] | None = None
-        self.workflow_policy = resolve_workflow_policy(config, load_plugins(config).workflow_nodes)
+        registry = load_plugins(config)
+        self.workflow_policy = resolve_workflow_policy(config, registry.workflow_nodes)
+        self.check_kinds = dict(registry.check_kinds)
         self.template = migrate_graph(json.loads(files("our_harness.templates").joinpath("gauntlet.json").read_text(encoding="utf-8")))
 
     def reserve_run(self) -> bool:
@@ -243,7 +245,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
     def _qa_suite(self) -> dict[str, Any]:
         try:
-            suite = qalab.load_suite(self.server.config)
+            suite = qalab.load_suite(self.server.config, None, self.server.check_kinds)
         except HarnessError as exc:
             return {"present": False, "reason": str(exc), "cases": [], "tags": []}
         return {
@@ -470,7 +472,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json(self._qa_suite())
             elif parsed.path == "/api/qa/history":
                 try:
-                    suite = qalab.load_suite(self.server.config)
+                    suite = qalab.load_suite(self.server.config, None, self.server.check_kinds)
                 except HarnessError:
                     suite = None
                 self._json({
@@ -546,8 +548,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 ids = body.get("cases") or []
                 if not isinstance(tags, list) or not isinstance(ids, list):
                     raise HarnessError("Tags and cases must be lists")
-                suite = qalab.load_suite(self.server.config)
-                selection = qalab.QaRunner(self.server.config).select(
+                suite = qalab.load_suite(self.server.config, None, self.server.check_kinds)
+                selection = qalab.QaRunner(self.server.config, extra_kinds=self.server.check_kinds).select(
                     suite, tags=[str(item) for item in tags], ids=[str(item) for item in ids]
                 )
                 if not self.server.reserve_qa():
@@ -575,7 +577,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
         events = self.server.events
         events.add({"kind": "qa_started", "node": "checks", "payload": {"suite": suite.name}})
         try:
-            result = qalab.QaRunner(self.server.config).run(suite, tags=tags, ids=ids)
+            result = qalab.QaRunner(self.server.config, extra_kinds=self.server.check_kinds).run(suite, tags=tags, ids=ids)
             qalab.record_history(self.server.config, result)
             self.server.qa_result = result.to_dict()
             events.add({"kind": "qa_result", "node": "checks", "payload": self.server.qa_result})

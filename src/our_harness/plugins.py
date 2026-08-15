@@ -21,6 +21,7 @@ class PluginRegistry:
         self.detectors: list[Any] = []
         self.workflow_nodes: dict[str, Any] = {}
         self.doctor_checks: list[Any] = []
+        self.check_kinds: dict[str, Any] = {}
 
     def add_detector(self, detector: Any) -> None:
         self.detectors.append(detector)
@@ -32,6 +33,22 @@ class PluginRegistry:
 
     def add_doctor_check(self, check: Any) -> None:
         self.doctor_checks.append(check)
+
+    def add_check_kind(self, kind: Any) -> None:
+        """Add a kind of QA check, such as one that talks to a database."""
+
+        name = getattr(kind, "name", "")
+        if not name:
+            raise HarnessError("A plugin check kind must have a name")
+        if name in self.check_kinds:
+            raise HarnessError(f"Check kind is already registered: {name}")
+        self.check_kinds[name] = kind
+
+
+def check_kinds(config: LoadedConfig) -> dict[str, Any]:
+    """Every extra check kind the enabled plugins add. Empty when there are none."""
+
+    return dict(load_plugins(config).check_kinds)
 
 
 def load_plugins(config: LoadedConfig) -> PluginRegistry:

@@ -13,6 +13,7 @@ from __future__ import annotations
 import concurrent.futures
 import html
 import json
+import math
 import re
 import socket
 import ssl
@@ -63,6 +64,57 @@ class QaSkipped(HarnessError):
 
 
 @dataclass(frozen=True)
+class CheckKind:
+    """A kind of check added by a plugin.
+
+    A plugin says what extra fields its cases carry, what its `expect` block may
+    ask for, and how to run one. The suite reader then treats it exactly like a
+    built-in kind: unknown fields are still refused, and a mistake is still
+    caught when the suite is read.
+    """
+
+    name: str
+    summary: str
+    fields: frozenset[str] = frozenset()
+    expectations: frozenset[str] = frozenset()
+    # run(case, runner) returns (reasons, short evidence, full evidence).
+    # No reasons means the case passed. Raise QaSkipped when it cannot run here.
+    run: Callable[["QaCase", "QaRunner"], tuple[tuple[str, ...], str, str]] | None = None
+
+    def validate(self) -> None:
+        if not isinstance(self.name, str) or not _ID_PATTERN.fullmatch(self.name):
+            raise QaError(
+                "A plugin check kind needs a lowercase name of letters, digits, dash, or underscore"
+            )
+        if self.name in CASE_KINDS:
+            raise QaError(f"A plugin may not replace the built-in {self.name} check kind")
+        if not callable(self.run):
+            raise QaError(f"The {self.name} check kind has no way to run")
+        overlap = (self.fields | self.expectations) & _COMMON_CASE_FIELDS
+        if overlap:
+            raise QaError(
+                f"The {self.name} check kind reuses a field the suite already owns: {sorted(overlap)[0]}"
+            )
+
+
+def validated_kinds(kinds: Iterable[CheckKind] | Mapping[str, CheckKind] | None) -> dict[str, CheckKind]:
+    """Check every plugin kind once, and index it by name."""
+
+    if not kinds:
+        return {}
+    found = list(kinds.values()) if isinstance(kinds, Mapping) else list(kinds)
+    indexed: dict[str, CheckKind] = {}
+    for kind in found:
+        if not isinstance(kind, CheckKind):
+            raise QaError("A plugin check kind must be a CheckKind")
+        kind.validate()
+        if kind.name in indexed:
+            raise QaError(f"Two plugins both add a check kind named {kind.name}")
+        indexed[kind.name] = kind
+    return indexed
+
+
+@dataclass(frozen=True)
 class QaExpectation:
     """What a passing case looks like. Every field is optional."""
 
@@ -85,6 +137,8 @@ class QaExpectation:
     max_page_errors: int | None = None
     max_failed_requests: int | None = None
     max_accessibility_problems: int | None = None
+    # Whatever a plugin check kind declared for itself.
+    extra: tuple[tuple[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {}
@@ -105,6 +159,8 @@ class QaExpectation:
                 value[name] = list(found)
         if self.json_fields:
             value["json_fields"] = {key: item for key, item in self.json_fields}
+        for key, item in self.extra:
+            value[key] = item
         return value
 
 
@@ -131,6 +187,24 @@ class QaCase:
     click_all: bool = False
     check_accessibility: bool = False
     steps: tuple[Mapping[str, Any], ...] = ()
+    # Whatever a plugin check kind declared for itself.
+    extra: tuple[tuple[str, Any], ...] = ()
+
+    def field(self, name: str, default: Any = None) -> Any:
+        """One of this case's plugin fields, or the default."""
+
+        for key, value in self.extra:
+            if key == name:
+                return value
+        return default
+
+    def expect_extra(self, name: str, default: Any = None) -> Any:
+        """One of this case's plugin expectations, or the default."""
+
+        for key, value in self.expect.extra:
+            if key == name:
+                return value
+        return default
 
     def to_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {"id": self.id, "title": self.title, "kind": self.kind}
@@ -166,6 +240,8 @@ class QaCase:
                 value["check_accessibility"] = True
             if self.steps:
                 value["steps"] = [dict(step) for step in self.steps]
+        for key, item in self.extra:
+            value[key] = item
         expect = self.expect.to_dict()
         if expect:
             value["expect"] = expect
@@ -347,9 +423,11 @@ _EXPECT_FIELDS_BY_KIND: dict[str, frozenset[str]] = {
 }
 
 
-def _parse_expectation(value: object, kind: str, label: str) -> QaExpectation:
+def _parse_expectation(
+    value: object, kind: str, label: str, extra: frozenset[str] = frozenset()
+) -> QaExpectation:
     data = _require_object(value if value is not None else {}, label)
-    allowed = _EXPECT_FIELDS_BY_KIND[kind]
+    allowed = _EXPECT_FIELDS_BY_KIND.get(kind, frozenset()) | extra
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise QaError(
@@ -400,6 +478,14 @@ def _parse_expectation(value: object, kind: str, label: str) -> QaExpectation:
                 )
             pairs.append((key, item))
         fields["json_fields"] = tuple(pairs)
+    if extra:
+        plugin_values = []
+        for name in sorted(extra):
+            if name not in data:
+                continue
+            plugin_values.append((name, _plain_value(data[name], f"{label}.{name}")))
+        if plugin_values:
+            fields["extra"] = tuple(plugin_values)
     return QaExpectation(**fields)
 
 
@@ -424,6 +510,35 @@ STEP_ACTIONS: dict[str, frozenset[str]] = {
 }
 _MAX_STEPS = 60
 _COMMON_CASE_FIELDS = frozenset({"id", "title", "kind", "tags", "retries", "timeout_seconds", "expect"})
+
+
+_MAX_PLUGIN_VALUE_CHARS = 20_000
+_MAX_PLUGIN_LIST = 100
+
+
+def _plain_value(value: object, label: str) -> Any:
+    """A value a suite may hand a plugin: text, a number, a flag, or a flat list."""
+
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise QaError(f"{label} must be a real number")
+        return value
+    if isinstance(value, str):
+        if len(value) > _MAX_PLUGIN_VALUE_CHARS:
+            raise QaError(f"{label} must be at most {_MAX_PLUGIN_VALUE_CHARS} characters")
+        return value
+    if isinstance(value, list):
+        if len(value) > _MAX_PLUGIN_LIST:
+            raise QaError(f"{label} must hold at most {_MAX_PLUGIN_LIST} values")
+        for item in value:
+            if isinstance(item, (dict, list)):
+                raise QaError(f"{label} must be a flat list, not a list holding lists or objects")
+        return [_plain_value(item, f"{label} entry") for item in value]
+    raise QaError(
+        f"{label} must be text, a number, true, false, null, or a flat list of those"
+    )
 
 
 def _relative_project_path(value: object, label: str) -> str:
@@ -492,13 +607,22 @@ def _parse_web_url(value: object, label: str) -> str:
     return url
 
 
-def _parse_case(value: object, index: int, seen: set[str]) -> QaCase:
+def _parse_case(
+    value: object,
+    index: int,
+    seen: set[str],
+    extra_kinds: Mapping[str, CheckKind] | None = None,
+) -> QaCase:
     label = f"cases[{index}]"
     data = _require_object(value, label)
     kind = _require_text(data.get("kind"), f"{label}.kind")
-    if kind not in CASE_KINDS:
-        raise QaError(f"{label}.kind must be one of: {', '.join(CASE_KINDS)}")
-    allowed = _COMMON_CASE_FIELDS | _CASE_FIELDS_BY_KIND[kind]
+    plugin_kind = (extra_kinds or {}).get(kind)
+    if kind not in CASE_KINDS and plugin_kind is None:
+        known = [*CASE_KINDS, *sorted(extra_kinds or {})]
+        raise QaError(f"{label}.kind must be one of: {', '.join(known)}")
+    allowed = _COMMON_CASE_FIELDS | _CASE_FIELDS_BY_KIND.get(kind, frozenset())
+    if plugin_kind is not None:
+        allowed = allowed | plugin_kind.fields
     unknown = sorted(set(data) - allowed)
     if unknown:
         raise QaError(f"{label}.{unknown[0]} is not a field a {kind} case understands")
@@ -531,10 +655,24 @@ def _parse_case(value: object, index: int, seen: set[str]) -> QaCase:
     timeout_seconds = float(timeout_value)
     if timeout_seconds and not 0 < timeout_seconds <= 86_400:
         raise QaError(f"{label}.timeout_seconds must be between 0 and 86400")
-    expect = _parse_expectation(data.get("expect"), kind, f"{label}.expect")
+    expect = _parse_expectation(
+        data.get("expect"),
+        kind,
+        f"{label}.expect",
+        plugin_kind.expectations if plugin_kind is not None else frozenset(),
+    )
 
     fields: dict[str, Any] = {}
-    if kind == "command":
+    if plugin_kind is not None:
+        # A plugin owns its fields, but the suite is still only a data file. It
+        # may hold plain values of a bounded size, so a checked-in suite cannot
+        # hand a plugin something huge or deeply nested to choke on.
+        fields["extra"] = tuple(
+            (name, _plain_value(data[name], f"{label}.{name}"))
+            for name in sorted(plugin_kind.fields)
+            if name in data
+        )
+    elif kind == "command":
         argv = data.get("command")
         if not isinstance(argv, list) or not argv:
             raise QaError(f"{label}.command must be a non-empty list, one item per argument")
@@ -625,7 +763,12 @@ def _parse_case(value: object, index: int, seen: set[str]) -> QaCase:
     )
 
 
-def parse_suite(data: object, *, source: str = "") -> QaSuite:
+def parse_suite(
+    data: object,
+    *,
+    source: str = "",
+    extra_kinds: Mapping[str, CheckKind] | None = None,
+) -> QaSuite:
     body = _require_object(data, "suite")
     unknown = sorted(set(body) - {"schema_version", "name", "cases"})
     if unknown:
@@ -640,7 +783,12 @@ def parse_suite(data: object, *, source: str = "") -> QaSuite:
     if len(cases_value) > _MAX_CASES:
         raise QaError(f"suite.cases must hold at most {_MAX_CASES} cases")
     seen: set[str] = set()
-    cases = tuple(_parse_case(item, index, seen) for index, item in enumerate(cases_value))
+    # Check the plugin kinds before reading a single case, so a broken or
+    # shadowing kind is refused here and not halfway through a run.
+    checked = validated_kinds(extra_kinds)
+    cases = tuple(
+        _parse_case(item, index, seen, checked) for index, item in enumerate(cases_value)
+    )
     return QaSuite(name=name, cases=cases, source=source)
 
 
@@ -649,7 +797,11 @@ def suite_path(config: LoadedConfig, override: str | None = None) -> Path:
     return _control_path(config.project_root, relative)
 
 
-def load_suite(config: LoadedConfig, override: str | None = None) -> QaSuite:
+def load_suite(
+    config: LoadedConfig,
+    override: str | None = None,
+    extra_kinds: Mapping[str, CheckKind] | None = None,
+) -> QaSuite:
     path = suite_path(config, override)
     if not path.is_file():
         raise QaError(
@@ -663,7 +815,7 @@ def load_suite(config: LoadedConfig, override: str | None = None) -> QaSuite:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise QaError(f"The test suite is not valid JSON: line {exc.lineno}, column {exc.colno}") from exc
-    return parse_suite(data, source=str(path))
+    return parse_suite(data, source=str(path), extra_kinds=extra_kinds)
 
 
 def write_suite(config: LoadedConfig, suite: QaSuite, override: str | None = None) -> Path:
@@ -732,6 +884,7 @@ class QaRunner:
         command_runner: CommandRunner | None = None,
         http_fetch: Callable[[QaCase, float], tuple[int, str, int]] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        extra_kinds: Mapping[str, CheckKind] | None = None,
     ) -> None:
         self.config = config
         self.root = config.project_root
@@ -743,6 +896,7 @@ class QaRunner:
         self.allowed_hosts = tuple(
             str(item).lower() for item in config.get("qa.allow_hosts", list(_LOOPBACK_HOSTS))
         )
+        self.extra_kinds = validated_kinds(extra_kinds)
         self._browser_ready: bool | None = None
 
     # -- selection ---------------------------------------------------------
@@ -898,7 +1052,10 @@ class QaRunner:
         started = self.clock()
         skipped = ""
         try:
-            if case.kind == "command":
+            if case.kind in self.extra_kinds:
+                handler = self.extra_kinds[case.kind].run
+                reasons, evidence, full = handler(case, self)
+            elif case.kind == "command":
                 reasons, evidence, full = self._check_command(case)
             elif case.kind == "file":
                 reasons, evidence, full = self._check_file(case)
@@ -1845,21 +2002,34 @@ def generation_prompt(
 
 
 def _json_object(text: str) -> dict[str, Any]:
+    """Find the one JSON object in a model answer, however it was wrapped.
+
+    A model may put prose before or after it, wrap it in a fenced block, or do
+    both. Anything that is not one readable object is refused, rather than
+    guessed at.
+    """
+
+    if not isinstance(text, str) or not text.strip():
+        raise QaError("The model answered with nothing")
     stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```[a-zA-Z]*\n", "", stripped)
-        stripped = re.sub(r"\n```\s*$", "", stripped)
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start < 0 or end <= start:
+    fenced = re.findall(r"```(?:[a-zA-Z0-9_-]*)\n(.*?)```", stripped, re.DOTALL)
+    candidates = [block.strip() for block in fenced]
+    candidates.append(stripped)
+    for candidate in candidates:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end <= start:
+            continue
+        try:
+            value = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    # Say which problem it was, so a person can see what the model did wrong.
+    if "{" not in stripped:
         raise QaError("The model answer did not hold a JSON object")
-    try:
-        value = json.loads(stripped[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise QaError(f"The model answer is not valid JSON: {exc.msg}") from exc
-    if not isinstance(value, dict):
-        raise QaError("The model answer must be a JSON object")
-    return value
+    raise QaError("The model answer is not valid JSON")
 
 
 _DENIED_COMMAND_WORDS = (
@@ -1892,11 +2062,18 @@ def review_generated_case(case: QaCase) -> tuple[str, ...]:
     return tuple(warnings)
 
 
-def parse_generated_cases(text: str, existing_ids: Iterable[str] = ()) -> list[dict[str, Any]]:
+def parse_generated_cases(
+    text: str,
+    existing_ids: Iterable[str] = (),
+    extra_kinds: Mapping[str, CheckKind] | None = None,
+) -> list[dict[str, Any]]:
     """Turn a model answer into validated candidate cases with warnings attached."""
 
     body = _json_object(text)
     raw = body.get("cases")
+    if raw is None and body.get("kind"):
+        # A model sometimes answers with one case instead of a list of them.
+        raw = [body]
     if not isinstance(raw, list):
         raise QaError("The model answer must hold a \"cases\" list")
     if not raw:
@@ -1907,7 +2084,7 @@ def parse_generated_cases(text: str, existing_ids: Iterable[str] = ()) -> list[d
     seen: set[str] = set()
     candidates: list[dict[str, Any]] = []
     for index, item in enumerate(raw):
-        case = _parse_case(item, index, seen)
+        case = _parse_case(item, index, seen, extra_kinds)
         if case.id in taken:
             raise QaError(f"The model reused an existing case id: {case.id}")
         candidates.append({"case": case.to_dict(), "warnings": list(review_generated_case(case))})

@@ -53,6 +53,16 @@ class Changes:
         return {"added": list(self.added), "changed": list(self.changed), "removed": list(self.removed)}
 
 
+@dataclass(frozen=True)
+class Wakeup:
+    """Why the watch stopped waiting."""
+
+    changes: Changes
+    # "changes" when files moved, "timer" when the repeat time came round,
+    # "nothing" when the wait gave up without either.
+    reason: str = "nothing"
+
+
 Snapshot = dict[str, tuple[int, int]]
 
 
@@ -140,24 +150,58 @@ class ProjectWatcher:
             self.sleep(self.interval_seconds)
         return collected
 
+    def wait_for_next(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        repeat_seconds: float | None = None,
+    ) -> Wakeup:
+        """Wait for files to change, or for the repeat time to come round.
+
+        With no repeat time this is just wait_for_changes. With one, the wait
+        also ends when that many seconds have passed with nothing happening,
+        which is how a plain timed run is asked for.
+        """
+
+        if repeat_seconds is None:
+            found = self.wait_for_changes(timeout_seconds)
+            return Wakeup(found, "changes" if found else "nothing")
+        if repeat_seconds <= 0:
+            raise HarnessError("The repeat time must be more than zero seconds")
+        due_at = self.clock() + float(repeat_seconds)
+        while not self.stopped:
+            remaining = due_at - self.clock()
+            slice_seconds = remaining if timeout_seconds is None else min(remaining, float(timeout_seconds))
+            found = self.wait_for_changes(max(0.0, slice_seconds))
+            if found:
+                return Wakeup(found, "changes")
+            if self.clock() >= due_at:
+                return Wakeup(Changes(), "timer")
+            if timeout_seconds is not None:
+                return Wakeup(Changes(), "nothing")
+        return Wakeup(Changes(), "nothing")
+
     def watch(
         self,
         on_change: Callable[[Changes], Any],
         *,
         max_batches: int | None = None,
         timeout_seconds: float | None = None,
+        repeat_seconds: float | None = None,
     ) -> int:
         """Call on_change for each settled batch. Returns how many batches ran."""
 
         batches = 0
         while not self.stopped and (max_batches is None or batches < max_batches):
-            found = self.wait_for_changes(timeout_seconds)
-            if not found:
+            wakeup = self.wait_for_next(
+                timeout_seconds=timeout_seconds, repeat_seconds=repeat_seconds
+            )
+            if wakeup.reason == "nothing":
                 if timeout_seconds is not None:
                     return batches
                 continue
             batches += 1
-            on_change(found)
+            on_change(wakeup.changes)
         return batches
 
 

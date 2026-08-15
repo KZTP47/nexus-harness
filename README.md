@@ -222,7 +222,8 @@ JUnit XML for a build server, or a self-contained HTML page. Evidence for every
 attempt is kept under `.harness/qa/runs`.
 
 `harness qa watch` runs them again every time you save, after waiting for the
-changes to settle. `harness qa generate` asks the configured model for new checks. Every proposal is
+changes to settle, and `--every 300` also runs them on a timer. A plugin can add
+a whole new kind of check, such as one that asks a database a question. `harness qa generate` asks the configured model for new checks. Every proposal is
 validated, carries plain-language warnings, and does nothing until you run
 `harness qa accept`.
 
@@ -298,6 +299,7 @@ Read [docs/SECURITY.md](docs/SECURITY.md) before running on an untrusted reposit
 ## More documentation
 
 - [Checks and the test lab](docs/QA.md)
+- [Plugins](docs/PLUGINS.md)
 - [Team notes: how the agents talk](docs/TEAM_NOTES.md)
 - [The desktop app](docs/DESKTOP.md)
 - [Source binding audit](docs/AUDIT.md)

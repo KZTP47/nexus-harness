@@ -203,6 +203,62 @@ class WaitingTests(WatcherTestCase):
         self.assertEqual(seen, [])
 
 
+class RepeatTests(WatcherTestCase):
+    """The timer is a plain schedule: run again even when nothing moved."""
+
+    def test_the_timer_wakes_the_watch_when_nothing_changed(self) -> None:
+        watcher = self.watcher(interval_seconds=1.0, quiet_seconds=1.0)
+        wakeup = watcher.wait_for_next(repeat_seconds=3.0)
+        self.assertEqual(wakeup.reason, "timer")
+        self.assertFalse(wakeup.changes)
+        self.assertGreaterEqual(self.time.now, 3.0)
+
+    def test_a_change_still_wins_over_the_timer(self) -> None:
+        watcher = self.watcher(interval_seconds=1.0, quiet_seconds=1.0)
+        original_poll = watcher.poll
+        steps = {"count": 0}
+
+        def poll_with_edit() -> Changes:
+            steps["count"] += 1
+            if steps["count"] == 1:
+                self.write("one.py", "1\n")
+            return original_poll()
+
+        watcher.poll = poll_with_edit  # type: ignore[method-assign]
+        wakeup = watcher.wait_for_next(repeat_seconds=60.0)
+        self.assertEqual(wakeup.reason, "changes")
+        self.assertEqual(wakeup.changes.added, ("one.py",))
+
+    def test_watch_keeps_running_on_the_timer(self) -> None:
+        watcher = self.watcher(interval_seconds=1.0, quiet_seconds=1.0)
+        seen: list[Changes] = []
+        batches = watcher.watch(seen.append, max_batches=3, repeat_seconds=2.0)
+        self.assertEqual(batches, 3)
+        self.assertEqual([bool(item) for item in seen], [False, False, False])
+
+    def test_no_repeat_time_behaves_as_before(self) -> None:
+        watcher = self.watcher()
+        wakeup = watcher.wait_for_next(timeout_seconds=2.0)
+        self.assertEqual(wakeup.reason, "nothing")
+
+    def test_a_repeat_time_of_zero_or_less_is_refused(self) -> None:
+        watcher = self.watcher()
+        for value in (0, -5):
+            with self.subTest(value=value), self.assertRaises(HarnessError):
+                watcher.wait_for_next(repeat_seconds=value)
+
+    def test_stopping_ends_a_timed_watch(self) -> None:
+        watcher = self.watcher()
+        original_poll = watcher.poll
+
+        def poll_then_stop() -> Changes:
+            watcher.stop()
+            return original_poll()
+
+        watcher.poll = poll_then_stop  # type: ignore[method-assign]
+        self.assertEqual(watcher.wait_for_next(repeat_seconds=60.0).reason, "nothing")
+
+
 class CommandLineTests(WatcherTestCase):
     def run_cli(self, *arguments: str) -> tuple[int, str]:
         from contextlib import redirect_stdout
@@ -226,7 +282,17 @@ class CommandLineTests(WatcherTestCase):
         self.assertIn("Watching", output)
         self.assertIn("will run each time", output)
         self.assertIn("All checks passed", output)
-        self.assertIn("Stopped after 0 changes", output)
+        self.assertIn("Stopped after 0 runs", output)
+
+    def test_watch_can_also_run_on_a_timer(self) -> None:
+        self.run_cli("init")
+        code, output = self.run_cli(
+            "watch", "--every", "0.1", "--max-runs", "1", "--interval", "0.05", "--quiet", "0.05"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("every 0.1 seconds", output)
+        self.assertIn("running on the timer", output)
+        self.assertIn("Stopped after 1 run.", output)
 
     def test_watch_can_wait_before_its_first_run(self) -> None:
         self.run_cli("init")
