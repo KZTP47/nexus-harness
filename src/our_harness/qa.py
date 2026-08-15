@@ -1231,11 +1231,18 @@ async function runStep(page, step) {
       if (await target.count()) {
         // A box the user types into holds its text as a value, not as page text.
         const tag = await target.evaluate((node) => node.tagName.toLowerCase());
-        seen = (tag === 'input' || tag === 'textarea' || tag === 'select'
-          ? await target.inputValue()
-          : await target.innerText()) || '';
+        if (tag === 'input' || tag === 'textarea' || tag === 'select') {
+          seen = (await target.inputValue()) || '';
+          if (seen.includes(step.text)) return;
+        } else {
+          // Styling can change the letters on screen, for example by making
+          // them all capitals. Accept the written text or the shown text.
+          const shown = (await target.innerText()) || '';
+          const written = (await target.textContent()) || '';
+          seen = shown;
+          if (shown.includes(step.text) || written.includes(step.text)) return;
+        }
       }
-      if (seen.includes(step.text)) return;
       await page.waitForTimeout(100);
     }
     throw new Error('expected to read "' + step.text + '" but the page shows "' + seen.slice(0, 120) + '"');

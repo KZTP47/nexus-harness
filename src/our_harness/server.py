@@ -23,6 +23,7 @@ from .graphs import migrate_graph, resolve_graph_execution_policy, resolve_workf
 from .memory import MemoryStore
 from .models import HarnessError
 from .plugins import load_plugins
+from .provider_help import setup_advice
 from .providers import ProviderRegistry
 from .workflow import HarnessApplication
 
@@ -464,6 +465,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
             except HarnessError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
+            query = urllib.parse.parse_qs(parsed.query)
             if parsed.path == "/api/qa/suite":
                 self._json(self._qa_suite())
             elif parsed.path == "/api/qa/history":
@@ -474,7 +476,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/qa/result":
                 self._json({"result": self.server.qa_result, "running": self.server.qa_lock.locked()})
             else:
-                self._json(self._checkup())
+                refresh = query.get("refresh", [""])[0] == "1"
+                self._json({
+                    **self._checkup(),
+                    "model_setup": setup_advice(self.server.config, refresh=refresh),
+                })
         elif parsed.path == "/api/health":
             self._json({"status": "ok"})
         elif parsed.path == "/favicon.ico":

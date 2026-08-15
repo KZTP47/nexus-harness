@@ -543,9 +543,9 @@ let checkup = null;
 let qaSuite = {present: false, cases: [], tags: []};
 let qaResult = null;
 
-async function refreshCheckup() {
+async function refreshCheckup(fresh = false) {
   try {
-    checkup = await request("/api/checkup");
+    checkup = await request(`/api/checkup${fresh ? "?refresh=1" : ""}`);
     renderCheckup();
   } catch (error) { showError(error.message); }
 }
@@ -572,8 +572,37 @@ function renderCheckup() {
       button.addEventListener("click", createSuite);
       item.append(button);
     }
+    if (step.id === "provider") item.append(modelSetup());
     list.append(item);
   }
+}
+
+function modelSetup() {
+  const advice = checkup?.model_setup;
+  const box = make("details", "model-setup");
+  if (!advice) return box;
+  box.open = !checkup.steps.find((step) => step.id === "provider")?.done;
+  box.append(make("summary", "", "Ways to connect a model"));
+  box.append(make("p", "", advice.headline));
+  const list = make("ul", "model-list");
+  for (const option of advice.options) {
+    const item = make("li", `model-option ${option.state === "ready" ? "ready" : "todo"}`);
+    const head = make("p", "model-head");
+    head.append(
+      make("span", "step-mark", option.state === "ready" ? "Ready" : "To do"),
+      make("strong", "", option.label),
+      make("span", "", option.in_use ? " (this project uses it)" : "")
+    );
+    item.append(head, make("p", "", option.summary), make("p", "field-help", `${option.reason} ${option.cost}`));
+    if (option.steps.length) {
+      const steps = make("ol", "model-steps");
+      for (const line of option.steps) steps.append(make("li", "", line));
+      item.append(steps);
+    }
+    list.append(item);
+  }
+  box.append(list, make("p", "field-help", advice.note));
+  return box;
 }
 
 async function quickRun() {
@@ -821,7 +850,7 @@ function bindEvents() {
   $("agentDialog").addEventListener("close", () => dialogInvoker?.focus?.());
   ["nodeLabel", "nodeProvider", "nodeModel", "nodeRoleName", "nodePrompt", "nodeRole", "mergeSlots", "mergeOutput"].forEach((id) => $(id).addEventListener("change", updateSelectedNode)); $("nodeCapabilities").addEventListener("change", updateSelectedNode); $("nodeAgentRef").addEventListener("change", () => { applyAgentAssignment($("nodeAgentRef"), $("nodeProvider"), $("nodeModel"), $("nodeRoleName"), $("nodeCapabilities")); updateSelectedNode(); });
   ["edgeMode", "edgeCondition", "edgeVariables", "edgeTargetSlot", "edgeReturnFields", "maxIterations", "temperatureDecay", "loopTimeout"].forEach((id) => $(id).addEventListener("change", updateSelectedEdge)); $("deleteNode").addEventListener("click", () => selected?.kind === "node" && removeNode(selected.id)); $("deleteEdge").addEventListener("click", () => selected?.kind === "edge" && removeEdge(selected.id));
-  $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", refreshCheckup); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
+  $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
   $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("refreshUnstable").addEventListener("click", refreshUnstable); $("checkTag").addEventListener("change", renderChecks);
   $("refreshMemory").addEventListener("click", refreshMemory); $("memoryQuery").addEventListener("change", refreshMemory); $("memoryKind").addEventListener("change", refreshMemory); $("refreshPrompts").addEventListener("click", refreshPrompts); $("promptLeft").addEventListener("change", renderPromptCompare); $("promptRight").addEventListener("change", renderPromptCompare);

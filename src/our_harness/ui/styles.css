@@ -167,6 +167,15 @@ th { position: sticky; top: 0; background: var(--panel-strong); }
 .status-skipped::before { content: "-"; }
 .metric-good::before { content: "OK "; }
 .metric-bad::before { content: "X "; }
+.model-setup { margin-top: 12px; }
+.model-setup > summary { margin-bottom: 8px; }
+.model-list { display: grid; gap: 10px; margin: 10px 0 0; padding: 0; list-style: none; }
+.model-option { padding: 10px 12px; border: 1px solid var(--line); border-left: 4px solid var(--yellow); border-radius: 10px; background: rgba(1,15,21,.45); }
+.model-option.ready { border-left-color: var(--green); }
+.model-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 6px; }
+.model-option p { margin: 0 0 4px; }
+.model-steps { margin: 8px 0 0; padding-left: 20px; color: var(--muted); font-size: .88rem; }
+.model-steps li { margin: 4px 0; overflow-wrap: anywhere; }
 .history-list { display: grid; gap: 12px; margin: 12px 0; }
 .history-run { padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(1,15,21,.45); }
 .history-run h3 { margin: 0; font-size: 1rem; overflow-wrap: anywhere; }

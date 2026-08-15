@@ -258,7 +258,10 @@ harness ui
 ```
 
 It opens on **Start here**, which lists the few steps left before the project is
-ready, and lets you ask for a change in your own words. **Checks** runs the test
+ready, and lets you ask for a change in your own words. If no model is connected
+yet, that screen lists every way of connecting one, says which are already
+working on this machine, and gives the exact commands for the rest. A key is
+never typed into the page and never saved in the project. **Checks** runs the test
 lab and shows unstable checks. **History** draws each past run as a row of bars,
 one per step, so you can see where the time went and which step failed.
 **Workflow** is the graph editor for later, once you want to rewire the agents

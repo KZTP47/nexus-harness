@@ -490,6 +490,64 @@
         "max_failed_requests": 0,
         "max_accessibility_problems": 0
       }
+    },
+    {
+      "id": "model-setup-help",
+      "title": "The first screen explains how to connect a model",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "expect_visible",
+          "target": ".model-setup"
+        },
+        {
+          "do": "expect_text",
+          "target": ".model-setup",
+          "text": "Ollama on this machine"
+        },
+        {
+          "do": "expect_text",
+          "target": ".model-option .step-mark",
+          "text": "To do",
+          "note": "Each way says whether it is ready in words, not only colour"
+        },
+        {
+          "do": "expect_text",
+          "target": ".model-setup",
+          "text": "Never paste a key into this page"
+        },
+        {
+          "do": "expect_text",
+          "target": ".model-steps",
+          "text": "ollama pull",
+          "note": "It gives the exact command to run"
+        },
+        {
+          "do": "click",
+          "target": "#refreshCheckup",
+          "note": "Check again asks for a fresh look"
+        },
+        {
+          "do": "expect_visible",
+          "target": ".model-setup"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0,
+        "body_not_contains": [
+          "Enter your key",
+          "Paste your key"
+        ]
+      }
     }
   ]
 }
