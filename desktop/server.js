@@ -42,6 +42,33 @@ function readReadyLine(text) {
   return null;
 }
 
+// The window may show this machine's harness, or one of the app's own pages.
+// Both sides are decoded before comparing, because a folder name with a space
+// in it arrives as %20 and would otherwise never match.
+function isOwnPage(candidate, pagesFolderUrl) {
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch (error) {
+    return false;
+  }
+  if (parsed.protocol !== "file:") return false;
+  let folder;
+  try {
+    folder = decodeURIComponent(String(pagesFolderUrl));
+  } catch (error) {
+    return false;
+  }
+  let target;
+  try {
+    target = decodeURIComponent(parsed.href);
+  } catch (error) {
+    return false;
+  }
+  if (!folder.endsWith("/")) folder += "/";
+  return target.startsWith(folder) && !target.slice(folder.length).includes("..");
+}
+
 function isLoopbackUrl(candidate) {
   let parsed;
   try {
@@ -166,4 +193,4 @@ class HarnessServer {
   }
 }
 
-module.exports = { HarnessServer, pythonCandidates, readReadyLine, isLoopbackUrl, READY_MARKER };
+module.exports = { HarnessServer, pythonCandidates, readReadyLine, isLoopbackUrl, isOwnPage, READY_MARKER };

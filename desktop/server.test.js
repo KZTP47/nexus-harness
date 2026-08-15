@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const { EventEmitter } = require("node:events");
 
-const { HarnessServer, readReadyLine, isLoopbackUrl, pythonCandidates } = require("./server");
+const { HarnessServer, readReadyLine, isLoopbackUrl, isOwnPage, pythonCandidates } = require("./server");
 
 function fakeChild() {
   const child = new EventEmitter();
@@ -135,4 +135,22 @@ test("the kept log stays short", async () => {
   for (let index = 0; index < 500; index += 1) server.remember(`line ${index}`);
   assert.strictEqual(server.log.length, 200);
   assert.strictEqual(server.log.at(-1), "line 499");
+});
+
+test("the window may open this app's own pages", () => {
+  const folder = "file:///somewhere/My%20Work/desktop/pages/";
+  assert.ok(isOwnPage("file:///somewhere/My%20Work/desktop/pages/help.html", folder));
+  assert.ok(isOwnPage("file:///somewhere/My Work/desktop/pages/help.html", folder),
+    "a folder name with a space must still match");
+  assert.ok(isOwnPage("file:///somewhere/My%20Work/desktop/pages/problem.html?title=x", folder));
+});
+
+test("the window may not open anything outside its pages folder", () => {
+  const folder = "file:///somewhere/My%20Work/desktop/pages/";
+  assert.ok(!isOwnPage("file:///other-place/secret.ini", folder));
+  assert.ok(!isOwnPage("file:///somewhere/My%20Work/desktop/main.js", folder));
+  assert.ok(!isOwnPage("file:///somewhere/My%20Work/desktop/pages/../main.js", folder));
+  assert.ok(!isOwnPage("https://example.com/", folder));
+  assert.ok(!isOwnPage("not a url", folder));
+  assert.ok(!isOwnPage("file:///somewhere/My%20Work/desktop/pages/%ZZ", folder));
 });

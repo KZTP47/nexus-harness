@@ -9,6 +9,7 @@ const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
 
+// Exported for the matcher tests below.
 const PACKAGE = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
 const SHIPPED = PACKAGE.build.files;
 
@@ -17,13 +18,32 @@ function localRequires(file) {
   return [...source.matchAll(/require\(["'](\.[^"']+)["']\)/g)].map((match) => match[1]);
 }
 
+// electron-builder patterns: "*" stops at a slash, "**" crosses folders, and a
+// pattern starting with "!" takes a file back out again. A file counts as
+// shipped only when something lets it in and nothing takes it out, so an
+// excluded file is never reported as shipped.
+function matches(pattern, relative) {
+  const expression = pattern
+    .split(/(\*\*\/|\*\*|\*|\?)/)
+    .map((part) => {
+      if (part === "**/") return "(?:.*/)?";
+      if (part === "**") return ".*";
+      if (part === "*") return "[^/]*";
+      if (part === "?") return "[^/]";
+      return part.replace(/[.+^${}()|[\]]/g, (found) => "\\" + found);
+    })
+    .join("");
+  return new RegExp(`^${expression}$`).test(relative);
+}
+
 function shipped(relative) {
-  return SHIPPED.some((pattern) => {
-    if (pattern.startsWith("!")) return false;
-    if (pattern === relative) return true;
-    if (pattern.endsWith("/**")) return relative.startsWith(pattern.slice(0, -2));
-    return false;
-  });
+  const allowed = SHIPPED.filter((pattern) => !pattern.startsWith("!"));
+  const removed = SHIPPED.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
+  const letIn = allowed.some(
+    (pattern) => matches(pattern, relative) || (pattern.endsWith("/**") && relative.startsWith(pattern.slice(0, -2)))
+  );
+  const takenOut = removed.some((pattern) => matches(pattern, relative));
+  return letIn && !takenOut;
 }
 
 test("every local file the app loads is in the installer", () => {
@@ -88,4 +108,22 @@ test("test and smoke files stay out of the installer", () => {
   for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js"]) {
     assert.ok(!shipped(name), `${name} should not be shipped`);
   }
+});
+
+test("a file taken out by an exclusion is never called shipped", () => {
+  // A test file inside pages matches "pages/**" and is then taken back out by
+  // "!**/*.test.js". Reading only the first of those would call it shipped,
+  // which is how a file the app loads goes missing from the installer.
+  assert.ok(!shipped("pages/welcome.test.js"), "an excluded page test must not count as shipped");
+  assert.ok(shipped("pages/welcome.js"), "a real page script must count as shipped");
+  assert.ok(shipped("pages/welcome.html"), "a real page must count as shipped");
+});
+
+test("the pattern matcher treats stars the way the builder does", () => {
+  assert.ok(matches("pages/*.js", "pages/welcome.js"));
+  assert.ok(!matches("pages/*.js", "pages/deep/welcome.js"), "one star must not cross a folder");
+  assert.ok(matches("pages/**", "pages/deep/welcome.js"), "two stars must cross folders");
+  assert.ok(matches("**/*.test.js", "server.test.js"), "a leading two stars must also match no folder");
+  assert.ok(matches("**/*.test.js", "pages/deep/a.test.js"));
+  assert.ok(!matches("**/*.test.js", "server.js"));
 });

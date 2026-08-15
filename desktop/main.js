@@ -8,7 +8,7 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron")
 const fs = require("node:fs");
 const path = require("node:path");
 
-const { HarnessServer, isLoopbackUrl } = require("./server");
+const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
 
 const server = new HarnessServer({ onExit: (code) => reportServerStopped(code) });
 let window = null;
@@ -84,7 +84,7 @@ async function openProject(chosen) {
 }
 
 function allowedTarget(candidate) {
-  return isLoopbackUrl(candidate) || candidate.startsWith(`file://${path.join(__dirname, "pages").split(path.sep).join("/")}`);
+  return isLoopbackUrl(candidate) || isOwnPage(candidate, pageUrl(""));
 }
 
 function createWindow() {
@@ -191,9 +191,21 @@ app.whenReady().then(async () => {
   // window is on screen blocks with nothing to look at.
   showPage("welcome.html");
   await new Promise((resolve) => {
-    if (!window || window.isVisible()) resolve();
-    else window.once("ready-to-show", resolve);
+    if (!window || window.isVisible()) {
+      resolve();
+      return;
+    }
+    // Resolve on whichever comes first. Waiting only for ready-to-show would
+    // hang for good if the user closed the window before it finished loading.
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(done, 10000);
+    window.once("ready-to-show", done);
+    window.once("closed", done);
   });
+  if (!window || window.isDestroyed()) return;
 
   const remembered = readSettings().lastProject;
   if (remembered && fs.existsSync(remembered)) {
