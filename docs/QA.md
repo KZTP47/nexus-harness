@@ -167,6 +167,32 @@ everything passed or was skipped, and 1 when anything failed.
 Evidence for each attempt goes to `.harness/qa/runs/<run id>/`. The last
 `qa.keep_runs` runs are kept and older ones are removed.
 
+## Running again whenever you save
+
+```bash
+harness qa watch
+harness qa watch --tag fast
+```
+
+It runs the checks once, then watches the project. When a file changes it waits
+half a second for the changes to settle, prints what moved, and runs the checks
+again. Press Ctrl+C to stop.
+
+Only the size and modified time of each file are read, never the contents, and
+the same ignore rules the rest of the harness uses decide what is watched, so a
+`node_modules` folder or the harness' own `.harness` folder never sets it off.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--interval` | `1.0` | Seconds between looks at the project. |
+| `--quiet` | `0.5` | Seconds of stillness before a run starts. |
+| `--tag` | none | Only run cases with this tag. May repeat. |
+| `--skip-first` | off | Wait for a change before the first run. |
+| `--max-runs` | none | Stop after this many change batches. |
+
+A save that writes several files in a row counts as one change, so the checks
+run once, not once per file.
+
 ## Retries and unstable checks
 
 `retries` lets a case try again. A case that fails and then passes is reported

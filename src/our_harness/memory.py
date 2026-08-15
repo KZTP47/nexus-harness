@@ -804,6 +804,61 @@ class MemoryStore:
         rows = self.connection.execute("SELECT * FROM events WHERE run_id=? ORDER BY sequence", (run_id,)).fetchall()
         return [{**dict(row), "payload": json.loads(row["payload_json"])} for row in rows]
 
+    def run_timeline(self, limit: int = 10, per_run_steps: int = 200) -> list[dict[str, Any]]:
+        """Recent runs and what each step of them did, newest run first.
+
+        A step starts when a node reports it began and ends at the next event
+        for that node, so the reader can see where the time went without
+        reading the whole event log.
+        """
+
+        # Start times are whole seconds, so several runs can share one. The
+        # insertion order breaks the tie and keeps "newest first" true.
+        runs = self.connection.execute(
+            "SELECT id,task,state,started_at,updated_at FROM runs "
+            "ORDER BY started_at DESC, rowid DESC LIMIT ?",
+            (max(1, min(int(limit), 100)),),
+        ).fetchall()
+        step_cap = max(1, min(int(per_run_steps), 1000))
+        timeline: list[dict[str, Any]] = []
+        for run in runs:
+            rows = self.connection.execute(
+                "SELECT kind,node_id,created_at FROM events WHERE run_id=? ORDER BY sequence LIMIT ?",
+                (run["id"], step_cap),
+            ).fetchall()
+            steps: list[dict[str, Any]] = []
+            open_step: dict[str, Any] | None = None
+            for row in rows:
+                node = str(row["node_id"] or "")
+                moment = float(row["created_at"] or 0.0)
+                if open_step is not None and (node != open_step["node"] or row["kind"] == "node_start"):
+                    open_step["ended_at"] = moment
+                    open_step["duration_ms"] = max(0, int((moment - open_step["started_at"]) * 1000))
+                    steps.append(open_step)
+                    open_step = None
+                if open_step is None and node:
+                    open_step = {"node": node, "started_at": moment, "ended_at": moment, "duration_ms": 0, "result": ""}
+                if open_step is not None:
+                    if row["kind"] in ("failure", "run_error"):
+                        open_step["result"] = "failed"
+                    elif not open_step["result"] and row["kind"] in ("success", "node_end"):
+                        open_step["result"] = "passed"
+            if open_step is not None:
+                open_step["ended_at"] = float(run["updated_at"] or open_step["started_at"])
+                open_step["duration_ms"] = max(0, int((open_step["ended_at"] - open_step["started_at"]) * 1000))
+                steps.append(open_step)
+            started = float(run["started_at"] or 0.0)
+            finished = float(run["updated_at"] or started)
+            timeline.append({
+                "run_id": run["id"],
+                "task": run["task"],
+                "state": run["state"],
+                "started_at": started,
+                "duration_ms": max(0, int((finished - started) * 1000)),
+                "steps": steps,
+            })
+        return timeline
+
     def agent_conversation(self, run_id: str = "", limit: int = 200) -> list[dict[str, Any]]:
         """Every note the agents wrote, newest run first when no run is named."""
 

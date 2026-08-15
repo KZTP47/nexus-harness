@@ -419,6 +419,91 @@ class DurableTests(unittest.TestCase):
             connection.close()
 
 
+class TimelineTests(unittest.TestCase):
+    """The history view needs a step list a person can read."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name).resolve()
+        (self.root / ".harness").mkdir()
+        self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        self.addCleanup(self.temporary.cleanup)
+
+    def test_each_visit_to_a_node_becomes_its_own_step(self) -> None:
+        with MemoryStore(self.config) as memory:
+            run = memory.start_run("Set VALUE to 2")
+            for kind, node in (
+                ("node_start", "planner"), ("success", "planner"),
+                ("node_start", "coder"), ("failure", "coder"),
+                ("node_start", "coder"), ("success", "coder"),
+                ("node_start", "reviewer"), ("success", "reviewer"),
+            ):
+                memory.append_event(run, kind, node, {})
+            timeline = memory.run_timeline()
+        self.assertEqual(len(timeline), 1)
+        steps = timeline[0]["steps"]
+        self.assertEqual([step["node"] for step in steps], ["planner", "coder", "coder", "reviewer"])
+        self.assertEqual([step["result"] for step in steps], ["passed", "failed", "passed", "passed"])
+        self.assertEqual(timeline[0]["task"], "Set VALUE to 2")
+
+    def test_newest_runs_come_first_and_the_count_is_capped(self) -> None:
+        with MemoryStore(self.config) as memory:
+            for index in range(4):
+                run = memory.start_run(f"task {index}")
+                memory.append_event(run, "node_start", "planner", {})
+            timeline = memory.run_timeline(limit=2)
+        self.assertEqual(len(timeline), 2)
+        self.assertEqual([item["task"] for item in timeline], ["task 3", "task 2"])
+
+    def test_a_run_with_no_events_still_appears(self) -> None:
+        with MemoryStore(self.config) as memory:
+            memory.start_run("nothing happened")
+            timeline = memory.run_timeline()
+        self.assertEqual(timeline[0]["steps"], [])
+        self.assertEqual(timeline[0]["task"], "nothing happened")
+
+    def test_durations_are_never_negative(self) -> None:
+        with MemoryStore(self.config) as memory:
+            run = memory.start_run("demo")
+            memory.append_event(run, "node_start", "planner", {})
+            memory.connection.execute("UPDATE runs SET updated_at=0 WHERE id=?", (run,))
+            timeline = memory.run_timeline()
+        self.assertGreaterEqual(timeline[0]["steps"][0]["duration_ms"], 0)
+        self.assertGreaterEqual(timeline[0]["duration_ms"], 0)
+
+    def test_the_control_panel_serves_the_timeline(self) -> None:
+        import http.client
+        import threading
+
+        from our_harness.server import HarnessHTTPServer
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["ui"].update({"host": "127.0.0.1", "port": 0, "open_browser": False})
+        config = LoadedConfig(data, self.root, [], {})
+        with MemoryStore(config) as memory:
+            run = memory.start_run("Set VALUE to 2")
+            memory.append_event(run, "node_start", "planner", {})
+        server = HarnessHTTPServer(("127.0.0.1", 0), config)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+        try:
+            connection.request("GET", "/api/timeline", headers={
+                "Host": f"127.0.0.1:{server.server_port}", "X-Harness-Token": server.token,
+            })
+            answer = connection.getresponse()
+            body = json.loads(answer.read())
+            self.assertEqual(answer.status, 200)
+            self.assertEqual(body["runs"][0]["task"], "Set VALUE to 2")
+
+            connection.request("GET", "/api/timeline", headers={"Host": f"127.0.0.1:{server.server_port}"})
+            self.assertEqual(connection.getresponse().status, 400)
+        finally:
+            connection.close()
+
+
 class EndToEndTests(unittest.TestCase):
     """One real run in which the planner writes a note and the coder reads it."""
 

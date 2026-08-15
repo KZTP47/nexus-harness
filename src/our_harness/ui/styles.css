@@ -167,6 +167,19 @@ th { position: sticky; top: 0; background: var(--panel-strong); }
 .status-skipped::before { content: "-"; }
 .metric-good::before { content: "OK "; }
 .metric-bad::before { content: "X "; }
+.history-list { display: grid; gap: 12px; margin: 12px 0; }
+.history-run { padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(1,15,21,.45); }
+.history-run h3 { margin: 0; font-size: 1rem; overflow-wrap: anywhere; }
+.history-run p { margin: 4px 0 0; }
+.history-bars { display: grid; gap: 6px; margin: 10px 0 0; padding: 0; list-style: none; }
+.history-bar { display: grid; grid-template-columns: minmax(90px, 140px) 1fr auto; gap: 10px; align-items: center; }
+.bar-name { font-weight: 650; overflow-wrap: anywhere; }
+.bar-time { color: var(--muted); font-size: .82rem; font-variant-numeric: tabular-nums; }
+.history-bar .bar { display: block; min-width: 4px; height: 14px; border-radius: 7px; background: var(--cyan); }
+.history-bar .bar.passed { background: var(--green); }
+.history-bar .bar.failed { background: var(--red); }
+.history-bar .bar.unknown { background: var(--line); }
+.empty-state { color: var(--muted); }
 .team-board { display: grid; gap: 8px; max-height: 300px; overflow: auto; margin: 10px 0 0; padding: 0; list-style: none; }
 .team-note { padding: 9px 11px; border: 1px solid var(--line); border-left: 4px solid var(--cyan); border-radius: 10px; background: rgba(1,15,21,.55); }
 .team-note p { margin: 0; }

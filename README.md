@@ -77,6 +77,7 @@ harness test [--lint] [--build]     Run configured project checks
 harness qa init                     Write a starter check suite from detected commands
 harness qa list                     Show every check in the suite
 harness qa run [--tag|--case ...]   Run the checks side by side and report
+harness qa watch                    Run the checks again whenever a file changes
 harness qa flaky                    Name checks whose result keeps changing
 harness qa generate|candidates      Ask a model for new checks and read them back
 harness qa accept|reject <id> ...   Decide on a proposed check
@@ -219,7 +220,8 @@ whose result keeps changing across runs. Reports come out as Markdown, JSON,
 JUnit XML for a build server, or a self-contained HTML page. Evidence for every
 attempt is kept under `.harness/qa/runs`.
 
-`harness qa generate` asks the configured model for new checks. Every proposal is
+`harness qa watch` runs them again every time you save, after waiting for the
+changes to settle. `harness qa generate` asks the configured model for new checks. Every proposal is
 validated, carries plain-language warnings, and does nothing until you run
 `harness qa accept`.
 
@@ -257,9 +259,10 @@ harness ui
 
 It opens on **Start here**, which lists the few steps left before the project is
 ready, and lets you ask for a change in your own words. **Checks** runs the test
-lab and shows unstable checks. **Workflow** is the graph editor for later, once
-you want to rewire the agents yourself. **Memory** and **Prompt history** show
-what the harness has learnt.
+lab and shows unstable checks. **History** draws each past run as a row of bars,
+one per step, so you can see where the time went and which step failed.
+**Workflow** is the graph editor for later, once you want to rewire the agents
+yourself. **Memory** and **Prompt history** show what the harness has learnt.
 
 There is also a desktop window that starts the server for you and closes it
 again on quit. See [docs/DESKTOP.md](docs/DESKTOP.md).

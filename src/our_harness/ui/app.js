@@ -535,7 +535,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") refreshChecks(); if (name === "workflow") { fitGraph(); refreshTeamNotes(); } }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") refreshChecks(); if (name === "workflow") { fitGraph(); refreshTeamNotes(); } if (name === "history") refreshHistory(); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -695,6 +695,60 @@ async function refreshUnstable() {
   } catch (error) { showError(error.message); }
 }
 
+/* ---- History: what past runs did, step by step ---- */
+
+let historyRuns = [];
+
+async function refreshHistory() {
+  try {
+    const answer = await request("/api/timeline?limit=10");
+    historyRuns = answer.runs || [];
+    renderHistory();
+  } catch (error) { showError(error.message); }
+}
+
+function renderHistory() {
+  const list = $("historyList");
+  const body = $("historyBody");
+  list.replaceChildren();
+  body.replaceChildren();
+  if (!historyRuns.length) {
+    list.append(make("p", "empty-state", "No runs yet. Start one from the Start here tab and it will appear here."));
+    return;
+  }
+  for (const run of historyRuns) {
+    const card = make("article", "history-run");
+    const heading = make("h3", "", run.task || run.run_id);
+    const longest = Math.max(1, ...run.steps.map((step) => step.duration_ms || 0));
+    card.append(heading, make("p", "field-help", `${run.steps.length} step${run.steps.length === 1 ? "" : "s"}, ${Math.round((run.duration_ms || 0) / 1000)} seconds in total`));
+    const bars = make("ol", "history-bars");
+    for (const step of run.steps) {
+      const item = make("li", "history-bar");
+      const width = Math.max(4, Math.round(((step.duration_ms || 0) / longest) * 100));
+      const bar = make("span", `bar ${step.result || "unknown"}`);
+      bar.style.width = `${width}%`;
+      const seconds = Math.round((step.duration_ms || 0) / 1000);
+      const outcome = step.result === "failed" ? "failed" : step.result === "passed" ? "passed" : "no result recorded";
+      // The bar says everything by its width and colour. Spell the same thing
+      // out for anyone reading with a screen reader.
+      bar.setAttribute("role", "img");
+      bar.setAttribute("aria-label", `${step.node} ${outcome} after ${seconds} seconds`);
+      item.append(make("span", "bar-name", step.node), bar, make("span", "bar-time", `${seconds} s`));
+      bars.append(item);
+      const row = document.createElement("tr");
+      row.append(
+        make("td", "", run.task || run.run_id),
+        make("td", "", step.node),
+        make("td", `status-${step.result === "failed" ? "failed" : step.result === "passed" ? "passed" : "skipped"}`, step.result || "no result"),
+        make("td", "", `${seconds} s`)
+      );
+      body.append(row);
+    }
+    card.append(bars);
+    list.append(card);
+  }
+}
+
 /* ---- Team notes: what the agents told each other ---- */
 
 let teamNotes = [];
@@ -767,7 +821,7 @@ function bindEvents() {
   $("agentDialog").addEventListener("close", () => dialogInvoker?.focus?.());
   ["nodeLabel", "nodeProvider", "nodeModel", "nodeRoleName", "nodePrompt", "nodeRole", "mergeSlots", "mergeOutput"].forEach((id) => $(id).addEventListener("change", updateSelectedNode)); $("nodeCapabilities").addEventListener("change", updateSelectedNode); $("nodeAgentRef").addEventListener("change", () => { applyAgentAssignment($("nodeAgentRef"), $("nodeProvider"), $("nodeModel"), $("nodeRoleName"), $("nodeCapabilities")); updateSelectedNode(); });
   ["edgeMode", "edgeCondition", "edgeVariables", "edgeTargetSlot", "edgeReturnFields", "maxIterations", "temperatureDecay", "loopTimeout"].forEach((id) => $(id).addEventListener("change", updateSelectedEdge)); $("deleteNode").addEventListener("click", () => selected?.kind === "node" && removeNode(selected.id)); $("deleteEdge").addEventListener("click", () => selected?.kind === "edge" && removeEdge(selected.id));
-  $("refreshCheckup").addEventListener("click", refreshCheckup); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
+  $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", refreshCheckup); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
   $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("refreshUnstable").addEventListener("click", refreshUnstable); $("checkTag").addEventListener("change", renderChecks);
   $("refreshMemory").addEventListener("click", refreshMemory); $("memoryQuery").addEventListener("change", refreshMemory); $("memoryKind").addEventListener("change", refreshMemory); $("refreshPrompts").addEventListener("click", refreshPrompts); $("promptLeft").addEventListener("change", renderPromptCompare); $("promptRight").addEventListener("change", renderPromptCompare);

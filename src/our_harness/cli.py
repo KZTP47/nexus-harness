@@ -27,6 +27,7 @@ from .context import ContextCompiler
 from .refinement import RefinementManager
 from .server import serve_ui
 from .safety import confined_path
+from .watcher import Changes, ProjectWatcher
 from .workflow import HarnessApplication
 from .resident import ResidentClient, start_daemon
 
@@ -467,6 +468,12 @@ def command_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+def _count(number: int, singular: str, plural: str = "") -> str:
+    """Say "1 check" or "3 checks" rather than "1 check(s)"."""
+
+    return f"{number} {singular if number == 1 else (plural or singular + 's')}"
+
+
 def _qa_write_report(config: LoadedConfig, result: qa.QaRunResult, args: argparse.Namespace) -> None:
     destination = getattr(args, "output", None)
     if not destination:
@@ -493,7 +500,7 @@ def command_qa(args: argparse.Namespace) -> int:
         if path.exists() and not args.force:
             raise HarnessError(f"A suite already exists at {path}. Use --force to replace it.")
         written = qa.write_suite(config, suite)
-        print(f"Wrote {len(suite.cases)} starter case(s) to {written}")
+        print(f"Wrote {_count(len(suite.cases), 'starter check')} to {written}")
         print("Edit that file, then run: harness qa run")
         return 0
 
@@ -502,7 +509,7 @@ def command_qa(args: argparse.Namespace) -> int:
         if args.json:
             _print_json(suite.to_dict())
             return 0
-        print(f"Suite {suite.name} holds {len(suite.cases)} case(s).")
+        print(f"Suite {suite.name} holds {_count(len(suite.cases), 'check')}.")
         for case in suite.cases:
             tags = f" [{', '.join(case.tags)}]" if case.tags else ""
             print(f"  {case.id} ({case.kind}){tags}: {case.title}")
@@ -526,6 +533,46 @@ def command_qa(args: argparse.Namespace) -> int:
         elif not args.output:
             print(qa.render_report(result, args.format))
         return 0 if result.passed else 1
+
+    if command == "watch":
+        suite = qa.load_suite(config, getattr(args, "suite", None))
+        runner = qa.QaRunner(config)
+        tags = args.tag or ()
+        chosen = runner.select(suite, tags=tags)
+        watcher = ProjectWatcher(
+            config,
+            interval_seconds=args.interval,
+            quiet_seconds=args.quiet,
+        )
+        print(f"Watching {config.project_root} for changes.")
+        print(f"{_count(len(chosen), 'check')} will run each time. Press Ctrl+C to stop.")
+
+        def run_once(changes: Changes | None = None) -> bool:
+            if changes is not None:
+                print(f"\n{changes.describe()}")
+            result = runner.run(suite, tags=tags, write_artifacts=not args.no_artifacts)
+            if not args.no_artifacts:
+                qa.record_history(config, result)
+            counts = result.counts
+            headline = "All checks passed" if result.passed else "Some checks failed"
+            print(f"{headline}: {counts['passed']} passed, {counts['failed']} failed, "
+                  f"{counts['flaky']} flaky, {counts['skipped']} skipped in {result.duration_ms} ms")
+            for case in result.cases:
+                if case.status == qa.STATUS_FAILED:
+                    print(f"  {case.id}: {case.reasons[0] if case.reasons else 'failed'}")
+            return result.passed
+
+        passed = run_once() if not args.skip_first else True
+        try:
+            batches = watcher.watch(
+                lambda changes: run_once(changes),
+                max_batches=args.max_runs,
+            )
+        except KeyboardInterrupt:
+            print("\nStopped watching.")
+            return 0 if passed else 1
+        print(f"\nStopped after {_count(batches, 'change')}.")
+        return 0
 
     if command == "flaky":
         report = qa.flaky_report(config)
@@ -565,7 +612,7 @@ def command_qa(args: argparse.Namespace) -> int:
         existing = [case.id for case in suite.cases] if suite else []
         candidates = qa.parse_generated_cases(response.text, existing)
         path = qa.save_candidates(config, candidates, source=str(config.get("provider.model")))
-        print(f"Saved {len(candidates)} proposed case(s) to {path}")
+        print(f"Saved {_count(len(candidates), 'proposed check')} to {path}")
         for item in candidates:
             case = item["case"]
             print(f"  {case['id']} ({case['kind']}): {case['title']}")
@@ -591,12 +638,12 @@ def command_qa(args: argparse.Namespace) -> int:
 
     if command == "accept":
         suite, accepted = qa.accept_candidates(config, args.case_id, suite_override=getattr(args, "suite", None))
-        print(f"Added {len(accepted)} case(s). The suite now holds {len(suite.cases)}.")
+        print(f"Added {_count(len(accepted), 'check')}. The suite now holds {len(suite.cases)}.")
         return 0
 
     if command == "reject":
         rejected = qa.reject_candidates(config, args.case_id)
-        print(f"Removed {len(rejected)} proposed case(s).")
+        print(f"Removed {_count(len(rejected), 'proposed check')}.")
         return 0
 
     raise HarnessError("QA command is required")
@@ -853,6 +900,15 @@ def parser() -> argparse.ArgumentParser:
     qa_run.add_argument("--output", help="Write the report to this project-relative file")
     qa_run.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
     qa_run.set_defaults(handler=command_qa)
+    qa_watch = qa_sub.add_parser("watch", help="Run the checks again whenever a project file changes")
+    qa_watch.add_argument("--suite", help="Suite file to read instead of the configured one")
+    qa_watch.add_argument("--tag", action="append", help="Only run cases with this tag; may repeat")
+    qa_watch.add_argument("--interval", type=float, default=1.0, help="Seconds between looks at the project")
+    qa_watch.add_argument("--quiet", type=float, default=0.5, help="Seconds of stillness before running")
+    qa_watch.add_argument("--max-runs", type=int, help="Stop after this many change batches")
+    qa_watch.add_argument("--skip-first", action="store_true", help="Wait for a change before the first run")
+    qa_watch.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
+    qa_watch.set_defaults(handler=command_qa)
     qa_flaky = qa_sub.add_parser("flaky", help="Name the cases whose result keeps changing")
     qa_flaky.add_argument("--json", action="store_true")
     qa_flaky.set_defaults(handler=command_qa)

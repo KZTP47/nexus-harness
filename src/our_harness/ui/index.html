@@ -23,6 +23,7 @@
     <button type="button" data-view="start" aria-pressed="true" title="Set up your project and ask for a change">Start here</button>
     <button type="button" data-view="checks" aria-pressed="false" title="Your tests: what a working project looks like">Checks</button>
     <button type="button" data-view="workflow" aria-pressed="false" title="For later: rewire the agents yourself">Workflow</button>
+    <button type="button" data-view="history" aria-pressed="false" title="What past runs did, step by step">History</button>
     <button type="button" data-view="memory" aria-pressed="false" title="What the harness has learnt about this project">Memory</button>
     <button type="button" data-view="prompts" aria-pressed="false" title="How the harness instructions changed over time">Prompt history</button>
   </nav>
@@ -220,6 +221,26 @@
       <section class="validation" aria-labelledby="validationTitle"><h2 id="validationTitle">Validation</h2><div id="validationStatus" role="status">Not checked.</div><ul id="issueList"></ul></section>
     </aside>
   </div>
+
+  <main id="historyView" data-view-panel="history" class="data-view" hidden>
+    <section class="glass data-panel" aria-labelledby="historyTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="historyTitle">What past runs did</h2>
+          <p>Each bar is one step. A longer bar took longer. Green passed, red failed, grey means nothing was recorded. The same steps are written out in the table below. Times are to the nearest second.</p>
+        </div>
+        <button id="refreshHistory" type="button">Refresh</button>
+      </div>
+      <div id="historyList" class="history-list"></div>
+      <div class="table-scroll">
+        <table>
+          <caption class="sr-only">Every step of the recent runs</caption>
+          <thead><tr><th scope="col">Run</th><th scope="col">Step</th><th scope="col">Result</th><th scope="col">Time</th></tr></thead>
+          <tbody id="historyBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
 
   <main id="memoryView" data-view-panel="memory" class="data-view" hidden>
     <section class="glass data-panel" aria-labelledby="memoryTitle"><div class="section-heading"><div><h2 id="memoryTitle">Shared memory</h2><p>Links show which agent wrote or read a record.</p></div><button id="refreshMemory" type="button">Refresh</button></div><div class="filter-row"><label for="memoryQuery">Filter</label><input id="memoryQuery" type="search"><label for="memoryKind">Kind</label><select id="memoryKind"><option value="">All</option><option value="episode">Episode</option><option value="document">Source</option><option value="prompt">Prompt</option></select></div><div id="memoryGraph" class="memory-map" role="img" aria-label="Memory provenance map"></div><div class="table-scroll"><table><thead><tr><th scope="col">Kind</th><th scope="col">Record</th><th scope="col">Summary</th><th scope="col">Provenance</th></tr></thead><tbody id="memoryBody"></tbody></table></div></section>

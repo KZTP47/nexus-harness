@@ -183,6 +183,18 @@
         },
         {
           "do": "click",
+          "target": "[data-view=\"history\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#workflowView"
+        },
+        {
+          "do": "click",
           "target": "[data-view=\"memory\"]"
         },
         {
@@ -191,7 +203,7 @@
         },
         {
           "do": "expect_hidden",
-          "target": "#workflowView"
+          "target": "#historyView"
         },
         {
           "do": "click",
@@ -426,6 +438,50 @@
           "target": "#teamCount",
           "text": "note",
           "note": "It states how many notes there are"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "history-view-shows-past-runs",
+      "title": "The history view opens and explains itself",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "history"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"history\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyView"
+        },
+        {
+          "do": "expect_text",
+          "target": "#historyTitle",
+          "text": "What past runs did"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyList"
+        },
+        {
+          "do": "click",
+          "target": "#refreshHistory"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyList"
         }
       ],
       "expect": {

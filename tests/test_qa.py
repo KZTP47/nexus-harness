@@ -672,7 +672,7 @@ class CommandLineTests(unittest.TestCase):
     def test_init_then_list_then_run(self) -> None:
         code, output = self.run_cli("init")
         self.assertEqual(code, 0)
-        self.assertIn("starter case", output)
+        self.assertIn("starter check", output)
         self.assertTrue((self.root / ".harness" / "qa" / "suite.json").is_file())
 
         code, output = self.run_cli("list")
