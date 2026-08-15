@@ -39,9 +39,11 @@ def run_sqlite_check(case, runner):
     query = str(case.field("query", ""))
     if not database or not query:
         raise QaError("A sqlite case needs both a database and a query")
-    if not query.lstrip().upper().startswith("SELECT"):
-        # A check reads. It never changes the thing it is checking.
-        raise QaError("A sqlite case may only run a SELECT query")
+    # A check reads. It never changes the thing it is checking. The read-only
+    # connection and the query_only setting below are what actually enforce
+    # that; this is a plain first refusal with a message a person can act on.
+    if not query.lstrip().upper().startswith(("SELECT", "WITH")):
+        raise QaError("A sqlite case may only run a SELECT query, or a WITH that ends in one")
 
     path = confined_path(runner.root, database, allow_missing=True)
     if not path.is_file():
@@ -53,8 +55,21 @@ def run_sqlite_check(case, runner):
         raise QaError(f"Cannot open {database}: {exc}") from exc
     try:
         connection.execute("PRAGMA query_only = ON")
+        # A plugin runs inside the harness, so nothing outside can stop a query
+        # that never ends. This asks SQLite to give up after a set amount of
+        # work, which a recursive query would otherwise sail past.
+        steps = {"count": 0}
+
+        def give_up_eventually() -> int:
+            steps["count"] += 1
+            return 1 if steps["count"] > 2000 else 0
+
+        connection.set_progress_handler(give_up_eventually, 10_000)
         rows = connection.execute(query).fetchmany(100)
+        connection.set_progress_handler(None, 0)
     except sqlite3.Error as exc:
+        if steps["count"] > 2000:
+            raise QaError("The query took too long and was stopped") from exc
         raise QaError(f"The query did not run: {exc}") from exc
     finally:
         connection.close()

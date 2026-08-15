@@ -87,6 +87,17 @@ Inside `run`:
   needs is not installed. A skipped check never fails the run.
 - Anything else your code raises is caught, and only your case fails.
 
+### Your plugin must stop itself
+
+A command check runs in its own process, so the harness can time it out and kill
+it. A plugin runs inside the harness, so nothing outside can stop it. A plugin
+that waits forever holds up the whole run.
+
+Bound your own work. The `timeout_seconds` on a case is yours to honour, through
+whatever the library you are calling offers: a timeout argument, a deadline, or
+a progress handler. The SQLite example asks SQLite to give up after a set amount
+of work, so a recursive query cannot hang the run.
+
 Your fields may not take a name the suite already owns, such as `id`, `title`,
 `tags`, `retries`, or `timeout_seconds`. Two plugins may not add the same kind
 name, and no plugin may replace a built-in kind. Every one of those mistakes is

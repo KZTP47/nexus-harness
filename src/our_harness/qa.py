@@ -535,7 +535,16 @@ def _plain_value(value: object, label: str) -> Any:
         for item in value:
             if isinstance(item, (dict, list)):
                 raise QaError(f"{label} must be a flat list, not a list holding lists or objects")
-        return [_plain_value(item, f"{label} entry") for item in value]
+        found = [_plain_value(item, f"{label} entry") for item in value]
+        # A hundred values that are each under the limit can still add up, so
+        # cap the whole list as well as each value in it.
+        total = sum(len(item) for item in found if isinstance(item, str))
+        if total > _MAX_PLUGIN_VALUE_CHARS:
+            raise QaError(
+                f"{label} holds {total} characters in total, more than the "
+                f"{_MAX_PLUGIN_VALUE_CHARS} allowed"
+            )
+        return found
     raise QaError(
         f"{label} must be text, a number, true, false, null, or a flat list of those"
     )

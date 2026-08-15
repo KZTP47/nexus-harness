@@ -233,6 +233,13 @@ class PluginValueBoundsTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             self.parse(self.case(target=list(range(101))))
 
+    def test_a_list_of_allowed_values_that_adds_up_is_refused(self) -> None:
+        """A hundred values under the limit can still make two megabytes."""
+
+        with self.assertRaises(HarnessError) as caught:
+            self.parse(self.case(target=["x" * 20_000] * 100))
+        self.assertIn("in total", str(caught.exception))
+
     def test_a_number_that_is_not_real_is_refused(self) -> None:
         with self.assertRaises(HarnessError) as caught:
             self.parse(self.case(target=float("inf")))
@@ -323,6 +330,28 @@ class ExamplePluginTests(unittest.TestCase):
         connection = sqlite3.connect(self.root / "data" / "app.db")
         self.assertEqual(connection.execute("SELECT count(*) FROM users").fetchone()[0], 1)
         connection.close()
+
+    def test_a_with_query_that_only_reads_is_allowed(self) -> None:
+        self.database([("ada", "admin"), ("bob", "user")])
+        found = self.run_case({
+            "id": "counted", "kind": "sqlite", "database": "data/app.db",
+            "query": "WITH admins AS (SELECT * FROM users WHERE role = 'admin') "
+                     "SELECT count(*) FROM admins",
+            "expect": {"first_value": "1"},
+        })
+        self.assertEqual(found.status, "passed")
+
+    def test_a_query_that_never_ends_is_stopped(self) -> None:
+        """A plugin runs inside the harness, so it has to stop itself."""
+
+        self.database([("ada", "admin")])
+        found = self.run_case({
+            "id": "runaway", "kind": "sqlite", "database": "data/app.db",
+            "query": "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c) "
+                     "SELECT count(*) FROM c",
+        })
+        self.assertEqual(found.status, "failed")
+        self.assertIn("took too long", found.reasons[0])
 
     def test_the_example_cannot_read_outside_the_project(self) -> None:
         found = self.run_case({
