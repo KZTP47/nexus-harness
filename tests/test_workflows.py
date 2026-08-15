@@ -34,6 +34,19 @@ class NameTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(HarnessError):
                 workflows.clean_name(value)
 
+    def test_names_windows_keeps_for_itself_are_refused(self) -> None:
+        """A file called con.json cannot be created on Windows at all."""
+
+        for name in ("CON", "con", "prn", "aux", "nul", "COM1", "lpt9"):
+            with self.subTest(name=name), self.assertRaises(HarnessError) as caught:
+                workflows.file_name(name)
+            self.assertIn("Windows keeps for itself", str(caught.exception))
+
+    def test_a_name_that_only_looks_reserved_is_fine(self) -> None:
+        self.assertEqual(workflows.file_name("Console"), "console.json")
+        self.assertEqual(workflows.file_name("Nul point"), "nul-point.json")
+        self.assertEqual(workflows.file_name("com10"), "com10.json")
+
     def test_two_names_that_look_alike_land_on_one_file(self) -> None:
         self.assertEqual(workflows.file_name("Quick fix"), "quick-fix.json")
         self.assertEqual(workflows.file_name("quick   FIX"), "quick-fix.json")

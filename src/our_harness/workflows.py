@@ -28,6 +28,14 @@ WORKFLOW_FOLDER = ".harness/workflows"
 MAX_WORKFLOWS = 100
 MAX_WORKFLOW_BYTES = 2_000_000
 _NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
+# Windows keeps these names for its own devices, whatever extension follows, so
+# a file called con.json cannot be created at all. Refusing them here gives the
+# user a sentence they can act on instead of a raw operating system error.
+_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{digit}" for digit in range(1, 10)}
+    | {f"lpt{digit}" for digit in range(1, 10)}
+)
 
 
 class WorkflowError(HarnessError):
@@ -79,7 +87,15 @@ def clean_name(value: object) -> str:
 def file_name(name: str) -> str:
     """The file one workflow lives in. Two names never collide on one file."""
 
-    return re.sub(r"[^a-z0-9]+", "-", clean_name(name).casefold()).strip("-") + ".json"
+    stem = re.sub(r"[^a-z0-9]+", "-", clean_name(name).casefold()).strip("-")
+    if not stem:
+        raise WorkflowError("A workflow name needs at least one letter or digit")
+    if stem in _RESERVED_NAMES:
+        raise WorkflowError(
+            f"{clean_name(name)} is a name Windows keeps for itself, so it cannot be a file. "
+            "Pick another one."
+        )
+    return stem + ".json"
 
 
 def folder(config: LoadedConfig) -> Path:
