@@ -84,6 +84,71 @@ harness ui             # open the control panel in your browser
 
 ---
 
+## See what the harness actually does
+
+The first screen draws the whole workflow as a picture, in plain words. Press
+**Show me how it works** and it walks through the steps one at a time. While a
+real run is going, the same boxes light up as the work reaches them.
+
+![What happens when you ask for a change](docs/images/how-it-works.png)
+
+Every box is one agent or one check from the Workflow tab. Rewire it there and
+this picture changes with it, because it is drawn from the workflow that will
+really run — not from a drawing somebody has to remember to update.
+
+---
+
+## Pipelines: many jobs, wired together
+
+A check suite answers "does this project work?". A pipeline answers a bigger
+question: run these suites side by side, scan the code for credentials, only go
+on if that passed, then run the unit tests, and try the flaky one again.
+
+![The pipelines board](docs/images/pipelines.png)
+
+Drag steps out of the list on the left, press **Connect** on one box and then
+another to join them, and press the small cross on an arrow to cut it. Each box
+lights up as the run reaches it: blue while it works, green when it passed, red
+when it did not, and dim when a gate stopped the work before it got there.
+
+| Step | What it does |
+| --- | --- |
+| Start | Where a run begins. Everything it points at starts together. |
+| Test suite | Runs your checks, or only the ones carrying a tag. |
+| Unit test | Runs the project's own test, lint, or build command. |
+| Security scan | Reads your files for credentials left in them. |
+| Security gate | Lets the work go on only if the scans before it went well enough. |
+| Gate | The same, for anything: all of what came before, or any of it. |
+| Git repo | Reads which branch you are on and what is uncommitted. It never writes. |
+| AI drafts a test | Asks the model you set up to write a test, and saves it as a draft for you to read. Nothing runs a draft where it is kept. |
+| Keep the evidence | Writes what happened into one file you can send to somebody. |
+
+Any step can be told to try again up to five times before it gives up, which is
+usually enough for the one test that fails on a slow morning.
+
+A pipeline is ordinary JSON in `.harness/pipelines`, so it can go into your
+repository and everyone gets the same one. There is deliberately no "run this
+shell line" step: a saved pipeline is a file people pass around, and a file
+that can run anything is a file nobody should open.
+
+---
+
+## "I don't care, just do it for me"
+
+Connecting a model is a short list of instructions, and a short list is still
+work if you have never done it. Every way of connecting one has a button that
+does the list for you.
+
+![The do it for me button on a service that needs a key](docs/images/just-do-it.png)
+
+It will start Ollama if it is installed but not running, fetch the model, write
+the route into your own settings file, and trust that file. It will not install
+software, make an account, or ask you for a key — so it says which single part
+is left for you, and where to do it. A key is never typed into the page and
+never written into a settings file.
+
+---
+
 ## The seven kinds of check
 
 | Kind | What it does |
@@ -186,6 +251,33 @@ will. Both of those ship a command line tool that is already signed in, so the
 harness can put them on the same job: Claude plans and reviews, Copilot writes
 the code, and the two send notes to each other as they go.
 
+### The short way: let it set itself up
+
+Open `harness ui`, stay on the Start view, and work down the three steps.
+
+![Setting up the assistants you already pay for](docs/images/seats.png)
+
+1. **Find the assistants.** It looks for each tool on this machine, asks its
+   version, and says which ones are ready. If one is missing it tells you what
+   to install.
+2. **Write the settings and trust them.** One button writes a route per
+   assistant into your own settings file and marks the file as yours. It shows
+   you exactly what it wrote, and **Put my settings back** undoes it.
+3. **Share the work out.** One button gives each agent in the workflow on
+   screen a seat, lets them send notes to each other, and — when you have two
+   assistants — puts the reviewer on the other one from the coder.
+
+Same thing without the screen:
+
+```bash
+harness seats list      # what is on this machine
+harness seats setup     # write the routes and trust the file
+```
+
+### The long way: do it by hand
+
+Useful when your tools take different arguments, or you want to see every part.
+
 **1. Check both tools are installed and signed in.** They are separate products
 from the subscriptions, and each signs in on its own.
 
@@ -260,8 +352,6 @@ Full walkthrough, including what to do when a tool takes different arguments:
 
 ---
 
----
-
 ## Running in a build server
 
 ```bash
@@ -323,6 +413,7 @@ Cloning a repository never gives that repository the right to run code.
 | Guide | About |
 | --- | --- |
 | [QA.md](docs/QA.md) | Checks, in full: every kind, every option, every command |
+| [PIPELINES.md](docs/PIPELINES.md) | Wiring many jobs together, with gates between them |
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting and where it may come from |
 | [SECURITY.md](docs/SECURITY.md) | What is fenced off, and how |
 | [SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) | Using a Claude or Copilot seat instead of a key |

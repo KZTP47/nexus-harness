@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 IMAGES = ROOT / "docs" / "images"
 WIDE = (1280, 860)
+PORT = 8765
 
 
 def demo_project(folder: Path) -> None:
@@ -100,7 +102,7 @@ def demo_project(folder: Path) -> None:
                 "title": "The control panel opens with no errors",
                 "kind": "browser",
                 "tags": ["ui"],
-                "url": "http://127.0.0.1:8765/",
+                "url": f"http://127.0.0.1:{PORT}/",
                 "expect": {"max_console_errors": 0, "max_page_errors": 0},
             },
         ],
@@ -121,12 +123,21 @@ def wait_for(url: str, seconds: float = 60.0) -> None:
     raise SystemExit(f"The panel never answered on {url}")
 
 
+def already_answering(port: int) -> bool:
+    """Is something else already sitting on this port?"""
+
+    with socket.socket() as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
 SHOTS = """
 const { chromium } = require('playwright');
 
 const wide = { width: WIDTH, height: HEIGHT };
 const out = OUTPUT;
 const address = ADDRESS;
+const DEMO = DEMONAME;
 
 async function settle(page, ms = 1200) {
   await page.waitForTimeout(ms);
@@ -140,6 +151,12 @@ async function settle(page, ms = 1200) {
   // it still thinking.
   await page.waitForSelector('#checkupSteps li', { timeout: 60000 });
   await settle(page, 1500);
+  // Last line of defence: the panel names the project it is looking at, and it
+  // has to be the demo one, or somebody's own work ends up in a picture.
+  const looking = await page.textContent('#checkupSummary');
+  if (!looking.includes(DEMO)) {
+    throw new Error('The panel is looking at the wrong project: ' + looking);
+  }
   // Fold away anything that names a path on the machine taking the picture.
   await page.evaluate(() => {
     document.querySelectorAll('#checkupSteps details').forEach((box) => { box.open = false; });
@@ -147,6 +164,61 @@ async function settle(page, ms = 1200) {
   await settle(page, 400);
 
   await page.screenshot({ path: out + '/start.png' });
+
+  // The seat setup, after looking. Nothing is written by looking.
+  await page.click('#findSeats');
+  for (let tries = 0; tries < 200; tries += 1) {
+    if (await page.locator('#seatList li').count()) break;
+    await page.waitForTimeout(250);
+  }
+  await settle(page, 600);
+  // Where a tool was found is useful on your own machine and nobody else's
+  // business in a picture. A path can also turn up in the line that says why a
+  // tool would not start, so anything path-shaped goes, not only the words
+  // "found at": a Windows path carries the account name in it.
+  await page.evaluate(() => {
+    // Built fresh for each line: a regular expression with /g remembers where
+    // it stopped, so reusing one here would skip every other line.
+    const stand_in = 'the usual place for this machine';
+    // Only the lines of text. Writing over a whole row would throw away the
+    // parts inside it and leave every word run together.
+    document.querySelectorAll('#seatList p').forEach((line) => {
+      line.textContent = line.textContent.replace(
+        // A drive letter, then everything up to the next space. The letter has
+        // to stand on its own, or the middle of "http://..." would count.
+        /(?<![A-Za-z])[A-Za-z][:][^\s,;"']+|\/(?:home|Users)\/[^\s,;"']+/g, stand_in);
+    });
+  });
+  await settle(page, 300);
+  await page.locator('#seatSteps').screenshot({ path: out + '/seats.png' });
+
+  // The picture of the workflow, part way through the walk through, so the
+  // steps show as done, working, and still to come all at once.
+  await page.click('#howDemo');
+  await page.waitForTimeout(2600);
+  await page.locator('#howStages').screenshot({ path: out + '/how-it-works.png' });
+  for (let tries = 0; tries < 60; tries += 1) {
+    if (!(await page.locator('#howDemo').isDisabled())) break;
+    await page.waitForTimeout(250);
+  }
+
+  // "I don't care, just do it for me", on a service still waiting for a key:
+  // it writes nothing, and shows what it did and what is left for a person.
+  await page.evaluate(() => {
+    const box = document.querySelector('.model-setup');
+    if (box) box.open = true;
+  });
+  await settle(page, 400);
+  const doItCard = page.locator('.model-option').filter({ hasText: 'ANTHROPIC_API_KEY' }).first();
+  if (await doItCard.count()) {
+    await doItCard.locator('button', { hasText: 'just do it for me' }).click();
+    for (let tries = 0; tries < 80; tries += 1) {
+      if (await doItCard.locator('.do-it-cannot').count()) break;
+      await page.waitForTimeout(250);
+    }
+    await settle(page, 400);
+    await doItCard.screenshot({ path: out + '/just-do-it.png' });
+  }
 
   await page.click('[data-view="checks"]');
   await settle(page);
@@ -186,6 +258,28 @@ async function settle(page, ms = 1200) {
   await settle(page, 800);
   await page.screenshot({ path: out + '/workflow.png' });
 
+  // The pipelines board, part way through a run, so the boxes show green,
+  // blue and grey at once rather than all one colour.
+  await page.click('[data-view="pipelines"]');
+  for (let tries = 0; tries < 60; tries += 1) {
+    if (await page.locator('#pipelineNodes .pipeline-node').count()) break;
+    await page.waitForTimeout(250);
+  }
+  await settle(page, 500);
+  await page.evaluate(() => {
+    // The demo project has no test command and no git, so a real run would
+    // show mostly failures. These are the states a run really writes, put on
+    // the boxes so the picture shows what a run looks like.
+    const shown = {start: 'passed', scan: 'passed', checks: 'passed',
+                   gate: 'running', tests: 'waiting', evidence: 'waiting'};
+    for (const [id, state] of Object.entries(shown)) {
+      const box = document.querySelector(`[data-node="${id}"]`);
+      if (box && state !== 'waiting') box.dataset.state = state;
+    }
+  });
+  await settle(page, 400);
+  await page.screenshot({ path: out + '/pipelines.png' });
+
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });
 """
@@ -193,25 +287,34 @@ async function settle(page, ms = 1200) {
 
 def main() -> int:
     IMAGES.mkdir(parents=True, exist_ok=True)
+    # A panel left running from earlier answers on this port first, and every
+    # picture then shows that project instead of the demo one. That is somebody
+    # else's work in a published picture, so stop rather than guess.
+    if already_answering(PORT):
+        raise SystemExit(
+            f"Something is already answering on port {PORT}. Stop it first, "
+            "or the pictures will show that project instead of the demo one."
+        )
     with tempfile.TemporaryDirectory() as temporary:
         folder = Path(temporary).resolve() / "shop"
         folder.mkdir()
         demo_project(folder)
         panel = subprocess.Popen(
             [sys.executable, "-m", "our_harness", "--project", str(folder),
-             "ui", "--port", "8765", "--no-open-browser"],
+             "ui", "--port", str(PORT), "--no-open-browser"],
             cwd=ROOT,
             env={**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         try:
-            wait_for("http://127.0.0.1:8765/api/health")
+            wait_for(f"http://127.0.0.1:{PORT}/api/health")
             script = (
                 SHOTS.replace("WIDTH", str(WIDE[0]))
                 .replace("HEIGHT", str(WIDE[1]))
                 .replace("OUTPUT", json.dumps(IMAGES.as_posix()))
-                .replace("ADDRESS", json.dumps("http://127.0.0.1:8765/"))
+                .replace("ADDRESS", json.dumps(f"http://127.0.0.1:{PORT}/"))
+                .replace("DEMONAME", json.dumps(folder.name))
             )
             # The script has to sit beside the project's own node modules,
             # or the browser library cannot be found from a temporary folder.

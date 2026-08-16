@@ -34,6 +34,36 @@ instead of two.
 
 ---
 
+## The short way, in three buttons
+
+If you would rather not do any of the steps below by hand, the harness can do
+them for you. Run `harness ui`, stay on the Start view, and work down:
+
+![Setting up the assistants you already pay for](images/seats.png)
+
+| Button | What it does | The steps it replaces |
+| --- | --- | --- |
+| Find the assistants | Looks for each tool, asks its version, says which are ready | Before you start |
+| Set it up for me | Writes one route per assistant and trusts the file | Steps 2 to 4 |
+| Share the work out | Gives each agent a seat and lets them send notes | Steps 5 and 6 |
+
+Nothing is written until you press the second button, it shows you the file it
+wrote, and **Put my settings back** undoes it exactly. The same two things
+without the screen:
+
+```bash
+harness seats list      # what is on this machine
+harness seats setup     # write the routes and trust the file
+```
+
+`harness seats setup --only claude-cli` sets up one seat instead of all the
+ready ones, and `--json` prints the same answer for a script to read.
+
+The rest of this page is the same setup done by hand. Read it if a tool on your
+machine takes different arguments, or you want to know what each part is for.
+
+---
+
 ## Step 1 — Start the project
 
 ```bash

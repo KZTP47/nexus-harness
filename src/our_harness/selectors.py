@@ -224,7 +224,7 @@ def starter_step(candidate: Candidate, action: str = "expect_visible") -> dict[s
 # names for that one thing. Every name is tried on the real page before it is
 # sent back, which is why each one carries a count.
 _PICKER_SCRIPT = r"""
-// Written by Our Harness so a person can point at part of a page. Deleted after.
+// Written by Nexus Harness so a person can point at part of a page. Deleted after.
 const { chromium } = require('playwright');
 const plan = __PLAN__;
 

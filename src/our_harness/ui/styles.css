@@ -291,3 +291,160 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .changed-since { margin: 8px 0 14px; }
 .changed-since h3 { margin: 10px 0 4px; font-size: .88rem; }
 .changed-list { margin: 0; padding-left: 20px; font-size: .84rem; }
+
+/* Setting up a subscription: three steps, and where you are in them. */
+.seat-steps { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 10px; }
+.seat-step { display: flex; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; }
+.seat-step > div { flex: 1; min-width: 0; }
+.seat-step strong { display: block; margin-bottom: 3px; }
+.seat-step p { margin: 0 0 8px; color: var(--muted); font-size: .86rem; }
+.seat-mark { display: flex; align-items: center; justify-content: center; width: 26px; height: 26px; flex: none; border-radius: 50%; border: 1px solid var(--line); font-size: .78rem; font-weight: 800; }
+.seat-step.doing { border-color: var(--cyan); }
+.seat-step.doing .seat-mark { color: #03202b; background: var(--cyan); border-color: var(--cyan); }
+.seat-step.done .seat-mark { color: #03202b; background: var(--green); border-color: var(--green); }
+.seat-step.waiting { opacity: .6; }
+.seat-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+.seat-list .seat { display: flex; gap: 10px; align-items: baseline; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; font-size: .86rem; }
+.seat-state { flex: none; min-width: 68px; font-weight: 700; }
+.seat.ready .seat-state { color: var(--green); }
+.seat.not-ready .seat-state { color: var(--yellow); }
+.seat p { margin: 2px 0 0; }
+#seatFile { max-height: 260px; overflow: auto; font-size: .78rem; }
+
+/* What happens when you ask for a change: the workflow as a picture anyone can
+   read. Boxes flow left to right and wrap on a narrow screen, with an arrow
+   drawn between them so the order is obvious without reading a word. */
+.how-stages { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 26px 30px; }
+.how-stage { position: relative; flex: 1 1 190px; min-width: 170px; max-width: 280px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255, 255, 255, .02); }
+.how-stage::after { content: ""; position: absolute; top: 50%; right: -22px; width: 14px; height: 2px; background: var(--line); }
+.how-stage::before { content: ""; position: absolute; top: 50%; right: -22px; margin-top: -4px; border: 5px solid transparent; border-left-color: var(--line); }
+.how-stage:last-child::after, .how-stage:last-child::before,
+.how-stage.row-end::after, .how-stage.row-end::before { display: none; }
+.how-head { display: flex; align-items: center; gap: 9px; margin-bottom: 5px; }
+.how-number { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; flex: none; border-radius: 50%; border: 1px solid var(--line); font-size: .76rem; font-weight: 800; }
+.how-stage p { margin: 0; color: var(--muted); font-size: .82rem; }
+.how-stage .how-back { margin-top: 6px; color: var(--yellow); font-size: .78rem; }
+.how-stage .how-state { margin-top: 6px; font-weight: 700; font-size: .78rem; color: var(--cyan); }
+.how-stage[data-state="doing"] { border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan) inset; }
+.how-stage[data-state="doing"] .how-number { color: #03202b; background: var(--cyan); border-color: var(--cyan); }
+.how-stage[data-state="done"] { border-color: var(--green); }
+.how-stage[data-state="done"] .how-number { color: #03202b; background: var(--green); border-color: var(--green); }
+.how-stage[data-state="wrong"] { border-color: var(--yellow); }
+.how-stage[data-state="wrong"] .how-number { color: #2a1d00; background: var(--yellow); border-color: var(--yellow); }
+.how-stage[data-state="wrong"] .how-state { color: var(--yellow); }
+.how-stage[data-state="done"] .how-state { color: var(--green); }
+.how-stage.start, .how-stage.end { flex-basis: 150px; }
+.how-loops { margin-top: 12px; }
+.how-loop-list { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: .84rem; display: grid; gap: 4px; }
+@media (prefers-reduced-motion: no-preference) {
+  .how-stage { transition: border-color .2s ease, box-shadow .2s ease; }
+}
+
+/* "I don't care, just do it for me": the same list of steps, done for you, with
+   whatever is left for a person marked plainly rather than buried. */
+.do-it-button { margin-top: 10px; }
+.do-it-said { margin-top: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; }
+.do-it-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.do-it-step { padding-left: 22px; position: relative; font-size: .86rem; }
+.do-it-step p { margin: 2px 0 0; color: var(--muted); font-size: .82rem; }
+.do-it-step::before { position: absolute; left: 0; top: 0; font-weight: 800; }
+.do-it-step.doing::before { content: "..."; color: var(--cyan); }
+.do-it-step.done::before { content: "OK"; color: var(--green); font-size: .72rem; }
+.do-it-step.cannot::before { content: "!"; color: var(--yellow); }
+.do-it-worked { margin: 10px 0 0; color: var(--green); font-weight: 700; }
+.do-it-said-line { margin: 10px 0 0; font-weight: 700; }
+.do-it-cannot { margin: 8px 0 0; color: var(--yellow); font-size: .86rem; }
+
+/* The choice about trusting a settings file somebody else left behind. It is
+   marked out because it is a decision, not a message: the warning is spelled
+   out, the file is above it, and the button is deliberately plain about what
+   it means. */
+.trust-choice { margin-top: 12px; padding: 12px 14px; border: 1px solid var(--yellow); border-radius: 12px; background: rgba(255, 200, 60, .06); }
+.trust-choice strong { display: block; margin-bottom: 6px; color: var(--yellow); }
+.trust-choice p { margin: 0 0 8px; font-size: .86rem; }
+.trust-risks { margin: 0 0 10px; padding-left: 18px; display: grid; gap: 4px; font-size: .84rem; color: var(--yellow); }
+.trust-choice button.danger { border-color: var(--yellow); color: var(--yellow); }
+
+/* Pipelines. This one view keeps the look of the tool the idea came from: a
+   pale board, cards in flat colours with a coloured strip down the side, and
+   curved wires between them with a small cross to cut one. The rest of the
+   panel is dark, so every colour here is set on this view rather than taken
+   from the page, and the board says plainly which view you are on. */
+.pipeline-shell { display: grid; grid-template-columns: 250px 1fr; gap: 0; height: calc(100vh - 132px); }
+.pipeline-side { background: #f2f4f7; color: #1f2933; border-right: 1px solid #d7dce3; padding: 14px; overflow: auto; }
+.pipeline-side h2 { margin: 0 0 8px; font-size: .95rem; color: #1f2933; }
+.pipeline-side h3 { margin: 16px 0 8px; font-size: .9rem; color: #1f2933; }
+.pipeline-side h4.pipeline-group { margin: 12px 0 6px; font-size: .74rem; text-transform: uppercase; letter-spacing: .08em; color: #64748b; }
+.pipeline-saved { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 220px; overflow: auto; }
+.pipeline-saved .hint { color: #64748b; font-size: .82rem; }
+.pipeline-saved-one { width: 100%; text-align: left; background: #fff; border: 1px solid #d7dce3; color: #1f2933; border-radius: 8px; padding: 6px 9px; font-size: .84rem; }
+.pipeline-saved-one:hover { border-color: #94a3b8; }
+.pipeline-saved-one.chosen { border-color: #2563eb; color: #1d4ed8; font-weight: 700; }
+.pipeline-side-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.pipeline-side-buttons button { background: #fff; color: #1f2933; border: 1px solid #d7dce3; border-radius: 8px; padding: 6px 10px; font-size: .82rem; }
+.pipeline-side-buttons button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.pipeline-side-buttons button:disabled { opacity: .5; }
+.pipeline-palette { display: grid; gap: 5px; }
+.pipeline-add { text-align: left; border-radius: 8px; padding: 7px 10px; font-size: .84rem; border: 1px solid transparent; color: #1f2933; }
+
+/* The colours a step can be. The engine names them, so a new kind of step
+   arrives with a colour rather than turning up grey. */
+.colour-green { background: #b7f0c2; border-color: #7bd694; }
+.colour-mint { background: #d8f5e0; border-color: #9fdcb3; }
+.colour-red { background: #ffc9c9; border-color: #f38b8b; }
+.colour-yellow { background: #ffe79a; border-color: #f0c752; }
+.colour-orange { background: #ffd2a8; border-color: #f0a75a; }
+.colour-purple { background: #e0cffc; border-color: #b794f4; }
+.colour-cyan { background: #b8ecf7; border-color: #6fd3e8; }
+.colour-blue { background: #cfe0ff; border-color: #8ab0f0; }
+.colour-grey { background: #e6e9ee; border-color: #c2c8d2; }
+
+.pipeline-main { display: flex; flex-direction: column; background: #eef1f5; color: #1f2933; overflow: hidden; }
+.pipeline-bar { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: flex-end; padding: 12px 16px; background: #f7f9fb; border-bottom: 1px solid #d7dce3; }
+.pipeline-bar h2 { margin: 0; font-size: 1.05rem; }
+.pipeline-bar .hint { margin: 2px 0 0; color: #52616b; font-size: .82rem; }
+.pipeline-bar-fields { display: flex; align-items: center; gap: 8px; }
+.pipeline-bar-fields label { color: #52616b; font-size: .82rem; }
+.pipeline-bar-fields input { background: #fff; color: #1f2933; border: 1px solid #cbd2db; border-radius: 8px; padding: 6px 9px; min-width: 180px; }
+.pipeline-bar-fields button { white-space: nowrap; background: #fff; color: #1f2933; border: 1px solid #cbd2db; border-radius: 8px; padding: 6px 10px; font-size: .82rem; }
+.pipeline-said { margin: 0; padding: 8px 16px; background: #fff; border-bottom: 1px solid #e2e6ec; color: #1f2933; font-size: .86rem; }
+
+.pipeline-canvas { position: relative; flex: 1; min-height: 320px; overflow: auto; background-color: #eef1f5; background-image: radial-gradient(#cfd6de 1px, transparent 1px); background-size: 22px 22px; }
+.pipeline-nodes { position: relative; min-width: 1200px; min-height: 600px; }
+.pipeline-wires { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.pipeline-wire { fill: none; stroke: #6b7f9e; stroke-width: 2; }
+.pipeline-cut { fill: #e5484d; cursor: pointer; pointer-events: all; }
+.pipeline-cut-mark { fill: #fff; font-size: 11px; font-weight: 700; text-anchor: middle; pointer-events: none; }
+
+.pipeline-node { position: absolute; width: 200px; border: 1px solid; border-left-width: 7px; border-radius: 10px; padding: 8px 10px; box-shadow: 0 1px 3px rgba(20, 30, 45, .18); cursor: grab; user-select: none; }
+.pipeline-node.moving { cursor: grabbing; box-shadow: 0 6px 16px rgba(20, 30, 45, .25); }
+.pipeline-node-head { display: flex; justify-content: space-between; gap: 6px; }
+.pipeline-node-head strong { font-size: .88rem; color: #16202b; overflow-wrap: anywhere; }
+.pipeline-node-kind { margin: 2px 0 0; font-size: .72rem; color: #4a5763; }
+.pipeline-node-state { margin: 4px 0 0; font-size: .74rem; font-weight: 700; color: #16202b; }
+.pipeline-node-buttons { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.pipeline-node-button { background: rgba(255, 255, 255, .82); border: 1px solid rgba(20, 30, 45, .2); color: #16202b; border-radius: 7px; padding: 3px 7px; font-size: .72rem; }
+.pipeline-node-button:hover { background: #fff; }
+.pipeline-node[data-state="running"] { outline: 3px solid #2563eb; outline-offset: 1px; }
+.pipeline-node[data-state="passed"] { outline: 3px solid #16a34a; outline-offset: 1px; }
+.pipeline-node[data-state="failed"] { outline: 3px solid #dc2626; outline-offset: 1px; }
+.pipeline-node[data-state="skipped"] { opacity: .6; }
+
+.pipeline-log-box { border-top: 1px solid #d7dce3; background: #f7f9fb; padding: 10px 16px; max-height: 190px; overflow: auto; }
+.pipeline-log-box h3 { margin: 0 0 6px; font-size: .85rem; color: #1f2933; }
+.pipeline-log { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; font-size: .82rem; }
+.pipeline-log-line { padding: 4px 8px; border-radius: 7px; background: #fff; border: 1px solid #e2e6ec; color: #1f2933; }
+.pipeline-log-line.passed { border-color: #86e0a3; }
+.pipeline-log-line.failed { border-color: #f6a3a3; }
+.pipeline-log-line.running { border-color: #a8c5f5; }
+.pipeline-log-line.skipped { opacity: .7; }
+.pipeline-log-said { color: #52616b; }
+
+#pipelineNodeDialog { color: inherit; }
+.pipeline-settings { display: grid; gap: 6px; margin: 8px 0; }
+.pipeline-settings label { font-size: .82rem; }
+
+@media (max-width: 900px) {
+  .pipeline-shell { grid-template-columns: 1fr; height: auto; }
+  .pipeline-side { border-right: none; border-bottom: 1px solid #d7dce3; }
+}

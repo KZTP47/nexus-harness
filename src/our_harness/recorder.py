@@ -245,7 +245,7 @@ _NAMING = r"""
 """
 
 _RECORDER_SCRIPT = r"""
-// Written by Our Harness to watch one workflow being done by hand. Deleted after.
+// Written by Nexus Harness to watch one workflow being done by hand. Deleted after.
 const { chromium } = require('playwright');
 const plan = __PLAN__;
 

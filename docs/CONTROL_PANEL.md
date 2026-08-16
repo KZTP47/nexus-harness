@@ -2,6 +2,29 @@
 
 The local control panel edits schema-v2 workflow graphs. It keeps provider credentials outside the browser. Agent nodes refer to named provider profiles from harness configuration.
 
+## The first screen
+
+Two things there explain and do the setting up, so nobody has to read the rest
+of this page before their first run.
+
+**What happens when you ask for a change** draws the workflow as a row of
+plain-words boxes: you ask, it plans, it changes the files, each check runs, a
+second model reviews, done. The boxes come from the graph the harness will
+really run, so editing the workflow changes the picture. **Show me how it
+works** walks through them one at a time; during a real run the same boxes show
+what the work has reached.
+
+**I don't care, just do it for me** sits on every way of connecting a model. It
+does the parts a program may do — start Ollama if it is installed, fetch the
+model, write the provider route, trust the settings file — and names the one
+part it will not: installing software, or making a key. A key's value is never
+read, never shown, and never written down; only the name of the environment
+variable is.
+
+Trusting follows the same rule as everywhere else. A settings file that was
+already there and never trusted is left untrusted, because it can start
+programs and nobody has read it. The panel says so and gives the command.
+
 ## Agent nodes
 
 Select **Add agent**, then set:
@@ -99,6 +122,7 @@ The loopback server exposes token-protected read endpoints:
 - `GET /api/memory?after=0&limit=100&query=&kind=`
 - `GET /api/usage?after=0&limit=100&run_id=`
 - `GET /api/prompts?after=0&limit=100&name=`
+- `GET /api/seats` and `GET /api/setup/do-it`
 
 Responses are bounded and redacted. Cursor fields support paging. `/api/events?meta=1` also reports an event-buffer gap so the UI can state when older live events were dropped.
 

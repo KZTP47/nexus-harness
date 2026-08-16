@@ -35,6 +35,7 @@ from . import datasets
 from . import handover
 from . import qa
 from . import recorder
+from . import seats as seat_setup
 from . import selectors
 from . import share
 from . import starters
@@ -434,6 +435,57 @@ def command_config_show(args: argparse.Namespace) -> int:
     config = _config(args)
     redacted = json.loads(json.dumps(config.data))
     _print_json({"project_root": str(config.project_root), "config": redacted, "provenance": config.provenance})
+    return 0
+
+
+def command_seats(args: argparse.Namespace) -> int:
+    """Find the assistants on this machine, and set them up."""
+
+    root = Path(args.project).resolve() if getattr(args, "project", None) else Path.cwd()
+    config, trouble = seat_setup.settings_to_work_from(root)
+    if trouble:
+        print(trouble)
+        print("")
+    found = seat_setup.look(config)
+    if args.seats_command == "list":
+        if args.json:
+            _print_json(found.to_dict())
+            return 0
+        for line in seat_setup.summary(found):
+            print(line)
+        if found.ready:
+            print("")
+            print("Set them all up with: harness seats setup")
+        return 0 if found.ready else 1
+
+    wanted = [seat.kind for seat in found.ready]
+    if args.only:
+        asked = {str(item) for item in args.only}
+        wanted = [kind for kind in wanted if kind in asked]
+    if not wanted:
+        raise HarnessError(
+            "No assistant is ready on this machine. Run 'harness seats list' to see why."
+        )
+    done = seat_setup.set_up(config, wanted, trust=not args.no_trust)
+    if args.json:
+        _print_json(done.to_dict())
+        return 0
+    print(f"Wrote {done.settings_file}")
+    print(f"Routes: {', '.join(done.routes)}")
+    if done.kept:
+        print(f"Your other settings were kept: {', '.join(done.kept)}")
+    if done.replaced:
+        print(f"Written over: {', '.join(done.replaced)}")
+    print("Trusted." if done.trusted else done.note)
+    if done.needs_your_say:
+        # Written, shown, and left for a person to decide. The same choice the
+        # panel offers, in a terminal.
+        for line in done.risky_parts:
+            print(f"  - {line}")
+        print("")
+        print("Read it, then trust it with: harness trust")
+    print("")
+    print("Give each agent one of these in the Workflow tab, or run: harness ui")
     return 0
 
 
@@ -1266,6 +1318,25 @@ def parser() -> argparse.ArgumentParser:
     benchmark.set_defaults(handler=command_benchmark)
     show = sub.add_parser("config", help="Print effective config and setting sources")
     show.set_defaults(handler=command_config_show)
+    seats = sub.add_parser(
+        "seats", help="Find the assistants you already pay for, and set them up"
+    )
+    seats_sub = seats.add_subparsers(dest="seats_command", required=True)
+    seats_list = seats_sub.add_parser("list", help="Say which assistants this machine can use")
+    seats_list.add_argument("--json", action="store_true")
+    seats_list.set_defaults(handler=command_seats)
+    seats_setup = seats_sub.add_parser(
+        "setup", help="Write a route for each assistant that is ready, and trust it"
+    )
+    seats_setup.add_argument(
+        "--only", action="append", help="Set up only this kind. May repeat."
+    )
+    seats_setup.add_argument(
+        "--no-trust", action="store_true",
+        help="Write the settings but do not trust them yet",
+    )
+    seats_setup.add_argument("--json", action="store_true")
+    seats_setup.set_defaults(handler=command_seats)
     trust = sub.add_parser("trust", help="Say the local config file in this project is yours")
     trust.add_argument("--yes", action="store_true", help="Do not ask first")
     trust.add_argument("--show", action="store_true", help="Only say whether it is trusted")

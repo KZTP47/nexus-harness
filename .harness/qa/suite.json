@@ -67,7 +67,8 @@
         "exists": true,
         "min_bytes": 500,
         "contains": [
-          "Fast install"
+          "## Install",
+          "python -m pip install"
         ]
       }
     },

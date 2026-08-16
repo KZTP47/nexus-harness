@@ -569,6 +569,7 @@ async function pollEvents() {
         // arrives, and the page quietly never shows it.
         if (["qa_", "pick_", "record_", "coverage_"].some((start) => kind.startsWith(start))) applyCheckEvent(event);
         if (kind === "agent_message") applyTeamEvent(event);
+        if (kind.startsWith("pipeline_")) applyPipelineEvent(event);
       } catch (error) {
         appendEvent("update", `One update could not be read: ${error.message}`);
       }
@@ -576,6 +577,10 @@ async function pollEvents() {
     if (result.events.length) {
       const now = Date.now();
       renderNodes(); await refreshUsage();
+      // The picture on the first screen lights up from the same news, so
+      // somebody watching it sees the run move without opening Workflow.
+      // Real news beats a walk through that has already finished.
+      if (howStages.length && !howWalk) { howWalkStates = new Map(); renderHowItWorks(); }
       if (now - lastLiveDataRefreshAt >= 1000) {
         lastLiveDataRefreshAt = now;
         if (!$("memoryView").hidden) await refreshMemory();
@@ -610,7 +615,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -652,11 +657,22 @@ function renderCheckup() {
   }
 }
 
+// Whether somebody has opened or closed "Ways to connect a model" by hand.
+// null means they have not touched it, so the panel decides.
+let modelSetupOpen = null;
+
 function modelSetup() {
   const advice = checkup?.model_setup;
   const box = make("details", "model-setup");
   if (!advice) return box;
-  box.open = !checkup.steps.find((step) => step.id === "provider")?.done;
+  // Open by itself when there is still a model to connect. Once somebody has
+  // opened or closed it themselves, that choice is kept: the first screen
+  // redraws on its own, and a panel that shuts while you are reading it is a
+  // panel nobody can use.
+  box.open = modelSetupOpen === null
+    ? !checkup.steps.find((step) => step.id === "provider")?.done
+    : modelSetupOpen;
+  box.addEventListener("toggle", () => { modelSetupOpen = box.open; });
   box.append(make("summary", "", "Ways to connect a model"));
   box.append(make("p", "", advice.headline));
   const list = make("ul", "model-list");
@@ -674,10 +690,104 @@ function modelSetup() {
       for (const line of option.steps) steps.append(make("li", "", line));
       item.append(steps);
     }
+    if (canDoForYou.includes(option.id)) {
+      // The whole list above, done for somebody who does not want to read it.
+      const button = make("button", "do-it-button", "I don't care, just do it for me");
+      button.type = "button";
+      button.dataset.option = option.id;
+      button.addEventListener("click", () => doItForMe(option.id));
+      item.append(button);
+      const said = make("div", "do-it-said");
+      said.id = `doIt-${option.id}`;
+      said.hidden = true;
+      // A job already running or just finished for this one goes straight back
+      // on screen, so a redraw never swallows the answer.
+      if (lastDoItJob && lastDoItJob.option === option.id) fillDoItBox(said, lastDoItJob);
+      item.append(said);
+    }
     list.append(item);
   }
   box.append(list, make("p", "field-help", advice.note));
   return box;
+}
+
+/* ---- I don't care, just do it for me ---- */
+
+// Which ways of connecting a model the harness can set up on its own. Asked
+// for once, rather than written down here where it would go stale.
+let canDoForYou = [];
+let doItTimer = null;
+// The last answer, kept so a redraw of the first screen can put it back.
+let lastDoItJob = null;
+
+async function loadWhatCanBeDoneForYou() {
+  try {
+    const said = await request("/api/setup/do-it");
+    canDoForYou = said.can_do || [];
+  } catch (error) { canDoForYou = []; }
+}
+
+async function doItForMe(option) {
+  const box = $(`doIt-${option}`);
+  if (!box) return;
+  document.querySelectorAll(".do-it-button").forEach((button) => { button.disabled = true; });
+  box.hidden = false;
+  box.replaceChildren(make("p", "field-help", "Starting."));
+  try {
+    renderDoItJob(await request("/api/setup/do-it", {
+      method: "POST", body: JSON.stringify({option}),
+    }), option);
+    watchDoItJob(option);
+  } catch (error) {
+    showError(error.message);
+    box.replaceChildren(make("p", "do-it-cannot", error.message));
+    document.querySelectorAll(".do-it-button").forEach((button) => { button.disabled = false; });
+  }
+}
+
+function watchDoItJob(option) {
+  if (doItTimer) window.clearTimeout(doItTimer);
+  const askAgain = async () => {
+    try {
+      const said = await request("/api/setup/do-it");
+      if (said.job) renderDoItJob(said.job, option);
+      if (said.busy) { doItTimer = window.setTimeout(askAgain, 1000); return; }
+    } catch (error) { showError(error.message); }
+    doItTimer = null;
+    document.querySelectorAll(".do-it-button").forEach((button) => { button.disabled = false; });
+    refreshCheckup();
+  };
+  doItTimer = window.setTimeout(askAgain, 1000);
+}
+
+function renderDoItJob(job, option) {
+  lastDoItJob = job;
+  const box = $(`doIt-${job.option || option}`);
+  if (!box) return;
+  fillDoItBox(box, job);
+}
+
+// Drawn into a box handed in, rather than one looked up by name, because the
+// first screen redraws itself while a job is running and the card holding the
+// answer is thrown away and built again. What somebody is reading has to
+// survive that, or the answer disappears mid-sentence.
+function fillDoItBox(box, job) {
+  box.hidden = false;
+  box.replaceChildren();
+  const steps = make("ol", "do-it-steps");
+  for (const step of job.steps || []) {
+    const item = make("li", `do-it-step ${step.state}`);
+    item.append(make("strong", "", step.text));
+    if (step.detail) item.append(make("p", "", step.detail));
+    steps.append(item);
+  }
+  if (job.steps && job.steps.length) box.append(steps);
+  if (job.running) box.append(make("p", "field-help", "Working on it. This can take a while."));
+  if (job.said) box.append(make("p", job.worked ? "do-it-worked" : "do-it-said-line", job.said));
+  for (const line of job.left_for_you || []) {
+    box.append(make("p", "do-it-cannot", `Left for you: ${line}`));
+  }
+  if (job.finished) announce(job.said);
 }
 
 async function quickRun() {
@@ -1259,6 +1369,724 @@ async function makeSharePage() {
   } catch (error) { showError(error.message); }
 }
 
+/* ---- Setting up a subscription you already pay for ---- */
+
+let seatsFound = null;
+
+function markSeatStep(id, state) {
+  const step = $(id);
+  step.classList.remove("doing", "waiting", "done");
+  step.classList.add(state);
+}
+
+function renderSeats(found) {
+  seatsFound = found;
+  const list = $("seatList");
+  list.replaceChildren();
+  for (const seat of found.seats || []) {
+    const row = make("li", `seat ${seat.ready ? "ready" : "not-ready"}`);
+    row.append(make("span", "seat-state", seat.ready ? "Ready" : "Not here"));
+    const detail = make("div", "");
+    detail.append(make("strong", "", seat.label));
+    detail.append(make("p", "", seat.ready
+      ? `${seat.version} — found at ${seat.found_at}`
+      : seat.why_not));
+    if (!seat.ready && seat.install_hint) detail.append(make("p", "field-help", seat.install_hint));
+    if (seat.ready && seat.already_set_up) detail.append(make("p", "field-help", "A route for this is already in your settings."));
+    row.append(detail);
+    list.append(row);
+  }
+  const ready = (found.seats || []).filter((seat) => seat.ready);
+  $("seatFindSaid").textContent = ready.length
+    ? `${ready.length} of ${(found.seats || []).length} are ready to use.`
+    : "None of them are on this machine yet. Install one, then press the button again.";
+  markSeatStep("seatStepFind", "done");
+  markSeatStep("seatStepWrite", ready.length ? "doing" : "waiting");
+  $("setUpSeats").disabled = ready.length === 0;
+  $("setUpSeats").textContent = ready.length > 1
+    ? `Set up all ${ready.length} for me`
+    : "Set it up for me";
+  announce($("seatFindSaid").textContent);
+}
+
+/* ---- Pipelines ----
+
+   Many jobs wired together, with gates between them. A pipeline is nodes and
+   arrows: an arrow means "after", and a gate looks at what came before it and
+   decides whether the work goes on.
+
+   The picture is drawn from what the harness says a pipeline may hold, so a
+   kind of step added to the engine turns up here without this file changing.
+*/
+
+let pipeline = {name: "First pipeline", nodes: [], edges: []};
+let pipelineKinds = [];
+let pipelineSaved = [];
+let pipelineJoining = "";      // the node an arrow is being drawn from
+let pipelineDragging = null;
+let pipelineEditing = "";
+let pipelineStates = new Map();
+
+async function refreshPipelines(name) {
+  try {
+    const said = await request(`/api/pipelines${name ? `?name=${encodeURIComponent(name)}` : ""}`);
+    pipelineKinds = said.kinds || [];
+    pipelineSaved = said.saved || [];
+    pipeline = said.pipeline;
+    pipelineStates = new Map();
+    $("pipelineName").value = pipeline.name || "";
+    $("pipelineStop").disabled = !said.running;
+    renderPipelinePalette();
+    renderPipelineSaved();
+    renderPipeline();
+    if (said.last_run) showPipelineRun(said.last_run);
+  } catch (error) { showError(error.message); }
+}
+
+function renderPipelineSaved() {
+  const list = $("pipelineList");
+  list.replaceChildren();
+  if (!pipelineSaved.length) {
+    list.append(make("li", "hint", "None saved yet. Draw one and press Save."));
+    return;
+  }
+  for (const name of pipelineSaved) {
+    const item = make("li", "");
+    const button = make("button", `pipeline-saved-one${name === pipeline.name ? " chosen" : ""}`, name);
+    button.type = "button";
+    button.addEventListener("click", () => refreshPipelines(name));
+    item.append(button);
+    list.append(item);
+  }
+}
+
+function renderPipelinePalette() {
+  const box = $("pipelinePalette");
+  box.replaceChildren();
+  const groups = [];
+  for (const kind of pipelineKinds) {
+    let group = groups.find((item) => item.name === kind.group);
+    if (!group) { group = {name: kind.group, kinds: []}; groups.push(group); }
+    group.kinds.push(kind);
+  }
+  for (const group of groups) {
+    box.append(make("h4", "pipeline-group", group.name));
+    for (const kind of group.kinds) {
+      const button = make("button", `pipeline-add colour-${kind.colour}`, kind.label);
+      button.type = "button";
+      button.title = kind.summary;
+      button.dataset.kind = kind.id;
+      button.addEventListener("click", () => addPipelineNode(kind.id));
+      box.append(button);
+    }
+  }
+}
+
+function kindOf(id) {
+  return pipelineKinds.find((kind) => kind.id === id) || {label: id, colour: "grey", settings: []};
+}
+
+function addPipelineNode(kindId) {
+  const kind = kindOf(kindId);
+  let number = pipeline.nodes.length + 1;
+  while (pipeline.nodes.some((node) => node.id === `${kindId}-${number}`)) number += 1;
+  const spot = pipeline.nodes.length;
+  pipeline.nodes.push({
+    id: `${kindId}-${number}`,
+    kind: kindId,
+    label: kind.label,
+    settings: {},
+    at: {x: 40 + (spot % 4) * 250, y: 40 + Math.floor(spot / 4) * 150},
+  });
+  renderPipeline();
+  say(`Added ${kind.label}. Press Connect on one box, then another, to join them.`);
+}
+
+function say(words) {
+  $("pipelineSaid").textContent = words;
+  announce(words);
+}
+
+function renderPipeline() {
+  const box = $("pipelineNodes");
+  const wires = $("pipelineWires");
+  box.replaceChildren(wires);
+  for (const node of pipeline.nodes) {
+    const kind = kindOf(node.kind);
+    const card = make("div", `pipeline-node colour-${kind.colour}`);
+    card.dataset.node = node.id;
+    card.style.left = `${node.at?.x || 0}px`;
+    card.style.top = `${node.at?.y || 0}px`;
+    const state = pipelineStates.get(node.id);
+    if (state) card.dataset.state = state.state;
+
+    const head = make("div", "pipeline-node-head");
+    head.append(make("strong", "", node.label || kind.label));
+    card.append(head);
+    if ((node.label || "") !== kind.label) card.append(make("p", "pipeline-node-kind", kind.label));
+    if (state) {
+      card.append(make("p", "pipeline-node-state", state.said || state.state));
+    }
+    const buttons = make("div", "pipeline-node-buttons");
+    const join = make("button", "pipeline-node-button", pipelineJoining === node.id ? "Joining" : "Connect");
+    join.type = "button";
+    join.title = "Draw an arrow from this step to another";
+    join.addEventListener("click", (event) => { event.stopPropagation(); joinPipelineNodes(node.id); });
+    const settings = make("button", "pipeline-node-button", "Settings");
+    settings.type = "button";
+    settings.addEventListener("click", (event) => { event.stopPropagation(); openPipelineNode(node.id); });
+    const remove = make("button", "pipeline-node-button", "Remove");
+    remove.type = "button";
+    remove.addEventListener("click", (event) => { event.stopPropagation(); removePipelineNode(node.id); });
+    buttons.append(join, settings, remove);
+    card.append(buttons);
+
+    card.addEventListener("pointerdown", (event) => startPipelineDrag(event, node));
+    card.addEventListener("click", () => { if (pipelineJoining && pipelineJoining !== node.id) joinPipelineNodes(node.id); });
+    box.append(card);
+  }
+  drawPipelineWires();
+}
+
+function drawPipelineWires() {
+  const wires = $("pipelineWires");
+  wires.replaceChildren();
+  for (const edge of pipeline.edges) {
+    const from = pipeline.nodes.find((node) => node.id === edge.from);
+    const to = pipeline.nodes.find((node) => node.id === edge.to);
+    if (!from || !to) continue;
+    const x1 = (from.at?.x || 0) + 200, y1 = (from.at?.y || 0) + 34;
+    const x2 = (to.at?.x || 0), y2 = (to.at?.y || 0) + 34;
+    const middle = (x1 + x2) / 2;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}`);
+    line.setAttribute("class", "pipeline-wire");
+    wires.append(line);
+    // A small cross in the middle of the arrow removes it, the way the old
+    // project did it: the thing you want to get rid of is what you press.
+    const cut = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    cut.setAttribute("cx", String(middle));
+    cut.setAttribute("cy", String((y1 + y2) / 2));
+    cut.setAttribute("r", "9");
+    cut.setAttribute("class", "pipeline-cut");
+    cut.addEventListener("click", () => {
+      pipeline.edges = pipeline.edges.filter((item) => !(item.from === edge.from && item.to === edge.to));
+      renderPipeline();
+      say(`Took the arrow from ${edge.from} to ${edge.to} out.`);
+    });
+    const cross = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    cross.setAttribute("x", String(middle));
+    cross.setAttribute("y", String((y1 + y2) / 2 + 4));
+    cross.setAttribute("class", "pipeline-cut-mark");
+    cross.textContent = "x";
+    wires.append(cut, cross);
+  }
+}
+
+function joinPipelineNodes(nodeId) {
+  if (!pipelineJoining) {
+    pipelineJoining = nodeId;
+    renderPipeline();
+    say(`Joining from ${nodeId}. Press another box to finish the arrow.`);
+    return;
+  }
+  if (pipelineJoining === nodeId) {
+    pipelineJoining = "";
+    renderPipeline();
+    say("Stopped joining.");
+    return;
+  }
+  const already = pipeline.edges.some((edge) => edge.from === pipelineJoining && edge.to === nodeId);
+  if (!already) pipeline.edges.push({from: pipelineJoining, to: nodeId});
+  const from = pipelineJoining;
+  pipelineJoining = "";
+  renderPipeline();
+  say(already ? "That arrow is already there." : `Joined ${from} to ${nodeId}.`);
+}
+
+function removePipelineNode(nodeId) {
+  pipeline.nodes = pipeline.nodes.filter((node) => node.id !== nodeId);
+  pipeline.edges = pipeline.edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId);
+  if (pipelineJoining === nodeId) pipelineJoining = "";
+  renderPipeline();
+  say(`Took ${nodeId} out.`);
+}
+
+function startPipelineDrag(event, node) {
+  if (event.target.closest("button")) return;
+  const card = event.currentTarget;
+  const box = $("pipelineCanvas").getBoundingClientRect();
+  pipelineDragging = {
+    node,
+    grabX: event.clientX - box.left - (node.at?.x || 0),
+    grabY: event.clientY - box.top - (node.at?.y || 0),
+  };
+  card.setPointerCapture(event.pointerId);
+  card.classList.add("moving");
+}
+
+function movePipelineDrag(event) {
+  if (!pipelineDragging) return;
+  const box = $("pipelineCanvas").getBoundingClientRect();
+  const node = pipelineDragging.node;
+  node.at = {
+    x: Math.max(0, event.clientX - box.left - pipelineDragging.grabX),
+    y: Math.max(0, event.clientY - box.top - pipelineDragging.grabY),
+  };
+  const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(node.id)}"]`);
+  if (card) { card.style.left = `${node.at.x}px`; card.style.top = `${node.at.y}px`; }
+  drawPipelineWires();
+}
+
+function endPipelineDrag() {
+  if (!pipelineDragging) return;
+  const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(pipelineDragging.node.id)}"]`);
+  if (card) card.classList.remove("moving");
+  pipelineDragging = null;
+}
+
+/* ---- one step's settings ---- */
+
+const PIPELINE_FIELDS = {
+  suite: {label: "Suite file, if not the usual one", placeholder: ".harness/qa/suite.json"},
+  tag: {label: "Only checks with this tag", placeholder: "fast"},
+  case: {label: "Only this one check", placeholder: "readme"},
+  paths: {label: "Only these files or folders, separated by commas", placeholder: "src, tests"},
+  needs: {label: "How much has to pass", choices: ["all", "any"]},
+  command_kind: {label: "Which command", choices: ["test", "lint", "build"]},
+  instructions: {label: "What the model should write", long: true,
+                 placeholder: "Write a test for the basket total, covering an empty basket."},
+  write_to: {label: "Save the draft as", placeholder: "basket-total.test.js"},
+};
+
+function openPipelineNode(nodeId) {
+  const node = pipeline.nodes.find((item) => item.id === nodeId);
+  if (!node) return;
+  pipelineEditing = nodeId;
+  const kind = kindOf(node.kind);
+  $("pipelineNodeDialogTitle").textContent = kind.label;
+  $("pipelineNodeSummary").textContent = kind.summary || "";
+  $("pipelineNodeLabel").value = node.label || kind.label;
+  $("pipelineNodeTries").value = String(node.settings?.tries || 1);
+  const box = $("pipelineNodeSettings");
+  box.replaceChildren();
+  for (const name of kind.settings || []) {
+    const field = PIPELINE_FIELDS[name] || {label: name};
+    const id = `pipelineSetting-${name}`;
+    box.append(Object.assign(make("label", "", field.label), {htmlFor: id}));
+    let input;
+    if (field.choices) {
+      input = make("select", "");
+      for (const choice of field.choices) {
+        const option = make("option", "", choice);
+        option.value = choice;
+        input.append(option);
+      }
+    } else if (field.long) {
+      input = make("textarea", "");
+      input.rows = 4;
+    } else {
+      input = make("input", "");
+      input.type = "text";
+    }
+    input.id = id;
+    input.dataset.setting = name;
+    if (field.placeholder) input.placeholder = field.placeholder;
+    input.value = node.settings?.[name] || "";
+    box.append(input);
+  }
+  $("pipelineNodeDialog").showModal();
+}
+
+function savePipelineNode() {
+  const node = pipeline.nodes.find((item) => item.id === pipelineEditing);
+  if (!node) return;
+  node.label = $("pipelineNodeLabel").value.trim() || kindOf(node.kind).label;
+  const settings = {};
+  for (const input of $("pipelineNodeSettings").querySelectorAll("[data-setting]")) {
+    const value = input.value.trim();
+    if (value) settings[input.dataset.setting] = value;
+  }
+  const tries = Number($("pipelineNodeTries").value) || 1;
+  if (tries > 1) settings.tries = Math.min(5, Math.max(1, Math.round(tries)));
+  node.settings = settings;
+  $("pipelineNodeDialog").close();
+  renderPipeline();
+  say(`Saved the settings for ${node.label}.`);
+}
+
+/* ---- saving, checking, running ---- */
+
+function pipelineOnScreen() {
+  return {name: $("pipelineName").value.trim() || "Pipeline", nodes: pipeline.nodes, edges: pipeline.edges};
+}
+
+async function checkPipeline() {
+  try {
+    await request("/api/pipelines/check", {
+      method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
+    });
+    say("This pipeline can run.");
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+async function savePipeline() {
+  try {
+    const said = await request("/api/pipelines/save", {
+      method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
+    });
+    pipeline = said.pipeline;
+    say(`Saved ${pipeline.name}.`);
+    const list = await request("/api/pipelines");
+    pipelineSaved = list.saved || [];
+    renderPipelineSaved();
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+async function savePipelineAs() {
+  const name = window.prompt("Save it as", `${$("pipelineName").value} copy`);
+  if (!name) return;
+  $("pipelineName").value = name;
+  await savePipeline();
+}
+
+async function deletePipeline() {
+  const name = $("pipelineName").value.trim();
+  if (!name) return;
+  if (!window.confirm(`Remove the saved pipeline "${name}"? The drawing on screen stays.`)) return;
+  try {
+    const said = await request("/api/pipelines/delete", {method: "POST", body: JSON.stringify({name})});
+    pipelineSaved = said.saved || [];
+    renderPipelineSaved();
+    say(said.note);
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+function newPipeline() {
+  pipeline = {name: "New pipeline", nodes: [], edges: []};
+  pipelineStates = new Map();
+  $("pipelineName").value = pipeline.name;
+  $("pipelineLog").replaceChildren();
+  renderPipeline();
+  renderPipelineSaved();
+  say("A fresh one. Add a step from the left.");
+}
+
+async function runPipeline() {
+  try {
+    pipelineStates = new Map();
+    $("pipelineLog").replaceChildren();
+    renderPipeline();
+    await request("/api/pipelines/run", {
+      method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
+    });
+    $("pipelineStop").disabled = false;
+    say("Running. Each step lights up as it goes.");
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+async function stopPipeline() {
+  try {
+    const said = await request("/api/pipelines/stop", {method: "POST", body: "{}"});
+    say(said.note);
+  } catch (error) { showError(error.message); }
+}
+
+// News from a run, arriving while it happens.
+function applyPipelineEvent(event) {
+  if (event.kind === "pipeline_started") {
+    $("pipelineStop").disabled = false;
+    say(`Running ${event.payload?.name || "the pipeline"}.`);
+    return;
+  }
+  if (event.kind === "pipeline_node") {
+    const result = event.payload || {};
+    pipelineStates.set(String(result.id), result);
+    renderPipeline();
+    addPipelineLogLine(result);
+    return;
+  }
+  if (event.kind === "pipeline_finished") {
+    $("pipelineStop").disabled = true;
+    showPipelineRun(event.payload || {});
+  }
+}
+
+function addPipelineLogLine(result) {
+  const log = $("pipelineLog");
+  const already = log.querySelector(`[data-node="${CSS.escape(String(result.id))}"]`);
+  const line = already || make("li", "");
+  line.dataset.node = String(result.id);
+  line.className = `pipeline-log-line ${result.state}`;
+  line.replaceChildren(
+    make("strong", "", result.label || result.id),
+    make("span", "", ` ${result.state}`),
+    make("span", "pipeline-log-said", result.said ? ` - ${result.said}` : "")
+  );
+  if (result.tries > 1) line.append(make("span", "pipeline-log-said", ` (try ${result.tries})`));
+  if (!already) log.append(line);
+}
+
+function showPipelineRun(run) {
+  for (const result of run.nodes || []) {
+    pipelineStates.set(String(result.id), result);
+    addPipelineLogLine(result);
+  }
+  renderPipeline();
+  if (run.said) say(run.said);
+}
+
+/* ---- What happens when you ask for a change ---- */
+
+// The picture on the first screen. Drawn from the workflow the harness will
+// really run, so it can never describe something the harness does not do.
+let howStages = [];
+let howWalk = null;
+// How far the walk through has got, kept as a name against a state rather than
+// a handful of boxes. Anything that redraws the picture — pressing "Draw it
+// again", news arriving from a run — replaces every box on the page, and a
+// walk holding those boxes would carry on lighting up ones nobody can see.
+let howWalkStates = new Map();
+
+async function refreshHowItWorks() {
+  try {
+    // The workflow on screen when there is one, so editing it changes this too.
+    const drawn = graph && Array.isArray(graph.nodes) && graph.nodes.length ? graph : null;
+    const said = await request("/api/how-it-works", {
+      method: "POST",
+      body: JSON.stringify(drawn ? {graph: drawn} : {}),
+    });
+    howStages = said.stages || [];
+    $("howHeadline").textContent = said.headline || "";
+    renderHowItWorks();
+    const loops = $("howLoops");
+    loops.replaceChildren();
+    for (const line of said.loops || []) loops.append(make("li", "", line));
+  } catch (error) { showError(error.message); }
+}
+
+function renderHowItWorks() {
+  const list = $("howStages");
+  list.replaceChildren();
+  howStages.forEach((stage, spot) => {
+    const item = make("li", `how-stage ${stage.kind || ""}`);
+    item.dataset.stage = stage.id;
+    // One set of words for the box's look, another for the person reading it.
+    // These used to be the same string, so a real run wrote "Working on it"
+    // into the state and nothing lit up, because the styles key on "doing".
+    const walking = howWalkStates.get(stage.id);
+    const live = walking ? "" : howState(stage.id);
+    if (walking) item.dataset.state = walking;
+    else if (live) item.dataset.state = live.look;
+    const head = make("div", "how-head");
+    head.append(make("span", "how-number", String(spot + 1)), make("strong", "", stage.title));
+    item.append(head, make("p", "", stage.detail));
+    if (live) item.append(make("p", "how-state", live.said));
+    if ((stage.goes_back_to || []).length) {
+      item.append(make("p", "how-back", "If this goes wrong, the work goes back a step."));
+    }
+    list.append(item);
+  });
+  hideArrowsAtTheEndOfARow();
+}
+
+// The boxes wrap onto as many rows as the window needs. The arrow between two
+// boxes is drawn to the right of the first one, so the last box on a row would
+// otherwise point off the edge at nothing.
+function hideArrowsAtTheEndOfARow() {
+  const boxes = [...$("howStages").children];
+  boxes.forEach((box, spot) => {
+    const next = boxes[spot + 1];
+    box.classList.toggle("row-end", !next || next.offsetTop > box.offsetTop);
+  });
+}
+
+function howState(nodeId) {
+  // The same news the workflow canvas gets, so both agree about what is
+  // happening without either being told twice. Two things come back: the word
+  // the styles colour the box by, and the words a person reads.
+  const said = nodeStatuses.get(String(nodeId));
+  if (!said) return null;
+  const known = {
+    Running: {look: "doing", said: "Working on it"},
+    Updated: {look: "doing", said: "Working on it"},
+    Passed: {look: "done", said: "Done"},
+    Failed: {look: "wrong", said: "Something was wrong"},
+  };
+  return known[said] || {look: "doing", said};
+}
+
+async function demoHowItWorks() {
+  const button = $("howDemo");
+  if (howWalk) { window.clearTimeout(howWalk); howWalk = null; }
+  howWalkStates = new Map();
+  if (!howStages.length) await refreshHowItWorks();
+  if (!howStages.length) { $("howSaid").textContent = "There is no workflow to walk through yet."; return; }
+  button.disabled = true;
+  const walking = howStages.map((stage) => stage.id);
+  const quick = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let spot = 0;
+  const step = () => {
+    if (spot > 0) howWalkStates.set(walking[spot - 1], "done");
+    if (spot >= walking.length) {
+      renderHowItWorks();
+      howWalk = null;
+      button.disabled = false;
+      $("howSaid").textContent = "That is the whole thing. Ask for a change below and it really happens.";
+      announce("The walk through finished.");
+      return;
+    }
+    howWalkStates.set(walking[spot], "doing");
+    renderHowItWorks();
+    $("howSaid").textContent = `Step ${spot + 1} of ${walking.length}: ${howStages[spot].title}`;
+    spot += 1;
+    howWalk = window.setTimeout(step, quick ? 60 : 900);
+  };
+  step();
+}
+
+async function findSeats() {
+  const button = $("findSeats");
+  button.disabled = true;
+  $("seatFindSaid").textContent = "Looking, and asking each one its version.";
+  try {
+    renderSeats(await request("/api/seats"));
+  } catch (error) { showError(error.message); $("seatFindSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+async function setUpSeats() {
+  const ready = ((seatsFound && seatsFound.seats) || []).filter((seat) => seat.ready);
+  if (!ready.length) return;
+  const button = $("setUpSeats");
+  button.disabled = true;
+  try {
+    const done = await request("/api/seats/setup", {
+      method: "POST",
+      body: JSON.stringify({kinds: ready.map((seat) => seat.kind)}),
+    });
+    $("seatWriteSaid").textContent = done.trusted
+      ? `Written to ${done.settings_file} and trusted. Routes: ${done.routes.join(", ")}.`
+      : `Written to ${done.settings_file}. ${done.note}`;
+    if (done.kept && done.kept.length) {
+      $("seatWriteSaid").textContent += ` Your other settings were kept: ${done.kept.join(", ")}.`;
+    }
+    if (done.replaced && done.replaced.length) {
+      // Writing over somebody's earlier decision is said out loud, not left
+      // for them to notice in the file.
+      $("seatWriteSaid").textContent += ` Written over: ${done.replaced.join(", ")}.`;
+    }
+    $("seatFile").textContent = done.contents;
+    $("seatFileBox").hidden = false;
+    showTheChoiceAboutTrusting(done);
+    markSeatStep("seatStepWrite", "done");
+    $("undoSeats").hidden = false;
+    markSeatStep("seatStepShare", "doing");
+    $("shareTheWork").disabled = false;
+    $("shareTheWork").dataset.routes = JSON.stringify(done.routes);
+    announce($("seatWriteSaid").textContent);
+    refreshCheckup();
+  } catch (error) { showError(error.message); $("seatWriteSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+// A settings file that was already here and never trusted is not this panel's
+// to trust on its own, and not its place to refuse either. So it says what
+// trusting would allow, in the plainest words there are, and puts the choice
+// where it belongs.
+function showTheChoiceAboutTrusting(done) {
+  const box = $("trustChoice");
+  box.replaceChildren();
+  box.hidden = !done.needs_your_say;
+  if (!done.needs_your_say) return;
+  // The mark of the file being shown, handed back when the person says they
+  // have read it, so the harness can refuse if the file changed in between.
+  box.dataset.mark = done.mark || "";
+  box.append(make("strong", "", "This file was already here. Only you can say it is yours."));
+  box.append(make("p", "", done.note || ""));
+  if ((done.risky_parts || []).length) {
+    box.append(make("p", "", "Trusting it would allow this:"));
+    const list = make("ul", "trust-risks");
+    for (const line of done.risky_parts) list.append(make("li", "", line));
+    box.append(list);
+  } else {
+    // Never a clean bill of health. This says what was looked for and what was
+    // not found, which is a different thing from "there is nothing to worry
+    // about" - and saying the second while a file quietly starts programs is
+    // the worst thing this panel could do.
+    box.append(make("p", "", "Nothing in it matched the things this knows to look for."
+      + " That is not the same as safe. Read the file above yourself."));
+  }
+  box.append(make("p", "field-help", "The whole file is shown above. Nothing else was changed."));
+  const button = make("button", "danger", "I have read it - trust it anyway");
+  button.type = "button";
+  button.addEventListener("click", () => trustItAnyway(button));
+  box.append(button);
+}
+
+async function trustItAnyway(button) {
+  button.disabled = true;
+  try {
+    const said = await request("/api/settings/trust-anyway", {
+      method: "POST", body: JSON.stringify({seen: $("trustChoice").dataset.mark || ""}),
+    });
+    $("trustChoice").replaceChildren(make("p", "do-it-worked", said.note));
+    $("seatWriteSaid").textContent += " Trusted, because you said so.";
+    announce(said.note);
+    refreshCheckup();
+  } catch (error) { showError(error.message); button.disabled = false; }
+}
+
+async function undoSeats() {
+  const button = $("undoSeats");
+  button.disabled = true;
+  try {
+    const said = await request("/api/seats/undo", {method: "POST", body: "{}"});
+    $("seatWriteSaid").textContent = said.note;
+    $("seatFileBox").hidden = true;
+    button.hidden = true;
+    markSeatStep("seatStepWrite", "doing");
+    markSeatStep("seatStepShare", "waiting");
+    $("shareTheWork").disabled = true;
+    announce(said.note);
+    refreshCheckup();
+  } catch (error) { showError(error.message); $("seatWriteSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+async function shareTheWork() {
+  const routes = JSON.parse($("shareTheWork").dataset.routes || "[]");
+  if (!routes.length) return;
+  const button = $("shareTheWork");
+  button.disabled = true;
+  try {
+    const answer = await request("/api/seats/share-the-work", {
+      method: "POST",
+      body: JSON.stringify({graph, routes}),
+    });
+    graph = answer.graph;
+    render();
+    const list = $("seatJobs");
+    list.replaceChildren();
+    for (const node of graph.nodes || []) {
+      const route = (node.config || {}).provider_route;
+      if (!route) continue;
+      const row = make("li", "seat ready");
+      row.append(make("span", "seat-state", route));
+      const detail = make("div", "");
+      detail.append(make("strong", "", node.label || node.id));
+      detail.append(make("p", "", "Can send and read notes."));
+      row.append(detail);
+      list.append(row);
+    }
+    $("seatShareSaid").textContent =
+      "Done. Open the Workflow tab to see it, then press Start run.";
+    markSeatStep("seatStepShare", "done");
+    announce($("seatShareSaid").textContent);
+  } catch (error) { showError(error.message); $("seatShareSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
 let coverageFound = null;
 
 async function findGaps() {
@@ -1431,14 +2259,14 @@ function bindEvents() {
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
-  $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
+  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", runPipeline); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("refreshMemory").addEventListener("click", refreshMemory); $("memoryQuery").addEventListener("change", refreshMemory); $("memoryKind").addEventListener("change", refreshMemory); $("refreshPrompts").addEventListener("click", refreshPrompts); $("promptLeft").addEventListener("change", renderPromptCompare); $("promptRight").addEventListener("change", renderPromptCompare);
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && edgeDrag) { event.preventDefault(); finishEdgeDrag({pointerId: edgeDrag.pointerId}, true); } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !$("agentDialog").open) { event.preventDefault(); undo(); } });
 }
 
 async function boot() {
   bindEvents();
-  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await refreshCheckup(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
+  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
 }
 
 boot();

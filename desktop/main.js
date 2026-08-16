@@ -95,7 +95,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 620,
     backgroundColor: "#071922",
-    title: "Our Harness",
+    title: "Nexus Harness",
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),

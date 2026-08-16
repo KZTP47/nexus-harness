@@ -138,15 +138,11 @@
           "note": "Only the quick docs check"
         },
         {
-          "do": "click",
-          "target": "#runChecks",
-          "note": "Run it"
-        },
-        {
-          "do": "expect_text",
-          "target": "#checkStatus",
-          "text": "Running",
-          "note": "It says it started"
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('runChecks').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Running')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
+          "text": "true",
+          "timeout_ms": 60000,
+          "note": "Pressing Run says it started"
         },
         {
           "do": "expect_text",
@@ -521,6 +517,17 @@
       "check_accessibility": true,
       "steps": [
         {
+          "do": "click",
+          "target": ".model-setup summary",
+          "note": "Open the list first, the way a person does"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.querySelector('.model-setup'); if (!box.open) box.open = true; return box.open ? 'the list is open' : 'the list would not open'",
+          "text": "the list is open",
+          "note": "However it started, it is open now"
+        },
+        {
           "do": "expect_visible",
           "target": ".model-setup"
         },
@@ -535,15 +542,16 @@
           "note": "Each way carries a written state, not only a colour"
         },
         {
-          "do": "expect_text",
-          "target": ".model-setup",
-          "text": "Never paste a key into this page"
+          "do": "run",
+          "script": "const waiting = [...document.querySelectorAll('.model-option.todo')]; if (!waiting.length) return 'every way is ready on this machine'; const withSteps = waiting.filter(card => card.querySelectorAll('.model-steps li').length); return withSteps.length === waiting.length   ? 'every way still waiting says what to do'   : 'one of them says nothing: ' + waiting.find(c => !c.querySelectorAll('.model-steps li').length).textContent.slice(0, 60)",
+          "text": "every way still waiting says what to do",
+          "note": "Every way that is not ready says exactly what to do about it"
         },
         {
-          "do": "expect_text",
-          "target": ".model-setup",
-          "text": "ollama pull",
-          "note": "It gives the exact command to run"
+          "do": "run",
+          "script": "const keyed = [...document.querySelectorAll('.model-option')]   .filter(card => card.textContent.includes('_API_KEY is not set')); if (!keyed.length) return 'no service here is waiting for a key'; return keyed.every(card => card.textContent.includes('Never paste a key into this page'))   ? 'it says where a key goes, and where it must not'   : 'one of them does not warn about the key'",
+          "text": "it says where a key goes, and where it must not",
+          "note": "And a service waiting for a key says a key never goes in this page"
         },
         {
           "do": "click",
@@ -1902,7 +1910,7 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#starterList li')]; const row = rows.find(item => item.textContent.includes('The page works at phone size')); if (!row) return 'that ready-made check is not on the shelf'; const button = [...row.querySelectorAll('button')]   .find(item => item.textContent.includes('Add this')); if (!button) return 'the row has no Add this button'; button.click(); for (let tries = 0; tries < 100; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Added the check works-on-a-phone')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "script": "document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#starterList li')]; const row = rows.find(item => item.textContent.includes('The page works at phone size')); if (!row) return 'that ready-made check is not on the shelf'; const button = [...row.querySelectorAll('button')]   .find(item => item.textContent.includes('Add this')); if (!button) return 'the row has no Add this button'; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); button.click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Added the check works-on-a-phone')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
           "text": "true",
           "timeout_ms": 20000,
           "note": "Pressing Add this adds that check and says so"
@@ -2191,7 +2199,7 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('addMissingChecks').click(); for (let tries = 0; tries < 60; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Added')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('addMissingChecks').click(); for (let tries = 0; tries < 60; tries += 1) {   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Added')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
           "text": "true",
           "note": "Pressing it writes the check and says so"
         },
@@ -2232,7 +2240,7 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; return 'the screen is clear'",
+          "script": "document.getElementById('validationStatus').textContent = '';const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); window.__everySaid = everySaid; window.__watcher = watcher; return 'the screen is clear'",
           "text": "the screen is clear",
           "note": "Empty the message box so only new words count"
         },
@@ -2243,15 +2251,15 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 100; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('report.html')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "script": "const line = document.getElementById('checkStatus'); const everySaid = window.__everySaid || [line.textContent]; const watcher = window.__watcher || {disconnect() {}}; for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('report.html')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
           "text": "true",
           "timeout_ms": 20000,
           "note": "The panel says which file it wrote"
         },
         {
-          "do": "expect_text",
-          "target": "#checkStatus",
-          "text": "send it to anyone",
+          "do": "run",
+          "script": "const everySaid = window.__everySaid || []; return everySaid.some(said => said.includes('send it to anyone'))   ? 'it says what the file is for' : 'it never said what the file is for'",
+          "text": "it says what the file is for",
           "note": "And says plainly what the file is for"
         }
       ],
@@ -2521,7 +2529,7 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('quickChecks').click(); for (let tries = 0; tries < 100; tries += 1) {   const shown = !document.getElementById('checksView').hidden;   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (shown && (said.includes('Running') || said.includes('passed')     || said.includes('failed'))) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'nothing happened'",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('quickChecks').click(); for (let tries = 0; tries < 100; tries += 1) {   const shown = !document.getElementById('checksView').hidden;   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (shown && (said.includes('Running') || said.includes('passed')     || said.includes('failed'))) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'nothing happened'",
           "text": "true",
           "timeout_ms": 20000,
           "note": "Pressing it shows the checks view and a run begins"
@@ -2571,7 +2579,7 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('saveBaselines').click(); for (let tries = 0; tries < 150; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Running') || said.includes('passed')     || said.includes('failed')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 200)); } return 'nothing happened'",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('saveBaselines').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Running') || said.includes('passed')     || said.includes('failed')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 200)); } return 'nothing happened'",
           "text": "true",
           "timeout_ms": 40000,
           "note": "Pressing it really starts taking the pictures"
@@ -2727,34 +2735,34 @@
         },
         {
           "do": "run",
-          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
           "text": "nothing of mine is left",
           "note": "Nothing left over from an earlier run",
           "timeout_ms": 30000
         },
         {
           "do": "run",
-          "script": "await request('/api/qa/add', {method: 'POST', body: JSON.stringify({starter: 'works-on-a-phone', url: ''})}); await refreshChecks(); const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('works-on-a-phone')); return row ? 'the check is in the table' : 'it is not in the table'",
+          "script": "await request('/api/qa/add', {method: 'POST', body: JSON.stringify({starter: 'page-is-quick', url: ''})}); await refreshChecks(); const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('page-is-quick')); return row ? 'the check is in the table' : 'it is not in the table'",
           "text": "the check is in the table",
           "timeout_ms": 20000,
           "note": "A check to remove is put in first"
         },
         {
           "do": "run",
-          "script": "window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('works-on-a-phone')); const button = [...row.querySelectorAll('button')]   .find(b => b.textContent.trim() === 'Remove'); if (!button) return 'the row has no Remove button'; button.click(); for (let tries = 0; tries < 100; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Took works-on-a-phone out')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "script": "window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('page-is-quick')); const button = [...row.querySelectorAll('button')]   .find(b => b.textContent.trim() === 'Remove'); if (!button) return 'the row has no Remove button'; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); button.click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Took page-is-quick out')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
           "text": "true",
           "timeout_ms": 20000,
           "note": "Pressing Remove really takes it out and says so"
         },
         {
           "do": "run",
-          "script": "const now = await request('/api/qa/suite'); return (now.cases || []).some(c => c.id === 'works-on-a-phone') ? 'it is still there' : 'it is really gone'",
+          "script": "const now = await request('/api/qa/suite'); return (now.cases || []).some(c => c.id === 'page-is-quick') ? 'it is still there' : 'it is really gone'",
           "text": "it is really gone",
           "note": "And it is gone from the suite"
         },
         {
           "do": "run",
-          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
           "text": "nothing of mine is left",
           "always": true,
           "note": "This check leaves the project exactly as it found it",
@@ -3027,6 +3035,598 @@
           "text": "the drawing is as it was",
           "always": true,
           "note": "Take the box off again whatever happened"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-finding-the-assistants-on-this-machine",
+      "title": "Find what is on this machine really looks, and says what it found",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "seats"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#findSeats",
+          "note": "The button is offered"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('setUpSeats').disabled ? 'nothing can be set up before looking' : 'it offered to set up too early'",
+          "text": "nothing can be set up before looking",
+          "note": "Nothing can be written before anything has been found"
+        },
+        {
+          "do": "click",
+          "target": "#findSeats",
+          "note": "Press the button itself"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const rows = document.querySelectorAll('#seatList li');   if (rows.length > 0) return 'it listed what it found';   await new Promise(r => setTimeout(r, 250)); } return 'it never listed anything'",
+          "text": "it listed what it found",
+          "timeout_ms": 60000,
+          "note": "It lists every assistant it knows about"
+        },
+        {
+          "do": "run",
+          "script": "const said = document.getElementById('seatFindSaid').textContent; return /are ready to use|on this machine yet/.test(said)   ? 'it said how many are ready' : ('it said: ' + said)",
+          "text": "it said how many are ready",
+          "note": "And says plainly how many can be used"
+        },
+        {
+          "do": "run",
+          "script": "const rows = [...document.querySelectorAll('#seatList li')]; const marked = rows.every(row => /Ready|Not here/.test(row.textContent)); return marked ? 'each one says whether it is there' : 'a row said neither'",
+          "text": "each one says whether it is there",
+          "note": "Each one is marked ready or not"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('seatStepFind').classList.contains('done') ? 'step one is done' : 'step one still looks unfinished'",
+          "text": "step one is done",
+          "note": "The first step is marked done"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-setting-up-a-seat-writes-shares-and-puts-it-back",
+      "title": "The three seat buttons do the whole job, and Put my settings back undoes it",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "seats"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "click",
+          "target": "#findSeats",
+          "note": "Look first"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatList li').length) break;   await new Promise(r => setTimeout(r, 250)); } if (document.getElementById('setUpSeats').disabled)   return 'no assistant is ready on this machine'; document.getElementById('validationStatus').textContent = ''; document.getElementById('setUpSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('trusted') || said.includes('Written to'))     return 'it wrote the settings';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
+          "text": "it wrote the settings",
+          "timeout_ms": 90000,
+          "note": "Pressing it writes the settings and says so"
+        },
+        {
+          "do": "run",
+          "script": "const shown = document.getElementById('seatFile').textContent; return shown.includes('providers') && shown.includes('kind')   ? 'it showed the file it wrote' : 'it showed nothing useful'",
+          "text": "it showed the file it wrote",
+          "note": "And shows exactly what went into the file"
+        },
+        {
+          "do": "run",
+          "script": "const button = document.getElementById('shareTheWork'); if (button.disabled) return 'the next step is still shut'; const handed = button.dataset.routes || ''; return handed.includes('claude') || handed.includes('copilot')   ? 'the next step was handed the routes'   : 'the next step was handed nothing: ' + handed",
+          "text": "the next step was handed the routes",
+          "note": "Setting up hands the real routes to the sharing button"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('undoSeats').hidden   ? 'no way back was offered' : 'it offers a way back'",
+          "text": "it offers a way back",
+          "note": "And offers a way back"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('shareTheWork').click(); for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatJobs li').length)     return 'it shared the work out';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'nothing happened'",
+          "text": "it shared the work out",
+          "timeout_ms": 60000,
+          "note": "Pressing share gives each agent a seat"
+        },
+        {
+          "do": "run",
+          "script": "const withSeats = (graph.nodes || []).filter(n => (n.config || {}).provider_route); if (!withSeats.length) return 'no agent got a seat'; const talk = withSeats.every(n => (n.config.capabilities || []).includes('team.message')); return talk ? 'every one of them can send notes' : 'one of them cannot send notes'",
+          "text": "every one of them can send notes",
+          "note": "And lets each of them send notes to the others"
+        },
+        {
+          "do": "run",
+          "script": "const coder = (graph.nodes || []).find(n => n.type === 'coder'); return coder && (coder.config.capabilities || []).includes('workspace.write')   ? 'the one writing code may write files' : 'the coder cannot write'",
+          "text": "the one writing code may write files",
+          "note": "The agent that writes code may write files"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('undoSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   if (said.includes('put back') || said.includes('removed'))     return 'it put them back';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
+          "text": "it put them back",
+          "timeout_ms": 90000,
+          "always": true,
+          "note": "Pressing put back undoes it, whatever happened above"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('undoSeats').hidden   && document.getElementById('shareTheWork').disabled   ? 'the steps went back too' : 'the steps still look done'",
+          "text": "the steps went back too",
+          "always": true,
+          "note": "And the steps go back to where they were"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-the-picture-of-the-workflow-is-real",
+      "title": "The picture on the first screen is drawn from the real workflow",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "how"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#howStages li').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('#howStages li').length; return boxes ? 'it drew ' + boxes + ' steps' : 'it drew nothing'",
+          "text": "it drew 9 steps",
+          "timeout_ms": 60000,
+          "note": "It draws one box per step of the workflow"
+        },
+        {
+          "do": "run",
+          "script": "const drawn = [...document.querySelectorAll('#howStages li')]   .map(box => box.dataset.stage); const real = (graph.nodes || []).map(node => node.id); return JSON.stringify(drawn) === JSON.stringify(real.filter(id => drawn.includes(id)))   && drawn.length === real.length   ? 'every box is a real part of the workflow'   : 'the picture and the workflow disagree: ' + JSON.stringify(drawn)",
+          "text": "every box is a real part of the workflow",
+          "note": "And every box is a node the harness will really run"
+        },
+        {
+          "do": "run",
+          "script": "return document.querySelectorAll('#howLoops li').length   ? 'it says when the work goes back a step'   : 'it never says the work goes back'",
+          "text": "it says when the work goes back a step",
+          "note": "It says where the work can go back to an earlier step"
+        },
+        {
+          "do": "click",
+          "target": "#howRefresh",
+          "note": "Draw it again really redraws it"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 100; tries += 1) {   if (document.querySelectorAll('#howStages li').length) break;   await new Promise(r => setTimeout(r, 200)); } return document.querySelectorAll('#howStages li').length   ? 'it is still drawn' : 'redrawing emptied it'",
+          "text": "it is still drawn",
+          "timeout_ms": 30000,
+          "note": "Drawing it again leaves a picture, not an empty box"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('howDemo').click(); let sawOne = false; for (let tries = 0; tries < 200; tries += 1) {   if ([...document.querySelectorAll('#howStages li')]        .some(box => box.dataset.state === 'doing')) sawOne = true;   if (!document.getElementById('howDemo').disabled) break;   await new Promise(r => setTimeout(r, 100)); } const all = [...document.querySelectorAll('#howStages li')]   .every(box => box.dataset.state === 'done'); if (!sawOne) return 'it never lit a step up'; return all ? 'it walked through every step' : 'it stopped part way'",
+          "text": "it walked through every step",
+          "timeout_ms": 60000,
+          "note": "Show me how it works lights each step up in turn"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('howSaid').textContent.includes('whole thing')   ? 'it says it finished' : 'it never said it finished'",
+          "text": "it says it finished",
+          "note": "And says so plainly at the end"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-just-do-it-for-me-does-the-work",
+      "title": "I don't care, just do it for me runs the job and says what is left for you",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "setup"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.model-option').length) break;   await new Promise(r => setTimeout(r, 250)); } const box = document.querySelector('.model-setup'); if (box) box.open = true; const buttons = [...document.querySelectorAll('button')]   .filter(b => b.textContent.includes(\"I don't care, just do it for me\")); return buttons.length ? 'there are ' + buttons.length + ' of them'   : 'no card offers to do it for you'",
+          "text": "there are 7 of them",
+          "timeout_ms": 60000,
+          "note": "Every way of connecting a model offers to do it for you"
+        },
+        {
+          "do": "run",
+          "script": "const safeOnes = ['anthropic', 'openai', 'gemini']; const cards = [...document.querySelectorAll('.model-option')]; const safe = cards.find(card => {   const button = [...card.querySelectorAll('button')]     .find(b => b.textContent.includes(\"I don't care, just do it for me\"));   return button && safeOnes.includes(button.dataset.option)     && card.textContent.includes('is not set'); }); if (!safe) return 'every service on this machine already has a key, so nothing was pressed'; const button = [...safe.querySelectorAll('button')]   .find(b => b.textContent.includes(\"I don't care, just do it for me\")); window.__whichOption = button.dataset.option; return 'found one that cannot finish on its own'",
+          "text": "found one that cannot finish on its own",
+          "note": "Pick one that cannot write anything: a service still waiting for a key"
+        },
+        {
+          "do": "run",
+          "script": "const option = window.__whichOption; const button = document.querySelector('button[data-option=\"' + option + '\"]'); button.click(); for (let tries = 0; tries < 300; tries += 1) {   const said = document.getElementById('doIt-' + option);   if (said && !said.hidden && said.querySelectorAll('.do-it-step').length)     return 'it showed what it was doing';   await new Promise(r => setTimeout(r, 250)); } return 'it never showed anything'",
+          "text": "it showed what it was doing",
+          "timeout_ms": 90000,
+          "note": "Pressing it shows each thing it does, one line at a time"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 300; tries += 1) {   const said = document.getElementById('doIt-' + window.__whichOption);   if (said && said.querySelector('.do-it-cannot')) return 'it says what is left for you';   await new Promise(r => setTimeout(r, 250)); } return 'it never said what is left'",
+          "text": "it says what is left for you",
+          "timeout_ms": 90000,
+          "note": "And says plainly the one part only a person can do"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const buttons = [...document.querySelectorAll('button')]     .filter(b => b.textContent.includes(\"I don't care, just do it for me\"));   if (buttons.length && buttons.every(b => !b.disabled))     return 'the buttons work again';   await new Promise(r => setTimeout(r, 250)); } return 'the buttons stayed shut'",
+          "text": "the buttons work again",
+          "timeout_ms": 60000,
+          "note": "When the job ends every button can be pressed again"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('doIt-' + window.__whichOption)   .textContent.includes('Left for you')   ? 'it wrote nothing and said why' : 'it did not say what it left'",
+          "text": "it wrote nothing and said why",
+          "note": "Nothing was written, because the one part left is nobody's job but yours"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-trusting-a-file-somebody-else-left-behind",
+      "title": "The panel warns about an untrusted settings file, and checks you read the one you trust",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "seats"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "const asked = await request('/api/seats'); showTheChoiceAboutTrusting({   needs_your_say: true,   note: 'It was already here and nobody has said it is theirs.',   risky_parts: ['The route theirs starts this program: curl http://elsewhere.example'],   mark: 'not-the-mark-of-anything', }); const box = document.getElementById('trustChoice'); return box.hidden ? 'it said nothing' : 'it put the choice in front of me'",
+          "text": "it put the choice in front of me",
+          "note": "It puts the choice in front of the person, rather than deciding"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('trustChoice'); return box.textContent.includes('curl http://elsewhere.example')   ? 'it named what trusting would allow'   : 'it warned without saying what about'",
+          "text": "it named what trusting would allow",
+          "note": "And names exactly what in the file carries the risk"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; showTheChoiceAboutTrusting({needs_your_say: true, note: 'x',   risky_parts: [], mark: 'a-mark-from-some-other-file'}); const button = [...document.querySelectorAll('#trustChoice button')]   .find(b => b.textContent.includes('I have read it - trust it anyway')); button.click(); for (let tries = 0; tries < 200; tries += 1) {   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.includes('changed since it was shown'))     return 'it refuses to trust a file that changed';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it trusted it anyway'",
+          "text": "it refuses to trust a file that changed",
+          "timeout_ms": 60000,
+          "note": "Saying you have read it is checked against the file you were shown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-draws-the-pipeline-and-joins-steps-up",
+      "title": "The pipelines view draws a pipeline, and its buttons really join and cut",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#pipelineNodes .pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('#pipelineNodes .pipeline-node').length; const wires = document.querySelectorAll('.pipeline-wire').length; return boxes && wires ? 'it drew boxes and wires' : 'it drew nothing'",
+          "text": "it drew boxes and wires",
+          "timeout_ms": 60000,
+          "note": "It opens with a pipeline drawn, boxes and arrows and all"
+        },
+        {
+          "do": "run",
+          "script": "const kinds = document.querySelectorAll('#pipelinePalette .pipeline-add').length; return kinds > 5 ? 'every kind of step is on the left' : 'only ' + kinds + ' kinds'",
+          "text": "every kind of step is on the left",
+          "note": "Every kind of step the harness can run is there to add"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.querySelectorAll('.pipeline-node').length; const add = [...document.querySelectorAll('#pipelinePalette .pipeline-add')]   .find(b => b.dataset.kind === 'git_repo'); add.click(); const after = document.querySelectorAll('.pipeline-node').length; return after === before + 1 ? 'pressing one adds a step' : 'nothing was added'",
+          "text": "pressing one adds a step",
+          "note": "Pressing a kind on the left really adds that step"
+        },
+        {
+          "do": "run",
+          "script": "const boxes = [...document.querySelectorAll('.pipeline-node')]; const last = boxes[boxes.length - 1]; const first = boxes[0]; const wiresBefore = document.querySelectorAll('.pipeline-wire').length; [...first.querySelectorAll('button')].find(b => b.textContent === 'Connect').click(); [...last.querySelectorAll('button')].find(b => b.textContent === 'Connect').click(); const wiresAfter = document.querySelectorAll('.pipeline-wire').length; return wiresAfter === wiresBefore + 1   ? 'Connect really draws an arrow' : 'no arrow was drawn'",
+          "text": "Connect really draws an arrow",
+          "note": "Connect on one box then another really joins them"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.querySelectorAll('.pipeline-wire').length; document.querySelector('.pipeline-cut').dispatchEvent(   new MouseEvent('click', {bubbles: true})); const after = document.querySelectorAll('.pipeline-wire').length; return after === before - 1 ? 'the cross really cuts an arrow' : 'the arrow stayed'",
+          "text": "the cross really cuts an arrow",
+          "note": "The small cross on an arrow really takes it out"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.querySelectorAll('.pipeline-node').length; const boxes = [...document.querySelectorAll('.pipeline-node')]; const last = boxes[boxes.length - 1]; [...last.querySelectorAll('button')].find(b => b.textContent === 'Remove').click(); const after = document.querySelectorAll('.pipeline-node').length; return after === before - 1 ? 'Remove really takes a step out' : 'the step stayed'",
+          "text": "Remove really takes a step out",
+          "note": "Remove on a box really takes that step out"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineCheck').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('can run')))     { watcher.disconnect(); return 'it says the pipeline can run'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'it never said: ' + everySaid.join(' | ')",
+          "text": "it says the pipeline can run",
+          "timeout_ms": 60000,
+          "note": "Check it says plainly whether the pipeline would run"
+        },
+        {
+          "do": "run",
+          "script": "refreshPipelines = async () => {}; const boxes = [...document.querySelectorAll('.pipeline-node')]; const a = boxes[0].dataset.node, b = boxes[1].dataset.node; pipeline.edges.push({from: a, to: b}, {from: b, to: a});const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineCheck').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('circle')))     { watcher.disconnect(); return 'it refuses a pipeline that goes round'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'it let a circle through: ' + everySaid.join(' | ')",
+          "text": "it refuses a pipeline that goes round",
+          "timeout_ms": 60000,
+          "note": "A pipeline that goes round in a circle is refused, with a reason"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineNew",
+          "note": "Start a fresh one clears the board"
+        },
+        {
+          "do": "run",
+          "script": "return document.querySelectorAll('.pipeline-node').length === 0   ? 'a fresh one is empty' : 'the old one is still there'",
+          "text": "a fresh one is empty",
+          "note": "And a fresh one really is empty"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-a-steps-settings-are-really-saved",
+      "title": "Settings on a step open, save, and stay saved",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const box = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'scan'); if (!box) return 'there is no scan step to open'; [...box.querySelectorAll('button')].find(b => b.textContent === 'Settings').click(); return document.getElementById('pipelineNodeDialog').open   ? 'the settings window opened' : 'nothing opened'",
+          "text": "the settings window opened",
+          "timeout_ms": 60000,
+          "note": "Settings on a step opens a window for that step"
+        },
+        {
+          "do": "run",
+          "script": "const fields = document.querySelectorAll('#pipelineNodeSettings [data-setting]'); return fields.length ? 'it asks for what that kind needs'   : 'it asks for nothing at all'",
+          "text": "it asks for what that kind needs",
+          "note": "And asks only for what that kind of step needs"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('pipelineNodeLabel').value = 'Read only the readme'; const field = document.querySelector('#pipelineNodeSettings [data-setting=\"paths\"]'); if (field) field.value = 'README.md'; document.getElementById('pipelineNodeTries').value = '3'; document.getElementById('pipelineNodeSave').click(); const node = pipeline.nodes.find(item => item.id === 'scan'); return node.label === 'Read only the readme' && node.settings.tries === 3   ? 'what was typed in was really saved'   : 'it was not saved: ' + JSON.stringify(node)",
+          "text": "what was typed in was really saved",
+          "note": "Saving really keeps what was typed in"
+        },
+        {
+          "do": "run",
+          "script": "const box = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'scan'); return box.textContent.includes('Read only the readme')   ? 'the box on the board shows the new name' : 'the board did not change'",
+          "text": "the box on the board shows the new name",
+          "note": "And the box on the board says so"
+        },
+        {
+          "do": "run",
+          "script": "const before = JSON.stringify(pipeline.nodes.find(n => n.id === 'scan')); const box = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'scan'); [...box.querySelectorAll('button')].find(b => b.textContent === 'Settings').click(); document.getElementById('pipelineNodeLabel').value = 'Something else entirely'; document.getElementById('pipelineNodeCancel').click(); const after = JSON.stringify(pipeline.nodes.find(n => n.id === 'scan')); if (document.getElementById('pipelineNodeDialog').open) return 'it stayed open'; return before === after ? 'Cancel changes nothing' : 'Cancel changed something'",
+          "text": "Cancel changes nothing",
+          "note": "Cancel closes the window and leaves the step as it was"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-really-runs-one-and-lights-the-steps-up",
+      "title": "Run really runs a pipeline, lights each step up, and gates the rest",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'Watched while it runs', nodes: [   {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 60}},   {id: 'scan', kind: 'security_scan', label: 'Scan the readme',    settings: {paths: 'README.md'}, at: {x: 300, y: 60}},   {id: 'gate', kind: 'security_gate', label: 'Gate',    settings: {needs: 'all'}, at: {x: 560, y: 60}},   {id: 'keep', kind: 'artifact', label: 'Evidence',    settings: {}, at: {x: 820, y: 60}} ], edges: [   {from: 'start', to: 'scan'}, {from: 'scan', to: 'gate'},   {from: 'gate', to: 'keep'} ]}; document.getElementById('pipelineName').value = 'Watched while it runs'; renderPipeline(); return document.querySelectorAll('.pipeline-node').length === 4   ? 'a small pipeline is on the board' : 'the board is wrong'",
+          "text": "a small pipeline is on the board",
+          "timeout_ms": 60000,
+          "note": "Put a small pipeline on the board that only reads"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineRun",
+          "note": "Press Run"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 400; tries += 1) {   const lines = document.querySelectorAll('#pipelineLog li').length;   const stopped = document.getElementById('pipelineStop').disabled;   if (lines >= 4 && stopped) return 'every step reported';   await new Promise(r => setTimeout(r, 250)); } return 'it never finished'",
+          "text": "every step reported",
+          "timeout_ms": 120000,
+          "note": "Every step says what happened, as it happens"
+        },
+        {
+          "do": "run",
+          "script": "const states = [...document.querySelectorAll('.pipeline-node')]   .map(node => node.dataset.state || 'none'); return states.every(state => state === 'passed')   ? 'every box went green' : 'the boxes say ' + states.join(', ')",
+          "text": "every box went green",
+          "note": "And every box on the board shows how it went"
+        },
+        {
+          "do": "run",
+          "script": "const log = document.getElementById('pipelineLog').textContent; return log.includes('Start') && log.includes('Gate')   ? 'the log names each step' : 'the log is missing steps'",
+          "text": "the log names each step",
+          "note": "The log underneath names each step and what it said"
+        },
+        {
+          "do": "run",
+          "script": "pipeline.nodes.find(n => n.id === 'scan').settings =   {paths: 'a-file-that-is-not-here.txt'}; renderPipeline(); document.getElementById('pipelineRun').click(); for (let tries = 0; tries < 400; tries += 1) {   const stopped = document.getElementById('pipelineStop').disabled;   const lines = document.querySelectorAll('#pipelineLog li').length;   if (lines >= 4 && stopped) break;   await new Promise(r => setTimeout(r, 250)); } const keep = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'keep'); return keep.dataset.state === 'skipped'   ? 'a shut gate stops the work going on'   : 'the work carried on: ' + keep.dataset.state",
+          "text": "a shut gate stops the work going on",
+          "timeout_ms": 120000,
+          "note": "When a step before a gate fails, the work after it is skipped"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineStop').disabled = false; document.getElementById('pipelineStop').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('will stop')))     { watcher.disconnect(); return 'Stop says the run will stop'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'Stop said nothing: ' + everySaid.join(' | ')",
+          "text": "Stop says the run will stop",
+          "timeout_ms": 60000,
+          "note": "Stop asks the run to stop after the step it is on"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-saving-and-removing-a-pipeline",
+      "title": "A pipeline can be saved, opened again, and removed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const there = await request('/api/pipelines'); if ((there.saved || []).includes('Checked by a check')) {   await request('/api/pipelines/delete',     {method: 'POST', body: JSON.stringify({name: 'Checked by a check'})}); } return 'nothing left over from before'",
+          "text": "nothing left over from before",
+          "timeout_ms": 60000,
+          "note": "Nothing left over from an earlier run"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('pipelineName').value = 'Checked by a check'; document.getElementById('validationStatus').textContent = '';const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineSave').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Saved')))     { watcher.disconnect(); return 'it saved the pipeline'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'nothing happened: ' + everySaid.join(' | ')",
+          "text": "it saved the pipeline",
+          "timeout_ms": 60000,
+          "note": "Save really saves it"
+        },
+        {
+          "do": "run",
+          "script": "const names = [...document.querySelectorAll('.pipeline-saved-one')]   .map(button => button.textContent); return names.includes('Checked by a check')   ? 'it is listed on the left' : 'it is not listed: ' + names.join(', ')",
+          "text": "it is listed on the left",
+          "note": "And it appears in the list of saved ones"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'Checked by a check two'; const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineSaveAs').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Checked by a check two')))     { watcher.disconnect(); break; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); const listed = [...document.querySelectorAll('.pipeline-saved-one')]   .map(item => item.textContent); if (!listed.includes('Checked by a check two'))   return 'Save as did not save a second one: ' + listed.join(', '); await request('/api/pipelines/delete',   {method: 'POST', body: JSON.stringify({name: 'Checked by a check two'})}); document.getElementById('pipelineName').value = 'Checked by a check'; return 'Save as really saves it under the new name'",
+          "text": "Save as really saves it under the new name",
+          "timeout_ms": 60000,
+          "always": true,
+          "note": "Save as saves a second copy under the name you give it"
+        },
+        {
+          "do": "run",
+          "script": "refreshPipelines = refreshPipelines; const wanted = pipeline.nodes.map(node => node.id).sort().join(','); newPipeline(); if (document.querySelectorAll('.pipeline-node').length)   return 'the board did not empty'; document.getElementById('validationStatus').textContent = ''; const button = [...document.querySelectorAll('.pipeline-saved-one')]   .find(item => item.textContent === 'Checked by a check'); if (!button) return 'the saved one is not in the list'; button.click(); for (let tries = 0; tries < 200; tries += 1) {   const back = pipeline.nodes.map(node => node.id).sort().join(',');   if (back === wanted && document.getElementById('pipelineName').value === 'Checked by a check')     return 'opening it really brings the steps back';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'the steps never came back'",
+          "text": "opening it really brings the steps back",
+          "timeout_ms": 60000,
+          "note": "Pressing a saved one really loads it back, steps and all"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; document.getElementById('pipelineDelete').click(); for (let tries = 0; tries < 200; tries += 1) {   const names = [...document.querySelectorAll('.pipeline-saved-one')]     .map(item => item.textContent);   if (!names.includes('Checked by a check')) return 'removing it really removes it';   await new Promise(r => setTimeout(r, 250)); } return 'it is still there'",
+          "text": "removing it really removes it",
+          "timeout_ms": 60000,
+          "always": true,
+          "note": "Delete really removes it, and leaves the project as it was"
         }
       ],
       "expect": {

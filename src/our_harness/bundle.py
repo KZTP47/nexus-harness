@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from . import __version__
+from . import PRODUCT_NAME, __version__
 from .config import LoadedConfig
 from .models import HarnessError
 from .redaction import CredentialRedactor
@@ -280,7 +280,7 @@ def build(
             writer.text("machine.json", json.dumps(_machine_notes(), indent=2, sort_keys=True))
         manifest = {
             "schema_version": 1,
-            "made_by": f"Our Harness {__version__}",
+            "made_by": f"{PRODUCT_NAME} {__version__}",
             "made_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "project": root.name,
             "parts": list(wanted),

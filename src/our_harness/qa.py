@@ -2173,7 +2173,7 @@ class QaRunner:
 
 
 _BROWSER_SCRIPT = r"""
-// Written by Our Harness for one browser case. It is deleted after the run.
+// Written by Nexus Harness for one browser case. It is deleted after the run.
 const { chromium } = require('playwright');
 const plan = __PLAN__;
 
@@ -2198,7 +2198,16 @@ function auditPage() {
     if (!labelled) add('A form field has no label', field.outerHTML.slice(0, 120));
   }
   for (const control of document.querySelectorAll('button, a[href], [role="button"]')) {
+    // Something the page is not drawing right now cannot be read out either,
+    // and nobody can reach it, so it is not a problem to report. It matters:
+    // innerText is empty for anything inside a folded-away panel, so without
+    // this every button in one would be called nameless when it is not.
+    // The words on a control are its name whether the page is drawing them
+    // this second or not. innerText is empty for anything inside a folded-away
+    // panel, and reading only that called every button in one nameless when
+    // each had a perfectly good name written on it.
     const name = (control.innerText || '').trim()
+      || (control.textContent || '').trim()
       || control.getAttribute('aria-label')
       || control.getAttribute('title');
     if (!name) add('A button or link has no readable name', control.outerHTML.slice(0, 120));

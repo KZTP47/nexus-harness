@@ -439,7 +439,7 @@ class BenchmarkTests(unittest.TestCase):
                 exit_code = main(["benchmark", "--format", "markdown", "--output", str(output)])
             self.assertEqual(exit_code, 0)
             self.assertEqual(stdout.getvalue().strip(), str(output.resolve()))
-            self.assertIn("Our Harness benchmark", output.read_text(encoding="utf-8"))
+            self.assertIn("Nexus Harness benchmark", output.read_text(encoding="utf-8"))
 
             stdout = io.StringIO()
             with patch("our_harness.cli.run_benchmark", return_value=self.result), redirect_stdout(stdout):

@@ -1,7 +1,7 @@
 {
   "name": "our-harness-desktop",
   "version": "0.1.0",
-  "description": "Desktop window for the Our Harness control panel",
+  "description": "Desktop window for the Nexus Harness control panel",
   "main": "main.js",
   "private": true,
   "scripts": {
@@ -42,5 +42,5 @@
       "output": "build-output"
     }
   },
-  "author": "Our Harness"
+  "author": "Nexus Harness"
 }

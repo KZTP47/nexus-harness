@@ -64,7 +64,7 @@ def build_file(service: str, *, suite: str = "", python: str = "3.11") -> tuple[
     suite_part = f" --suite {suite}" if suite else ""
     if key == "github":
         body = f"""# Runs the harness checks on every change.
-# Written by Our Harness. Change it freely; it is only a starting point.
+# Written by Nexus Harness. Change it freely; it is only a starting point.
 name: Checks
 
 on:
@@ -98,7 +98,7 @@ jobs:
 """
     else:
         body = f"""# Runs the harness checks on every change.
-# Written by Our Harness. Change it freely; it is only a starting point.
+# Written by Nexus Harness. Change it freely; it is only a starting point.
 checks:
   image: python:{_yaml_text(python)}
   script:

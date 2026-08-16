@@ -179,6 +179,8 @@ class WatcherSurvivalTests(unittest.TestCase):
 
 class AdviceCacheTests(unittest.TestCase):
     def test_changing_the_model_changes_the_advice(self) -> None:
+        from unittest import mock
+
         from our_harness import provider_help
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -188,10 +190,15 @@ class AdviceCacheTests(unittest.TestCase):
                 "name": "ollama", "model": "qwen2.5-coder:7b",
                 "endpoint": "http://127.0.0.1:11434",
             })
-            first = repr(provider_help.setup_advice(LoadedConfig(data, root, [], {})))
-            changed = copy.deepcopy(data)
-            changed["provider"]["model"] = "llama3.1:70b"
-            second = repr(provider_help.setup_advice(LoadedConfig(changed, root, [], {})))
+            # Nothing listening, said so here rather than found out by asking
+            # the machine. This test used to make a real call to the local
+            # address, and passed or failed depending on whether the person
+            # running it happened to have Ollama running.
+            with mock.patch.object(provider_help, "_reachable", lambda *a, **k: False):
+                first = repr(provider_help.setup_advice(LoadedConfig(data, root, [], {})))
+                changed = copy.deepcopy(data)
+                changed["provider"]["model"] = "llama3.1:70b"
+                second = repr(provider_help.setup_advice(LoadedConfig(changed, root, [], {})))
             self.assertIn("qwen2.5-coder:7b", first)
             self.assertIn("llama3.1:70b", second)
             self.assertNotIn("qwen2.5-coder:7b", second)

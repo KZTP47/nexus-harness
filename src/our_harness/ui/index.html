@@ -23,6 +23,7 @@
     <button type="button" data-view="start" aria-pressed="true" title="Set up your project and ask for a change">Start here</button>
     <button type="button" data-view="checks" aria-pressed="false" title="Your tests: what a working project looks like">Checks</button>
     <button type="button" data-view="workflow" aria-pressed="false" title="For later: rewire the agents yourself">Workflow</button>
+    <button type="button" data-view="pipelines" aria-pressed="false" title="Wire many jobs together with gates between them">Pipelines</button>
     <button type="button" data-view="history" aria-pressed="false" title="What past runs did, step by step">History</button>
     <button type="button" data-view="memory" aria-pressed="false" title="What the harness has learnt about this project">Memory</button>
     <button type="button" data-view="prompts" aria-pressed="false" title="How the harness instructions changed over time">Prompt history</button>
@@ -39,6 +40,73 @@
       </div>
       <p id="checkupSummary" class="callout" role="status">Looking at your project.</p>
       <ol id="checkupSteps" class="step-list"></ol>
+    </section>
+
+    <section class="glass data-panel" aria-labelledby="howTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="howTitle">What happens when you ask for a change</h2>
+          <p id="howHeadline">This is the real workflow, drawn from the steps the harness will actually run.</p>
+        </div>
+        <div class="button-row">
+          <button id="howDemo" class="primary" type="button">Show me how it works</button>
+          <button id="howRefresh" type="button">Draw it again</button>
+        </div>
+      </div>
+      <ol id="howStages" class="how-stages" aria-live="polite"></ol>
+      <p id="howSaid" class="field-help" role="status">Press "Show me how it works" to watch the harness walk through it.</p>
+      <details class="how-loops">
+        <summary>When does it go back a step?</summary>
+        <ul id="howLoops" class="how-loop-list"></ul>
+      </details>
+      <p class="field-help">Every box here is one agent or one check in the Workflow tab. Change it there and this picture changes with it.</p>
+    </section>
+
+    <section class="glass data-panel" aria-labelledby="seatsTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="seatsTitle">Use a subscription you already pay for</h2>
+          <p>Claude and GitHub Copilot each ship a command line tool that is already signed in. If your organisation pays for a seat, the harness can use it, and you need no key at all.</p>
+        </div>
+        <button id="findSeats" class="primary" type="button">Find what is on this machine</button>
+      </div>
+      <ol id="seatSteps" class="seat-steps">
+        <li id="seatStepFind" class="seat-step doing">
+          <span class="seat-mark">1</span>
+          <div>
+            <strong>Find the assistants</strong>
+            <p id="seatFindSaid">Press the button. Nothing is changed by looking.</p>
+            <ul id="seatList" class="seat-list"></ul>
+          </div>
+        </li>
+        <li id="seatStepWrite" class="seat-step waiting">
+          <span class="seat-mark">2</span>
+          <div>
+            <strong>Write the settings and trust them</strong>
+            <p id="seatWriteSaid">One route per assistant, written into your own settings file. Trusting it is what lets the harness start those tools.</p>
+            <div class="button-row">
+              <button id="setUpSeats" type="button" disabled>Set it up for me</button>
+              <button id="undoSeats" type="button" hidden>Put my settings back</button>
+            </div>
+            <details id="seatFileBox" hidden>
+              <summary>What was written</summary>
+              <pre id="seatFile"></pre>
+            </details>
+            <div id="trustChoice" class="trust-choice" role="group" aria-label="Trusting the settings file" hidden></div>
+          </div>
+        </li>
+        <li id="seatStepShare" class="seat-step waiting">
+          <span class="seat-mark">3</span>
+          <div>
+            <strong>Share the work out</strong>
+            <p id="seatShareSaid">Give each agent one of the seats, and let them send notes to each other. With two seats the reviewer goes on the other assistant from the coder, so they do not share a blind spot.</p>
+            <div class="button-row">
+              <button id="shareTheWork" type="button" disabled>Share the work out</button>
+            </div>
+            <ul id="seatJobs" class="seat-list"></ul>
+          </div>
+        </li>
+      </ol>
     </section>
 
     <section class="glass data-panel" aria-labelledby="firstTaskTitle">
@@ -285,6 +353,64 @@
       </div>
     </section>
   </main>
+
+  <div id="pipelinesView" data-view-panel="pipelines" class="pipeline-shell" hidden>
+    <aside class="pipeline-side" aria-labelledby="pipelineSideTitle">
+      <h2 id="pipelineSideTitle">Saved pipelines</h2>
+      <ul id="pipelineList" class="pipeline-saved"></ul>
+      <div class="pipeline-side-buttons">
+        <button id="pipelineSave" type="button">Save</button>
+        <button id="pipelineSaveAs" type="button">Save as</button>
+        <button id="pipelineRun" class="primary" type="button">Run</button>
+        <button id="pipelineStop" type="button" disabled>Stop</button>
+        <button id="pipelineDelete" type="button">Delete</button>
+      </div>
+      <h3 id="pipelinePaletteTitle">Add a step</h3>
+      <div id="pipelinePalette" class="pipeline-palette" aria-labelledby="pipelinePaletteTitle"></div>
+    </aside>
+
+    <section class="pipeline-main" aria-labelledby="pipelineTitle">
+      <div class="pipeline-bar">
+        <div>
+          <h2 id="pipelineTitle">Pipelines</h2>
+          <p class="hint">Wire jobs together. An arrow means "after". A gate decides whether the work goes on.</p>
+        </div>
+        <div class="pipeline-bar-fields">
+          <label for="pipelineName">Name</label>
+          <input id="pipelineName" type="text" maxlength="64" value="First pipeline">
+          <button id="pipelineNew" type="button">Start a fresh one</button>
+          <button id="pipelineCheck" type="button">Check it</button>
+        </div>
+      </div>
+      <p id="pipelineSaid" class="pipeline-said" role="status">Draw a pipeline, then press Run.</p>
+      <div id="pipelineCanvas" class="pipeline-canvas" role="application" aria-label="Pipeline" aria-describedby="pipelineHelp">
+        <p id="pipelineHelp" class="sr-only">Each step is a box. Press Connect on a box, then press another box to draw an arrow between them.</p>
+        <div id="pipelineNodes" class="pipeline-nodes">
+          <svg id="pipelineWires" class="pipeline-wires" aria-hidden="true"></svg>
+        </div>
+      </div>
+      <div class="pipeline-log-box">
+        <h3 id="pipelineLogTitle">What happened</h3>
+        <ol id="pipelineLog" class="pipeline-log" aria-labelledby="pipelineLogTitle"></ol>
+      </div>
+    </section>
+  </div>
+
+  <dialog id="pipelineNodeDialog" aria-labelledby="pipelineNodeDialogTitle">
+    <form id="pipelineNodeForm" method="dialog">
+      <h2 id="pipelineNodeDialogTitle">Step</h2>
+      <p id="pipelineNodeSummary" class="hint"></p>
+      <label for="pipelineNodeLabel">What to call it</label>
+      <input id="pipelineNodeLabel" type="text" maxlength="80">
+      <div id="pipelineNodeSettings" class="pipeline-settings"></div>
+      <label for="pipelineNodeTries">Try again this many times if it fails</label>
+      <input id="pipelineNodeTries" type="number" min="1" max="5" value="1">
+      <div class="dialog-buttons">
+        <button id="pipelineNodeCancel" type="button">Cancel</button>
+        <button id="pipelineNodeSave" class="primary" type="button">Save</button>
+      </div>
+    </form>
+  </dialog>
 
   <main id="memoryView" data-view-panel="memory" class="data-view" hidden>
     <section class="glass data-panel" aria-labelledby="memoryTitle"><div class="section-heading"><div><h2 id="memoryTitle">Shared memory</h2><p>Links show which agent wrote or read a record.</p></div><button id="refreshMemory" type="button">Refresh</button></div><div class="filter-row"><label for="memoryQuery">Filter</label><input id="memoryQuery" type="search"><label for="memoryKind">Kind</label><select id="memoryKind"><option value="">All</option><option value="episode">Episode</option><option value="document">Source</option><option value="prompt">Prompt</option></select></div><div id="memoryGraph" class="memory-map" role="img" aria-label="Memory provenance map"></div><div class="table-scroll"><table><thead><tr><th scope="col">Kind</th><th scope="col">Record</th><th scope="col">Summary</th><th scope="col">Provenance</th></tr></thead><tbody id="memoryBody"></tbody></table></div></section>

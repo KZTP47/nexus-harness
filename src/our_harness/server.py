@@ -19,9 +19,13 @@ from . import bundle
 from . import comparison
 from . import coverage
 from . import handover
+from . import autosetup
+from . import pipelines as pipeline_lab
+from . import plain_graph
 from . import qa as qalab
 from . import recorder
 from . import starters
+from . import seats as seat_setup
 from . import selectors
 from . import share
 from .config import LoadedConfig
@@ -137,6 +141,25 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # change would quietly disappear while both said they worked.
         self.suite_lock = threading.Lock()
         self.qa_result: dict[str, Any] | None = None
+        # Seat setup has a lock of its own. It asks each assistant its version,
+        # and a tool waiting on a sign-in can sit there for the best part of a
+        # minute. Sharing the suite lock would stop every other change to the
+        # checks for that whole time, for a job that has nothing to do with them.
+        self.seats_lock = threading.Lock()
+        # "I don't care, just do it for me" runs one job at a time, in the
+        # background, because fetching a model can take a long while and the
+        # page has to keep saying what is happening.
+        self.setup_runner = autosetup.Runner()
+        # One pipeline run at a time. A pipeline starts real suites and real
+        # commands, and two at once would fight over the same project.
+        self.pipeline_lock = threading.Lock()
+        self.pipeline_run: dict[str, Any] | None = None
+        self.pipeline_running = False
+        self.pipeline_stop = False
+        # What the settings file held before the last seat setup, kept so
+        # that setup can be undone. Only ever written back by this process.
+        self.seats_before: seat_setup.Before | None = None
+        self.seats_were_set_up = False
         registry = load_plugins(config)
         self.workflow_policy = resolve_workflow_policy(config, registry.workflow_nodes)
         self.check_kinds = dict(registry.check_kinds)
@@ -355,6 +378,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
             "tags": list(suite.tags()),
             "cases": [case.to_dict() for case in suite.cases],
         }
+
+    def _settings_now(self):
+        """The settings as they are on disk this second.
+
+        The panel reads the settings once when it starts. Seat setup changes
+        that same file while the panel is running, so answering from the copy
+        loaded at start would tell somebody a route they have just written is
+        not there yet.
+        """
+
+        settings, _trouble = seat_setup.settings_to_work_from(self.server.config.project_root)
+        return settings
 
     def _checkup(self) -> dict[str, Any]:
         """One plain-language answer to 'is this project ready to use?'."""
@@ -603,6 +638,38 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         before, after, redactor=CredentialRedactor(self.server.config)
                     ).to_dict()
                 )
+            elif parsed.path == "/api/pipelines":
+                self._require_token()
+                config = self.server.config
+                query = urllib.parse.parse_qs(parsed.query)
+                wanted = (query.get("name", [""])[0] or "").strip()
+                answer: dict[str, Any] = {
+                    "saved": pipeline_lab.saved_ones(config),
+                    "kinds": [kind.to_dict() for kind in pipeline_lab.KINDS.values()],
+                    "running": self.server.pipeline_running,
+                    "last_run": self.server.pipeline_run,
+                }
+                answer["pipeline"] = (
+                    pipeline_lab.load(config, wanted)
+                    if wanted
+                    else pipeline_lab.a_starting_pipeline()
+                )
+                self._json(answer)
+            elif parsed.path == "/api/setup/do-it":
+                self._require_token()
+                self._json({
+                    "job": self.server.setup_runner.latest(),
+                    "busy": self.server.setup_runner.busy,
+                    "can_do": sorted(autosetup.PLANS),
+                })
+            elif parsed.path == "/api/seats":
+                self._require_token()
+                found = seat_setup.look(self._settings_now()).to_dict()
+                # Setting seats up changes one file, so only one setup can be
+                # outstanding at a time. Saying so lets anything else wait its
+                # turn instead of writing over it.
+                found["setup_outstanding"] = self.server.seats_were_set_up
+                self._json(found)
             elif parsed.path == "/api/qa/starters":
                 try:
                     self._require_token()
@@ -844,6 +911,130 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self.server.release_qa()
                     raise
                 self._json({"accepted": True}, HTTPStatus.ACCEPTED)
+            elif self.path == "/api/seats/setup":
+              with self.server.seats_lock:
+                  asked = body.get("kinds") or []
+                  if not isinstance(asked, list):
+                      raise HarnessError("Choose which assistants to set up")
+                  if self.server.seats_were_set_up:
+                      raise HarnessError(
+                          "A setup here has not been put back yet. Press 'Put my settings "
+                          "back' first, or set them up again once that is done."
+                      )
+                  done = seat_setup.set_up(
+                      self._settings_now(),
+                      [str(item) for item in asked][:8],
+                      trust=body.get("trust") is not False,
+                  )
+                  self.server.seats_before = done.previous
+                  self.server.seats_were_set_up = True
+                  self._json(done.to_dict())
+            elif self.path == "/api/seats/undo":
+              with self.server.seats_lock:
+                  if not self.server.seats_were_set_up:
+                      raise HarnessError(
+                          "Nothing was set up here to undo. This only puts back what "
+                          "this panel changed while it has been running."
+                      )
+                  said = seat_setup.put_it_back(self._settings_now(), self.server.seats_before)
+                  self.server.seats_were_set_up = False
+                  self.server.seats_before = None
+                  self._json({"note": said})
+            elif self.path == "/api/pipelines/save":
+                with self.server.suite_lock:
+                    self._json({"pipeline": pipeline_lab.save(self.server.config, body.get("pipeline"))})
+            elif self.path == "/api/pipelines/delete":
+                with self.server.suite_lock:
+                    self._json({
+                        "note": pipeline_lab.remove(self.server.config, str(body.get("name") or "")),
+                        "saved": pipeline_lab.saved_ones(self.server.config),
+                    })
+            elif self.path == "/api/pipelines/check":
+                # Says whether a drawing would run, without running any of it.
+                self._json({"pipeline": pipeline_lab.read_it(body.get("pipeline"))})
+            elif self.path == "/api/pipelines/stop":
+                self.server.pipeline_stop = True
+                self._json({"note": "The run will stop after the step it is on."})
+            elif self.path == "/api/pipelines/run":
+                drawn = pipeline_lab.read_it(body.get("pipeline"))
+                if not self.server.pipeline_lock.acquire(blocking=False):
+                    raise HarnessError(
+                        "A pipeline is running already. Wait for it, or press Stop."
+                    )
+                self.server.pipeline_running = True
+                self.server.pipeline_stop = False
+                events = self.server.events
+                config = self.server.config
+                kinds = self.server.check_kinds
+                server = self.server
+
+                def go() -> None:
+                    try:
+                        events.add({"kind": "pipeline_started", "node": "pipeline",
+                                    "payload": {"name": drawn["name"]}})
+                        run = pipeline_lab.run_it(
+                            config, drawn, tell=events.add, check_kinds=kinds,
+                            stopping=lambda: server.pipeline_stop,
+                        )
+                        server.pipeline_run = run.to_dict()
+                        events.add({"kind": "pipeline_finished", "node": "pipeline",
+                                    "payload": run.to_dict()})
+                    except Exception as exc:  # noqa: BLE001 - it has to end, whatever happens
+                        server.pipeline_run = {
+                            "name": drawn.get("name", ""), "nodes": [], "passed": False,
+                            "said": f"The run stopped: {exc}", "milliseconds": 0,
+                        }
+                        events.add({"kind": "pipeline_finished", "node": "pipeline",
+                                    "payload": server.pipeline_run})
+                    finally:
+                        # However it ends, the next press has to work.
+                        server.pipeline_running = False
+                        server.pipeline_lock.release()
+
+                try:
+                    threading.Thread(target=go, name="pipeline", daemon=True).start()
+                except Exception:
+                    self.server.pipeline_running = False
+                    self.server.pipeline_lock.release()
+                    raise
+                self._json({"accepted": True, "name": drawn["name"]}, HTTPStatus.ACCEPTED)
+            elif self.path == "/api/settings/trust-anyway":
+                # Deliberate, and only ever from a press. The panel shows the
+                # whole file and what in it carries risk before offering this.
+                with self.server.seats_lock:
+                    self._json({
+                        "trusted": True,
+                        "note": seat_setup.trust_it_anyway(
+                            self._settings_now(), str(body.get("seen") or "")
+                        ),
+                    })
+            elif self.path == "/api/setup/do-it":
+                # One name, chosen from a list this module holds. Nothing from
+                # the request reaches a command line.
+                option = str(body.get("option") or "")
+                self._json(self.server.setup_runner.start(self._settings_now(), option))
+            elif self.path == "/api/how-it-works":
+                # The picture on the first screen is drawn from the workflow
+                # that will really run, so it cannot say one thing while the
+                # harness does another. The page sends the workflow it has on
+                # screen; with nothing to send, the shipped one is described.
+                asked = body.get("graph")
+                self._json(
+                    plain_graph.in_plain_words(
+                        asked if isinstance(asked, dict) else self.server.template
+                    )
+                )
+            elif self.path == "/api/seats/share-the-work":
+                graph = body.get("graph")
+                routes = body.get("routes") or []
+                if not isinstance(routes, list):
+                    raise HarnessError("Routes must be a list")
+                self._json({
+                    "graph": seat_setup.share_the_work(
+                        graph if isinstance(graph, dict) else self.server.template,
+                        [str(item) for item in routes][:8],
+                    )
+                })
             elif self.path == "/api/qa/share":
               with self.server.suite_lock:
                   path, page = share.write(

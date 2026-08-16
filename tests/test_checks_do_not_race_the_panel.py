@@ -175,12 +175,26 @@ def racing_steps(case: dict, table: dict[str, set[str]]) -> list[str]:
         if not steps[index + 1:]:
             continue
         for name in sorted(at_risk):
-            put_in = re.search(rf"\b{re.escape(name)}\s*=[^=]", script)
+            # Two ways to stage something, and both are lost the same way when
+            # the view reloads: putting a new value in the name, and changing
+            # what is already in it. Reading only for the first left the second
+            # wide open, and a check staging an arrow by pushing onto a list
+            # failed now and then for a reason that looked like nothing.
+            put_in = re.search(
+                rf"\b{re.escape(name)}\s*=[^=]"
+                rf"|\b{re.escape(name)}\.\w+\s*=[^=]"
+                rf"|\b{re.escape(name)}(?:\.\w+)*\.(?:push|pop|shift|unshift|splice|sort|reverse|fill)\(",
+                script,
+            )
             if not put_in:
                 continue
             # Read back in the same step means the step got its answer before
             # anything else could run. Only data left for later is at risk.
-            if re.search(rf"\b{re.escape(name)}\b", script[put_in.end():]):
+            # The name has to be read as code, not merely appear: these checks
+            # say what they are doing in plain words, and "a pipeline that goes
+            # round" was being taken for a read of the data called pipeline.
+            used_as_code = rf"\b{re.escape(name)}\s*(?:[.\[(),;=]|$)"
+            if re.search(used_as_code, script[put_in.end():]):
                 continue
             found.append(f"step {index + 1} sets {name}")
     return found
