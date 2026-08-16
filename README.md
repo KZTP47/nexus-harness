@@ -179,6 +179,89 @@ for and need no key at all. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
 
 ---
 
+## Worked example: two subscriptions on one job
+
+Plenty of organisations have Claude and Copilot seats and no API keys, and never
+will. Both of those ship a command line tool that is already signed in, so the
+harness can put them on the same job: Claude plans and reviews, Copilot writes
+the code, and the two send notes to each other as they go.
+
+**1. Check both tools are installed and signed in.** They are separate products
+from the subscriptions, and each signs in on its own.
+
+```bash
+claude --version        # 2.1.101 (Claude Code)
+copilot --version
+```
+
+**2. Name one route per seat** in `.harness/config.local.json` — your own file,
+never shared:
+
+```json
+{
+  "providers": {
+    "claude":  {"kind": "claude-cli",  "model": "claude-sonnet-4-5", "endpoint": ""},
+    "copilot": {"kind": "copilot-cli", "model": "gpt-5",             "endpoint": ""}
+  },
+  "provider": {"name": "claude-cli", "model": "claude-sonnet-4-5",
+               "endpoint": "", "api_key_env": ""}
+}
+```
+
+`endpoint` stays empty: a signed-in tool has no address to call.
+
+**3. Say the file is yours.** Until you do, the harness refuses to use it:
+
+```text
+error: providers.claude.kind requires trusted local, user, environment,
+explicit, or command-line config
+```
+
+```bash
+harness trust
+harness doctor          # OK provider: Provider configuration is present: claude-cli
+```
+
+**4. Give each agent a seat.** Open `harness ui`, go to the Workflow tab, and
+set the **Provider route** on each agent box:
+
+| Agent | Route |
+| --- | --- |
+| Planner | `claude` |
+| Coder | `copilot` |
+| Final Reviewer | `claude` |
+
+A reviewer on a different assistant from the coder is the whole point. Two
+models that share no training tend not to share the same blind spot.
+
+**5. Let them talk.** Tick `team.message` on each agent. Then one can tell
+another what it found:
+
+```json
+{"to": "coder", "subject": "The parser caches by file name",
+ "body": "Two files with the same name share a cache slot. Key on the full path."}
+```
+
+**6. Press Start run.** That runs the workflow you have on screen. The finished
+setup routes like this:
+
+```text
+planner  -> route claude   = claude-cli claude-sonnet-4-5
+coder    -> route copilot  = copilot-cli gpt-5
+review   -> route claude   = claude-cli claude-sonnet-4-5
+```
+
+Subscription work is recorded as `subscription-unpriced` — there is no price
+per request, so the harness does not invent one. Your plan's own rate limits
+still apply.
+
+Full walkthrough, including what to do when a tool takes different arguments:
+[docs/TWO_SEATS.md](docs/TWO_SEATS.md).
+
+---
+
+---
+
 ## Running in a build server
 
 ```bash
@@ -243,6 +326,7 @@ Cloning a repository never gives that repository the right to run code.
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting and where it may come from |
 | [SECURITY.md](docs/SECURITY.md) | What is fenced off, and how |
 | [SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) | Using a Claude or Copilot seat instead of a key |
+| [TWO_SEATS.md](docs/TWO_SEATS.md) | Two subscriptions on one job, step by step |
 | [CONTROL_PANEL.md](docs/CONTROL_PANEL.md) | The panel and the workflow editor |
 | [DESKTOP.md](docs/DESKTOP.md) | The desktop app |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the parts fit together |
