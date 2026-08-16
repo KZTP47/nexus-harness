@@ -279,7 +279,4 @@ python scripts/make_screenshots.py
 
 ---
 
-## Licence
 
-No licence has been chosen yet, so default copyright applies and nobody else
-may reuse this. Add a `LICENSE` file to change that.
