@@ -1,0 +1,178 @@
+{
+  "agents": {},
+  "context": {
+    "max_chars": 120000,
+    "memory_chars": 20000,
+    "recent_event_chars": 24000,
+    "reserve_chars": 20000,
+    "workspace_chars": 50000
+  },
+  "execution": {
+    "deny_argument_sequences": [
+      "--force",
+      "reset --hard",
+      "clean -fd",
+      "push --force"
+    ],
+    "deny_executables": [
+      "format",
+      "diskpart",
+      "shutdown",
+      "reboot"
+    ],
+    "docker_image": "python:3.12-slim",
+    "docker_network": "none",
+    "inherit_environment": [
+      "PATH",
+      "PATHEXT",
+      "SYSTEMDRIVE",
+      "SYSTEMROOT",
+      "WINDIR",
+      "TMP",
+      "TEMP",
+      "LANG",
+      "LC_ALL",
+      "APPDATA",
+      "LOCALAPPDATA",
+      "USERPROFILE",
+      "HOMEDRIVE",
+      "HOMEPATH",
+      "HOME"
+    ],
+    "max_changed_bytes": 2000000,
+    "max_changed_files": 24,
+    "max_output_bytes": 250000,
+    "mode": "process",
+    "timeout_seconds": 180
+  },
+  "git": {
+    "allow_commit": false,
+    "allow_merge": false,
+    "allow_push": false,
+    "enabled": true,
+    "protected_branches": [
+      "main",
+      "master"
+    ],
+    "required_branch_prefix": ""
+  },
+  "mcp": {
+    "max_response_bytes": 1000000,
+    "servers": [],
+    "timeout_seconds": 60
+  },
+  "memory": {
+    "allow_remote_embeddings": false,
+    "database": ".harness/memory/harness.db",
+    "embedding_model": "",
+    "embedding_provider": "",
+    "enabled": true,
+    "max_results": 8,
+    "retention_days": 180
+  },
+  "plugins": {
+    "enabled": [],
+    "paths": []
+  },
+  "pricing": {
+    "allow_unpriced_remote_calls": false,
+    "snapshots": []
+  },
+  "project": {
+    "build_commands": [],
+    "ignore": [
+      ".git",
+      ".harness",
+      ".venv",
+      "venv",
+      "node_modules",
+      "dist",
+      "build",
+      "target",
+      "vendor",
+      "coverage",
+      "__pycache__"
+    ],
+    "lint_commands": [],
+    "max_file_bytes": 1000000,
+    "performance_commands": [],
+    "security_commands": [],
+    "standards_files": [
+      "AGENTS.md",
+      "CLAUDE.md",
+      "CONTRIBUTING.md",
+      "README.md"
+    ],
+    "test_commands": [
+      [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-t",
+        "tests",
+        "-q"
+      ]
+    ]
+  },
+  "provider": {
+    "api_key_env": "",
+    "api_mode": "auto",
+    "command": [],
+    "endpoint": "http://127.0.0.1:11434",
+    "max_output_tokens": 8192,
+    "model": "qwen2.5-coder:7b",
+    "name": "ollama",
+    "prompt_cache_key": "",
+    "prompt_cache_retention": "",
+    "role_output_caps": {
+      "coder": 1000000,
+      "evaluator": 1000000,
+      "merge": 1000000,
+      "planner": 1000000
+    },
+    "temperature": 0.2,
+    "timeout_seconds": 180
+  },
+  "providers": {},
+  "qa": {
+    "allow_hosts": [
+      "127.0.0.1",
+      "localhost",
+      "::1"
+    ],
+    "artifacts_dir": ".harness/qa/runs",
+    "default_timeout_seconds": 120,
+    "flaky_min_runs": 5,
+    "flaky_threshold": 0.2,
+    "keep_runs": 20,
+    "max_evidence_chars": 4000,
+    "max_response_bytes": 1000000,
+    "suite": ".harness/qa/suite.json",
+    "workers": 4
+  },
+  "schema_version": 1,
+  "ui": {
+    "host": "127.0.0.1",
+    "open_browser": false,
+    "port": 8765
+  },
+  "workflow": {
+    "max_elapsed_seconds": 1800,
+    "max_iterations": 4,
+    "max_tool_calls": 12,
+    "max_tool_output_bytes": 32000,
+    "max_tool_total_bytes": 128000,
+    "name": "planner-coder-reviewer",
+    "repeat_failure_limit": 2,
+    "require_executable_counterexamples": false,
+    "require_review": true,
+    "review_parallelism": 1,
+    "reviewer_lenses": [],
+    "reviewers": 1,
+    "rollback_on_exhaustion": true,
+    "temperature_decay": 0.75
+  }
+}

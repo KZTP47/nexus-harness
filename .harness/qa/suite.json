@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "name": "our-harness",
+  "cases": [
+    {
+      "id": "qa-tests",
+      "title": "The test lab's own tests pass",
+      "kind": "command",
+      "tags": [
+        "fast",
+        "tests"
+      ],
+      "timeout_seconds": 300,
+      "command": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-t",
+        "tests",
+        "-p",
+        "test_qa.py",
+        "-q"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stderr_contains": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "id": "cli-help",
+      "title": "The command line starts and lists its commands",
+      "kind": "command",
+      "tags": [
+        "fast",
+        "cli"
+      ],
+      "command": [
+        "python",
+        "-m",
+        "our_harness",
+        "--help"
+      ],
+      "expect": {
+        "exit_code": 0,
+        "stdout_contains": [
+          "qa",
+          "run",
+          "doctor"
+        ]
+      }
+    },
+    {
+      "id": "readme",
+      "title": "The README explains how to install",
+      "kind": "file",
+      "tags": [
+        "fast",
+        "docs"
+      ],
+      "path": "README.md",
+      "expect": {
+        "exists": true,
+        "min_bytes": 500,
+        "contains": [
+          "Fast install"
+        ]
+      }
+    },
+    {
+      "id": "no-secrets-in-config",
+      "title": "The shared config holds no API key values",
+      "kind": "file",
+      "tags": [
+        "fast",
+        "safety"
+      ],
+      "path": ".harness/config.json",
+      "expect": {
+        "exists": true,
+        "not_contains": [
+          "sk-",
+          "api_key\":"
+        ]
+      }
+    },
+    {
+      "id": "ui-health",
+      "title": "The control panel answers when it is running",
+      "kind": "http",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/api/health",
+      "method": "GET",
+      "expect": {
+        "status": 200,
+        "json_fields": {
+          "status": "ok"
+        }
+      }
+    },
+    {
+      "id": "ui-pages",
+      "title": "The control panel opens with no browser errors",
+      "kind": "browser",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "routes": [
+        "/"
+      ],
+      "viewport": {
+        "width": 1280,
+        "height": 800
+      },
+      "check_accessibility": true,
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0,
+        "body_contains": [
+          "Welcome"
+        ]
+      }
+    },
+    {
+      "id": "no-keys-in-the-code",
+      "title": "No credentials are written into the shipped code or the docs",
+      "kind": "secrets",
+      "tags": [
+        "fast",
+        "safety"
+      ],
+      "paths": [
+        "src/**/*.py",
+        "desktop/*.js",
+        "scripts/*.py",
+        "*.md",
+        "docs/*.md"
+      ],
+      "skip": [
+        "src/our_harness/scan.py",
+        "src/our_harness/redaction.py"
+      ],
+      "expect": {
+        "max_findings": 0
+      }
+    },
+    {
+      "id": "panel-script-is-readable",
+      "title": "The control panel script has no mistake in it",
+      "kind": "command",
+      "tags": [
+        "fast",
+        "ui"
+      ],
+      "command": [
+        "node",
+        "--check",
+        "src/our_harness/ui/app.js"
+      ],
+      "expect": {
+        "exit_code": 0
+      }
+    }
+  ]
+}

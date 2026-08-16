@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexus Harness</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workflow</a>
+  <header class="topbar">
+    <div><p class="eyebrow">LOCAL CONTROL</p><h1>Nexus Harness</h1></div>
+    <div id="workflowActions" class="top-actions" aria-label="Workflow actions" hidden>
+      <button id="addAgentButton" class="primary" type="button">Add agent</button>
+      <button id="validateButton" type="button">Validate</button>
+      <button id="simulateButton" type="button">Simulate</button>
+      <button id="exportButton" type="button">Export JSON</button>
+      <label class="file-button">Import JSON<input id="importInput" type="file" accept="application/json"></label>
+    </div>
+  </header>
+
+  <nav class="view-nav" aria-label="Control panel views">
+    <button type="button" data-view="start" aria-pressed="true" title="Set up your project and ask for a change">Start here</button>
+    <button type="button" data-view="checks" aria-pressed="false" title="Your tests: what a working project looks like">Checks</button>
+    <button type="button" data-view="workflow" aria-pressed="false" title="For later: rewire the agents yourself">Workflow</button>
+    <button type="button" data-view="history" aria-pressed="false" title="What past runs did, step by step">History</button>
+    <button type="button" data-view="memory" aria-pressed="false" title="What the harness has learnt about this project">Memory</button>
+    <button type="button" data-view="prompts" aria-pressed="false" title="How the harness instructions changed over time">Prompt history</button>
+  </nav>
+
+  <main id="startView" data-view-panel="start" class="data-view">
+    <section class="glass data-panel" aria-labelledby="startTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="startTitle">Welcome</h2>
+          <p>Four short steps get this project ready. You can do them in any order.</p>
+        </div>
+        <button id="refreshCheckup" type="button">Check again</button>
+      </div>
+      <p id="checkupSummary" class="callout" role="status">Looking at your project.</p>
+      <ol id="checkupSteps" class="step-list"></ol>
+    </section>
+
+    <section class="glass data-panel" aria-labelledby="firstTaskTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="firstTaskTitle">Ask for a change</h2>
+          <p>Say what you want in your own words. The harness plans it, edits the files, runs your checks, and reviews the result.</p>
+        </div>
+      </div>
+      <label for="quickTask">What should the harness do?</label>
+      <textarea id="quickTask" rows="3" placeholder="Fix the failing parser test"></textarea>
+      <div class="example-row">
+        <p id="exampleLabel">Examples you can click:</p>
+        <ul class="example-list" aria-labelledby="exampleLabel">
+          <li><button type="button" data-example="Find the cause of the failing test, fix it, and add a test that would have caught it">Fix a failing test</button></li>
+          <li><button type="button" data-example="Add CSV export to the report command and cover invalid output paths">Add a small feature</button></li>
+          <li><button type="button" data-example="Split the parser from the transport code without changing what it does">Tidy up the code</button></li>
+        </ul>
+      </div>
+      <label class="check-row"><input id="quickDryRun" type="checkbox"> Plan only, change no files</label>
+      <div class="button-row">
+        <button id="quickRun" class="primary" type="button">Start</button>
+        <button id="quickChecks" type="button">Run the checks instead</button>
+      </div>
+      <p class="field-help">A run stops on its own if it fails twice or runs out of time. Files are restored when a run fails.</p>
+    </section>
+
+    <section class="glass data-panel" aria-labelledby="tabsTitle">
+      <div class="section-heading"><div><h2 id="tabsTitle">What the other tabs are for</h2><p>You do not need any of them to get started.</p></div></div>
+      <dl class="tab-guide">
+        <dt>Checks</dt><dd>Your tests. Each one says what to do and what a good result looks like. Run them any time. That tab can also point at a thing on a page to name it for you, keep a picture of a page to compare later, and pack up the evidence when you need somebody's help.</dd>
+        <dt>Workflow</dt><dd>For later. It draws the agents as boxes so you can change who does what, and in which order.</dd>
+        <dt>Memory</dt><dd>What the harness has read and remembered about this project, and which agent wrote each note.</dd>
+        <dt>Prompt history</dt><dd>The instructions the harness gives its agents, and how they changed. Nothing changes without your review.</dd>
+      </dl>
+    </section>
+  </main>
+
+  <main id="checksView" data-view-panel="checks" class="data-view" hidden>
+    <section class="glass data-panel" aria-labelledby="checksTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="checksTitle">Checks</h2>
+          <p>Each check says what to do and what a good result looks like. They run side by side.</p>
+        </div>
+        <div class="button-row">
+          <button id="createSuite" type="button">Write starter checks</button>
+          <button id="makeBundle" type="button">Pack up the evidence</button>
+          <button id="makeSharePage" type="button">Make one file I can send</button>
+          <button id="recordSteps" type="button">Record what I do</button>
+          <button id="pickElement" type="button">Point at something</button>
+          <button id="findGaps" type="button">Find pages nobody checks</button>
+          <button id="saveBaselines" type="button" hidden>Save screenshots</button>
+          <button id="runChecks" class="primary" type="button">Run all checks</button>
+        </div>
+      </div>
+      <details id="starterBox" class="starter-box">
+        <summary>Add a ready-made check</summary>
+        <p class="field-help">Pick one, say which address it should look at, and it is added to your checks.</p>
+        <div class="filter-row">
+          <label for="starterUrl">Address</label>
+          <input id="starterUrl" type="url" placeholder="http://127.0.0.1:8765/">
+        </div>
+        <ul id="starterList" class="starter-list"></ul>
+      </details>
+      <div id="pickResult" class="pick-result" hidden>
+        <h3 id="pickHeading">Names you can use</h3>
+        <p id="pickSummary"></p>
+        <ul id="pickNames"></ul>
+        <p id="pickThrown" class="quiet"></p>
+      </div>
+      <div id="coverageResult" class="coverage-result" hidden>
+        <h3 id="coverageHeading">Which pages are checked</h3>
+        <div id="coverageBar" class="coverage-bar" role="img" aria-label="How much of the site has a check"></div>
+        <p id="coverageSummary"></p>
+        <ul id="coverageList" class="coverage-list"></ul>
+        <div class="button-row">
+          <button id="addMissingChecks" type="button" hidden>Write a check for every page nobody looks at</button>
+        </div>
+      </div>
+      <div class="filter-row">
+        <label for="checkTag">Only run</label>
+        <select id="checkTag"><option value="">Every check</option></select>
+        <output id="checkStatus" role="status">No run yet.</output>
+      </div>
+      <div id="checkSummary" class="metric-row"></div>
+      <div class="table-scroll">
+        <table>
+          <caption class="sr-only">Checks in this project and their last result</caption>
+          <thead><tr><th scope="col">Check</th><th scope="col">Kind</th><th scope="col">Result</th><th scope="col">Time</th><th scope="col">What happened</th></tr></thead>
+          <tbody id="checkBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="glass data-panel" aria-labelledby="unstableTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="unstableTitle">What to do about your checks</h2>
+          <p>The harness watches how your checks behave over time and says which ones need attention. Run them a few times to fill this in.</p>
+        </div>
+        <button id="refreshUnstable" type="button">Refresh</button>
+      </div>
+      <div id="changedSince" class="changed-since"></div>
+      <ol id="adviceList" class="step-list"></ol>
+      <div class="table-scroll">
+        <table>
+          <caption class="sr-only">Checks whose result keeps changing</caption>
+          <thead><tr><th scope="col">Check</th><th scope="col">Runs</th><th scope="col">Failed</th><th scope="col">How unstable</th><th scope="col">Why it is listed</th></tr></thead>
+          <tbody id="unstableBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="workflowView" data-view-panel="workflow" class="app-shell" hidden>
+    <aside class="glass palette" aria-labelledby="paletteTitle">
+      <h2 id="paletteTitle">Nodes</h2>
+      <p class="hint">Click a node or drag it onto the canvas.</p>
+      <div class="palette-list">
+        <button draggable="true" data-node-type="planner"><span class="node-dot planner"></span>Planner agent</button>
+        <button draggable="true" data-node-type="coder"><span class="node-dot coder"></span>Coder agent</button>
+        <button draggable="true" data-node-type="evaluator"><span class="node-dot evaluator"></span>Evaluator agent</button>
+        <button draggable="true" data-node-type="merge"><span class="node-dot merge"></span>Merge agent</button>
+        <button draggable="true" data-node-type="tool"><span class="node-dot tool"></span>Tool</button>
+        <button draggable="true" data-node-type="gauntlet"><span class="node-dot gauntlet"></span>Gauntlet macro</button>
+      </div>
+
+      <section aria-labelledby="runTitle" class="run-panel">
+        <h2 id="runTitle">Run a task</h2>
+        <label for="taskInput">Task</label>
+        <textarea id="taskInput" rows="4" placeholder="Fix the failing parser test"></textarea>
+        <label class="check-row"><input id="dryRunInput" type="checkbox"> Plan without file changes</label>
+        <button id="runButton" class="primary" type="button">Start run</button>
+      </section>
+
+      <details>
+        <summary>Keyboard controls</summary>
+        <p>Tab enters the graph. Arrow keys choose a node. C starts a connection. Enter selects. Control plus an arrow moves a node. Delete removes it. Control+Z restores the last graph edit.</p>
+      </details>
+    </aside>
+
+    <main id="workspace" class="workspace" tabindex="-1">
+      <section class="glass workflow-bar" aria-labelledby="workflowBarTitle">
+        <h2 id="workflowBarTitle" class="sr-only">Your workflows</h2>
+        <div id="workflowTabs" class="workflow-tabs" role="tablist" aria-label="Saved workflows"></div>
+        <div class="workflow-actions">
+          <button id="newWorkflow" type="button">New</button>
+          <button id="saveWorkflow" class="primary" type="button">Save</button>
+          <button id="renameWorkflow" type="button">Rename</button>
+          <button id="deleteWorkflow" class="danger" type="button">Delete</button>
+        </div>
+        <output id="workflowStatus" class="workflow-status">Not saved yet.</output>
+      </section>
+
+      <section class="canvas-toolbar glass" aria-label="Canvas controls">
+        <button id="zoomOut" type="button" aria-label="Zoom out">−</button>
+        <output id="zoomValue" aria-label="Current zoom">100%</output>
+        <button id="zoomIn" type="button" aria-label="Zoom in">+</button>
+        <button id="fitButton" type="button">Fit</button>
+        <button id="undoButton" type="button" disabled>Undo</button>
+        <span class="keyboard-note">Arrow: focus. Ctrl+Arrow: move. C: connect.</span>
+      </section>
+
+      <section id="canvas" class="canvas" role="application" aria-label="Agent workflow graph" aria-describedby="graphInstructions">
+        <p id="graphInstructions" class="sr-only">Use arrow keys to focus nodes. Press C to start a connection and Enter to select a target.</p>
+        <div id="viewport" class="viewport">
+          <svg id="edgeLayer" class="edge-layer" width="2400" height="1400" aria-hidden="true"></svg>
+          <div id="nodeLayer" class="node-layer"></div>
+        </div>
+      </section>
+
+      <section class="glass table-view" aria-labelledby="edgeListTitle">
+        <div class="section-heading"><h2 id="edgeListTitle">Workflow outline</h2><p>Keyboard-accessible nodes and connections.</p></div>
+        <div class="outline-grid"><ul id="nodeList" class="edge-list"></ul><ul id="edgeList" class="edge-list"></ul></div>
+      </section>
+
+      <section class="glass usage-panel" aria-labelledby="usageTitle">
+        <div class="section-heading"><h2 id="usageTitle">Live usage</h2><output id="connectionStatus">Connecting</output></div>
+        <div class="metric-row" id="usageSummary"></div>
+        <div class="table-scroll"><table><caption class="sr-only">Provider usage by request</caption><thead><tr><th scope="col">Agent</th><th scope="col">Provider</th><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Latency</th><th scope="col">Cost</th></tr></thead><tbody id="usageBody"></tbody></table></div>
+      </section>
+
+      <section class="glass event-panel" aria-labelledby="teamTitle">
+        <div class="section-heading">
+          <div><h2 id="teamTitle">Team notes</h2><p>What the agents told each other during this run.</p></div>
+          <output id="teamCount">No notes yet.</output>
+        </div>
+        <ol id="teamBoard" class="team-board"></ol>
+      </section>
+
+      <section class="glass event-panel" aria-labelledby="eventTitle">
+        <div class="section-heading"><h2 id="eventTitle">Run log</h2><button id="clearLog" type="button">Clear</button></div>
+        <div class="table-scroll"><table><thead><tr><th scope="col">Time</th><th scope="col">State</th><th scope="col">Result</th></tr></thead><tbody id="eventBody"></tbody></table></div>
+      </section>
+    </main>
+
+    <aside class="glass inspector" aria-labelledby="inspectorTitle">
+      <h2 id="inspectorTitle">Inspector</h2>
+      <div id="emptyInspector" class="empty-state">Select a node or connection.</div>
+      <form id="nodeInspector" hidden>
+        <label for="nodeLabel">Node label</label><input id="nodeLabel" type="text" maxlength="80">
+        <div id="agentInspectorFields">
+          <label for="nodeAgentRef">Trusted agent assignment</label><select id="nodeAgentRef"><option value="">None</option></select>
+          <label for="nodeProvider">Provider route</label><select id="nodeProvider"></select>
+          <label for="nodeModel">Model</label><input id="nodeModel" type="text" list="modelSuggestions" maxlength="256">
+          <label for="nodeRoleName">Role</label><input id="nodeRoleName" type="text" maxlength="256">
+          <label for="nodePrompt">System prompt</label><textarea id="nodePrompt" rows="6" maxlength="32000"></textarea>
+          <fieldset><legend>Capabilities</legend><div id="nodeCapabilities" class="check-list"></div></fieldset>
+          <div id="mergeFields" hidden><label for="mergeSlots">Required merge slots</label><input id="mergeSlots" type="text" placeholder="implementation, review"><label for="mergeOutput">Output state field</label><input id="mergeOutput" type="text"></div>
+        </div>
+        <label for="nodeRole">Tool role</label><select id="nodeRole"><option value="generic">Generic</option><option value="syntax">Syntax checker</option><option value="security">Security auditor</option><option value="performance">Performance profiler</option><option value="unit_test">Unit test sandbox</option></select>
+        <button id="deleteNode" class="danger" type="button">Delete node</button>
+      </form>
+      <form id="edgeInspector" hidden>
+        <label for="edgeMode">Transfer mode</label><select id="edgeMode"><option value="state">State</option><option value="delegate">Delegate task</option><option value="merge_input">Merge input</option></select>
+        <label for="edgeCondition">Condition</label><input id="edgeCondition" type="text" placeholder="tests_passed == false" aria-describedby="conditionHelp"><p id="conditionHelp" class="field-help">Use key == true, key != false, or key == &quot;text&quot;.</p>
+        <label for="edgeVariables">State fields passed</label><input id="edgeVariables" type="text" placeholder="source_code, error_trace">
+        <label for="edgeTargetSlot">Merge target slot</label><input id="edgeTargetSlot" type="text">
+        <label for="edgeReturnFields">Delegation return fields</label><input id="edgeReturnFields" type="text" placeholder="plan, findings">
+        <fieldset><legend>Loop limits</legend><label for="maxIterations">Maximum iterations</label><input id="maxIterations" type="number" min="1" max="100"><label for="temperatureDecay">Temperature multiplier</label><input id="temperatureDecay" type="number" min="0.05" max="1" step="0.05"><label for="loopTimeout">Timeout in seconds</label><input id="loopTimeout" type="number" min="1" max="86400"></fieldset>
+        <button id="deleteEdge" class="danger" type="button">Delete connection</button>
+      </form>
+      <section class="validation" aria-labelledby="validationTitle"><h2 id="validationTitle">Validation</h2><div id="validationStatus" role="status">Not checked.</div><ul id="issueList"></ul></section>
+    </aside>
+  </div>
+
+  <main id="historyView" data-view-panel="history" class="data-view" hidden>
+    <section class="glass data-panel" aria-labelledby="historyTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="historyTitle">What past runs did</h2>
+          <p>Each bar is one step. A longer bar took longer. Green passed, red failed, grey means nothing was recorded. The same steps are written out in the table below. Times are to the nearest second.</p>
+        </div>
+        <button id="refreshHistory" type="button">Refresh</button>
+      </div>
+      <div id="historyList" class="history-list"></div>
+      <div class="table-scroll">
+        <table>
+          <caption class="sr-only">Every step of the recent runs</caption>
+          <thead><tr><th scope="col">Run</th><th scope="col">Step</th><th scope="col">Result</th><th scope="col">Time</th></tr></thead>
+          <tbody id="historyBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <main id="memoryView" data-view-panel="memory" class="data-view" hidden>
+    <section class="glass data-panel" aria-labelledby="memoryTitle"><div class="section-heading"><div><h2 id="memoryTitle">Shared memory</h2><p>Links show which agent wrote or read a record.</p></div><button id="refreshMemory" type="button">Refresh</button></div><div class="filter-row"><label for="memoryQuery">Filter</label><input id="memoryQuery" type="search"><label for="memoryKind">Kind</label><select id="memoryKind"><option value="">All</option><option value="episode">Episode</option><option value="document">Source</option><option value="prompt">Prompt</option></select></div><div id="memoryGraph" class="memory-map" role="img" aria-label="Memory provenance map"></div><div class="table-scroll"><table><thead><tr><th scope="col">Kind</th><th scope="col">Record</th><th scope="col">Summary</th><th scope="col">Provenance</th></tr></thead><tbody id="memoryBody"></tbody></table></div></section>
+  </main>
+
+  <main id="promptsView" data-view-panel="prompts" class="data-view" hidden>
+    <section class="glass data-panel" aria-labelledby="promptsTitle"><div class="section-heading"><div><h2 id="promptsTitle">Prompt history</h2><p>Reviewed versions and their parents.</p></div><button id="refreshPrompts" type="button">Refresh</button></div><div id="promptLineage" class="lineage"></div><div class="compare-grid"><div><label for="promptLeft">Earlier version</label><select id="promptLeft"></select><pre id="promptLeftBody"></pre></div><div><label for="promptRight">Later version</label><select id="promptRight"></select><pre id="promptRightBody"></pre></div></div><div class="table-scroll"><table><thead><tr><th scope="col">Name</th><th scope="col">Version</th><th scope="col">Parent</th><th scope="col">State</th><th scope="col">Evidence</th></tr></thead><tbody id="promptBody"></tbody></table></div></section>
+  </main>
+
+  <dialog id="agentDialog" aria-labelledby="agentDialogTitle">
+    <form id="agentForm">
+      <div class="dialog-heading"><h2 id="agentDialogTitle" tabindex="-1">Add agent</h2><button id="closeAgentDialog" type="button" aria-label="Close agent setup">×</button></div>
+      <div id="agentFormError" class="form-error" role="alert" tabindex="-1" hidden></div>
+      <label for="agentType">Agent type</label><select id="agentType"><option value="planner">Planner</option><option value="coder">Coder</option><option value="evaluator">Evaluator</option><option value="merge">Merge</option></select>
+      <label for="agentLabel">Label</label><input id="agentLabel" type="text" required maxlength="80">
+      <label for="agentRef">Trusted agent assignment</label><select id="agentRef"><option value="">None</option></select>
+      <label for="agentProvider">Provider route</label><select id="agentProvider" required></select>
+      <label for="agentModel">Model</label><input id="agentModel" type="text" list="modelSuggestions" maxlength="256" required>
+      <datalist id="modelSuggestions"></datalist>
+      <label for="agentRoleName">Role</label><input id="agentRoleName" type="text" maxlength="256" required>
+      <label for="agentPrompt">System prompt</label><textarea id="agentPrompt" rows="7" maxlength="32000"></textarea>
+      <fieldset><legend>Capabilities</legend><div id="agentCapabilities" class="check-list"></div></fieldset>
+      <div id="agentMergeFields" hidden><label for="agentMergeSlots">Required merge slots</label><input id="agentMergeSlots" type="text" value="implementation, review"><label for="agentMergeOutput">Output state field</label><input id="agentMergeOutput" type="text" value="merged_output"></div>
+      <div class="dialog-actions"><button id="cancelAgent" type="button">Cancel</button><button class="primary" type="submit">Add agent</button></div>
+    </form>
+  </dialog>
+
+  <div id="liveStatus" class="sr-only" role="status" aria-live="polite"></div>
+  <div id="liveAlert" class="sr-only" role="alert" aria-live="assertive"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

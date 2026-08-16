@@ -1,0 +1,32 @@
+# Runtime data the harness writes. The suites and config in .harness are shared;
+# .harness/.gitignore names the parts that are not.
+.harness/config.local.json
+.harness/memory/
+.harness/runs/
+.harness/backups/
+.harness/checkpoints/
+.harness/cache/
+.harness/qa/runs/
+.harness/qa/tmp/
+.harness/bundles/
+.harness/qa/history.json
+.harness/qa/candidates.json
+.harness/transaction.lock
+
+# Dependencies and build output
+node_modules/
+desktop/build-output/
+desktop/dist/
+.wheel-stage*/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Local scratch
+%SystemDrive%/
+benchmark-logs/
+benchmark-archive/
+reports/
+.claude/

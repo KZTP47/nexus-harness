@@ -1,0 +1,21 @@
+{
+  "name": "our-harness",
+  "version": "1.0.0",
+  "description": "Our Harness is a local programming-agent CLI. It scans a project, builds an indexed context, asks a configured model to plan and edit, runs project checks, reviews the result, and performs bounded repair attempts.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "example": "examples",
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}

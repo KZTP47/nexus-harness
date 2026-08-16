@@ -1,0 +1,28 @@
+{
+  "benchmark_provider_route": "codex_subscription",
+  "workflow": {
+    "require_executable_counterexamples": true,
+    "max_elapsed_seconds": 1800
+  },
+  "providers": {
+    "codex_subscription": {
+      "kind": "codex-cli",
+      "model": "gpt-5.6-terra",
+      "command": ["codex"],
+      "auth_mode": "chatgpt",
+      "reasoning_effort": "high",
+      "temperature": 0,
+      "max_output_tokens": 4096,
+      "role_output_caps": {
+        "planner": 2048,
+        "coder": 4096,
+        "evaluator": 2048,
+        "merge": 2048
+      },
+      "timeout_seconds": 600,
+      "max_concurrency": 1,
+      "allow_project_graphs": true,
+      "max_data_class": "project_private"
+    }
+  }
+}

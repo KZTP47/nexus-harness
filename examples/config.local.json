@@ -1,0 +1,14 @@
+{
+  "provider": {
+    "name": "ollama",
+    "model": "qwen2.5-coder:7b",
+    "endpoint": "http://127.0.0.1:11434"
+  },
+  "workflow": {
+    "max_iterations": 4,
+    "max_tool_calls": 12,
+    "max_tool_output_bytes": 32000,
+    "max_tool_total_bytes": 128000,
+    "temperature_decay": 0.75
+  }
+}

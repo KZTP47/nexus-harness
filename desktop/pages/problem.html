@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:">
+  <title>Something went wrong</title>
+  <link rel="stylesheet" href="shell.css">
+</head>
+<body>
+  <main>
+    <h1 id="title">Something went wrong</h1>
+    <p class="lead" id="detail"></p>
+    <p>Most of the time this means one of two things:</p>
+    <ul>
+      <li>Python 3.11 or newer is not installed, or the app cannot find it. Install it, then start the app again.</li>
+      <li>The harness package is not installed for that Python. Open a terminal in the project folder and run <code>python -m pip install .</code></li>
+    </ul>
+    <p>If Python lives somewhere unusual, set the <code>HARNESS_PYTHON</code> environment variable to its full path before starting this app.</p>
+    <div class="row">
+      <button id="retry" class="primary" type="button">Try again</button>
+      <button id="choose" type="button">Choose a different folder</button>
+    </div>
+    <h2 id="logTitle" hidden>What the harness printed</h2>
+    <pre id="log" hidden aria-labelledby="logTitle"></pre>
+  </main>
+  <script src="problem.js"></script>
+</body>
+</html>

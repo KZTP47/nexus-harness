@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "name": "The Gauntlet Loop",
+  "entry": "start",
+  "nodes": [
+    {"id": "start", "type": "start", "label": "Start", "position": {"x": 70, "y": 240}},
+    {"id": "planner", "type": "planner", "label": "Planner", "position": {"x": 230, "y": 240}},
+    {"id": "coder", "type": "coder", "label": "Coder", "position": {"x": 400, "y": 240}},
+    {"id": "syntax", "type": "tool", "label": "Syntax Checker", "config": {"role": "syntax"}, "position": {"x": 590, "y": 80}},
+    {"id": "security", "type": "tool", "label": "Security Auditor", "config": {"role": "security"}, "position": {"x": 780, "y": 80}},
+    {"id": "performance", "type": "tool", "label": "Performance Profiler", "config": {"role": "performance"}, "position": {"x": 970, "y": 80}},
+    {"id": "unit", "type": "tool", "label": "Unit Test Gate", "config": {"role": "unit_test"}, "position": {"x": 1160, "y": 80}},
+    {"id": "review", "type": "evaluator", "label": "Final Reviewer", "position": {"x": 1350, "y": 240}},
+    {"id": "end", "type": "end", "label": "Complete", "position": {"x": 1530, "y": 240}}
+  ],
+  "edges": [
+    {"id": "e-start-plan", "source": "start", "target": "planner", "variables": []},
+    {"id": "e-plan-code", "source": "planner", "target": "coder", "condition": "plan_ready == true", "variables": ["plan_ready"]},
+    {"id": "e-code-syntax", "source": "coder", "target": "syntax", "variables": ["source_code"]},
+    {"id": "e-syntax-security", "source": "syntax", "target": "security", "condition": "stage_passed == true", "variables": ["source_code", "test_results"]},
+    {"id": "e-syntax-coder", "source": "syntax", "target": "coder", "condition": "stage_passed == false", "variables": ["error_trace"], "loop": {"max_iterations": 4, "temperature_decay": 0.75, "timeout_seconds": 600}},
+    {"id": "e-security-performance", "source": "security", "target": "performance", "condition": "stage_passed == true", "variables": ["source_code", "test_results"]},
+    {"id": "e-security-coder", "source": "security", "target": "coder", "condition": "stage_passed == false", "variables": ["error_trace"], "loop": {"max_iterations": 4, "temperature_decay": 0.75, "timeout_seconds": 600}},
+    {"id": "e-performance-unit", "source": "performance", "target": "unit", "condition": "stage_passed == true", "variables": ["source_code", "test_results"]},
+    {"id": "e-performance-coder", "source": "performance", "target": "coder", "condition": "stage_passed == false", "variables": ["error_trace"], "loop": {"max_iterations": 4, "temperature_decay": 0.75, "timeout_seconds": 600}},
+    {"id": "e-unit-review", "source": "unit", "target": "review", "condition": "stage_passed == true", "variables": ["source_code", "test_results"]},
+    {"id": "e-unit-coder", "source": "unit", "target": "coder", "condition": "stage_passed == false", "variables": ["source_code", "error_trace"], "loop": {"max_iterations": 4, "temperature_decay": 0.75, "timeout_seconds": 600}},
+    {"id": "e-review-end", "source": "review", "target": "end", "condition": "tests_passed == true", "variables": ["source_code", "test_results"]},
+    {"id": "e-review-coder", "source": "review", "target": "coder", "condition": "tests_passed == false", "variables": ["error_trace"], "loop": {"max_iterations": 4, "temperature_decay": 0.75, "timeout_seconds": 600}}
+  ]
+}

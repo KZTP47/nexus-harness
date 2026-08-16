@@ -1,0 +1,3038 @@
+{
+  "schema_version": 1,
+  "name": "control-panel-workflows",
+  "cases": [
+    {
+      "id": "guided-first-view",
+      "title": "A new user lands on the guided view and sees the next steps",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "expect_visible",
+          "target": "#startView",
+          "note": "The guided view is showing"
+        },
+        {
+          "do": "expect_text",
+          "target": "#startTitle",
+          "text": "Welcome"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checkupSteps li",
+          "note": "The setup steps are listed"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#workflowActions",
+          "note": "Expert buttons stay out of the way"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "guided-example-fills-the-box",
+      "title": "Clicking an example fills in the task box",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-example]",
+          "note": "Click the first example"
+        },
+        {
+          "do": "expect_text",
+          "target": "#quickTask",
+          "text": "failing test",
+          "note": "The box now holds text"
+        },
+        {
+          "do": "type",
+          "target": "#quickTask",
+          "text": "Tidy the parser",
+          "note": "A user can type their own"
+        }
+      ]
+    },
+    {
+      "id": "guided-empty-task-is-refused",
+      "title": "Starting with an empty task says what is missing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "type",
+          "target": "#quickTask",
+          "text": ""
+        },
+        {
+          "do": "click",
+          "target": "#quickRun"
+        },
+        {
+          "do": "expect_text",
+          "target": "#liveAlert",
+          "text": "Say what the harness should do"
+        }
+      ]
+    },
+    {
+      "id": "checks-view-lists-and-runs",
+      "title": "The checks view lists the checks and runs them",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "timeout_seconds": 300,
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checkBody tr",
+          "note": "The checks are listed"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkBody",
+          "text": "README",
+          "note": "A known check is listed"
+        },
+        {
+          "do": "choose",
+          "target": "#checkTag",
+          "value": "docs",
+          "note": "Only the quick docs check"
+        },
+        {
+          "do": "click",
+          "target": "#runChecks",
+          "note": "Run it"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "Running",
+          "note": "It says it started"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "checks passed",
+          "timeout_ms": 60000,
+          "note": "The panel reports the finished run"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkBody",
+          "text": "passed",
+          "note": "The table shows the result"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checkSummary .metric",
+          "note": "The summary counts are shown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "nav-reaches-every-view",
+      "title": "Every tab opens and only one view shows at a time",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "nav"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#workflowView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#startView"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#workflowActions"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"history\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#workflowView"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"memory\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#historyView"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptsView"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#startView"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#promptsView"
+        }
+      ]
+    },
+    {
+      "id": "workflow-graph-validates",
+      "title": "The built-in workflow passes validation",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "click",
+          "target": "#validateButton"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "This workflow can run",
+          "timeout_ms": 15000
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeList li"
+        }
+      ]
+    },
+    {
+      "id": "workflow-agent-dialog-opens-and-closes",
+      "title": "The add agent window opens, refuses empty input, and closes",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentDialog"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentType"
+        },
+        {
+          "do": "click",
+          "target": "#cancelAgent"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentDialog"
+        }
+      ]
+    },
+    {
+      "id": "workflow-zoom-controls-work",
+      "title": "The canvas zoom buttons change the zoom reading",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn"
+        },
+        {
+          "do": "expect_text",
+          "target": "#zoomValue",
+          "text": "%"
+        },
+        {
+          "do": "click",
+          "target": "#fitButton"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        }
+      ]
+    },
+    {
+      "id": "memory-and-prompt-views-load",
+      "title": "The memory and prompt views load without an error",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "memory"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"memory\"]"
+        },
+        {
+          "do": "click",
+          "target": "#refreshMemory"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryGraph"
+        },
+        {
+          "do": "type",
+          "target": "#memoryQuery",
+          "text": "harness"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]"
+        },
+        {
+          "do": "click",
+          "target": "#refreshPrompts"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptLineage"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "keyboard-only-reaches-the-graph",
+      "title": "A keyboard user can reach the graph and move a node",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "keyboard"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "press",
+          "target": "#nodeLayer .graph-node .node-body",
+          "key": "ArrowRight"
+        },
+        {
+          "do": "press",
+          "target": "#nodeLayer .graph-node .node-body",
+          "key": "Control+ArrowRight"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        }
+      ]
+    },
+    {
+      "id": "team-notes-panel",
+      "title": "The team notes panel is there and says when it is empty",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "team"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#teamBoard"
+        },
+        {
+          "do": "expect_text",
+          "target": "#teamTitle",
+          "text": "Team notes"
+        },
+        {
+          "do": "expect_text",
+          "target": "#teamCount",
+          "text": "note",
+          "note": "It states how many notes there are"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "history-view-shows-past-runs",
+      "title": "The history view opens and explains itself",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "history"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"history\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyView"
+        },
+        {
+          "do": "expect_text",
+          "target": "#historyTitle",
+          "text": "What past runs did"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyList"
+        },
+        {
+          "do": "click",
+          "target": "#refreshHistory"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyList"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "model-setup-help",
+      "title": "The first screen explains how to connect a model",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "guided"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "expect_visible",
+          "target": ".model-setup"
+        },
+        {
+          "do": "expect_text",
+          "target": ".model-setup",
+          "text": "Ollama on this machine"
+        },
+        {
+          "do": "expect_visible",
+          "target": ".model-option .step-mark",
+          "note": "Each way carries a written state, not only a colour"
+        },
+        {
+          "do": "expect_text",
+          "target": ".model-setup",
+          "text": "Never paste a key into this page"
+        },
+        {
+          "do": "expect_text",
+          "target": ".model-setup",
+          "text": "ollama pull",
+          "note": "It gives the exact command to run"
+        },
+        {
+          "do": "click",
+          "target": "#refreshCheckup",
+          "note": "Check again asks for a fresh look"
+        },
+        {
+          "do": "expect_visible",
+          "target": ".model-setup"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0,
+        "body_not_contains": [
+          "Enter your key",
+          "Paste your key"
+        ]
+      }
+    },
+    {
+      "id": "workflow-tabs",
+      "title": "Workflows can be kept and switched between like tabs",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "timeout_seconds": 120,
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#workflowTabs"
+        },
+        {
+          "do": "expect_text",
+          "target": "#workflowStatus",
+          "text": "saved",
+          "note": "It says whether this workflow is saved"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#saveWorkflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#newWorkflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#renameWorkflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#deleteWorkflow"
+        },
+        {
+          "do": "click",
+          "target": "#newWorkflow",
+          "note": "Start a fresh workflow"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeLayer .graph-node"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "screenshot-button-stays-away",
+      "title": "The checks view offers the picker, and hides the screenshot button until it is useful",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "expect_visible",
+          "target": "#runChecks",
+          "note": "The checks view is showing"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#pickElement",
+          "note": "The picker button is offered"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#makeBundle",
+          "note": "The evidence button is offered"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#recordSteps",
+          "note": "The recorder button is offered"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#saveBaselines",
+          "note": "This project has no screenshot checks, so that button stays hidden"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#pickResult",
+          "note": "Nothing has been picked yet, so the names box stays out of the way"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-tag-filter-narrows-the-list",
+      "title": "Choosing a tag narrows the list of checks",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checkBody tr",
+          "note": "The checks are listed"
+        },
+        {
+          "do": "run",
+          "script": "window.__all = document.querySelectorAll('#checkBody tr').length; window.__tagged = qaSuite.cases.filter(c => (c.tags||[]).includes('safety')).length; return String(window.__all > window.__tagged && window.__tagged > 0)",
+          "text": "true",
+          "note": "The whole list is longer than the safety part of it"
+        },
+        {
+          "do": "choose",
+          "target": "#checkTag",
+          "value": "safety",
+          "note": "Only the safety checks"
+        },
+        {
+          "do": "run",
+          "script": "return String(document.querySelectorAll('#checkBody tr').length === window.__tagged)",
+          "text": "true",
+          "note": "Only the safety checks are listed"
+        },
+        {
+          "do": "choose",
+          "target": "#checkTag",
+          "value": "",
+          "note": "Back to every check"
+        },
+        {
+          "do": "run",
+          "script": "return String(document.querySelectorAll('#checkBody tr').length === window.__all)",
+          "text": "true",
+          "note": "The whole list is back"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-starter-suite-refuses-to-overwrite",
+      "title": "Writing starter checks over an existing suite is refused with a reason",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "click",
+          "target": "#createSuite",
+          "note": "Ask for starter checks"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "already exists",
+          "note": "It says the suite is already there instead of replacing it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-evidence-bundle-is-written",
+      "title": "The evidence button really writes a zip and says where it went",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "click",
+          "target": "#makeBundle",
+          "note": "Pack up the evidence"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "harness-bundle-",
+          "timeout_ms": 60000,
+          "note": "It names the file it wrote"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "Credentials were taken out",
+          "note": "It says what it did about credentials"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-picker-can-be-called-off",
+      "title": "Asking to point at something and then changing your mind leaves the panel working",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => null; return 'ready'",
+          "text": "ready",
+          "note": "Answer the address question with nothing, as a person pressing cancel would"
+        },
+        {
+          "do": "click",
+          "target": "#pickElement",
+          "note": "Point at something"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#pickResult",
+          "note": "No names box appears"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#runChecks",
+          "note": "The view still works"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-names-box-shows-what-was-picked",
+      "title": "The names box lists what was picked and never lets a page put markup in the panel",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "renderPick({gave_up:false, tag:'button', text:\"<img src=x onerror=window.__broken=1>Buy\", offered:[{selector:'[data-testid=\"buy\"]', kind:'test-hook', matches:1, reason:'An attribute put there for testing.'},{selector:'#mui-4821', kind:'id', matches:1, reason:\"The thing's own id.\", warning:'The name mui-4821 looks like one the page builds fresh every time.'}], thrown_away:[{selector:'button.primary', kind:'class', matches:6, reason:'A style class.'}]}); return String(!window.__broken && document.querySelectorAll('#pickResult img').length === 0)",
+          "text": "true",
+          "note": "Words from the page stay words"
+        },
+        {
+          "do": "expect_count",
+          "target": "#pickNames li",
+          "count": 2,
+          "note": "Both names are offered"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pickNames code",
+          "text": "data-testid",
+          "note": "The best name is first"
+        },
+        {
+          "do": "expect_visible",
+          "target": ".pick-warning",
+          "note": "The warning about a made-up name shows"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pickThrown",
+          "text": "button.primary",
+          "note": "The rejected name is explained"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-screenshot-button-appears-when-there-is-one",
+      "title": "The screenshot button appears as soon as the suite holds a screenshot check",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#saveBaselines",
+          "note": "Nothing to photograph yet"
+        },
+        {
+          "do": "run",
+          "script": "qaSuite = {present: true, tags: [], cases: [{id: 'look', title: 'A look', kind: 'visual'}]}; renderChecks(); const button = document.getElementById('saveBaselines'); const shown = !button.hidden && button.getClientRects().length > 0; return String(shown)",
+          "text": "true",
+          "note": "With a screenshot check in the suite the button shows, and is really visible"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "workflow-simulate-runs-and-logs",
+      "title": "Simulating the workflow walks the agents and writes to the run log",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#clearLog",
+          "note": "Start with an empty log"
+        },
+        {
+          "do": "expect_count",
+          "target": "#eventBody tr",
+          "count": 0,
+          "note": "The log is empty"
+        },
+        {
+          "do": "click",
+          "target": "#simulateButton",
+          "note": "Simulate"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#eventBody tr",
+          "timeout_ms": 30000,
+          "note": "The log filled up"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "This workflow can run",
+          "note": "It validated first"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-export-gives-a-file",
+      "title": "Exporting the workflow produces a file the panel could hand over",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__downloaded = ''; const realClick = HTMLAnchorElement.prototype.click; HTMLAnchorElement.prototype.click = function () { window.__downloaded = this.download; }; document.getElementById('exportButton').click(); HTMLAnchorElement.prototype.click = realClick; return window.__downloaded",
+          "text": "harness-graph.json",
+          "note": "The export hands over a named file"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-import-refuses-rubbish",
+      "title": "Importing a file that is not a workflow says so and changes nothing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__before = JSON.stringify(graph); return String(graph.nodes.length > 0)",
+          "text": "true",
+          "note": "There is a workflow to protect"
+        },
+        {
+          "do": "run",
+          "script": "await importGraph(new File(['not a workflow at all'], 'bad.json')); return String(JSON.stringify(graph) === window.__before)",
+          "text": "true",
+          "note": "The workflow on screen is untouched"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "It said something about it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-import-accepts-what-export-gave",
+      "title": "A workflow that was exported can be imported again",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__saved = JSON.stringify(graph, null, 2); await importGraph(new File([window.__saved], 'harness-graph.json')); return String(graph.nodes.length)",
+          "note": "Importing the same workflow back gives the same agents"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "This workflow can run",
+          "note": "It is still a workflow that runs"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-undo-puts-back-what-was-removed",
+      "title": "Removing an agent can be undone",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__count = graph.nodes.length; selectNode(graph.nodes[graph.nodes.length - 1].id); removeNode(graph.nodes[graph.nodes.length - 1].id); return String(graph.nodes.length === window.__count - 1)",
+          "text": "true",
+          "note": "One agent is gone"
+        },
+        {
+          "do": "click",
+          "target": "#undoButton",
+          "note": "Undo"
+        },
+        {
+          "do": "run",
+          "script": "return String(graph.nodes.length === window.__count)",
+          "text": "true",
+          "note": "The agent is back"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-new-agent-can-be-added-and-named",
+      "title": "Adding an agent either works or says exactly what is missing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__before = graph.nodes.length; return 'ok'",
+          "text": "ok"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton",
+          "note": "Open the add agent window"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentDialog",
+          "note": "The window is open"
+        },
+        {
+          "do": "type",
+          "target": "#agentLabel",
+          "text": "A tester",
+          "note": "Name it"
+        },
+        {
+          "do": "type",
+          "target": "#agentModel",
+          "text": "qwen2.5-coder:7b",
+          "note": "Say which model"
+        },
+        {
+          "do": "type",
+          "target": "#agentRoleName",
+          "text": "tester",
+          "note": "Say what it does"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('agentProvider'); const usable = [...box.options].find(o => o.value && !o.disabled); if (usable) { box.value = usable.value; document.querySelector('#agentForm button[type=submit]').click();   return String(graph.nodes.length === window.__before + 1); } return [...box.options].some(o => o.textContent.includes('allow_project_graphs')   || o.textContent.includes('Start here')) ? 'true' : 'false'",
+          "text": "true",
+          "note": "Either the agent is added, or the box says what to change to make it possible"
+        },
+        {
+          "do": "click",
+          "target": "#cancelAgent",
+          "note": "Close the window"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentDialog",
+          "note": "The window closed"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-every-agent-kind-can-be-added",
+      "title": "Every button in the palette does what it says",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__before = graph.nodes.length; return 'ok'",
+          "text": "ok"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"tool\"]",
+          "note": "Add a tool"
+        },
+        {
+          "do": "run",
+          "script": "return String(graph.nodes.length === window.__before + 1)",
+          "text": "true",
+          "note": "A tool goes straight on the canvas"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"gauntlet\"]",
+          "note": "Add the ready-made group"
+        },
+        {
+          "do": "run",
+          "script": "return String(graph.nodes.length > window.__before + 1)",
+          "text": "true",
+          "note": "The ready-made group added several agents at once"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"planner\"]",
+          "note": "Add a planner"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentDialog",
+          "note": "An agent asks for its details first"
+        },
+        {
+          "do": "click",
+          "target": "#cancelAgent",
+          "note": "Change your mind"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentDialog",
+          "note": "The window closed"
+        },
+        {
+          "do": "click",
+          "target": "#validateButton",
+          "note": "Check the workflow still runs"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "It answered"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-fit-and-zoom-keep-the-canvas-usable",
+      "title": "Fit brings the whole workflow back into view after zooming right in",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn",
+          "note": "Zoom in"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn",
+          "note": "Zoom in again"
+        },
+        {
+          "do": "click",
+          "target": "#fitButton",
+          "note": "Fit"
+        },
+        {
+          "do": "run",
+          "script": "return String(Number(document.getElementById('zoomValue').textContent.replace('%','')) <= 125)",
+          "text": "true",
+          "note": "The whole workflow fits on screen"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-run-needs-a-task",
+      "title": "Starting a run with an empty task says what is missing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "type",
+          "target": "#taskInput",
+          "text": "",
+          "note": "Leave the task empty"
+        },
+        {
+          "do": "click",
+          "target": "#runButton",
+          "note": "Start"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "task",
+          "note": "It asks for a task"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "memory-search-box-asks-the-server",
+      "title": "Typing in the memory search box asks again and keeps the view working",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "memory"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"memory\"]",
+          "note": "Open the memory view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryBody",
+          "note": "The memory table is there"
+        },
+        {
+          "do": "type",
+          "target": "#memoryQuery",
+          "text": "parser",
+          "note": "Search for something"
+        },
+        {
+          "do": "press",
+          "target": "#memoryQuery",
+          "key": "Enter",
+          "note": "Ask"
+        },
+        {
+          "do": "wait",
+          "ms": 700,
+          "note": "Give the answer time to come back"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryTitle",
+          "note": "The view is still fine"
+        },
+        {
+          "do": "choose",
+          "target": "#memoryKind",
+          "value": "",
+          "note": "Every kind of memory"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "history-refresh-keeps-the-table",
+      "title": "Asking the history view to look again keeps its table",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "history"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"history\"]",
+          "note": "Open the history view"
+        },
+        {
+          "do": "click",
+          "target": "#refreshHistory",
+          "note": "Look again"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyBody",
+          "note": "The table is still there"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyList",
+          "note": "The list of past runs is there"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "prompts-two-versions-can-be-compared",
+      "title": "The prompt view offers two sides to compare",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "prompts"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]",
+          "note": "Open the prompts view"
+        },
+        {
+          "do": "click",
+          "target": "#refreshPrompts",
+          "note": "Look again"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptLeft",
+          "note": "The left side picker is there"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptRight",
+          "note": "The right side picker is there"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptLineage",
+          "note": "The history of changes is there"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "advice-panel-answers",
+      "title": "The panel says what to do about the checks without being asked twice",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "click",
+          "target": "#refreshUnstable",
+          "note": "Ask for advice"
+        },
+        {
+          "do": "wait",
+          "ms": 700
+        },
+        {
+          "do": "expect_visible",
+          "target": "#adviceList li",
+          "note": "Advice is shown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "errors-are-shown-not-swallowed",
+      "title": "When the server says no, the panel shows the reason",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "try { await request('/api/workflows/save', {method:'POST', body: JSON.stringify({name:'../escape', graph})}); return 'no error'; } catch (error) { showError(error.message); return 'told'; }",
+          "text": "told",
+          "note": "A name that could escape the folder is refused"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "The reason is on screen"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "the-panel-says-when-it-is-connected",
+      "title": "The panel shows whether it is still talking to the harness",
+      "kind": "browser",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "expect_text",
+          "target": "#connectionStatus",
+          "text": "Connected",
+          "timeout_ms": 20000,
+          "note": "It says it is connected"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#liveStatus",
+          "note": "There is a live area for messages"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-agents-can-be-joined-up",
+      "title": "Two agents can be joined, and a joint that makes no sense is refused",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__edges = graph.edges.length; addNode('tool', 500, 400); window.__new = graph.nodes[graph.nodes.length - 1].id; window.__from = graph.nodes[0].id; return String(graph.edges.length === window.__edges)",
+          "text": "true",
+          "note": "Add a fresh tool with nothing joined to it"
+        },
+        {
+          "do": "run",
+          "script": "connectPort(window.__from); connectPort(window.__new); return String(graph.edges.length === window.__edges + 1)",
+          "text": "true",
+          "note": "Joining two agents makes one connection"
+        },
+        {
+          "do": "run",
+          "script": "const before = graph.edges.length; connectPort(window.__new); connectPort(window.__new); return String(graph.edges.length === before)",
+          "text": "true",
+          "note": "An agent joined to itself makes nothing"
+        },
+        {
+          "do": "click",
+          "target": "#validateButton",
+          "note": "Check the workflow still runs"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "It answered"
+        },
+        {
+          "do": "run",
+          "script": "const edge = graph.edges[graph.edges.length - 1]; selectEdge(edge.id); removeEdge(edge.id); return String(graph.edges.length === window.__edges)",
+          "text": "true",
+          "note": "The new connection can be taken out again"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-can-be-joined-with-the-keyboard",
+      "title": "A keyboard user can join two agents without a mouse",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow",
+        "keyboard"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__edges = graph.edges.length; addNode('tool', 520, 420); const to = graph.nodes[graph.nodes.length - 1]; const from = graph.nodes[0]; focusedNodeId = from.id; render(); const box = document.querySelector('[data-node-focus=\"' + from.id + '\"]'); box.dispatchEvent(new KeyboardEvent('keydown', {key: 'c', bubbles: true})); const target = document.querySelector('[data-node-focus=\"' + to.id + '\"]'); target.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return String(graph.edges.length === window.__edges + 1)",
+          "text": "true",
+          "note": "Pressing C then Enter joins two agents"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#edgeList",
+          "note": "The list of connections is there"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-keyboard-really-moves-an-agent",
+      "title": "The arrow keys really move an agent, not just make a sound",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow",
+        "keyboard"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const node = graph.nodes[0]; focusedNodeId = node.id; window.__where = {x: node.position.x, y: node.position.y}; const box = document.querySelector('[data-node-focus=\"' + node.id + '\"]'); box.focus(); box.dispatchEvent(new KeyboardEvent('keydown',   {key: 'ArrowRight', ctrlKey: true, bubbles: true})); const now = nodeById(node.id).position; return String(now.x !== window.__where.x || now.y !== window.__where.y)",
+          "text": "true",
+          "note": "The agent moved"
+        },
+        {
+          "do": "click",
+          "target": "#undoButton",
+          "note": "Undo the move"
+        },
+        {
+          "do": "run",
+          "script": "const node = graph.nodes[0]; return String(nodeById(node.id).position.x === window.__where.x)",
+          "text": "true",
+          "note": "It went back where it was"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-inspector-edits-the-agent",
+      "title": "Changing a name in the side panel really changes the workflow",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const node = graph.nodes.find(n => n.type === 'tool') || graph.nodes[0]; window.__node = node.id; selectNode(node.id); return 'ready'",
+          "text": "ready",
+          "note": "Choose an agent"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeInspector",
+          "note": "The side panel is showing"
+        },
+        {
+          "do": "type",
+          "target": "#nodeLabel",
+          "text": "Renamed by a check",
+          "note": "Type a new name"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('nodeLabel')  .dispatchEvent(new Event('change', {bubbles: true})); return nodeById(window.__node).label",
+          "text": "Renamed by a check",
+          "note": "The workflow holds the new name"
+        },
+        {
+          "do": "expect_text",
+          "target": "#nodeLayer",
+          "text": "Renamed by a check",
+          "note": "The canvas shows it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-tabs-really-save-and-remove",
+      "title": "A workflow can be kept under a name, opened again, renamed and removed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'Check made this'; window.confirm = () => true; await saveWorkflow(); const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check made this'))",
+          "text": "true",
+          "note": "It was really kept on disk"
+        },
+        {
+          "do": "expect_text",
+          "target": "#workflowTabs",
+          "text": "Check made this",
+          "note": "It shows as a tab"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'Check renamed this'; await renameWorkflow(); const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check renamed this')   && !kept.workflows.some(item => item.name === 'Check made this'))",
+          "text": "true",
+          "note": "The new name replaced the old one, with no copy left behind"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; await deleteWorkflow(); const kept = await request('/api/workflows'); return String(!kept.workflows.some(item => item.name === 'Check renamed this'))",
+          "text": "true",
+          "note": "It was really removed"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "panel-notices-the-harness-restarting",
+      "title": "A panel left open notices the harness restarting and listens again",
+      "kind": "browser",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "run",
+          "script": "lastEvent = 500; startedId = 'an-older-run'; const realRequest = window.request; window.request = async (path) => path.startsWith('/api/events')   ? {events: [], started_id: 'a-newer-run', gap: 0}   : realRequest(path); await pollEvents(); window.request = realRequest; return String(lastEvent === 0 && startedId === 'a-newer-run')",
+          "text": "true",
+          "note": "It starts listening from the beginning again"
+        },
+        {
+          "do": "expect_text",
+          "target": "#eventBody",
+          "text": "restarted",
+          "note": "It says so in the log"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "panel-copes-with-a-broken-update",
+      "title": "One broken update does not stop the rest being read",
+      "kind": "browser",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "run",
+          "script": "const realRequest = window.request; window.request = async (path) => path.startsWith('/api/events')   ? {events: [{sequence: 1}, {sequence: 2, kind: 'qa_started', node: 'checks'},      {sequence: 3, kind: 'note', node: 'later', payload: {summary: 'still read'}}],      started_id: startedId || '', gap: 0}   : realRequest(path); await pollEvents(); window.request = realRequest; return document.getElementById('eventBody').textContent.includes('still read')   ? 'kept going' : 'stopped'",
+          "text": "kept going",
+          "note": "An update with nothing in it did not stop the others"
+        },
+        {
+          "do": "expect_text",
+          "target": "#connectionStatus",
+          "text": "Connected",
+          "note": "It still says connected"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-can-be-added-from-the-shelf",
+      "title": "Pressing Add this on the shelf really adds the check",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('starterBox'); box.open = true; await refreshStarters(); return String(document.querySelectorAll('#starterList li').length > 5)",
+          "text": "true",
+          "note": "The shelf of ready-made checks is listed"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#starterList li')]; const row = rows.find(item => item.textContent.includes('The page works at phone size')); if (!row) return 'that ready-made check is not on the shelf'; const button = [...row.querySelectorAll('button')]   .find(item => item.textContent.includes('Add this')); if (!button) return 'the row has no Add this button'; button.click(); for (let tries = 0; tries < 100; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Added the check works-on-a-phone')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing Add this adds that check and says so"
+        },
+        {
+          "do": "run",
+          "script": "const now = await request('/api/qa/suite'); return (now.cases || []).some(c => c.id === 'works-on-a-phone') ? 'the check is there' : 'the check was not written'",
+          "text": "the check is there",
+          "note": "The check is really in the suite"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkBody",
+          "text": "works-on-a-phone",
+          "note": "And it shows in the table"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "await refreshChecks(); return document.getElementById('checkBody').textContent.includes('works-on-a-phone') ? 'still there' : 'gone'",
+          "text": "gone",
+          "always": true,
+          "note": "The table agrees it is gone"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-recording-can-be-called-off",
+      "title": "Asking to record and then changing your mind leaves the panel working",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => null; return 'ready'",
+          "text": "ready",
+          "note": "Answer the address question with nothing"
+        },
+        {
+          "do": "click",
+          "target": "#recordSteps",
+          "note": "Record what I do"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#runChecks",
+          "note": "The view still works"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('checkStatus').textContent.includes('browser window') ? 'started' : 'quiet'",
+          "text": "quiet",
+          "note": "Nothing was started"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-explain-button-answers",
+      "title": "The button that asks a model about a failure answers, even with no model set up",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const askButton = () => [...document.querySelectorAll('#checkBody button')].find(b => b.textContent.includes('Ask why')); qaResult = {counts: {passed: 0, failed: 1, flaky: 0, skipped: 0, total: 1}, passed: false, duration_ms: 1, run_id: 'made-up', cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', status: 'failed', duration_ms: 1, reasons: ['it did not work'], tags: [], artifacts: [], attempts: [{number: 1, passed: false, duration_ms: 1, evidence: 'nothing was there'}]}]}; qaSuite = {present: true, tags: [], cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', tags: []}]}; renderChecks(); let ask = null; for (let tries = 0; tries < 40 && !ask; tries += 1) {   ask = askButton();   if (!ask) { await new Promise(r => setTimeout(r, 100)); qaResult = {counts: {passed: 0, failed: 1, flaky: 0, skipped: 0, total: 1}, passed: false, duration_ms: 1, run_id: 'made-up', cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', status: 'failed', duration_ms: 1, reasons: ['it did not work'], tags: [], artifacts: [], attempts: [{number: 1, passed: false, duration_ms: 1, evidence: 'nothing was there'}]}]}; qaSuite = {present: true, tags: [], cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', tags: []}]}; renderChecks(); } } if (!ask) return 'the button never appeared'; ask.click(); for (let tries = 0; tries < 60; tries += 1) {   const box = document.querySelector('.explain-box');   const said = document.getElementById('validationStatus').textContent;   if (box || said.length > 0) return 'true';   await new Promise(r => setTimeout(r, 100)); } return 'it neither answered nor said why not'",
+          "text": "true",
+          "note": "A failed check offers to explain itself, and the answer arrives"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-what-changed-is-shown",
+      "title": "The checks view says what moved since the run before",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "await refreshChanged(); const box = document.getElementById('changedSince'); return box.textContent.trim().length > 0 ? 'said something' : 'said nothing'",
+          "text": "said something",
+          "note": "It says what changed, or that nothing did"
+        },
+        {
+          "do": "run",
+          "script": "const found = await request('/api/qa/changed'); return String('broke' in found || 'nothing_to_compare' in found)",
+          "text": "true",
+          "note": "The answer has the shape the panel expects"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-coverage-panel-draws-the-gap",
+      "title": "The coverage panel draws one block per page and names the gap",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "renderCoverage({percent: 50, pages: [{address: 'http://127.0.0.1:8765/', state: 'checked', checked_by: ['home']},{address: 'http://127.0.0.1:8765/shop', state: 'nobody looks at it', checked_by: []}], checked: ['http://127.0.0.1:8765/'], missing: ['http://127.0.0.1:8765/shop'], walked_only: [], more_pages: 0}); return String(document.querySelectorAll('#coverageBar .coverage-block').length)",
+          "text": "2",
+          "note": "One block per page"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#addMissingChecks",
+          "note": "The button to write the missing checks is offered"
+        },
+        {
+          "do": "expect_text",
+          "target": "#coverageSummary",
+          "text": "1 have a check of their own",
+          "note": "It says how many pages are checked"
+        },
+        {
+          "do": "run",
+          "script": "return document.querySelector('#coverageList .coverage-nobody-looks-at-it') ? 'marked' : 'not marked'",
+          "text": "marked",
+          "note": "The page nobody checks is marked in the list"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-coverage-refuses-a-page-off-this-machine",
+      "title": "Writing a check for a page this project may not open is refused",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks",
+        "safety"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "try { await request('/api/qa/coverage/add', {method: 'POST', body: JSON.stringify({addresses: ['http://example.com/']})}); return 'it was allowed' } catch (error) { return 'refused' }",
+          "text": "refused",
+          "note": "The panel will not write a check for another machine"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-one-file-to-send-is-written",
+      "title": "The panel writes one file you can send, with the pictures inside it",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#makeSharePage",
+          "note": "The button is offered"
+        },
+        {
+          "do": "run",
+          "script": "const made = await request('/api/qa/share', {method: 'POST', body: JSON.stringify({})}); return (made.path && made.path.endsWith('report.html') && made.bytes > 0) ? 'wrote one file' : 'wrote nothing useful'",
+          "text": "wrote one file",
+          "note": "It writes one file and says where"
+        },
+        {
+          "do": "run",
+          "script": "try { await request('/api/qa/share', {method: 'POST', body: JSON.stringify({run: '../../elsewhere'})}); return 'it was allowed' } catch (error) { return 'refused' }",
+          "text": "refused",
+          "note": "A run name that climbs out of the project is refused"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-writing-the-missing-checks-works-end-to-end",
+      "title": "The button that writes a check for a page nobody looks at",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "renderCoverage({percent: 0, pages: [{address: 'http://127.0.0.1:8765/a-page-with-no-check-of-its-own', state: 'nobody looks at it', checked_by: []}], checked: [], missing: ['http://127.0.0.1:8765/a-page-with-no-check-of-its-own'], walked_only: [], more_pages: 0}); const button = document.getElementById('addMissingChecks'); return String(!button.hidden && button.textContent.includes('Write a check'))",
+          "text": "true",
+          "note": "The button is offered for the page nobody checks"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('addMissingChecks').click(); for (let tries = 0; tries < 60; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Added')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "text": "true",
+          "note": "Pressing it writes the check and says so"
+        },
+        {
+          "do": "run",
+          "script": "const now = await request('/api/qa/suite'); const names = (now.cases || []).map(c => c.id); return names.includes('a-page-with-no-check-of-its-own-opens') ? 'the check is there' : 'the check was not written'",
+          "text": "the check is there",
+          "note": "The check it wrote is really in the suite"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-the-send-one-file-button-is-really-pressed",
+      "title": "Pressing Make one file I can send writes the file and says where",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; return 'the screen is clear'",
+          "text": "the screen is clear",
+          "note": "Empty the message box so only new words count"
+        },
+        {
+          "do": "click",
+          "target": "#makeSharePage",
+          "note": "Press the button itself"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 100; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('report.html')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "The panel says which file it wrote"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "send it to anyone",
+          "note": "And says plainly what the file is for"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-the-find-pages-button-really-walks-the-site",
+      "title": "Pressing Find pages nobody checks walks the site and draws the answer",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; return 'the screen is clear'",
+          "text": "the screen is clear",
+          "note": "Empty the message box so only new words count"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => window.location.origin + '/'; return 'the address is ready'",
+          "text": "the address is ready",
+          "note": "Answer the box the button opens"
+        },
+        {
+          "do": "click",
+          "target": "#findGaps",
+          "note": "Press the button itself"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const box = document.getElementById('coverageResult');   const wrong = document.getElementById('validationStatus').textContent;   if (!box.hidden && document.querySelectorAll('#coverageBar .coverage-block').length > 0)     return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 500)); } return 'the walk never finished'",
+          "text": "true",
+          "timeout_ms": 120000,
+          "note": "A real walk happens and one block per page is drawn"
+        },
+        {
+          "do": "expect_text",
+          "target": "#coverageSummary",
+          "text": "have a check of their own",
+          "note": "And it says how much of the site is checked"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "canvas-zoom-out-really-zooms-out",
+      "title": "Pressing the zoom out button really makes the drawing smaller",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const said = document.getElementById('zoomValue').value; return said.endsWith('%') && parseInt(said) > 0   ? 'shown as a percentage' : ('it says ' + said)",
+          "text": "shown as a percentage",
+          "note": "The zoom is shown as a percentage"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.getElementById('zoomValue').value; document.getElementById('zoomOut').click(); const after = document.getElementById('zoomValue').value; return parseInt(after) < parseInt(before) ? 'smaller' :  (before + ' then ' + after)",
+          "text": "smaller",
+          "note": "Pressing zoom out makes the number go down"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 40; tries += 1)   document.getElementById('zoomOut').click(); const now = parseInt(document.getElementById('zoomValue').value); return now >= 30 ? 'it stops at a sensible size' : 'it shrank to ' + now",
+          "text": "it stops at a sensible size",
+          "note": "It stops shrinking rather than going to nothing"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "canvas-a-node-and-an-edge-can-be-deleted",
+      "title": "The delete buttons really take a box and a line off the drawing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const boxes = document.querySelectorAll('.graph-node').length; const lines = document.querySelectorAll('.edge-path').length; return (boxes > 1 && lines > 0) ? 'there is something to delete'   : ('boxes ' + boxes + ' lines ' + lines)",
+          "text": "there is something to delete",
+          "note": "The drawing starts with boxes and lines"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.querySelector('.edge-hit'); if (!line) return 'no line to pick'; line.dispatchEvent(new MouseEvent('click', {bubbles: true})); const before = document.querySelectorAll('.edge-path').length; document.getElementById('deleteEdge').click(); const after = document.querySelectorAll('.edge-path').length; return after === before - 1 ? 'one line fewer' : (before + ' then ' + after)",
+          "text": "one line fewer",
+          "note": "Pressing delete on a line removes it"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.querySelector('.graph-node .node-body'); if (!box) return 'no box to pick'; box.dispatchEvent(new MouseEvent('click', {bubbles: true})); const before = document.querySelectorAll('.graph-node').length; document.getElementById('deleteNode').click(); const after = document.querySelectorAll('.graph-node').length; return after === before - 1 ? 'one box fewer' : (before + ' then ' + after)",
+          "text": "one box fewer",
+          "note": "Pressing delete on a box removes it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "the-add-agent-box-can-be-closed",
+      "title": "The close button really shuts the add agent box",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton",
+          "note": "Open the add agent box"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('agentDialog').open ? 'the box is open' : 'the box did not open'",
+          "text": "the box is open",
+          "note": "The box really opened"
+        },
+        {
+          "do": "click",
+          "target": "#closeAgentDialog",
+          "note": "Press the close button"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('agentDialog').open ? 'it is still open' : 'the box is shut'",
+          "text": "the box is shut",
+          "note": "Pressing close really shuts it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-save-rename-and-delete-buttons-are-really-pressed",
+      "title": "The save, rename and delete buttons on a workflow really work",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const list = await request('/api/workflows'); const mine = (list.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); for (const name of mine) {   try { await request('/api/workflows/delete', {method: 'POST',     body: JSON.stringify({name})}) } catch (error) { return 'could not remove ' + name } } const now = await request('/api/workflows'); const left = (now.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'a-workflow-a-check-made'; window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; document.getElementById('saveWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   if ((list.workflows || []).some(w => w.name === 'a-workflow-a-check-made')) return 'saved';   await new Promise(r => setTimeout(r, 100)); } return 'it was never saved'",
+          "text": "saved",
+          "timeout_ms": 20000,
+          "note": "Pressing save really saves the workflow under that name"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'a-workflow-a-check-renamed'; document.getElementById('renameWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   const names = (list.workflows || []).map(w => w.name);   if (names.includes('a-workflow-a-check-renamed') && !names.includes('a-workflow-a-check-made')) return 'renamed';   await new Promise(r => setTimeout(r, 100)); } return 'it was never renamed'",
+          "text": "renamed",
+          "timeout_ms": 20000,
+          "note": "Pressing rename really changes its name"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; document.getElementById('deleteWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   if (!(list.workflows || []).some(w => w.name === 'a-workflow-a-check-renamed')) return 'deleted';   await new Promise(r => setTimeout(r, 100)); } return 'it was never deleted'",
+          "text": "deleted",
+          "timeout_ms": 20000,
+          "note": "Pressing delete really takes it away"
+        },
+        {
+          "do": "run",
+          "script": "const list = await request('/api/workflows'); const mine = (list.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); for (const name of mine) {   try { await request('/api/workflows/delete', {method: 'POST',     body: JSON.stringify({name})}) } catch (error) { return 'could not remove ' + name } } const now = await request('/api/workflows'); const left = (now.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-run-the-checks-button-is-really-pressed",
+      "title": "Run the checks instead really opens the checks view and starts a run",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('quickChecks').click(); for (let tries = 0; tries < 100; tries += 1) {   const shown = !document.getElementById('checksView').hidden;   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (shown && (said.includes('Running') || said.includes('passed')     || said.includes('failed'))) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'nothing happened'",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing it shows the checks view and a run begins"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-the-save-screenshots-button-is-really-pressed",
+      "title": "Save screenshots really starts a run when there is a picture check",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "await request('/api/qa/add', {method: 'POST', body: JSON.stringify({starter: 'looks-the-same', url: ''})}); await refreshChecks(); const button = document.getElementById('saveBaselines'); return button.hidden ? 'the button is still hidden' : 'the button is offered'",
+          "text": "the button is offered",
+          "timeout_ms": 20000,
+          "note": "With a picture check in the suite the button appears"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('saveBaselines').click(); for (let tries = 0; tries < 150; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Running') || said.includes('passed')     || said.includes('failed')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 200)); } return 'nothing happened'",
+          "text": "true",
+          "timeout_ms": 40000,
+          "note": "Pressing it really starts taking the pictures"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-copy-step-button-is-really-pressed",
+      "title": "Copy step really copies a step, or says plainly that it could not",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "renderPick({url: 'http://127.0.0.1:8765/', tag: 'button', text: 'Run all checks', offered: [{selector: '#runChecks', reason: 'it has a name of its own', matches: 1}], thrown_away: []}); const rows = [...document.querySelectorAll('#pickNames li')]; const button = rows.flatMap(r => [...r.querySelectorAll('button')])   .find(b => b.textContent.includes('Copy step')); return button ? 'the button is there' : 'no copy button was drawn'",
+          "text": "the button is there",
+          "note": "A picked name comes with a way to copy it"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#pickNames li')]; const button = rows.flatMap(r => [...r.querySelectorAll('button')])   .find(b => b.textContent.includes('Copy step')); button.click(); for (let tries = 0; tries < 60; tries += 1) {   if (button.textContent.includes('Copied')) return 'true';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.includes('would not let the harness copy')) return 'true';   await new Promise(r => setTimeout(r, 100)); } return 'it neither copied nor said why not'",
+          "text": "true",
+          "timeout_ms": 15000,
+          "note": "Pressing it either copies the step or says plainly it could not"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "start-view-plan-only-box-really-changes-what-is-asked",
+      "title": "Both plan only boxes really change what the harness is asked to do",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "type",
+          "target": "#quickTask",
+          "note": "Say what to do",
+          "text": "Tidy up the parser"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; const real = window.fetch; window.fetch = async (where, how) => {   if (String(where).includes('/api/run')) {     window.__asked.push(JSON.parse(how.body));     return new Response('{\"accepted\": true}',       {status: 202, headers: {'Content-Type': 'application/json'}});   }   return real(where, how); }; return 'ready to listen'",
+          "text": "ready to listen",
+          "note": "Listen for what the button asks for"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('quickDryRun').checked = false; document.getElementById('quickRun').click(); for (let tries = 0; tries < 60 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === false   ? 'it asked for a real run' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked for a real run",
+          "timeout_ms": 15000,
+          "note": "With the box clear it asks for a real run"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Back to the first view"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; document.getElementById('quickDryRun').checked = true; document.getElementById('quickRun').click(); for (let tries = 0; tries < 60 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === true   ? 'it asked to plan only' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked to plan only",
+          "timeout_ms": 15000,
+          "note": "With the box ticked it asks to plan only and change nothing"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "type",
+          "target": "#taskInput",
+          "text": "Tidy up the parser",
+          "note": "Say what to do there too"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; document.getElementById('dryRunInput').checked = true; document.getElementById('runButton').click(); for (let tries = 0; tries < 100 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === true   ? 'it asked to plan only' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked to plan only",
+          "timeout_ms": 20000,
+          "note": "The workflow view's box asks to plan only as well"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; document.getElementById('dryRunInput').checked = false; document.getElementById('runButton').click(); for (let tries = 0; tries < 100 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === false   ? 'it asked for a real run' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked for a real run",
+          "timeout_ms": 20000,
+          "note": "And clearing it asks for a real run"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-the-remove-button-on-a-row-is-really-pressed",
+      "title": "Remove on a check row really takes that check out",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "await request('/api/qa/add', {method: 'POST', body: JSON.stringify({starter: 'works-on-a-phone', url: ''})}); await refreshChecks(); const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('works-on-a-phone')); return row ? 'the check is in the table' : 'it is not in the table'",
+          "text": "the check is in the table",
+          "timeout_ms": 20000,
+          "note": "A check to remove is put in first"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('works-on-a-phone')); const button = [...row.querySelectorAll('button')]   .find(b => b.textContent.trim() === 'Remove'); if (!button) return 'the row has no Remove button'; button.click(); for (let tries = 0; tries < 100; tries += 1) {   const said = document.getElementById('checkStatus').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Took works-on-a-phone out')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'it never said what happened'",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing Remove really takes it out and says so"
+        },
+        {
+          "do": "run",
+          "script": "const now = await request('/api/qa/suite'); return (now.cases || []).some(c => c.id === 'works-on-a-phone') ? 'it is still there' : 'it is really gone'",
+          "text": "it is really gone",
+          "note": "And it is gone from the suite"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-write-starter-checks-button-is-really-pressed",
+      "title": "Write starter checks for me really writes them, or says they are there already",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "refreshCheckup = async () => {}; await new Promise(r => setTimeout(r, 1500)); checkup = {project: 'this project', steps: [{id: 'suite', title: 'Write your first checks', done: false, detail: 'A check says what a working project looks like.', action: 'harness qa init'}]}; renderCheckup(); for (let tries = 0; tries < 40; tries += 1) {   const list = document.getElementById('checkupSteps');   const button = [...list.querySelectorAll('button')]     .find(b => b.textContent.includes('Write starter checks for me'));   if (button) return 'the button is offered';   await new Promise(r => setTimeout(r, 100)); } return 'the button was not drawn'",
+          "text": "the button is offered",
+          "note": "A project with no checks is offered a way to write some",
+          "timeout_ms": 20000
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const list = document.getElementById('checkupSteps'); const button = [...list.querySelectorAll('button')]   .find(b => b.textContent.includes('Write starter checks for me')); button.click(); for (let tries = 0; tries < 100; tries += 1) {   const shown = !document.getElementById('checksView').hidden;   const wrong = document.getElementById('validationStatus').textContent;   if (shown) return 'true';   if (wrong.includes('already')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'nothing happened'",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing it either writes them and shows them, or says they are there already"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "workflow-choosing-merge-shows-the-merge-fields",
+      "title": "Choosing Merge as the agent type really shows the merge fields",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton",
+          "note": "Open the add agent box"
+        },
+        {
+          "do": "choose",
+          "target": "#agentType",
+          "value": "planner",
+          "note": "Start with an ordinary agent type"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentMergeFields",
+          "note": "An ordinary agent has no merge fields to fill in"
+        },
+        {
+          "do": "choose",
+          "target": "#agentType",
+          "value": "merge",
+          "note": "Choose Merge"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentMergeFields",
+          "note": "Choosing Merge really shows the fields a merge agent needs"
+        },
+        {
+          "do": "choose",
+          "target": "#agentType",
+          "value": "coder",
+          "note": "Choose something else again"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentMergeFields",
+          "note": "And they go away again"
+        },
+        {
+          "do": "click",
+          "target": "#closeAgentDialog",
+          "always": true,
+          "note": "Shut the box whatever happened"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "prompts-choosing-two-versions-really-shows-both",
+      "title": "Choosing two versions really shows both of them side by side",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "prompts"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]",
+          "note": "Open the prompt history"
+        },
+        {
+          "do": "run",
+          "script": "refreshPrompts = async () => {}; await new Promise(r => setTimeout(r, 1500)); promptRecords = [{id: 'aaaaaaaaaa11', name: 'planner', active: false, parent_id: '', body: 'THE EARLIER WORDING', metadata: {}},{id: 'bbbbbbbbbb22', name: 'planner', active: true, parent_id: 'aaaaaaaaaa11', body: 'THE LATER WORDING', metadata: {}}]; renderPrompts(); for (let tries = 0; tries < 40; tries += 1) {   const left = document.getElementById('promptLeft');   if (left.options.length === 2) return 'both versions are offered';   await new Promise(r => setTimeout(r, 100)); } return 'it offers ' + document.getElementById('promptLeft').options.length",
+          "text": "both versions are offered",
+          "timeout_ms": 20000,
+          "note": "Both versions are offered to choose from"
+        },
+        {
+          "do": "choose",
+          "target": "#promptLeft",
+          "value": "aaaaaaaaaa11",
+          "note": "Choose the earlier one on the left"
+        },
+        {
+          "do": "choose",
+          "target": "#promptRight",
+          "value": "bbbbbbbbbb22",
+          "note": "Choose the later one on the right"
+        },
+        {
+          "do": "expect_text",
+          "target": "#promptLeftBody",
+          "text": "THE EARLIER WORDING",
+          "note": "The left side shows the earlier wording"
+        },
+        {
+          "do": "expect_text",
+          "target": "#promptRightBody",
+          "text": "THE LATER WORDING",
+          "note": "The right side shows the later wording"
+        },
+        {
+          "do": "choose",
+          "target": "#promptLeft",
+          "value": "bbbbbbbbbb22",
+          "note": "Change the left one"
+        },
+        {
+          "do": "expect_text",
+          "target": "#promptLeftBody",
+          "text": "THE LATER WORDING",
+          "note": "Changing a choice really changes what is shown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "workflow-choosing-a-transfer-mode-really-changes-the-line",
+      "title": "Choosing a transfer mode really changes what the line does",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.querySelector('.edge-hit'); if (!line) return 'there is no line to pick'; line.dispatchEvent(new MouseEvent('click', {bubbles: true})); await new Promise(r => setTimeout(r, 200)); return document.getElementById('edgeMode').disabled   ? 'the mode cannot be changed' : 'a line is picked'",
+          "text": "a line is picked",
+          "note": "Pick a line on the drawing"
+        },
+        {
+          "do": "choose",
+          "target": "#edgeMode",
+          "value": "delegate",
+          "note": "Choose Delegate task"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const edge = graph.edges.find(e => e.id === selected.id); return edge.mode === 'delegate' ? 'the line really carries a task'   : ('the line says ' + edge.mode)",
+          "text": "the line really carries a task",
+          "note": "Choosing it really changes what the line does"
+        },
+        {
+          "do": "choose",
+          "target": "#edgeMode",
+          "value": "state",
+          "note": "Choose State again"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const edge = graph.edges.find(e => e.id === selected.id); return edge.mode === 'state' ? 'it changes back' : ('the line says ' + edge.mode)",
+          "text": "it changes back",
+          "note": "And choosing again changes it back"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-choosing-a-tool-role-really-changes-the-box",
+      "title": "Choosing what a tool box is for really changes the box",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"tool\"]",
+          "note": "Add a tool box"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const list = document.getElementById('nodeRole'); return list.hidden ? 'the list is hidden' : 'the list is offered'",
+          "text": "the list is offered",
+          "note": "A tool box is asked what it is for"
+        },
+        {
+          "do": "choose",
+          "target": "#nodeRole",
+          "value": "security",
+          "note": "Choose Security auditor"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const node = graph.nodes.find(n => n.id === selected.id); return node.config.role === 'security' ? 'the box really is a security one'   : ('the box says ' + node.config.role)",
+          "text": "the box really is a security one",
+          "note": "Choosing it really changes what the box is for"
+        },
+        {
+          "do": "run",
+          "script": "const id = selected.id; removeNode(id); await new Promise(r => setTimeout(r, 200)); return graph.nodes.some(n => n.id === id)   ? 'it is still there' : 'the drawing is as it was'",
+          "text": "the drawing is as it was",
+          "always": true,
+          "note": "Take the box off again whatever happened"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    }
+  ]
+}
