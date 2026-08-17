@@ -2609,7 +2609,14 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('saveBaselines').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Running') || said.includes('passed')     || said.includes('failed')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 200)); } return 'nothing happened'",
+          "script": "const suite = await request('/api/qa/suite'); const already = (suite.cases || []).some(one => one.id === 'looks-the-same'); if (already) return 'there is a picture check to save one for'; await request('/api/qa/add', {method: 'POST', body: JSON.stringify({   starter: 'looks-the-same', url: window.location.origin + '/',   name: 'looks-the-same'})}); const now = await request('/api/qa/suite'); return (now.cases || []).some(one => one.id === 'looks-the-same')   ? 'there is a picture check to save one for'   : 'the picture check could not be added'",
+          "text": "there is a picture check to save one for",
+          "timeout_ms": 60000,
+          "note": "A project with no picture check has no picture to save, so this brings one"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; await refreshChecks();document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('saveBaselines').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Running') || said.includes('passed')     || said.includes('failed')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 200)); } return 'nothing happened'",
           "text": "true",
           "timeout_ms": 40000,
           "note": "Pressing it really starts taking the pictures"
