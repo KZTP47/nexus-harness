@@ -1505,6 +1505,7 @@ class QaRunner:
         self.environment_name, self.environment = datasets.chosen_environment(config, environment)
         self.update_baselines = bool(update_baselines)
         self._browser_ready: bool | None = None
+        self._browser_why = ""
         # Screenshot checks save pictures while they run. Cases run side by side,
         # so the list of saved files is kept under a lock, one entry per case.
         self._pictures: dict[str, list[str]] = {}
@@ -2016,9 +2017,11 @@ class QaRunner:
 
     def _ready_for_browser(self) -> None:
         if not self.browser_available():
+            why = getattr(self, "_browser_why", "")
             raise QaSkipped(
                 "This machine has no Playwright browser driver yet. Install Node.js, then run "
                 "'npm install playwright' and 'npx playwright install chromium' in the project."
+                + (f" What it tried: {why}" if why else "")
             )
 
     def _drive_browser(
@@ -2291,8 +2294,16 @@ class QaRunner:
                     ["node", "-e", "require.resolve('playwright')"], cwd=".", timeout=30
                 )
                 self._browser_ready = probe.passed
-            except HarnessError:
+                # What it tried, kept for the message. "No browser driver" with
+                # nothing else said sends people to reinstall something that was
+                # already there.
+                self._browser_why = "" if probe.passed else (
+                    f"node stopped with {probe.exit_code}: "
+                    f"{(probe.stderr or probe.stdout or '').strip()[:300]}"
+                )
+            except HarnessError as exc:
                 self._browser_ready = False
+                self._browser_why = f"node could not be started at all: {exc}"
         return bool(self._browser_ready)
 
     def _check_host(self, url: str) -> None:
