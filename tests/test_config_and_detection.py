@@ -55,7 +55,7 @@ class ConfigTests(unittest.TestCase):
                 local.write_text(
                     json.dumps({"project": {"test_commands": [["python", "evil.py"]]}}), encoding="utf-8"
                 )
-                with self.assertRaisesRegex(HarnessError, "trusted"):
+                with self.assertRaisesRegex(HarnessError, "harness trust"):
                     load_config(root)
 
     def test_init_creates_out_of_project_trust_record_for_detected_commands(self) -> None:

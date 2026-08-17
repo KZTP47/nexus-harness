@@ -48,6 +48,13 @@ class Rule:
     headline: str
     because: str
     try_this: tuple[str, ...]
+    # Some words only mean one thing in one kind of check. "2 to look at" is a
+    # security scan saying it found something; in a browser check the same
+    # words are ordinary English, and reading them as a leaked key sends
+    # somebody hunting for a secret that was never there.
+    only_for: tuple[str, ...] = ()
+    # Every one of these has to be there, not just one of them.
+    and_also: tuple[str, ...] = ()
 
 
 # Every rule is one somebody has really needed. The words on the left are what
@@ -133,8 +140,9 @@ RULES: tuple[Rule, ...] = (
     ),
     Rule(
         name="credentials in the code",
-        looks_like=(" to look at", "a password or key", "an API key", "a private key",
-                    "credentials left"),
+        looks_like=("a password or key", "an API key", "a private key",
+                    "credentials left", " to look at"),
+        and_also=("files",),
         headline="Something that looks like a credential is in your files.",
         because="The security scan reads your own files for keys and passwords left in them.",
         try_this=(
@@ -228,6 +236,10 @@ def what_it_means(said: str, *, kind: str = "") -> Meaning:
         )
     low = text.lower()
     for rule in RULES:
+        if rule.only_for and str(kind or "").lower() not in rule.only_for:
+            continue
+        if rule.and_also and not all(mark.lower() in low for mark in rule.and_also):
+            continue
         if any(mark.lower() in low for mark in rule.looks_like):
             return Meaning(
                 headline=rule.headline,

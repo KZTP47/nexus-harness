@@ -26,6 +26,7 @@
     <button type="button" data-view="checks" aria-pressed="false" title="Your tests: what a working project looks like">Checks</button>
     <button type="button" data-view="workflow" aria-pressed="false" title="For later: rewire the agents yourself">Workflow</button>
     <button type="button" data-view="pipelines" aria-pressed="false" title="Wire many jobs together with gates between them">Pipelines</button>
+    <button type="button" data-view="team" aria-pressed="false" title="The assistants you already pay for, and how they work together">Your team</button>
     <button type="button" data-view="vault" aria-pressed="false" title="What the harness has learned about you and this project">What it knows</button>
     <button type="button" data-view="settings" aria-pressed="false" title="Change any setting, without opening a file">Settings</button>
     <button type="button" data-view="history" aria-pressed="false" title="What past runs did, step by step">History</button>
@@ -418,6 +419,74 @@
       <div class="dialog-buttons">
         <button id="pipelineNodeCancel" type="button">Cancel</button>
         <button id="pipelineNodeSave" class="primary" type="button">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="teamView" data-view-panel="team" class="team-shell" hidden>
+    <aside class="team-side" aria-labelledby="teamSideTitle">
+      <div class="team-side-head">
+        <h2 id="teamSideTitle">Your team</h2>
+        <p id="teamWhoNote" class="hint">Looking for the assistants on this machine.</p>
+      </div>
+      <h3 id="teamWhoTitle">On this machine</h3>
+      <ul id="teamWho" class="team-who" aria-labelledby="teamWhoTitle"></ul>
+      <div class="team-side-buttons">
+        <button id="teamLookAgain" type="button">Look again</button>
+        <button id="teamSetUp" class="primary" type="button">I don't care, just set them up for me</button>
+      </div>
+      <h3 id="teamSavedTitle">Saved teams</h3>
+      <ul id="teamSaved" class="team-saved" aria-labelledby="teamSavedTitle"></ul>
+      <h3 id="teamAddTitle">Add somebody</h3>
+      <div id="teamJobs" class="team-jobs" aria-labelledby="teamAddTitle"></div>
+    </aside>
+
+    <section class="team-main" aria-labelledby="teamTitleMain">
+      <div class="team-bar">
+        <div>
+          <h2 id="teamTitleMain">How they work together</h2>
+          <p class="hint">A box is one assistant with a job. An arrow is a hand-over: who passes the work to whom.</p>
+          <p class="hint">Keyboard: Tab to a box, arrow keys move it, C connects it to another, S opens its settings, Delete takes it out.</p>
+        </div>
+        <div class="team-bar-fields">
+          <label for="teamName">Name</label>
+          <input id="teamName" type="text" maxlength="64" value="Your team">
+          <button id="teamStarting" type="button">Use the ready-made team</button>
+          <button id="teamCheck" type="button">Check it</button>
+          <button id="teamSave" class="primary" type="button">Save</button>
+          <button id="teamRemove" type="button">Delete</button>
+        </div>
+      </div>
+      <p id="teamSaid" class="team-said" role="status">Reading who is here.</p>
+      <div id="teamCanvas" class="team-canvas" role="application" aria-label="Your team" aria-describedby="teamHelp">
+        <p id="teamHelp" class="sr-only">Each assistant is a box with a job written on it. Press Connect on a box, then press another box to draw an arrow between them. With the keyboard: Tab to a box, arrow keys move it, C connects it to another, S opens its settings, Delete takes it out.</p>
+        <div id="teamNodes" class="team-nodes">
+          <svg id="teamWires" class="team-wires" aria-hidden="true"></svg>
+        </div>
+      </div>
+      <div class="team-plain-box">
+        <h3 id="teamPlainTitle">The same thing in words</h3>
+        <ol id="teamPlain" class="team-plain" aria-labelledby="teamPlainTitle"></ol>
+        <h3 id="teamProblemsTitle">What is in the way</h3>
+        <ul id="teamProblems" class="team-problems" aria-labelledby="teamProblemsTitle"></ul>
+      </div>
+    </section>
+  </div>
+
+  <dialog id="teamNodeDialog" aria-labelledby="teamNodeDialogTitle">
+    <form id="teamNodeForm" method="dialog">
+      <h2 id="teamNodeDialogTitle">Who is this, and what do they do</h2>
+      <p id="teamNodeSummary" class="hint"></p>
+      <label for="teamNodeLabel">What to call this box</label>
+      <input id="teamNodeLabel" type="text" maxlength="80">
+      <label for="teamNodeWho">Who does it</label>
+      <select id="teamNodeWho"></select>
+      <label for="teamNodeJob">What they do</label>
+      <select id="teamNodeJob"></select>
+      <p id="teamNodeJobMeans" class="hint"></p>
+      <div class="dialog-buttons">
+        <button id="teamNodeCancel" type="button">Cancel</button>
+        <button id="teamNodeSave" class="primary" type="button">Save</button>
       </div>
     </form>
   </dialog>

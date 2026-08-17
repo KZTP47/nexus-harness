@@ -1,0 +1,217 @@
+name: Checks
+
+# Everything that has to pass before a change is trusted. The jobs below do not
+# wait for each other, so the wait is as long as the slowest one rather than the
+# sum of all of them. The two long suites are split into four parts each, which
+# is what keeps that slowest one short.
+#
+# Windows only, on purpose: this is the machine the project is developed and
+# checked on, so a green build here means the same thing as a green run at a
+# desk. Adding Linux is a one line change once somebody has run the tests there
+# and seen them pass - a build that goes red on its first run teaches nobody
+# anything.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests, part ${{ matrix.part }} of 4
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Run this part of the tests
+        run: python scripts/run_tests.py --part ${{ matrix.part }}/4 --quiet
+
+  tests-on-the-oldest-python:
+    name: Tests on Python 3.11
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run every test
+        # The whole suite, not a part of it. This job says whether the oldest
+        # Python we promise to work on still works, so it has to cover all of
+        # it, and it runs beside the four parts rather than after them.
+        run: python scripts/run_tests.py --quiet
+
+  panel:
+    name: Panel checks, part ${{ matrix.part }} of 4
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Fetch the browser driver
+        run: |
+          npm ci
+          npx playwright install chromium
+      - name: Start the control panel
+        run: |
+          $env:PYTHONPATH = "src"
+          Start-Process -FilePath python `
+            -ArgumentList "-m","our_harness","ui","--port","8765","--no-open-browser" `
+            -RedirectStandardOutput panel-out.log -RedirectStandardError panel-err.log
+          $ready = $false
+          foreach ($try in 1..60) {
+            try {
+              Invoke-WebRequest -Uri http://127.0.0.1:8765/ -UseBasicParsing -TimeoutSec 2 | Out-Null
+              $ready = $true
+              break
+            } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $ready) {
+            Get-Content panel-out.log, panel-err.log -ErrorAction SilentlyContinue
+            throw "The control panel did not start, so none of these checks would mean anything."
+          }
+      - name: Run this part of the panel checks
+        env:
+          PYTHONPATH: src
+        run: >
+          python -m our_harness qa run
+          --suite .harness/qa/workflows.json
+          --part ${{ matrix.part }}/4
+          --workers 4
+          --format json
+          --output .harness/qa/ci-report.json
+      - name: Make sure they really ran
+        # Without a browser driver every one of these checks says "this could
+        # not be tried here" and the run passes. A build that checked nothing
+        # and went green is worse than no build at all.
+        run: |
+          $report = Get-Content .harness/qa/ci-report.json -Raw | ConvertFrom-Json
+          $counts = $report.counts
+          Write-Host "$($counts.passed) passed, $($counts.failed) failed, $($counts.skipped) skipped."
+          if ($counts.skipped -gt 0) {
+            throw "$($counts.skipped) check(s) could not be tried here, so this build proves less than it looks like it does."
+          }
+          if ($counts.total -lt 15) {
+            throw "Only $($counts.total) checks ran in this part. Something is wrong with how the suite was split."
+          }
+          if (-not $report.passed) { throw "Some checks failed." }
+      - name: Keep what the failures looked like
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: panel-part-${{ matrix.part }}
+          path: |
+            .harness/qa/runs
+            panel-out.log
+            panel-err.log
+          retention-days: 7
+
+  project-checks:
+    name: The project's own suite
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Fetch the browser driver
+        run: |
+          npm ci
+          npx playwright install chromium
+      - name: Run the suite
+        env:
+          PYTHONPATH: src
+        run: >
+          python -m our_harness qa run --workers 4
+          --format json --output .harness/qa/ci-report.json
+      - name: Make sure they really ran
+        run: |
+          $report = Get-Content .harness/qa/ci-report.json -Raw | ConvertFrom-Json
+          Write-Host "$($report.counts.passed) passed, $($report.counts.skipped) skipped."
+          if ($report.counts.skipped -gt 0) {
+            throw "$($report.counts.skipped) check(s) could not be tried here, so this build proves less than it looks like it does."
+          }
+          if (-not $report.passed) { throw "Some checks failed." }
+      - name: Look for anything that should not ship
+        env:
+          PYTHONPATH: src
+        run: python -m our_harness audit
+
+  desktop:
+    name: Desktop app
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install what the desktop app needs
+        working-directory: desktop
+        run: npm ci
+      - name: Run its tests
+        working-directory: desktop
+        run: npm test
+      - name: Start it and see that it answers
+        working-directory: desktop
+        run: npm run smoke
+
+  package:
+    name: What we would hand out
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build the single file and the wheel
+        run: |
+          python scripts/build_zipapp.py
+          python -m pip wheel . --no-deps -w dist
+      - name: Check they hold the same code as the source
+        run: python scripts/verify_dist.py
+      - name: Keep them
+        uses: actions/upload-artifact@v4
+        with:
+          name: harness-build
+          # Both really are written here. Naming a path nothing writes to would
+          # keep the job green while handing out less than it says.
+          if-no-files-found: error
+          path: |
+            dist/harness.pyz
+            dist/*.whl
+          retention-days: 14

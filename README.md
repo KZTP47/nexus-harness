@@ -103,6 +103,28 @@ really run — not from a drawing somebody has to remember to update.
 
 ---
 
+## Your team
+
+Most organisations have seats, not keys — somebody signed in to Claude,
+somebody signed in to Copilot. Both come with a command line tool that is
+already signed in, and the harness can drive either of them.
+
+![Your team](docs/images/your-team.png)
+
+The team tab looks on your machine, says who it found and whether each one is
+ready, and draws a team you can change: a box per assistant with a job on it,
+an arrow per hand-over. The ready-made one has the first assistant plan the
+work, the second write it, and the first read that work back — because two
+assistants trained apart tend not to share a blind spot.
+
+A job is only ever offered to an assistant really found here, and a team that
+could not run is never saved. A saved team is an ordinary workflow file, so
+everything that already runs a workflow runs a team.
+
+See [YOUR_TEAM.md](docs/YOUR_TEAM.md).
+
+---
+
 ## What it knows about you
 
 A harness that runs against the same project every day learns things: how you
@@ -510,6 +532,8 @@ Cloning a repository never gives that repository the right to run code.
 | [QA.md](docs/QA.md) | Checks, in full: every kind, every option, every command |
 | [PIPELINES.md](docs/PIPELINES.md) | Wiring many jobs together, with gates between them |
 | [WHAT_IT_KNOWS.md](docs/WHAT_IT_KNOWS.md) | The notes the harness keeps about you and your project |
+| [YOUR_TEAM.md](docs/YOUR_TEAM.md) | The assistants on your machine, and how to make them work together |
+| [WHAT_WE_COULD_ADD.md](docs/WHAT_WE_COULD_ADD.md) | What two other harnesses have that this one does not, and what each is worth |
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting and where it may come from |
 | [SECURITY.md](docs/SECURITY.md) | What is fenced off, and how |
 | [SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) | Using a Claude or Copilot seat instead of a key |

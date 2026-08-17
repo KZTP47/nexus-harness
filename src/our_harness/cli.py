@@ -743,6 +743,32 @@ def _count(number: int, singular: str, plural: str = "") -> str:
     return f"{number} {singular if number == 1 else (plural or singular + 's')}"
 
 
+def _which_part(said: str) -> tuple[int, int]:
+    """Read "2/4" as: the second part of four.
+
+    Splitting a suite across machines is how a long run is made short. Getting
+    the split wrong quietly runs a quarter of the checks and reports a pass, so
+    anything that is not two plain numbers is refused here rather than guessed
+    at.
+    """
+
+    said = str(said or "").strip()
+    if not said:
+        return (0, 0)
+    parts = said.replace(" of ", "/").replace("-", "/").split("/")
+    if len(parts) != 2 or not all(re.fullmatch(r"[0-9]+", item.strip()) for item in parts):
+        raise HarnessError(
+            "Write which part to run as two numbers, like --part 2/4 for the "
+            "second part of four."
+        )
+    number, of = int(parts[0]), int(parts[1])
+    if of < 1 or of > 100:
+        raise HarnessError("Split the suite into between 1 and 100 parts.")
+    if not 1 <= number <= of:
+        raise HarnessError(f"There is no part {number} of {of}. Number the parts from 1 up to {of}.")
+    return (number, of)
+
+
 def _qa_write_report(config: LoadedConfig, result: qa.QaRunResult, args: argparse.Namespace) -> None:
     destination = getattr(args, "output", None)
     if not destination:
@@ -796,6 +822,7 @@ def command_qa(args: argparse.Namespace) -> int:
             ids=args.case or (),
             workers=args.workers,
             write_artifacts=not args.no_artifacts,
+            part=_which_part(getattr(args, "part", "") or ""),
         )
         if not args.no_artifacts:
             qa.record_history(config, result)
@@ -1577,6 +1604,13 @@ def parser() -> argparse.ArgumentParser:
     qa_run.add_argument("--output", help="Write the report to this project-relative file")
     qa_run.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
     qa_run.add_argument("--environment", help="Use these saved settings for ${env.NAME} values")
+    qa_run.add_argument(
+        "--part",
+        help=(
+            "Run one part of the suite, written as 2/4. Split the checks across "
+            "several machines and each one runs its own part"
+        ),
+    )
     qa_run.set_defaults(handler=command_qa)
     qa_record = qa_sub.add_parser(
         "record", help="Do a workflow by hand once, and get a check written from it"

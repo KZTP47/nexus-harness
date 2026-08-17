@@ -29,6 +29,7 @@ from . import recorder
 from . import starters
 from . import seats as seat_setup
 from . import settings as settings_lab
+from . import team as team_lab
 from . import vault as vault_lab
 from . import selectors
 from . import share
@@ -190,6 +191,11 @@ class HarnessHTTPServer(ThreadingHTTPServer):
 class HarnessHandler(BaseHTTPRequestHandler):
     server: HarnessHTTPServer
     protocol_version = "HTTP/1.1"
+    # A caller that says it is sending a megabyte and then sends nothing used
+    # to hold a thread here for as long as it liked. One thread per connection,
+    # and no way to get them back, is how a panel stops answering the person
+    # who actually opened it.
+    timeout = 30
 
     def log_message(self, format: str, *args: object) -> None:
         if args and isinstance(args[0], str) and args[0].startswith("GET /api/events"):
@@ -377,7 +383,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
 
     def _qa_suite(self) -> dict[str, Any]:
         try:
-            suite = qalab.load_suite(self.server.config, None, self.server.check_kinds)
+            # The same lock every change to the suite takes. Reading while one
+            # is being written is how the panel came to say "no checks yet"
+            # about a project full of them.
+            with self.server.suite_lock:
+                suite = qalab.load_suite(self.server.config, None, self.server.check_kinds)
         except HarnessError as exc:
             return {"present": False, "reason": str(exc), "cases": [], "tags": []}
         return {
@@ -716,6 +726,25 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     if wanted
                     else pipeline_lab.a_starting_pipeline()
                 )
+                self._json(answer)
+            elif parsed.path == "/api/who-is-on-it":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                wanted = (query.get("name", [""])[0] or "").strip()
+                # Looking for assistants runs their command line tools, and
+                # setting seats up writes the routes those tools need. One at a
+                # time, so neither reads the other half done.
+                with self.server.seats_lock:
+                    answer = team_lab.everything(self._settings_now())
+                if wanted:
+                    try:
+                        answer["open"] = team_lab.load_team(self.server.config, wanted)
+                    except HarnessError:
+                        # Removed here, or in an editor, since the page last
+                        # looked. Losing the whole view over it would be a poor
+                        # trade.
+                        answer["open"] = None
+                        answer["gone"] = wanted
                 self._json(answer)
             elif parsed.path == "/api/setup/do-it":
                 self._require_token()
@@ -1074,6 +1103,36 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json(explainer.what_it_means(
                     str(body.get("said") or "")[:20000], kind=str(body.get("kind") or "")
                 ).to_dict())
+            elif self.path == "/api/who-is-on-it/save":
+                # Saving a team looks at the machine, which runs each
+                # assistant's own tool. That belongs to the seats lock: holding
+                # the suite's lock through a minute of waiting would stop every
+                # change to the checks for a job that has nothing to do with
+                # them.
+                with self.server.seats_lock:
+                    self._json({
+                        "team": team_lab.save_team(
+                            self.server.config,
+                            str(body.get("name") or ""),
+                            body.get("team"),
+                            was=str(body.get("was") or ""),
+                        ),
+                        "teams": team_lab.teams(self.server.config),
+                    })
+            elif self.path == "/api/who-is-on-it/remove":
+                with self.server.seats_lock:
+                    self._json({
+                        "note": team_lab.remove_team(self.server.config, str(body.get("name") or "")),
+                        "teams": team_lab.teams(self.server.config),
+                    })
+            elif self.path == "/api/who-is-on-it/check":
+                # Says what is wrong with a drawing without saving any of it.
+                with self.server.seats_lock:
+                    problems = team_lab.check_it(self._settings_now(), body.get("team"))
+                self._json({
+                    "problems": problems,
+                    "plain": team_lab.in_plain_words(body.get("team")),
+                })
             elif self.path == "/api/pipelines/save":
                 with self.server.suite_lock:
                     self._json({"pipeline": pipeline_lab.save(self.server.config, body.get("pipeline"))})

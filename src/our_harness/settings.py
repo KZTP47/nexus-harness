@@ -420,12 +420,22 @@ def _as_the_shipped_one(key: str, value: Any) -> Any:
         text = str(value).strip()
         if not text:
             return []
-        try:
-            read = json.loads(text)
-        except json.JSONDecodeError:
-            pass
-        else:
-            return read if isinstance(read, list) else [read]
+        # A written-out list is read as one. Anything else is read as what the
+        # setting holds: "true" is a command called true, not the word true.
+        if text[:1] in "[{":
+            try:
+                read = json.loads(text)
+            except json.JSONDecodeError:
+                pass
+            else:
+                return read if isinstance(read, list) else [read]
+        elif not key.endswith("_commands"):
+            try:
+                read = json.loads(text)
+            except json.JSONDecodeError:
+                pass
+            else:
+                return read if isinstance(read, list) else [read]
         if key.endswith("_commands"):
             # A command is a program and its arguments, and the harness keeps
             # each one as a list so nothing is handed to a shell. Somebody

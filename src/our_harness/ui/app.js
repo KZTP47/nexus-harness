@@ -615,7 +615,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -3221,8 +3221,512 @@ function bindEvents() {
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
   window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", runPipeline); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
+  $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
+  $("teamSetUp").addEventListener("click", setUpTheTeam);
+  $("teamStarting").addEventListener("click", async () => {
+    const said = await request("/api/who-is-on-it");
+    useTheStartingTeam(said.starting_team);
+    teamSay("This is the ready-made team. Change anything you like, then save it.");
+  });
+  $("teamCheck").addEventListener("click", async () => {
+    const fine = await checkTheTeam();
+    teamSay(fine ? "Nothing is in the way. This team would run." : "Have a look at what is in the way, below.");
+  });
+  $("teamSave").addEventListener("click", saveTheTeam);
+  $("teamRemove").addEventListener("click", removeTheTeam);
+  $("teamNodeSave").addEventListener("click", saveTeamNode);
+  $("teamNodeCancel").addEventListener("click", () => $("teamNodeDialog").close());
+  $("teamNodeJob").addEventListener("change", () => {
+    $("teamNodeJobMeans").textContent =
+      teamJobs.find((one) => one.job === $("teamNodeJob").value)?.means || "";
+  });
+  document.addEventListener("pointermove", moveTeamDrag);
+  document.addEventListener("pointerup", endTeamDrag);
   $("refreshMemory").addEventListener("click", refreshMemory); $("memoryQuery").addEventListener("change", refreshMemory); $("memoryKind").addEventListener("change", refreshMemory); $("refreshPrompts").addEventListener("click", refreshPrompts); $("promptLeft").addEventListener("change", renderPromptCompare); $("promptRight").addEventListener("change", renderPromptCompare);
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && edgeDrag) { event.preventDefault(); finishEdgeDrag({pointerId: edgeDrag.pointerId}, true); } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !$("agentDialog").open) { event.preventDefault(); undo(); } });
+}
+
+/* ==========================================================================
+   Your team: who is on this machine, and how they work together.
+
+   The picture is an ordinary saved workflow, so a team is something the rest
+   of the harness already knows how to run. What is different here is that the
+   boxes are people rather than jobs: each one says who does it, and the panel
+   only ever offers assistants it really found on this machine.
+   ========================================================================== */
+
+let teamGraph = {schema_version: 2, name: "Your team", entry: "start", nodes: [], edges: []};
+let teamWho = [];              // the assistants found on this machine
+let teamJobs = [];             // the jobs a box can be given
+let teamSavedNames = [];       // the teams already written down
+let teamOpen = "";             // the saved team on screen, if it came from one
+let teamJoining = "";          // the box an arrow is being drawn from
+let teamDragging = null;       // the box a pointer is moving
+let teamNodeOpen = "";         // the box whose settings window is open
+let teamNextId = 1;
+
+function teamSay(words) {
+  $("teamSaid").textContent = words;
+  announce(words);
+}
+
+async function refreshTeam(name) {
+  try {
+    const asked = name ? `?name=${encodeURIComponent(name)}` : "";
+    const said = await request(`/api/who-is-on-it${asked}`);
+    teamWho = said.who?.members || [];
+    teamJobs = said.jobs || [];
+    teamSavedNames = said.teams || [];
+    $("teamWhoNote").textContent = said.who?.note || "";
+    renderTeamWho();
+    renderTeamSaved();
+    renderTeamJobs();
+    if (said.gone) {
+      // Removed here, or in an editor, since this page last looked.
+      teamOpen = "";
+      teamSay(`${said.gone} is not here any more.`);
+      useTheStartingTeam(said.starting_team);
+      return;
+    }
+    if (said.open) {
+      teamOpen = said.open.name;
+      $("teamName").value = said.open.name;
+      teamGraph = laidOut(said.open.graph);
+      renderTeam();
+      await checkTheTeam();
+      return;
+    }
+    if (!teamGraph.nodes.length) useTheStartingTeam(said.starting_team);
+    else renderTeam();
+  } catch (error) { showError(error.message); $("teamSaid").textContent = error.message; }
+}
+
+function useTheStartingTeam(starting) {
+  if (!starting) return;
+  teamGraph = laidOut(starting);
+  teamOpen = "";
+  $("teamName").value = "Your team";
+  renderTeam();
+  const ready = teamWho.filter((one) => one.ready).length;
+  teamSay(ready > 1
+    ? "This is the ready-made team: one assistant plans and reads the work back, another writes it."
+    : "This is the ready-made team. Only one assistant is ready here, so it does every job for now.");
+  checkTheTeam();
+}
+
+// A saved workflow says nothing about where its boxes sit, so anything without
+// a place gets one: left to right in the order the work reaches them.
+function laidOut(graph) {
+  const copy = structuredClone(graph || {});
+  copy.nodes = (copy.nodes || []).map((node, spot) => ({
+    ...node,
+    at: node.at || {x: 30 + spot * 235, y: 30 + (spot % 2) * 155},
+  }));
+  copy.edges = copy.edges || [];
+  teamNextId = copy.nodes.length + copy.edges.length + 1;
+  return copy;
+}
+
+function renderTeamWho() {
+  const list = $("teamWho");
+  list.replaceChildren();
+  if (!teamWho.length) {
+    list.append(make("li", "hint", "Nothing was found yet. Press Look again."));
+    return;
+  }
+  for (const one of teamWho) {
+    const row = make("li", `team-who-one ${one.ready ? "ready" : "not-ready"}`);
+    row.dataset.who = one.route;
+    row.append(make("strong", "", one.label));
+    row.append(make("p", "team-who-state", one.ready
+      ? (one.already_set_up ? "Ready, and already set up." : "Ready. It is not set up yet.")
+      : (one.why_not || "Not on this machine.")));
+    if (one.version) row.append(make("p", "hint", one.version));
+    if (!one.ready && one.install_hint) row.append(make("p", "hint", one.install_hint));
+    list.append(row);
+  }
+}
+
+function renderTeamSaved() {
+  const list = $("teamSaved");
+  list.replaceChildren();
+  if (!teamSavedNames.length) {
+    list.append(make("li", "hint", "None saved yet."));
+    return;
+  }
+  for (const one of teamSavedNames) {
+    const row = make("li", "team-saved-one");
+    const open = make("button", "link", one.name);
+    open.type = "button";
+    open.dataset.team = one.name;
+    open.addEventListener("click", () => refreshTeam(one.name));
+    row.append(open);
+    row.append(make("span", "hint", `${one.nodes} boxes, ${one.edges} arrows`));
+    if (!one.valid) row.append(make("span", "team-broken", "will not run"));
+    list.append(row);
+  }
+}
+
+function renderTeamJobs() {
+  const box = $("teamJobs");
+  box.replaceChildren();
+  for (const job of teamJobs) {
+    const button = make("button", "team-job-add", job.label);
+    button.type = "button";
+    button.dataset.job = job.job;
+    button.title = job.means;
+    button.addEventListener("click", () => addToTheTeam(job));
+    box.append(button);
+  }
+}
+
+function addToTheTeam(job) {
+  const ready = teamWho.filter((one) => one.ready);
+  if (!ready.length) {
+    teamSay("No assistant on this machine is ready yet, so there is nobody to give a job to.");
+    return;
+  }
+  const id = `who-${teamNextId++}`;
+  const who = ready[teamGraph.nodes.length % ready.length];
+  teamGraph.nodes.push({
+    id,
+    type: job.job,
+    label: `${who.label} ${job.label.toLowerCase()}`,
+    config: {provider_route: who.route},
+    at: {
+      x: 30 + (teamGraph.nodes.length % 4) * 235,
+      y: 30 + Math.floor(teamGraph.nodes.length / 4) * 155,
+    },
+  });
+  renderTeam();
+  checkTheTeam();
+  teamSay(`Added ${job.label}. Press Connect on one box, then another, to hand work between them.`);
+}
+
+function renderTeam() {
+  const box = $("teamNodes");
+  const wires = $("teamWires");
+  box.replaceChildren(wires);
+  for (const node of teamGraph.nodes) {
+    const job = teamJobs.find((one) => one.job === node.type);
+    const card = make("div", `team-node kind-${node.type}`);
+    card.dataset.node = node.id;
+    card.style.left = `${node.at?.x || 0}px`;
+    card.style.top = `${node.at?.y || 0}px`;
+    card.append(make("strong", "", node.label || node.id));
+    if (job) card.append(make("p", "team-node-job", job.label));
+    const route = (node.config || {}).provider_route || "";
+    if (route) {
+      const known = teamWho.find((one) => one.route === route);
+      const who = make("p", "team-node-who", known ? known.label : route);
+      if (!known || !known.ready) who.classList.add("not-ready");
+      card.append(who);
+    } else if (job) {
+      card.append(make("p", "team-node-who not-ready", "Nobody chosen"));
+    }
+    const buttons = make("div", "team-node-buttons");
+    const join = make("button", "team-node-button", teamJoining === node.id ? "Joining" : "Connect");
+    join.type = "button";
+    join.title = "Draw an arrow from this one to another";
+    join.addEventListener("click", (event) => { event.stopPropagation(); joinTeamNodes(node.id); });
+    buttons.append(join);
+    if (job) {
+      const settings = make("button", "team-node-button", "Settings");
+      settings.type = "button";
+      settings.addEventListener("click", (event) => { event.stopPropagation(); openTeamNode(node.id); });
+      const remove = make("button", "team-node-button", "Remove");
+      remove.type = "button";
+      remove.addEventListener("click", (event) => { event.stopPropagation(); removeTeamNode(node.id); });
+      buttons.append(settings, remove);
+    }
+    card.append(buttons);
+    card.tabIndex = 0;
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label",
+      `${node.label || node.id}${job ? `, ${job.label}` : ""}. Arrow keys move it. `
+      + "C connects, S for settings, Delete removes it.");
+    card.addEventListener("keydown", (event) => teamKey(event, node));
+    card.addEventListener("pointerdown", (event) => startTeamDrag(event, node));
+    card.addEventListener("click", () => { if (teamJoining && teamJoining !== node.id) joinTeamNodes(node.id); });
+    box.append(card);
+  }
+  drawTeamWires();
+}
+
+function drawTeamWires() {
+  const wires = $("teamWires");
+  wires.replaceChildren();
+  for (const edge of teamGraph.edges) {
+    const from = teamGraph.nodes.find((node) => node.id === edge.source);
+    const to = teamGraph.nodes.find((node) => node.id === edge.target);
+    if (!from || !to) continue;
+    const x1 = (from.at?.x || 0) + 200, y1 = (from.at?.y || 0) + 40;
+    const x2 = (to.at?.x || 0), y2 = (to.at?.y || 0) + 40;
+    const middle = (x1 + x2) / 2;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}`);
+    line.setAttribute("class", edge.condition ? "team-wire only-when" : "team-wire");
+    wires.append(line);
+    if (edge.condition) {
+      const words = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      words.setAttribute("x", String(middle));
+      words.setAttribute("y", String((y1 + y2) / 2 - 12));
+      words.setAttribute("class", "team-wire-words");
+      words.textContent = edge.condition.includes("!=") ? "if it is not right yet" : "if it is right";
+      wires.append(words);
+    }
+    // The cross in the middle of an arrow takes it out: the thing you want
+    // rid of is the thing you press.
+    const cut = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    cut.setAttribute("cx", String(middle));
+    cut.setAttribute("cy", String((y1 + y2) / 2));
+    cut.setAttribute("r", "9");
+    cut.setAttribute("class", "team-cut");
+    cut.addEventListener("click", () => {
+      teamGraph.edges = teamGraph.edges.filter((one) => one !== edge);
+      renderTeam();
+      checkTheTeam();
+      teamSay(`Took the arrow from ${from.label} to ${to.label} out.`);
+    });
+    const cross = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    cross.setAttribute("x", String(middle));
+    cross.setAttribute("y", String((y1 + y2) / 2 + 4));
+    cross.setAttribute("class", "team-cut-mark");
+    cross.textContent = "x";
+    wires.append(cut, cross);
+  }
+}
+
+function joinTeamNodes(nodeId) {
+  if (!teamJoining) {
+    teamJoining = nodeId;
+    renderTeam();
+    teamSay("Press another box to finish the arrow.");
+    return;
+  }
+  if (teamJoining === nodeId) {
+    teamJoining = "";
+    renderTeam();
+    teamSay("Stopped joining.");
+    return;
+  }
+  const already = teamGraph.edges.some((edge) => edge.source === teamJoining && edge.target === nodeId);
+  if (!already) {
+    teamGraph.edges.push({
+      id: `hand-${teamNextId++}`,
+      source: teamJoining,
+      target: nodeId,
+      variables: ["task"],
+    });
+  }
+  teamJoining = "";
+  renderTeam();
+  checkTheTeam();
+  teamSay(already ? "That arrow is already there." : "They can hand work along that arrow now.");
+}
+
+function removeTeamNode(nodeId) {
+  teamGraph.nodes = teamGraph.nodes.filter((node) => node.id !== nodeId);
+  teamGraph.edges = teamGraph.edges.filter((edge) => edge.source !== nodeId && edge.target !== nodeId);
+  if (teamJoining === nodeId) teamJoining = "";
+  renderTeam();
+  checkTheTeam();
+  teamSay("Took that one off the team.");
+}
+
+function teamKey(event, node) {
+  const step = event.shiftKey ? 40 : 10;
+  const moves = {
+    ArrowLeft: [-step, 0], ArrowRight: [step, 0],
+    ArrowUp: [0, -step], ArrowDown: [0, step],
+  };
+  if (moves[event.key]) {
+    event.preventDefault();
+    node.at = {
+      x: Math.max(0, (node.at?.x || 0) + moves[event.key][0]),
+      y: Math.max(0, (node.at?.y || 0) + moves[event.key][1]),
+    };
+    renderTeam();
+    keepTeamFocus(node.id);
+    teamSay(`${node.label} is at ${Math.round(node.at.x)}, ${Math.round(node.at.y)}.`);
+    return;
+  }
+  const key = event.key.toLowerCase();
+  if (key === "c") { event.preventDefault(); joinTeamNodes(node.id); keepTeamFocus(node.id); return; }
+  if (key === "s") { event.preventDefault(); openTeamNode(node.id); return; }
+  if (event.key === "Delete" || event.key === "Backspace") {
+    event.preventDefault();
+    removeTeamNode(node.id);
+    const first = $("teamNodes").querySelector(".team-node");
+    if (first) first.focus();
+  }
+}
+
+// Redrawing builds new boxes, and the keyboard would otherwise be left on
+// nothing at all.
+function keepTeamFocus(nodeId) {
+  const card = $("teamNodes").querySelector(`[data-node="${CSS.escape(nodeId)}"]`);
+  if (card) card.focus();
+}
+
+function startTeamDrag(event, node) {
+  if (event.target.closest("button")) return;
+  const card = event.currentTarget;
+  const box = $("teamCanvas").getBoundingClientRect();
+  teamDragging = {
+    node,
+    grabX: event.clientX - box.left - (node.at?.x || 0),
+    grabY: event.clientY - box.top - (node.at?.y || 0),
+  };
+  card.setPointerCapture(event.pointerId);
+  card.classList.add("moving");
+}
+
+function moveTeamDrag(event) {
+  if (!teamDragging) return;
+  const box = $("teamCanvas").getBoundingClientRect();
+  const node = teamDragging.node;
+  node.at = {
+    x: Math.max(0, event.clientX - box.left - teamDragging.grabX),
+    y: Math.max(0, event.clientY - box.top - teamDragging.grabY),
+  };
+  const card = $("teamNodes").querySelector(`[data-node="${CSS.escape(node.id)}"]`);
+  if (card) { card.style.left = `${node.at.x}px`; card.style.top = `${node.at.y}px`; }
+  drawTeamWires();
+}
+
+function endTeamDrag() {
+  if (!teamDragging) return;
+  const card = $("teamNodes").querySelector(`[data-node="${CSS.escape(teamDragging.node.id)}"]`);
+  if (card) card.classList.remove("moving");
+  teamDragging = null;
+}
+
+/* ---- one box's settings ---- */
+
+function openTeamNode(nodeId) {
+  const node = teamGraph.nodes.find((one) => one.id === nodeId);
+  if (!node) return;
+  teamNodeOpen = nodeId;
+  $("teamNodeLabel").value = node.label || "";
+  const who = $("teamNodeWho");
+  who.replaceChildren();
+  for (const one of teamWho) {
+    const option = make("option", "", one.ready ? one.label : `${one.label} (not ready)`);
+    option.value = one.route;
+    option.disabled = !one.ready;
+    who.append(option);
+  }
+  who.value = (node.config || {}).provider_route || "";
+  const jobs = $("teamNodeJob");
+  jobs.replaceChildren();
+  for (const job of teamJobs) {
+    const option = make("option", "", job.label);
+    option.value = job.job;
+    jobs.append(option);
+  }
+  jobs.value = node.type;
+  $("teamNodeJobMeans").textContent = teamJobs.find((one) => one.job === node.type)?.means || "";
+  $("teamNodeSummary").textContent =
+    "The one that reads the work back is best not being the one that wrote it.";
+  $("teamNodeDialog").showModal();
+}
+
+function saveTeamNode() {
+  const node = teamGraph.nodes.find((one) => one.id === teamNodeOpen);
+  if (!node) { $("teamNodeDialog").close(); return; }
+  node.label = $("teamNodeLabel").value.trim() || node.label;
+  node.type = $("teamNodeJob").value;
+  node.config = {...(node.config || {}), provider_route: $("teamNodeWho").value};
+  $("teamNodeDialog").close();
+  renderTeam();
+  checkTheTeam();
+  teamSay(`${node.label} is set.`);
+}
+
+/* ---- checking, saving, removing ---- */
+
+async function checkTheTeam() {
+  try {
+    const said = await request("/api/who-is-on-it/check", {
+      method: "POST",
+      body: JSON.stringify({team: forSaving()}),
+    });
+    const problems = $("teamProblems");
+    problems.replaceChildren();
+    if (!(said.problems || []).length) {
+      problems.append(make("li", "team-ok", "Nothing. This team would run."));
+    } else {
+      for (const one of said.problems) problems.append(make("li", "team-problem", one));
+    }
+    const plain = $("teamPlain");
+    plain.replaceChildren();
+    for (const hand of (said.plain?.hand_overs || [])) {
+      const words = hand.only_when
+        ? `${hand.who} passes ${hand.what} back to ${hand.to_whom}, but only when the work is not right yet.`
+        : `${hand.who} passes ${hand.what} to ${hand.to_whom}.`;
+      plain.append(make("li", "team-plain-one", words));
+    }
+    if (said.plain?.note) plain.append(make("li", "team-plain-note", said.plain.note));
+    return (said.problems || []).length === 0;
+  } catch (error) { showError(error.message); return false; }
+}
+
+// The panel keeps where each box sits; the harness does not care. Both are
+// written down, because a team that forgot its own layout every time it was
+// opened would be a picture nobody could keep tidy.
+function forSaving() {
+  return {
+    schema_version: teamGraph.schema_version || 2,
+    name: $("teamName").value.trim() || "Your team",
+    entry: teamGraph.entry || "start",
+    nodes: teamGraph.nodes.map((node) => ({...node})),
+    edges: teamGraph.edges.map((edge) => ({...edge})),
+  };
+}
+
+async function saveTheTeam() {
+  const name = $("teamName").value.trim();
+  if (!name) { teamSay("Give the team a name first."); return; }
+  try {
+    const said = await request("/api/who-is-on-it/save", {
+      method: "POST",
+      body: JSON.stringify({name, team: forSaving(), was: teamOpen}),
+    });
+    teamOpen = said.team?.name || name;
+    teamSavedNames = said.teams || teamSavedNames;
+    renderTeamSaved();
+    teamSay(`${teamOpen} is saved. Anything that runs a workflow can run it.`);
+  } catch (error) { showError(error.message); $("teamSaid").textContent = error.message; }
+}
+
+async function removeTheTeam() {
+  const name = teamOpen || $("teamName").value.trim();
+  if (!name) { teamSay("There is nothing saved to remove."); return; }
+  if (!window.confirm(`Remove the team called ${name}?`)) return;
+  try {
+    const said = await request("/api/who-is-on-it/remove", {
+      method: "POST",
+      body: JSON.stringify({name}),
+    });
+    teamOpen = "";
+    teamSavedNames = said.teams || [];
+    renderTeamSaved();
+    teamSay(said.note || `${name} was removed.`);
+  } catch (error) { showError(error.message); $("teamSaid").textContent = error.message; }
+}
+
+// Setting them up is the seats setup, which is the only thing that writes
+// routes. Doing it twice in two places is how two answers start to disagree.
+async function setUpTheTeam() {
+  $("teamSetUp").disabled = true;
+  teamSay("Setting up every assistant that is really here. This runs their own tools, so give it a moment.");
+  try {
+    const said = await request("/api/seats/setup", {method: "POST", body: "{}"});
+    teamSay(said.note || "Set up.");
+    await refreshTeam(teamOpen);
+  } catch (error) { showError(error.message); $("teamSaid").textContent = error.message; }
+  finally { $("teamSetUp").disabled = false; }
 }
 
 async function boot() {
