@@ -420,10 +420,23 @@ def _do_ollama(job: Job, config: LoadedConfig, plan: Plan) -> None:
         starting.state = DONE
         starting.detail = f"Running, and answering at {endpoint}."
 
+    # The model is fetched whatever happened above, and the step is always
+    # shown. Ollama can be answering as a background service while its command
+    # is nowhere this process can see it; that used to skip the fetch without a
+    # word and still report the whole thing as set up and ready to use.
+    fetching = Step(f"Fetch the model {plan.model}")
+    job.steps.append(fetching)
     where = shutil.which(plan.command)
-    if where:
-        fetching = Step(f"Fetch the model {plan.model}")
-        job.steps.append(fetching)
+    if not where:
+        fetching.state = CANNOT
+        fetching.detail = (
+            f"Ollama is answering at {endpoint}, but its {plan.command} command is not "
+            "on this machine's path, so the model could not be fetched or checked."
+        )
+        job.left_for_you.append(
+            f"Fetch the model yourself: {plan.command} pull {plan.model}"
+        )
+    else:
         code, said = _run([where, "pull", plan.model], PULL_TIMEOUT_SECONDS)
         if code != 0:
             fetching.state = CANNOT

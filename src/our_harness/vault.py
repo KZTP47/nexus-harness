@@ -186,6 +186,21 @@ def _read_front(text: str) -> tuple[dict[str, Any], str]:
     return front, text[end + 4:].lstrip("\n")
 
 
+def _one_plain_line(said: Any) -> str:
+    """One line, with nothing in it that could pass for another line.
+
+    The few lines at the top of a note are one thing each. A value with a line
+    break in it wrote lines of its own, and a note that came from a run could
+    quietly set how sure the harness was about itself.
+    """
+
+    tidy = "".join(
+        " " if ord(letter) < 32 or ord(letter) == 127 else letter
+        for letter in str(said or "")
+    )
+    return re.sub(r"\s+", " ", tidy).strip()[:120]
+
+
 def _write_front(note: Note) -> str:
     tags = ", ".join(note.tags)
     return (
@@ -255,10 +270,11 @@ def write_one(config: LoadedConfig, note: Note, *, was: str = "") -> Note:
 
       - Changing a title changes the file name. Without knowing which note this
         was, the old file is left behind and the vault quietly holds two.
-      - Two different titles can turn into the same file name - "Payment Notes"
-        and "Payment  Notes" both become payment-notes. Writing anyway would
-        destroy somebody's note without a word, so it is refused unless this is
-        that same note.
+      - Two titles can turn into the same file name - "Payment Notes" and
+        "Payment  Notes" both become payment-notes, and so does writing a
+        second note with a title somebody already used. Writing anyway would
+        destroy their note without a word, so it is refused unless `was` says
+        this is that same note.
     """
 
     note.title = check_the_title(note.title)
@@ -271,6 +287,8 @@ def write_one(config: LoadedConfig, note: Note, *, was: str = "") -> Note:
         )
     if any(ord(letter) < 32 and letter not in "\t\n\r" for letter in note.body):
         raise VaultError("That note holds a control character")
+    note.came_from = _one_plain_line(note.came_from)
+    note.learned = _one_plain_line(note.learned)
     note.tags = [re.sub(r"[^A-Za-z0-9_-]+", "", str(tag))[:32] for tag in note.tags]
     note.tags = sorted({tag for tag in note.tags if tag})[:12]
     note.name = as_a_name(note.title)
@@ -281,12 +299,12 @@ def write_one(config: LoadedConfig, note: Note, *, was: str = "") -> Note:
     was = as_a_name(was) if was else ""
     if where.is_file() and note.name != was:
         there = read_one(config, note.name)
-        if there.title != note.title:
-            raise VaultError(
-                f"There is already a note called {there.title}, and it lives in the "
-                f"same file as {note.title} would. Give this one a name that is "
-                "different by more than spaces, capitals or punctuation."
-            )
+        raise VaultError(
+            f"There is already a note called {there.title}, and it lives in the "
+            f"same file as {note.title} would. Open that one to change it, or give "
+            "this one a name that is different by more than spaces, capitals or "
+            "punctuation."
+        )
     where.parent.mkdir(parents=True, exist_ok=True)
     where.write_text(_write_front(note), encoding="utf-8")
     if was and was != note.name:
@@ -414,7 +432,7 @@ def used(config: LoadedConfig, name: str, *, went_well: bool) -> Note:
     # What it is worth moves towards how it actually goes, rather than jumping,
     # so one bad afternoon does not throw away everything a note has earned.
     note.sure = round(max(0.05, min(0.99, note.sure + (0.1 if went_well else -0.15))), 2)
-    return write_one(config, note)
+    return write_one(config, note, was=note.name)
 
 
 def going_stale(config: LoadedConfig) -> list[Note]:

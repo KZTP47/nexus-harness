@@ -1864,7 +1864,7 @@
       "steps": [
         {
           "do": "run",
-          "script": "const realRequest = window.request; window.request = async (path) => path.startsWith('/api/events')   ? {events: [{sequence: 1}, {sequence: 2, kind: 'qa_started', node: 'checks'},      {sequence: 3, kind: 'note', node: 'later', payload: {summary: 'still read'}}],      started_id: startedId || '', gap: 0}   : realRequest(path); await pollEvents(); window.request = realRequest; return document.getElementById('eventBody').textContent.includes('still read')   ? 'kept going' : 'stopped'",
+          "script": "const realRequest = window.request; window.request = async (path, ...rest) => path.startsWith('/api/events')   ? {events: [{sequence: 1}, {sequence: 2, kind: 'qa_started', node: 'checks'},      {sequence: 3, kind: 'note', node: 'later', payload: {summary: 'still read'}}],      started_id: startedId || '', gap: 0}   : realRequest(path, ...rest); await pollEvents(); window.request = realRequest; return document.getElementById('eventBody').textContent.includes('still read')   ? 'kept going' : 'stopped'",
           "text": "kept going",
           "note": "An update with nothing in it did not stop the others"
         },
@@ -1878,7 +1878,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the panel's own asking"
+      ]
     },
     {
       "id": "checks-can-be-added-from-the-shelf",
@@ -4208,6 +4211,223 @@
       "touches": [
         "the vault"
       ]
+    },
+    {
+      "id": "team-view-draws-who-is-here-and-how-they-work-together",
+      "title": "The team view finds the assistants on this machine and draws the ready-made team",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "team"
+      ],
+      "touches": [
+        "the team"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"team\"]",
+          "note": "Open the team view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelectorAll('.team-node').length       && document.querySelectorAll('#teamPlain li').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('.team-node').length; const wires = document.querySelectorAll('.team-wire').length; return boxes && wires ? 'it drew the team and the hand-overs between them'   : 'it drew ' + boxes + ' boxes and ' + wires + ' arrows'",
+          "text": "it drew the team and the hand-overs between them",
+          "timeout_ms": 120000,
+          "note": "It opens with a picture: a box per assistant, an arrow per hand-over"
+        },
+        {
+          "do": "run",
+          "script": "const found = [...document.querySelectorAll('.team-who-one')]; if (!found.length) return 'it found nobody at all'; return found.every(one => one.textContent.trim().length > 10)   ? 'it says who is on this machine and whether each one is ready'   : 'one of them says nothing'",
+          "text": "it says who is on this machine and whether each one is ready",
+          "note": "The side says who was found, and for anyone missing, why"
+        },
+        {
+          "do": "run",
+          "script": "const boxes = [...document.querySelectorAll('.team-node')]; const jobs = boxes.filter(one => one.querySelector('.team-node-who')); if (!jobs.length) return 'no box says who does it'; const ready = [...document.querySelectorAll('.team-who-one.ready strong')]   .map(one => one.textContent); return jobs.every(one => ready.some(who =>   one.querySelector('.team-node-who').textContent.includes(who)))   ? 'every job is given to somebody really on this machine'   : 'a job was given to somebody who is not here'",
+          "text": "every job is given to somebody really on this machine",
+          "note": "And no job is given to a tool this machine does not have"
+        },
+        {
+          "do": "run",
+          "script": "const said = [...document.querySelectorAll('#teamPlain li')]   .map(one => one.textContent); return said.filter(one => one.includes('passes')).length >= 3   ? 'the same thing is written out in words'   : 'it said: ' + said.join(' | ').slice(0, 90)",
+          "text": "the same thing is written out in words",
+          "note": "The picture is also written out, for anybody not looking at pictures"
+        },
+        {
+          "do": "run",
+          "script": "const each = [...document.querySelectorAll('.team-node')]; return each.every(one => (one.getAttribute('aria-label') || '').length > 5)   ? 'every box says what it is' : 'a box says nothing'",
+          "text": "every box says what it is",
+          "note": "And every box says what it is, for anybody listening rather than looking"
+        },
+        {
+          "do": "run",
+          "script": "const problems = [...document.querySelectorAll('#teamProblems li')]; return problems.length ? 'it says whether the team would run'   : 'it did not say whether the team would run'",
+          "text": "it says whether the team would run",
+          "note": "It says plainly whether this team could run, or what is in the way"
+        },
+        {
+          "do": "click",
+          "target": "#teamLookAgain",
+          "note": "Look again really looks again"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelectorAll('.team-who-one').length       && document.querySelectorAll('.team-node').length) break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelectorAll('.team-who-one').length   ? 'looking again leaves the view standing'   : 'looking again emptied it'",
+          "text": "looking again leaves the view standing",
+          "timeout_ms": 120000,
+          "note": "And leaves a view with something in it, not an empty one"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "team-view-builds-saves-and-removes-a-team",
+      "title": "A team can be changed, saved, read back and removed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "team"
+      ],
+      "touches": [
+        "the team"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"team\"]",
+          "note": "Open the team view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelectorAll('.team-node').length       && document.querySelectorAll('#teamPlain li').length) break;   await new Promise(r => setTimeout(r, 250)); } for (const one of (teamSavedNames || []).slice()) {   if (one.name !== 'A team a check made') continue;   await request('/api/who-is-on-it/remove',     {method: 'POST', body: JSON.stringify({name: one.name})}); } await refreshTeam(); return 'nothing left over from before'",
+          "text": "nothing left over from before",
+          "timeout_ms": 120000,
+          "note": "Nothing left over from an earlier run"
+        },
+        {
+          "do": "run",
+          "script": "const before = teamGraph.nodes.length; const add = [...document.querySelectorAll('.team-job-add')]   .find(one => one.textContent.includes('Reads the work back')); if (!add) return 'there is no way to add somebody'; add.click(); await new Promise(r => setTimeout(r, 600)); return teamGraph.nodes.length === before + 1   ? 'adding somebody really adds them'   : 'it went from ' + before + ' to ' + teamGraph.nodes.length",
+          "text": "adding somebody really adds them",
+          "timeout_ms": 60000,
+          "note": "Adding somebody to the team puts a new box on the board"
+        },
+        {
+          "do": "run",
+          "script": "const added = teamGraph.nodes[teamGraph.nodes.length - 1]; const before = document.querySelectorAll('.team-wire').length; joinTeamNodes('coder'); joinTeamNodes(added.id); await new Promise(r => setTimeout(r, 700)); return document.querySelectorAll('.team-wire').length === before + 1   ? 'connecting two of them draws the hand-over'   : 'no arrow was drawn'",
+          "text": "connecting two of them draws the hand-over",
+          "timeout_ms": 60000,
+          "note": "Connect on one box then another draws the arrow between them"
+        },
+        {
+          "do": "run",
+          "script": " document.getElementById('teamName').value = 'A team a check made'; document.getElementById('teamSave').click(); for (let tries = 0; tries < 200; tries += 1) {   if ((teamSavedNames || []).some(one => one.name === 'A team a check made'))     return 'saving a team really saves it';   await new Promise(r => setTimeout(r, 250)); } return 'nothing was saved: ' + document.getElementById('teamSaid').textContent",
+          "text": "saving a team really saves it",
+          "timeout_ms": 120000,
+          "note": "Saving writes it down, and it turns up in the list of saved teams"
+        },
+        {
+          "do": "run",
+          "script": " await refreshTeam('A team a check made'); for (let tries = 0; tries < 200; tries += 1) {   if (document.getElementById('teamName').value === 'A team a check made') break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelectorAll('.team-node').length > 1   ? 'a saved team opens again with its boxes where they were'   : 'it opened empty'",
+          "text": "a saved team opens again with its boxes where they were",
+          "timeout_ms": 120000,
+          "note": "Opening a saved team brings it back, laid out as it was left"
+        },
+        {
+          "do": "run",
+          "script": "const box = teamGraph.nodes.find(one => one.type === 'coder'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 500)); return document.getElementById('teamNodeDialog').open   && document.getElementById('teamNodeWho').options.length > 0   ? 'a box can be opened to change who does it'   : 'the window did not open with anybody to choose'",
+          "text": "a box can be opened to change who does it",
+          "timeout_ms": 60000,
+          "note": "Each box opens a window to pick who does it and what they do"
+        },
+        {
+          "do": "choose",
+          "target": "#teamNodeJob",
+          "value": "evaluator",
+          "note": "Choose what this one does"
+        },
+        {
+          "do": "run",
+          "script": "const ready = [...document.getElementById('teamNodeWho').options]   .filter(one => !one.disabled); if (!ready.length) return 'there is nobody ready to choose'; document.getElementById('teamNodeWho').value = ready[0].value; document.getElementById('teamNodeWho')   .dispatchEvent(new Event('change', {bubbles: true})); return document.getElementById('teamNodeJobMeans').textContent.length > 10   ? 'choosing a job says what that job means'   : 'choosing a job explained nothing'",
+          "text": "choosing a job says what that job means",
+          "timeout_ms": 60000,
+          "note": "The list only offers somebody really here, and says what each job means"
+        },
+        {
+          "do": "click",
+          "target": "#teamNodeSave",
+          "note": "Save what was chosen"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (!document.getElementById('teamNodeDialog').open) break;   await new Promise(r => setTimeout(r, 250)); } return teamGraph.nodes.filter(one => one.type === 'evaluator').length >= 2   ? 'saving that window really changes the box'   : 'nothing changed'",
+          "text": "saving that window really changes the box",
+          "timeout_ms": 60000,
+          "note": "Saving that window changes the box on the board"
+        },
+        {
+          "do": "run",
+          "script": "const box = teamGraph.nodes.find(one => one.type === 'planner'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 400)); document.getElementById('teamNodeLabel').value = 'Never saved'; return 'the window is open with a change in it'",
+          "text": "the window is open with a change in it",
+          "timeout_ms": 60000,
+          "note": "Open a box and change something without saving"
+        },
+        {
+          "do": "click",
+          "target": "#teamNodeCancel",
+          "note": "Cancel the window"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 400)); return teamGraph.nodes.some(one => one.label === 'Never saved')   ? 'cancel kept the change anyway' : 'cancel really changes nothing'",
+          "text": "cancel really changes nothing",
+          "timeout_ms": 60000,
+          "note": "Cancel leaves the box exactly as it was"
+        },
+        {
+          "do": "click",
+          "target": "#teamStarting",
+          "note": "Go back to the ready-made team"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.getElementById('teamName').value === 'Your team') break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelectorAll('.team-node').length >= 3   ? 'the ready-made team can be brought back at any time'   : 'it came back empty'",
+          "text": "the ready-made team can be brought back at any time",
+          "timeout_ms": 60000,
+          "note": "The ready-made team is always one press away"
+        },
+        {
+          "do": "click",
+          "target": "#teamCheck",
+          "note": "Check it says whether it would run"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#teamProblems li').length) break;   await new Promise(r => setTimeout(r, 250)); } return document.getElementById('teamSaid').textContent.length > 10   ? 'checking it says what it found' : 'checking it said nothing'",
+          "text": "checking it says what it found",
+          "timeout_ms": 60000,
+          "note": "And says what it found, whether that is a problem or nothing at all"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; if ((teamSavedNames || []).some(one => one.name === 'A team a check made')) {   teamOpen = 'A team a check made';   document.getElementById('teamRemove').click();   for (let tries = 0; tries < 200; tries += 1) {     if (!(teamSavedNames || []).some(one => one.name === 'A team a check made')) break;     await new Promise(r => setTimeout(r, 250));   } } if ((teamSavedNames || []).some(one => one.name === 'A team a check made')) {   await request('/api/who-is-on-it/remove',     {method: 'POST', body: JSON.stringify({name: 'A team a check made'})}); } await refreshTeam(); return (teamSavedNames || []).some(one => one.name === 'A team a check made')   ? 'it is still there' : 'removing a team really removes it'",
+          "text": "removing a team really removes it",
+          "timeout_ms": 120000,
+          "always": true,
+          "note": "Removing it really removes it, and leaves the project as it was found"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
     }
   ]
 }

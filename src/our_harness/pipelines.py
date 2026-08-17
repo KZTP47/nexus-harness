@@ -387,6 +387,18 @@ def saved_ones(config: LoadedConfig) -> list[str]:
 
 
 def load(config: LoadedConfig, name: str) -> dict[str, Any]:
+    return _the_one_called(config, name)[1]
+
+
+def _the_one_called(config: LoadedConfig, name: str) -> tuple[Path, dict[str, Any]]:
+    """The file a pipeline lives in, and what is in it.
+
+    "Nightly build" and "Nightly-Build" share one file name. Saving already
+    refuses to write one over the other. Reading and removing did not, so
+    asking for a name nobody ever saved handed back somebody else's pipeline,
+    and removing it took theirs away while naming one that never existed.
+    """
+
     path = file_for(config, name)
     if not path.is_file():
         raise PipelineError(f"There is no pipeline called {name}")
@@ -394,7 +406,13 @@ def load(config: LoadedConfig, name: str) -> dict[str, Any]:
         held = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise PipelineError(f"{path.name} cannot be read: {exc}") from exc
-    return read_it(held)
+    there = str(held.get("name") or "") if isinstance(held, dict) else ""
+    if there and there.strip().lower() != str(name).strip().lower():
+        raise PipelineError(
+            f"There is no pipeline called {name}. The one saved under that file "
+            f"name is called {there}."
+        )
+    return path, read_it(held)
 
 
 def save(config: LoadedConfig, pipeline: Any) -> dict[str, Any]:
@@ -420,11 +438,9 @@ def save(config: LoadedConfig, pipeline: Any) -> dict[str, Any]:
 
 
 def remove(config: LoadedConfig, name: str) -> str:
-    path = file_for(config, name)
-    if not path.is_file():
-        raise PipelineError(f"There is no pipeline called {name}")
+    path, held = _the_one_called(config, name)
     path.unlink()
-    return f"{name} was removed."
+    return f"{held['name']} was removed."
 
 
 def a_starting_pipeline() -> dict[str, Any]:
@@ -796,7 +812,14 @@ def _do_one(config, node, before, results, order, check_kinds) -> tuple[bool, st
     if kind == "ai_unit_test":
         return _run_ai_unit_test(config, node, check_kinds)
     if kind == "artifact":
-        done = [results[other] for other in order if results[other].state != WAITING]
+        # Everything that has finished - not this step itself, which is running
+        # right now. Keeping the record of a run is the one job where writing
+        # down a half-finished thing about yourself is worst.
+        done = [
+            results[other]
+            for other in order
+            if other != node["id"] and results[other].state in (PASSED, FAILED, SKIPPED)
+        ]
         return _run_artifact(config, node, check_kinds, so_far=done)
     # read_it refuses an unknown kind long before here, so this is the case
     # where a kind was added to the list and not to the running.

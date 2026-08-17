@@ -82,12 +82,57 @@ def _plain_words(node: dict[str, Any]) -> tuple[str, str]:
     return title, detail
 
 
-def _in_running_order(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[str]:
-    """The node ids in the order the work reaches them.
+def _the_arrows_that_go_back(
+    onward: dict[str, list[str]], starts: list[str], place: dict[str, int] | None = None
+) -> set[tuple[str, str]]:
+    """The arrows that point at a stage the work has already been through.
 
-    Following the arrows forward from the start. A workflow can send work back
-    to a stage it has already been through, so anything already seen is not
-    walked again, or this would never finish.
+    Walking forward and marking each stage while it is still being walked. An
+    arrow onto a stage that is still open is the only kind that really goes
+    back; every other arrow moves the work along, however far apart the two
+    stages end up in the written order.
+
+    Where two stages point at each other, either arrow could be called the one
+    that goes back, and only one of the two answers reads right. So the walk
+    follows the arrows in the order the stages were written down, which is the
+    order somebody laying out a workflow works in. The retry then comes out as
+    the arrow pointing at the earlier stage, which is what a person would say
+    looking at the same picture.
+    """
+
+    place = place or {node_id: spot for spot, node_id in enumerate(onward)}
+    open_now: set[str] = set()
+    done: set[str] = set()
+    going_back: set[tuple[str, str]] = set()
+
+    def walk(node_id: str) -> None:
+        open_now.add(node_id)
+        for onto in sorted(onward.get(node_id, []), key=lambda one: place.get(one, 0)):
+            if onto in open_now:
+                going_back.add((node_id, onto))
+            elif onto not in done:
+                walk(onto)
+        open_now.discard(node_id)
+        done.add(node_id)
+
+    for node_id in sorted([*starts, *onward], key=lambda one: (one not in starts, place.get(one, 0))):
+        if node_id not in done:
+            walk(node_id)
+    return going_back
+
+
+def _in_running_order(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> list[str]:
+    """The node ids in an order where nothing comes before what it waits on.
+
+    Following the arrows forward is not enough on its own. Where two paths meet
+    again - the work splits, and both halves lead into one later stage - simply
+    walking outwards can reach that later stage down the short path first and
+    put it ahead of a stage it actually waits for. The story then reads
+    backwards, and an ordinary arrow looks like the work being sent back to try
+    again.
+
+    So: find the arrows that really do go back, leave those out, and take what
+    is left in the order that respects what waits on what.
     """
 
     by_id = {str(node.get("id")): node for node in nodes if isinstance(node, dict)}
@@ -107,19 +152,32 @@ def _in_running_order(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) 
     if not starts:
         starts = list(by_id)[:1]
 
+    place = {node_id: spot for spot, node_id in enumerate(by_id)}
+    back = _the_arrows_that_go_back(onward, starts, place)
+    waiting_on: dict[str, set[str]] = {node_id: set() for node_id in by_id}
+    for source, targets in onward.items():
+        for target in targets:
+            if (source, target) not in back:
+                waiting_on[target].add(source)
+
+    # A stage the work reaches sooner is written sooner; between two that are
+    # equally ready, the one written down first.
     order: list[str] = []
-    seen: set[str] = set()
-    waiting = list(starts)
-    while waiting:
-        node_id = waiting.pop(0)
-        if node_id in seen:
-            continue
-        seen.add(node_id)
-        order.append(node_id)
-        waiting.extend(onward.get(node_id, []))
-    # A node nothing points at still belongs in the story, at the end, rather
-    # than disappearing from an explanation that claims to be the whole thing.
-    order.extend(node_id for node_id in by_id if node_id not in seen)
+    left = {node_id: set(needs) for node_id, needs in waiting_on.items()}
+    while left:
+        ready = sorted(
+            (node_id for node_id, needs in left.items() if not needs),
+            key=lambda node_id: (node_id not in starts, place[node_id]),
+        )
+        if not ready:
+            # Every arrow that goes back was left out above, so this cannot
+            # happen. If it ever did, the rest still belongs in the story.
+            ready = sorted(left, key=lambda node_id: place[node_id])[:1]
+        for node_id in ready:
+            order.append(node_id)
+            del left[node_id]
+        for needs in left.values():
+            needs.difference_update(ready)
     return order
 
 
@@ -131,8 +189,18 @@ def story(graph: dict[str, Any]) -> list[Stage]:
     nodes = [node for node in (graph.get("nodes") or []) if isinstance(node, dict)]
     edges = [edge for edge in (graph.get("edges") or []) if isinstance(edge, dict)]
     order = _in_running_order(nodes, edges)
-    place = {node_id: spot for spot, node_id in enumerate(order)}
     by_id = {str(node.get("id")): node for node in nodes}
+    onward: dict[str, list[str]] = {node_id: [] for node_id in by_id}
+    for edge in edges:
+        source, target = str(edge.get("source")), str(edge.get("target"))
+        if source in by_id and target in by_id:
+            onward[source].append(target)
+    starts = [node_id for node_id, node in by_id.items() if node.get("type") == "start"]
+    going_back = _the_arrows_that_go_back(
+        onward,
+        starts or list(by_id)[:1],
+        {node_id: spot for spot, node_id in enumerate(by_id)},
+    )
 
     stages: list[Stage] = []
     for node_id in order:
@@ -140,13 +208,7 @@ def story(graph: dict[str, Any]) -> list[Stage]:
         title, detail = _plain_words(node)
         # An arrow pointing at a stage the work has already been through is the
         # loop: the harness found something wrong and is having another go.
-        back = sorted({
-            str(edge.get("target"))
-            for edge in edges
-            if str(edge.get("source")) == node_id
-            and str(edge.get("target")) in place
-            and place[str(edge.get("target"))] < place[node_id]
-        })
+        back = sorted({onto for source, onto in going_back if source == node_id})
         stages.append(
             Stage(
                 id=node_id,

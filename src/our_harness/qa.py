@@ -15,6 +15,7 @@ import contextlib
 import html
 import json
 import math
+import os
 import re
 import socket
 import ssl
@@ -434,6 +435,9 @@ class QaRunResult:
     selected_tags: tuple[str, ...] = ()
     selected_ids: tuple[str, ...] = ()
     artifacts_dir: str = ""
+    # Which part of the suite this run covered, when it was split across
+    # several machines. (0, 0) means the whole thing ran here.
+    part: tuple[int, int] = (0, 0)
 
     @property
     def counts(self) -> dict[str, int]:
@@ -461,6 +465,7 @@ class QaRunResult:
             "selected_tags": list(self.selected_tags),
             "selected_ids": list(self.selected_ids),
             "artifacts_dir": self.artifacts_dir,
+            "part": {"number": self.part[0], "of": self.part[1]} if self.part[1] else None,
             "cases": [case.to_dict() for case in self.cases],
         }
 
@@ -468,6 +473,54 @@ class QaRunResult:
 # ---------------------------------------------------------------------------
 # Suite parsing
 # ---------------------------------------------------------------------------
+
+
+def _one_part_of(chosen: list[QaCase], number: int, of: int) -> list[QaCase]:
+    """The checks one machine out of several should run.
+
+    Two things have to hold at once.
+
+    Every check is in exactly one part. A check that fell between two parts
+    would be a check nobody ran, on a build that stayed green.
+
+    And checks that name the same thing under `touches` stay together. Holding
+    them apart only works inside one run: split across four machines, each has
+    its own idea of what is busy, and two checks that must never overlap would
+    start at the same instant on two machines. So they are dealt as a group,
+    not one at a time.
+    """
+
+    # Which checks belong together: anything sharing a touch name, and anything
+    # sharing a check with something that shares a touch name.
+    group_of: dict[str, str] = {}
+    for case in chosen:
+        found = [group_of[thing] for thing in case.touches if thing in group_of]
+        name = min([*found, *case.touches]) if (found or case.touches) else case.id
+        for thing in case.touches:
+            group_of[thing] = name
+        for thing, was in list(group_of.items()):
+            if was in found:
+                group_of[thing] = name
+
+    groups: dict[str, list[QaCase]] = {}
+    order: list[str] = []
+    for case in chosen:
+        name = min((group_of[thing] for thing in case.touches if thing in group_of), default=case.id)
+        if name not in groups:
+            groups[name] = []
+            order.append(name)
+        groups[name].append(case)
+
+    # Dealt to whichever part has least so far, biggest group first, so a group
+    # that has to stay whole does not leave one machine doing everything. Ties
+    # go to the earlier part, so the same suite always splits the same way.
+    parts: list[list[QaCase]] = [[] for _ in range(of)]
+    heaviest = sorted(order, key=lambda name: (-len(groups[name]), order.index(name)))
+    for name in heaviest:
+        smallest = min(range(of), key=lambda spot: (len(parts[spot]), spot))
+        parts[smallest].extend(groups[name])
+    mine = {case.id for case in parts[number - 1]}
+    return [case for case in chosen if case.id in mine]
 
 
 def _control_path(root: Path, relative: str) -> Path:
@@ -1124,10 +1177,24 @@ def load_suite(
         raise QaError(
             f"No test suite at {path.name}. Run 'harness qa init' to write a starter suite."
         )
-    try:
-        raw = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise QaError(f"Cannot read the test suite: {exc}") from exc
+    # Writing the suite swaps a whole new file into place. On Windows there is
+    # a moment during that swap when opening the file is refused outright, so a
+    # panel refreshing at exactly the wrong instant used to be told the project
+    # had no readable suite. The swap is over in a moment, so this waits.
+    raw = ""
+    for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0):
+        try:
+            raw = path.read_text(encoding="utf-8")
+            break
+        except PermissionError as exc:
+            if not wait:
+                raise QaError(
+                    f"Cannot read the test suite: something else is holding {path.name} "
+                    "open. Close whatever has it and try again."
+                ) from exc
+            time.sleep(wait)
+        except OSError as exc:
+            raise QaError(f"Cannot read the test suite: {exc}") from exc
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -1136,9 +1203,39 @@ def load_suite(
 
 
 def write_suite(config: LoadedConfig, suite: QaSuite, override: str | None = None) -> Path:
+    """Write the suite so that nobody can ever read half of it.
+
+    Writing straight over the file empties it first and fills it after. A panel
+    reading it in that moment saw an empty file and said the project had no
+    checks at all. So: write the whole thing beside it, then move it into
+    place, which is one step as far as anybody watching is concerned.
+    """
+
     path = suite_path(config, override)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(suite.to_dict(), indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    written = json.dumps(suite.to_dict(), indent=2, sort_keys=False) + "\n"
+    # One name each. Two writers sharing one file beside the suite meant one
+    # change disappeared without a word, and the other fell over on a file that
+    # had already been moved away.
+    beside = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.part")
+    beside.write_text(written, encoding="utf-8")
+    # Windows will not let the file be moved into place while somebody has it
+    # open, even to read. That somebody is a panel refreshing, and it lets go
+    # in a moment, so this waits rather than giving up on the change.
+    for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8):
+        try:
+            os.replace(beside, path)
+            return path
+        except PermissionError:
+            time.sleep(wait)
+    try:
+        os.replace(beside, path)
+    except PermissionError as exc:
+        beside.unlink(missing_ok=True)
+        raise QaError(
+            f"The suite file could not be written: something else is holding {path.name} "
+            "open. Close whatever is reading it and try again. Nothing was changed."
+        ) from exc
     return path
 
 
@@ -1488,6 +1585,7 @@ class QaRunner:
         *,
         tags: Iterable[str] = (),
         ids: Iterable[str] = (),
+        part: tuple[int, int] = (0, 0),
     ) -> tuple[QaCase, ...]:
         wanted_tags = {str(tag).lower() for tag in tags}
         wanted_ids = {str(item).lower() for item in ids}
@@ -1506,6 +1604,18 @@ class QaRunner:
             chosen.extend(self.expand(case))
         if not chosen:
             raise QaError("The filter matched no cases")
+        number, of = part
+        if of:
+            if not 1 <= number <= of:
+                raise QaError(
+                    f"There is no part {number} of {of}. Number the parts from 1 up to {of}."
+                )
+            chosen = _one_part_of(chosen, number, of)
+            if not chosen:
+                raise QaError(
+                    f"Part {number} of {of} holds no checks. There are fewer checks than "
+                    "parts, so some machines would have nothing to do."
+                )
         return tuple(chosen)
 
     # -- public run --------------------------------------------------------
@@ -1519,8 +1629,9 @@ class QaRunner:
         workers: int | None = None,
         run_id: str | None = None,
         write_artifacts: bool = True,
+        part: tuple[int, int] = (0, 0),
     ) -> QaRunResult:
-        selected = self.select(suite, tags=tags, ids=ids)
+        selected = self.select(suite, tags=tags, ids=ids, part=part)
         selected_tags = tuple(sorted({str(tag).lower() for tag in tags}))
         selected_ids = tuple(sorted({str(item).lower() for item in ids}))
         configured_workers = int(self.config.get("qa.workers", 4))
@@ -1558,6 +1669,7 @@ class QaRunner:
             cases=ordered,
             selected_tags=selected_tags,
             selected_ids=selected_ids,
+            part=part,
             artifacts_dir=(
                 artifacts_root.relative_to(self.root).as_posix() if artifacts_root else ""
             ),
@@ -2964,6 +3076,10 @@ def report_markdown(result: QaRunResult, redactor: "CredentialRedactor | None" =
         f"Suite: {result.suite_name}",
         f"Started: {result.started_at}",
         f"Took: {result.duration_ms} ms with {result.workers} at a time",
+        *([
+            f"This was part {result.part[0]} of {result.part[1]}. The other parts "
+            "ran somewhere else, and this report says nothing about them.",
+        ] if result.part[1] else []),
         "",
         f"**{'All checks passed' if result.passed else 'Some checks failed'}**: "
         f"{counts[STATUS_PASSED]} passed, {counts[STATUS_FAILED]} failed, "
@@ -3050,6 +3166,16 @@ def report_junit_xml(result: QaRunResult, redactor: "CredentialRedactor | None" 
             "timestamp": plain_xml_text(result.started_at),
         },
     )
+    if result.part[1]:
+        held = ElementTree.SubElement(suite, "properties")
+        ElementTree.SubElement(held, "property", {
+            "name": "part",
+            "value": f"{result.part[0]} of {result.part[1]}",
+        })
+        ElementTree.SubElement(suite, "system-out").text = (
+            f"This was part {result.part[0]} of {result.part[1]}. The other parts ran "
+            "somewhere else, and this file says nothing about them."
+        )
     for case in result.cases:
         node = ElementTree.SubElement(
             suite,
@@ -3136,7 +3262,14 @@ def report_html(result: QaRunResult, redactor: "CredentialRedactor | None" = Non
         "</head>\n<body>\n"
         f"<h1>Test run {html.escape(result.run_id)}</h1>\n"
         f"<p>Suite {html.escape(result.suite_name)}, started {html.escape(result.started_at)}.</p>\n"
-        f'<div class="summary" role="status"><p><strong>{headline}.</strong> '
+        + (
+            f"<p><strong>This was part {result.part[0]} of {result.part[1]}.</strong> "
+            "The other parts ran somewhere else, and this page says nothing about "
+            "them.</p>\n"
+            if result.part[1]
+            else ""
+        )
+        + f'<div class="summary" role="status"><p><strong>{headline}.</strong> '
         f"{counts[STATUS_PASSED]} passed, {counts[STATUS_FAILED]} failed, {counts[STATUS_FLAKY]} flaky, "
         f"{counts[STATUS_SKIPPED]} skipped in {result.duration_ms} ms.</p></div>\n"
         "<table>\n<caption>Every case in this run</caption>\n<thead><tr>"

@@ -221,7 +221,7 @@ class ProviderProfileTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(HarnessError, "trusted local"):
+            with self.assertRaisesRegex(HarnessError, "harness trust"):
                 load_config(root)
 
 

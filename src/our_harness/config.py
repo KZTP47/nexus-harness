@@ -486,7 +486,10 @@ def _validate_capability_provenance(
             and nested(data, dotted) != nested(trusted_floor, dotted)
         ):
             raise HarnessError(
-                f"{dotted} requires trusted local, user, environment, explicit, or command-line config"
+                f"{dotted} is set in a settings file this machine has not been told "
+                "to trust. A setting like that can start a program, so nothing reads "
+                "it until somebody says the file is theirs. Read the file, then run: "
+                "harness trust"
             )
 
     provider = data["provider"]
@@ -621,7 +624,10 @@ def _validate_capability_provenance(
         dotted = f"project.{key}"
         if project_changed(dotted):
             raise HarnessError(
-                f"{dotted} requires trusted local, user, environment, explicit, or command-line config"
+                f"{dotted} is set in a settings file this machine has not been told "
+                "to trust. A setting like that can start a program, so nothing reads "
+                "it until somebody says the file is theirs. Read the file, then run: "
+                "harness trust"
             )
 
 

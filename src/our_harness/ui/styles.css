@@ -594,3 +594,90 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 @media (prefers-reduced-motion: no-preference) {
   .vault-dot { transition: filter .15s ease, opacity .15s ease; }
 }
+
+/* ---- Your team ---------------------------------------------------------
+   Same board as the pipelines view, on purpose: somebody who has laid out one
+   picture in this panel already knows how to lay out the other. What differs
+   is the colour per job, and that a box says who is doing it. */
+
+.team-shell { display: grid; grid-template-columns: 265px 1fr; gap: 0; height: calc(100vh - 132px); }
+.team-side { background: #f2f4f7; color: #1f2933; border-right: 1px solid #d7dce3; padding: 14px; overflow: auto; }
+.team-side h2 { margin: 0 0 6px; font-size: .95rem; }
+.team-side h3 { margin: 16px 0 8px; font-size: .9rem; }
+.team-side-head .hint { margin: 0; color: #4a5763; }
+.team-side .hint { color: #4a5763; }
+.team-side-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.team-side-buttons button { background: #fff; color: #1f2933; border: 1px solid #d7dce3; border-radius: 8px; padding: 6px 10px; font-size: .82rem; }
+.team-side-buttons button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.team-side-buttons button:disabled { opacity: .5; }
+
+.team-who { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.team-who-one { border: 1px solid #d7dce3; border-left-width: 6px; border-radius: 9px; background: #fff; padding: 8px 10px; }
+.team-who-one.ready { border-left-color: #16a34a; }
+.team-who-one.not-ready { border-left-color: #b6bfcc; opacity: .85; }
+.team-who-one strong { font-size: .85rem; }
+.team-who-state { margin: 3px 0 0; font-size: .76rem; color: #4a5763; }
+.team-who-one .hint { margin: 2px 0 0; font-size: .72rem; }
+
+.team-saved { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; }
+.team-saved-one { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: .82rem; }
+.team-saved-one .hint { margin: 0; font-size: .72rem; }
+.team-broken { color: #b42318; font-size: .72rem; font-weight: 700; }
+
+.team-jobs { display: flex; flex-wrap: wrap; gap: 6px; }
+.team-job-add { background: #fff; border: 1px solid #d7dce3; border-radius: 8px; padding: 6px 10px; font-size: .8rem; color: #1f2933; text-align: left; }
+.team-job-add:hover { border-color: #2563eb; }
+
+.team-main { display: flex; flex-direction: column; min-width: 0; }
+.team-bar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; padding: 12px 16px; border-bottom: 1px solid #d7dce3; background: #f7f9fb; color: #1f2933; }
+.team-bar h2 { margin: 0; font-size: 1rem; }
+.team-bar .hint { margin: 3px 0 0; }
+.team-bar-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.team-bar-fields label { color: #1f2933; font-size: .8rem; }
+.team-bar-fields input { background: #fff; color: #1f2933; border: 1px solid #d7dce3; border-radius: 8px; padding: 5px 8px; font-size: .82rem; width: 190px; }
+.team-bar-fields button { background: #fff; color: #1f2933; border: 1px solid #d7dce3; border-radius: 8px; padding: 6px 10px; font-size: .82rem; }
+.team-bar-fields button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.team-said { margin: 0; padding: 8px 16px; font-size: .84rem; color: #1f2933; background: #eef2f7; border-bottom: 1px solid #d7dce3; }
+
+.team-canvas { position: relative; flex: 1; min-height: 320px; overflow: auto; background-color: #eef1f5; background-image: radial-gradient(#cfd6de 1px, transparent 1px); background-size: 22px 22px; }
+.team-nodes { position: relative; min-width: 1200px; min-height: 600px; }
+.team-wires { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.team-wire { fill: none; stroke: #6b7f9e; stroke-width: 2; }
+.team-wire.only-when { stroke: #b45309; stroke-dasharray: 7 5; }
+.team-wire-words { fill: #7a5320; font-size: 11px; text-anchor: middle; pointer-events: none; }
+.team-cut { fill: #e5484d; cursor: pointer; pointer-events: all; }
+.team-cut-mark { fill: #fff; font-size: 11px; font-weight: 700; text-anchor: middle; pointer-events: none; }
+
+.team-node { position: absolute; width: 200px; border: 1px solid #c3ccd8; border-left-width: 7px; border-radius: 10px; padding: 8px 10px; background: #fff; box-shadow: 0 1px 3px rgba(20, 30, 45, .18); cursor: grab; user-select: none; }
+.team-node.moving { cursor: grabbing; box-shadow: 0 6px 16px rgba(20, 30, 45, .25); }
+.team-node strong { font-size: .86rem; color: #16202b; overflow-wrap: anywhere; }
+.team-node-job { margin: 3px 0 0; font-size: .74rem; color: #4a5763; }
+.team-node-who { margin: 3px 0 0; font-size: .76rem; font-weight: 700; color: #14532d; }
+.team-node-who.not-ready { color: #b42318; }
+.team-node-buttons { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.team-node-button { background: rgba(255, 255, 255, .82); border: 1px solid rgba(20, 30, 45, .2); color: #16202b; border-radius: 7px; padding: 3px 7px; font-size: .72rem; }
+.team-node-button:hover { background: #fff; }
+/* One colour per job, so who does what is readable before anything is read. */
+.team-node.kind-start { border-left-color: #64748b; background: #f8fafc; }
+.team-node.kind-end { border-left-color: #64748b; background: #f8fafc; }
+.team-node.kind-planner { border-left-color: #2563eb; background: #eff5ff; }
+.team-node.kind-coder { border-left-color: #7c3aed; background: #f5f0ff; }
+.team-node.kind-evaluator { border-left-color: #16a34a; background: #eefaf1; }
+.team-node.kind-merge { border-left-color: #b45309; background: #fdf5e9; }
+
+.team-plain-box { border-top: 1px solid #d7dce3; background: #f7f9fb; padding: 10px 16px; max-height: 210px; overflow: auto; }
+.team-plain-box h3 { margin: 0 0 6px; font-size: .85rem; color: #1f2933; }
+.team-plain, .team-problems { list-style: none; margin: 0 0 10px; padding: 0; display: grid; gap: 3px; font-size: .82rem; }
+.team-plain-one { padding: 4px 8px; border-radius: 7px; background: #fff; border: 1px solid #e2e6ec; color: #1f2933; }
+.team-plain-note { padding: 4px 8px; color: #52616b; font-style: italic; }
+.team-problem { padding: 4px 8px; border-radius: 7px; background: #fff5f5; border: 1px solid #f6a3a3; color: #7a1d1d; }
+.team-ok { padding: 4px 8px; border-radius: 7px; background: #f1fbf4; border: 1px solid #86e0a3; color: #14532d; }
+
+#teamNodeDialog { color: inherit; }
+#teamNodeDialog label { display: block; margin-top: 8px; font-size: .82rem; }
+#teamNodeDialog input, #teamNodeDialog select { width: 100%; border: 1px solid #d7dce3; border-radius: 8px; padding: 6px 8px; font-size: .85rem; }
+
+@media (max-width: 900px) {
+  .team-shell { grid-template-columns: 1fr; height: auto; }
+  .team-side { border-right: none; border-bottom: 1px solid #d7dce3; }
+}

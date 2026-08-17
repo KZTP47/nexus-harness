@@ -309,6 +309,18 @@ async function settle(page, ms = 1200) {
   await settle(page, 900);
   await page.screenshot({ path: out + '/what-it-knows.png' });
 
+  // The team: who is on this machine and how they work together. Whatever is
+  // really installed here is what shows, so this picture is honest about a
+  // machine with one assistant as much as one with two.
+  await page.click('[data-view="team"]');
+  for (let tries = 0; tries < 80; tries += 1) {
+    if (await page.locator('.team-node').count()
+        && await page.locator('#teamPlain li').count()) break;
+    await page.waitForTimeout(250);
+  }
+  await settle(page, 600);
+  await page.screenshot({ path: out + '/your-team.png' });
+
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });
 """

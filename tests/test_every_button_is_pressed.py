@@ -42,6 +42,19 @@ _BUILT_BY_CLASS = re.compile(r'make\("button",\s*"([a-z][a-z -]*)"\)')
 # A control that is deliberately not pressed, and why. Nothing may sit here
 # without a real sentence.
 ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
+    "teamSetUp": (
+        "It asks the server to do exactly what #setUpSeats asks, and that one is "
+        "already pressed and put back again by a check on the first view. Pressing "
+        "it here would write the settings of the project being checked a second "
+        "time for no more coverage. That it really is the same request is held "
+        "down by a test in tests/test_team_server.py."
+    ),
+    "teamNodeWho": (
+        "It is filled in with the assistants found on this machine, which differ "
+        "from machine to machine, so there is no value a check could choose "
+        "everywhere. A check does choose from it: it takes the first one marked "
+        "ready and makes sure the list only ever offers somebody really here."
+    ),
     "nodeAgentRef": (
         "It is filled in from agents this project trusts, and this project "
         "trusts none, so there is nothing in the list to choose."
