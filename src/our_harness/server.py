@@ -860,6 +860,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self.send_error(404)
         except HarnessError as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except ConnectionError:
+            # The page went to another view and closed the connection while
+            # this was still answering. There is nobody left to tell, and
+            # trying anyway wrote a 500 into a log and into the console of
+            # whatever opened the next page.
+            self.close_connection = True
         except Exception as exc:
             self._json({"error": f"Server error: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -1340,6 +1346,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self.send_error(404)
         except HarnessError as exc:
             self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        except ConnectionError:
+            # The page went to another view and closed the connection while
+            # this was still answering. There is nobody left to tell, and
+            # trying anyway wrote a 500 into a log and into the console of
+            # whatever opened the next page.
+            self.close_connection = True
         except Exception as exc:
             self._json({"error": f"Server error: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
 

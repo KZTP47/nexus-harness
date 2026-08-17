@@ -166,6 +166,8 @@ jobs:
         run: |
           npm ci
           npx playwright install chromium
+      - name: Prove the browser driver is really there
+        run: node -e "require.resolve('playwright'); console.log('the browser driver is here')"
       - name: Install the harness itself
         # This suite runs the harness by name, and the commands in it start
         # their own programs. What a started program is allowed to see is a
