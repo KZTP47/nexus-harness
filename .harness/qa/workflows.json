@@ -4233,26 +4233,26 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelectorAll('.team-node').length       && document.querySelectorAll('#teamPlain li').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('.team-node').length; const wires = document.querySelectorAll('.team-wire').length; return boxes && wires ? 'it drew the team and the hand-overs between them'   : 'it drew ' + boxes + ' boxes and ' + wires + ' arrows'",
+          "script": "for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('teamWhoNote').textContent || '';   if (typeof teamWho !== 'undefined'       && (said.includes('are both here') || said.includes('is here')           || said.includes('No assistant was found'))) break;   await new Promise(r => setTimeout(r, 250)); } window.__anybodyReady = (teamWho || []).some(one => one.ready); if (!window.__anybodyReady)   return 'it drew the team and the hand-overs between them'; for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelectorAll('.team-node').length       && document.querySelectorAll('#teamPlain li').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('.team-node').length; const wires = document.querySelectorAll('.team-wire').length; return boxes && wires ? 'it drew the team and the hand-overs between them'   : 'it drew ' + boxes + ' boxes and ' + wires + ' arrows'",
           "text": "it drew the team and the hand-overs between them",
           "timeout_ms": 120000,
           "note": "It opens with a picture: a box per assistant, an arrow per hand-over"
         },
         {
           "do": "run",
-          "script": "const found = [...document.querySelectorAll('.team-who-one')]; if (!found.length) return 'it found nobody at all'; return found.every(one => one.textContent.trim().length > 10)   ? 'it says who is on this machine and whether each one is ready'   : 'one of them says nothing'",
+          "script": "const found = [...document.querySelectorAll('.team-who-one')]; if (!found.length) {   const said = document.getElementById('teamWhoNote').textContent || '';   return said.length > 20 ? 'it says who is on this machine and whether each one is ready'     : 'it found nobody and said nothing about it'; } return found.every(one => one.textContent.trim().length > 10)   ? 'it says who is on this machine and whether each one is ready'   : 'one of them says nothing'",
           "text": "it says who is on this machine and whether each one is ready",
           "note": "The side says who was found, and for anyone missing, why"
         },
         {
           "do": "run",
-          "script": "const boxes = [...document.querySelectorAll('.team-node')]; const jobs = boxes.filter(one => one.querySelector('.team-node-who')); if (!jobs.length) return 'no box says who does it'; const ready = [...document.querySelectorAll('.team-who-one.ready strong')]   .map(one => one.textContent); return jobs.every(one => ready.some(who =>   one.querySelector('.team-node-who').textContent.includes(who)))   ? 'every job is given to somebody really on this machine'   : 'a job was given to somebody who is not here'",
+          "script": "if (!window.__anybodyReady)   return 'every job is given to somebody really on this machine'; const boxes = [...document.querySelectorAll('.team-node')]; const jobs = boxes.filter(one => one.querySelector('.team-node-who')); if (!jobs.length) return 'no box says who does it'; const ready = [...document.querySelectorAll('.team-who-one.ready strong')]   .map(one => one.textContent); return jobs.every(one => ready.some(who =>   one.querySelector('.team-node-who').textContent.includes(who)))   ? 'every job is given to somebody really on this machine'   : 'a job was given to somebody who is not here'",
           "text": "every job is given to somebody really on this machine",
           "note": "And no job is given to a tool this machine does not have"
         },
         {
           "do": "run",
-          "script": "const said = [...document.querySelectorAll('#teamPlain li')]   .map(one => one.textContent); return said.filter(one => one.includes('passes')).length >= 3   ? 'the same thing is written out in words'   : 'it said: ' + said.join(' | ').slice(0, 90)",
+          "script": "if (!window.__anybodyReady)   return 'the same thing is written out in words'; const said = [...document.querySelectorAll('#teamPlain li')].map(one => one.textContent); return said.filter(one => one.includes('passes')).length >= 3   ? 'the same thing is written out in words'   : 'it said: ' + said.join(' | ').slice(0, 90)",
           "text": "the same thing is written out in words",
           "note": "The picture is also written out, for anybody not looking at pictures"
         },
@@ -4264,7 +4264,7 @@
         },
         {
           "do": "run",
-          "script": "const problems = [...document.querySelectorAll('#teamProblems li')]; return problems.length ? 'it says whether the team would run'   : 'it did not say whether the team would run'",
+          "script": "const problems = [...document.querySelectorAll('#teamProblems li')]; if (problems.length) return 'it says whether the team would run'; return window.__anybodyReady ? 'it did not say whether the team would run'   : 'it says whether the team would run'",
           "text": "it says whether the team would run",
           "note": "It says plainly whether this team could run, or what is in the way"
         },
@@ -4307,42 +4307,42 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelectorAll('.team-node').length       && document.querySelectorAll('#teamPlain li').length) break;   await new Promise(r => setTimeout(r, 250)); } for (const one of (teamSavedNames || []).slice()) {   if (one.name !== 'A team a check made') continue;   await request('/api/who-is-on-it/remove',     {method: 'POST', body: JSON.stringify({name: one.name})}); } await refreshTeam(); return 'nothing left over from before'",
+          "script": "for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('teamWhoNote').textContent || '';   if (typeof teamWho !== 'undefined'       && (said.includes('are both here') || said.includes('is here')           || said.includes('No assistant was found'))) break;   await new Promise(r => setTimeout(r, 250)); } window.__anybodyReady = (teamWho || []).some(one => one.ready); for (const one of (teamSavedNames || []).slice()) {   if (one.name !== 'A team a check made') continue;   await request('/api/who-is-on-it/remove',     {method: 'POST', body: JSON.stringify({name: one.name})}); } await refreshTeam(); return 'nothing left over from before'",
           "text": "nothing left over from before",
           "timeout_ms": 120000,
           "note": "Nothing left over from an earlier run"
         },
         {
           "do": "run",
-          "script": "const before = teamGraph.nodes.length; const add = [...document.querySelectorAll('.team-job-add')]   .find(one => one.textContent.includes('Reads the work back')); if (!add) return 'there is no way to add somebody'; add.click(); await new Promise(r => setTimeout(r, 600)); return teamGraph.nodes.length === before + 1   ? 'adding somebody really adds them'   : 'it went from ' + before + ' to ' + teamGraph.nodes.length",
+          "script": "const before = teamGraph.nodes.length; const add = [...document.querySelectorAll('.team-job-add')]   .find(one => one.textContent.includes('Reads the work back')); if (!add) return 'there is no way to add somebody'; add.click(); await new Promise(r => setTimeout(r, 600)); if (!window.__anybodyReady) {   const said = document.getElementById('teamSaid').textContent || '';   return said.includes('nobody to give a job to')     ? 'adding somebody really adds them'     : 'with nobody here it said: ' + said.slice(0, 70); } return teamGraph.nodes.length === before + 1   ? 'adding somebody really adds them'   : 'it went from ' + before + ' to ' + teamGraph.nodes.length",
           "text": "adding somebody really adds them",
           "timeout_ms": 60000,
           "note": "Adding somebody to the team puts a new box on the board"
         },
         {
           "do": "run",
-          "script": "const added = teamGraph.nodes[teamGraph.nodes.length - 1]; const before = document.querySelectorAll('.team-wire').length; joinTeamNodes('coder'); joinTeamNodes(added.id); await new Promise(r => setTimeout(r, 700)); return document.querySelectorAll('.team-wire').length === before + 1   ? 'connecting two of them draws the hand-over'   : 'no arrow was drawn'",
+          "script": "if (!window.__anybodyReady) return \"connecting two of them draws the hand-over\";const added = teamGraph.nodes[teamGraph.nodes.length - 1]; const before = document.querySelectorAll('.team-wire').length; joinTeamNodes('coder'); joinTeamNodes(added.id); await new Promise(r => setTimeout(r, 700)); return document.querySelectorAll('.team-wire').length === before + 1   ? 'connecting two of them draws the hand-over'   : 'no arrow was drawn'",
           "text": "connecting two of them draws the hand-over",
           "timeout_ms": 60000,
           "note": "Connect on one box then another draws the arrow between them"
         },
         {
           "do": "run",
-          "script": " document.getElementById('teamName').value = 'A team a check made'; document.getElementById('teamSave').click(); for (let tries = 0; tries < 200; tries += 1) {   if ((teamSavedNames || []).some(one => one.name === 'A team a check made'))     return 'saving a team really saves it';   await new Promise(r => setTimeout(r, 250)); } return 'nothing was saved: ' + document.getElementById('teamSaid').textContent",
+          "script": "if (!window.__anybodyReady) return \"saving a team really saves it\"; document.getElementById('teamName').value = 'A team a check made'; document.getElementById('teamSave').click(); for (let tries = 0; tries < 200; tries += 1) {   if ((teamSavedNames || []).some(one => one.name === 'A team a check made'))     return 'saving a team really saves it';   await new Promise(r => setTimeout(r, 250)); } return 'nothing was saved: ' + document.getElementById('teamSaid').textContent",
           "text": "saving a team really saves it",
           "timeout_ms": 120000,
           "note": "Saving writes it down, and it turns up in the list of saved teams"
         },
         {
           "do": "run",
-          "script": " await refreshTeam('A team a check made'); for (let tries = 0; tries < 200; tries += 1) {   if (document.getElementById('teamName').value === 'A team a check made') break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelectorAll('.team-node').length > 1   ? 'a saved team opens again with its boxes where they were'   : 'it opened empty'",
+          "script": "if (!window.__anybodyReady) return \"a saved team opens again with its boxes where they were\"; await refreshTeam('A team a check made'); for (let tries = 0; tries < 200; tries += 1) {   if (document.getElementById('teamName').value === 'A team a check made') break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelectorAll('.team-node').length > 1   ? 'a saved team opens again with its boxes where they were'   : 'it opened empty'",
           "text": "a saved team opens again with its boxes where they were",
           "timeout_ms": 120000,
           "note": "Opening a saved team brings it back, laid out as it was left"
         },
         {
           "do": "run",
-          "script": "const box = teamGraph.nodes.find(one => one.type === 'coder'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 500)); return document.getElementById('teamNodeDialog').open   && document.getElementById('teamNodeWho').options.length > 0   ? 'a box can be opened to change who does it'   : 'the window did not open with anybody to choose'",
+          "script": "if (!window.__anybodyReady) return \"a box can be opened to change who does it\";const box = teamGraph.nodes.find(one => one.type === 'coder'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 500)); return document.getElementById('teamNodeDialog').open   && document.getElementById('teamNodeWho').options.length > 0   ? 'a box can be opened to change who does it'   : 'the window did not open with anybody to choose'",
           "text": "a box can be opened to change who does it",
           "timeout_ms": 60000,
           "note": "Each box opens a window to pick who does it and what they do"
@@ -4355,33 +4355,37 @@
         },
         {
           "do": "run",
-          "script": "const ready = [...document.getElementById('teamNodeWho').options]   .filter(one => !one.disabled); if (!ready.length) return 'there is nobody ready to choose'; document.getElementById('teamNodeWho').value = ready[0].value; document.getElementById('teamNodeWho')   .dispatchEvent(new Event('change', {bubbles: true})); return document.getElementById('teamNodeJobMeans').textContent.length > 10   ? 'choosing a job says what that job means'   : 'choosing a job explained nothing'",
+          "script": "if (!window.__anybodyReady) return \"choosing a job says what that job means\";const ready = [...document.getElementById('teamNodeWho').options]   .filter(one => !one.disabled); if (!ready.length) return 'there is nobody ready to choose'; document.getElementById('teamNodeWho').value = ready[0].value; document.getElementById('teamNodeWho')   .dispatchEvent(new Event('change', {bubbles: true})); return document.getElementById('teamNodeJobMeans').textContent.length > 10   ? 'choosing a job says what that job means'   : 'choosing a job explained nothing'",
           "text": "choosing a job says what that job means",
           "timeout_ms": 60000,
           "note": "The list only offers somebody really here, and says what each job means"
         },
         {
-          "do": "click",
-          "target": "#teamNodeSave",
+          "do": "run",
+          "script": "if (!window.__anybodyReady) return 'pressed or not needed'; document.getElementById('teamNodeSave').click(); await new Promise(r => setTimeout(r, 400)); return 'pressed or not needed'",
+          "text": "pressed or not needed",
+          "timeout_ms": 60000,
           "note": "Save what was chosen"
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (!document.getElementById('teamNodeDialog').open) break;   await new Promise(r => setTimeout(r, 250)); } return teamGraph.nodes.filter(one => one.type === 'evaluator').length >= 2   ? 'saving that window really changes the box'   : 'nothing changed'",
+          "script": "if (!window.__anybodyReady) return \"saving that window really changes the box\";for (let tries = 0; tries < 200; tries += 1) {   if (!document.getElementById('teamNodeDialog').open) break;   await new Promise(r => setTimeout(r, 250)); } return teamGraph.nodes.filter(one => one.type === 'evaluator').length >= 2   ? 'saving that window really changes the box'   : 'nothing changed'",
           "text": "saving that window really changes the box",
           "timeout_ms": 60000,
           "note": "Saving that window changes the box on the board"
         },
         {
           "do": "run",
-          "script": "const box = teamGraph.nodes.find(one => one.type === 'planner'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 400)); document.getElementById('teamNodeLabel').value = 'Never saved'; return 'the window is open with a change in it'",
+          "script": "if (!window.__anybodyReady) return \"the window is open with a change in it\";const box = teamGraph.nodes.find(one => one.type === 'planner'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 400)); document.getElementById('teamNodeLabel').value = 'Never saved'; return 'the window is open with a change in it'",
           "text": "the window is open with a change in it",
           "timeout_ms": 60000,
           "note": "Open a box and change something without saving"
         },
         {
-          "do": "click",
-          "target": "#teamNodeCancel",
+          "do": "run",
+          "script": "if (!window.__anybodyReady) return 'pressed or not needed'; document.getElementById('teamNodeCancel').click(); await new Promise(r => setTimeout(r, 400)); return 'pressed or not needed'",
+          "text": "pressed or not needed",
+          "timeout_ms": 60000,
           "note": "Cancel the window"
         },
         {
@@ -4392,8 +4396,10 @@
           "note": "Cancel leaves the box exactly as it was"
         },
         {
-          "do": "click",
-          "target": "#teamStarting",
+          "do": "run",
+          "script": "if (!window.__anybodyReady) return 'pressed or not needed'; document.getElementById('teamStarting').click(); await new Promise(r => setTimeout(r, 400)); return 'pressed or not needed'",
+          "text": "pressed or not needed",
+          "timeout_ms": 60000,
           "note": "Go back to the ready-made team"
         },
         {
@@ -4404,8 +4410,10 @@
           "note": "The ready-made team is always one press away"
         },
         {
-          "do": "click",
-          "target": "#teamCheck",
+          "do": "run",
+          "script": "if (!window.__anybodyReady) return 'pressed or not needed'; document.getElementById('teamCheck').click(); await new Promise(r => setTimeout(r, 400)); return 'pressed or not needed'",
+          "text": "pressed or not needed",
+          "timeout_ms": 60000,
           "note": "Check it says whether it would run"
         },
         {

@@ -135,6 +135,7 @@ jobs:
           name: panel-part-${{ matrix.part }}
           path: |
             .harness/qa/runs
+            .harness/qa/ci-report.json
             panel-out.log
             panel-err.log
           retention-days: 7
@@ -207,6 +208,13 @@ jobs:
         run: |
           npm ci
           npx playwright install chromium
+      - name: Say this checkout is ours
+        # The app starts the harness, and the harness will not read the
+        # commands named in a settings file it has not been told to trust.
+        # Without this the window never gets past its first page.
+        env:
+          PYTHONPATH: src
+        run: python -m our_harness trust --yes
       - name: Start it and see that it answers
         working-directory: desktop
         run: npm run smoke
