@@ -407,6 +407,17 @@ if os.name == "nt":
             if not kernel32.AssignProcessToJobObject(self.handle, wintypes.HANDLE(int(process._handle))):
                 error = ctypes.WinError(ctypes.get_last_error())
                 self.close()
+                # A job is how one command and everything it starts get stopped
+                # together. Some machines will not allow it: a build server
+                # already puts every step inside a job of its own, and Windows
+                # refuses to put a process in a second one. Refusing to run the
+                # command at all was the wrong answer to that - it made every
+                # command on such a machine fail for a reason nothing to do
+                # with the command. So it runs without one, and stopping it
+                # stops the command itself rather than its whole tree.
+                if getattr(error, "winerror", 0) == 5:
+                    self.handle = None
+                    return
                 raise HarnessError(f"Cannot assign command to a Windows process job: {error}")
 
         def terminate(self) -> None:
