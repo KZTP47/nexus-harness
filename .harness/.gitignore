@@ -8,3 +8,4 @@ qa/runs/
 qa/tmp/
 qa/history.json
 qa/candidates.json
+pipelines/last-run.json
