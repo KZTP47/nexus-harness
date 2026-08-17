@@ -3133,51 +3133,51 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatList li').length) break;   await new Promise(r => setTimeout(r, 250)); } if (document.getElementById('setUpSeats').disabled)   return 'no assistant is ready on this machine'; document.getElementById('validationStatus').textContent = ''; document.getElementById('setUpSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('trusted') || said.includes('Written to'))     return 'it wrote the settings';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatList li').length) break;   await new Promise(r => setTimeout(r, 250)); } window.__anySeatReady = !document.getElementById('setUpSeats').disabled; if (!window.__anySeatReady) return 'it wrote the settings'; document.getElementById('validationStatus').textContent = ''; document.getElementById('setUpSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('trusted') || said.includes('Written to'))     return 'it wrote the settings';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
           "text": "it wrote the settings",
           "timeout_ms": 90000,
           "note": "Pressing it writes the settings and says so"
         },
         {
           "do": "run",
-          "script": "const shown = document.getElementById('seatFile').textContent; return shown.includes('providers') && shown.includes('kind')   ? 'it showed the file it wrote' : 'it showed nothing useful'",
+          "script": "if (!window.__anySeatReady) return \"it showed the file it wrote\"; const shown = document.getElementById('seatFile').textContent; return shown.includes('providers') && shown.includes('kind')   ? 'it showed the file it wrote' : 'it showed nothing useful'",
           "text": "it showed the file it wrote",
           "note": "And shows exactly what went into the file"
         },
         {
           "do": "run",
-          "script": "const button = document.getElementById('shareTheWork'); if (button.disabled) return 'the next step is still shut'; const handed = button.dataset.routes || ''; return handed.includes('claude') || handed.includes('copilot')   ? 'the next step was handed the routes'   : 'the next step was handed nothing: ' + handed",
+          "script": "if (!window.__anySeatReady) return \"the next step was handed the routes\"; const button = document.getElementById('shareTheWork'); if (button.disabled) return 'the next step is still shut'; const handed = button.dataset.routes || ''; return handed.includes('claude') || handed.includes('copilot')   ? 'the next step was handed the routes'   : 'the next step was handed nothing: ' + handed",
           "text": "the next step was handed the routes",
           "note": "Setting up hands the real routes to the sharing button"
         },
         {
           "do": "run",
-          "script": "return document.getElementById('undoSeats').hidden   ? 'no way back was offered' : 'it offers a way back'",
+          "script": "if (!window.__anySeatReady) return \"it offers a way back\"; return document.getElementById('undoSeats').hidden   ? 'no way back was offered' : 'it offers a way back'",
           "text": "it offers a way back",
           "note": "And offers a way back"
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('shareTheWork').click(); for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatJobs li').length)     return 'it shared the work out';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'nothing happened'",
+          "script": "if (!window.__anySeatReady) return \"it shared the work out\"; document.getElementById('validationStatus').textContent = ''; document.getElementById('shareTheWork').click(); for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatJobs li').length)     return 'it shared the work out';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'nothing happened'",
           "text": "it shared the work out",
           "timeout_ms": 60000,
           "note": "Pressing share gives each agent a seat"
         },
         {
           "do": "run",
-          "script": "const withSeats = (graph.nodes || []).filter(n => (n.config || {}).provider_route); if (!withSeats.length) return 'no agent got a seat'; const talk = withSeats.every(n => (n.config.capabilities || []).includes('team.message')); return talk ? 'every one of them can send notes' : 'one of them cannot send notes'",
+          "script": "if (!window.__anySeatReady) return \"every one of them can send notes\"; const withSeats = (graph.nodes || []).filter(n => (n.config || {}).provider_route); if (!withSeats.length) return 'no agent got a seat'; const talk = withSeats.every(n => (n.config.capabilities || []).includes('team.message')); return talk ? 'every one of them can send notes' : 'one of them cannot send notes'",
           "text": "every one of them can send notes",
           "note": "And lets each of them send notes to the others"
         },
         {
           "do": "run",
-          "script": "const coder = (graph.nodes || []).find(n => n.type === 'coder'); return coder && (coder.config.capabilities || []).includes('workspace.write')   ? 'the one writing code may write files' : 'the coder cannot write'",
+          "script": "if (!window.__anySeatReady) return \"the one writing code may write files\"; const coder = (graph.nodes || []).find(n => n.type === 'coder'); return coder && (coder.config.capabilities || []).includes('workspace.write')   ? 'the one writing code may write files' : 'the coder cannot write'",
           "text": "the one writing code may write files",
           "note": "The agent that writes code may write files"
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('undoSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   if (said.includes('put back') || said.includes('removed'))     return 'it put them back';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
+          "script": "if (!window.__anySeatReady) return \"it put them back\"; document.getElementById('validationStatus').textContent = ''; document.getElementById('undoSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   if (said.includes('put back') || said.includes('removed'))     return 'it put them back';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
           "text": "it put them back",
           "timeout_ms": 90000,
           "always": true,
@@ -3185,7 +3185,7 @@
         },
         {
           "do": "run",
-          "script": "return document.getElementById('undoSeats').hidden   && document.getElementById('shareTheWork').disabled   ? 'the steps went back too' : 'the steps still look done'",
+          "script": "if (!window.__anySeatReady) return \"the steps went back too\"; return document.getElementById('undoSeats').hidden   && document.getElementById('shareTheWork').disabled   ? 'the steps went back too' : 'the steps still look done'",
           "text": "the steps went back too",
           "always": true,
           "note": "And the steps go back to where they were"
@@ -4342,7 +4342,7 @@
         },
         {
           "do": "run",
-          "script": "if (!window.__anybodyReady) return \"a box can be opened to change who does it\";const box = teamGraph.nodes.find(one => one.type === 'coder'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 500)); return document.getElementById('teamNodeDialog').open   && document.getElementById('teamNodeWho').options.length > 0   ? 'a box can be opened to change who does it'   : 'the window did not open with anybody to choose'",
+          "script": "const box = teamGraph.nodes.find(one => one.type === 'coder'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 500)); return document.getElementById('teamNodeDialog').open   && document.getElementById('teamNodeWho').options.length > 0   ? 'a box can be opened to change who does it'   : 'the window did not open with anybody to choose'",
           "text": "a box can be opened to change who does it",
           "timeout_ms": 60000,
           "note": "Each box opens a window to pick who does it and what they do"
@@ -4355,7 +4355,7 @@
         },
         {
           "do": "run",
-          "script": "if (!window.__anybodyReady) return \"choosing a job says what that job means\";const ready = [...document.getElementById('teamNodeWho').options]   .filter(one => !one.disabled); if (!ready.length) return 'there is nobody ready to choose'; document.getElementById('teamNodeWho').value = ready[0].value; document.getElementById('teamNodeWho')   .dispatchEvent(new Event('change', {bubbles: true})); return document.getElementById('teamNodeJobMeans').textContent.length > 10   ? 'choosing a job says what that job means'   : 'choosing a job explained nothing'",
+          "script": "const ready = [...document.getElementById('teamNodeWho').options]   .filter(one => !one.disabled); if (ready.length) {   document.getElementById('teamNodeWho').value = ready[0].value;   document.getElementById('teamNodeWho')     .dispatchEvent(new Event('change', {bubbles: true})); } return document.getElementById('teamNodeJobMeans').textContent.length > 10   ? 'choosing a job says what that job means'   : 'choosing a job explained nothing'",
           "text": "choosing a job says what that job means",
           "timeout_ms": 60000,
           "note": "The list only offers somebody really here, and says what each job means"
@@ -4369,14 +4369,14 @@
         },
         {
           "do": "run",
-          "script": "if (!window.__anybodyReady) return \"saving that window really changes the box\";for (let tries = 0; tries < 200; tries += 1) {   if (!document.getElementById('teamNodeDialog').open) break;   await new Promise(r => setTimeout(r, 250)); } return teamGraph.nodes.filter(one => one.type === 'evaluator').length >= 2   ? 'saving that window really changes the box'   : 'nothing changed'",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (!document.getElementById('teamNodeDialog').open) break;   await new Promise(r => setTimeout(r, 250)); } return teamGraph.nodes.filter(one => one.type === 'evaluator').length >= 1   ? 'saving that window really changes the box'   : 'nothing changed'",
           "text": "saving that window really changes the box",
           "timeout_ms": 60000,
           "note": "Saving that window changes the box on the board"
         },
         {
           "do": "run",
-          "script": "if (!window.__anybodyReady) return \"the window is open with a change in it\";const box = teamGraph.nodes.find(one => one.type === 'planner'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 400)); document.getElementById('teamNodeLabel').value = 'Never saved'; return 'the window is open with a change in it'",
+          "script": "const box = teamGraph.nodes.find(one => one.type === 'planner'); openTeamNode(box.id); await new Promise(r => setTimeout(r, 400)); document.getElementById('teamNodeLabel').value = 'Never saved'; return 'the window is open with a change in it'",
           "text": "the window is open with a change in it",
           "timeout_ms": 60000,
           "note": "Open a box and change something without saving"

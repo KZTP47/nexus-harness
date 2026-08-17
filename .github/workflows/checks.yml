@@ -133,6 +133,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: panel-part-${{ matrix.part }}
+          # Everything worth keeping lives under .harness, and a folder whose
+          # name starts with a dot is left out unless this says otherwise. That
+          # is how a failed build came back with nothing to read.
+          include-hidden-files: true
           path: |
             .harness/qa/runs
             .harness/qa/ci-report.json
