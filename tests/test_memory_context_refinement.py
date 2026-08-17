@@ -606,14 +606,15 @@ class ContextTests(unittest.TestCase):
             )
             config = load_config(root)
             provider = SlowEmbeddingProvider()
-            # Long enough that the embedding is always reached, even on a busy
-            # build server. Eighty milliseconds could run out before the first
-            # call was made, and then this checked nothing at all.
-            deadline = WorkflowDeadline.start(1.0)
             started = time.monotonic()
             with MemoryStore(config) as memory, patch(
                 "our_harness.providers.create_embedding_provider", return_value=provider
             ), self.assertRaisesRegex(HarnessError, "deadline expired"):
+                # Started here, not before opening the store. Opening it was
+                # spending the budget, so on a slow machine the whole second
+                # was gone before the embedding was ever asked for and this
+                # checked nothing at all.
+                deadline = WorkflowDeadline.start(1.0)
                 ContextCompiler(config, memory).compile("semantic task", [], query_vector=[1.0], deadline=deadline)
             elapsed = time.monotonic() - started
             self.assertEqual(len(provider.timeouts), 1)

@@ -2150,6 +2150,13 @@
           "note": "Open the checks view"
         },
         {
+          "do": "run",
+          "script": "const already = await request('/api/qa/history'); if ((already.runs || []).length) return 'there is a run to send on'; try {   await request('/api/qa/run', {method: 'POST', body: JSON.stringify({cases: ['readme']})}); } catch (error) { return 'a run could not be started: ' + error.message; } for (let tries = 0; tries < 200; tries += 1) {   const now = await request('/api/qa/history');   if ((now.runs || []).length) return 'there is a run to send on';   await new Promise(r => setTimeout(r, 500)); } return 'no run ever finished'",
+          "text": "there is a run to send on",
+          "timeout_ms": 115000,
+          "note": "There is nothing to send until something has run, so this makes one run happen first"
+        },
+        {
           "do": "expect_visible",
           "target": "#makeSharePage",
           "note": "The button is offered"
@@ -2170,7 +2177,10 @@
       "expect": {
         "max_console_errors": 1,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "a run of the checks"
+      ]
     },
     {
       "id": "checks-writing-the-missing-checks-works-end-to-end",
