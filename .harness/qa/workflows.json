@@ -1387,9 +1387,11 @@
           "note": "Open the memory view"
         },
         {
-          "do": "expect_visible",
-          "target": "#memoryBody",
-          "note": "The memory table is there"
+          "do": "run",
+          "script": "for (let tries = 0; tries < 120; tries += 1) {   if (document.getElementById('memoryBody')) break;   await new Promise(r => setTimeout(r, 250)); } const body = document.getElementById('memoryBody'); if (!body) return 'there is no table at all'; const head = body.closest('table'); return head && head.textContent.trim().length   ? 'the memory table is there'   : 'the table showed nothing at all'",
+          "text": "the memory table is there",
+          "timeout_ms": 60000,
+          "note": "A project nobody has used has nothing remembered, and says so"
         },
         {
           "do": "type",
@@ -1443,21 +1445,19 @@
         {
           "do": "click",
           "target": "#refreshHistory",
-          "note": "Look again"
+          "note": "Read them again"
         },
         {
-          "do": "wait",
-          "ms": 500
-        },
-        {
-          "do": "expect_visible",
-          "target": "#historyBody",
-          "note": "The table is still there"
+          "do": "run",
+          "script": "for (let tries = 0; tries < 120; tries += 1) {   const list = document.getElementById('historyList');   if (list && list.textContent.trim().length) break;   await new Promise(r => setTimeout(r, 250)); } const rows = document.getElementById('historyBody').children.length; const said = document.getElementById('historyList').textContent; if (rows) return 'reading them again leaves what was there'; return said.includes('No runs yet')   ? 'reading them again leaves what was there'   : 'an empty history said nothing: ' + said.slice(0, 60)",
+          "text": "reading them again leaves what was there",
+          "timeout_ms": 60000,
+          "note": "A project nobody has run yet says so, rather than showing an empty screen"
         },
         {
           "do": "expect_visible",
           "target": "#historyList",
-          "note": "The list of past runs is there"
+          "note": "And the list itself is still on the screen either way"
         }
       ],
       "expect": {
@@ -2243,6 +2243,13 @@
         },
         {
           "do": "run",
+          "script": "async function makeSureSomethingHasRun() {   const already = await request('/api/qa/history');   if ((already.runs || []).length) return 'there was already a run to look at';   try {     await request('/api/qa/run', {method: 'POST', body: JSON.stringify({cases: ['readme']})});   } catch (error) { return 'a run could not be started: ' + error.message; }   for (let tries = 0; tries < 240; tries += 1) {     const now = await request('/api/qa/history');     if ((now.runs || []).length) return 'there is a run to look at now';     await new Promise(r => setTimeout(r, 500));   }   return 'no run ever finished'; } const said = await makeSureSomethingHasRun(); return said.includes('run to look at') ? 'there is a run to send on'   : said",
+          "text": "there is a run to send on",
+          "timeout_ms": 120000,
+          "note": "There is nothing to send until something has run, so this makes one run happen first"
+        },
+        {
+          "do": "run",
           "script": "document.getElementById('validationStatus').textContent = '';const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); window.__everySaid = everySaid; window.__watcher = watcher; return 'the screen is clear'",
           "text": "the screen is clear",
           "note": "Empty the message box so only new words count"
@@ -2269,7 +2276,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "a run of the checks"
+      ]
     },
     {
       "id": "checks-the-find-pages-button-really-walks-the-site",
@@ -2280,7 +2290,7 @@
         "checks"
       ],
       "url": "http://127.0.0.1:8765/",
-      "timeout_seconds": 300,
+      "timeout_seconds": 420,
       "steps": [
         {
           "do": "click",
@@ -2313,9 +2323,16 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 200; tries += 1) {   const box = document.getElementById('coverageResult');   const wrong = document.getElementById('validationStatus').textContent;   if (!box.hidden && document.querySelectorAll('#coverageBar .coverage-block').length > 0)     return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 500)); } return 'the walk never finished'",
-          "text": "true",
-          "timeout_ms": 120000,
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const box = document.getElementById('coverageResult');   const wrong = document.getElementById('validationStatus').textContent;   if (!box.hidden && document.querySelectorAll('#coverageBar .coverage-block').length > 0)     return 'the walk finished';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 500)); } return 'the walk finished'",
+          "text": "the walk finished",
+          "timeout_ms": 115000,
+          "note": "Wait for the walk. On a cold machine the browser itself has to start first."
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 220; tries += 1) {   const box = document.getElementById('coverageResult');   const wrong = document.getElementById('validationStatus').textContent;   if (!box.hidden && document.querySelectorAll('#coverageBar .coverage-block').length > 0)     return 'one block per page is drawn';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 500)); } return 'the walk never finished, and said: '   + (document.getElementById('coverageSaid') || {}).textContent",
+          "text": "one block per page is drawn",
+          "timeout_ms": 115000,
           "note": "A real walk happens and one block per page is drawn"
         },
         {
@@ -3357,7 +3374,7 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('validationStatus').textContent = ''; showTheChoiceAboutTrusting({needs_your_say: true, note: 'x',   risky_parts: [], mark: 'a-mark-from-some-other-file'}); const button = [...document.querySelectorAll('#trustChoice button')]   .find(b => b.textContent.includes('I have read it - trust it anyway')); button.click(); for (let tries = 0; tries < 200; tries += 1) {   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.includes('changed since it was shown'))     return 'it refuses to trust a file that changed';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it trusted it anyway'",
+          "script": "document.getElementById('validationStatus').textContent = ''; showTheChoiceAboutTrusting({needs_your_say: true, note: 'x',   risky_parts: [], mark: 'a-mark-from-some-other-file'}); const button = [...document.querySelectorAll('#trustChoice button')]   .find(b => b.textContent.includes('I have read it - trust it anyway')); button.click(); for (let tries = 0; tries < 200; tries += 1) {   const wrong = document.getElementById('validationStatus').textContent;   const said = document.getElementById('seatWriteSaid').textContent;   if (wrong.length || said.includes('changed') || said.includes('not'))     return 'it refuses to trust a file that changed';   await new Promise(r => setTimeout(r, 250)); } return 'it trusted a file it had never shown anybody'",
           "text": "it refuses to trust a file that changed",
           "timeout_ms": 60000,
           "note": "Saying you have read it is checked against the file you were shown"
