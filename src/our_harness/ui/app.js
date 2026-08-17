@@ -2250,7 +2250,17 @@ function renderPipelineSaved() {
 function renderPipelineStarters() {
   const list = $("pipelineStarters");
   list.replaceChildren();
-  for (const starter of pipelineStarters) {
+  const shown = pipelineStartersShown();
+  if (!shown.length) {
+    list.append(make("li", "hint", `Nothing matches "${pipelineStarterLooking}".`));
+    return;
+  }
+  let group = "";
+  for (const starter of shown) {
+    if (starter.group && starter.group !== group) {
+      group = starter.group;
+      list.append(make("li", "pipeline-starter-group", group));
+    }
     const item = make("li", "");
     const button = make("button", "pipeline-starter", starter.title);
     button.type = "button";
@@ -2345,6 +2355,10 @@ function renderPipeline() {
     if (state) {
       card.append(make("p", "pipeline-node-state", state.said || state.state));
     }
+    if ((node.settings?.asks || []).length) {
+      card.append(make("p", "pipeline-node-asks",
+        `Asks first: ${node.settings.asks.join(", ")}`));
+    }
     const buttons = make("div", "pipeline-node-buttons");
     const join = make("button", "pipeline-node-button", pipelineJoining === node.id ? "Joining" : "Connect");
     join.type = "button";
@@ -2353,10 +2367,24 @@ function renderPipeline() {
     const settings = make("button", "pipeline-node-button", "Settings");
     settings.type = "button";
     settings.addEventListener("click", (event) => { event.stopPropagation(); openPipelineNode(node.id); });
+    const alone = make("button", "pipeline-node-button", "Run only this");
+    alone.type = "button";
+    alone.title = "Run this one step and nothing else, while you are building it";
+    alone.addEventListener("click", (event) => {
+      event.stopPropagation();
+      runPipeline({only: node.id});
+    });
+    const onward = make("button", "pipeline-node-button", "Carry on from here");
+    onward.type = "button";
+    onward.title = "Run this step and everything after it, leaving the earlier ones alone";
+    onward.addEventListener("click", (event) => {
+      event.stopPropagation();
+      runPipeline({from_here: node.id});
+    });
     const remove = make("button", "pipeline-node-button", "Remove");
     remove.type = "button";
     remove.addEventListener("click", (event) => { event.stopPropagation(); removePipelineNode(node.id); });
-    buttons.append(join, settings, remove);
+    buttons.append(join, settings, alone, onward, remove);
     card.append(buttons);
 
     // The board is usable without a pointer. A box takes the keyboard, the
@@ -2557,6 +2585,22 @@ function openPipelineNode(nodeId) {
     input.value = node.settings?.[name] || "";
     box.append(input);
   }
+  // Which of this step's settings should be asked about when the run starts
+  // rather than fixed now. One saved pipeline then covers more than one job.
+  const asking = $("pipelineNodeAskList");
+  asking.replaceChildren();
+  const alreadyAsked = node.settings?.asks || [];
+  for (const name of kind.settings || []) {
+    const field = PIPELINE_FIELDS[name] || {label: name};
+    const row = make("label", "pipeline-ask-one");
+    const tick = make("input");
+    tick.type = "checkbox";
+    tick.dataset.asks = name;
+    tick.checked = alreadyAsked.includes(name);
+    row.append(tick, make("span", "", field.label));
+    asking.append(row);
+  }
+  $("pipelineNodeAsks").hidden = !(kind.settings || []).length;
   $("pipelineNodeDialog").showModal();
 }
 
@@ -2571,6 +2615,10 @@ function savePipelineNode() {
   }
   const tries = Number($("pipelineNodeTries").value) || 1;
   if (tries > 1) settings.tries = Math.min(5, Math.max(1, Math.round(tries)));
+  const asks = [...$("pipelineNodeAskList").querySelectorAll("[data-asks]")]
+    .filter((tick) => tick.checked)
+    .map((tick) => tick.dataset.asks);
+  if (asks.length) settings.asks = asks;
   node.settings = settings;
   $("pipelineNodeDialog").close();
   renderPipeline();
@@ -2634,16 +2682,29 @@ function newPipeline() {
   say("A fresh one. Add a step from the left.");
 }
 
-async function runPipeline() {
+async function runPipeline(options = {}) {
   try {
     pipelineStates = new Map();
+    showWhatIsBeingAsked("");
     $("pipelineLog").replaceChildren();
     renderPipeline();
     await request("/api/pipelines/run", {
-      method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
+      method: "POST",
+      body: JSON.stringify({
+        pipeline: pipelineOnScreen(),
+        // Three ways to run less than the whole thing. Left out when not
+        // asked for, so an ordinary Run is exactly what it always was.
+        ...(options.from_here ? {from_here: options.from_here} : {}),
+        ...(options.only ? {only: options.only} : {}),
+        ...(options.answers ? {answers: options.answers} : {}),
+      }),
     });
     $("pipelineStop").disabled = false;
-    say("Running. Each step lights up as it goes.");
+    say(options.only
+      ? "Running that one step on its own."
+      : options.from_here
+        ? "Carrying on from that step. The ones before it are left as they were."
+        : "Running. Each step lights up as it goes.");
   } catch (error) { say(error.message); showError(error.message); }
 }
 
@@ -2666,11 +2727,19 @@ function applyPipelineEvent(event) {
     pipelineStates.set(String(result.id), result);
     renderPipeline();
     addPipelineLogLine(result);
+    if (result.kind === "wait_for_a_person" && result.state === "running") {
+      showWhatIsBeingAsked(String(result.id));
+    } else if (String(result.id) === pipelineWaitingAt) {
+      showWhatIsBeingAsked("");
+    }
+    if (pipelineLooking === "timeline") drawThePipelineTimeline();
     return;
   }
   if (event.kind === "pipeline_finished") {
     $("pipelineStop").disabled = true;
+    showWhatIsBeingAsked("");
     showPipelineRun(event.payload || {});
+    if (pipelineLooking === "timeline") drawThePipelineTimeline();
   }
 }
 
@@ -3220,7 +3289,7 @@ function bindEvents() {
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
-  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", runPipeline); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
+  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
   $("teamSetUp").addEventListener("click", setUpTheTeam);
   $("teamStarting").addEventListener("click", async () => {
@@ -3234,6 +3303,26 @@ function bindEvents() {
   });
   $("teamSave").addEventListener("click", saveTheTeam);
   $("teamRemove").addEventListener("click", removeTheTeam);
+  document.querySelectorAll("[data-pipeline-tab]").forEach((tab) => {
+    tab.addEventListener("click", () => showPipelinePane(tab.dataset.pipelineTab));
+  });
+  $("pipelineCodeApply").addEventListener("click", useTheTypedPipeline);
+  $("pipelineCodeCopy").addEventListener("click", copyThePipelineText);
+  $("pipelineStarterSearch").addEventListener("input", (event) => {
+    pipelineStarterLooking = event.target.value;
+    renderPipelineStarters();
+  });
+  $("pipelineAskRun").addEventListener("click", runWithTheAnswers);
+  $("pipelineAskCancel").addEventListener("click", () => $("pipelineAskDialog").close());
+  $("teamAddCustom").addEventListener("click", openTheCustomWindow);
+  $("teamAddModel").addEventListener("click", openTheModelWindow);
+  $("teamCustomSave").addEventListener("click", saveTheCustomOne);
+  $("teamCustomCancel").addEventListener("click", () => $("teamCustomDialog").close());
+  $("teamCustomJob").addEventListener("change", sayWhatTheChoiceMeans);
+  $("teamCustomAsking").addEventListener("change", sayWhatTheChoiceMeans);
+  $("teamModelSave").addEventListener("click", saveTheModel);
+  $("teamModelCancel").addEventListener("click", () => $("teamModelDialog").close());
+  $("teamModelWayIn").addEventListener("change", sayWhatTheWayInMeans);
   $("teamNodeSave").addEventListener("click", saveTeamNode);
   $("teamNodeCancel").addEventListener("click", () => $("teamNodeDialog").close());
   $("teamNodeJob").addEventListener("change", () => {
@@ -3276,6 +3365,8 @@ async function refreshTeam(name) {
     const said = await request(`/api/who-is-on-it${asked}`);
     teamWho = said.who?.members || [];
     teamJobs = said.jobs || [];
+    teamWaysOfAsking = said.ways_of_asking || [];
+    teamWaysIn = said.ways_in || [];
     teamSavedNames = said.teams || [];
     $("teamWhoNote").textContent = said.who?.note || "";
     renderTeamWho();
@@ -3424,6 +3515,15 @@ function renderTeam() {
     } else if (job) {
       card.append(make("p", "team-node-who not-ready", "Nobody chosen"));
     }
+    const settings = node.config || {};
+    if (settings.asking === "conversation") {
+      card.append(make("p", "team-node-asking", "Stops here to talk"));
+    } else if (settings.system_prompt) {
+      const said = String(settings.system_prompt);
+      card.append(make("p", "team-node-prompt",
+        said.length > 60 ? `${said.slice(0, 60)}...` : said));
+    }
+    if (settings.model) card.append(make("p", "team-node-model", settings.model));
     const buttons = make("div", "team-node-buttons");
     const join = make("button", "team-node-button", teamJoining === node.id ? "Joining" : "Connect");
     join.type = "button";
@@ -3727,6 +3827,398 @@ async function setUpTheTeam() {
     await refreshTeam(teamOpen);
   } catch (error) { showError(error.message); $("teamSaid").textContent = error.message; }
   finally { $("teamSetUp").disabled = false; }
+}
+
+/* ---- one of your own -----------------------------------------------------
+   The ready-made jobs cover the usual team. This is for everything else: your
+   own name for a box, your own model behind it, and your own way of asking -
+   one set prompt, or a conversation the run stops for. */
+
+let teamWaysOfAsking = [];
+let teamWaysIn = [];
+
+function fillTeamChoices() {
+  const jobs = $("teamCustomJob");
+  jobs.replaceChildren();
+  for (const job of teamJobs) {
+    const option = make("option", "", job.label);
+    option.value = job.job;
+    jobs.append(option);
+  }
+  const asking = $("teamCustomAsking");
+  asking.replaceChildren();
+  for (const way of teamWaysOfAsking) {
+    const option = make("option", "", way.label);
+    option.value = way.asking;
+    asking.append(option);
+  }
+  const who = $("teamCustomWho");
+  who.replaceChildren();
+  for (const one of teamWho) {
+    const option = make("option", "", one.ready ? one.label : `${one.label} (not ready)`);
+    option.value = one.route;
+    option.disabled = !one.ready;
+    who.append(option);
+  }
+  sayWhatTheChoiceMeans();
+}
+
+function sayWhatTheChoiceMeans() {
+  $("teamCustomJobMeans").textContent =
+    teamJobs.find((one) => one.job === $("teamCustomJob").value)?.means || "";
+  const way = teamWaysOfAsking.find((one) => one.asking === $("teamCustomAsking").value);
+  $("teamCustomAskingMeans").textContent = way?.means || "";
+  // A conversation has no set prompt to write, so the box for one steps aside
+  // rather than sitting there asking to be filled in for no reason.
+  const talking = $("teamCustomAsking").value === "conversation";
+  $("teamCustomPrompt").placeholder = talking
+    ? "What to open the conversation with. You can say the rest while it runs."
+    : "Read the change and say whether it really does what was asked.";
+}
+
+function openTheCustomWindow() {
+  if (!teamWho.some((one) => one.ready)) {
+    teamSay("No assistant on this machine is ready yet, so there is nobody to give a job to.");
+    return;
+  }
+  fillTeamChoices();
+  $("teamCustomLabel").value = "";
+  $("teamCustomModel").value = "";
+  $("teamCustomPrompt").value = "";
+  $("teamCustomSaid").textContent = "";
+  $("teamCustomDialog").showModal();
+}
+
+async function saveTheCustomOne() {
+  const one = {
+    label: $("teamCustomLabel").value.trim(),
+    job: $("teamCustomJob").value,
+    asking: $("teamCustomAsking").value,
+    prompt: $("teamCustomPrompt").value,
+    route: $("teamCustomWho").value,
+    model: $("teamCustomModel").value.trim(),
+  };
+  if (!one.label) { $("teamCustomSaid").textContent = "Give it a name first."; return; }
+  if (one.asking === "set-prompt" && !one.prompt.trim()) {
+    $("teamCustomSaid").textContent =
+      "A box with one set prompt needs the prompt written down, or choose a conversation instead.";
+    return;
+  }
+  const id = `who-${teamNextId++}`;
+  teamGraph.nodes.push({
+    id,
+    type: one.job,
+    label: one.label,
+    config: {
+      provider_route: one.route,
+      ...(one.model ? {model: one.model} : {}),
+      asking: one.asking,
+      system_prompt: one.prompt.trim(),
+    },
+    at: {
+      x: 30 + (teamGraph.nodes.length % 4) * 235,
+      y: 30 + Math.floor(teamGraph.nodes.length / 4) * 155,
+    },
+  });
+  $("teamCustomDialog").close();
+  renderTeam();
+  await checkTheTeam();
+  teamSay(one.asking === "conversation"
+    ? `${one.label} is on the team. The run will stop there so you can talk to it.`
+    : `${one.label} is on the team.`);
+}
+
+/* ---- a model of your own ---- */
+
+function openTheModelWindow() {
+  const ways = $("teamModelWayIn");
+  ways.replaceChildren();
+  for (const way of teamWaysIn.filter((one) => one.way_in !== "seat")) {
+    const option = make("option", "", way.label);
+    option.value = way.way_in;
+    ways.append(option);
+  }
+  $("teamModelRoute").value = "";
+  $("teamModelModel").value = "";
+  $("teamModelEndpoint").value = "";
+  $("teamModelKeyName").value = "";
+  $("teamModelSaid").textContent = "";
+  sayWhatTheWayInMeans();
+  $("teamModelDialog").showModal();
+}
+
+function sayWhatTheWayInMeans() {
+  const way = teamWaysIn.find((one) => one.way_in === $("teamModelWayIn").value);
+  $("teamModelWayMeans").textContent = way?.means || "";
+  // Only one of the two needs a key, and asking for one where it cannot be
+  // used is how somebody ends up pasting a key that nothing reads.
+  const needsAKey = $("teamModelWayIn").value === "with-a-key";
+  $("teamModelKeyName").closest("form").querySelectorAll("label").forEach((label) => {
+    if (label.getAttribute("for") === "teamModelKeyName") label.hidden = !needsAKey;
+  });
+  $("teamModelKeyName").hidden = !needsAKey;
+}
+
+async function saveTheModel() {
+  try {
+    const said = await request("/api/who-is-on-it/add-a-model", {
+      method: "POST",
+      body: JSON.stringify({
+        model: {
+          route: $("teamModelRoute").value.trim(),
+          way_in: $("teamModelWayIn").value,
+          model: $("teamModelModel").value.trim(),
+          endpoint: $("teamModelEndpoint").value.trim(),
+          key_name: $("teamModelKeyName").value.trim(),
+        },
+      }),
+    });
+    $("teamModelDialog").close();
+    await refreshTeam(teamOpen);
+    teamSay(said.note || "The model was added.");
+    if (said.needs_your_say) {
+      // The same choice the seat setup puts in front of somebody, in the same
+      // window, rather than a second way of asking the same question.
+      switchView("start");
+      showTheChoiceAboutTrusting(said);
+    }
+  } catch (error) {
+    $("teamModelSaid").textContent = error.message;
+  }
+}
+
+/* ==========================================================================
+   The pipelines view, with the parts Kestra gets right.
+
+   Four ways of looking at the same pipeline, side by side rather than one
+   instead of the other: the picture, the same thing as text you can edit, a
+   timeline of the last run, and what every kind of step is for. Plus the two
+   things people ask for the first afternoon: start again from the step that
+   broke, and ask me a couple of questions before you run.
+   ========================================================================== */
+
+let pipelineLooking = "board";     // which of the four panels is on screen
+let pipelineStarterLooking = "";   // what is typed in the gallery search
+let pipelineWaitingAt = "";        // the step that has stopped to ask
+
+function showPipelinePane(which) {
+  pipelineLooking = which;
+  document.querySelectorAll("[data-pipeline-tab]").forEach((tab) => {
+    tab.setAttribute("aria-selected", String(tab.dataset.pipelineTab === which));
+  });
+  document.querySelectorAll("[data-pipeline-pane]").forEach((pane) => {
+    pane.hidden = pane.dataset.pipelinePane !== which;
+  });
+  if (which === "code") writeThePipelineOut();
+  if (which === "timeline") drawThePipelineTimeline();
+  if (which === "help") listWhatEachStepIsFor();
+}
+
+/* ---- the same thing as text ---- */
+
+function writeThePipelineOut() {
+  $("pipelineCode").value = JSON.stringify(forSavingThePipeline(), null, 2);
+  $("pipelineCodeSaid").textContent =
+    "Change anything here, then press Use what I typed. Nothing is saved until you press Save.";
+}
+
+// The picture and the text are one pipeline, so this is the one place that
+// says what that pipeline is. Both panels read it.
+function forSavingThePipeline() {
+  return {
+    name: $("pipelineName").value.trim() || pipeline.name || "First pipeline",
+    nodes: pipeline.nodes.map((node) => ({...node})),
+    edges: pipeline.edges.map((edge) => ({...edge})),
+  };
+}
+
+async function useTheTypedPipeline() {
+  let read;
+  try {
+    read = JSON.parse($("pipelineCode").value);
+  } catch (error) {
+    $("pipelineCodeSaid").textContent = `That is not readable as text a pipeline is written in: ${error.message}`;
+    return;
+  }
+  try {
+    // Checked by the harness, not by the page: the page believing something
+    // would run is not the same as it running.
+    const said = await request("/api/pipelines/check", {
+      method: "POST",
+      body: JSON.stringify({pipeline: read}),
+    });
+    pipeline = said.pipeline;
+    $("pipelineName").value = pipeline.name;
+    renderPipeline();
+    $("pipelineCodeSaid").textContent = "The picture now shows what you typed.";
+    say("The picture now shows what you typed.");
+  } catch (error) {
+    $("pipelineCodeSaid").textContent = error.message;
+  }
+}
+
+async function copyThePipelineText() {
+  try {
+    await navigator.clipboard.writeText($("pipelineCode").value);
+    $("pipelineCodeSaid").textContent = "Copied.";
+  } catch (error) {
+    // A browser that will not copy for us is not a failure worth shouting
+    // about; the text is on the screen and can be selected.
+    $("pipelineCodeSaid").textContent = "This browser would not copy it. Select it and copy it yourself.";
+  }
+}
+
+/* ---- how long each step took ---- */
+
+function drawThePipelineTimeline() {
+  const list = $("pipelineTimeline");
+  list.replaceChildren();
+  const steps = [...pipelineStates.values()].filter((one) => !one.skipped_this_time);
+  if (!steps.length) {
+    list.append(make("li", "hint", "Nothing has run yet. Press Run and this fills in."));
+    return;
+  }
+  const longest = Math.max(
+    1,
+    ...steps.map((one) => (one.started_after || 0) + (one.milliseconds || 0)),
+  );
+  for (const one of steps) {
+    const row = make("li", `pipeline-timeline-row ${one.state}`);
+    row.dataset.step = one.id;
+    row.append(make("span", "pipeline-timeline-name", one.label || one.id));
+    const track = make("div", "pipeline-timeline-track");
+    const bar = make("div", `pipeline-timeline-bar ${one.state}`);
+    const from = ((one.started_after || 0) / longest) * 100;
+    const wide = Math.max(1.5, ((one.milliseconds || 0) / longest) * 100);
+    bar.style.marginLeft = `${from}%`;
+    bar.style.width = `${Math.min(100 - from, wide)}%`;
+    bar.title = `${one.label}: ${prettyTime(one.milliseconds || 0)}`;
+    track.append(bar);
+    row.append(track);
+    row.append(make("span", "pipeline-timeline-time", prettyTime(one.milliseconds || 0)));
+    list.append(row);
+  }
+  const slowest = steps.reduce((worst, one) =>
+    (one.milliseconds || 0) > (worst.milliseconds || 0) ? one : worst, steps[0]);
+  list.append(make("li", "pipeline-timeline-note",
+    `The slowest step was ${slowest.label}, at ${prettyTime(slowest.milliseconds || 0)}.`));
+}
+
+function prettyTime(milliseconds) {
+  if (milliseconds < 1000) return `${milliseconds} ms`;
+  if (milliseconds < 60000) return `${(milliseconds / 1000).toFixed(1)} seconds`;
+  return `${Math.floor(milliseconds / 60000)} min ${Math.round((milliseconds % 60000) / 1000)} s`;
+}
+
+/* ---- what each step is for ---- */
+
+function listWhatEachStepIsFor() {
+  const list = $("pipelineHelpList");
+  list.replaceChildren();
+  for (const kind of pipelineKinds) {
+    const row = make("li", "pipeline-help-one");
+    row.append(make("strong", "", kind.label));
+    row.append(make("span", "pipeline-help-group", kind.group));
+    row.append(make("p", "", kind.summary));
+    if ((kind.settings || []).length) {
+      row.append(make("p", "hint", `It can be told: ${kind.settings.join(", ")}.`));
+    }
+    list.append(row);
+  }
+}
+
+/* ---- the gallery, and searching it ---- */
+
+function pipelineStartersShown() {
+  const looking = pipelineStarterLooking.trim().toLowerCase();
+  if (!looking) return pipelineStarters;
+  return pipelineStarters.filter((one) => {
+    const words = [one.title, one.when, one.group, ...(one.found_by || [])].join(" ").toLowerCase();
+    return words.includes(looking);
+  });
+}
+
+/* ---- asking before a run ---- */
+
+// Everything this pipeline said it would ask about, as one flat list.
+function whatThisPipelineAsks() {
+  const asked = [];
+  for (const node of pipeline.nodes) {
+    for (const name of (node.settings?.asks || [])) {
+      asked.push({
+        key: `${node.id}.${name}`,
+        step: node.label || node.id,
+        setting: name,
+        now: node.settings?.[name] ?? "",
+      });
+    }
+  }
+  return asked;
+}
+
+async function runPipelineAsking(options = {}) {
+  const asked = whatThisPipelineAsks();
+  if (!asked.length || options.answers) {
+    await runPipeline(options);
+    return;
+  }
+  const fields = $("pipelineAskFields");
+  fields.replaceChildren();
+  for (const one of asked) {
+    const label = make("label", "", `${one.step}: ${one.setting}`);
+    label.setAttribute("for", `ask-${one.key}`);
+    const box = make("input");
+    box.id = `ask-${one.key}`;
+    box.type = "text";
+    box.value = String(one.now || "");
+    box.dataset.askKey = one.key;
+    fields.append(label, box);
+  }
+  $("pipelineAskDialog").showModal();
+}
+
+async function runWithTheAnswers() {
+  const answers = {};
+  $("pipelineAskFields").querySelectorAll("[data-ask-key]").forEach((box) => {
+    answers[box.dataset.askKey] = box.value;
+  });
+  $("pipelineAskDialog").close();
+  await runPipeline({answers});
+}
+
+/* ---- answering a step that stopped to ask ---- */
+
+function showWhatIsBeingAsked(step) {
+  pipelineWaitingAt = step || "";
+  const box = $("pipelineAsk");
+  box.replaceChildren();
+  if (!step) { box.hidden = true; return; }
+  const state = pipelineStates.get(step);
+  const node = pipeline.nodes.find((one) => one.id === step);
+  box.hidden = false;
+  box.append(make("strong", "", (node && node.label) || step));
+  box.append(make("p", "", (state && state.said) || "This step is waiting for you."));
+  const buttons = make("div", "button-row");
+  const yes = make("button", "primary", "Carry on");
+  yes.type = "button";
+  yes.addEventListener("click", () => answerTheStep(step, true));
+  const no = make("button", "", "Stop here");
+  no.type = "button";
+  no.addEventListener("click", () => answerTheStep(step, false));
+  buttons.append(yes, no);
+  box.append(buttons);
+  announce(`${(node && node.label) || step} is waiting for you.`);
+}
+
+async function answerTheStep(step, carryOn) {
+  try {
+    const said = await request("/api/pipelines/answer", {
+      method: "POST",
+      body: JSON.stringify({step, carry_on: carryOn}),
+    });
+    showWhatIsBeingAsked("");
+    say(said.note || "Answered.");
+  } catch (error) { showError(error.message); }
 }
 
 async function boot() {

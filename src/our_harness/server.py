@@ -166,6 +166,12 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.pipeline_run: dict[str, Any] | None = None
         self.pipeline_running = False
         self.pipeline_stop = False
+        # What somebody has said about a step that stopped to ask. One answer
+        # per step: True to carry on, False to stop there.
+        self.pipeline_answers: dict[str, bool] = {}
+        # The step a run is waiting at, so the page can show the question and
+        # the two buttons without asking every second what is going on.
+        self.pipeline_waiting_at = ""
         # What the settings file held before the last seat setup, kept so
         # that setup can be undone. Only ever written back by this process.
         self.seats_before: seat_setup.Before | None = None
@@ -718,6 +724,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "saved": pipeline_lab.saved_ones(config),
                     "kinds": [kind.to_dict() for kind in pipeline_lab.KINDS.values()],
                     "running": self.server.pipeline_running,
+                    "waiting_at": self.server.pipeline_waiting_at,
                     "last_run": self.server.pipeline_run,
                 }
                 answer["starters"] = pipeline_starters.listed()
@@ -1131,6 +1138,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         "note": team_lab.remove_team(self.server.config, str(body.get("name") or "")),
                         "teams": team_lab.teams(self.server.config),
                     })
+            elif self.path == "/api/who-is-on-it/add-a-model":
+                # Writing a route into somebody's own settings. It takes the
+                # seats lock because that is the lock the settings file has.
+                with self.server.seats_lock:
+                    done = team_lab.add_its_own_way_in(self._settings_now(), body.get("model"))
+                if done.get("needs_your_say"):
+                    # The same choice the seat setup puts in front of somebody,
+                    # so the panel can show the one window it already has.
+                    self.server.seats_were_set_up = True
+                self._json(done)
             elif self.path == "/api/who-is-on-it/check":
                 # Says what is wrong with a drawing without saving any of it.
                 with self.server.seats_lock:
@@ -1154,6 +1171,21 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/pipelines/stop":
                 self.server.pipeline_stop = True
                 self._json({"note": "The run will stop after the step it is on."})
+            elif self.path == "/api/pipelines/answer":
+                # Somebody answering a step that stopped to ask. Nothing else
+                # reads these, and they are cleared at the start of every run.
+                step = str(body.get("step") or "")
+                if not step:
+                    raise HarnessError("Say which step is being answered.")
+                self.server.pipeline_answers[step] = bool(body.get("carry_on"))
+                self._json({
+                    "step": step,
+                    "carry_on": self.server.pipeline_answers[step],
+                    "note": (
+                        "Carrying on." if self.server.pipeline_answers[step]
+                        else "Stopping there. Nothing after it will run."
+                    ),
+                })
             elif self.path == "/api/pipelines/run":
                 drawn = pipeline_lab.read_it(body.get("pipeline"))
                 if not self.server.pipeline_lock.acquire(blocking=False):
@@ -1162,6 +1194,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     )
                 self.server.pipeline_running = True
                 self.server.pipeline_stop = False
+                self.server.pipeline_answers = {}
+                self.server.pipeline_waiting_at = ""
+                # Three ways to run less than the whole thing: carry on from a
+                # step, run one step on its own, and fill in what a step said
+                # it would ask about.
+                from_here = str(body.get("from_here") or "")
+                only = str(body.get("only") or "")
+                answers = body.get("answers")
+                answers = answers if isinstance(answers, dict) else {}
                 events = self.server.events
                 config = self.server.config
                 kinds = self.server.check_kinds
@@ -1171,23 +1212,40 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     try:
                         events.add({"kind": "pipeline_started", "node": "pipeline",
                                     "payload": {"name": drawn["name"]}})
+                        def waiting_on(step: str):
+                            server.pipeline_waiting_at = (
+                                step if step not in server.pipeline_answers else ""
+                            )
+                            return server.pipeline_answers.get(step)
+
                         run = pipeline_lab.run_it(
                             config, drawn, tell=events.add, check_kinds=kinds,
                             stopping=lambda: server.pipeline_stop,
+                            from_here=from_here, only=only, answers=answers,
+                            waiting_on=waiting_on,
                         )
                         server.pipeline_run = run.to_dict()
                         events.add({"kind": "pipeline_finished", "node": "pipeline",
                                     "payload": run.to_dict()})
                     except Exception as exc:  # noqa: BLE001 - it has to end, whatever happens
+                        # Nothing ran: a run that gets this far has fallen over
+                        # before the first step, so there are no steps to
+                        # report. Saying that plainly beats an empty list that
+                        # reads as "nothing went wrong".
                         server.pipeline_run = {
                             "name": drawn.get("name", ""), "nodes": [], "passed": False,
-                            "said": f"The run stopped: {exc}", "milliseconds": 0,
+                            "said": (
+                                f"The run stopped before any step ran, so nothing was "
+                                f"checked: {exc}"
+                            ),
+                            "milliseconds": 0,
                         }
                         events.add({"kind": "pipeline_finished", "node": "pipeline",
                                     "payload": server.pipeline_run})
                     finally:
                         # However it ends, the next press has to work.
                         server.pipeline_running = False
+                        server.pipeline_waiting_at = ""
                         server.pipeline_lock.release()
 
                 try:

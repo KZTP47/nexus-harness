@@ -32,15 +32,22 @@ Two rules, the same two the seat setup keeps:
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import seats as seats_lab
 from . import workflows as workflows_lab
-from .config import LoadedConfig
+from .config import (
+    LoadedConfig,
+    is_project_local_config_trusted,
+    trust_project_local_config,
+)
 from .graphs import migrate_graph, validate_graph
 from .models import HarnessError
+from .safety import confined_path
 
 # The jobs an assistant can be given, in the words the panel shows. The key is
 # the node type the rest of the harness already understands, so a team is a
@@ -68,6 +75,51 @@ JOBS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 JOB_NAMES = {key for key, _label, _means in JOBS}
+
+# How a box gets its answers. A set prompt is the ordinary one: the job is
+# written down once and the same words are used every time. A conversation is
+# for the work nobody can write down in advance - the run stops there, you talk
+# it through, and you say when to carry on.
+WAYS_OF_ASKING: tuple[tuple[str, str, str], ...] = (
+    (
+        "set-prompt",
+        "One set prompt",
+        "The same instructions every time. Write them once and the run does not stop.",
+    ),
+    (
+        "conversation",
+        "A conversation you can carry on",
+        "The run stops here and waits. You talk to it as long as you like, then say carry on.",
+    ),
+)
+ASKING_NAMES = {key for key, _label, _means in WAYS_OF_ASKING}
+
+# How the harness reaches a model. The first is the one most people have: a
+# tool they are already signed in to. The last one never holds a key - only the
+# name of the place a key is kept.
+WAYS_IN: tuple[tuple[str, str, str], ...] = (
+    (
+        "seat",
+        "A tool you are signed in to",
+        "Claude or Copilot on this machine. Nothing to paste, nothing to keep secret.",
+    ),
+    (
+        "on-this-machine",
+        "A model running on this machine",
+        "Ollama or anything that answers like it. Nothing leaves the machine.",
+    ),
+    (
+        "with-a-key",
+        "A service, with the key kept in an environment variable",
+        "The harness is told the name of the variable, never the key itself.",
+    ),
+)
+WAY_IN_NAMES = {key for key, _label, _means in WAYS_IN}
+# What each way in is written as in the settings.
+KIND_FOR_WAY_IN = {"on-this-machine": "ollama", "with-a-key": "openai-compatible"}
+ROUTE_SHAPE = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
+KEY_NAME_SHAPE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+MOST_PROMPT_LETTERS = 4000
 
 # How many boxes one team may hold. Past this it stops being a picture somebody
 # can read, which is the whole point of it.
@@ -140,6 +192,27 @@ def who_is_here(config: LoadedConfig) -> dict[str, Any]:
                 found_at=seat.found_at,
                 why_not=seat.why_not,
                 install_hint=seat.install_hint,
+            )
+        )
+    # And anything already set up in the settings that is not one of those
+    # tools: a model on this machine, or a service somebody wired up. Without
+    # this, a model you added yourself could never be given a job.
+    known = {one.route for one in members}
+    for route, held in (config.get("providers", {}) or {}).items():
+        if route in known or not isinstance(held, dict):
+            continue
+        kind = str(held.get("kind") or "")
+        members.append(
+            Member(
+                route=str(route),
+                label=f"{route} ({held.get('model') or kind or 'a model of your own'})",
+                kind=kind or "your own",
+                ready=True,
+                signed_in=not held.get("api_key_env"),
+                already_set_up=True,
+                version=str(held.get("model") or ""),
+                found_at=str(held.get("endpoint") or ""),
+                why_not="",
             )
         )
     ready = [one for one in members if one.ready]
@@ -305,6 +378,136 @@ def in_plain_words(graph: dict[str, Any]) -> dict[str, Any]:
     return {"members": members, "hand_overs": hand_overs, "note": note}
 
 
+@dataclass
+class ItsOwnWayIn:
+    """A model somebody set up themselves, rather than a tool already signed in.
+
+    The key itself is never held here, and never asked for. What is kept is the
+    name of the environment variable the key lives in, which is a name and not
+    a secret. Anything else would put somebody's key in a file that travels.
+    """
+
+    route: str
+    way_in: str
+    model: str
+    endpoint: str = ""
+    key_name: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "route": self.route,
+            "way_in": self.way_in,
+            "model": self.model,
+            "endpoint": self.endpoint,
+            "key_name": self.key_name,
+        }
+
+    def as_a_route(self) -> dict[str, Any]:
+        """The same thing written the way the settings file keeps it."""
+
+        written: dict[str, Any] = {
+            "kind": KIND_FOR_WAY_IN.get(self.way_in, "openai-compatible"),
+            "model": self.model,
+        }
+        if self.endpoint:
+            written["endpoint"] = self.endpoint
+        if self.key_name:
+            written["api_key_env"] = self.key_name
+        return written
+
+
+def check_its_own_way_in(said: Any) -> ItsOwnWayIn:
+    """Read what somebody typed into the new-model window, and refuse nonsense."""
+
+    if not isinstance(said, dict):
+        raise TeamError("Say how this one is reached.")
+    way_in = str(said.get("way_in") or "").strip()
+    if way_in not in WAY_IN_NAMES:
+        raise TeamError(
+            "Choose how it is reached: a tool you are signed in to, a model on this "
+            "machine, or a service with its key in an environment variable."
+        )
+    route = str(said.get("route") or "").strip().lower()
+    if not ROUTE_SHAPE.fullmatch(route):
+        raise TeamError(
+            "A short name for this model is lowercase letters, numbers, dashes and "
+            "underscores, up to 40 of them. It is the name you will see on the box."
+        )
+    model = str(said.get("model") or "").strip()
+    if not 1 <= len(model) <= 120:
+        raise TeamError("Say which model to use, in up to 120 letters.")
+    endpoint = str(said.get("endpoint") or "").strip()
+    if endpoint and not endpoint.startswith(("http://", "https://")):
+        raise TeamError("An address starts with http:// or https://.")
+    if len(endpoint) > 300:
+        raise TeamError("That address is too long.")
+    key_name = str(said.get("key_name") or "").strip()
+    if key_name and not KEY_NAME_SHAPE.fullmatch(key_name):
+        raise TeamError(
+            "Give the name of the environment variable the key is kept in, like "
+            "OPENAI_API_KEY - capitals, numbers and underscores. Never the key itself."
+        )
+    if way_in == "with-a-key" and not key_name:
+        raise TeamError(
+            "Say which environment variable holds the key. The harness reads the key "
+            "from there when it runs, so nothing secret is written down here."
+        )
+    if key_name and _looks_like_a_key(key_name):
+        raise TeamError(
+            "That looks like a key rather than the name of one. Put the key in an "
+            "environment variable and give the name of that variable here."
+        )
+    return ItsOwnWayIn(
+        route=route, way_in=way_in, model=model, endpoint=endpoint, key_name=key_name
+    )
+
+
+def _looks_like_a_key(said: str) -> bool:
+    """A rough guess at somebody pasting the key where the name should go."""
+
+    return len(said) > 40 or said.lower().startswith(("sk-", "sk_", "ghp_", "xox"))
+
+
+def check_a_custom_member(said: Any) -> dict[str, Any]:
+    """Everything one custom box holds, checked over."""
+
+    if not isinstance(said, dict):
+        raise TeamError("A box on the team is a set of settings, and this is not one.")
+    label = str(said.get("label") or "").strip()
+    if not 1 <= len(label) <= 80:
+        raise TeamError("Give this box a name, in up to 80 letters.")
+    job = str(said.get("job") or "").strip()
+    if job not in JOB_NAMES:
+        raise TeamError("Choose what this one does from the list of jobs.")
+    asking = str(said.get("asking") or "set-prompt").strip()
+    if asking not in ASKING_NAMES:
+        raise TeamError(
+            "Choose whether this one gets one set prompt or a conversation you can "
+            "carry on."
+        )
+    prompt = str(said.get("prompt") or "")
+    if len(prompt) > MOST_PROMPT_LETTERS:
+        raise TeamError(
+            f"That prompt is longer than {MOST_PROMPT_LETTERS} letters. Anything that "
+            "long belongs in the project, with the prompt pointing at it."
+        )
+    if any(ord(letter) < 32 and letter not in "\t\n\r" for letter in prompt):
+        raise TeamError("That prompt holds a control character.")
+    if asking == "set-prompt" and not prompt.strip():
+        raise TeamError(
+            "A box with one set prompt needs the prompt written down. Say what it "
+            "should do every time."
+        )
+    return {
+        "label": label,
+        "job": job,
+        "asking": asking,
+        "prompt": prompt.strip(),
+        "route": str(said.get("route") or "").strip().lower(),
+        "model": str(said.get("model") or "").strip()[:120],
+    }
+
+
 def check_it(
     config: LoadedConfig, graph: Any, here: dict[str, dict] | None = None
 ) -> list[str]:
@@ -337,6 +540,17 @@ def check_it(
         if not route:
             problems.append(f"{label} has a job but nobody doing it. Choose who it is.")
             continue
+        settings = node.get("config")
+        settings = settings if isinstance(settings, dict) else {}
+        asking = str(settings.get("asking") or "set-prompt")
+        if asking not in ASKING_NAMES:
+            problems.append(
+                f"{label} does not say whether it gets one set prompt or a conversation."
+            )
+        # An empty prompt is not a problem: it means "the usual instructions for
+        # that job", which is what every box on the ready-made team uses. The
+        # window that writes a box of your own asks for one, because somebody
+        # typing there has a particular thing in mind.
         known = here.get(route)
         if known is None:
             problems.append(
@@ -439,6 +653,89 @@ def remove_team(config: LoadedConfig, name: str) -> str:
     return workflows_lab.delete(config, name)
 
 
+def add_its_own_way_in(config: LoadedConfig, said: Any) -> dict[str, Any]:
+    """Write one model of your own into your settings, and leave the rest alone.
+
+    Two rules, both the same ones the seat setup keeps:
+
+      - It adds. Somebody else's settings are not this tool's to throw away, so
+        every other route, and the one used by default, are left exactly as they
+        were.
+      - It never holds a key. What goes in the file is the name of the
+        environment variable the key lives in, and the harness reads the key
+        from there when it runs.
+    """
+
+    wanted = check_its_own_way_in(said)
+    here = {one["route"] for one in who_is_here(config)["members"]}
+    if wanted.route in here:
+        raise TeamError(
+            f"{wanted.route} is already the name of an assistant found on this "
+            "machine. Give this one a different name."
+        )
+    local = confined_path(
+        config.project_root, ".harness/config.local.json",
+        allow_missing=True, allow_control=True,
+    )
+    settings: dict[str, Any] = {}
+    was_there = local.is_file()
+    was_trusted = was_there and is_project_local_config_trusted(config.project_root, local)
+    if was_there:
+        try:
+            settings = json.loads(local.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TeamError(
+                f"{local.name} is there and cannot be read: {exc}. Fix or move that "
+                "file first; nothing was changed."
+            ) from exc
+        if not isinstance(settings, dict):
+            raise TeamError(f"{local.name} does not hold settings, so it was left alone")
+    routes = settings.get("providers")
+    routes = dict(routes) if isinstance(routes, dict) else {}
+    replaced = wanted.route in routes
+    routes[wanted.route] = wanted.as_a_route()
+    settings["providers"] = routes
+    body = json.dumps(settings, indent=2) + "\n"
+    local.parent.mkdir(parents=True, exist_ok=True)
+    # Written beside and moved into place, so a machine turned off in the middle
+    # cannot leave half a settings file behind.
+    beside = local.with_name(f"{local.name}.{os.getpid()}.part")
+    beside.write_text(body, encoding="utf-8")
+    os.replace(beside, local)
+
+    trusted = False
+    needs_your_say = False
+    note = ""
+    if not was_there or was_trusted:
+        try:
+            trust_project_local_config(config.project_root, local)
+            trusted = True
+            note = f"{wanted.route} is set up and ready to give a job to."
+        except HarnessError as exc:
+            note = f"{wanted.route} was written, and trusting the file did not work: {exc}"
+    else:
+        # The same choice the seat setup puts in front of somebody: the file was
+        # already here, nobody has said it is theirs, and trusting it lets
+        # everything in it act - not only what was just written.
+        needs_your_say = True
+        note = (
+            f"{wanted.route} was written into {local.name}. That file was already here "
+            "and nobody has said it is theirs, so nothing in it acts yet."
+        )
+    return {
+        "route": wanted.route,
+        "way_in": wanted.way_in,
+        "written_over": replaced,
+        "settings_file": local.as_posix(),
+        "contents": body,
+        "trusted": trusted,
+        "needs_your_say": needs_your_say,
+        "risky_parts": seats_lab.what_makes_it_risky(settings),
+        "mark": seats_lab.mark_of(body),
+        "note": note,
+    }
+
+
 def everything(config: LoadedConfig) -> dict[str, Any]:
     """What the team view needs to draw itself, in one answer."""
 
@@ -447,6 +744,14 @@ def everything(config: LoadedConfig) -> dict[str, Any]:
     return {
         "who": who,
         "jobs": [{"job": key, "label": label, "means": means} for key, label, means in JOBS],
+        "ways_in": [
+            {"way_in": key, "label": label, "means": means} for key, label, means in WAYS_IN
+        ],
+        "ways_of_asking": [
+            {"asking": key, "label": label, "means": means}
+            for key, label, means in WAYS_OF_ASKING
+        ],
+        "most_prompt_letters": MOST_PROMPT_LETTERS,
         "teams": teams(config),
         "starting_team": starting,
         "starting_plain": in_plain_words(starting),

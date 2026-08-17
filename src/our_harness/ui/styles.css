@@ -654,6 +654,14 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .team-node-job { margin: 3px 0 0; font-size: .74rem; color: #4a5763; }
 .team-node-who { margin: 3px 0 0; font-size: .76rem; font-weight: 700; color: #14532d; }
 .team-node-who.not-ready { color: #b42318; }
+.team-node-asking { margin: 3px 0 0; font-size: .72rem; font-weight: 700; color: #7c3aed; }
+.team-node-prompt { margin: 3px 0 0; font-size: .71rem; color: #52616b; font-style: italic; overflow-wrap: anywhere; }
+.team-node-model { margin: 2px 0 0; font-size: .69rem; color: #64748b; }
+#teamCustomDialog textarea, #teamModelDialog input, #teamCustomDialog input,
+#teamCustomDialog select, #teamModelDialog select { width: 100%; background: #fff; color: #1f2933;
+  border: 1px solid #d7dce3; border-radius: 8px; padding: 6px 8px; font-size: .85rem; }
+#teamCustomDialog label, #teamModelDialog label { display: block; margin-top: 8px; font-size: .82rem; }
+
 .team-node-buttons { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
 .team-node-button { background: rgba(255, 255, 255, .82); border: 1px solid rgba(20, 30, 45, .2); color: #16202b; border-radius: 7px; padding: 3px 7px; font-size: .72rem; }
 .team-node-button:hover { background: #fff; }
@@ -681,3 +689,36 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
   .team-shell { grid-template-columns: 1fr; height: auto; }
   .team-side { border-right: none; border-bottom: 1px solid #d7dce3; }
 }
+
+/* ---- the pipelines view, laid out in panels ---------------------------- */
+.pipeline-tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 6px 16px 0; background: #f7f9fb; border-bottom: 1px solid #d7dce3; }
+.pipeline-tabs button { background: #eef2f7; color: #1f2933; border: 1px solid #d7dce3; border-bottom: none; border-radius: 8px 8px 0 0; padding: 6px 12px; font-size: .82rem; }
+.pipeline-tabs button[aria-selected="true"] { background: #fff; font-weight: 700; }
+.pipeline-pane { flex: 1; min-height: 320px; overflow: auto; background: #fff; color: #1f2933; padding: 12px 16px; }
+.pipeline-pane .hint { color: #4a5763; }
+#pipelineCode { width: 100%; min-height: 320px; font-family: ui-monospace, Consolas, monospace; font-size: .8rem; background: #f7f9fb; color: #1f2933; border: 1px solid #d7dce3; border-radius: 8px; padding: 8px; }
+.pipeline-timeline { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px; }
+.pipeline-timeline-row { display: grid; grid-template-columns: 190px 1fr 90px; align-items: center; gap: 8px; font-size: .8rem; }
+.pipeline-timeline-name { overflow-wrap: anywhere; }
+.pipeline-timeline-track { background: #eef1f5; border-radius: 6px; height: 18px; position: relative; }
+.pipeline-timeline-bar { height: 18px; border-radius: 6px; background: #2563eb; }
+.pipeline-timeline-bar.passed { background: #16a34a; }
+.pipeline-timeline-bar.failed { background: #dc2626; }
+.pipeline-timeline-bar.skipped { background: #b6bfcc; }
+.pipeline-timeline-time { text-align: right; color: #52616b; }
+.pipeline-timeline-note { margin-top: 8px; font-size: .8rem; color: #52616b; }
+.pipeline-help-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.pipeline-help-one { border: 1px solid #e2e6ec; border-radius: 9px; padding: 8px 10px; }
+.pipeline-help-one p { margin: 3px 0 0; font-size: .82rem; }
+.pipeline-help-group { margin-left: 8px; font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; color: #64748b; }
+.pipeline-ask { margin: 0; padding: 10px 16px; background: #fdf5e9; border-bottom: 1px solid #e8c98a; color: #7a5320; }
+.pipeline-ask p { margin: 3px 0 6px; font-size: .84rem; }
+.pipeline-ask button { background: #fff; color: #1f2933; border: 1px solid #e8c98a; border-radius: 8px; padding: 6px 12px; font-size: .84rem; }
+.pipeline-ask button.primary { background: #b45309; border-color: #b45309; color: #fff; font-weight: 700; }
+
+.pipeline-asks { border: 1px solid #d7dce3; border-radius: 8px; padding: 8px; margin-top: 8px; }
+.pipeline-asks legend { font-size: .8rem; padding: 0 4px; }
+.pipeline-ask-one { display: flex; align-items: center; gap: 6px; font-size: .8rem; }
+.pipeline-node-asks { margin: 3px 0 0; font-size: .71rem; font-weight: 700; color: #b45309; }
+.pipeline-starter-group { margin: 10px 0 2px; font-size: .72rem; text-transform: uppercase; letter-spacing: .07em; color: #64748b; }
+#pipelineStarterSearch { width: 100%; background: #fff; color: #1f2933; border: 1px solid #d7dce3; border-radius: 8px; padding: 5px 8px; font-size: .8rem; margin-bottom: 6px; }

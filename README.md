@@ -189,6 +189,25 @@ when it did not, and dim when a gate stopped the work before it got there.
 Any step can be told to try again up to five times before it gives up, which is
 usually enough for the one test that fails on a slow morning.
 
+Four tabs over the board show the same pipeline four ways: the picture, the same
+thing written out as text you can edit, a timeline of the last run, and what
+every kind of step is for.
+
+![How long each step took](docs/images/pipeline-timeline.png)
+
+Three ways to run less than all of it, which is what you want once a pipeline is
+longer than a minute:
+
+- **Run only this** — one step, while you are building it.
+- **Carry on from here** — the step that broke and everything after it. The
+  earlier ones are marked *left as they were*, never *passed*.
+- **Ask me first** — a step can ask about one of its settings when the run
+  starts, so one saved pipeline covers "the quick ones" and "all of them".
+
+And a step can **wait for a person**: the run stops, shows the question you
+wrote, and waits for *Carry on* or *Stop here*. Ten ready-made pipelines, in
+groups, with a search box over them — nobody should start from a blank board.
+
 A pipeline is ordinary JSON in `.harness/pipelines`, so it can go into your
 repository and everyone gets the same one. There is deliberately no "run this
 shell line" step: a saved pipeline is a file people pass around, and a file

@@ -135,10 +135,25 @@ KINDS: dict[str, Kind] = {
         summary="Writes what happened into one file you can send to somebody.",
         settings=("write_to",),
     ),
+    "wait_for_a_person": Kind(
+        id="wait_for_a_person", label="Wait for a person", colour="yellow", group="Flow",
+        summary="Stops here until somebody says to carry on. For the step before something that matters.",
+        settings=("question",),
+    ),
+    "another_pipeline": Kind(
+        id="another_pipeline", label="Run another pipeline", colour="blue", group="Flow",
+        summary="Runs one of your saved pipelines as a single step, so nobody copies steps about.",
+        settings=("pipeline",),
+    ),
 }
 
 # Which gate kinds decide whether the work goes on.
 GATES = {"gate", "security_gate"}
+
+# How deep one pipeline may call another. A pipeline that runs itself, or two
+# that run each other, would go round forever, and each round would look like
+# ordinary work.
+DEEPEST_NESTING = 3
 
 
 @dataclass
@@ -153,6 +168,13 @@ class NodeResult:
     detail: str = ""
     tries: int = 0
     milliseconds: int = 0
+    # True when this run left the step alone: it was done in an earlier run, or
+    # this run was only ever about one other step. A picture of the run has to
+    # say that, or "passed" would claim more than happened.
+    skipped_this_time: bool = False
+    # When it started, counted from the beginning of the run. This is what the
+    # timeline is drawn from.
+    started_after: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +186,8 @@ class NodeResult:
             "detail": self.detail,
             "tries": self.tries,
             "milliseconds": self.milliseconds,
+            "skipped_this_time": self.skipped_this_time,
+            "started_after": self.started_after,
         }
 
 
@@ -241,15 +265,25 @@ def read_it(pipeline: Any) -> dict[str, Any]:
         settings = node.get("settings") or {}
         if not isinstance(settings, dict):
             raise PipelineError(f"The settings on {node_id} are not settings")
-        allowed = set(KINDS[kind].settings) | {"tries"}
+        allowed = set(KINDS[kind].settings) | {"tries", "asks"}
         extra = sorted(set(settings) - allowed)
         if extra:
             raise PipelineError(f"{node_id} has a setting it cannot use: {extra[0]}")
+        # A step can say which of its own settings to ask about when the run
+        # starts, so one saved pipeline serves two jobs without being copied.
+        asked = settings.get("asks", [])
+        if not isinstance(asked, list) or not all(isinstance(one, str) for one in asked):
+            raise PipelineError(f"What {node_id} asks about has to be a list of setting names")
+        unknown = sorted(set(asked) - set(KINDS[kind].settings))
+        if unknown:
+            raise PipelineError(
+                f"{node_id} says it asks about {unknown[0]}, which is not one of its settings"
+            )
         tries = settings.get("tries", 1)
         if not isinstance(tries, int) or isinstance(tries, bool) or not 1 <= tries <= MOST_TRIES:
             raise PipelineError(f"Tries on {node_id} has to be a whole number from 1 to {MOST_TRIES}")
         for key, value in settings.items():
-            if key == "tries":
+            if key in ("tries", "asks"):
                 continue
             if isinstance(value, list):
                 for item in value:
@@ -703,15 +737,35 @@ def run_it(
     tell: Callable[[dict[str, Any]], None] | None = None,
     check_kinds: Any = None,
     stopping: Callable[[], bool] | None = None,
+    from_here: str = "",
+    only: str = "",
+    answers: dict[str, Any] | None = None,
+    waiting_on: Callable[[str], bool] | None = None,
+    depth: int = 0,
 ) -> Run:
     """Run a whole pipeline, in order, and say what happened at each step.
 
     Everything a node does is something the harness can already do on its own.
     What this adds is the order, the gates, and trying again.
+
+    Three ways to run less than all of it:
+
+      - `from_here` starts at one step and carries on from there. The steps
+        before it are marked as already done rather than run again, which is
+        what somebody wants after fixing what broke at step four of six.
+      - `only` runs one step and nothing else, which is how a step gets built:
+        try it, look at what it said, change it, try it again.
+      - `answers` fills in the settings a step said it would ask for, so one
+        saved pipeline can serve two jobs without being copied.
     """
 
     tidy = read_it(pipeline)
     order = in_running_order(tidy)
+    if from_here and from_here not in {node["id"] for node in tidy["nodes"]}:
+        raise PipelineError(f"There is no step called {from_here} in this pipeline")
+    if only and only not in {node["id"] for node in tidy["nodes"]}:
+        raise PipelineError(f"There is no step called {only} in this pipeline")
+    answers = dict(answers or {})
     by_id = {node["id"]: node for node in tidy["nodes"]}
     coming_from: dict[str, list[str]] = {node_id: [] for node_id in by_id}
     for edge in tidy["edges"]:
@@ -727,10 +781,31 @@ def run_it(
         if tell:
             tell({"kind": "pipeline_node", "node": result.id, "payload": result.to_dict()})
 
+    # Which steps this run is really doing. The rest are marked as already
+    # done, so a picture of the run says plainly what was and was not tried.
+    doing = set(order)
+    if only:
+        doing = {only}
+    elif from_here:
+        doing = _from_here_on(order, coming_from, from_here)
     for node_id in order:
         node = by_id[node_id]
         result = results[node_id]
         before = [results[other] for other in coming_from[node_id]]
+        if node_id not in doing:
+            result.state = PASSED
+            result.said = "Left as it was, from an earlier run"
+            result.skipped_this_time = True
+            say(result)
+            continue
+        # Anything the step said it would ask about is filled in here, once,
+        # before it runs. Nothing else about the saved pipeline changes.
+        asked = node["settings"].get("asks")
+        if isinstance(asked, list):
+            for name in asked:
+                key = f"{node_id}.{name}"
+                if key in answers:
+                    node["settings"][name] = answers[key]
         if stopping and stopping():
             result.state = SKIPPED
             result.said = "The run was stopped"
@@ -746,14 +821,38 @@ def run_it(
             continue
 
         result.state = RUNNING
+        result.started_after = int((time.monotonic() - started_everything) * 1000)
         say(result)
         started = time.monotonic()
+        if node["kind"] == "wait_for_a_person":
+            # The one step that is meant to take as long as a person takes.
+            # Everything before it has run, nothing after it has, and it says
+            # so while it waits.
+            result.said = str(node["settings"].get("question") or "").strip() or (
+                "Waiting for somebody to say carry on."
+            )
+            say(result)
+            answered = _wait_for_a_person(node_id, waiting_on, stopping, started)
+            result.milliseconds = int((time.monotonic() - started) * 1000)
+            if answered is True:
+                result.state = PASSED
+                result.said = "Somebody said carry on."
+            elif answered is False:
+                result.state = FAILED
+                result.said = "Somebody said no, so the rest was not run."
+            else:
+                result.state = SKIPPED
+                result.said = (
+                    "Nobody answered, so the rest was not run. Nothing after this ran."
+                )
+            say(result)
+            continue
         tries = int(node["settings"].get("tries", 1))
         passed, said, detail = False, "", ""
         for attempt in range(1, tries + 1):
             result.tries = attempt
             try:
-                passed, said, detail = _do_one(config, node, before, results, order, check_kinds)
+                passed, said, detail = _do_one(config, node, before, results, order, check_kinds, depth)
             except HarnessError as exc:
                 passed, said, detail = False, str(exc), ""
             except Exception as exc:  # noqa: BLE001 - one bad node must not end the run
@@ -776,10 +875,15 @@ def run_it(
     ordered = [results[node_id] for node_id in order]
     failed = [item for item in ordered if item.state == FAILED]
     skipped = [item for item in ordered if item.state == SKIPPED]
+    # A step that never ran is not a step that passed. Being stopped part way,
+    # or nobody answering, leaves work undone, and a run with work left undone
+    # must not read like one that finished. The only steps that do not count
+    # against it are the ones this run deliberately left alone.
+    left_alone = [item for item in ordered if item.skipped_this_time]
     run = Run(
         name=tidy["name"],
         nodes=ordered,
-        passed=not failed,
+        passed=not failed and not skipped,
         milliseconds=_how_long(started_everything),
     )
     if failed:
@@ -787,13 +891,89 @@ def run_it(
             item.label for item in failed[:4]
         )
     elif skipped:
-        run.said = f"Everything that ran passed. {len(skipped)} step(s) were skipped."
+        run.said = (
+            f"Everything that ran passed, and {len(skipped)} step(s) never ran: "
+            + ", ".join(item.label for item in skipped[:4])
+        )
+    elif left_alone:
+        ran = len(ordered) - len(left_alone)
+        run.said = (
+            f"Every one of the {ran} step(s) this run covered passed. "
+            f"{len(left_alone)} were left as they were."
+        )
     else:
         run.said = f"Every one of the {len(ordered)} steps passed."
     return run
 
 
-def _do_one(config, node, before, results, order, check_kinds) -> tuple[bool, str, str]:
+# How long a step waits for somebody to answer before giving up. Long enough to
+# go and look at something; short enough that a forgotten run does not hold a
+# thread until the machine is turned off.
+LONGEST_WAIT_SECONDS = 3600.0
+
+
+def _wait_for_a_person(node_id, waiting_on, stopping, started) -> bool | None:
+    """Wait until somebody says carry on, says no, or nobody says anything."""
+
+    if waiting_on is None:
+        # Nothing is listening for an answer - a run from the command line, or
+        # a test. Waiting for a person nobody asked would hang forever, so it
+        # says plainly that nobody answered.
+        return None
+    while True:
+        answer = waiting_on(node_id)
+        if answer is not None:
+            return bool(answer)
+        if stopping and stopping():
+            return None
+        if time.monotonic() - started >= LONGEST_WAIT_SECONDS:
+            return None
+        time.sleep(0.25)
+
+
+def _from_here_on(
+    order: list[str], coming_from: dict[str, list[str]], from_here: str
+) -> set[str]:
+    """This step, and everything that waits on it, however far down."""
+
+    doing = {from_here}
+    for node_id in order:
+        if any(other in doing for other in coming_from.get(node_id, [])):
+            doing.add(node_id)
+    return doing
+
+
+def _run_another_pipeline(config, node, check_kinds, depth: int) -> tuple[bool, str, str]:
+    """Run one saved pipeline as a single step of this one."""
+
+    name = str(node["settings"].get("pipeline") or "").strip()
+    if not name:
+        return False, "This step does not say which pipeline to run.", ""
+    if depth + 1 > DEEPEST_NESTING:
+        return (
+            False,
+            f"Pipelines are only followed {DEEPEST_NESTING} deep. One of them is calling "
+            "another that calls it back, or the chain is simply too long to follow.",
+            "",
+        )
+    try:
+        held = load(config, name)
+    except PipelineError as exc:
+        return False, str(exc), ""
+    run = run_it(config, held, check_kinds=check_kinds, depth=depth + 1)
+    # Why it failed, not only that it did. Without this the reason is buried a
+    # pipeline down, where nobody reading the outer one will find it.
+    went_wrong = next((one for one in run.nodes if one.state == FAILED and one.said), None)
+    said = f"{name}: {run.said}"
+    if went_wrong:
+        said = f"{said} ({went_wrong.label}: {went_wrong.said})"
+    detail = "\n".join(
+        f"{one.label}: {one.state}" for one in run.nodes if not one.skipped_this_time
+    )
+    return run.passed, said, detail
+
+
+def _do_one(config, node, before, results, order, check_kinds, depth: int = 0) -> tuple[bool, str, str]:
     """One node, once. Kept apart so trying again is plainly the same work."""
 
     kind = node["kind"]
@@ -811,6 +991,8 @@ def _do_one(config, node, before, results, order, check_kinds) -> tuple[bool, st
         return _run_git_repo(config, node, check_kinds)
     if kind == "ai_unit_test":
         return _run_ai_unit_test(config, node, check_kinds)
+    if kind == "another_pipeline":
+        return _run_another_pipeline(config, node, check_kinds, depth)
     if kind == "artifact":
         # Everything that has finished - not this step itself, which is running
         # right now. Keeping the record of a run is the one job where writing

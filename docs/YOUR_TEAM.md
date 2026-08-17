@@ -69,6 +69,44 @@ still works, it just catches less.
 
 ---
 
+## One of your own
+
+*Add one of your own* is for everything the four ready-made jobs do not cover.
+You choose:
+
+| What | What it means |
+| --- | --- |
+| What to call it | Your own name for the box. "The one who checks the maths." |
+| What it does | One of the four jobs, so the rest of the harness knows what to do with its answer. |
+| Who does it | Any assistant found on this machine, or any model you added yourself. |
+| Which model | Leave it empty for the usual one, or name a particular model. |
+| How it is asked | One set prompt, or a conversation you can carry on. |
+| What to tell it | The prompt itself. |
+
+**One set prompt** is the ordinary one: the same instructions every time, the
+run does not stop. **A conversation you can carry on** is for work nobody can
+write down in advance — the run stops there, you talk to it as long as you like,
+and you say when to carry on. The board says *Stops here to talk* on that box,
+so nobody is surprised.
+
+---
+
+## A model of your own
+
+*Add a model* wires up something that is not one of the signed-in tools:
+
+- **A model running on this machine** — Ollama or anything that answers like it.
+  Nothing leaves the machine.
+- **A service, with the key kept in an environment variable** — you give the
+  **name** of the variable, like `OPENAI_API_KEY`. Never the key itself. The
+  harness reads the key from there when it runs, so nothing secret is written
+  into a file that travels. Paste a key where the name goes and it is refused.
+
+It is added to your own settings file and left there. Everything else in that
+file is untouched, and the assistant used by default does not change.
+
+---
+
 ## Making your own
 
 *Add somebody* puts a new box on the board. Open it to choose who does it and
