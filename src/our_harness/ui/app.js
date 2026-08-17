@@ -3877,15 +3877,19 @@ function sayWhatTheChoiceMeans() {
 }
 
 function openTheCustomWindow() {
-  if (!teamWho.some((one) => one.ready)) {
-    teamSay("No assistant on this machine is ready yet, so there is nobody to give a job to.");
-    return;
-  }
+  // It opens either way. On a machine with nothing set up yet the window still
+  // shows what it would offer, and says plainly why it cannot be saved -
+  // refusing to open at all leaves somebody guessing what they are missing.
+  const anybody = teamWho.some((one) => one.ready);
   fillTeamChoices();
   $("teamCustomLabel").value = "";
   $("teamCustomModel").value = "";
   $("teamCustomPrompt").value = "";
-  $("teamCustomSaid").textContent = "";
+  $("teamCustomSaid").textContent = anybody
+    ? ""
+    : "No assistant on this machine is ready yet, so there is nobody to give this job to. "
+      + "Set one up on the first screen, or add a model of your own.";
+  $("teamCustomSave").disabled = !anybody;
   $("teamCustomDialog").showModal();
 }
 
