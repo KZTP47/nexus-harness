@@ -166,15 +166,6 @@ jobs:
         run: |
           npm ci
           npx playwright install chromium
-      - name: Prove the browser driver is really there
-        # Twice: once as this shell sees it, and once as the harness itself
-        # sees it, because those are two different questions and only the
-        # second one decides whether a browser check runs.
-        env:
-          PYTHONPATH: src
-        run: |
-          node -e "require.resolve('playwright'); console.log('this shell can see playwright')"
-          python -c "from pathlib import Path; from our_harness.config import load_config; from our_harness.qa import QaRunner; r = QaRunner(load_config(Path('.'))); print('the harness can see it:', r.browser_available())"
       - name: Install the harness itself
         # This suite runs the harness by name, and the commands in it start
         # their own programs. What a started program is allowed to see is a
@@ -189,6 +180,15 @@ jobs:
         env:
           PYTHONPATH: src
         run: python -m our_harness trust --yes
+      - name: Prove the browser driver is really there
+        # Twice: once as this shell sees it, and once as the harness itself
+        # sees it, because those are two different questions and only the
+        # second one decides whether a browser check runs.
+        env:
+          PYTHONPATH: src
+        run: |
+          node -e "require.resolve('playwright'); console.log('this shell can see playwright')"
+          python -c "from pathlib import Path; from our_harness.config import load_config; from our_harness.qa import QaRunner; r = QaRunner(load_config(Path('.'))); print('the harness can see it:', r.browser_available())"
       - name: Start the panel and run the suite
         # One of these checks opens the panel in a browser, so the panel has to
         # be up, and it has to be up in the same step that uses it.
