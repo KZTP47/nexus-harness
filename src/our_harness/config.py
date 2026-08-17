@@ -240,6 +240,32 @@ def is_project_local_config_trusted(root: Path, local_path: Path | None = None) 
         return False
 
 
+def is_project_shared_config_trusted(root: Path) -> bool:
+    """Whether somebody has said the shared settings file in this project is theirs.
+
+    A settings file that travels with a repository can name the commands the
+    harness may run, so nothing reads those until a person says the file is
+    theirs. Until this existed there was no way to say it: cloning a project
+    whose shared file named its own test command left you told to trust a file,
+    and told there was no file to trust.
+    """
+
+    path = (root / ".harness" / "config.json").resolve()
+    if not path.is_file():
+        return False
+    try:
+        store = json.loads(project_trust_store_path().read_text(encoding="utf-8"))
+        record = store.get("projects", {}).get(_project_trust_key(root), {})
+        metadata = path.stat()
+        return (
+            store.get("schema_version") == 1
+            and record.get("shared_sha256") == _file_sha256(path)
+            and record.get("shared_size") == metadata.st_size
+        )
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
 def trust_project_local_config(root: Path, local_path: Path | None = None) -> Path:
     resolved_root = root.resolve()
     path = (local_path or resolved_root / ".harness" / "config.local.json").resolve(strict=True)
@@ -254,10 +280,16 @@ def trust_project_local_config(root: Path, local_path: Path | None = None) -> Pa
     projects = store.get("projects")
     if not isinstance(projects, dict):
         projects = {}
-    projects[_project_trust_key(resolved_root)] = {
-        "config_sha256": _file_sha256(path),
-        "config_size": metadata.st_size,
-    }
+    kept = projects.get(_project_trust_key(resolved_root))
+    kept = dict(kept) if isinstance(kept, dict) else {}
+    shared = resolved_root / ".harness" / "config.json"
+    if path == shared.resolve():
+        kept["shared_sha256"] = _file_sha256(path)
+        kept["shared_size"] = metadata.st_size
+    else:
+        kept["config_sha256"] = _file_sha256(path)
+        kept["config_size"] = metadata.st_size
+    projects[_project_trust_key(resolved_root)] = kept
     store = {"schema_version": 1, "projects": projects}
     store_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = store_path.with_suffix(".json.tmp")
@@ -1066,6 +1098,10 @@ def load_config(start: Path | None = None, explicit: Path | None = None, cli_ove
     trusted_local = is_project_local_config_trusted(root, local_project_path) or (
         explicit is not None and explicit.resolve() == local_project_path
     )
+    # Only a recorded yes counts here. Pointing --config at the shared file is
+    # naming a file, not reading it and saying it is yours, and a settings file
+    # that travelled with a repository is exactly the one to be careful about.
+    trusted_shared = is_project_shared_config_trusted(root)
     shared_source = str(shared_project_path)
     trusted_floor = copy.deepcopy(data)
     floor_captured = False
@@ -1078,9 +1114,9 @@ def load_config(start: Path | None = None, explicit: Path | None = None, cli_ove
             seen_paths.add(resolved_path)
             layer = _read_json(path)
             _check_known_keys(layer, DEFAULT_CONFIG)
-            is_shared_project = resolved_path == shared_project_path or (
-                resolved_path == local_project_path and not trusted_local
-            )
+            is_shared_project = (
+                resolved_path == shared_project_path and not trusted_shared
+            ) or (resolved_path == local_project_path and not trusted_local)
             if is_shared_project:
                 if not floor_captured:
                     trusted_floor = copy.deepcopy(data)
@@ -1095,7 +1131,9 @@ def load_config(start: Path | None = None, explicit: Path | None = None, cli_ove
         _check_known_keys(cli_overrides, DEFAULT_CONFIG)
         _merge(data, cli_overrides, provenance, "command line")
     validate_config(data)
-    if shared_project_path.is_file() or (local_project_path.is_file() and not trusted_local):
+    if (shared_project_path.is_file() and not trusted_shared) or (
+        local_project_path.is_file() and not trusted_local
+    ):
         _validate_capability_provenance(data, provenance, shared_source, trusted_floor)
     return LoadedConfig(data, root, sources, provenance, trusted_floor)
 
