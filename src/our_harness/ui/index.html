@@ -374,6 +374,8 @@
         <button id="pipelineDelete" type="button">Delete</button>
       </div>
       <h3 id="pipelineStartersTitle">Start from a ready-made one</h3>
+      <label class="sr-only" for="pipelineStarterSearch">Search the ready-made pipelines</label>
+      <input id="pipelineStarterSearch" type="search" placeholder="Search: release, security, tag...">
       <ul id="pipelineStarters" class="pipeline-starters" aria-labelledby="pipelineStartersTitle"></ul>
       <h3 id="pipelinePaletteTitle">Add a step</h3>
       <div id="pipelinePalette" class="pipeline-palette" aria-labelledby="pipelinePaletteTitle"></div>
@@ -394,7 +396,32 @@
         </div>
       </div>
       <p id="pipelineSaid" class="pipeline-said" role="status">Draw a pipeline, then press Run.</p>
-      <div id="pipelineCanvas" class="pipeline-canvas" role="application" aria-label="Pipeline" aria-describedby="pipelineHelp">
+      <div id="pipelineAsk" class="pipeline-ask" role="group" aria-label="A step is waiting for you" hidden></div>
+      <div class="pipeline-tabs" role="tablist" aria-label="How to look at this pipeline">
+        <button type="button" role="tab" data-pipeline-tab="board" aria-selected="true">The picture</button>
+        <button type="button" role="tab" data-pipeline-tab="code" aria-selected="false">The same thing as text</button>
+        <button type="button" role="tab" data-pipeline-tab="timeline" aria-selected="false">How long each step took</button>
+        <button type="button" role="tab" data-pipeline-tab="help" aria-selected="false">What each step is for</button>
+      </div>
+      <div id="pipelinePaneCode" class="pipeline-pane" data-pipeline-pane="code" hidden>
+        <p class="hint">The same pipeline, written out. Change it here and the picture changes with it.</p>
+        <label class="sr-only" for="pipelineCode">The pipeline as text</label>
+        <textarea id="pipelineCode" spellcheck="false" rows="18"></textarea>
+        <div class="button-row">
+          <button id="pipelineCodeApply" class="primary" type="button">Use what I typed</button>
+          <button id="pipelineCodeCopy" type="button">Copy it</button>
+        </div>
+        <p id="pipelineCodeSaid" class="hint" role="status"></p>
+      </div>
+      <div id="pipelinePaneTimeline" class="pipeline-pane" data-pipeline-pane="timeline" hidden>
+        <p class="hint">One bar per step of the last run, laid out in time. The long one is the slow one.</p>
+        <ol id="pipelineTimeline" class="pipeline-timeline"></ol>
+      </div>
+      <div id="pipelinePaneHelp" class="pipeline-pane" data-pipeline-pane="help" hidden>
+        <p class="hint">Every kind of step you can put on the board, and what it does.</p>
+        <ul id="pipelineHelpList" class="pipeline-help-list"></ul>
+      </div>
+      <div id="pipelineCanvas" class="pipeline-canvas" data-pipeline-pane="board" role="application" aria-label="Pipeline" aria-describedby="pipelineHelp">
         <p id="pipelineHelp" class="sr-only">Each step is a box. Press Connect on a box, then press another box to draw an arrow between them. With the keyboard: Tab to a box, arrow keys move it, C connects it to another, S opens its settings, Delete takes it out.</p>
         <div id="pipelineNodes" class="pipeline-nodes">
           <svg id="pipelineWires" class="pipeline-wires" aria-hidden="true"></svg>
@@ -407,6 +434,19 @@
     </section>
   </div>
 
+  <dialog id="pipelineAskDialog" aria-labelledby="pipelineAskDialogTitle">
+    <form id="pipelineAskForm" method="dialog">
+      <h2 id="pipelineAskDialogTitle">Before this runs</h2>
+      <p class="hint">This pipeline asks a few things each time, so one saved pipeline covers
+        more than one job.</p>
+      <div id="pipelineAskFields" class="pipeline-settings"></div>
+      <div class="dialog-buttons">
+        <button id="pipelineAskCancel" type="button">Cancel</button>
+        <button id="pipelineAskRun" class="primary" type="button">Run it</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="pipelineNodeDialog" aria-labelledby="pipelineNodeDialogTitle">
     <form id="pipelineNodeForm" method="dialog">
       <h2 id="pipelineNodeDialogTitle">Step</h2>
@@ -414,6 +454,11 @@
       <label for="pipelineNodeLabel">What to call it</label>
       <input id="pipelineNodeLabel" type="text" maxlength="80">
       <div id="pipelineNodeSettings" class="pipeline-settings"></div>
+      <fieldset id="pipelineNodeAsks" class="pipeline-asks">
+        <legend>Ask me for these when the run starts</legend>
+        <p class="hint">Anything ticked here is asked each time instead of being fixed now.</p>
+        <div id="pipelineNodeAskList"></div>
+      </fieldset>
       <label for="pipelineNodeTries">Try again this many times if it fails</label>
       <input id="pipelineNodeTries" type="number" min="1" max="5" value="1">
       <div class="dialog-buttons">
@@ -439,6 +484,10 @@
       <ul id="teamSaved" class="team-saved" aria-labelledby="teamSavedTitle"></ul>
       <h3 id="teamAddTitle">Add somebody</h3>
       <div id="teamJobs" class="team-jobs" aria-labelledby="teamAddTitle"></div>
+      <div class="team-side-buttons">
+        <button id="teamAddCustom" type="button">Add one of your own</button>
+        <button id="teamAddModel" type="button">Add a model</button>
+      </div>
     </aside>
 
     <section class="team-main" aria-labelledby="teamTitleMain">
@@ -472,6 +521,58 @@
       </div>
     </section>
   </div>
+
+  <dialog id="teamCustomDialog" aria-labelledby="teamCustomDialogTitle">
+    <form id="teamCustomForm" method="dialog">
+      <h2 id="teamCustomDialogTitle">One of your own</h2>
+      <p class="hint">Your own name for it, your own model, and your own way of asking.</p>
+      <label for="teamCustomLabel">What to call it</label>
+      <input id="teamCustomLabel" type="text" maxlength="80" placeholder="The one who checks the maths">
+      <label for="teamCustomJob">What it does</label>
+      <select id="teamCustomJob"></select>
+      <p id="teamCustomJobMeans" class="hint"></p>
+      <label for="teamCustomWho">Who does it</label>
+      <select id="teamCustomWho"></select>
+      <label for="teamCustomModel">Which model, if not the usual one for that</label>
+      <input id="teamCustomModel" type="text" maxlength="120" placeholder="Leave empty for the usual one">
+      <label for="teamCustomAsking">How it is asked</label>
+      <select id="teamCustomAsking"></select>
+      <p id="teamCustomAskingMeans" class="hint"></p>
+      <label for="teamCustomPrompt">What to tell it</label>
+      <textarea id="teamCustomPrompt" rows="5" maxlength="4000"
+        placeholder="Read the change and say whether it really does what was asked."></textarea>
+      <p id="teamCustomSaid" class="hint" role="status"></p>
+      <div class="dialog-buttons">
+        <button id="teamCustomCancel" type="button">Cancel</button>
+        <button id="teamCustomSave" class="primary" type="button">Put it on the team</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="teamModelDialog" aria-labelledby="teamModelDialogTitle">
+    <form id="teamModelForm" method="dialog">
+      <h2 id="teamModelDialogTitle">Add a model</h2>
+      <p class="hint">A model of your own, so you can give it a job like any other.</p>
+      <label for="teamModelWayIn">How it is reached</label>
+      <select id="teamModelWayIn"></select>
+      <p id="teamModelWayMeans" class="hint"></p>
+      <label for="teamModelRoute">A short name for it</label>
+      <input id="teamModelRoute" type="text" maxlength="40" placeholder="my-model">
+      <label for="teamModelModel">Which model</label>
+      <input id="teamModelModel" type="text" maxlength="120" placeholder="qwen2.5-coder:7b">
+      <label for="teamModelEndpoint">Address, if it is not the usual one</label>
+      <input id="teamModelEndpoint" type="text" maxlength="300" placeholder="http://127.0.0.1:11434">
+      <label for="teamModelKeyName">Which environment variable holds the key</label>
+      <input id="teamModelKeyName" type="text" maxlength="64" placeholder="OPENAI_API_KEY">
+      <p class="hint">The name of the variable, never the key itself. The harness reads the
+        key from there when it runs, so nothing secret is written down.</p>
+      <p id="teamModelSaid" class="hint" role="status"></p>
+      <div class="dialog-buttons">
+        <button id="teamModelCancel" type="button">Cancel</button>
+        <button id="teamModelSave" class="primary" type="button">Add it</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="teamNodeDialog" aria-labelledby="teamNodeDialogTitle">
     <form id="teamNodeForm" method="dialog">

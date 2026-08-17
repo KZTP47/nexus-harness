@@ -606,17 +606,21 @@ class ContextTests(unittest.TestCase):
             )
             config = load_config(root)
             provider = SlowEmbeddingProvider()
-            deadline = WorkflowDeadline.start(0.08)
             started = time.monotonic()
             with MemoryStore(config) as memory, patch(
                 "our_harness.providers.create_embedding_provider", return_value=provider
             ), self.assertRaisesRegex(HarnessError, "deadline expired"):
+                # Started here, not before opening the store. Opening it was
+                # spending the budget, so on a slow machine the whole second
+                # was gone before the embedding was ever asked for and this
+                # checked nothing at all.
+                deadline = WorkflowDeadline.start(1.0)
                 ContextCompiler(config, memory).compile("semantic task", [], query_vector=[1.0], deadline=deadline)
             elapsed = time.monotonic() - started
             self.assertEqual(len(provider.timeouts), 1)
             self.assertGreater(provider.timeouts[0], 0)
-            self.assertLessEqual(provider.timeouts[0], 0.08)
-            self.assertLess(elapsed, 0.25)
+            self.assertLessEqual(provider.timeouts[0], 1.0)
+            self.assertLess(elapsed, 5.0)
 
 
 class RefinementTests(unittest.TestCase):

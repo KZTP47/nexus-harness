@@ -167,7 +167,7 @@ class RunningThemTests(PipelineTestCase):
     def stand_in(self, answers: dict[str, tuple[bool, str, str]]):
         """Every node kind stood in, so no real suite or model is started."""
 
-        def one(config, node, before, results, order, check_kinds):
+        def one(config, node, before, results, order, check_kinds, depth=0):
             if node["kind"] == "start":
                 return True, "Started", ""
             if node["kind"] in pipelines.GATES:
@@ -206,7 +206,7 @@ class RunningThemTests(PipelineTestCase):
     def test_a_step_told_to_try_again_really_tries_again(self) -> None:
         tries: list[int] = []
 
-        def flaky(config, node, before, results, order, check_kinds):
+        def flaky(config, node, before, results, order, check_kinds, depth=0):
             if node["id"] != "tests":
                 return True, "done", ""
             tries.append(1)
@@ -220,7 +220,7 @@ class RunningThemTests(PipelineTestCase):
         self.assertEqual(by_id["tests"].tries, 2)
 
     def test_a_step_that_throws_does_not_end_the_run(self) -> None:
-        def explodes(config, node, before, results, order, check_kinds):
+        def explodes(config, node, before, results, order, check_kinds, depth=0):
             if node["id"] == "scan":
                 raise ValueError("something nobody expected")
             return True, "done", ""
@@ -248,12 +248,20 @@ class RunningThemTests(PipelineTestCase):
                 self.config, pipelines.a_starting_pipeline(), stopping=lambda: True
             )
         self.assertTrue(all(node.state == pipelines.SKIPPED for node in run.nodes))
-        self.assertTrue(run.passed, "nothing failed; it was stopped")
+        # It used to report this as a pass, because nothing had failed. Nothing
+        # had run either. A run somebody stopped has not passed, and saying so
+        # is the same rule the whole harness keeps: work that did not happen
+        # must never read like work that did.
+        self.assertFalse(run.passed, "a run that was stopped has not passed")
+        self.assertIn("never ran", run.said)
 
     def test_every_kind_can_really_be_run(self) -> None:
         # A kind on the list that nothing knows how to run would be a node a
         # person can drag out and never use.
-        for kind in pipelines.KINDS:
+        # Waiting for a person is not run here: it is handled by the runner
+        # itself, because it has to be able to wait, and _do_one cannot. Its
+        # own tests are in test_the_kestra_ideas.py.
+        for kind in set(pipelines.KINDS) - {"wait_for_a_person"}:
             with self.subTest(kind=kind):
                 node = {"id": "only", "kind": kind, "label": kind, "settings": {}}
                 try:

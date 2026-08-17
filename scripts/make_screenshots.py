@@ -280,6 +280,27 @@ async function settle(page, ms = 1200) {
   await settle(page, 400);
   await page.screenshot({ path: out + '/pipelines.png' });
 
+  // The timeline: one bar per step of a run, laid out in time. A short run is
+  // started here first, so there is something real to draw.
+  await page.evaluate(async () => {
+    pipeline = {name: 'A short one', nodes: [
+      {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}},
+      {id: 'repo', kind: 'git_repo', label: 'Read the repo', settings: {}, at: {x: 320, y: 120}},
+      {id: 'kept', kind: 'artifact', label: 'Keep the evidence', settings: {}, at: {x: 600, y: 120}},
+    ], edges: [{from: 'start', to: 'repo'}, {from: 'repo', to: 'kept'}]};
+    renderPipeline();
+    await runPipeline();
+  });
+  for (let tries = 0; tries < 80; tries += 1) {
+    const done = await page.evaluate(() => document.getElementById('pipelineStop').disabled);
+    if (done) break;
+    await page.waitForTimeout(250);
+  }
+  await page.click('[data-pipeline-tab="timeline"]');
+  await settle(page, 600);
+  await page.screenshot({ path: out + '/pipeline-timeline.png' });
+  await page.click('[data-pipeline-tab="board"]');
+
   // What the harness has learned, as a picture. A few notes are written first,
   // in the throwaway project, so the picture has something to show.
   await page.click('[data-view="vault"]');

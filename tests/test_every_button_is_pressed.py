@@ -49,6 +49,12 @@ ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "time for no more coverage. That it really is the same request is held "
         "down by a test in tests/test_team_server.py."
     ),
+    "teamCustomWho": (
+        "The same list as teamNodeWho: the assistants found on this machine, "
+        "which differ from machine to machine, so there is no value a check "
+        "could choose everywhere. A check does open the window and read it, and "
+        "makes sure only somebody really here can be picked."
+    ),
     "teamNodeWho": (
         "It is filled in with the assistants found on this machine, which differ "
         "from machine to machine, so there is no value a check could choose "

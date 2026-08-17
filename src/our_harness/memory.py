@@ -143,7 +143,26 @@ class MemoryStore:
             self.connection = sqlite3.connect(":memory:", timeout=15)
         self.connection.row_factory = sqlite3.Row
         self.has_fts = True
-        self._migrate()
+        # Every opening makes sure the tables are there. Several at once on a
+        # database that does not exist yet - four browsers opening the panel on
+        # a fresh machine - each try to make them at the same moment, and all
+        # but one are told the database is busy. It is busy for a moment, so
+        # this waits rather than giving up and reporting a broken panel.
+        last: Exception | None = None
+        for wait in (0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 0):
+            try:
+                self._migrate()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) and "busy" not in str(exc):
+                    raise
+                last = exc
+                if not wait:
+                    raise HarnessError(
+                        "The memory database is busy and stayed busy. Close anything else "
+                        "using this project and try again."
+                    ) from last
+                time.sleep(wait)
 
     def redact_text(self, value: str) -> str:
         return self.redactor.text(value)
@@ -162,6 +181,7 @@ class MemoryStore:
 
     def _migrate(self) -> None:
         db = self.connection
+        db.execute("PRAGMA busy_timeout=15000")
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA foreign_keys=ON")
         db.executescript(

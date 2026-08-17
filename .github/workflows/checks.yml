@@ -77,34 +77,47 @@ jobs:
         run: |
           npm ci
           npx playwright install chromium
-      - name: Start the control panel
-        run: |
-          $env:PYTHONPATH = "src"
-          Start-Process -FilePath python `
-            -ArgumentList "-m","our_harness","ui","--port","8765","--no-open-browser" `
-            -RedirectStandardOutput panel-out.log -RedirectStandardError panel-err.log
-          $ready = $false
-          foreach ($try in 1..60) {
-            try {
-              Invoke-WebRequest -Uri http://127.0.0.1:8765/ -UseBasicParsing -TimeoutSec 2 | Out-Null
-              $ready = $true
-              break
-            } catch { Start-Sleep -Seconds 1 }
-          }
-          if (-not $ready) {
-            Get-Content panel-out.log, panel-err.log -ErrorAction SilentlyContinue
-            throw "The control panel did not start, so none of these checks would mean anything."
-          }
-      - name: Run this part of the panel checks
+      - name: Say this checkout is ours
+        # The settings file in this repository names the commands the harness
+        # may run. A machine will not read that from a file somebody handed it
+        # until it is told the file is trusted, which is the whole point of the
+        # rule. Saying so here is deliberate: this is our own repository.
         env:
           PYTHONPATH: src
-        run: >
-          python -m our_harness qa run
-          --suite .harness/qa/workflows.json
-          --part ${{ matrix.part }}/4
-          --workers 4
-          --format json
-          --output .harness/qa/ci-report.json
+        run: python -m our_harness trust --yes
+      - name: Start the panel and run this part of the checks
+        # One step, on purpose. Each step gets its own shell, and a program
+        # started in one is not promised to be alive in the next: the panel was
+        # started, said it was ready, and was gone by the time the checks
+        # looked, so every one of them failed with "connection refused".
+        env:
+          PYTHONPATH: src
+        run: |
+          $panel = Start-Process -FilePath python -PassThru `
+            -ArgumentList "-m","our_harness","ui","--port","8765","--no-open-browser" `
+            -RedirectStandardOutput panel-out.log -RedirectStandardError panel-err.log
+          try {
+            $ready = $false
+            foreach ($try in 1..60) {
+              try {
+                Invoke-WebRequest -Uri http://127.0.0.1:8765/ -UseBasicParsing -TimeoutSec 2 | Out-Null
+                $ready = $true
+                break
+              } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) {
+              Get-Content panel-out.log, panel-err.log -ErrorAction SilentlyContinue
+              throw "The control panel did not start, so none of these checks would mean anything."
+            }
+            python -m our_harness qa run `
+              --suite .harness/qa/workflows.json `
+              --part ${{ matrix.part }}/4 `
+              --workers 4 `
+              --format json `
+              --output .harness/qa/ci-report.json
+          } finally {
+            if ($panel -and -not $panel.HasExited) { Stop-Process -Id $panel.Id -Force }
+          }
       - name: Make sure they really ran
         # Without a browser driver every one of these checks says "this could
         # not be tried here" and the run passes. A build that checked nothing
@@ -125,8 +138,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: panel-part-${{ matrix.part }}
+          # Everything worth keeping lives under .harness, and a folder whose
+          # name starts with a dot is left out unless this says otherwise. That
+          # is how a failed build came back with nothing to read.
+          include-hidden-files: true
           path: |
             .harness/qa/runs
+            .harness/qa/ci-report.json
             panel-out.log
             panel-err.log
           retention-days: 7
@@ -148,12 +166,49 @@ jobs:
         run: |
           npm ci
           npx playwright install chromium
-      - name: Run the suite
+      - name: Prove the browser driver is really there
+        run: node -e "require.resolve('playwright'); console.log('the browser driver is here')"
+      - name: Install the harness itself
+        # This suite runs the harness by name, and the commands in it start
+        # their own programs. What a started program is allowed to see is a
+        # short list that does not include PYTHONPATH, so it has to be really
+        # installed rather than pointed at.
+        run: python -m pip install -e .
+      - name: Say this checkout is ours
+        # The settings file in this repository names the commands the harness
+        # may run. A machine will not read that from a file somebody handed it
+        # until it is told the file is trusted, which is the whole point of the
+        # rule. Saying so here is deliberate: this is our own repository.
         env:
           PYTHONPATH: src
-        run: >
-          python -m our_harness qa run --workers 4
-          --format json --output .harness/qa/ci-report.json
+        run: python -m our_harness trust --yes
+      - name: Start the panel and run the suite
+        # One of these checks opens the panel in a browser, so the panel has to
+        # be up, and it has to be up in the same step that uses it.
+        env:
+          PYTHONPATH: src
+        run: |
+          $panel = Start-Process -FilePath python -PassThru `
+            -ArgumentList "-m","our_harness","ui","--port","8765","--no-open-browser" `
+            -RedirectStandardOutput panel-out.log -RedirectStandardError panel-err.log
+          try {
+            $ready = $false
+            foreach ($try in 1..60) {
+              try {
+                Invoke-WebRequest -Uri http://127.0.0.1:8765/ -UseBasicParsing -TimeoutSec 2 | Out-Null
+                $ready = $true
+                break
+              } catch { Start-Sleep -Seconds 1 }
+            }
+            if (-not $ready) {
+              Get-Content panel-out.log, panel-err.log -ErrorAction SilentlyContinue
+              throw "The control panel did not start, so this suite would prove nothing."
+            }
+            python -m our_harness qa run --workers 4 `
+              --format json --output .harness/qa/ci-report.json
+          } finally {
+            if ($panel -and -not $panel.HasExited) { Stop-Process -Id $panel.Id -Force }
+          }
       - name: Make sure they really ran
         run: |
           $report = Get-Content .harness/qa/ci-report.json -Raw | ConvertFrom-Json
@@ -166,6 +221,18 @@ jobs:
         env:
           PYTHONPATH: src
         run: python -m our_harness audit
+      - name: Keep what the failures looked like
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-checks
+          include-hidden-files: true
+          path: |
+            .harness/qa/runs
+            .harness/qa/ci-report.json
+            panel-out.log
+            panel-err.log
+          retention-days: 7
 
   desktop:
     name: Desktop app
@@ -185,9 +252,15 @@ jobs:
       - name: Run its tests
         working-directory: desktop
         run: npm test
-      - name: Start it and see that it answers
+      - name: Check what would be shipped
+        # Not the smoke check. That one opens a real window and waits for it to
+        # load, and a build server has no screen to open one on: it waited the
+        # full ninety seconds every time and told us nothing about the code.
+        # This reads the built app instead, which is the part that keeps
+        # breaking anyway - a file left out of the installer kills the app on
+        # somebody else's machine, silently.
         working-directory: desktop
-        run: npm run smoke
+        run: node packaging.test.js
 
   package:
     name: What we would hand out

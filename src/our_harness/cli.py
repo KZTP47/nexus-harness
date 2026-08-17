@@ -16,6 +16,7 @@ from .changes import FileTransaction
 from .config import (
     LoadedConfig,
     is_project_local_config_trusted,
+    is_project_shared_config_trusted,
     load_config,
     trust_project_local_config,
     write_default_project_config,
@@ -607,22 +608,33 @@ def command_trust(args: argparse.Namespace) -> int:
 
     root = Path(args.project).resolve() if getattr(args, "project", None) else Path.cwd()
     local = root / ".harness" / "config.local.json"
-    if not local.is_file():
+    shared = root / ".harness" / "config.json"
+    # Whichever file is actually in the way. A project cloned from somewhere
+    # else often has only the shared one, and its settings are refused until
+    # somebody says it is theirs. Before this, that left three commands each
+    # pointing at the next and no way through.
+    which = local if local.is_file() else shared
+    if not which.is_file():
         raise HarnessError(
-            f"There is no {local}. Run 'harness init' first, or write the file yourself."
+            f"There is no {local} and no {shared}. Run 'harness init' first, or write "
+            "one of them yourself."
         )
     if args.show:
-        trusted = is_project_local_config_trusted(root, local)
-        print(f"{local}")
+        trusted = (
+            is_project_local_config_trusted(root, which)
+            if which == local
+            else is_project_shared_config_trusted(root)
+        )
+        print(f"{which}")
         print("This file is trusted." if trusted else "This file is not trusted yet.")
         return 0 if trusted else 1
-    print(local.read_text(encoding="utf-8"))
+    print(which.read_text(encoding="utf-8"))
     if not args.yes:
         answer = _ask("Trust this file and let it set provider routes and commands? [y/N] ", "n")
         if answer.lower() not in ("y", "yes"):
             print("Left as it was.")
             return 1
-    store = trust_project_local_config(root, local)
+    store = trust_project_local_config(root, which)
     print(f"Trusted. Recorded in {store}")
     print("Edit the file again and this goes back to untrusted, on purpose.")
     return 0

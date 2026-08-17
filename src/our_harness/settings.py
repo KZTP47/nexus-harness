@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import (
+    is_project_shared_config_trusted,
     DEFAULT_CONFIG,
     LoadedConfig,
     is_project_local_config_trusted,
@@ -515,7 +516,14 @@ def _try_writing(config: LoadedConfig, key: str, wanted: Any, relative: str):
         config.project_root, relative, allow_missing=True, allow_control=True
     )
     before = where.read_text(encoding="utf-8") if where.is_file() else None
-    was_trusted = where.is_file() and is_project_local_config_trusted(config.project_root, where)
+    shared = confined_path(
+        config.project_root, SHAREABLE, allow_missing=True, allow_control=True
+    )
+    was_trusted = where.is_file() and (
+        is_project_shared_config_trusted(config.project_root)
+        if where == shared
+        else is_project_local_config_trusted(config.project_root, where)
+    )
     held = _read(where)
     had = copy.deepcopy(held)
     _put(held, key, wanted)
@@ -523,9 +531,14 @@ def _try_writing(config: LoadedConfig, key: str, wanted: Any, relative: str):
     _put_the_file(where, _written_out(held, had))
 
     needs_trusting = False
-    if relative == YOURS:
+    if relative == YOURS or was_trusted:
         # The same rule as everywhere else: a file this tool created, or one
         # already trusted, it may trust. One somebody else left, it may not.
+        #
+        # The second half matters more than it looks. Changing a setting
+        # rewrites the file, and a file that has changed is no longer the file
+        # somebody read and said yes to - so without this, using the settings
+        # view once left the project unusable until it was trusted again.
         if before is None or was_trusted:
             try:
                 trust_project_local_config(config.project_root, where)
@@ -589,7 +602,7 @@ def reset(config: LoadedConfig, key: str) -> Changed:
             continue
         was_trusted = is_project_local_config_trusted(config.project_root, where)
         _put_the_file(where, _written_out(held, had))
-        if relative == YOURS and was_trusted:
+        if was_trusted:
             try:
                 trust_project_local_config(config.project_root, where)
             except HarnessError:
