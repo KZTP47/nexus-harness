@@ -6,7 +6,7 @@ const { EventEmitter } = require("node:events");
 
 const { HarnessServer, readReadyLine, isLoopbackUrl, isOwnPage, pythonCandidates } = require("./server");
 
-function fakeChild() {
+function fakeChild(behaviour) {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
@@ -14,6 +14,8 @@ function fakeChild() {
   child.stderr.setEncoding = () => {};
   child.killed = false;
   child.kill = () => { child.killed = true; };
+  // A test can say what this pretend Python does once someone is listening.
+  if (behaviour) setImmediate(() => behaviour(child));
   return child;
 }
 
@@ -96,7 +98,11 @@ test("the next Python command is tried when the first is missing", async () => {
     spawn: (command) => (command === "py" ? missing : working),
   });
   const started = server.start("demo-project");
-  missing.emit("error", new Error("not found"));
+  // A command that is not on this machine always arrives with this code. It is
+  // what tells the app to try the next one rather than stop and report.
+  const notThere = new Error("not found");
+  notThere.code = "ENOENT";
+  missing.emit("error", notThere);
   await new Promise((resolve) => setImmediate(resolve));
   working.stdout.emit("data", 'harness-ui-ready {"url": "http://127.0.0.1:2/", "port": 2}\n');
   assert.strictEqual(await started, "http://127.0.0.1:2/");
@@ -153,4 +159,103 @@ test("the window may not open anything outside its pages folder", () => {
   assert.ok(!isOwnPage("https://example.com/", folder));
   assert.ok(!isOwnPage("not a url", folder));
   assert.ok(!isOwnPage("file:///somewhere/My%20Work/desktop/pages/%ZZ", folder));
+});
+
+test("a Python that runs and then fails is the answer, not a reason to try the next one", async () => {
+  // The real problem was here. Moving on would replace it with a complaint
+  // about a command the person never chose.
+  const tried = [];
+  const server = new HarnessServer({
+    candidates: [["py", ["-3"]], ["python", []], ["python3", []]],
+    timeoutMs: 2000,
+    spawn: (command) => {
+      tried.push(command);
+      return fakeChild((child) => {
+        if (command === "py") {
+          child.stderr.emit("data", "No module named our_harness\n");
+          child.emit("exit", 1);
+          return;
+        }
+        const error = new Error("spawn ENOENT");
+        error.code = "ENOENT";
+        child.emit("error", error);
+      });
+    },
+  });
+  await assert.rejects(
+    () => server.start("demo-project"),
+    (error) => {
+      // The message names the Python that really ran, not the last one tried.
+      assert.match(error.message, /^py stopped with code 1/);
+      assert.match(error.message, /our_harness/);
+      return true;
+    }
+  );
+  assert.deepStrictEqual(tried, ["py", "python", "python3"],
+    "every Python is still tried, because only one of them may have the harness");
+});
+
+test("a Python without the harness does not stop a later one that has it", async () => {
+  // A machine often has several Pythons and only one with the harness in it.
+  const tried = [];
+  const server = new HarnessServer({
+    candidates: [["py", ["-3"]], ["python", []]],
+    timeoutMs: 2000,
+    spawn: (command) => {
+      tried.push(command);
+      return fakeChild((child) => {
+        if (command === "py") {
+          child.stderr.emit("data", "No module named our_harness\n");
+          child.emit("exit", 1);
+          return;
+        }
+        child.stdout.emit("data", `harness-ui-ready {"url":"http://127.0.0.1:4321/"}\n`);
+      });
+    },
+  });
+  assert.strictEqual(await server.start("demo-project"), "http://127.0.0.1:4321/");
+  assert.deepStrictEqual(tried, ["py", "python"]);
+});
+
+test("a command that is not on this machine moves on to the next one", async () => {
+  const tried = [];
+  const server = new HarnessServer({
+    candidates: [["py", ["-3"]], ["python", []]],
+    timeoutMs: 2000,
+    spawn: (command) => {
+      tried.push(command);
+      return fakeChild((child) => {
+        if (command === "py") {
+          const error = new Error("spawn ENOENT");
+          error.code = "ENOENT";
+          child.emit("error", error);
+          return;
+        }
+        child.stdout.emit("data", `harness-ui-ready {"url":"http://127.0.0.1:8765"}\n`);
+      });
+    },
+  });
+  assert.strictEqual(await server.start("demo-project"), "http://127.0.0.1:8765");
+  assert.deepStrictEqual(tried, ["py", "python"]);
+});
+
+test("no Python at all is said plainly, naming what was tried", async () => {
+  const server = new HarnessServer({
+    candidates: [["py", ["-3"]], ["python", []], ["python3", []]],
+    timeoutMs: 2000,
+    spawn: () => fakeChild((child) => {
+      const error = new Error("spawn ENOENT");
+      error.code = "ENOENT";
+      child.emit("error", error);
+    }),
+  });
+  await assert.rejects(
+    () => server.start("demo-project"),
+    (error) => {
+      assert.match(error.message, /No Python was found on this machine/);
+      assert.match(error.message, /py, python, python3/);
+      assert.match(error.message, /HARNESS_PYTHON/);
+      return true;
+    }
+  );
 });

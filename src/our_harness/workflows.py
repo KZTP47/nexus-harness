@@ -168,7 +168,14 @@ def load(config: LoadedConfig, name: str) -> SavedWorkflow:
     return _read(path)
 
 
-def save(config: LoadedConfig, name: str, graph: object, *, replace: bool = True) -> SavedWorkflow:
+def save(
+    config: LoadedConfig,
+    name: str,
+    graph: object,
+    *,
+    replace: bool = True,
+    taking_over: bool = False,
+) -> SavedWorkflow:
     """Write one workflow after checking the harness could really run it."""
 
     clean = clean_name(name)
@@ -181,10 +188,26 @@ def save(config: LoadedConfig, name: str, graph: object, *, replace: bool = True
             "This workflow cannot be saved because the harness could not run it: " + "; ".join(issues[:3])
         )
     base = folder(config)
-    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise WorkflowError(f"Cannot make the workflows folder: {exc}") from exc
     path = base / file_name(clean)
     if path.exists() and not replace:
         raise WorkflowError(f"A workflow named {clean} already exists")
+    if path.exists():
+        # Two names that differ only in capital letters share one file. Saving
+        # over somebody else's workflow by accident is worse than being told to
+        # pick another name.
+        try:
+            already = json.loads(path.read_text(encoding="utf-8")).get("name", "")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            already = ""
+        if already and already != clean and not taking_over:
+            raise WorkflowError(
+                f"A workflow named {already} is already kept under the same file name. "
+                f"Rename it first, or choose a name that differs by more than capital letters."
+            )
     if not path.exists() and len(listed(config)) >= MAX_WORKFLOWS:
         raise WorkflowError(f"There are already {MAX_WORKFLOWS} workflows, which is the limit")
     body = {
@@ -216,8 +239,9 @@ def rename(config: LoadedConfig, name: str, new_name: str) -> SavedWorkflow:
 
     found = load(config, name)
     if file_name(new_name) == file_name(name):
-        # Only the spelling changed, so rewrite the one file in place.
-        return save(config, new_name, found.graph)
+        # Only the spelling changed, so rewrite the one file in place. This
+        # is the one time a name may take over a file another name held.
+        return save(config, new_name, found.graph, taking_over=True)
     saved = save(config, new_name, found.graph, replace=False)
     try:
         delete(config, name)

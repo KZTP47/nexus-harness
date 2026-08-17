@@ -66,6 +66,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "PATH", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "LANG", "LC_ALL",
             "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME",
         ],
+        # A project may add to this list but never take from it. More names
+        # that are never a coding job, such as mkfs and Format-Volume, are
+        # refused by the runner itself; see ALWAYS_DENIED in execution.py.
         "deny_executables": ["format", "diskpart", "shutdown", "reboot"],
         "deny_argument_sequences": ["--force", "reset --hard", "clean -fd", "push --force"],
         "docker_image": "python:3.12-slim",

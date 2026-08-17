@@ -1,348 +1,553 @@
-# Our Harness
+# Nexus Harness
 
-Our Harness is a local programming-agent CLI. It scans a project, builds an indexed context, asks a configured model to plan and edit, runs project checks, reviews the result, and performs bounded repair attempts.
+A local test lab and coding assistant for your project. It writes and runs your
+checks, tells you plainly what broke, and can ask a model to fix it — all on
+your own machine.
 
-The core uses Python 3.11+ and the standard library. Hosted providers and local model servers are optional.
+Python 3.11 or newer. The core uses only the standard library: no packages to
+install, no account to create, nothing sent anywhere unless you set that up
+yourself.
 
-## Fast install
+![The checks view, with every check passing](docs/images/checks.png)
 
-Python 3.11 or newer must already be installed and available to the installer. With that prerequisite in place, a local install normally completes in under 60 seconds and needs no package download, pip, compiler, or network access.
+---
 
-Download or clone this folder, then run one command from its root.
+## What it does
 
-Windows PowerShell:
+**Writes your tests for you.** Point it at a page and click the thing you want
+to check. Record yourself using the site once and get a test written from it.
+Or pick from twelve ready-made checks and change one line.
+
+**Runs them and says what happened in plain words.** Not a stack trace: "Step 2
+of 5 did not work: the Sign in button. The browser said it was still hidden
+after 10 seconds," and a picture of the page at that moment.
+
+**Tells you what changed since last time.** A check that has failed all week is
+not news. A check that passed yesterday and fails today is the whole story.
+
+**Finds the pages nobody checks.** It walks your site the way a visitor would
+and colours in every page: checked, only walked over, or nobody looks at it.
+
+**Packs the evidence up.** One web page with the screenshots inside it that you
+can send to anyone — no install needed to read it. Credentials are taken out
+first.
+
+---
+
+## Install
+
+Python 3.11+ must already be on the machine. Nothing else is needed.
+
+```bash
+git clone https://github.com/KZTP47/nexus-harness.git
+cd nexus-harness
+python -m pip install .
+```
+
+Or build a single self-contained file and a launcher, with no pip and no
+network:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-macOS or Linux:
-
 ```bash
 sh ./scripts/install.sh
 ```
 
-The installers build a single `harness.pyz` and place a relative launcher beside its `app` directory. The installed tree can be moved as a unit. Launchers find Python from `PATH` at run time; Windows also accepts the `py` launcher. They do not install Python. On macOS and Linux, `${HARNESS_INSTALL_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/our-harness}/bin` must be on `PATH`; the installer prints it. On Windows, open a new terminal after installation so the updated user `PATH` is visible.
-
-You can also install the Python package:
+Browser and screenshot checks additionally need Node.js and Playwright. Every
+other kind works without them, and a browser check says so plainly instead of
+failing when they are missing:
 
 ```bash
-python -m pip install .
+npm install playwright
+npx playwright install chromium
 ```
 
-## Start a project
+---
+
+## One command
 
 ```bash
-cd path/to/your/project
-harness init
-harness doctor
+cd your-project
+harness start
+```
+
+That reads your project, writes a starter suite from the commands you already
+use, says what is still missing, and opens the panel. Press **Show me around**
+on the first screen and it walks you through the rest.
+
+The same thing, a step at a time, if you would rather:
+
+```bash
+harness qa init        # writes a starter suite from the commands you already use
+harness qa run         # runs them side by side and reports
+harness ui             # open the control panel in your browser
+```
+
+![The guided start view](docs/images/start.png)
+
+---
+
+## See what the harness actually does
+
+The first screen draws the whole workflow as a picture, in plain words. Press
+**Show me how it works** and it walks through the steps one at a time. While a
+real run is going, the same boxes light up as the work reaches them.
+
+![What happens when you ask for a change](docs/images/how-it-works.png)
+
+Every box is one agent or one check from the Workflow tab. Rewire it there and
+this picture changes with it, because it is drawn from the workflow that will
+really run — not from a drawing somebody has to remember to update.
+
+---
+
+## What it knows about you
+
+A harness that runs against the same project every day learns things: how you
+like to be answered, which command really runs the tests here, what went wrong
+last time and what fixed it. Kept in a database, that is the harness's private
+business. Kept as notes, it is yours.
+
+![What the harness has learned](docs/images/what-it-knows.png)
+
+Every note is one markdown file in `.harness/vault`, with a few lines at the
+top and links written `[[like this]]`. Open the folder in any editor and it is
+a set of notes about your project. Nothing needs the harness to read it.
+
+| Kind of note | What it holds |
+| --- | --- |
+| About you | How you like to be worked with. |
+| How to | Something that worked, written down so it can be done again. |
+| About this project | What the harness has worked out about the code. |
+| Lesson | Something that went wrong once, and what fixed it. |
+
+The picture is the point. A circle is a note, a line is a link, colour says
+which kind, and size says how connected and how used it is. A note nothing has
+touched for months is dimmed rather than believed for ever, and a link to a
+note nobody has written yet is drawn as a dashed outline you can press to write
+it.
+
+**How a note earns its place.** Open one and say whether it helped. A note that
+is used and goes well grows and rises; one that does not fade. That is the
+whole loop: the harness writes down what worked, you correct what did not, and
+what is left is true.
+
+**Learn from the runs** reads what the harness already remembers and writes the
+parts worth keeping as notes. It never writes over a note you have edited.
+
+---
+
+## Pipelines: many jobs, wired together
+
+A check suite answers "does this project work?". A pipeline answers a bigger
+question: run these suites side by side, scan the code for credentials, only go
+on if that passed, then run the unit tests, and try the flaky one again.
+
+![The pipelines board](docs/images/pipelines.png)
+
+Drag steps out of the list on the left, press **Connect** on one box and then
+another to join them, and press the small cross on an arrow to cut it. Each box
+lights up as the run reaches it: blue while it works, green when it passed, red
+when it did not, and dim when a gate stopped the work before it got there.
+
+| Step | What it does |
+| --- | --- |
+| Start | Where a run begins. Everything it points at starts together. |
+| Test suite | Runs your checks, or only the ones carrying a tag. |
+| Unit test | Runs the project's own test, lint, or build command. |
+| Security scan | Reads your files for credentials left in them. |
+| Security gate | Lets the work go on only if the scans before it went well enough. |
+| Gate | The same, for anything: all of what came before, or any of it. |
+| Git repo | Reads which branch you are on and what is uncommitted. It never writes. |
+| AI drafts a test | Asks the model you set up to write a test, and saves it as a draft for you to read. Nothing runs a draft where it is kept. |
+| Keep the evidence | Writes what happened into one file you can send to somebody. |
+
+Any step can be told to try again up to five times before it gives up, which is
+usually enough for the one test that fails on a slow morning.
+
+A pipeline is ordinary JSON in `.harness/pipelines`, so it can go into your
+repository and everyone gets the same one. There is deliberately no "run this
+shell line" step: a saved pipeline is a file people pass around, and a file
+that can run anything is a file nobody should open.
+
+---
+
+## "I don't care, just do it for me"
+
+Connecting a model is a short list of instructions, and a short list is still
+work if you have never done it. Every way of connecting one has a button that
+does the list for you.
+
+![The do it for me button on a service that needs a key](docs/images/just-do-it.png)
+
+It will start Ollama if it is installed but not running, fetch the model, write
+the route into your own settings file, and trust that file. It will not install
+software, make an account, or ask you for a key — so it says which single part
+is left for you, and where to do it. A key is never typed into the page and
+never written into a settings file.
+
+---
+
+## Change any setting without opening a file
+
+Everything the harness can be told, in plain words: what it is set to now,
+which file that came from, and what it shipped as. Type a new value and press
+Save. A setting that only counts from your own file goes there by itself, and
+anything the harness would refuse is put straight back with the reason.
+
+```bash
+harness ui             # then open Settings
+```
+
+There is no list of key names to learn and no JSON to edit. A command can be
+typed the way you would type it in a terminal: `pytest -q`, not
+`[["pytest", "-q"]]`.
+
+---
+
+## When a check fails
+
+Every failing check has a **What does this mean?** button. It turns the error
+into a sentence and a short list of things to try:
+
+```text
+Nothing was listening at that address.
+The check asked a server on this machine for a page, and no server answered.
+
+Worth trying:
+  - Start the thing being checked, then run the check again.
+  - Look at the address in the check: a different port is the usual reason.
+  - If it is the harness's own panel, run: harness ui
+```
+
+If it does not recognise a failure it says so, rather than guessing. A
+confident wrong answer sends you looking in the wrong place for an hour.
+
+---
+
+## Carrying a setup to another machine
+
+```bash
+harness carry pack                       # writes harness-setup.json
+harness carry unpack harness-setup.json  # on the other machine
+```
+
+Your checks, your pipelines and the shared settings travel. Your own settings
+file never does: it names the tools on your machine, the addresses you call,
+and the variables holding your keys. Nothing already on the other machine is
+written over unless you say so.
+
+---
+
+## The seven kinds of check
+
+| Kind | What it does |
+| --- | --- |
+| `command` | Runs a program and looks at how it finished. |
+| `file` | Reads a file in the project and checks what is in it. |
+| `http` | Asks a local server a question and checks the answer, including its shape against a JSON Schema. |
+| `browser` | Opens a real page, walks through a written workflow, and watches for errors. |
+| `visual` | Takes a picture of a page and compares it with one you saved. |
+| `secrets` | Reads your own files and looks for credentials left in them. |
+| `crawl` | Follows every link from one page and reports what is broken. |
+
+Plugins can add their own kinds. See [docs/PLUGINS.md](docs/PLUGINS.md).
+
+A check is ordinary JSON, so it reads like something a person wrote:
+
+```json
+{
+  "id": "sign-in-works",
+  "title": "A person can sign in",
+  "kind": "browser",
+  "url": "http://127.0.0.1:8000/",
+  "steps": [
+    {"do": "type", "target": "#email", "text": "someone@example.com"},
+    {"do": "type", "target": "#password", "text": "example"},
+    {"do": "click", "target": "#sign-in", "note": "Press sign in"},
+    {"do": "expect_text", "target": "#welcome", "text": "Welcome back"}
+  ],
+  "expect": {"max_console_errors": 0}
+}
+```
+
+---
+
+## Which pages nobody checks
+
+```bash
+harness qa coverage --url http://127.0.0.1:8000/ --write-missing
+```
+
+It walks the site, sorts every page into checked, only walked over, or nobody
+looks at it, and can write a check for each page in the last group.
+
+![The coverage view](docs/images/coverage.png)
+
+---
+
+## What changed since the last run
+
+```bash
+harness qa changed
+```
+
+Only what moved: what started failing, what got fixed, what is new, what went
+away, and what got a lot slower. A check that was already failing is mentioned
+at the end, not the top.
+
+---
+
+## One file you can send to anyone
+
+```bash
+harness qa share
+```
+
+One web page holding the results and the screenshots, openable on a machine
+that has never seen this project. Credentials, your own folder names, and
+terminal colour codes are all taken out first.
+
+---
+
+## Asking a model to make a change
+
+This part is optional and off until you set up a model.
+
+```bash
+harness doctor                      # says what is missing and how to fix it
 harness run "Fix the failing parser test"
 ```
 
-`harness init` detects the stack, writes shareable `.harness/config.json`, and puts local provider routes and detected commands in `.harness/config.local.json`. Init records the local file hash in the user config directory. A copied or downloaded `config.local.json` has no executable authority without that out-of-project trust record. Runtime data stays under `.harness/memory`, `.harness/runs`, `.harness/backups`, and `.harness/checkpoints`; the generated `.harness/.gitignore` excludes it.
+The harness plans the change, edits the files, runs your checks, reviews the
+result, and tries a bounded number of repairs. Files are restored if a run
+fails. `--dry-run` plans without touching anything.
 
-For non-interactive setup:
+You can rewire who does what, and in which order:
+
+![The workflow view](docs/images/workflow.png)
+
+Model services it can use: Ollama or any OpenAI-compatible server on your own
+machine; OpenAI, Anthropic or Gemini with your own key; or the Claude and
+GitHub Copilot command lines, which use a seat your organisation already pays
+for and need no key at all. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
+
+---
+
+## Worked example: two subscriptions on one job
+
+Plenty of organisations have Claude and Copilot seats and no API keys, and never
+will. Both of those ship a command line tool that is already signed in, so the
+harness can put them on the same job: Claude plans and reviews, Copilot writes
+the code, and the two send notes to each other as they go.
+
+### The short way: let it set itself up
+
+Open `harness ui`, stay on the Start view, and work down the three steps.
+
+![Setting up the assistants you already pay for](docs/images/seats.png)
+
+1. **Find the assistants.** It looks for each tool on this machine, asks its
+   version, and says which ones are ready. If one is missing it tells you what
+   to install.
+2. **Write the settings and trust them.** One button writes a route per
+   assistant into your own settings file and marks the file as yours. It shows
+   you exactly what it wrote, and **Put my settings back** undoes it.
+3. **Share the work out.** One button gives each agent in the workflow on
+   screen a seat, lets them send notes to each other, and — when you have two
+   assistants — puts the reviewer on the other one from the coder.
+
+Same thing without the screen:
 
 ```bash
-harness init --yes --provider ollama
+harness seats list      # what is on this machine
+harness seats setup     # write the routes and trust the file
 ```
 
-## Provider credentials
+### The long way: do it by hand
 
-| Provider | Credential | Default endpoint |
-|---|---|---|
-| Ollama | None | `http://127.0.0.1:11434` |
-| OpenAI | `OPENAI_API_KEY` | `https://api.openai.com/v1` |
-| Anthropic | `ANTHROPIC_API_KEY` | `https://api.anthropic.com/v1` |
-| Gemini | `GEMINI_API_KEY` | `https://generativelanguage.googleapis.com/v1beta` |
-| Claude Code | Existing `claude` sign-in, no key | Local subprocess |
-| GitHub Copilot | Existing `copilot` sign-in, no key | Local subprocess |
-| Codex CLI (optional named profile) | Existing `codex login` with ChatGPT | Local subprocess |
-| OpenAI-compatible | Configured by that server | `http://127.0.0.1:8000/v1` |
-| Local process | None unless the process requires one | Configured argv |
+Useful when your tools take different arguments, or you want to see every part.
 
-The OpenAI adapter calls the OpenAI API and needs an API key. It cannot turn a ChatGPT subscription into an API credential. The separate optional `codex-cli` named profile can reuse an existing local ChatGPT sign-in through `codex exec`. It remains subject to ChatGPT plan, workspace, model, and rate limits. Its usage is recorded as `subscription-unpriced`, with no dollar-cost estimate. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#optional-codex-cli-profile).
+**1. Check both tools are installed and signed in.** They are separate products
+from the subscriptions, and each signs in on its own.
 
-Never put keys in `.harness/config.json`. Config stores the environment-variable name, not its value.
+```bash
+claude --version        # 2.1.101 (Claude Code)
+copilot --version
+```
 
-### No API key at your organisation
-
-If you have Claude or GitHub Copilot seats but no keys, the harness can drive
-those tools' own command lines instead. Nothing to buy, no key anywhere:
+**2. Name one route per seat** in `.harness/config.local.json` — your own file,
+never shared:
 
 ```json
-{"provider": {"name": "claude-cli", "model": "claude-sonnet-4-5", "endpoint": "", "api_key_env": ""}}
+{
+  "providers": {
+    "claude":  {"kind": "claude-cli",  "model": "claude-sonnet-4-5", "endpoint": ""},
+    "copilot": {"kind": "copilot-cli", "model": "gpt-5",             "endpoint": ""}
+  },
+  "provider": {"name": "claude-cli", "model": "claude-sonnet-4-5",
+               "endpoint": "", "api_key_env": ""}
+}
 ```
 
-Put that in `.harness/config.local.json`, run `harness trust`, and you are done.
-Several assistants can work on one job at once, each on its own agent, and they
-can write notes to each other. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
+`endpoint` stays empty: a signed-in tool has no address to call.
 
-## Commands
+**3. Say the file is yours.** Until you do, the harness refuses to use it:
 
 ```text
-harness init [path]                 Scan a project and create config
-harness run <task>                  Plan, edit, test, review, and repair
-harness run --detach <task>         Queue a task in the workspace daemon
-harness daemon start|status|stop    Manage the workspace resident process
-harness jobs list|status|attach     Inspect resident jobs and durable events
-harness jobs cancel|resume <id>     Control a checkpoint-safe resident job
-harness jobs message|receipts ...   Queue bounded node-boundary steering
-harness test [--lint] [--build]     Run configured project checks
-harness qa init                     Write a starter check suite from detected commands
-harness qa list                     Show every check in the suite
-harness qa run [--tag|--case ...]   Run the checks side by side and report
-harness qa watch                    Run the checks again whenever a file changes
-harness qa advise                   Say what to do about the checks, from past runs
-harness qa flaky                    Name checks whose result keeps changing
-harness qa generate|candidates      Ask a model for new checks and read them back
-harness qa accept|reject <id> ...   Decide on a proposed check
-harness trust                       Say the local config file in this project is yours
-harness doctor                      Check provider, tools, config, and stack
-harness index                       Refresh workspace search and dependency edges
-harness memory search <query>       Search prior episodes and indexed files
-harness refine list                 Show active reviewed supplemental state
-harness refine candidates           Show staged improvement candidates
-harness refine review <id> ...      Attach verification and a review verdict
-harness refine promote <id>         Activate a reviewed passing candidate
-harness refine reject <id> <reason> Reject a candidate explicitly
-harness mcp list <server>            List tools from a configured MCP server
-harness mcp call <server> <tool>     Call an allowed configured MCP tool
-harness graph validate <file>       Validate a workflow graph
-harness graph simulate <file>       Run a local graph simulation
-harness benchmark                   Run deterministic and optional agentic benchmarks
-harness recovery list              List interrupted file transactions
-harness recovery rollback <id>     Restore a safely classified transaction
-harness recovery finalize <id>     Accept a fully applied transaction
-harness runs list                  List resumable durable runs
-harness runs show <id>             Inspect one frozen run checkpoint
-harness runs resume <id>           Continue from the last completed node boundary
-harness runs cancel <id> ...       Cancel and roll back a retained run
-harness runs approve <id> ...      Record an explicit approval decision
-harness runs reject <id> ...       Record an explicit rejection decision
-harness ui                          Open the loopback graph console
-harness audit                       Scan the distribution for fixed paths
+error: providers.claude.kind requires trusted local, user, environment,
+explicit, or command-line config
 ```
-
-See [docs/RESIDENT_RUNTIME.md](docs/RESIDENT_RUNTIME.md) for the resident process security boundary, crash rules, and mailbox limits.
-
-## Deterministic benchmark
-
-`harness benchmark` runs a versioned deterministic suite against the same file transaction, recovery, context, index, graph, stream, and command APIs used by normal harness workflows. Every case uses a temporary workspace; the evaluator and its expected outcomes remain outside that workspace.
-
-The default JSON result includes the deterministic seed, exact weighted cases, per-case elapsed time and evidence, source and artifact hashes, environment metadata, and the score out of 100:
 
 ```bash
-harness benchmark
-harness benchmark --seed 20260814 --format markdown
-harness benchmark --format json --output benchmark-result.json
-harness benchmark --provider-profile provider-profile.json --repetitions 3
+harness trust
+harness doctor          # OK provider: Provider configuration is present: claude-cli
 ```
 
-Without `--provider-profile`, the command does not contact a model service and reports `agentic_score` as `not_run`. A trusted provider profile runs isolated repair tasks. Public tests run inside the repair loop; external hidden evaluators grade the submitted tree afterward. Resolution depends on behavior, path scope, evaluator isolation, and a completed workflow. Byte equality with the reference patch remains a diagnostic and does not decide resolution. Failed attempts retain bounded, redacted trajectory and public-test evidence. Hidden evaluator code and output are never retained. The result reports Agentic Resolution Score, Harness Quality Score, provider calls, token counts when supplied by the provider, tool discovery, elapsed time, and per-attempt results. It is not a SWE-bench or cross-harness score. The versioned manifest, fixtures, and result schema ship with the package.
+**4. Give each agent a seat.** Open `harness ui`, go to the Workflow tab, and
+set the **Provider route** on each agent box:
 
-See [docs/BEST_IN_CLASS_EVALUATION.md](docs/BEST_IN_CLASS_EVALUATION.md) for the evidence required before describing a release as best in class.
+| Agent | Route |
+| --- | --- |
+| Planner | `claude` |
+| Coder | `copilot` |
+| Final Reviewer | `claude` |
 
-Current measured release evidence is in [docs/BENCHMARK_RESULTS_2026-08-15.md](docs/BENCHMARK_RESULTS_2026-08-15.md). A provider startup, authentication, quota, or evaluator failure is reported as infrastructure failure and is not presented as model quality.
+A reviewer on a different assistant from the coder is the whole point. Two
+models that share no training tend not to share the same blind spot.
 
-The deterministic score grants a case's full weight only when every assertion passes. The manifest weights total 100. A failed critical safety, recovery, graph, stream, or execution case caps the displayed score at 49 while retaining the uncapped score for diagnosis.
-
-Release builds must pass `python scripts/verify_dist.py`. The gate compares every packaged source and resource byte against `src/our_harness`, then probes the zipapp and isolated wheel for benchmark, durable-run, review-panel, and tool-loop capabilities.
-
-## Common work
-
-Debug a failure:
-
-```bash
-harness run "Find the cause of the failing checkout test, fix it, and add a regression test"
-```
-
-Add a feature:
-
-```bash
-harness run "Add CSV export to the report command and cover invalid output paths"
-```
-
-Write tests without applying edits:
-
-```bash
-harness run --dry-run "Plan tests for the cache invalidation rules"
-```
-
-Refactor:
-
-```bash
-harness run "Split the parser from transport code without changing public behavior"
-```
-
-## How a run works
-
-1. Detect project manifests, standards, tests, linters, and build tools.
-2. Incrementally index text and dependency edges.
-3. Retrieve matching episodes and workspace evidence.
-4. Let the planner use bounded read-only discovery tools, then require acceptance criteria, non-goals, file scope, and checks.
-5. Let the coder inspect bounded source evidence, then require baseline-bound file changes.
-6. Hold the project transaction lock, reject Windows path aliases and nested harness or Git control components, checkpoint a preallocated transaction intent, reread each planner-approved target immediately before backup and replacement, checkpoint the prepared backups, and apply an atomic transaction.
-7. Run only configured or detected checks.
-8. Send the canonical cumulative patch and its exact hash to the reviewer in a packet-only request with an immutable review policy and no author context.
-9. On failure, send the trace to the repair node and lower temperature.
-10. Stop on success, repeated failure, the workflow deadline, or a graph loop limit.
-
-If the run fails, the default policy restores its file transactions in reverse order. Before the first restore write, rollback verifies that every record matches its exact before or after hash and mode, then verifies every backup's manifest-bound SHA-256 and byte count. It persists rollback intent and progress around each atomic restore. A retry skips records already at the before boundary and restores records still at the after boundary. It refuses to overwrite any third state or use a damaged backup. The cumulative frozen scope is verified again around success recording and immediately before return. `harness recovery list` reports interrupted apply and rollback states. Only a fully applied transaction can be finalized; ambiguous state is never changed automatically.
-
-Every completed graph-node boundary has a versioned compare-and-swap checkpoint. Coder changes also checkpoint their transaction ID and candidate before backup creation, then checkpoint the prepared manifest before mutation. `harness runs resume <id>` continues the frozen graph without repeating a completed node or coder call, reconciles its bound transaction, and refuses changed configuration, expired time, altered applied files, unrelated interrupted transactions, or a concurrent resume. A graph may include an `approval_required` node; it records a durable pause, and `runs approve` or `runs reject` requires an explicit JSON-object decision through `--decision-json`. Terminal results remain idempotently readable by run ID after their checkpoint is removed.
-
-## Memory and context
-
-`.harness/memory/harness.db` contains:
-
-- append-only run events;
-- episodic successes and failures;
-- FTS5 text retrieval;
-- optional embedding vectors;
-- indexed workspace documents;
-- dependency edges;
-- prompt versions and pending refinement candidates;
-- hash-bound discovery-tool results for crash replay;
-- review packets and verdicts.
-
-Memory is advisory. Current disk content, task rules, and fresh command results take priority.
-
-Set `memory.enabled` to `false` for an ephemeral run: source indexing and retrieval are skipped, no episodes or run/review/refinement history is retained, and the configured database is not created. Only process-local workflow events remain until the command exits.
-
-The request compiler keeps the base policy, provider execution boundary, and output grammar in a byte-stable prefix. Planner and coder rounds may request only the supplied read-only discovery tools: bounded tree/file reads, workspace or memory search, dependency context, and explicitly allowlisted MCP calls. MCP tools must set `annotations.readOnlyHint` to the JSON boolean `true` and must not set `destructiveHint` to `true`; idempotence does not grant discovery authority. Other calls are refused. No shell or file-write tool exists in this loop. Each bounded result is labelled as untrusted data, recorded as a run event, and retained in a hash-bound per-call journal for restart replay. OpenAI Responses tool rounds pass typed function outputs with retained response state instead of copying tool data into prompt prose. Later workflow stages separately validate and apply proposed changes or configured verification commands. Repository evidence, memory, and recent events follow in a bounded suffix. The run manifest records the prefix hash, section sources, sizes, and cacheable ratio.
-
-## Checks: the test lab
-
-A check says what to do and what a good result looks like. Checks live in one
-JSON file, run side by side, and need no model at all.
-
-```bash
-harness qa init      # write a starter suite from the commands already detected
-harness qa run       # run them and print what happened
-```
-
-There are four kinds. A **command** check runs a program and looks at how it
-finished. A **file** check reads a file. An **http** check asks a local server a
-question. A **browser** check opens a real page, watches the console and network,
-audits accessibility, and can follow a written-down user workflow:
-
-```json
-{"do": "click", "target": "[data-view=\"checks\"]", "note": "Open the checks tab"}
-```
-
-Checks run in parallel, retry when told to, and mark a case that only passes
-after a retry as flaky rather than as a pass. `harness qa flaky` names the checks
-whose result keeps changing across runs. Reports come out as Markdown, JSON,
-JUnit XML for a build server, or a self-contained HTML page. Evidence for every
-attempt is kept under `.harness/qa/runs`.
-
-`harness qa watch` runs them again every time you save, after waiting for the
-changes to settle, and `--every 300` also runs them on a timer. A plugin can add
-a whole new kind of check, such as one that asks a database a question. `harness qa generate` asks the configured model for new checks. Every proposal is
-validated, carries plain-language warnings, and does nothing until you run
-`harness qa accept`.
-
-Browser checks need Node.js with `npm install playwright` and
-`npx playwright install chromium`. Without them those checks report as skipped
-with that instruction, and the rest of the suite runs as usual.
-
-See [docs/QA.md](docs/QA.md).
-
-## Agents that talk to each other
-
-A run can use several agents. The arrows of a workflow already say who works
-next. Team notes cover the rest: an agent can write a short note to another
-agent in the same run, or to everyone.
+**5. Let them talk.** Tick `team.message` on each agent. Then one can tell
+another what it found:
 
 ```json
 {"to": "coder", "subject": "The parser caches by file name",
  "body": "Two files with the same name share a cache slot. Key on the full path."}
 ```
 
-A note is text. Reading one never runs anything, so talking does not widen what
-an agent can do to your project. The board is bounded, an agent may only write
-to an agent that is really in the run, and every note shows up in the **Team
-notes** panel and in the stored run history.
-
-See [docs/TEAM_NOTES.md](docs/TEAM_NOTES.md).
-
-## Control panel
-
-Run:
-
-```bash
-harness ui
-```
-
-It opens on **Start here**, which lists the few steps left before the project is
-ready, and lets you ask for a change in your own words. If no model is connected
-yet, that screen lists every way of connecting one, says which are already
-working on this machine, and gives the exact commands for the rest. A key is
-never typed into the page and never saved in the project. **Checks** runs the test
-lab and shows unstable checks. **History** draws each past run as a row of bars,
-one per step, so you can see where the time went and which step failed.
-**Workflow** is the graph editor for later, once you want to rewire the agents
-yourself. **Memory** and **Prompt history** show what the harness has learnt.
-
-There is also a desktop window that starts the server for you and closes it
-again on quit. See [docs/DESKTOP.md](docs/DESKTOP.md).
-
-```bash
-cd desktop && npm install && npm start
-```
-
-## Several workflows, like tabs
-
-Most people end up with more than one: a quick one for small fixes, a careful
-one with two reviewers, a different one for a different project. The **Workflow**
-tab keeps them side by side.
-
-**New** starts one from the built-in workflow. **Save** keeps the one on screen
-under a name. **Rename** and **Delete** do what they say. Clicking a tab opens
-that workflow, and the bar tells you whether what you are looking at has been
-saved. **Export JSON** and **Import JSON** move one between machines.
-
-Each is a plain file under `.harness/workflows`, so they can be read, edited and
-checked into a repository like anything else. A workflow the harness could not
-run is never saved: it tells you what is wrong instead.
-
-## Workflow graph editor
-
-The server binds only to loopback. The canvas supports drag, pan, zoom, keyboard node movement, keyboard connection creation, edge conditions, selected state fields, and bounded cycle settings. A text connection list provides the same graph information without the canvas. **Simulate** explores graph state without project commands. **Start run** validates the current canvas as a production graph, submits its exact hash, and uses its reachable tool roles and repair-edge limits for real configured/detected checks.
-
-The built-in Gauntlet template runs:
+**6. Press Start run.** That runs the workflow you have on screen. The finished
+setup routes like this:
 
 ```text
-Coder -> Syntax Checker -> Security Auditor -> Performance Profiler -> Unit Test Gate -> Reviewer
+planner  -> route claude   = claude-cli claude-sonnet-4-5
+coder    -> route copilot  = copilot-cli gpt-5
+review   -> route claude   = claude-cli claude-sonnet-4-5
 ```
 
-Select `workflow.name: "gauntlet"` for non-UI runs, or edit and submit the canvas through **Start run**. Configure `project.security_commands` and `project.performance_commands`; a Gauntlet run fails closed when either stage has no command. Standard non-UI runs also use an explicit built-in graph. The production interpreter starts at `entry`, visits outgoing edges in declared order, evaluates the restricted typed condition grammar, transfers named variables, and executes each visited planner, coder, tool, evaluator, and end node. Loop edges enforce attempt, temperature-decay, and timeout values. A false entry route or any state with no matching edge fails explicitly. A submitted graph is frozen for that run, so later canvas edits cannot alter it.
+Subscription work is recorded as `subscription-unpriced` — there is no price
+per request, so the harness does not invent one. Your plan's own rate limits
+still apply.
 
-## Execution boundary
+Full walkthrough, including what to do when a tool takes different arguments:
+[docs/TWO_SEATS.md](docs/TWO_SEATS.md).
 
-The default process runner is not an operating-system security sandbox. It uses argv execution, project-root cwd checks, a filtered environment, timeouts, output limits, process-tree cancellation, and denied command patterns. Model-generated code still runs with your user account permissions.
+---
 
-Set `execution.mode` to `docker` for optional container execution. The configured image and project commands must exist inside that container.
+## Running in a build server
 
-Read [docs/SECURITY.md](docs/SECURITY.md) before running on an untrusted repository.
+```bash
+harness qa ci github          # writes the workflow file
+harness qa ci gitlab
+harness qa run --format junit --output report.xml
+```
 
-## More documentation
+Reports come out as JSON, Markdown, JUnit XML, or a single HTML page.
 
-- [Checks and the test lab](docs/QA.md)
-- [Using a subscription you already pay for](docs/SUBSCRIPTIONS.md)
-- [Plugins](docs/PLUGINS.md)
-- [Team notes: how the agents talk](docs/TEAM_NOTES.md)
-- [The desktop app](docs/DESKTOP.md)
-- [Source binding audit](docs/AUDIT.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Configuration](docs/CONFIGURATION.md)
-- [Deterministic benchmark](docs/BENCHMARK.md)
-- [Capability parity](docs/PARITY.md)
-- [MCP](docs/MCP.md)
-- [Accessibility](docs/ACCESSIBILITY.md)
-- [Security](docs/SECURITY.md)
+---
 
-## License status
+## Every command
 
-Legal review requested. A license has not been selected. See [LICENSE_REVIEW_REQUESTED.md](LICENSE_REVIEW_REQUESTED.md) before public distribution.
+```text
+harness start                       Set a project up and open the panel, in one go
+harness init                        Scan a project and write its settings
+harness doctor                      Say what is missing and how to fix it
+harness run <task>                  Plan, edit, test, review, repair
+harness ui                          Open the control panel
+harness qa init                     Write a starter suite from your own commands
+harness qa run [--tag|--case ...]    Run the checks side by side
+harness qa watch                    Run them again whenever a file changes
+harness qa coverage --url <address> Which pages have no check at all
+harness qa changed                  What moved since the run before
+harness qa share                    One page of a run you can send to anyone
+harness carry pack                  Pack this setup up to carry to another machine
+harness carry unpack <file>         Write a carried setup into this project
+harness qa record --url <address>   Do a workflow by hand and get a check from it
+harness qa pick --url <address>     Click a thing and get a name a check can use
+harness qa starters | add <name>    Ready-made checks
+harness qa baseline                 Save today's screenshots as the ones to match
+harness qa explain                  Ask your model why a check failed
+harness qa flaky | advise           Which checks need attention, and why
+harness qa ci github|gitlab         Write the file a build server needs
+harness bundle                      Zip the evidence to send on
+```
+
+`harness <command> --help` explains any of them.
+
+---
+
+## What it will not do
+
+It will not run a command your settings deny, and the deny list has a floor it
+cannot be talked out of: nothing formats a disk or shuts down a machine, whatever
+a project's own settings say.
+
+It will not read or write outside your project folder.
+
+It will not send anything anywhere until you configure a model, and it takes
+credentials out of everything it writes for a person to read or pass on.
+
+Project settings that could run something — provider commands, test commands,
+plugins — are refused unless the file they come from is trusted on this machine.
+Cloning a repository never gives that repository the right to run code.
+
+---
+
+## Documentation
+
+| Guide | About |
+| --- | --- |
+| [QA.md](docs/QA.md) | Checks, in full: every kind, every option, every command |
+| [PIPELINES.md](docs/PIPELINES.md) | Wiring many jobs together, with gates between them |
+| [WHAT_IT_KNOWS.md](docs/WHAT_IT_KNOWS.md) | The notes the harness keeps about you and your project |
+| [CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting and where it may come from |
+| [SECURITY.md](docs/SECURITY.md) | What is fenced off, and how |
+| [SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) | Using a Claude or Copilot seat instead of a key |
+| [TWO_SEATS.md](docs/TWO_SEATS.md) | Two subscriptions on one job, step by step |
+| [CONTROL_PANEL.md](docs/CONTROL_PANEL.md) | The panel and the workflow editor |
+| [DESKTOP.md](docs/DESKTOP.md) | The desktop app |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the parts fit together |
+| [PLUGINS.md](docs/PLUGINS.md) | Adding your own kind of check |
+| [ACCESSIBILITY.md](docs/ACCESSIBILITY.md) | Keyboard and screen reader support |
+
+---
+
+## Working on the harness itself
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -t tests -q
+```
+
+1324 tests, no test dependencies beyond the standard library. The project also
+checks itself with its own tool:
+
+```bash
+PYTHONPATH=src python -m our_harness qa run --suite .harness/qa/suite.json
+PYTHONPATH=src python -m our_harness qa run --suite .harness/qa/workflows.json
+PYTHONPATH=src python -m our_harness audit
+```
+
+The second of those is 67 browser checks over the control panel. Three guards
+keep the panel honest: every control has to be really used by a check, every
+kind of news the server sends has to be one the page listens for, and no check
+may lean on data the panel can replace underneath it.
+
+To retake the screenshots in this file:
+
+```bash
+python scripts/make_screenshots.py
+```
+
+---
+
+

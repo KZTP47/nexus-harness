@@ -364,3 +364,32 @@ class ExamplePluginTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NamespaceTests(unittest.TestCase):
+    """A case field and an expectation are different things with different names."""
+
+    def run_nothing(self, case, runner):
+        return (), "", ""
+
+    def test_a_kind_may_name_an_expectation_after_a_case_field(self) -> None:
+        kind = qa.CheckKind(
+            name="counts", summary="s",
+            expectations=frozenset({"rows"}),
+            run=self.run_nothing,
+        )
+        kind.validate()
+
+    def test_a_kind_may_not_take_a_case_field_the_suite_owns(self) -> None:
+        for name in ("rows", "rows_file", "retries", "tags", "expect"):
+            with self.subTest(name=name), self.assertRaises(HarnessError) as caught:
+                qa.CheckKind(name="x", summary="s", fields=frozenset({name}), run=self.run_nothing).validate()
+            self.assertIn("case field", str(caught.exception))
+
+    def test_a_kind_may_not_take_an_expectation_the_suite_owns(self) -> None:
+        for name in ("exit_code", "status", "contains", "max_console_errors"):
+            with self.subTest(name=name), self.assertRaises(HarnessError) as caught:
+                qa.CheckKind(
+                    name="x", summary="s", expectations=frozenset({name}), run=self.run_nothing
+                ).validate()
+            self.assertIn("expectation", str(caught.exception))

@@ -281,3 +281,36 @@ class ExecutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChildEnvironmentTests(unittest.TestCase):
+    """What a child process must be able to see.
+
+    A Windows program that asks the system where the shared program folder is
+    gets the answer "%SystemDrive%\ProgramData" and expands it itself. With no
+    SystemDrive to expand, the name stays as it is and the program creates a
+    folder literally called "%SystemDrive%" next to whatever it was working in.
+    We once found one of those sitting in this project. So these names are not
+    a nicety; leaving them out puts rubbish in the user's folders.
+    """
+
+    NEEDED = ("PATH", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "WINDIR", "TMP", "TEMP")
+
+    def test_the_default_list_keeps_the_windows_basics(self) -> None:
+        from our_harness.config import DEFAULT_CONFIG
+
+        allowed = {name.upper() for name in DEFAULT_CONFIG["execution"]["inherit_environment"]}
+        for name in self.NEEDED:
+            with self.subTest(name=name):
+                self.assertIn(name, allowed)
+
+    @unittest.skipUnless(os.name == "nt", "these names only exist on Windows")
+    def test_a_child_on_windows_really_gets_them(self) -> None:
+        from our_harness.config import DEFAULT_CONFIG
+        from our_harness.safety import safe_environment
+
+        passed = safe_environment(DEFAULT_CONFIG["execution"]["inherit_environment"])
+        upper = {name.upper(): value for name, value in passed.items()}
+        for name in ("SYSTEMDRIVE", "SYSTEMROOT"):
+            with self.subTest(name=name):
+                self.assertTrue(upper.get(name, "").strip(), f"a child would run without {name}")

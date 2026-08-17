@@ -26,7 +26,7 @@ Selection hashes the fixed salt and each instance ID, sorts by that hash, and ta
 
 Copy `docs/examples/external_benchmark_fairness_lock.example.json`. Fill every revision before inference. One lock applies to every harness in the comparison. It records one model configuration, one turn/time/cost budget, and one tool policy.
 
-The manifest requires Our Harness, mini-SWE-agent, and Simple Strands Agent. A revision can be a Git commit or a content-addressed package digest. Record the SWE-bench evaluator revision separately in the experiment report.
+The manifest requires Nexus Harness, mini-SWE-agent, and Simple Strands Agent. A revision can be a Git commit or a content-addressed package digest. Record the SWE-bench evaluator revision separately in the experiment report.
 
 ```powershell
 py -B scripts/prepare_external_benchmark.py plan `

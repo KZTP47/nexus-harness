@@ -65,4 +65,4 @@ harness benchmark --provider-profile provider-profile.json --format json
 
 Both the Python API and `--repetitions` accept values from 1 through 10.
 
-Use [BENCHMARK_RELEASE_RUNBOOK.md](BENCHMARK_RELEASE_RUNBOOK.md) to regenerate release artifacts. Use [EXTERNAL_BENCHMARKS.md](EXTERNAL_BENCHMARKS.md) to freeze an equal-budget SWE-bench comparison plan. The local three-task score is not an external benchmark result.
+Use [EXTERNAL_BENCHMARKS.md](EXTERNAL_BENCHMARKS.md) to freeze an equal-budget comparison. The local three-task score is a smoke test, not an external benchmark result.

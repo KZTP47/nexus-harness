@@ -310,9 +310,18 @@ class UITests(unittest.TestCase):
                 self.assertEqual(status, HTTPStatus.BAD_REQUEST)
                 self.assertIn("Cross-site", body["error"])
 
-                status, bootstrap = request("/api/bootstrap", {"Host": allowed_host})
+                # A program asking directly, with none of the lines a browser
+                # always sends, is not handed the key to the panel.
+                status, body = request("/api/bootstrap", {"Host": allowed_host})
+                self.assertEqual(status, HTTPStatus.BAD_REQUEST)
+                self.assertIn("control panel page", body["error"])
+
+                status, bootstrap = request(
+                    "/api/bootstrap", {"Host": allowed_host, "Sec-Fetch-Site": "same-origin"}
+                )
                 self.assertEqual(status, HTTPStatus.OK)
                 token = bootstrap["token"]
+                self.assertTrue(bootstrap["started_id"])
 
                 status, body = request("/api/events?after=0", {"Host": allowed_host})
                 self.assertEqual(status, HTTPStatus.BAD_REQUEST)
@@ -329,7 +338,8 @@ class UITests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(status, HTTPStatus.OK)
-                self.assertEqual(body, {"events": []})
+                self.assertEqual(body["events"], [])
+                self.assertTrue(body["started_id"])
 
                 status, body = request(
                     "/api/events?after=0",
@@ -351,7 +361,10 @@ class UITests(unittest.TestCase):
 
                 for loopback_authority in (f"localhost:{port}", f"[::1]:{port}"):
                     with self.subTest(loopback_authority=loopback_authority):
-                        status, body = request("/api/bootstrap", {"Host": loopback_authority})
+                        status, body = request(
+                            "/api/bootstrap",
+                            {"Host": loopback_authority, "Sec-Fetch-Site": "same-origin"},
+                        )
                         self.assertEqual(status, HTTPStatus.OK)
                         self.assertIn("token", body)
             finally:

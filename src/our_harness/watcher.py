@@ -66,18 +66,51 @@ class Wakeup:
 Snapshot = dict[str, tuple[int, int]]
 
 
-def scan(root: Path, ignore: IgnorePolicy, max_files: int = DEFAULT_MAX_FILES) -> Snapshot:
-    """Size and modified time for every file the harness would look at."""
+def scan(
+    root: Path,
+    ignore: IgnorePolicy,
+    max_files: int = DEFAULT_MAX_FILES,
+    on_partial: Callable[[str], Any] | None = None,
+) -> Snapshot:
+    """Size and modified time for every file the harness would look at.
+
+    When it cannot look at all of them, on_partial is told why in one plain
+    sentence. Watching part of a project without saying so is the worst way to
+    fail here: the tool sits there quietly while the work changes underneath
+    it, and looks exactly like a project where nothing is happening.
+    """
 
     found: Snapshot = {}
-    for path in ignore.walk_files():
+    walk = ignore.walk_files()
+    partial = ""
+    while True:
+        # A build tool or an editor can remove a folder while this is reading
+        # it. That is an ordinary thing to happen, not a reason to stop
+        # watching a project for the rest of the day.
+        try:
+            path = next(walk)
+        except StopIteration:
+            break
+        except (OSError, HarnessError) as exc:
+            partial = (
+                f"Stopped part way through reading this project: {exc}. "
+                f"{len(found)} files are being watched, and any others are not."
+            )
+            break
         try:
             stat = path.stat()
         except OSError:
             continue
         found[path.relative_to(root).as_posix()] = (stat.st_mtime_ns, stat.st_size)
         if len(found) >= max_files:
+            partial = (
+                f"This project has more files than watch mode follows at once, so only "
+                f"{max_files} of them are being watched and a change to any other will "
+                "not be noticed. Narrow it with project.ignore, or raise the limit."
+            )
             break
+    if partial and on_partial is not None:
+        on_partial(partial)
     return found
 
 
@@ -100,6 +133,7 @@ class ProjectWatcher:
         max_files: int = DEFAULT_MAX_FILES,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        on_partial: Callable[[str], Any] | None = None,
     ) -> None:
         if interval_seconds <= 0 or quiet_seconds < 0 or max_files < 1:
             raise HarnessError("Watch settings must be positive")
@@ -114,7 +148,22 @@ class ProjectWatcher:
         self.clock = clock
         self.sleep = sleep
         self.stopped = False
-        self.snapshot: Snapshot = scan(self.root, self.ignore, self.max_files)
+        # Said once, not on every look round the project. A warning repeated
+        # every second is a warning nobody reads.
+        self._said: set[str] = set()
+        self.on_partial = on_partial
+        self.partial_note = ""
+        self.snapshot: Snapshot = scan(
+            self.root, self.ignore, self.max_files, self._say_once
+        )
+
+    def _say_once(self, note: str) -> None:
+        self.partial_note = note
+        if note in self._said:
+            return
+        self._said.add(note)
+        if self.on_partial is not None:
+            self.on_partial(note)
 
     def stop(self) -> None:
         self.stopped = True
@@ -122,7 +171,7 @@ class ProjectWatcher:
     def poll(self) -> Changes:
         """One look at the project. Empty when nothing moved."""
 
-        current = scan(self.root, self.ignore, self.max_files)
+        current = scan(self.root, self.ignore, self.max_files, self._say_once)
         found = compare(self.snapshot, current)
         self.snapshot = current
         return found

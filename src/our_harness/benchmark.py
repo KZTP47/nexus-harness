@@ -15,7 +15,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__
+from . import PRODUCT_NAME, __version__
 from .changes import FileTransaction, file_sha256
 from .config import load_isolated_config
 from .context import CompiledContext, ContextCompiler, fit_request_context, stable_prefix
@@ -923,7 +923,7 @@ def run_benchmark(seed: int = DEFAULT_SEED, provider_profile: str | None = None,
 
 def render_markdown(result: dict[str, Any]) -> str:
     lines = [
-        "# Our Harness benchmark",
+        f"# {PRODUCT_NAME} benchmark",
         "",
         f"- Benchmark: `{result['benchmark']['id']}` v{result['benchmark']['version']}",
         f"- Seed: `{result['run']['seed']}`",

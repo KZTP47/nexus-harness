@@ -27,9 +27,13 @@ function unpackedFolder() {
 }
 
 function archiveContents(folder) {
+  // The app folder is named after productName, so read that rather than
+  // repeat it here: a rename would otherwise leave this looking for a folder
+  // nobody builds any more.
+  const productName = require("./package.json").build.productName;
   const archive = [
     path.join(folder, "resources", "app.asar"),
-    path.join(folder, "Our Harness.app", "Contents", "Resources", "app.asar"),
+    path.join(folder, `${productName}.app`, "Contents", "Resources", "app.asar"),
   ].find((item) => fs.existsSync(item));
   if (!archive) throw new Error(`No app.asar was found under ${folder}`);
   // Read the archive directly. Shelling out breaks on a path with a space in it.

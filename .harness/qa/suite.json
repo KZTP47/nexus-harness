@@ -10,6 +10,7 @@
         "fast",
         "tests"
       ],
+      "timeout_seconds": 300,
       "command": [
         "python",
         "-m",
@@ -23,7 +24,6 @@
         "test_qa.py",
         "-q"
       ],
-      "timeout_seconds": 300,
       "expect": {
         "exit_code": 0,
         "stderr_contains": [
@@ -65,10 +65,11 @@
       "path": "README.md",
       "expect": {
         "exists": true,
+        "min_bytes": 500,
         "contains": [
-          "Fast install"
-        ],
-        "min_bytes": 500
+          "## Install",
+          "python -m pip install"
+        ]
       }
     },
     {
@@ -96,6 +97,7 @@
         "ui"
       ],
       "url": "http://127.0.0.1:8765/api/health",
+      "method": "GET",
       "expect": {
         "status": 200,
         "json_fields": {
@@ -114,15 +116,59 @@
       "routes": [
         "/"
       ],
+      "viewport": {
+        "width": 1280,
+        "height": 800
+      },
       "check_accessibility": true,
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0,
         "max_failed_requests": 0,
+        "max_accessibility_problems": 0,
         "body_contains": [
           "Welcome"
-        ],
-        "max_accessibility_problems": 0
+        ]
+      }
+    },
+    {
+      "id": "no-keys-in-the-code",
+      "title": "No credentials are written into the shipped code or the docs",
+      "kind": "secrets",
+      "tags": [
+        "fast",
+        "safety"
+      ],
+      "paths": [
+        "src/**/*.py",
+        "desktop/*.js",
+        "scripts/*.py",
+        "*.md",
+        "docs/*.md"
+      ],
+      "skip": [
+        "src/our_harness/scan.py",
+        "src/our_harness/redaction.py"
+      ],
+      "expect": {
+        "max_findings": 0
+      }
+    },
+    {
+      "id": "panel-script-is-readable",
+      "title": "The control panel script has no mistake in it",
+      "kind": "command",
+      "tags": [
+        "fast",
+        "ui"
+      ],
+      "command": [
+        "node",
+        "--check",
+        "src/our_harness/ui/app.js"
+      ],
+      "expect": {
+        "exit_code": 0
       }
     }
   ]

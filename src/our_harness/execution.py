@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -13,6 +14,82 @@ from .models import CommandResult, HarnessError
 from .safety import confined_path, safe_environment
 
 
+# Names that are never part of writing software, and would cost somebody their
+# disk or their session. They are refused whatever the project settings say,
+# and they are kept here rather than in the settings so that a project written
+# before this list existed still works.
+ALWAYS_DENIED = frozenset({
+    "mkfs", "fdisk", "diskpart", "format",
+    "format-volume", "clear-disk", "initialize-disk",
+    "restart-computer", "stop-computer", "shutdown", "reboot",
+})
+
+
+def _said_as(word: str) -> tuple[str, set[str]]:
+    """One word of a command, as either a plain word or the switches it holds.
+
+    The same switch turns up as --force, -Force, /force and /force:yes, and a
+    bundle such as -fd holds two of them. A plain word comes back as itself
+    with no switches; a switch comes back as no word with its letters.
+    """
+
+    plain = word.split(":", 1)[0].split("=", 1)[0].casefold()
+    if plain.startswith("--") or plain.startswith("/"):
+        return "", {plain.lstrip("-/")}
+    if plain.startswith("-") and len(plain) > 1:
+        letters = plain.lstrip("-")
+        # -fd is -f and -d. A long word after one dash, such as -force, is one
+        # switch, not five.
+        if len(letters) > 1 and not letters.isalpha():
+            return "", {letters}
+        return "", set(letters) if len(letters) > 1 else {letters}
+    return plain, set()
+
+
+def _reads_as(words: list[str]) -> tuple[list[str], set[str]]:
+    """A whole command as the words it names and the switches it asks for."""
+
+    named: list[str] = []
+    switches: set[str] = set()
+    for word in words:
+        plain, found = _said_as(word)
+        if plain:
+            named.append(plain)
+        switches |= found
+    return named, switches
+
+
+def _switch_is_here(wanted: str, switches: set[str]) -> bool:
+    """Is this switch here, however it was written?
+
+    A rule naming a long switch also means its short form: --force is -f on
+    nearly every tool that has both. A refused command says so plainly and can
+    be allowed by changing the policy; a command that was meant to be refused
+    and ran instead cannot be undone.
+    """
+
+    if wanted in switches:
+        return True
+    return len(wanted) > 1 and wanted[0] in switches
+
+
+def _matches_rule(rule: str, argv: list[str]) -> bool:
+    """Does this command do what the rule names, however it was typed?"""
+
+    asked_words, asked_switches = _reads_as(rule.split())
+    said_words, said_switches = _reads_as(argv)
+    if not asked_words and not asked_switches:
+        return False
+    # Every plain word the rule names, in that order, somewhere in the command.
+    at = 0
+    for word in said_words:
+        if at < len(asked_words) and word == asked_words[at]:
+            at += 1
+    if at < len(asked_words):
+        return False
+    return all(_switch_is_here(wanted, said_switches) for wanted in asked_switches)
+
+
 class CommandRunner:
     def __init__(self, config: LoadedConfig):
         self.config = config
@@ -21,14 +98,88 @@ class CommandRunner:
     def _check(self, argv: list[str]) -> None:
         if not argv or not all(isinstance(part, str) and part for part in argv):
             raise HarnessError("Command must be a non-empty argv list")
-        executable = Path(argv[0]).name.lower().removesuffix(".exe")
         denied = {str(item).lower() for item in self.config.get("execution.deny_executables", [])}
-        if executable in denied:
-            raise HarnessError(f"Executable is denied by policy: {argv[0]}")
+        denied |= ALWAYS_DENIED
+        first, inside = self._named_programs(argv)
+        if first in denied:
+            raise HarnessError(f"Executable is denied by policy: {first}")
+        for part in inside:
+            if part in denied:
+                raise HarnessError(f"Executable is denied by policy: {part}")
         normalized = " ".join(part.lower() for part in argv)
+        words = [word for part in argv for word in str(part).lower().split()]
         for sequence in self.config.get("execution.deny_argument_sequences", []):
-            if str(sequence).lower() in normalized:
+            wanted = str(sequence).lower()
+            if wanted in normalized or _matches_rule(wanted, words):
                 raise HarnessError(f"Command argument sequence is denied by policy: {sequence}")
+
+    # Programs that run whatever they are handed. A denied name inside one of
+    # these is still that program being run, so the whole line is looked at.
+    # A shell: every bare word on its line is a command it would run.
+    _SHELLS = frozenset({
+        "cmd", "command", "powershell", "pwsh", "sh", "bash", "zsh", "dash", "ksh",
+        "wsl", "env", "xargs", "start", "runas", "wscript", "cscript",
+    })
+    # A language: a one-liner in any of these starts programs just as easily,
+    # but its words are code, where "format" is an ordinary method name.
+    _SCRIPT_RUNNERS = frozenset({
+        "python", "python3", "py", "node", "nodejs", "deno", "bun",
+        "perl", "ruby", "php", "osascript", "julia", "lua", "tclsh",
+    })
+    _INTERPRETERS = _SHELLS | _SCRIPT_RUNNERS
+    # A few denied names are also ordinary method names. They are only
+    # ordinary when they are written as a method call, with a dot in front:
+    # "{}".format(x) is code, while subprocess.run(["format", "C:"]) is the
+    # disk formatter being started. So the method calls are taken out of the
+    # text before it is read, and nothing else is forgiven.
+    _METHOD_CALLS = re.compile(r"\.\s*(?:format|start|command)", re.IGNORECASE)
+    # Windows runs more than .exe. A name is compared without any of these.
+    _PROGRAM_ENDINGS = (".exe", ".com", ".bat", ".cmd", ".ps1", ".msc", ".scr")
+
+    @classmethod
+    def _plain_name(cls, part: str) -> str:
+        name = Path(part.strip().strip('"')).name.lower()
+        for ending in cls._PROGRAM_ENDINGS:
+            if name.endswith(ending):
+                return name[: -len(ending)]
+        return name
+
+    @classmethod
+    def _named_programs(cls, argv: list[str]) -> tuple[str, list[str]]:
+        """The program being run, and every name inside what it was handed."""
+
+        first = cls._plain_name(argv[0])
+        names: list[str] = []
+        if first not in cls._INTERPRETERS:
+            return first, names
+        reading_code = first in cls._SCRIPT_RUNNERS
+        for part in argv[1:]:
+            # A switch may carry what it is switching on, all in one argument:
+            # python -cCODE, cmd "/c whoami". Passing over the whole argument
+            # let a denied program be started by packing it next to the letter
+            # that asks for it. The letter is dropped and the rest is read.
+            if part.startswith(("-", "/")):
+                part = re.sub(r"^[-/]+[A-Za-z]?", " ", part, count=1)
+                if not part.strip():
+                    continue
+            # Windows lets a command line hide a letter behind a caret, so
+            # dan^ger is danger by the time cmd runs it.
+            part = part.replace("^", "")
+            if reading_code:
+                # Take out method calls such as "{}".format(x) so ordinary code
+                # is not mistaken for the program of the same name.
+                part = cls._METHOD_CALLS.sub(" ", part)
+            # A shell line can hold several commands, one inside another, and
+            # joins them with characters a program name never contains. Listing
+            # those characters is always one short, so this keeps what a name
+            # can hold and treats everything else as a gap.
+            plain = "".join(
+                character if (character.isalnum() or character in "._-/\\:") else " "
+                for character in part
+            )
+            for word in plain.split():
+                names.append(cls._plain_name(word))
+        return first, names
 
     def run(
         self,
@@ -62,7 +213,11 @@ class CommandRunner:
         if requested_timeout <= 0:
             raise HarnessError("Command timeout must be greater than zero")
         timeout_seconds = min(configured_timeout, requested_timeout)
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        flags = 0
+        if os.name == "nt":
+            # Without CREATE_NO_WINDOW every command run from the desktop app,
+            # which has no console of its own, pops a black window on screen.
+            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         reviewer_process_group = os.name != "nt" and os.environ.get("OUR_HARNESS_REVIEWER_PROCESS_GROUP") == "1"
         started = time.monotonic()
         deadline = started + timeout_seconds

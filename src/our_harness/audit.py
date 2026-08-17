@@ -15,14 +15,21 @@ ABSOLUTE_PATTERNS = [
         re.IGNORECASE,
     ),
 ]
-SOURCE_BINDINGS = ("RPG Maker", "RGSS", "KZTP47")
+# Names that would mean this package still points at the project it was built
+# beside, rather than standing on its own.
+SOURCE_BINDINGS = ("RPG Maker", "RGSS")
+# The account name is only a problem when it appears as part of a path, which
+# is a leftover from one machine. In a repository address it is the publisher,
+# written on purpose, and every public project has one.
+ACCOUNT_IN_A_PATH = re.compile(r"[\/]KZTP47(?=[\/]|$)", re.IGNORECASE)
+_AN_ADDRESS = re.compile(r"[a-z][a-z0-9+.\-]*://\S*", re.IGNORECASE)
 TEXT_SUFFIXES = {".py", ".json", ".md", ".toml", ".ps1", ".sh", ".html", ".css", ".js"}
 EXCLUDED_PARTS = {
     ".git", ".venv", "dist", "build", "tests", "__pycache__",
     # Third-party trees are not ours to rewrite, and the harness never ships them.
     "node_modules", ".harness", "benchmark-archive", "benchmark-logs",
 }
-RECORDED_AUDIT_NOTES = {"docs/AUDIT.md", "docs/PARITY.md", "src/our_harness/audit.py", "our_harness/audit.py"}
+RECORDED_AUDIT_NOTES = {"docs/AUDIT.md", "src/our_harness/audit.py", "our_harness/audit.py"}
 
 
 def _inspect_text(label: str, text: str, findings: list[dict[str, str]]) -> bool:
@@ -35,6 +42,11 @@ def _inspect_text(label: str, text: str, findings: list[dict[str, str]]) -> bool
             findings.append({"path": label, "line": str(number), "message": "machine-specific absolute path"})
         if any(binding in line for binding in SOURCE_BINDINGS):
             findings.append({"path": label, "line": str(number), "message": "source-project binding"})
+        # A web address is not a folder on anybody's machine, so the part after
+        # the host is not a path and is not read as one.
+        without_addresses = _AN_ADDRESS.sub(" ", path_material)
+        if ACCOUNT_IN_A_PATH.search(without_addresses):
+            findings.append({"path": label, "line": str(number), "message": "machine-specific account path"})
     if label.endswith(".py"):
         try:
             ast.parse(text, filename=label)

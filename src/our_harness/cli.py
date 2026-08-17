@@ -28,10 +28,21 @@ from .memory import MemoryStore
 from .models import HarnessError
 from .models import ProviderRequest
 from .plugins import check_kinds, load_plugins
+from . import bundle
+from . import comparison
+from . import coverage
+from . import datasets
+from . import handover
 from . import qa
+from . import recorder
+from . import seats as seat_setup
+from . import selectors
+from . import share
+from . import starters
 from .context import ContextCompiler
 from .refinement import RefinementManager
 from .server import serve_ui
+from .redaction import CredentialRedactor
 from .safety import confined_path
 from .watcher import Changes, ProjectWatcher
 from .workflow import HarnessApplication
@@ -62,15 +73,33 @@ def _config(args: argparse.Namespace) -> LoadedConfig:
     return load_config(start, explicit, overrides or None)
 
 
+def _ask(question: str, default: str = "") -> str:
+    """Ask a question, and cope with nobody being there to answer.
+
+    A command run by a script or a build server has no one at the keyboard.
+    Waiting for ever, or falling over with a raw error, would both be wrong;
+    the written-down answer is used instead.
+    """
+
+    try:
+        return input(question).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+
+
 def command_init(args: argparse.Namespace) -> int:
-    root = Path(args.path or ".").resolve()
+    # A folder named after init wins, then --project, then where you are
+    # standing. Without the middle one, "harness --project X init" would quietly
+    # set up the wrong folder.
+    root = Path(args.path or getattr(args, "project", None) or ".").resolve()
     if not root.is_dir():
         raise HarnessError(f"Project path is not a directory: {root}")
     detections = detect_project(root)
     print("Detected: " + ", ".join(item.stack for item in detections))
     provider = args.provider or "ollama"
     if not args.yes:
-        entered = input(f"Provider [{provider}]: ").strip()
+        entered = _ask(f"Provider [{provider}]: ")
         provider = entered or provider
     if provider not in PROVIDER_DEFAULTS:
         raise HarnessError(f"Unknown provider: {provider}")
@@ -78,8 +107,8 @@ def command_init(args: argparse.Namespace) -> int:
     model = args.model or default_model
     endpoint = args.endpoint or default_endpoint
     if not args.yes:
-        model = input(f"Model [{model}]: ").strip() or model
-        endpoint = input(f"Endpoint [{endpoint}]: ").strip() or endpoint
+        model = _ask(f"Model [{model}]: ") or model
+        endpoint = _ask(f"Endpoint [{endpoint}]: ") or endpoint
     path = write_default_project_config(
         root,
         provider,
@@ -314,8 +343,13 @@ def command_mcp(args: argparse.Namespace) -> int:
 
 
 def command_graph(args: argparse.Namespace) -> int:
+    # A plain name means a file in the project being worked on, the same as
+    # every other command. A full path is taken as it is written.
+    wanted = Path(args.file)
+    if not wanted.is_absolute():
+        wanted = (_config(args).project_root / wanted).resolve()
     try:
-        graph = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        graph = json.loads(wanted.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise HarnessError(f"Cannot read graph: {exc}") from exc
     if args.graph_command == "validate":
@@ -339,6 +373,45 @@ def command_audit(args: argparse.Namespace) -> int:
     result = audit_distribution(root) if (root / "src" / "our_harness").is_dir() else audit_installed_distribution()
     _print_json(result)
     return 0 if result["passed"] else 1
+
+
+def command_bundle(args: argparse.Namespace) -> int:
+    config = _config(args)
+    if getattr(args, "read", ""):
+        for name in ("part", "runs", "output"):
+            given = getattr(args, name, None)
+            if given not in (None, "", bundle.DEFAULT_RUNS):
+                raise HarnessError(
+                    f"--{name} makes a bundle, and --read only looks inside one. Use one or the other."
+                )
+        # A plain name means a file in the project being worked on, the same as
+        # everywhere else. A full path is taken as it is written.
+        wanted = Path(args.read)
+        found = bundle.read_manifest(
+            wanted if wanted.is_absolute() else (config.project_root / wanted).resolve()
+        )
+        if args.json:
+            _print_json(found)
+            return 0
+        print(f"Made by {found.get('made_by', 'an unknown version')} on {found.get('made_at', 'an unknown day')}")
+        print(f"It holds: {', '.join(found.get('parts', []))}")
+        print(f"{_count(len(found.get('files', [])), 'file')} inside.")
+        for line in found.get("left_out", []):
+            print(f"  Left out: {line}")
+        return 0
+    result = bundle.build(
+        config,
+        parts=args.part or (),
+        runs=args.runs,
+        output=args.output or "",
+        replace=bool(getattr(args, "replace", False)),
+    )
+    if args.json:
+        _print_json(result.to_dict())
+        return 0
+    for line in bundle.describe(result):
+        print(line)
+    return 0
 
 
 def command_benchmark(args: argparse.Namespace) -> int:
@@ -365,6 +438,170 @@ def command_config_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_seats(args: argparse.Namespace) -> int:
+    """Find the assistants on this machine, and set them up."""
+
+    root = Path(args.project).resolve() if getattr(args, "project", None) else Path.cwd()
+    config, trouble = seat_setup.settings_to_work_from(root)
+    if trouble:
+        print(trouble)
+        print("")
+    found = seat_setup.look(config)
+    if args.seats_command == "list":
+        if args.json:
+            _print_json(found.to_dict())
+            return 0
+        for line in seat_setup.summary(found):
+            print(line)
+        if found.ready:
+            print("")
+            print("Set them all up with: harness seats setup")
+        return 0 if found.ready else 1
+
+    wanted = [seat.kind for seat in found.ready]
+    if args.only:
+        asked = {str(item) for item in args.only}
+        wanted = [kind for kind in wanted if kind in asked]
+    if not wanted:
+        raise HarnessError(
+            "No assistant is ready on this machine. Run 'harness seats list' to see why."
+        )
+    done = seat_setup.set_up(config, wanted, trust=not args.no_trust)
+    if args.json:
+        _print_json(done.to_dict())
+        return 0
+    print(f"Wrote {done.settings_file}")
+    print(f"Routes: {', '.join(done.routes)}")
+    if done.kept:
+        print(f"Your other settings were kept: {', '.join(done.kept)}")
+    if done.replaced:
+        print(f"Written over: {', '.join(done.replaced)}")
+    print("Trusted." if done.trusted else done.note)
+    if done.needs_your_say:
+        # Written, shown, and left for a person to decide. The same choice the
+        # panel offers, in a terminal.
+        for line in done.risky_parts:
+            print(f"  - {line}")
+        print("")
+        print("Read it, then trust it with: harness trust")
+    print("")
+    print("Give each agent one of these in the Workflow tab, or run: harness ui")
+    return 0
+
+
+def command_start(args: argparse.Namespace) -> int:
+    """Set this project up and open the panel, in one go.
+
+    Four commands got somebody from nothing to a working panel: init, doctor,
+    qa init, ui. Each one is worth having on its own and none of them is worth
+    knowing about on your first afternoon. This does all four, says plainly
+    what it did and what is left, and then opens the panel.
+
+    Nothing here is new: every step is a command that already existed, run in
+    the order somebody would have run them.
+    """
+
+    root = Path(args.path or getattr(args, "project", None) or ".").resolve()
+    if not root.is_dir():
+        raise HarnessError(f"Project path is not a directory: {root}")
+    print(f"Setting up {root.name}.")
+    print("")
+
+    # 1. Settings, if there are none yet.
+    settings_file = root / ".harness" / "config.json"
+    if settings_file.is_file():
+        print(f"  Already set up: {settings_file.name} is there.")
+    else:
+        made = argparse.Namespace(
+            path=str(root), project=str(root), config=None, provider="ollama",
+            model=None, endpoint=None, api_key_env=None, yes=True, force=False,
+        )
+        try:
+            command_init(made)
+        except HarnessError as exc:
+            # A project part way through being set up - a settings file of your
+            # own but no shared one - is an ordinary state to be in, and this
+            # is the command somebody runs to get out of it. Stopping here
+            # would leave them exactly where they started.
+            print(f"  Could not write the shared settings: {exc}")
+            print("  Carrying on with what is here.")
+        print("")
+
+    config = _config(argparse.Namespace(project=str(root), config=None))
+
+    # 2. Checks, if there are none yet, written from the commands this project
+    #    already uses.
+    suite_file = qa.suite_path(config)
+    if suite_file.is_file():
+        print(f"  Already written: {suite_file.name} holds your checks.")
+    else:
+        detections = detect_project(config.project_root)
+        commands = {
+            kind: list(config.get(f"project.{kind}_commands") or [])
+            or combined_commands(detections, kind)
+            for kind in ("test", "lint", "build")
+        }
+        suite = qa.starter_suite(commands["test"], commands["lint"], commands["build"])
+        written = qa.write_suite(config, suite)
+        print(f"  Wrote {_count(len(suite.cases), 'starter check')} to {written.name}.")
+
+    # 3. What is missing, said plainly rather than left to be discovered.
+    print("")
+    report = run_doctor(config)
+    for check in report["checks"]:
+        mark = {"ok": "OK  ", "warn": "note", "error": "todo"}.get(str(check.get("level")), "    ")
+        print(f"  {mark} {check.get('name')}: {check.get('message')}")
+    left = [check for check in report["checks"] if str(check.get("level")) == "error"]
+    print("")
+    if left:
+        print(f"{len(left)} thing(s) still to do. The panel will walk you through them.")
+    else:
+        print("Everything is ready.")
+
+    if args.no_panel:
+        print("")
+        print("Open the panel yourself with: harness ui")
+        return 0
+    print("")
+    print("Opening the panel. Press Control and C here to stop it.")
+    return command_ui(argparse.Namespace(
+        project=str(root), config=None, port=args.port, host="127.0.0.1",
+        open_browser=not args.no_open_browser,
+    ))
+
+
+def command_carry(args: argparse.Namespace) -> int:
+    """Pack this setup up to carry to another machine, or unpack one here."""
+
+    from . import carry
+
+    config = _config(args)
+    if args.carry_command == "pack":
+        packed = carry.write_to(config, args.output)
+        print(f"Wrote {packed.file}")
+        for line in packed.holds:
+            print(f"  it holds {line}")
+        for line in packed.left_out:
+            print(f"  left out: {line}")
+        print("")
+        print("Copy that file to the other machine and run: harness carry unpack <file>")
+        return 0
+
+    where = confined_path(config.project_root, args.file, allow_missing=False)
+    try:
+        carried = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HarnessError(f"{where.name} cannot be read: {exc}") from exc
+    done = carry.unpack(config, carried, over_the_top=args.over_the_top)
+    for line in done.written:
+        print(f"  wrote {line}")
+    for line in done.left_alone:
+        print(f"  left alone: {line}")
+    print("")
+    print(done.note)
+    return 0
+
+
 def command_trust(args: argparse.Namespace) -> int:
     """Say that the local config file in this project is yours and may be used."""
 
@@ -381,8 +618,8 @@ def command_trust(args: argparse.Namespace) -> int:
         return 0 if trusted else 1
     print(local.read_text(encoding="utf-8"))
     if not args.yes:
-        answer = input("Trust this file and let it set provider routes and commands? [y/N] ")
-        if answer.strip().lower() not in ("y", "yes"):
+        answer = _ask("Trust this file and let it set provider routes and commands? [y/N] ", "n")
+        if answer.lower() not in ("y", "yes"):
             print("Left as it was.")
             return 1
     store = trust_project_local_config(root, local)
@@ -514,7 +751,9 @@ def _qa_write_report(config: LoadedConfig, result: qa.QaRunResult, args: argpars
         raise HarnessError("A report may not be written inside the .git folder")
     path = confined_path(config.project_root, destination, allow_missing=True, allow_control=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(qa.render_report(result, args.format), encoding="utf-8")
+    path.write_text(
+        qa.render_report(result, args.format, CredentialRedactor(config)), encoding="utf-8"
+    )
     print(f"Report written to {path}")
 
 
@@ -550,7 +789,7 @@ def command_qa(args: argparse.Namespace) -> int:
 
     if command == "run":
         suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
-        runner = qa.QaRunner(config, extra_kinds=kinds)
+        runner = qa.QaRunner(config, extra_kinds=kinds, environment=getattr(args, 'environment', '') or '')
         result = runner.run(
             suite,
             tags=args.tag or (),
@@ -564,23 +803,298 @@ def command_qa(args: argparse.Namespace) -> int:
         if args.format == "json" and not args.output:
             _print_json(result.to_dict())
         elif not args.output:
-            print(qa.render_report(result, args.format))
+            print(qa.render_report(result, args.format, CredentialRedactor(config)))
+        return 0 if result.passed else 1
+
+    if command == "record":
+        width, height = 1280, 800
+        if getattr(args, "viewport", ""):
+            parts = str(args.viewport).lower().replace("*", "x").split("x")
+            if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+                raise HarnessError("Write the window size as WIDTHxHEIGHT, for example 1280x800")
+            width, height = int(parts[0]), int(parts[1])
+        selectors.check_url(config, args.url)
+        print(f"Opening {args.url} in a browser window.")
+        print("Do the thing you want to check, then press Done in the bar at the top.")
+        taken = recorder.record(config, args.url, viewport=(width, height), seconds=args.seconds)
+        case = taken.case(args.name or "recorded-workflow", args.title or "")
+        for line in taken.skipped:
+            print(f"  Left out: {line}")
+        if args.json:
+            _print_json(case)
+            return 0
+        print("")
+        print(f"Wrote down {_count(len(taken.steps), 'step')}:")
+        for number, step in enumerate(taken.steps, start=1):
+            print(f"  {number}. {step.get('note') or step['do']}")
+        if args.dry_run:
+            print("")
+            print("The check it would add:")
+            print(json.dumps(case, indent=2))
+            return 0
+        try:
+            suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
+            cases = [item.to_dict() for item in suite.cases]
+            name = suite.name
+        except HarnessError:
+            cases, name = [], "default"
+        if any(item["id"] == case["id"] for item in cases):
+            raise HarnessError(
+                f"This suite already holds a check called {case['id']}. Use --name to give it another."
+            )
+        cases.append(case)
+        written = qa.parse_suite({"schema_version": 1, "name": name, "cases": cases}, extra_kinds=kinds)
+        path = qa.write_suite(config, written, getattr(args, "suite", None))
+        print("")
+        print(f"Added {case['id']} to {path}")
+        print("Look at the steps, then run: harness qa run --case " + case["id"])
+        return 0
+
+    if command == "changed":
+        if getattr(args, "before", "") or getattr(args, "after", ""):
+            if not (args.before and args.after):
+                raise HarnessError("Name both runs to compare, or neither to use the last two")
+            before = comparison.read_report(comparison.kept_run_folder(config, args.before))
+            after = comparison.read_report(comparison.kept_run_folder(config, args.after))
+        else:
+            before, after = comparison.last_two(config)
+        found = comparison.compare(before, after, redactor=CredentialRedactor(config))
+        if args.json:
+            _print_json(found.to_dict())
+            return 0 if not found.broke else 1
+        print(f"Comparing {found.before_id} with {found.after_id}")
+        for line in found.lines():
+            print(line)
+        return 1 if found.broke else 0
+
+    if command == "share":
+        path, page = share.write(
+            config,
+            str(getattr(args, "run", "") or ""),
+            output=str(getattr(args, "output", "") or ""),
+            with_pictures=not getattr(args, "no_pictures", False),
+        )
+        if args.json:
+            print(share.as_json(path, page), end="")
+            return 0
+        for line in share.summary(path, page):
+            print(line)
+        return 0
+
+    if command == "coverage":
+        found = coverage.look(
+            config,
+            str(getattr(args, "url", "") or ""),
+            max_pages=int(getattr(args, "max_pages", coverage.DEFAULT_MAX_PAGES)),
+            stay_under=str(getattr(args, "stay_under", "") or ""),
+            suite_path=getattr(args, "suite", None),
+            extra_kinds=kinds,
+        )
+        added: list[str] = []
+        if getattr(args, "write_missing", False) and found.missing:
+            added = coverage.add_missing(
+                config,
+                [item.address for item in found.missing],
+                extra_kinds=kinds,
+                suite_path=getattr(args, "suite", None),
+            )
+        if args.json:
+            shape = found.to_dict()
+            shape["written"] = added
+            _print_json(shape)
+            return 0 if added or not found.missing else 1
+        for line in found.lines(offer_help=not added):
+            print(line)
+        if added:
+            print("")
+            print(
+                f"Wrote {len(added)} new check{'' if len(added) == 1 else 's'} for those pages: "
+                + ", ".join(added)
+            )
+            print("Run them with: harness qa run")
+            return 0
+        return 1 if found.missing else 0
+
+    if command == "starters":
+        if args.json:
+            _print_json(starters.listed())
+            return 0
+        print("Ready-made checks. Add one with: harness qa add <name>\n")
+        for item in starters.STARTERS:
+            print(f"  {item.key}")
+            print(f"      {item.title}")
+            print(f"      {item.what_it_does}")
+            print(f"      To use it: {item.change_this}")
+            print(f"      Needs: {item.needs}\n")
+        return 0
+
+    if command == "add":
+        case = starters.build(args.starter, url=args.url or "", case_id=args.name or "")
+        try:
+            suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
+            cases = [item.to_dict() for item in suite.cases]
+            name = suite.name
+        except HarnessError:
+            cases, name = [], "default"
+        if any(item["id"] == case["id"] for item in cases):
+            raise HarnessError(
+                f"This suite already holds a check called {case['id']}. Use --name to give it another."
+            )
+        cases.append(case)
+        written = qa.parse_suite({"schema_version": 1, "name": name, "cases": cases}, extra_kinds=kinds)
+        path = qa.write_suite(config, written, getattr(args, "suite", None))
+        print(f"Added {case['id']} to {path}")
+        print(f"To use it: {starters.BY_KEY[args.starter].change_this}")
+        print("Then run: harness qa run --case " + case["id"])
+        return 0
+
+    if command == "remove":
+        suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
+        keeping = [item.to_dict() for item in suite.cases if item.id != args.case_id]
+        if len(keeping) == len(suite.cases):
+            known = ", ".join(item.id for item in suite.cases) or "none"
+            raise HarnessError(f"There is no check called {args.case_id}. This suite holds: {known}")
+        written = qa.parse_suite(
+            {"schema_version": 1, "name": suite.name, "cases": keeping}, extra_kinds=kinds
+        )
+        path = qa.write_suite(config, written, getattr(args, "suite", None))
+        print(f"Took {args.case_id} out of {path}")
+        print(f"{_count(len(keeping), 'check')} left.")
+        return 0
+
+    if command == "fake":
+        rows = starters.made_up_rows(args.rows, args.column, args.seed)
+        if args.json:
+            _print_json(rows)
+            return 0
+        if args.output:
+            import csv
+            import io
+
+            page = io.StringIO()
+            writer = csv.DictWriter(page, fieldnames=list(rows[0]), lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(rows)
+            path = confined_path(config.project_root, args.output, allow_missing=True, allow_control=True)
+            if path.exists() and not args.replace:
+                raise HarnessError(
+                    f"{args.output} is already there. Choose another name, or use --replace."
+                )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(page.getvalue(), encoding="utf-8")
+            print(f"Wrote {_count(len(rows), 'row')} to {path}")
+            print('Use it in a check with "rows_file": "' + args.output + '"')
+            return 0
+        for row in rows:
+            print(json.dumps(row, ensure_ascii=False))
+        return 0
+
+    if command == "explain":
+        report = handover.read_run(config, getattr(args, "run", "") or "")
+        case, evidence = handover.failure_from_run(report, getattr(args, "case", "") or "")
+        print(f"Asking about: {case.get('title') or case.get('id')}")
+        if args.dry_run:
+            print("\n" + handover.failure_question(case, evidence))
+            return 0
+        answer = handover.explain_failure(config, case, evidence)
+        print()
+        print(answer.answer)
+        print("\nThis is advice from a model. Nothing was changed.")
+        return 0
+
+    if command == "ci":
+        relative = handover.write_build_file(
+            config, args.service, suite=args.suite or "", python=args.python, replace=args.replace
+        )
+        print(f"Wrote {relative}")
+        print("Look at it, change what you need, and commit it.")
+        return 0
+
+    if command == "pick":
+        width, height = 1280, 800
+        if getattr(args, "viewport", ""):
+            parts = str(args.viewport).lower().replace("*", "x").split("x")
+            if len(parts) != 2 or not all(part.strip().isdigit() for part in parts):
+                raise HarnessError("Write the window size as WIDTHxHEIGHT, for example 1280x800")
+            width, height = int(parts[0]), int(parts[1])
+        selectors.check_url(config, args.url)
+        print(f"Opening {args.url} in a browser window.")
+        print("Click the thing you want to check. Press Escape to give up.")
+        picked = selectors.pick(config, args.url, viewport=(width, height), seconds=args.seconds)
+        if args.json:
+            _print_json(picked.to_dict())
+            return 0 if picked.offered else 1
+        if picked.gave_up:
+            print("\nNothing was picked.")
+            return 1
+        said = f' that says "{picked.text}"' if picked.text else ""
+        print(f"\nYou picked a <{picked.tag or 'thing'}>{said}.")
+        if not picked.offered:
+            print("\nNothing on this page names it on its own.")
+            print("Every name tried matched either nothing or several things:")
+            for item in picked.thrown_away[:6]:
+                print(f"  {item.selector} matches {_count(item.matches, 'thing')}")
+            print("\nAsk whoever wrote the page to add data-testid=\"something\" to it.")
+            return 1
+        print(f"\n{_count(len(picked.offered), 'name')} you can use, best first:")
+        for position, item in enumerate(picked.offered, start=1):
+            print(f"  {position}. {selectors.describe(item)}")
+        print("\nPaste this into the steps of a browser check:")
+        print("  " + json.dumps(selectors.starter_step(picked.offered[0])))
+        if picked.thrown_away:
+            print(f"\nAlso tried, but not offered:")
+            for item in picked.thrown_away[:5]:
+                print(f"  {item.selector} matches {_count(item.matches, 'thing')}")
+        return 0
+
+    if command == "baseline":
+        suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
+        wanted = [case.id for case in suite.cases if case.kind == "visual"]
+        if args.case:
+            unknown = sorted(set(args.case) - set(wanted))
+            if unknown:
+                raise HarnessError(f"{unknown[0]} is not a screenshot check in this suite")
+            wanted = [case_id for case_id in wanted if case_id in set(args.case)]
+        if not wanted:
+            print("This suite has no screenshot checks yet.")
+            print('Add one with "kind": "visual" and a url, then run this again.')
+            return 0
+        runner = qa.QaRunner(
+            config,
+            extra_kinds=kinds,
+            environment=getattr(args, "environment", "") or "",
+            update_baselines=True,
+        )
+        result = runner.run(suite, ids=wanted, write_artifacts=False)
+        for case in result.cases:
+            note = case.attempts[-1].evidence if case.attempts else ""
+            print(f"  {case.id}: {note or case.status}")
+        if not result.passed:
+            print("Some pictures could not be taken. The lines above say why.")
+        print("Look at the saved pictures before you keep them. They are what every later run is judged against.")
         return 0 if result.passed else 1
 
     if command == "watch":
         suite = qa.load_suite(config, getattr(args, "suite", None), kinds)
-        runner = qa.QaRunner(config, extra_kinds=kinds)
+        runner = qa.QaRunner(config, extra_kinds=kinds, environment=getattr(args, 'environment', '') or '')
         tags = args.tag or ()
         chosen = runner.select(suite, tags=tags)
         watcher = ProjectWatcher(
             config,
             interval_seconds=args.interval,
             quiet_seconds=args.quiet,
+            # Watching only part of a project is worth saying out loud. Said
+            # quietly, it looks exactly like a project where nothing happens.
+            on_partial=lambda note: print(f"\nOnly part of this project is watched. {note}"),
         )
         print(f"Watching {config.project_root} for changes.")
         if args.every:
             print(f"They also run every {args.every:g} seconds, whether anything changed or not.")
         print(f"{_count(len(chosen), 'check')} will run each time. Press Ctrl+C to stop.")
+
+        # Every run counts, not only the first one, so a watch session that saw
+        # a failure ends with a failing code and can be used as a gate.
+        outcome = {"all_passed": True}
 
         def run_once(changes: Changes | None = None) -> bool:
             if changes is not None:
@@ -595,9 +1109,11 @@ def command_qa(args: argparse.Namespace) -> int:
             for case in result.cases:
                 if case.status == qa.STATUS_FAILED:
                     print(f"  {case.id}: {case.reasons[0] if case.reasons else 'failed'}")
+            outcome["all_passed"] = outcome["all_passed"] and result.passed
             return result.passed
 
-        passed = run_once() if not args.skip_first else True
+        if not args.skip_first:
+            run_once()
         try:
             batches = watcher.watch(
                 lambda changes: run_once(changes),
@@ -606,9 +1122,47 @@ def command_qa(args: argparse.Namespace) -> int:
             )
         except KeyboardInterrupt:
             print("\nStopped watching.")
-            return 0 if passed else 1
+            return 0 if outcome["all_passed"] else 1
         print(f"\nStopped after {_count(batches, 'run')}.")
-        return 0
+        if not outcome["all_passed"]:
+            print("Some checks failed while watching.")
+        return 0 if outcome["all_passed"] else 1
+
+    if command == "env":
+        action = args.env_command
+        known = datasets.load_environments(config)
+        if action == "list":
+            if args.json:
+                _print_json(known)
+                return 0
+            if not known:
+                print("No settings are saved. Add some with: harness qa env set <name> KEY=value")
+                return 0
+            for name in sorted(known):
+                print(f"  {name}")
+                for key in sorted(known[name]):
+                    print(f"      {key} = {known[name][key]}")
+            return 0
+        if action == "set":
+            values = dict(known.get(args.name, {}))
+            for pair in args.value:
+                if "=" not in pair:
+                    raise HarnessError(f"Write each value as KEY=value, not {pair}")
+                key, _, item = pair.partition("=")
+                values[key.strip()] = item
+            known[args.name] = values
+            path = datasets.save_environments(config, known)
+            print(f"Saved {_count(len(values), 'value')} under {args.name} in {path}")
+            print("Use them in a check as ${env.NAME}, and run: harness qa run --environment " + args.name)
+            return 0
+        if action == "delete":
+            if args.name not in known:
+                raise HarnessError(f"There are no settings named {args.name}")
+            known.pop(args.name)
+            datasets.save_environments(config, known)
+            print(f"Removed the settings named {args.name}")
+            return 0
+        raise HarnessError("An env command is required")
 
     if command == "advise":
         try:
@@ -741,8 +1295,35 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--config", help="Extra config file loaded after project config")
     sub = root.add_subparsers(dest="command", required=True)
 
+    start = sub.add_parser(
+        "start",
+        help="Set this project up and open the panel, in one go. The one to run first.",
+    )
+    start.add_argument("path", nargs="?", default="")
+    start.add_argument("--port", type=int, default=0, help="Port for the panel; 0 asks for a free one")
+    start.add_argument("--no-panel", action="store_true", help="Set up, but do not open the panel")
+    start.add_argument(
+        "--no-open-browser", action="store_true", help="Start the panel without opening a browser"
+    )
+    start.set_defaults(handler=command_start)
+
+    carry_it = sub.add_parser(
+        "carry", help="Carry this setup to another machine, or unpack one here"
+    )
+    carry_sub = carry_it.add_subparsers(dest="carry_command", required=True)
+    packing = carry_sub.add_parser("pack", help="Write the setup to one file")
+    packing.add_argument("--output", default="harness-setup.json")
+    packing.set_defaults(handler=command_carry)
+    unpacking = carry_sub.add_parser("unpack", help="Write a carried setup into this project")
+    unpacking.add_argument("file")
+    unpacking.add_argument(
+        "--over-the-top", action="store_true",
+        help="Write over anything already here. Off by default, on purpose.",
+    )
+    unpacking.set_defaults(handler=command_carry)
+
     init = sub.add_parser("init", help="Scan a project and create .harness/config.json")
-    init.add_argument("path", nargs="?", default=".")
+    init.add_argument("path", nargs="?", default="")
     init.add_argument("--provider", choices=sorted(PROVIDER_DEFAULTS), default="ollama")
     init.add_argument("--model")
     init.add_argument("--endpoint")
@@ -851,6 +1432,23 @@ def parser() -> argparse.ArgumentParser:
 
     audit = sub.add_parser("audit", help="Check the installed source for fixed paths and project bindings")
     audit.set_defaults(handler=command_audit)
+    bundle_command = sub.add_parser(
+        "bundle", help="Zip the checks, recent runs, settings, and machine notes to send to somebody"
+    )
+    bundle_command.add_argument(
+        "--part", action="append",
+        help=f"Which part to include; may repeat. One of: {', '.join(bundle.PARTS)}, or all",
+    )
+    bundle_command.add_argument(
+        "--runs", type=int, default=bundle.DEFAULT_RUNS, help="How many recent runs to include"
+    )
+    bundle_command.add_argument("--output", help="Where to write the zip")
+    bundle_command.add_argument(
+        "--replace", action="store_true", help="Write over a file that is already there"
+    )
+    bundle_command.add_argument("--read", help="Say what is inside a bundle instead of making one")
+    bundle_command.add_argument("--json", action="store_true", help="Print the answer as JSON")
+    bundle_command.set_defaults(handler=command_bundle)
     benchmark = sub.add_parser("benchmark", help="Run deterministic checks and optional provider-backed repair tasks")
     benchmark.add_argument("--seed", type=int, default=DEFAULT_SEED)
     benchmark.add_argument("--repetitions", type=int, choices=range(1, 11), default=1, metavar="1..10")
@@ -860,6 +1458,25 @@ def parser() -> argparse.ArgumentParser:
     benchmark.set_defaults(handler=command_benchmark)
     show = sub.add_parser("config", help="Print effective config and setting sources")
     show.set_defaults(handler=command_config_show)
+    seats = sub.add_parser(
+        "seats", help="Find the assistants you already pay for, and set them up"
+    )
+    seats_sub = seats.add_subparsers(dest="seats_command", required=True)
+    seats_list = seats_sub.add_parser("list", help="Say which assistants this machine can use")
+    seats_list.add_argument("--json", action="store_true")
+    seats_list.set_defaults(handler=command_seats)
+    seats_setup = seats_sub.add_parser(
+        "setup", help="Write a route for each assistant that is ready, and trust it"
+    )
+    seats_setup.add_argument(
+        "--only", action="append", help="Set up only this kind. May repeat."
+    )
+    seats_setup.add_argument(
+        "--no-trust", action="store_true",
+        help="Write the settings but do not trust them yet",
+    )
+    seats_setup.add_argument("--json", action="store_true")
+    seats_setup.set_defaults(handler=command_seats)
     trust = sub.add_parser("trust", help="Say the local config file in this project is yours")
     trust.add_argument("--yes", action="store_true", help="Do not ask first")
     trust.add_argument("--show", action="store_true", help="Only say whether it is trusted")
@@ -959,7 +1576,117 @@ def parser() -> argparse.ArgumentParser:
     qa_run.add_argument("--format", choices=qa.REPORT_FORMATS, default="markdown")
     qa_run.add_argument("--output", help="Write the report to this project-relative file")
     qa_run.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
+    qa_run.add_argument("--environment", help="Use these saved settings for ${env.NAME} values")
     qa_run.set_defaults(handler=command_qa)
+    qa_record = qa_sub.add_parser(
+        "record", help="Do a workflow by hand once, and get a check written from it"
+    )
+    qa_record.add_argument("--url", required=True, help="The page to open")
+    qa_record.add_argument("--name", help="A name for the new check")
+    qa_record.add_argument("--title", help="What the check is called in reports")
+    qa_record.add_argument("--viewport", default="", help="Window size as WIDTHxHEIGHT")
+    qa_record.add_argument("--seconds", type=float, help="How long to keep recording")
+    qa_record.add_argument("--suite", help="Suite file to write instead of the configured one")
+    qa_record.add_argument("--dry-run", action="store_true", help="Show the check without adding it")
+    qa_record.add_argument("--json", action="store_true", help="Print the check as JSON")
+    qa_record.set_defaults(handler=command_qa)
+    qa_changed = qa_sub.add_parser(
+        "changed", help="Say what moved since the run before: broken, fixed, new, gone, slower"
+    )
+    qa_changed.add_argument("--before", help="A kept run to compare from, by its folder name")
+    qa_changed.add_argument("--after", help="A kept run to compare with, by its folder name")
+    qa_changed.add_argument("--json", action="store_true")
+    qa_changed.set_defaults(handler=command_qa)
+    qa_coverage = qa_sub.add_parser(
+        "coverage", help="Walk your site and say which pages have no check at all"
+    )
+    qa_coverage.add_argument("--url", required=True, help="The address to start walking from")
+    qa_coverage.add_argument(
+        "--max-pages", type=int, default=coverage.DEFAULT_MAX_PAGES,
+        help="How many pages to open at most",
+    )
+    qa_coverage.add_argument(
+        "--stay-under", default="", help="Do not follow links outside this address"
+    )
+    qa_coverage.add_argument("--suite", help="Suite file to read instead of the configured one")
+    qa_coverage.add_argument(
+        "--write-missing", action="store_true",
+        help="Also write a plain 'the page opens' check for every page nobody looks at",
+    )
+    qa_coverage.add_argument("--json", action="store_true")
+    qa_coverage.set_defaults(handler=command_qa)
+    qa_share = qa_sub.add_parser(
+        "share", help="Make one web page of a run, pictures and all, that you can send to anyone"
+    )
+    qa_share.add_argument("--run", default="", help="Which kept run, by its folder name")
+    qa_share.add_argument("--output", default="", help="Where to write the page")
+    qa_share.add_argument(
+        "--no-pictures", action="store_true", help="Leave the screenshots out to keep the file small"
+    )
+    qa_share.add_argument("--json", action="store_true")
+    qa_share.set_defaults(handler=command_qa)
+    qa_starters = qa_sub.add_parser(
+        "starters", help="Show the ready-made checks you can add in one line"
+    )
+    qa_starters.add_argument("--json", action="store_true")
+    qa_starters.set_defaults(handler=command_qa)
+    qa_add = qa_sub.add_parser("add", help="Add one ready-made check to your suite")
+    qa_add.add_argument("starter", help="Which ready-made check; see: harness qa starters")
+    qa_add.add_argument("--url", help="The address it should look at")
+    qa_add.add_argument("--name", help="A name for the new check")
+    qa_add.add_argument("--suite", help="Suite file to write instead of the configured one")
+    qa_add.set_defaults(handler=command_qa)
+    qa_remove = qa_sub.add_parser("remove", help="Take one check out of your suite")
+    qa_remove.add_argument("case_id", help="Which check to take out")
+    qa_remove.add_argument("--suite", help="Suite file to write instead of the configured one")
+    qa_remove.set_defaults(handler=command_qa)
+    qa_fake = qa_sub.add_parser(
+        "fake", help="Make a table of made-up values to run a check against"
+    )
+    qa_fake.add_argument("--rows", type=int, default=10, help="How many rows")
+    qa_fake.add_argument(
+        "--column", action="append", default=[],
+        help="A column name such as name, email, password; may repeat",
+    )
+    qa_fake.add_argument("--seed", type=int, default=1, help="The same seed gives the same table")
+    qa_fake.add_argument("--output", help="Write it to this file instead of printing it")
+    qa_fake.add_argument(
+        "--replace", action="store_true", help="Write over a file that is already there"
+    )
+    qa_fake.add_argument("--json", action="store_true")
+    qa_fake.set_defaults(handler=command_qa)
+    qa_explain = qa_sub.add_parser(
+        "explain", help="Ask your model why a check failed, in plain words"
+    )
+    qa_explain.add_argument("--case", help="Which failed check; the first one by default")
+    qa_explain.add_argument("--run", help="A run report to read instead of the most recent")
+    qa_explain.add_argument(
+        "--dry-run", action="store_true", help="Show the question without asking anything"
+    )
+    qa_explain.set_defaults(handler=command_qa)
+    qa_ci = qa_sub.add_parser(
+        "ci", help="Write the file a build server needs to run these checks"
+    )
+    qa_ci.add_argument("service", choices=sorted(handover.SERVICES), help="Which build server")
+    qa_ci.add_argument("--suite", help="Suite file the build server should run")
+    qa_ci.add_argument("--python", default="3.11", help="Which Python version to ask for")
+    qa_ci.add_argument("--replace", action="store_true", help="Write over a file that is already there")
+    qa_ci.set_defaults(handler=command_qa)
+    qa_pick = qa_sub.add_parser(
+        "pick", help="Open a page, click something, and get a name a check can use"
+    )
+    qa_pick.add_argument("--url", required=True, help="The page to open, such as http://127.0.0.1:8765/")
+    qa_pick.add_argument("--viewport", default="", help="Window size as WIDTHxHEIGHT, such as 1280x800")
+    qa_pick.add_argument("--seconds", type=float, help="How long to wait for the click")
+    qa_pick.add_argument("--json", action="store_true", help="Print the answer as JSON")
+    qa_pick.set_defaults(handler=command_qa)
+    qa_baseline = qa_sub.add_parser(
+        "baseline", help="Save today's screenshots as the pictures later runs are judged against"
+    )
+    qa_baseline.add_argument("--suite", help="Suite file to read instead of the configured one")
+    qa_baseline.add_argument("--case", action="append", help="Only save this check id; may repeat")
+    qa_baseline.add_argument("--environment", help="Use these saved settings for ${env.NAME} values")
+    qa_baseline.set_defaults(handler=command_qa)
     qa_watch = qa_sub.add_parser("watch", help="Run the checks again whenever a project file changes")
     qa_watch.add_argument("--suite", help="Suite file to read instead of the configured one")
     qa_watch.add_argument("--tag", action="append", help="Only run checks with this tag; may repeat")
@@ -969,11 +1696,24 @@ def parser() -> argparse.ArgumentParser:
     qa_watch.add_argument("--max-runs", type=int, help="Stop after this many runs")
     qa_watch.add_argument("--skip-first", action="store_true", help="Wait for a change before the first run")
     qa_watch.add_argument("--no-artifacts", action="store_true", help="Do not keep evidence files")
+    qa_watch.add_argument("--environment", help="Use these saved settings for ${env.NAME} values")
     qa_watch.set_defaults(handler=command_qa)
     qa_advise = qa_sub.add_parser("advise", help="Say what to do about the checks, based on past runs")
     qa_advise.add_argument("--suite", help="Suite file to read instead of the configured one")
     qa_advise.add_argument("--json", action="store_true")
     qa_advise.set_defaults(handler=command_qa)
+    qa_env = qa_sub.add_parser("env", help="Keep named settings that checks can use")
+    qa_env_sub = qa_env.add_subparsers(dest="env_command", required=True)
+    qa_env_list = qa_env_sub.add_parser("list", help="Show every saved set of settings")
+    qa_env_list.add_argument("--json", action="store_true")
+    qa_env_list.set_defaults(handler=command_qa)
+    qa_env_set = qa_env_sub.add_parser("set", help="Add or change one set of settings")
+    qa_env_set.add_argument("name")
+    qa_env_set.add_argument("value", nargs="+", help="One or more KEY=value pairs")
+    qa_env_set.set_defaults(handler=command_qa)
+    qa_env_delete = qa_env_sub.add_parser("delete", help="Remove one set of settings")
+    qa_env_delete.add_argument("name")
+    qa_env_delete.set_defaults(handler=command_qa)
     qa_flaky = qa_sub.add_parser("flaky", help="Name the checks whose result keeps changing")
     qa_flaky.add_argument("--json", action="store_true")
     qa_flaky.set_defaults(handler=command_qa)
@@ -1001,7 +1741,30 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def _say_anything_in_any_language() -> None:
+    """Let this tool print any word a project might hold.
+
+    On Windows, when the output goes to a file or a build server rather than a
+    window, Python writes it in an old code page that has no Japanese, no
+    arrows, no em dash. A check whose name held one of those stopped the whole
+    command with a stack trace and left an empty report behind. Nothing about
+    that is the person's fault, and none of it is worth an error.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # An output that will not be told is still an output. Whatever it
+            # can write, it writes.
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _say_anything_in_any_language()
     try:
         args = parser().parse_args(argv)
         return int(args.handler(args))
@@ -1011,3 +1774,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("cancelled", file=sys.stderr)
         return 130
+    except (OSError, UnicodeError) as exc:
+        # Somewhere to write, and something in the way of writing it. A
+        # sentence is more use than a stack trace.
+        print(f"error: could not write the output: {exc}", file=sys.stderr)
+        return 2

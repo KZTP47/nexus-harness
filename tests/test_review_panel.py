@@ -169,10 +169,15 @@ class ReviewPanelTests(unittest.TestCase):
 
     def test_shared_deadline_cancels_unfinished_reviewers_without_losing_finished_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            panel = ReviewPanel(panel_config(Path(temporary), 2, 2, delays=[0.01, 2.0]))
+            # The margins are wide on purpose. What this proves is that a
+            # reviewer which finished is kept while one still going is let go
+            # of, and that has nothing to do with how fast the machine is. Half
+            # a second was enough on a quiet machine and not on a busy one, so
+            # the test failed for a reason that was never what it was about.
+            panel = ReviewPanel(panel_config(Path(temporary), 2, 2, delays=[0.01, 30.0]))
             started = time.monotonic()
-            result = panel.review({"patch": "x"}, deadline_at=started + 0.50)
-            self.assertLess(time.monotonic() - started, 1.50)
+            result = panel.review({"patch": "x"}, deadline_at=started + 5.0)
+            self.assertLess(time.monotonic() - started, 20.0)
             self.assertEqual(result.verdict, "BLOCK")
             self.assertIn("passed", [item.status for item in result.reviews])
             self.assertIn("cancelled", [item.status for item in result.reviews])

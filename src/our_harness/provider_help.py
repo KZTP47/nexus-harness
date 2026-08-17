@@ -255,7 +255,18 @@ def setup_advice(
     a network probe every time. Pressing Check again asks for a fresh one.
     """
 
-    key = f"{config.project_root}|{config.get('provider.name')}|{config.get('provider.endpoint')}"
+    # The model belongs in the key. Without it, changing model inside the
+    # short remembering window gives back advice naming the old one.
+    key = "|".join(
+        str(part)
+        for part in (
+            config.project_root,
+            config.get("provider.name"),
+            config.get("provider.endpoint"),
+            config.get("provider.model"),
+            config.get("provider.api_key_env"),
+        )
+    )
     now = clock()
     if not refresh:
         with _cache_lock:

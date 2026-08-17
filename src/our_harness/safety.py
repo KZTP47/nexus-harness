@@ -17,6 +17,15 @@ CONTROL_COMPONENTS = {".git", ".harness"}
 _DOS_DEVICES = {"con", "prn", "aux", "nul"} | {
     f"{prefix}{number}" for prefix in ("com", "lpt") for number in range(1, 10)
 }
+# The console, by its other names. Writing to one of these throws the words
+# away and the folder stays empty; reading from one waits for somebody to type
+# something, for ever.
+_DOS_DEVICES |= {"conin$", "conout$"}
+# Windows gives every folder a second, shorter name: .git is also GIT~1, and
+# .harness is also HARNES~1. Both open the same folder, so a rule that only
+# knows the long spelling is a rule with a door beside it. Nothing the harness
+# writes ever needs one of these, so the shape itself is refused.
+_SHORT_NAME = re.compile(r"^[^\\/]{1,6}~\d{1,3}(\.[^\\/.]{0,3})?$")
 
 
 def portable_component_key(component: str) -> str:
@@ -57,8 +66,13 @@ def validate_portable_relative_path(relative: str | Path, *, allow_control: bool
             raise HarnessError(f"Path components must not contain a colon or alternate data stream: {relative}")
         key = portable_component_key(component)
         device_stem = key.split(".", 1)[0].rstrip(" .")
-        if device_stem in _DOS_DEVICES:
+        if device_stem in _DOS_DEVICES or key in _DOS_DEVICES:
             raise HarnessError(f"Reserved Windows device path is not accepted: {relative}")
+        if _SHORT_NAME.match(key):
+            raise HarnessError(
+                f"Windows short names such as GIT~1 are not accepted, because they open the "
+                f"same folder under another spelling: {relative}"
+            )
         if not allow_control and key in CONTROL_COMPONENTS:
             raise HarnessError(f"Git and harness control paths are not accepted: {relative}")
 

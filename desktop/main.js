@@ -9,6 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
+const { attachGuards } = require("./guards");
 
 const server = new HarnessServer({ onExit: (code) => reportServerStopped(code) });
 let window = null;
@@ -94,7 +95,7 @@ function createWindow() {
     minWidth: 900,
     minHeight: 620,
     backgroundColor: "#071922",
-    title: "Our Harness",
+    title: "Nexus Harness",
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -108,14 +109,9 @@ function createWindow() {
   window.once("ready-to-show", () => window.show());
   window.on("closed", () => { window = null; });
 
-  // The window only ever shows this machine. Anything else opens in the
-  // user's own browser, where they can see the address before they trust it.
-  window.webContents.setWindowOpenHandler(({ url }) => {
-    if (!isLoopbackUrl(url)) shell.openExternal(url);
-    return { action: "deny" };
-  });
-  window.webContents.on("will-navigate", (event, url) => {
-    if (!allowedTarget(url)) event.preventDefault();
+  attachGuards(window.webContents, {
+    allowedTarget,
+    openExternally: (url) => shell.openExternal(url),
   });
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   return window;

@@ -38,7 +38,13 @@ def _content_bytes(entry: ChangePlan) -> bytes | None:
 
 def atomic_write(path: Path, content: bytes, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    handle, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    # The file is written under a temporary name first and then moved into
+    # place. Building that name out of the real one made it longer than the
+    # system allows, so a file the person could create by hand could not be
+    # written by the harness at all. A short fixed stem is used instead, and
+    # the first few letters are kept only to make it recognisable.
+    stem = "".join(letter for letter in path.name[:24] if letter.isalnum() or letter in "._-")
+    handle, name = tempfile.mkstemp(prefix=f".{stem}.", suffix=".tmp", dir=path.parent)
     temporary = Path(name)
     try:
         with os.fdopen(handle, "wb") as stream:

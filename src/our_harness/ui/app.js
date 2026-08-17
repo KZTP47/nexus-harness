@@ -18,6 +18,7 @@ let drag = null;
 let panDrag = null;
 let nextId = 1;
 let lastEvent = 0;
+let startedId = "";
 let pollTimer = null;
 let undoStack = [];
 let dialogPosition = {x: 360, y: 300};
@@ -254,9 +255,20 @@ function nearestNode(id, key) {
   const current = nodeById(id);
   if (!current) return null;
   const origin = position(current);
+  const order = graph.nodes.map((node) => node.id);
+  const place = order.indexOf(id);
   const candidates = graph.nodes.filter((node) => node.id !== id).map((node) => {
     const point = position(node); const dx = point.x - origin.x; const dy = point.y - origin.y;
-    const valid = key === "ArrowLeft" ? dx < 0 : key === "ArrowRight" ? dx > 0 : key === "ArrowUp" ? dy < 0 : dy > 0;
+    // Two agents can sit in exactly the same spot, for example when several
+    // are added from the palette without being dragged. Without this they
+    // could never be reached from one another with the arrow keys, so the
+    // order they were added in stands in for a direction.
+    const together = dx === 0 && dy === 0;
+    const later = order.indexOf(node.id) > place;
+    const forward = key === "ArrowRight" || key === "ArrowDown";
+    const valid = together
+      ? later === forward
+      : key === "ArrowLeft" ? dx < 0 : key === "ArrowRight" ? dx > 0 : key === "ArrowUp" ? dy < 0 : dy > 0;
     return {node, valid, score: Math.hypot(dx, dy) + (key === "ArrowLeft" || key === "ArrowRight" ? Math.abs(dy) : Math.abs(dx))};
   }).filter((item) => item.valid).sort((a, b) => a.score - b.score || a.node.id.localeCompare(b.node.id));
   return candidates[0]?.node || null;
@@ -397,6 +409,27 @@ function fillAgentSelect(select, chosen = "") {
 }
 function fillProviderSelect(select, chosen = "") {
   select.replaceChildren();
+  if (!catalog.providers.length) {
+    // With no model route set up, the form could never be filled in. Say what
+    // to do instead of leaving an empty box a person cannot get past.
+    const option = make("option", "", "No model is set up yet. Open Start here first.");
+    option.value = "";
+    option.disabled = true;
+    select.append(option);
+    select.value = "";
+    return;
+  }
+  if (catalog.providers.every((provider) => provider.graph_routing_allowed === false)) {
+    // Every route this project has refuses to run a workflow built here. The
+    // form is unusable until that is changed, so say exactly what to change.
+    const option = make(
+      "option", "",
+      "No model route may run a workflow yet. Set allow_project_graphs to true for one route."
+    );
+    option.value = "";
+    option.disabled = true;
+    select.append(option);
+  }
   for (const provider of catalog.providers) {
     const suffix = provider.credential?.environment_variable && !provider.credential.present ? " (key missing)" : "";
     const blocked = provider.graph_routing_allowed === false;
@@ -451,6 +484,17 @@ function submitAgent(event) {
   if (!graph.entry) graph.entry = id; selected = {kind: "node", id}; focusedNodeId = id; closeAgentDialog(); render(); focusNode(id); announce(`${label} added.`);
 }
 
+function freeSpot(x, y) {
+  // Step a new agent down and across until it is not exactly on top of one
+  // that is already there, so nothing is hidden behind anything else.
+  let spot = {x: Math.max(0, x), y: Math.max(0, y)};
+  for (let tries = 0; tries < 40; tries += 1) {
+    if (!graph.nodes.some((node) => position(node).x === spot.x && position(node).y === spot.y)) break;
+    spot = {x: spot.x + 40, y: spot.y + 30};
+  }
+  return spot;
+}
+
 function addNode(type, x = 360, y = 300, invoker = document.activeElement) {
   if (agentTypes.has(type)) { openAgentDialog(type, x, y, invoker); return; }
   if (type === "gauntlet") { addGauntlet(x, y); return; }
@@ -486,7 +530,7 @@ function updateSelectedEdge() {
 }
 
 function showIssues(result) {
-  const status = $("validationStatus"); const list = $("issueList"); list.replaceChildren(); status.className = result.valid ? "status-pass" : "status-fail"; status.textContent = result.valid ? "Graph is executable." : `Graph has ${result.issues.length} error(s).`; for (const issue of result.issues) list.append(make("li", "", `${issue.path}: ${issue.message}`)); announce(status.textContent, !result.valid);
+  const status = $("validationStatus"); const list = $("issueList"); list.replaceChildren(); status.className = result.valid ? "status-pass" : "status-fail"; status.textContent = result.valid ? "This workflow can run." : `This workflow has ${result.issues.length} problem${result.issues.length === 1 ? "" : "s"} to fix.`; for (const issue of result.issues) list.append(make("li", "", `${issue.path}: ${issue.message}`)); announce(status.textContent, !result.valid);
 }
 async function validate(candidate = graph) { try { const result = await request("/api/validate", {method: "POST", body: JSON.stringify({graph: candidate})}); showIssues(result); return result; } catch (error) { showError(error.message); return {valid: false, issues: []}; } }
 async function simulate() { const checked = await validate(); if (!checked.valid) return; try { const result = await request("/api/simulate", {method: "POST", body: JSON.stringify({graph, state: {test_failures_remaining: 1, temperature: .2}})}); await animateTransitions(result.transitions); appendEvent("simulation", result.complete ? "Complete" : result.error || "Stopped"); announce(result.complete ? "Simulation completed." : `Simulation stopped: ${result.error || result.stopped_at}`); } catch (error) { showError(error.message); } }
@@ -499,11 +543,44 @@ async function pollEvents() {
   clearTimeout(pollTimer);
   try {
     const result = await request(`/api/events?after=${lastEvent}&meta=1`); $("connectionStatus").textContent = "Connected"; $("connectionStatus").className = "status-pass";
+    // The harness gives every start its own mark. A different mark means it
+    // was restarted under this page, and its numbering began again, so the
+    // page must listen from the beginning or it would wait for ever.
+    if (result.started_id && startedId && result.started_id !== startedId) {
+      lastEvent = 0;
+      startedId = result.started_id;
+      appendEvent("connection", "The harness was restarted. Listening again from the beginning.");
+      announce("The harness was restarted. The panel is listening again.", true);
+      pollTimer = setTimeout(pollEvents, 200);
+      return;
+    }
+    if (result.started_id) startedId = result.started_id;
     if (result.gap) { appendEvent("connection", `${result.gap} older event(s) were dropped.`); announce(`${result.gap} older run events were dropped.`, true); }
-    for (const event of result.events) { lastEvent = Math.max(lastEvent, event.sequence); const detail = event.payload?.error || event.payload?.summary || event.kind; appendEvent(event.node || event.kind, detail); nodeStatuses.set(String(event.node || ""), event.kind === "failure" || event.kind === "run_error" ? "Failed" : event.kind === "node_start" ? "Running" : "Updated"); if (event.kind.startsWith("qa_")) applyCheckEvent(event); if (event.kind === "agent_message") applyTeamEvent(event); }
+    for (const event of result.events) {
+      // One odd event must never stop the rest of the batch being read.
+      try {
+        lastEvent = Math.max(lastEvent, Number(event?.sequence) || lastEvent);
+        const kind = String(event?.kind || "");
+        const detail = event?.payload?.error || event?.payload?.summary || kind || "an update";
+        appendEvent(event?.node || kind || "update", detail);
+        nodeStatuses.set(String(event?.node || ""), kind === "failure" || kind === "run_error" ? "Failed" : kind === "node_start" ? "Running" : "Updated");
+        // Every kind of news the checks view knows how to draw. A kind missing
+        // from this list is not an error anywhere: the button works, the answer
+        // arrives, and the page quietly never shows it.
+        if (["qa_", "pick_", "record_", "coverage_"].some((start) => kind.startsWith(start))) applyCheckEvent(event);
+        if (kind === "agent_message") applyTeamEvent(event);
+        if (kind.startsWith("pipeline_")) applyPipelineEvent(event);
+      } catch (error) {
+        appendEvent("update", `One update could not be read: ${error.message}`);
+      }
+    }
     if (result.events.length) {
       const now = Date.now();
       renderNodes(); await refreshUsage();
+      // The picture on the first screen lights up from the same news, so
+      // somebody watching it sees the run move without opening Workflow.
+      // Real news beats a walk through that has already finished.
+      if (howStages.length && !howWalk) { howWalkStates = new Map(); renderHowItWorks(); }
       if (now - lastLiveDataRefreshAt >= 1000) {
         lastLiveDataRefreshAt = now;
         if (!$("memoryView").hidden) await refreshMemory();
@@ -538,7 +615,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") refreshCheckup(); if (name === "checks") refreshChecks(); if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -580,11 +657,22 @@ function renderCheckup() {
   }
 }
 
+// Whether somebody has opened or closed "Ways to connect a model" by hand.
+// null means they have not touched it, so the panel decides.
+let modelSetupOpen = null;
+
 function modelSetup() {
   const advice = checkup?.model_setup;
   const box = make("details", "model-setup");
   if (!advice) return box;
-  box.open = !checkup.steps.find((step) => step.id === "provider")?.done;
+  // Open by itself when there is still a model to connect. Once somebody has
+  // opened or closed it themselves, that choice is kept: the first screen
+  // redraws on its own, and a panel that shuts while you are reading it is a
+  // panel nobody can use.
+  box.open = modelSetupOpen === null
+    ? !checkup.steps.find((step) => step.id === "provider")?.done
+    : modelSetupOpen;
+  box.addEventListener("toggle", () => { modelSetupOpen = box.open; });
   box.append(make("summary", "", "Ways to connect a model"));
   box.append(make("p", "", advice.headline));
   const list = make("ul", "model-list");
@@ -602,10 +690,104 @@ function modelSetup() {
       for (const line of option.steps) steps.append(make("li", "", line));
       item.append(steps);
     }
+    if (canDoForYou.includes(option.id)) {
+      // The whole list above, done for somebody who does not want to read it.
+      const button = make("button", "do-it-button", "I don't care, just do it for me");
+      button.type = "button";
+      button.dataset.option = option.id;
+      button.addEventListener("click", () => doItForMe(option.id));
+      item.append(button);
+      const said = make("div", "do-it-said");
+      said.id = `doIt-${option.id}`;
+      said.hidden = true;
+      // A job already running or just finished for this one goes straight back
+      // on screen, so a redraw never swallows the answer.
+      if (lastDoItJob && lastDoItJob.option === option.id) fillDoItBox(said, lastDoItJob);
+      item.append(said);
+    }
     list.append(item);
   }
   box.append(list, make("p", "field-help", advice.note));
   return box;
+}
+
+/* ---- I don't care, just do it for me ---- */
+
+// Which ways of connecting a model the harness can set up on its own. Asked
+// for once, rather than written down here where it would go stale.
+let canDoForYou = [];
+let doItTimer = null;
+// The last answer, kept so a redraw of the first screen can put it back.
+let lastDoItJob = null;
+
+async function loadWhatCanBeDoneForYou() {
+  try {
+    const said = await request("/api/setup/do-it");
+    canDoForYou = said.can_do || [];
+  } catch (error) { canDoForYou = []; }
+}
+
+async function doItForMe(option) {
+  const box = $(`doIt-${option}`);
+  if (!box) return;
+  document.querySelectorAll(".do-it-button").forEach((button) => { button.disabled = true; });
+  box.hidden = false;
+  box.replaceChildren(make("p", "field-help", "Starting."));
+  try {
+    renderDoItJob(await request("/api/setup/do-it", {
+      method: "POST", body: JSON.stringify({option}),
+    }), option);
+    watchDoItJob(option);
+  } catch (error) {
+    showError(error.message);
+    box.replaceChildren(make("p", "do-it-cannot", error.message));
+    document.querySelectorAll(".do-it-button").forEach((button) => { button.disabled = false; });
+  }
+}
+
+function watchDoItJob(option) {
+  if (doItTimer) window.clearTimeout(doItTimer);
+  const askAgain = async () => {
+    try {
+      const said = await request("/api/setup/do-it");
+      if (said.job) renderDoItJob(said.job, option);
+      if (said.busy) { doItTimer = window.setTimeout(askAgain, 1000); return; }
+    } catch (error) { showError(error.message); }
+    doItTimer = null;
+    document.querySelectorAll(".do-it-button").forEach((button) => { button.disabled = false; });
+    refreshCheckup();
+  };
+  doItTimer = window.setTimeout(askAgain, 1000);
+}
+
+function renderDoItJob(job, option) {
+  lastDoItJob = job;
+  const box = $(`doIt-${job.option || option}`);
+  if (!box) return;
+  fillDoItBox(box, job);
+}
+
+// Drawn into a box handed in, rather than one looked up by name, because the
+// first screen redraws itself while a job is running and the card holding the
+// answer is thrown away and built again. What somebody is reading has to
+// survive that, or the answer disappears mid-sentence.
+function fillDoItBox(box, job) {
+  box.hidden = false;
+  box.replaceChildren();
+  const steps = make("ol", "do-it-steps");
+  for (const step of job.steps || []) {
+    const item = make("li", `do-it-step ${step.state}`);
+    item.append(make("strong", "", step.text));
+    if (step.detail) item.append(make("p", "", step.detail));
+    steps.append(item);
+  }
+  if (job.steps && job.steps.length) box.append(steps);
+  if (job.running) box.append(make("p", "field-help", "Working on it. This can take a while."));
+  if (job.said) box.append(make("p", job.worked ? "do-it-worked" : "do-it-said-line", job.said));
+  for (const line of job.left_for_you || []) {
+    box.append(make("p", "do-it-cannot", `Left for you: ${line}`));
+  }
+  if (job.finished) announce(job.said);
 }
 
 async function quickRun() {
@@ -628,6 +810,7 @@ async function refreshChecks() {
     if (stored.result) qaResult = stored.result;
     renderChecks();
     await refreshUnstable();
+    await refreshChanged();
   } catch (error) { showError(error.message); }
 }
 
@@ -648,17 +831,61 @@ function renderChecks() {
     row.append(cell);
     body.append(row);
   }
-  for (const item of qaSuite.cases || []) {
+  // Choosing a tag narrows the list as well as the run, because showing every
+  // check while only some of them would run is confusing.
+  const shown = (qaSuite.cases || []).filter((item) => !select.value || (item.tags || []).includes(select.value));
+  if (qaSuite.present && !shown.length) {
+    const row = document.createElement("tr");
+    const cell = make("td", "", `No check carries the tag ${select.value}.`);
+    cell.colSpan = 5;
+    row.append(cell);
+    body.append(row);
+  }
+  for (const item of shown) {
     const found = resultById.get(item.id);
     const row = document.createElement("tr");
     const status = found ? found.status : "not run yet";
     const outcome = make("td", "");
     outcome.append(make("p", "", found && found.reasons.length ? found.reasons.join(" ") : found ? "As expected" : "Press Run all checks to try this one."));
+    // A failure says what happened. What to do about it is a different
+    // question, and the one somebody new actually has.
+    if (found && !found.passed) {
+      const why = make("button", "explain-button", "What does this mean?");
+      why.type = "button";
+      why.addEventListener("click", () => explainThis(why, found));
+      outcome.append(why);
+      const meaning = make("div", "explain");
+      meaning.id = `explain-${item.id}`;
+      meaning.hidden = true;
+      outcome.append(meaning);
+    }
     const evidence = found?.attempts?.at(-1)?.evidence || "";
     if (evidence) {
       const box = make("details", "");
       box.append(make("summary", "", "Show what the check saw"), make("pre", "", evidence));
       outcome.append(box);
+    }
+    // A picture of the page as it was when a step went wrong says more than
+    // any wording, so it is offered right there under the reason.
+    const pictures = (found?.artifacts || []).filter((name) => name.endsWith(".png"));
+    if (pictures.length && qaResult?.run_id) {
+      const box = make("details", "");
+      box.append(make("summary", "", pictures.length === 1 ? "Show the picture" : `Show ${pictures.length} pictures`));
+      box.addEventListener("toggle", () => box.open && showPictures(box, qaResult.run_id, pictures), {once: true});
+      outcome.append(box);
+    }
+    const remove = make("button", "", "Remove");
+    remove.type = "button";
+    remove.title = `Take ${item.id} out of the checks`;
+    remove.addEventListener("click", () => removeCheck(item.id, item.title));
+    outcome.append(remove);
+    if (found && (found.status === "failed" || found.status === "flaky")) {
+      // A beginner staring at a failure can ask the model the project is
+      // already set up with what it means and what to try.
+      const ask = make("button", "", "Ask why this failed");
+      ask.type = "button";
+      ask.addEventListener("click", () => explainFailure(found.id, outcome, ask));
+      outcome.append(ask);
     }
     row.append(
       make("td", "", `${item.title}\n${item.id}`),
@@ -669,6 +896,8 @@ function renderChecks() {
     );
     body.append(row);
   }
+  // The button only appears once there is something to photograph.
+  $("saveBaselines").hidden = !shown.some((item) => item.kind === "visual");
   renderCheckSummary();
 }
 
@@ -696,6 +925,19 @@ async function runChecks() {
   } catch (error) { showError(error.message); }
 }
 
+async function saveBaselines() {
+  const shots = (qaSuite?.cases || []).filter((item) => item.kind === "visual").length;
+  const ask = `Take a new picture of every screenshot check and keep it?\n\n`
+    + `${shots} check${shots === 1 ? "" : "s"} will be photographed. `
+    + `The pictures you keep are what every later run is judged against, so only do this when the pages look right.`;
+  if (!window.confirm(ask)) return;
+  try {
+    const answer = await request("/api/qa/baseline", {method: "POST", body: JSON.stringify({})});
+    $("checkStatus").textContent = `Taking ${answer.cases} picture${answer.cases === 1 ? "" : "s"}.`;
+    announce(`Saving ${answer.cases} screenshots.`);
+  } catch (error) { showError(error.message); }
+}
+
 async function createSuite() {
   try {
     const answer = await request("/api/qa/init", {method: "POST", body: JSON.stringify({replace: false})});
@@ -703,6 +945,37 @@ async function createSuite() {
     await refreshChecks();
     await refreshCheckup();
     switchView("checks");
+  } catch (error) { showError(error.message); }
+}
+
+async function refreshChanged() {
+  // What moved since last time is the useful question most mornings, so the
+  // panel answers it without being asked.
+  const box = $("changedSince");
+  try {
+    const found = await request("/api/qa/changed");
+    box.replaceChildren();
+    if (found.nothing_to_compare) {
+      box.append(make("p", "quiet", found.nothing_to_compare));
+      return;
+    }
+    const groups = [
+      ["Started failing", found.broke],
+      ["Fixed", found.fixed],
+      ["New", found.added],
+      ["Gone", found.gone],
+      ["Much slower", found.slower],
+    ].filter(([, items]) => (items || []).length);
+    if (!groups.length) {
+      box.append(make("p", "quiet", "Nothing changed since the run before."));
+      return;
+    }
+    for (const [label, items] of groups) {
+      box.append(make("h3", "", label));
+      const list = make("ul", "changed-list");
+      for (const item of items) list.append(make("li", "", `${item.title || item.case_id}: ${item.detail}`));
+      box.append(list);
+    }
   } catch (error) { showError(error.message); }
 }
 
@@ -964,7 +1237,1957 @@ function renderTeamNotes() {
   }
 }
 
+let starterList = [];
+
+async function refreshStarters() {
+  if (starterList.length) return;
+  try {
+    const answer = await request("/api/qa/starters");
+    starterList = answer.starters || [];
+  } catch (error) { showError(error.message); return; }
+  const box = $("starterList");
+  box.replaceChildren();
+  for (const item of starterList) {
+    const row = make("li", "");
+    const head = make("div", "starter-head");
+    const add = make("button", "", "Add this");
+    add.type = "button";
+    add.addEventListener("click", () => addStarter(item.key, add));
+    head.append(make("strong", "", item.title), add);
+    row.append(
+      head,
+      make("p", "", item.what_it_does),
+      make("p", "starter-needs", `To use it: ${item.change_this}  ·  Needs: ${item.needs}`)
+    );
+    box.append(row);
+  }
+}
+
+async function addStarter(key, button) {
+  const url = $("starterUrl").value.trim();
+  button.disabled = true;
+  try {
+    const answer = await request("/api/qa/add", {
+      method: "POST",
+      body: JSON.stringify({starter: key, url}),
+    });
+    $("checkStatus").textContent = `Added the check ${answer.added}. Press Run all checks to try it.`;
+    announce($("checkStatus").textContent);
+    await refreshChecks();
+  } catch (error) { showError(error.message); }
+  button.disabled = false;
+}
+
+async function explainFailure(caseId, holder, button) {
+  button.disabled = true;
+  button.textContent = "Asking...";
+  try {
+    const answer = await request("/api/qa/explain", {
+      method: "POST",
+      body: JSON.stringify({case: caseId}),
+    });
+    // The answer is written in as text, never as page code.
+    const box = make("div", "explain-box", answer.answer);
+    holder.append(box);
+    button.textContent = "Asked";
+    announce("The model answered about this check.");
+  } catch (error) {
+    showError(error.message);
+    button.disabled = false;
+    button.textContent = "Ask why this failed";
+  }
+}
+
+async function showPictures(box, runId, names) {
+  // The pictures are fetched with the session key in a header, never in the
+  // address, so nothing sensitive ends up in a link or a log line.
+  for (const name of names) {
+    const line = make("p", "quiet", name);
+    box.append(line);
+    try {
+      const answer = await fetch(`/api/qa/picture?path=${encodeURIComponent(runId + "/" + name)}`, {
+        headers: {"X-Harness-Token": token},
+      });
+      if (!answer.ok) throw new Error(`HTTP ${answer.status}`);
+      const picture = document.createElement("img");
+      picture.className = "run-picture";
+      picture.alt = `The page during ${name}`;
+      picture.src = URL.createObjectURL(await answer.blob());
+      picture.addEventListener("load", () => URL.revokeObjectURL(picture.src), {once: true});
+      box.append(picture);
+    } catch (error) {
+      box.append(make("p", "quiet", `That picture could not be shown: ${error.message}`));
+    }
+  }
+}
+
+async function removeCheck(id, title) {
+  if (!window.confirm(`Take the check "${title || id}" out of this project?`)) return;
+  try {
+    const answer = await request("/api/qa/remove", {method: "POST", body: JSON.stringify({case: id})});
+    $("checkStatus").textContent = `Took ${answer.removed} out. ${answer.cases} checks left.`;
+    announce($("checkStatus").textContent);
+    await refreshChecks();
+  } catch (error) { showError(error.message); }
+}
+
+async function makeBundle() {
+  try {
+    $("checkStatus").textContent = "Packing up the checks, the last few runs, and the settings.";
+    const answer = await request("/api/bundle", {method: "POST", body: JSON.stringify({})});
+    const left = (answer.left_out || []).length;
+    $("checkStatus").textContent = `Wrote ${answer.path} with ${answer.files} file${answer.files === 1 ? "" : "s"}.`
+      + (left ? ` ${left} thing${left === 1 ? " was" : "s were"} left out; the list is inside the zip.` : "")
+      + " Credentials were taken out. Read it before sending it on.";
+    announce($("checkStatus").textContent);
+  } catch (error) { showError(error.message); }
+}
+
+async function recordSteps() {
+  const address = window.prompt(
+    "Which page should open?\n\nDo the thing you want to check in the window that opens, "
+      + "then press Done in the bar at the top.",
+    window.location.origin + "/"
+  );
+  if (!address) return;
+  try {
+    await request("/api/qa/record", {method: "POST", body: JSON.stringify({url: address})});
+    $("checkStatus").textContent = "A browser window is opening. Do the thing you want to check, then press Done.";
+    announce($("checkStatus").textContent);
+  } catch (error) { showError(error.message); }
+}
+
+async function pickElement() {
+  const address = window.prompt(
+    "Which page should open?\n\nClick the thing you want to check in the window that opens. Press Escape there to give up.",
+    window.location.origin + "/"
+  );
+  if (!address) return;
+  try {
+    await request("/api/qa/pick", {method: "POST", body: JSON.stringify({url: address})});
+    $("checkStatus").textContent = "A browser window is opening. Click the thing you want to check.";
+    announce("A browser window is opening. Click the thing you want to check.");
+  } catch (error) { showError(error.message); }
+}
+
+async function makeSharePage() {
+  try {
+    const made = await request("/api/qa/share", {method: "POST", body: JSON.stringify({})});
+    const pictures = Number(made.pictures || 0);
+    $("checkStatus").textContent = `Wrote ${made.path}. It is one file with `
+      + `${pictures} picture${pictures === 1 ? "" : "s"} inside it, so you can send it to anyone.`
+      + (made.left_out && made.left_out.length ? ` Left out: ${made.left_out.slice(0, 3).join("; ")}` : "");
+    announce($("checkStatus").textContent);
+  } catch (error) { showError(error.message); }
+}
+
+/* ---- Setting up a subscription you already pay for ---- */
+
+let seatsFound = null;
+
+function markSeatStep(id, state) {
+  const step = $(id);
+  step.classList.remove("doing", "waiting", "done");
+  step.classList.add(state);
+}
+
+function renderSeats(found) {
+  seatsFound = found;
+  const list = $("seatList");
+  list.replaceChildren();
+  for (const seat of found.seats || []) {
+    const row = make("li", `seat ${seat.ready ? "ready" : "not-ready"}`);
+    row.append(make("span", "seat-state", seat.ready ? "Ready" : "Not here"));
+    const detail = make("div", "");
+    detail.append(make("strong", "", seat.label));
+    detail.append(make("p", "", seat.ready
+      ? `${seat.version} — found at ${seat.found_at}`
+      : seat.why_not));
+    if (!seat.ready && seat.install_hint) detail.append(make("p", "field-help", seat.install_hint));
+    if (seat.ready && seat.already_set_up) detail.append(make("p", "field-help", "A route for this is already in your settings."));
+    row.append(detail);
+    list.append(row);
+  }
+  const ready = (found.seats || []).filter((seat) => seat.ready);
+  $("seatFindSaid").textContent = ready.length
+    ? `${ready.length} of ${(found.seats || []).length} are ready to use.`
+    : "None of them are on this machine yet. Install one, then press the button again.";
+  markSeatStep("seatStepFind", "done");
+  markSeatStep("seatStepWrite", ready.length ? "doing" : "waiting");
+  $("setUpSeats").disabled = ready.length === 0;
+  $("setUpSeats").textContent = ready.length > 1
+    ? `Set up all ${ready.length} for me`
+    : "Set it up for me";
+  announce($("seatFindSaid").textContent);
+}
+
+/* ---- What does this mean? ----
+
+   A failing check says what happened. This says what it means and what to try,
+   in the words somebody who has not seen it before would use.
+*/
+
+async function explainThis(button, found) {
+  const box = $(`explain-${found.id}`);
+  if (!box) return;
+  if (!box.hidden) { box.hidden = true; button.textContent = "What does this mean?"; return; }
+  button.disabled = true;
+  try {
+    const said = [
+      ...(found.reasons || []),
+      found.attempts?.at(-1)?.evidence || "",
+    ].join("\n");
+    const meaning = await request("/api/explain", {
+      method: "POST", body: JSON.stringify({said, kind: found.kind}),
+    });
+    box.replaceChildren();
+    box.append(make("strong", "", meaning.headline));
+    if (meaning.because) box.append(make("p", "", meaning.because));
+    if ((meaning.try_this || []).length) {
+      box.append(make("p", "field-help", "Worth trying:"));
+      const list = make("ul", "explain-list");
+      for (const line of meaning.try_this) list.append(make("li", "", line));
+      box.append(list);
+    }
+    if (!meaning.sure) {
+      box.append(make("p", "field-help",
+        "That is a guess at what to look at, not a diagnosis. The harness did not "
+        + "recognise this one."));
+    }
+    box.hidden = false;
+    button.textContent = "Hide that";
+    announce(meaning.headline);
+  } catch (error) { showError(error.message); }
+  button.disabled = false;
+}
+
+/* ---- What it knows ----
+
+   Everything the harness has learned, drawn the way people already draw notes:
+   a circle for each note, a line for each link, and the whole thing settling
+   into a shape by pushing every circle apart and pulling linked ones together.
+
+   The picture is the point, so it says as much as a picture can: a note used
+   often is bigger, a note nothing has touched for months is dimmed, a link to
+   a note nobody has written yet is drawn as an outline. None of that needs
+   reading a word.
+*/
+
+let vaultNotes = [];
+let vaultLinks = [];
+let vaultMissing = [];
+let vaultTags = [];
+let vaultKinds = [];
+let vaultOpen = "";
+let vaultLooking = "";
+// What was asked of the harness, when the vault is too large to sift here.
+let vaultAskingFor = "";
+let vaultKindsWanted = new Set();
+let vaultTagWanted = "";
+let vaultPlaces = new Map();
+let vaultSettling = null;
+let vaultEditing = "";
+let vaultReached = "";
+
+async function refreshVault(name) {
+  try {
+    // With more notes than the picture draws, the sifting happens where the
+    // notes are; below that the page sifts what it already has, which is
+    // quicker than asking.
+    const parts = [];
+    if (name) parts.push(`name=${encodeURIComponent(name)}`);
+    if (vaultAskingFor) parts.push(`q=${encodeURIComponent(vaultAskingFor)}`);
+    const asked = parts.length ? `?${parts.join("&")}` : "";
+    const said = await request(`/api/vault${asked}`);
+    vaultNotes = said.notes || [];
+    vaultLinks = said.links || [];
+    vaultMissing = said.not_written_yet || [];
+    vaultTags = said.tags || [];
+    vaultKinds = said.kinds || [];
+    const counts = said.counts || {};
+    $("vaultCounts").textContent =
+      `${counts.notes || 0} notes, ${counts.links || 0} links`
+      + (counts.not_written_yet ? `, ${counts.not_written_yet} not written yet` : "")
+      + (counts.stale ? `, ${counts.stale} going stale` : "");
+    renderVaultKinds();
+    renderVaultTags();
+    renderVaultList();
+    settleTheVault();
+    offerToStartTheVault();
+    if (said.open) showVaultNote(said.open);
+    else if (said.gone) {
+      // Removed here, or in an editor, since this page last looked.
+      vaultOpen = "";
+      $("vaultNote").hidden = true;
+      $("vaultSaid").textContent = `${said.gone} is not here any more.`;
+      renderVaultList();
+    }
+  } catch (error) { showError(error.message); $("vaultSaid").textContent = error.message; }
+}
+
+// An empty vault is a blank page, which is the hardest thing to hand anybody.
+// It is offered a start rather than given one: opening a tab must never leave
+// files behind in somebody's project.
+function offerToStartTheVault() {
+  const said = $("vaultSaid");
+  if (vaultNotes.length) {
+    const offer = document.getElementById("vaultStart");
+    if (offer) offer.remove();
+    return;
+  }
+  if (document.getElementById("vaultStart")) return;
+  said.textContent = "Nothing has been written down yet.";
+  const start = make("button", "primary", "Write two notes to start me off");
+  start.type = "button";
+  start.id = "vaultStart";
+  start.addEventListener("click", async () => {
+    start.disabled = true;
+    try {
+      const answer = await request("/api/vault/start", {method: "POST", body: "{}"});
+      await refreshVault();
+      $("vaultSaid").textContent = answer.note;
+      announce(answer.note);
+    } catch (error) { showError(error.message); start.disabled = false; }
+  });
+  said.after(start);
+}
+
+function vaultShown() {
+  const looking = vaultLooking.trim().toLowerCase();
+  return vaultNotes.filter((note) => {
+    if (vaultKindsWanted.size && !vaultKindsWanted.has(note.kind)) return false;
+    if (vaultTagWanted && !(note.tags || []).includes(vaultTagWanted)) return false;
+    if (looking) {
+      const haystack = `${note.title} ${note.body} ${(note.tags || []).join(" ")}`.toLowerCase();
+      if (!haystack.includes(looking)) return false;
+    }
+    if ($("vaultOnlyNear").checked && vaultOpen) {
+      if (note.name === vaultOpen) return true;
+      return vaultLinks.some((link) =>
+        (link.from === vaultOpen && link.to === note.name)
+        || (link.to === vaultOpen && link.from === note.name));
+    }
+    return true;
+  });
+}
+
+function renderVaultKinds() {
+  const box = $("vaultKinds");
+  box.replaceChildren();
+  for (const kind of vaultKinds) {
+    const many = vaultNotes.filter((note) => note.kind === kind.kind).length;
+    const button = make("button", `vault-kind kind-${kind.kind}${vaultKindsWanted.has(kind.kind) ? " chosen" : ""}`,
+      `${kind.name} (${many})`);
+    button.type = "button";
+    button.title = kind.means;
+    button.dataset.kind = kind.kind;
+    button.setAttribute("aria-pressed", String(vaultKindsWanted.has(kind.kind)));
+    button.addEventListener("click", () => {
+      if (vaultKindsWanted.has(kind.kind)) vaultKindsWanted.delete(kind.kind);
+      else vaultKindsWanted.add(kind.kind);
+      renderVaultKinds();
+      renderVaultList();
+      settleTheVault();
+    });
+    box.append(button);
+  }
+}
+
+function renderVaultTags() {
+  const box = $("vaultTags");
+  box.replaceChildren();
+  if (!vaultTags.length) {
+    box.append(make("p", "hint", "No tags yet."));
+    return;
+  }
+  for (const tag of vaultTags) {
+    const button = make("button", `vault-tag${vaultTagWanted === tag.tag ? " chosen" : ""}`,
+      `#${tag.tag} ${tag.notes}`);
+    button.type = "button";
+    button.dataset.tag = tag.tag;
+    button.setAttribute("aria-pressed", String(vaultTagWanted === tag.tag));
+    button.addEventListener("click", () => {
+      vaultTagWanted = vaultTagWanted === tag.tag ? "" : tag.tag;
+      renderVaultTags();
+      renderVaultList();
+      settleTheVault();
+    });
+    box.append(button);
+  }
+}
+
+function renderVaultList() {
+  const list = $("vaultList");
+  list.replaceChildren();
+  const shown = vaultShown();
+  if (!shown.length) {
+    list.append(make("li", "hint", "No notes match that."));
+    return;
+  }
+  for (const note of shown) {
+    const item = make("li", "");
+    const button = make("button", `vault-list-one kind-${note.kind}${note.name === vaultOpen ? " chosen" : ""}${note.stale ? " stale" : ""}`, note.title);
+    button.type = "button";
+    button.dataset.note = note.name;
+    button.addEventListener("click", () => openVaultNote(note.name));
+    item.append(button);
+    list.append(item);
+  }
+}
+
+/* ---- the picture ---- */
+
+// Every circle pushes every other away, every link pulls its two together, and
+// the middle pulls gently on everything so nothing drifts off the page. Run a
+// few hundred times, that settles into a shape where linked notes sit together
+// - which is the whole point of drawing it at all.
+// The most notes worth drawing at once. Beyond this the picture is a cloud
+// nobody can read anyway, and the settling is slow enough to be felt.
+const MOST_TO_DRAW = 300;
+
+// Settling is heavy, and a search box sends a letter at a time. Waiting for
+// somebody to stop typing turns twelve settlings into one.
+function settleTheVaultSoon() {
+  if (vaultSettling) window.clearTimeout(vaultSettling);
+  vaultSettling = window.setTimeout(() => { vaultSettling = null; settleTheVault(); }, 180);
+}
+
+function settleTheVault() {
+  if (vaultSettling) { window.clearTimeout(vaultSettling); vaultSettling = null; }
+  const all = vaultShown();
+  const shown = all.slice(0, MOST_TO_DRAW);
+  if (all.length > shown.length) {
+    $("vaultSaid").textContent =
+      `Drawing the first ${shown.length} of ${all.length} notes. Search, or choose a kind, to see fewer.`;
+  }
+  const names = shown.map((note) => note.name);
+  const box = $("vaultGraph").getBoundingClientRect();
+  const wide = Math.max(320, box.width - 40);
+  const tall = Math.max(260, box.height - 40);
+  const places = new Map();
+  shown.forEach((note, spot) => {
+    const already = vaultPlaces.get(note.name);
+    const round = (spot / Math.max(1, shown.length)) * Math.PI * 2;
+    places.set(note.name, already || {
+      x: wide / 2 + Math.cos(round) * Math.min(wide, tall) * 0.32,
+      y: tall / 2 + Math.sin(round) * Math.min(wide, tall) * 0.32,
+    });
+  });
+  const near = vaultLinks.filter((link) => names.includes(link.from) && names.includes(link.to));
+  const rounds = shown.length > 120 ? 60 : shown.length > 60 ? 120 : 260;
+  for (let round = 0; round < rounds; round += 1) {
+    for (const one of names) {
+      for (const other of names) {
+        if (one === other) continue;
+        const a = places.get(one), b = places.get(other);
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let far = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        if (far > 260) continue;
+        const push = 900 / (far * far);
+        a.x += (dx / far) * push;
+        a.y += (dy / far) * push;
+      }
+    }
+    for (const link of near) {
+      const a = places.get(link.from), b = places.get(link.to);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const far = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const pull = (far - 150) * 0.012;
+      a.x += (dx / far) * pull; a.y += (dy / far) * pull;
+      b.x -= (dx / far) * pull; b.y -= (dy / far) * pull;
+    }
+    for (const one of names) {
+      const at = places.get(one);
+      at.x += (wide / 2 - at.x) * 0.006;
+      at.y += (tall / 2 - at.y) * 0.006;
+      at.x = Math.max(30, Math.min(wide - 30, at.x));
+      at.y = Math.max(30, Math.min(tall - 30, at.y));
+    }
+  }
+  // Settling gives a shape; it does not give a size. Left alone, a handful of
+  // notes ends up huddled in one corner of a large board with their names on
+  // top of each other. So the shape is stretched to fill the space it has,
+  // keeping every distance in proportion.
+  vaultPlaces = spreadOut(places, wide, tall);
+  drawTheVault();
+}
+
+// Take a settled shape and fit it to the board, without changing the shape.
+function spreadOut(places, wide, tall) {
+  const all = [...places.values()];
+  if (all.length < 2) {
+    if (all.length === 1) { all[0].x = wide / 2; all[0].y = tall / 2; }
+    return places;
+  }
+  const left = Math.min(...all.map((at) => at.x));
+  const right = Math.max(...all.map((at) => at.x));
+  const top = Math.min(...all.map((at) => at.y));
+  const bottom = Math.max(...all.map((at) => at.y));
+  // Room for the names, which sit under each circle.
+  const edge = 70;
+  const room = {wide: Math.max(80, wide - edge * 2), tall: Math.max(80, tall - edge * 2)};
+  const spread = Math.min(
+    room.wide / Math.max(1, right - left),
+    room.tall / Math.max(1, bottom - top),
+    2.4,
+  );
+  const middleX = (left + right) / 2, middleY = (top + bottom) / 2;
+  for (const at of all) {
+    at.x = wide / 2 + (at.x - middleX) * spread;
+    at.y = tall / 2 + (at.y - middleY) * spread;
+  }
+  return places;
+}
+
+function drawTheVault() {
+  // Only what has a place: the settling draws the first so many, and a circle
+  // with nowhere to be would land in the corner.
+  const shown = vaultShown().filter((note) => vaultPlaces.has(note.name));
+  const names = new Set(shown.map((note) => note.name));
+  const wires = $("vaultWires");
+  const box = $("vaultNodes");
+  wires.replaceChildren();
+  box.replaceChildren();
+
+  for (const link of vaultLinks) {
+    if (!names.has(link.from) || !names.has(link.to)) continue;
+    const a = vaultPlaces.get(link.from), b = vaultPlaces.get(link.to);
+    if (!a || !b) continue;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(a.x)); line.setAttribute("y1", String(a.y));
+    line.setAttribute("x2", String(b.x)); line.setAttribute("y2", String(b.y));
+    const touching = vaultOpen && (link.from === vaultOpen || link.to === vaultOpen);
+    line.setAttribute("class", `vault-wire${touching ? " near" : ""}`);
+    wires.append(line);
+  }
+
+  for (const note of shown) {
+    const at = vaultPlaces.get(note.name);
+    if (!at) continue;
+    const many = vaultLinks.filter((link) => link.from === note.name || link.to === note.name).length;
+    const size = Math.round(13 + Math.min(16, many * 2.2 + note.uses * 1.2));
+    const dot = make("button", `vault-dot kind-${note.kind}${note.name === vaultOpen ? " chosen" : ""}${note.stale ? " stale" : ""}`);
+    dot.type = "button";
+    dot.dataset.note = note.name;
+    dot.style.left = `${at.x}px`;
+    dot.style.top = `${at.y}px`;
+    dot.style.width = `${size}px`;
+    dot.style.height = `${size}px`;
+    dot.title = `${note.title} - ${note.kind}${note.stale ? ", going stale" : ""}`;
+    dot.setAttribute("aria-label",
+      `${note.title}. ${note.kind}. ${many} link${many === 1 ? "" : "s"}.`
+      + (note.stale ? " Going stale." : ""));
+    dot.addEventListener("click", () => openVaultNote(note.name));
+    dot.addEventListener("focus", () => { vaultReached = note.name; });
+    box.append(dot);
+    const label = make("span", `vault-label${note.name === vaultOpen ? " chosen" : ""}`, note.title);
+    label.style.left = `${at.x}px`;
+    label.style.top = `${at.y + size / 2 + 3}px`;
+    label.setAttribute("aria-hidden", "true");
+    box.append(label);
+  }
+
+  // A link to a note nobody has written yet, drawn as an outline. These are the
+  // most useful thing in the picture: what somebody meant to write down.
+  for (const link of vaultMissing) {
+    if (!names.has(link.from)) continue;
+    const a = vaultPlaces.get(link.from);
+    if (!a) continue;
+    const spot = {x: Math.max(24, a.x + 70), y: Math.max(24, a.y - 46)};
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(a.x)); line.setAttribute("y1", String(a.y));
+    line.setAttribute("x2", String(spot.x)); line.setAttribute("y2", String(spot.y));
+    line.setAttribute("class", "vault-wire not-yet");
+    wires.append(line);
+    const dot = make("button", "vault-dot not-yet", "");
+    dot.type = "button";
+    dot.dataset.note = `not-yet-${link.to}`;
+    dot.style.left = `${spot.x}px`;
+    dot.style.top = `${spot.y}px`;
+    dot.title = `${link.to} - nobody has written this one yet. Press to write it.`;
+    dot.setAttribute("aria-label", `${link.to}, not written yet. Press to write it.`);
+    dot.addEventListener("click", () => writeTheMissingNote(link.to));
+    box.append(dot);
+  }
+}
+
+function openVaultNote(name) {
+  vaultOpen = name;
+  renderVaultList();
+  drawTheVault();
+  refreshVault(name);
+}
+
+async function writeTheMissingNote(name) {
+  openVaultDialog({
+    title: String(name || "").replace(/-/g, " "),
+    kind: "about-this-project",
+    tags: [],
+    sure: 0.5,
+    body: "",
+  }, "");
+}
+
+function showVaultNote(around) {
+  const note = around.note;
+  vaultOpen = note.name;
+  $("vaultNote").hidden = false;
+  $("vaultNoteTitle").textContent = note.title;
+  const kind = (vaultKinds.find((one) => one.kind === note.kind) || {}).name || note.kind;
+  $("vaultNoteAbout").textContent =
+    `${kind}. Learned ${note.learned || "at some point"}, last touched ${note.touched || "then"}.`
+    + (note.came_from ? ` From ${note.came_from}.` : "")
+    + (note.uses ? ` Used ${note.uses} time${note.uses === 1 ? "" : "s"}, helped ${note.worked}.` : "")
+    + (note.stale ? " Nothing has touched this for a long time, so it may no longer be true." : "");
+  const body = $("vaultNoteBody");
+  body.replaceChildren();
+  for (const line of (note.body || "").split("\n")) {
+    if (!line.trim()) continue;
+    body.append(vaultLine(line));
+  }
+  const links = $("vaultNoteLinks");
+  links.replaceChildren();
+  links.append(vaultSideList("This points at", around.points_at));
+  links.append(vaultSideList("These point here", around.points_here));
+  const tags = make("p", "vault-note-tags", "");
+  for (const tag of note.tags || []) {
+    const one = make("button", "vault-tag", `#${tag}`);
+    one.type = "button";
+    one.addEventListener("click", () => {
+      vaultTagWanted = tag; renderVaultTags(); renderVaultList(); settleTheVault();
+    });
+    tags.append(one);
+  }
+  if ((note.tags || []).length) links.append(tags);
+  $("vaultSaid").textContent = `${note.title} is open.`;
+}
+
+// A line of a note, with [[links]] turned into something you can press.
+function vaultLine(line) {
+  const held = make("p", "");
+  const parts = String(line).split(/(\[\[[^\]]+\]\])/g);
+  for (const part of parts) {
+    const found = /^\[\[([^\]|]+)(?:\|([^\]]+))?\]\]$/.exec(part);
+    if (!found) { held.append(document.createTextNode(part)); continue; }
+    const name = found[1].trim();
+    const words = (found[2] || found[1]).trim();
+    const there = vaultNotes.some((note) => note.name === asAVaultName(name));
+    const link = make("button", `vault-inline-link${there ? "" : " not-yet"}`, words);
+    link.type = "button";
+    link.title = there ? `Open ${name}` : `${name} is not written yet. Press to write it.`;
+    link.addEventListener("click", () =>
+      there ? openVaultNote(asAVaultName(name)) : writeTheMissingNote(asAVaultName(name)));
+    held.append(link);
+  }
+  return held;
+}
+
+function asAVaultName(title) {
+  return String(title || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function vaultSideList(said, notes) {
+  const box = make("div", "vault-side-list");
+  box.append(make("h4", "", `${said} (${(notes || []).length})`));
+  if (!(notes || []).length) {
+    box.append(make("p", "hint", "Nothing yet."));
+    return box;
+  }
+  const list = make("ul", "");
+  for (const note of notes) {
+    const item = make("li", "");
+    const button = make("button", `vault-list-one kind-${note.kind}`, note.title);
+    button.type = "button";
+    button.addEventListener("click", () => openVaultNote(note.name));
+    item.append(button);
+    list.append(item);
+  }
+  box.append(list);
+  return box;
+}
+
+/* ---- writing one ---- */
+
+function openVaultDialog(note, changing) {
+  vaultEditing = changing || "";
+  const kinds = $("vaultFormKind");
+  kinds.replaceChildren();
+  for (const kind of vaultKinds) {
+    const option = make("option", "", kind.name);
+    option.value = kind.kind;
+    kinds.append(option);
+  }
+  $("vaultDialogTitle").textContent = vaultEditing ? "Change this note" : "A new note";
+  $("vaultFormTitle").value = note.title || "";
+  $("vaultFormKind").value = note.kind || "about-this-project";
+  $("vaultFormTags").value = (note.tags || []).join(", ");
+  $("vaultFormSure").value = String(note.sure ?? 0.5);
+  $("vaultFormBody").value = note.body || "";
+  $("vaultDialog").showModal();
+}
+
+function newVaultNote() {
+  openVaultDialog({title: "", kind: "about-you", tags: [], sure: 0.5, body: ""}, "");
+}
+
+function editVaultNote() {
+  const note = vaultNotes.find((one) => one.name === vaultOpen);
+  if (!note) return;
+  openVaultDialog(note, note.name);
+}
+
+async function saveVaultNote() {
+  const tags = $("vaultFormTags").value.split(",").map((tag) => tag.trim()).filter(Boolean);
+  try {
+    const said = await request("/api/vault/write", {
+      method: "POST",
+      body: JSON.stringify({
+        // Which note this is, when it is one that already exists. Without it a
+        // change of title would leave the old file behind and the vault would
+        // quietly hold two.
+        was: vaultEditing,
+        title: $("vaultFormTitle").value,
+        kind: $("vaultFormKind").value,
+        tags,
+        sure: Number($("vaultFormSure").value),
+        body: $("vaultFormBody").value,
+      }),
+    });
+    $("vaultDialog").close();
+    vaultEditing = "";
+    await refreshVault(said.note.name);
+    $("vaultSaid").textContent = `${said.note.title} is written down.`;
+    announce($("vaultSaid").textContent);
+  } catch (error) { showError(error.message); $("vaultSaid").textContent = error.message; }
+}
+
+async function removeVaultNote() {
+  const note = vaultNotes.find((one) => one.name === vaultOpen);
+  if (!note) return;
+  if (!window.confirm(`Remove the note "${note.title}"? The file is deleted.`)) return;
+  try {
+    const said = await request("/api/vault/remove", {
+      method: "POST", body: JSON.stringify({name: note.name}),
+    });
+    vaultOpen = "";
+    $("vaultNote").hidden = true;
+    await refreshVault();
+    $("vaultSaid").textContent = said.note;
+  } catch (error) { showError(error.message); }
+}
+
+// Saying a note helped is what turns a pile of them into something that gets
+// better: the ones that earn their place grow, and the ones that do not fade.
+async function vaultNoteWasUsed(wentWell) {
+  const note = vaultNotes.find((one) => one.name === vaultOpen);
+  if (!note) return;
+  try {
+    const said = await request("/api/vault/used", {
+      method: "POST", body: JSON.stringify({name: note.name, went_well: wentWell}),
+    });
+    await refreshVault(said.note.name);
+    $("vaultSaid").textContent = wentWell
+      ? `${said.note.title} has helped ${said.note.worked} of ${said.note.uses} times.`
+      : `${said.note.title} did not help that time. It is marked down.`;
+    announce($("vaultSaid").textContent);
+  } catch (error) { showError(error.message); }
+}
+
+async function vaultLearnFromRuns() {
+  const button = $("vaultLearn");
+  button.disabled = true;
+  $("vaultSaid").textContent = "Reading what the harness remembers.";
+  try {
+    const said = await request("/api/vault/learn", {method: "POST", body: "{}"});
+    await refreshVault();
+    $("vaultSaid").textContent = said.note;
+    announce(said.note);
+  } catch (error) { showError(error.message); $("vaultSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+// The picture without a pointer: arrow keys walk the notes, Enter opens one.
+function vaultGraphKey(event) {
+  const dots = [...$("vaultNodes").querySelectorAll(".vault-dot:not(.not-yet)")];
+  if (!dots.length) return;
+  const at = dots.findIndex((dot) => dot.dataset.note === vaultReached);
+  const forward = ["ArrowRight", "ArrowDown"].includes(event.key);
+  const back = ["ArrowLeft", "ArrowUp"].includes(event.key);
+  if (forward || back) {
+    event.preventDefault();
+    const next = at < 0 ? 0 : (at + (forward ? 1 : -1) + dots.length) % dots.length;
+    vaultReached = dots[next].dataset.note;
+    dots[next].focus();
+    const note = vaultNotes.find((one) => one.name === vaultReached);
+    if (note) $("vaultSaid").textContent = `${note.title}. Press Enter to open it.`;
+    return;
+  }
+  if (event.key === "Enter" && vaultReached) {
+    event.preventDefault();
+    openVaultNote(vaultReached);
+  }
+}
+
+/* ---- Settings ----
+
+   Every setting the harness has, in plain words, with what it is set to, what
+   it shipped as, and which file that value came from. Changing one writes it
+   and reads the whole thing back; anything the harness refuses is put straight
+   back, with the reason.
+*/
+
+let settingsHeld = [];
+let settingsGroups = [];
+
+async function refreshSettings() {
+  try {
+    const said = await request("/api/settings");
+    settingsHeld = said.settings || [];
+    settingsGroups = said.groups || [];
+    renderSettings();
+    $("settingsSaid").textContent =
+      `${settingsHeld.length} settings. ${settingsHeld.filter((one) => one.changed).length} are not as they shipped.`;
+  } catch (error) { showError(error.message); $("settingsSaid").textContent = error.message; }
+}
+
+function renderSettings() {
+  const list = $("settingsList");
+  list.replaceChildren();
+  const looking = $("settingsFilter").value.trim().toLowerCase();
+  const onlyChanged = $("settingsChangedOnly").checked;
+  const shown = settingsHeld.filter((one) => {
+    if (onlyChanged && !one.changed) return false;
+    if (!looking) return true;
+    return `${one.key} ${one.label} ${one.means}`.toLowerCase().includes(looking);
+  });
+  if (!shown.length) {
+    list.append(make("p", "field-help", "Nothing matches that."));
+    return;
+  }
+  const byGroup = [];
+  for (const one of shown) {
+    let group = byGroup.find((item) => item.name === one.group);
+    if (!group) { group = {name: one.group, items: []}; byGroup.push(group); }
+    group.items.push(one);
+  }
+  for (const group of byGroup) {
+    const box = make("details", "settings-group");
+    box.open = Boolean(looking) || onlyChanged || group.items.some((one) => one.changed);
+    const about = settingsGroups.find((item) => item.name === group.name)?.about || "";
+    const heading = make("summary", "");
+    heading.append(make("strong", "", group.name), make("span", "settings-count", ` ${group.items.length}`));
+    box.append(heading);
+    if (about) box.append(make("p", "field-help", about));
+    for (const one of group.items) box.append(settingRow(one));
+    list.append(box);
+  }
+}
+
+function settingRow(one) {
+  const row = make("div", `setting${one.changed ? " changed" : ""}`);
+  row.dataset.setting = one.key;
+  const head = make("div", "setting-head");
+  head.append(make("strong", "", one.label), make("code", "setting-key", one.key));
+  if (one.changed) head.append(make("span", "setting-mark", "changed"));
+  if (one.needs_your_own_file) head.append(make("span", "setting-mark yours", "your own file"));
+  row.append(head);
+  if (one.means) row.append(make("p", "", one.means));
+  row.append(make("p", "field-help", `Now: ${short(one.value)} - from ${one.came_from}. It shipped as ${short(one.shipped)}.`));
+
+  const line = make("div", "setting-line");
+  let input;
+  if (one.kind === "yes or no") {
+    input = make("select", "");
+    for (const choice of ["yes", "no"]) {
+      const option = make("option", "", choice);
+      option.value = choice;
+      input.append(option);
+    }
+    input.value = one.value ? "yes" : "no";
+  } else if (one.kind === "list" || one.kind === "settings of its own") {
+    input = make("textarea", "");
+    input.rows = 2;
+    input.value = asText(one);
+  } else {
+    input = make("input", "");
+    input.type = one.kind === "number" ? "number" : "text";
+    input.step = "any";
+    input.value = one.value === null || one.value === undefined ? "" : String(one.value);
+  }
+  input.id = `setting-${one.key}`;
+  input.dataset.for = one.key;
+  const label = make("label", "sr-only", `${one.label}, ${one.key}`);
+  label.htmlFor = input.id;
+  const save = make("button", "setting-save", "Save");
+  save.type = "button";
+  save.addEventListener("click", () => changeSetting(one.key, input));
+  const back = make("button", "setting-reset", "Put it back");
+  back.type = "button";
+  back.disabled = !one.changed;
+  back.addEventListener("click", () => resetSetting(one.key));
+  line.append(label, input, save, back);
+  row.append(line);
+  const said = make("p", "setting-said");
+  said.id = `settingSaid-${one.key}`;
+  row.append(said);
+  return row;
+}
+
+function asText(one) {
+  if (one.kind === "list" && Array.isArray(one.value)) {
+    // A command is a program and its arguments. Shown as somebody would type
+    // it, one per line, rather than as the nest of lists it is kept as.
+    if (one.key.endsWith("_commands")) {
+      return one.value.map((command) => (Array.isArray(command) ? command.join(" ") : String(command))).join("\n");
+    }
+    return one.value.join(", ");
+  }
+  return JSON.stringify(one.value);
+}
+
+function short(value) {
+  const said = typeof value === "string" ? value : JSON.stringify(value);
+  if (said === undefined || said === null) return "nothing";
+  return said.length > 80 ? `${said.slice(0, 77)}...` : said || "nothing";
+}
+
+async function changeSetting(key, input) {
+  const said = $(`settingSaid-${key}`);
+  said.className = "setting-said";
+  said.textContent = "Saving.";
+  try {
+    const done = await request("/api/settings/change", {
+      method: "POST", body: JSON.stringify({key, value: input.value}),
+    });
+    said.className = "setting-said good";
+    said.textContent = done.note;
+    announce(done.note);
+    await refreshSettings();
+    refreshCheckup();
+  } catch (error) {
+    said.className = "setting-said wrong";
+    said.textContent = error.message;
+    announce(error.message, true);
+  }
+}
+
+async function resetSetting(key) {
+  const said = $(`settingSaid-${key}`);
+  said.className = "setting-said";
+  said.textContent = "Putting it back.";
+  try {
+    const done = await request("/api/settings/reset", {
+      method: "POST", body: JSON.stringify({key}),
+    });
+    said.className = "setting-said good";
+    said.textContent = done.note;
+    announce(done.note);
+    await refreshSettings();
+    refreshCheckup();
+  } catch (error) {
+    said.className = "setting-said wrong";
+    said.textContent = error.message;
+  }
+}
+
+/* ---- Pipelines ----
+
+   Many jobs wired together, with gates between them. A pipeline is nodes and
+   arrows: an arrow means "after", and a gate looks at what came before it and
+   decides whether the work goes on.
+
+   The picture is drawn from what the harness says a pipeline may hold, so a
+   kind of step added to the engine turns up here without this file changing.
+*/
+
+let pipeline = {name: "First pipeline", nodes: [], edges: []};
+let pipelineKinds = [];
+let pipelineSaved = [];
+let pipelineStarters = [];
+let pipelineJoining = "";      // the node an arrow is being drawn from
+let pipelineDragging = null;
+let pipelineEditing = "";
+let pipelineStates = new Map();
+
+async function refreshPipelines(name) {
+  try {
+    const said = await request(`/api/pipelines${name ? `?name=${encodeURIComponent(name)}` : ""}`);
+    pipelineKinds = said.kinds || [];
+    pipelineSaved = said.saved || [];
+    pipelineStarters = said.starters || [];
+    pipeline = said.pipeline;
+    pipelineStates = new Map();
+    $("pipelineName").value = pipeline.name || "";
+    $("pipelineStop").disabled = !said.running;
+    renderPipelinePalette();
+    renderPipelineStarters();
+    renderPipelineSaved();
+    renderPipeline();
+    if (said.last_run) showPipelineRun(said.last_run);
+  } catch (error) { showError(error.message); }
+}
+
+function renderPipelineSaved() {
+  const list = $("pipelineList");
+  list.replaceChildren();
+  if (!pipelineSaved.length) {
+    list.append(make("li", "hint", "None saved yet. Draw one and press Save."));
+    return;
+  }
+  for (const name of pipelineSaved) {
+    const item = make("li", "");
+    const button = make("button", `pipeline-saved-one${name === pipeline.name ? " chosen" : ""}`, name);
+    button.type = "button";
+    button.addEventListener("click", () => refreshPipelines(name));
+    item.append(button);
+    list.append(item);
+  }
+}
+
+// Ready-made pipelines. A blank board is the hardest thing to hand somebody
+// who has not done this before, so these are the shapes people actually want,
+// each made of steps anybody could have dragged out themselves.
+function renderPipelineStarters() {
+  const list = $("pipelineStarters");
+  list.replaceChildren();
+  for (const starter of pipelineStarters) {
+    const item = make("li", "");
+    const button = make("button", "pipeline-starter", starter.title);
+    button.type = "button";
+    button.title = `${starter.when} ${starter.steps} steps.`;
+    button.dataset.starter = starter.key;
+    button.addEventListener("click", () => usePipelineStarter(starter));
+    item.append(button, make("p", "field-help", starter.when));
+    list.append(item);
+  }
+}
+
+async function usePipelineStarter(starter) {
+  if (pipeline.nodes.length
+      && !window.confirm(`Replace what is on the board with "${starter.title}"?`)) return;
+  try {
+    const said = await request("/api/pipelines/starter", {
+      method: "POST", body: JSON.stringify({key: starter.key}),
+    });
+    pipeline = said.pipeline;
+    pipelineStates = new Map();
+    $("pipelineName").value = pipeline.name;
+    $("pipelineLog").replaceChildren();
+    renderPipeline();
+    say(`${starter.title} is on the board. Press Run, or change it first.`);
+  } catch (error) { showError(error.message); say(error.message); }
+}
+
+function renderPipelinePalette() {
+  const box = $("pipelinePalette");
+  box.replaceChildren();
+  const groups = [];
+  for (const kind of pipelineKinds) {
+    let group = groups.find((item) => item.name === kind.group);
+    if (!group) { group = {name: kind.group, kinds: []}; groups.push(group); }
+    group.kinds.push(kind);
+  }
+  for (const group of groups) {
+    box.append(make("h4", "pipeline-group", group.name));
+    for (const kind of group.kinds) {
+      const button = make("button", `pipeline-add colour-${kind.colour}`, kind.label);
+      button.type = "button";
+      button.title = kind.summary;
+      button.dataset.kind = kind.id;
+      button.addEventListener("click", () => addPipelineNode(kind.id));
+      box.append(button);
+    }
+  }
+}
+
+function kindOf(id) {
+  return pipelineKinds.find((kind) => kind.id === id) || {label: id, colour: "grey", settings: []};
+}
+
+function addPipelineNode(kindId) {
+  const kind = kindOf(kindId);
+  let number = pipeline.nodes.length + 1;
+  while (pipeline.nodes.some((node) => node.id === `${kindId}-${number}`)) number += 1;
+  const spot = pipeline.nodes.length;
+  pipeline.nodes.push({
+    id: `${kindId}-${number}`,
+    kind: kindId,
+    label: kind.label,
+    settings: {},
+    at: {x: 40 + (spot % 4) * 250, y: 40 + Math.floor(spot / 4) * 150},
+  });
+  renderPipeline();
+  say(`Added ${kind.label}. Press Connect on one box, then another, to join them.`);
+}
+
+function say(words) {
+  $("pipelineSaid").textContent = words;
+  announce(words);
+}
+
+function renderPipeline() {
+  const box = $("pipelineNodes");
+  const wires = $("pipelineWires");
+  box.replaceChildren(wires);
+  for (const node of pipeline.nodes) {
+    const kind = kindOf(node.kind);
+    const card = make("div", `pipeline-node colour-${kind.colour}`);
+    card.dataset.node = node.id;
+    card.style.left = `${node.at?.x || 0}px`;
+    card.style.top = `${node.at?.y || 0}px`;
+    const state = pipelineStates.get(node.id);
+    if (state) card.dataset.state = state.state;
+
+    const head = make("div", "pipeline-node-head");
+    head.append(make("strong", "", node.label || kind.label));
+    card.append(head);
+    if ((node.label || "") !== kind.label) card.append(make("p", "pipeline-node-kind", kind.label));
+    if (state) {
+      card.append(make("p", "pipeline-node-state", state.said || state.state));
+    }
+    const buttons = make("div", "pipeline-node-buttons");
+    const join = make("button", "pipeline-node-button", pipelineJoining === node.id ? "Joining" : "Connect");
+    join.type = "button";
+    join.title = "Draw an arrow from this step to another";
+    join.addEventListener("click", (event) => { event.stopPropagation(); joinPipelineNodes(node.id); });
+    const settings = make("button", "pipeline-node-button", "Settings");
+    settings.type = "button";
+    settings.addEventListener("click", (event) => { event.stopPropagation(); openPipelineNode(node.id); });
+    const remove = make("button", "pipeline-node-button", "Remove");
+    remove.type = "button";
+    remove.addEventListener("click", (event) => { event.stopPropagation(); removePipelineNode(node.id); });
+    buttons.append(join, settings, remove);
+    card.append(buttons);
+
+    // The board is usable without a pointer. A box takes the keyboard, the
+    // arrow keys move it, and the same three things it can do are on keys.
+    card.tabIndex = 0;
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label",
+      `${node.label || kind.label}, ${kind.label}. Arrow keys move it. `
+      + "C connects, S for settings, Delete removes it.");
+    card.addEventListener("keydown", (event) => pipelineKey(event, node));
+    card.addEventListener("pointerdown", (event) => startPipelineDrag(event, node));
+    card.addEventListener("click", () => { if (pipelineJoining && pipelineJoining !== node.id) joinPipelineNodes(node.id); });
+    box.append(card);
+  }
+  drawPipelineWires();
+}
+
+function drawPipelineWires() {
+  const wires = $("pipelineWires");
+  wires.replaceChildren();
+  for (const edge of pipeline.edges) {
+    const from = pipeline.nodes.find((node) => node.id === edge.from);
+    const to = pipeline.nodes.find((node) => node.id === edge.to);
+    if (!from || !to) continue;
+    const x1 = (from.at?.x || 0) + 200, y1 = (from.at?.y || 0) + 34;
+    const x2 = (to.at?.x || 0), y2 = (to.at?.y || 0) + 34;
+    const middle = (x1 + x2) / 2;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    line.setAttribute("d", `M ${x1} ${y1} C ${middle} ${y1}, ${middle} ${y2}, ${x2} ${y2}`);
+    line.setAttribute("class", "pipeline-wire");
+    wires.append(line);
+    // A small cross in the middle of the arrow removes it, the way the old
+    // project did it: the thing you want to get rid of is what you press.
+    const cut = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    cut.setAttribute("cx", String(middle));
+    cut.setAttribute("cy", String((y1 + y2) / 2));
+    cut.setAttribute("r", "9");
+    cut.setAttribute("class", "pipeline-cut");
+    cut.addEventListener("click", () => {
+      pipeline.edges = pipeline.edges.filter((item) => !(item.from === edge.from && item.to === edge.to));
+      renderPipeline();
+      say(`Took the arrow from ${edge.from} to ${edge.to} out.`);
+    });
+    const cross = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    cross.setAttribute("x", String(middle));
+    cross.setAttribute("y", String((y1 + y2) / 2 + 4));
+    cross.setAttribute("class", "pipeline-cut-mark");
+    cross.textContent = "x";
+    wires.append(cut, cross);
+  }
+}
+
+function joinPipelineNodes(nodeId) {
+  if (!pipelineJoining) {
+    pipelineJoining = nodeId;
+    renderPipeline();
+    say(`Joining from ${nodeId}. Press another box to finish the arrow.`);
+    return;
+  }
+  if (pipelineJoining === nodeId) {
+    pipelineJoining = "";
+    renderPipeline();
+    say("Stopped joining.");
+    return;
+  }
+  const already = pipeline.edges.some((edge) => edge.from === pipelineJoining && edge.to === nodeId);
+  if (!already) pipeline.edges.push({from: pipelineJoining, to: nodeId});
+  const from = pipelineJoining;
+  pipelineJoining = "";
+  renderPipeline();
+  say(already ? "That arrow is already there." : `Joined ${from} to ${nodeId}.`);
+}
+
+function removePipelineNode(nodeId) {
+  pipeline.nodes = pipeline.nodes.filter((node) => node.id !== nodeId);
+  pipeline.edges = pipeline.edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId);
+  if (pipelineJoining === nodeId) pipelineJoining = "";
+  renderPipeline();
+  say(`Took ${nodeId} out.`);
+}
+
+// The keyboard, on a box. Everything the mouse can do, a key can do.
+function pipelineKey(event, node) {
+  const step = event.shiftKey ? 40 : 10;
+  const moves = {
+    ArrowLeft: [-step, 0], ArrowRight: [step, 0],
+    ArrowUp: [0, -step], ArrowDown: [0, step],
+  };
+  if (moves[event.key]) {
+    event.preventDefault();
+    node.at = {
+      x: Math.max(0, (node.at?.x || 0) + moves[event.key][0]),
+      y: Math.max(0, (node.at?.y || 0) + moves[event.key][1]),
+    };
+    renderPipeline();
+    keepPipelineFocus(node.id);
+    say(`${node.label} is at ${Math.round(node.at.x)}, ${Math.round(node.at.y)}.`);
+    return;
+  }
+  const key = event.key.toLowerCase();
+  if (key === "c") { event.preventDefault(); joinPipelineNodes(node.id); keepPipelineFocus(node.id); return; }
+  if (key === "s") { event.preventDefault(); openPipelineNode(node.id); return; }
+  if (event.key === "Delete" || event.key === "Backspace") {
+    event.preventDefault();
+    removePipelineNode(node.id);
+    const first = $("pipelineNodes").querySelector(".pipeline-node");
+    if (first) first.focus();
+  }
+}
+
+// Redrawing the board builds new boxes, and the keyboard would otherwise be
+// left on nothing at all.
+function keepPipelineFocus(nodeId) {
+  const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(nodeId)}"]`);
+  if (card) card.focus();
+}
+
+function startPipelineDrag(event, node) {
+  if (event.target.closest("button")) return;
+  const card = event.currentTarget;
+  const box = $("pipelineCanvas").getBoundingClientRect();
+  pipelineDragging = {
+    node,
+    grabX: event.clientX - box.left - (node.at?.x || 0),
+    grabY: event.clientY - box.top - (node.at?.y || 0),
+  };
+  card.setPointerCapture(event.pointerId);
+  card.classList.add("moving");
+}
+
+function movePipelineDrag(event) {
+  if (!pipelineDragging) return;
+  const box = $("pipelineCanvas").getBoundingClientRect();
+  const node = pipelineDragging.node;
+  node.at = {
+    x: Math.max(0, event.clientX - box.left - pipelineDragging.grabX),
+    y: Math.max(0, event.clientY - box.top - pipelineDragging.grabY),
+  };
+  const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(node.id)}"]`);
+  if (card) { card.style.left = `${node.at.x}px`; card.style.top = `${node.at.y}px`; }
+  drawPipelineWires();
+}
+
+function endPipelineDrag() {
+  if (!pipelineDragging) return;
+  const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(pipelineDragging.node.id)}"]`);
+  if (card) card.classList.remove("moving");
+  pipelineDragging = null;
+}
+
+/* ---- one step's settings ---- */
+
+const PIPELINE_FIELDS = {
+  suite: {label: "Suite file, if not the usual one", placeholder: ".harness/qa/suite.json"},
+  tag: {label: "Only checks with this tag", placeholder: "fast"},
+  case: {label: "Only this one check", placeholder: "readme"},
+  paths: {label: "Only these files or folders, separated by commas", placeholder: "src, tests"},
+  needs: {label: "How much has to pass", choices: ["all", "any"]},
+  command_kind: {label: "Which command", choices: ["test", "lint", "build"]},
+  instructions: {label: "What the model should write", long: true,
+                 placeholder: "Write a test for the basket total, covering an empty basket."},
+  write_to: {label: "Save the draft as", placeholder: "basket-total.test.js"},
+};
+
+function openPipelineNode(nodeId) {
+  const node = pipeline.nodes.find((item) => item.id === nodeId);
+  if (!node) return;
+  pipelineEditing = nodeId;
+  const kind = kindOf(node.kind);
+  $("pipelineNodeDialogTitle").textContent = kind.label;
+  $("pipelineNodeSummary").textContent = kind.summary || "";
+  $("pipelineNodeLabel").value = node.label || kind.label;
+  $("pipelineNodeTries").value = String(node.settings?.tries || 1);
+  const box = $("pipelineNodeSettings");
+  box.replaceChildren();
+  for (const name of kind.settings || []) {
+    const field = PIPELINE_FIELDS[name] || {label: name};
+    const id = `pipelineSetting-${name}`;
+    box.append(Object.assign(make("label", "", field.label), {htmlFor: id}));
+    let input;
+    if (field.choices) {
+      input = make("select", "");
+      for (const choice of field.choices) {
+        const option = make("option", "", choice);
+        option.value = choice;
+        input.append(option);
+      }
+    } else if (field.long) {
+      input = make("textarea", "");
+      input.rows = 4;
+    } else {
+      input = make("input", "");
+      input.type = "text";
+    }
+    input.id = id;
+    input.dataset.setting = name;
+    if (field.placeholder) input.placeholder = field.placeholder;
+    input.value = node.settings?.[name] || "";
+    box.append(input);
+  }
+  $("pipelineNodeDialog").showModal();
+}
+
+function savePipelineNode() {
+  const node = pipeline.nodes.find((item) => item.id === pipelineEditing);
+  if (!node) return;
+  node.label = $("pipelineNodeLabel").value.trim() || kindOf(node.kind).label;
+  const settings = {};
+  for (const input of $("pipelineNodeSettings").querySelectorAll("[data-setting]")) {
+    const value = input.value.trim();
+    if (value) settings[input.dataset.setting] = value;
+  }
+  const tries = Number($("pipelineNodeTries").value) || 1;
+  if (tries > 1) settings.tries = Math.min(5, Math.max(1, Math.round(tries)));
+  node.settings = settings;
+  $("pipelineNodeDialog").close();
+  renderPipeline();
+  say(`Saved the settings for ${node.label}.`);
+}
+
+/* ---- saving, checking, running ---- */
+
+function pipelineOnScreen() {
+  return {name: $("pipelineName").value.trim() || "Pipeline", nodes: pipeline.nodes, edges: pipeline.edges};
+}
+
+async function checkPipeline() {
+  try {
+    await request("/api/pipelines/check", {
+      method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
+    });
+    say("This pipeline can run.");
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+async function savePipeline() {
+  try {
+    const said = await request("/api/pipelines/save", {
+      method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
+    });
+    pipeline = said.pipeline;
+    say(`Saved ${pipeline.name}.`);
+    const list = await request("/api/pipelines");
+    pipelineSaved = list.saved || [];
+    renderPipelineSaved();
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+async function savePipelineAs() {
+  const name = window.prompt("Save it as", `${$("pipelineName").value} copy`);
+  if (!name) return;
+  $("pipelineName").value = name;
+  await savePipeline();
+}
+
+async function deletePipeline() {
+  const name = $("pipelineName").value.trim();
+  if (!name) return;
+  if (!window.confirm(`Remove the saved pipeline "${name}"? The drawing on screen stays.`)) return;
+  try {
+    const said = await request("/api/pipelines/delete", {method: "POST", body: JSON.stringify({name})});
+    pipelineSaved = said.saved || [];
+    renderPipelineSaved();
+    say(said.note);
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+function newPipeline() {
+  pipeline = {name: "New pipeline", nodes: [], edges: []};
+  pipelineStates = new Map();
+  $("pipelineName").value = pipeline.name;
+  $("pipelineLog").replaceChildren();
+  renderPipeline();
+  renderPipelineSaved();
+  say("A fresh one. Add a step from the left.");
+}
+
+async function runPipeline() {
+  try {
+    pipelineStates = new Map();
+    $("pipelineLog").replaceChildren();
+    renderPipeline();
+    await request("/api/pipelines/run", {
+      method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
+    });
+    $("pipelineStop").disabled = false;
+    say("Running. Each step lights up as it goes.");
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
+async function stopPipeline() {
+  try {
+    const said = await request("/api/pipelines/stop", {method: "POST", body: "{}"});
+    say(said.note);
+  } catch (error) { showError(error.message); }
+}
+
+// News from a run, arriving while it happens.
+function applyPipelineEvent(event) {
+  if (event.kind === "pipeline_started") {
+    $("pipelineStop").disabled = false;
+    say(`Running ${event.payload?.name || "the pipeline"}.`);
+    return;
+  }
+  if (event.kind === "pipeline_node") {
+    const result = event.payload || {};
+    pipelineStates.set(String(result.id), result);
+    renderPipeline();
+    addPipelineLogLine(result);
+    return;
+  }
+  if (event.kind === "pipeline_finished") {
+    $("pipelineStop").disabled = true;
+    showPipelineRun(event.payload || {});
+  }
+}
+
+function addPipelineLogLine(result) {
+  const log = $("pipelineLog");
+  const already = log.querySelector(`[data-node="${CSS.escape(String(result.id))}"]`);
+  const line = already || make("li", "");
+  line.dataset.node = String(result.id);
+  line.className = `pipeline-log-line ${result.state}`;
+  line.replaceChildren(
+    make("strong", "", result.label || result.id),
+    make("span", "", ` ${result.state}`),
+    make("span", "pipeline-log-said", result.said ? ` - ${result.said}` : "")
+  );
+  if (result.tries > 1) line.append(make("span", "pipeline-log-said", ` (try ${result.tries})`));
+  if (!already) log.append(line);
+}
+
+function showPipelineRun(run) {
+  for (const result of run.nodes || []) {
+    pipelineStates.set(String(result.id), result);
+    addPipelineLogLine(result);
+  }
+  renderPipeline();
+  if (run.said) say(run.said);
+}
+
+/* ---- Show me around ----
+
+   Six short stops, one per tab, each opening the tab it is talking about. A
+   person who has just opened this has no idea which of these words mean
+   anything, and reading a page of documentation to find out is exactly what
+   they will not do.
+
+   Every stop names a tab that is really in the panel: a stop pointing at a tab
+   nobody built would be a tour of somewhere else.
+*/
+
+const TOUR = [
+  {
+    view: "start",
+    where: "Start here",
+    title: "This screen gets the project ready",
+    said: "Four short steps, in any order. When they are all done, you can ask for a "
+      + "change in your own words at the bottom of this screen.",
+  },
+  {
+    view: "checks",
+    where: "Checks",
+    title: "Your checks live here",
+    said: "A check says what a working project looks like. Write one from a ready-made "
+      + "shelf, record yourself using the site, or point at something on a page.",
+  },
+  {
+    view: "pipelines",
+    where: "Pipelines",
+    title: "Many jobs, wired together",
+    said: "Run your checks and a security scan side by side, and only carry on if they "
+      + "passed. Start from a ready-made one on the left.",
+  },
+  {
+    view: "workflow",
+    where: "Workflow",
+    title: "Who does what, when you ask for a change",
+    said: "The agents that plan, change the files, and review the result. You can rewire "
+      + "them, and the picture on the first screen follows what you do here.",
+  },
+  {
+    view: "settings",
+    where: "Settings",
+    title: "Everything the harness can be told",
+    said: "Every setting in plain words, what it is now, and where that came from. "
+      + "Nothing has to be edited by hand.",
+  },
+  {
+    view: "history",
+    where: "History",
+    title: "What past runs did",
+    said: "Every run, step by step, with what each agent said and what it cost. This is "
+      + "where to look when something went differently from last time.",
+  },
+];
+
+let tourAt = -1;
+
+function showMeAround() {
+  tourAt = 0;
+  drawTour();
+}
+
+function drawTour() {
+  const box = $("tour");
+  if (tourAt < 0 || tourAt >= TOUR.length) {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  const stop = TOUR[tourAt];
+  // The tour sits above the tabs, so opening the tab it is talking about shows
+  // that tab and nothing else. Holding the first screen open as well drew two
+  // whole views one after the other, which is exactly the confusion a tour is
+  // supposed to save somebody from.
+  switchView(stop.view);
+  box.replaceChildren();
+  box.hidden = false;
+  box.append(make("span", "tour-where", `${stop.where} - ${tourAt + 1} of ${TOUR.length}`));
+  box.append(make("strong", "", stop.title));
+  box.append(make("p", "", stop.said));
+  const buttons = make("div", "tour-buttons");
+  if (tourAt > 0) {
+    const back = make("button", "", "Back");
+    back.type = "button";
+    back.addEventListener("click", () => { tourAt -= 1; drawTour(); });
+    buttons.append(back);
+  }
+  const on = make("button", "primary", tourAt === TOUR.length - 1 ? "That is the lot" : "Next");
+  on.type = "button";
+  on.addEventListener("click", () => { tourAt += 1; drawTour(); });
+  const stop_it = make("button", "", "Stop the tour");
+  stop_it.type = "button";
+  stop_it.addEventListener("click", () => { tourAt = -1; switchView("start"); drawTour(); });
+  buttons.append(on, stop_it);
+  box.append(buttons);
+  announce(`${stop.where}. ${stop.title}. ${stop.said}`);
+}
+
+/* ---- What happens when you ask for a change ---- */
+
+// The picture on the first screen. Drawn from the workflow the harness will
+// really run, so it can never describe something the harness does not do.
+let howStages = [];
+let howWalk = null;
+// How far the walk through has got, kept as a name against a state rather than
+// a handful of boxes. Anything that redraws the picture — pressing "Draw it
+// again", news arriving from a run — replaces every box on the page, and a
+// walk holding those boxes would carry on lighting up ones nobody can see.
+let howWalkStates = new Map();
+
+async function refreshHowItWorks() {
+  try {
+    // The workflow on screen when there is one, so editing it changes this too.
+    const drawn = graph && Array.isArray(graph.nodes) && graph.nodes.length ? graph : null;
+    const said = await request("/api/how-it-works", {
+      method: "POST",
+      body: JSON.stringify(drawn ? {graph: drawn} : {}),
+    });
+    howStages = said.stages || [];
+    $("howHeadline").textContent = said.headline || "";
+    renderHowItWorks();
+    const loops = $("howLoops");
+    loops.replaceChildren();
+    for (const line of said.loops || []) loops.append(make("li", "", line));
+  } catch (error) { showError(error.message); }
+}
+
+function renderHowItWorks() {
+  const list = $("howStages");
+  list.replaceChildren();
+  howStages.forEach((stage, spot) => {
+    const item = make("li", `how-stage ${stage.kind || ""}`);
+    item.dataset.stage = stage.id;
+    // One set of words for the box's look, another for the person reading it.
+    // These used to be the same string, so a real run wrote "Working on it"
+    // into the state and nothing lit up, because the styles key on "doing".
+    const walking = howWalkStates.get(stage.id);
+    const live = walking ? "" : howState(stage.id);
+    if (walking) item.dataset.state = walking;
+    else if (live) item.dataset.state = live.look;
+    const head = make("div", "how-head");
+    head.append(make("span", "how-number", String(spot + 1)), make("strong", "", stage.title));
+    item.append(head, make("p", "", stage.detail));
+    if (live) item.append(make("p", "how-state", live.said));
+    if ((stage.goes_back_to || []).length) {
+      item.append(make("p", "how-back", "If this goes wrong, the work goes back a step."));
+    }
+    list.append(item);
+  });
+  hideArrowsAtTheEndOfARow();
+}
+
+// The boxes wrap onto as many rows as the window needs. The arrow between two
+// boxes is drawn to the right of the first one, so the last box on a row would
+// otherwise point off the edge at nothing.
+function hideArrowsAtTheEndOfARow() {
+  const boxes = [...$("howStages").children];
+  boxes.forEach((box, spot) => {
+    const next = boxes[spot + 1];
+    box.classList.toggle("row-end", !next || next.offsetTop > box.offsetTop);
+  });
+}
+
+function howState(nodeId) {
+  // The same news the workflow canvas gets, so both agree about what is
+  // happening without either being told twice. Two things come back: the word
+  // the styles colour the box by, and the words a person reads.
+  const said = nodeStatuses.get(String(nodeId));
+  if (!said) return null;
+  const known = {
+    Running: {look: "doing", said: "Working on it"},
+    Updated: {look: "doing", said: "Working on it"},
+    Passed: {look: "done", said: "Done"},
+    Failed: {look: "wrong", said: "Something was wrong"},
+  };
+  return known[said] || {look: "doing", said};
+}
+
+async function demoHowItWorks() {
+  const button = $("howDemo");
+  if (howWalk) { window.clearTimeout(howWalk); howWalk = null; }
+  howWalkStates = new Map();
+  if (!howStages.length) await refreshHowItWorks();
+  if (!howStages.length) { $("howSaid").textContent = "There is no workflow to walk through yet."; return; }
+  button.disabled = true;
+  const walking = howStages.map((stage) => stage.id);
+  const quick = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let spot = 0;
+  const step = () => {
+    if (spot > 0) howWalkStates.set(walking[spot - 1], "done");
+    if (spot >= walking.length) {
+      renderHowItWorks();
+      howWalk = null;
+      button.disabled = false;
+      $("howSaid").textContent = "That is the whole thing. Ask for a change below and it really happens.";
+      announce("The walk through finished.");
+      return;
+    }
+    howWalkStates.set(walking[spot], "doing");
+    renderHowItWorks();
+    $("howSaid").textContent = `Step ${spot + 1} of ${walking.length}: ${howStages[spot].title}`;
+    spot += 1;
+    howWalk = window.setTimeout(step, quick ? 60 : 900);
+  };
+  step();
+}
+
+async function findSeats() {
+  const button = $("findSeats");
+  button.disabled = true;
+  $("seatFindSaid").textContent = "Looking, and asking each one its version.";
+  try {
+    renderSeats(await request("/api/seats"));
+  } catch (error) { showError(error.message); $("seatFindSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+async function setUpSeats() {
+  const ready = ((seatsFound && seatsFound.seats) || []).filter((seat) => seat.ready);
+  if (!ready.length) return;
+  const button = $("setUpSeats");
+  button.disabled = true;
+  try {
+    const done = await request("/api/seats/setup", {
+      method: "POST",
+      body: JSON.stringify({kinds: ready.map((seat) => seat.kind)}),
+    });
+    $("seatWriteSaid").textContent = done.trusted
+      ? `Written to ${done.settings_file} and trusted. Routes: ${done.routes.join(", ")}.`
+      : `Written to ${done.settings_file}. ${done.note}`;
+    if (done.kept && done.kept.length) {
+      $("seatWriteSaid").textContent += ` Your other settings were kept: ${done.kept.join(", ")}.`;
+    }
+    if (done.replaced && done.replaced.length) {
+      // Writing over somebody's earlier decision is said out loud, not left
+      // for them to notice in the file.
+      $("seatWriteSaid").textContent += ` Written over: ${done.replaced.join(", ")}.`;
+    }
+    $("seatFile").textContent = done.contents;
+    $("seatFileBox").hidden = false;
+    showTheChoiceAboutTrusting(done);
+    markSeatStep("seatStepWrite", "done");
+    $("undoSeats").hidden = false;
+    markSeatStep("seatStepShare", "doing");
+    $("shareTheWork").disabled = false;
+    $("shareTheWork").dataset.routes = JSON.stringify(done.routes);
+    announce($("seatWriteSaid").textContent);
+    refreshCheckup();
+  } catch (error) { showError(error.message); $("seatWriteSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+// A settings file that was already here and never trusted is not this panel's
+// to trust on its own, and not its place to refuse either. So it says what
+// trusting would allow, in the plainest words there are, and puts the choice
+// where it belongs.
+function showTheChoiceAboutTrusting(done) {
+  const box = $("trustChoice");
+  box.replaceChildren();
+  box.hidden = !done.needs_your_say;
+  if (!done.needs_your_say) return;
+  // The mark of the file being shown, handed back when the person says they
+  // have read it, so the harness can refuse if the file changed in between.
+  box.dataset.mark = done.mark || "";
+  box.append(make("strong", "", "This file was already here. Only you can say it is yours."));
+  box.append(make("p", "", done.note || ""));
+  if ((done.risky_parts || []).length) {
+    box.append(make("p", "", "Trusting it would allow this:"));
+    const list = make("ul", "trust-risks");
+    for (const line of done.risky_parts) list.append(make("li", "", line));
+    box.append(list);
+  } else {
+    // Never a clean bill of health. This says what was looked for and what was
+    // not found, which is a different thing from "there is nothing to worry
+    // about" - and saying the second while a file quietly starts programs is
+    // the worst thing this panel could do.
+    box.append(make("p", "", "Nothing in it matched the things this knows to look for."
+      + " That is not the same as safe. Read the file above yourself."));
+  }
+  box.append(make("p", "field-help", "The whole file is shown above. Nothing else was changed."));
+  const button = make("button", "danger", "I have read it - trust it anyway");
+  button.type = "button";
+  button.addEventListener("click", () => trustItAnyway(button));
+  box.append(button);
+}
+
+async function trustItAnyway(button) {
+  button.disabled = true;
+  try {
+    const said = await request("/api/settings/trust-anyway", {
+      method: "POST", body: JSON.stringify({seen: $("trustChoice").dataset.mark || ""}),
+    });
+    $("trustChoice").replaceChildren(make("p", "do-it-worked", said.note));
+    $("seatWriteSaid").textContent += " Trusted, because you said so.";
+    announce(said.note);
+    refreshCheckup();
+  } catch (error) { showError(error.message); button.disabled = false; }
+}
+
+async function undoSeats() {
+  const button = $("undoSeats");
+  button.disabled = true;
+  try {
+    const said = await request("/api/seats/undo", {method: "POST", body: "{}"});
+    $("seatWriteSaid").textContent = said.note;
+    $("seatFileBox").hidden = true;
+    button.hidden = true;
+    markSeatStep("seatStepWrite", "doing");
+    markSeatStep("seatStepShare", "waiting");
+    $("shareTheWork").disabled = true;
+    announce(said.note);
+    refreshCheckup();
+  } catch (error) { showError(error.message); $("seatWriteSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+async function shareTheWork() {
+  const routes = JSON.parse($("shareTheWork").dataset.routes || "[]");
+  if (!routes.length) return;
+  const button = $("shareTheWork");
+  button.disabled = true;
+  try {
+    const answer = await request("/api/seats/share-the-work", {
+      method: "POST",
+      body: JSON.stringify({graph, routes}),
+    });
+    graph = answer.graph;
+    render();
+    const list = $("seatJobs");
+    list.replaceChildren();
+    for (const node of graph.nodes || []) {
+      const route = (node.config || {}).provider_route;
+      if (!route) continue;
+      const row = make("li", "seat ready");
+      row.append(make("span", "seat-state", route));
+      const detail = make("div", "");
+      detail.append(make("strong", "", node.label || node.id));
+      detail.append(make("p", "", "Can send and read notes."));
+      row.append(detail);
+      list.append(row);
+    }
+    $("seatShareSaid").textContent =
+      "Done. Open the Workflow tab to see it, then press Start run.";
+    markSeatStep("seatStepShare", "done");
+    announce($("seatShareSaid").textContent);
+  } catch (error) { showError(error.message); $("seatShareSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+let coverageFound = null;
+
+async function findGaps() {
+  const address = window.prompt(
+    "Which address should the walk start from?\n\nIt opens your site, follows the links, and "
+      + "tells you which pages have no check at all.",
+    window.location.origin + "/"
+  );
+  if (!address) return;
+  try {
+    await request("/api/qa/coverage", {method: "POST", body: JSON.stringify({url: address})});
+    $("checkStatus").textContent = "Walking your site. This takes a moment.";
+    announce($("checkStatus").textContent);
+  } catch (error) { showError(error.message); }
+}
+
+function renderCoverage(found) {
+  coverageFound = found;
+  const box = $("coverageResult");
+  const bar = $("coverageBar");
+  const list = $("coverageList");
+  const button = $("addMissingChecks");
+  box.hidden = false;
+  list.textContent = "";
+  bar.textContent = "";
+  const pages = found.pages || [];
+  const missing = found.missing || [];
+  const percent = Number(found.percent || 0);
+  bar.setAttribute(
+    "aria-label",
+    `${percent} out of every 100 pages has a check of its own`
+  );
+  // One block per page, so the gap is something you see rather than count.
+  for (const page of pages) {
+    const block = make("span", `coverage-block coverage-${(page.state || "").replace(/ /g, "-")}`);
+    block.title = `${page.address} — ${page.state}`;
+    bar.append(block);
+  }
+  const parts = [
+    `Walked ${pages.length} page${pages.length === 1 ? "" : "s"}.`,
+    `${(found.checked || []).length} have a check of their own (${percent}%).`,
+  ];
+  if (found.note) parts.push(found.note);
+  if (found.more_pages) parts.push(`${found.more_pages} more were still waiting.`);
+  $("coverageSummary").textContent = parts.join(" ");
+  for (const page of pages) {
+    const row = make("li", `coverage-row coverage-${(page.state || "").replace(/ /g, "-")}`);
+    row.append(make("span", "coverage-state", page.state));
+    row.append(make("span", "coverage-address", page.address));
+    if ((page.checked_by || []).length) {
+      row.append(make("span", "quiet", `checked by ${page.checked_by.join(", ")}`));
+    }
+    list.append(row);
+  }
+  button.hidden = missing.length === 0;
+  button.textContent = missing.length === 1
+    ? "Write a check for that page"
+    : `Write a check for all ${missing.length} pages nobody looks at`;
+  $("checkStatus").textContent = missing.length
+    ? `${missing.length} page${missing.length === 1 ? " has" : "s have"} no check at all.`
+    : "Every page that was walked has a check.";
+  announce($("checkStatus").textContent, missing.length > 0);
+}
+
+async function addMissingChecks() {
+  const missing = (coverageFound && coverageFound.missing) || [];
+  if (!missing.length) return;
+  try {
+    const answer = await request("/api/qa/coverage/add", {
+      method: "POST",
+      body: JSON.stringify({addresses: missing}),
+    });
+    const added = answer.added || [];
+    $("checkStatus").textContent = `Added ${added.length} check${added.length === 1 ? "" : "s"}: `
+      + added.join(", ");
+    announce($("checkStatus").textContent);
+    $("addMissingChecks").hidden = true;
+    refreshChecks();
+  } catch (error) { showError(error.message); }
+}
+
+function renderPick(picked) {
+  const box = $("pickResult");
+  const names = $("pickNames");
+  const thrown = $("pickThrown");
+  names.replaceChildren();
+  thrown.textContent = "";
+  box.hidden = false;
+  if (picked.gave_up) {
+    $("pickSummary").textContent = "Nothing was picked.";
+    return;
+  }
+  const said = picked.text ? ` that says "${picked.text}"` : "";
+  $("pickSummary").textContent = picked.offered.length
+    ? `You picked a <${picked.tag || "thing"}>${said}. Best name first.`
+    : `You picked a <${picked.tag || "thing"}>${said}, but no name matches it on its own. `
+      + "Ask whoever wrote the page to add data-testid=\"something\" to it.";
+  for (const name of picked.offered) {
+    const row = make("li", "");
+    // Everything here is put in as text, never as page code, because these
+    // words come from whatever page was opened.
+    row.append(make("code", "", name.selector), make("span", "pick-why", name.reason));
+    const copy = make("button", "", "Copy step");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      const step = JSON.stringify({do: "expect_visible", target: name.selector});
+      try {
+        await navigator.clipboard.writeText(step);
+        copy.textContent = "Copied";
+        announce("Step copied.");
+      } catch (error) { showError("This browser would not let the harness copy. Select the name and copy it yourself."); }
+    });
+    row.append(copy);
+    if (name.warning) row.append(make("span", "pick-warning", name.warning));
+    names.append(row);
+  }
+  const others = picked.thrown_away || [];
+  if (others.length) {
+    thrown.textContent = "Also tried, but each matches the wrong number of things: "
+      + others.slice(0, 5).map((item) => `${item.selector} (${item.matches})`).join(", ");
+  }
+}
+
 function applyCheckEvent(event) {
+  if (event.kind === "record_started") { $("checkStatus").textContent = "Recording. Press Done in the browser window when you have finished."; return; }
+  if (event.kind === "record_error") { $("checkStatus").textContent = `Nothing was recorded: ${event.payload?.error || "unknown reason"}`; return; }
+  if (event.kind === "record_result") {
+    const left = (event.payload?.left_out || []).length;
+    $("checkStatus").textContent = `Added the check ${event.payload?.added} with ${event.payload?.steps} steps.`
+      + (left ? ` ${left} action${left === 1 ? " was" : "s were"} left out; see the run log.` : "");
+    for (const line of event.payload?.left_out || []) appendEvent("recording", line);
+    refreshChecks();
+    return;
+  }
+  if (event.kind === "pick_started") { $("checkStatus").textContent = "Waiting for you to click something."; return; }
+  if (event.kind === "pick_error") { $("checkStatus").textContent = `Could not open the page: ${event.payload?.error || "unknown reason"}`; return; }
+  if (event.kind === "pick_result") { $("checkStatus").textContent = "Picked."; renderPick(event.payload); return; }
+  if (event.kind === "coverage_started") { $("checkStatus").textContent = "Walking your site to see which pages are checked."; return; }
+  if (event.kind === "coverage_error") { $("checkStatus").textContent = `Could not walk the site: ${event.payload?.error || "unknown reason"}`; return; }
+  if (event.kind === "coverage_result") { renderCoverage(event.payload); return; }
   if (event.kind === "qa_started") { $("checkStatus").textContent = "Running."; return; }
   if (event.kind === "qa_error") { $("checkStatus").textContent = `Could not run: ${event.payload?.error || "unknown reason"}`; return; }
   if (event.kind !== "qa_result") return;
@@ -997,14 +3220,14 @@ function bindEvents() {
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
-  $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("refreshUnstable").addEventListener("click", refreshUnstable); $("checkTag").addEventListener("change", renderChecks);
+  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", runPipeline); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("refreshMemory").addEventListener("click", refreshMemory); $("memoryQuery").addEventListener("change", refreshMemory); $("memoryKind").addEventListener("change", refreshMemory); $("refreshPrompts").addEventListener("click", refreshPrompts); $("promptLeft").addEventListener("change", renderPromptCompare); $("promptRight").addEventListener("change", renderPromptCompare);
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && edgeDrag) { event.preventDefault(); finishEdgeDrag({pointerId: edgeDrag.pointerId}, true); } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !$("agentDialog").open) { event.preventDefault(); undo(); } });
 }
 
 async function boot() {
   bindEvents();
-  try { const value = await request("/api/bootstrap"); token = value.token; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await refreshCheckup(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
+  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
 }
 
 boot();

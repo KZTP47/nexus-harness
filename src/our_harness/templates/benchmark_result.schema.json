@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.invalid/our-harness/benchmark-result-v3.schema.json",
-  "title": "Our Harness benchmark result",
+  "title": "Nexus Harness benchmark result",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "benchmark", "run", "harness", "environment", "deterministic_score", "deterministic_score_uncapped", "maximum_score", "critical_cap_applied", "critical_failures", "case_summary", "agentic_score", "agentic", "cases"],

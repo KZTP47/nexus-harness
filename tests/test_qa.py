@@ -385,7 +385,10 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Step 2 of 3", joined)
         self.assertIn("expect_text on #two", joined)
         self.assertIn("the page shows nothing", joined)
-        self.assertIn("Only 2 of 3 steps ran", joined)
+        # Skipping the rest after a failure is deliberate, so it is said
+        # that way rather than as though steps went missing.
+        self.assertIn("1 later step was skipped after that", joined)
+        self.assertNotIn("Only 2 of 3 steps ran", joined)
 
     def test_the_generated_script_is_valid_javascript(self) -> None:
         node = shutil.which("node")
@@ -427,6 +430,7 @@ const locator = new Proxy({}, {get: (_t, name) => {
   return async (...args) => { calls.push([String(name), ...args.filter((item) => typeof item === 'string')]); };
 }});
 const page = {locator: (selector) => { calls.push(['locator', selector]); return locator; },
+              evaluate: async (body) => { calls.push(['evaluate', String(body)]); return 1; },
               waitForTimeout: async () => {}};
 const steps = [
   {do: 'click', target: '#a'},
@@ -437,6 +441,8 @@ const steps = [
   {do: 'expect_visible', target: '#a'},
   {do: 'expect_hidden', target: '#a'},
   {do: 'wait', ms: 1},
+  {do: 'expect_count', target: '#a', count: 1},
+  {do: 'run', script: 'return 1', text: '1'},
 ];
 (async () => {
   for (const step of steps) {
@@ -451,9 +457,10 @@ const steps = [
         path = self.root / "steps.js"
         path.write_text(body + harness, encoding="utf-8")
         finished = subprocess.run([node, str(path)], capture_output=True, text=True, timeout=60)
-        self.assertIn("ALL_ACTIONS_HANDLED 8", finished.stdout, finished.stdout + finished.stderr)
+        self.assertIn("ALL_ACTIONS_HANDLED 10", finished.stdout, finished.stdout + finished.stderr)
         self.assertEqual(sorted(qa.STEP_ACTIONS), sorted([
-            "choose", "click", "expect_hidden", "expect_text", "expect_visible", "press", "type", "wait",
+            "choose", "click", "expect_count", "expect_hidden", "expect_text", "expect_visible",
+            "press", "run", "type", "wait",
         ]), "a new step action needs a branch in the generated script and a line in this test")
 
     def test_the_generated_browser_script_carries_the_plan(self) -> None:
@@ -1061,3 +1068,192 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpeedBudgetTests(unittest.TestCase):
+    """How fast and how heavy a page may be."""
+
+    def case(self, expect: dict) -> qa.QaCase:
+        return qa.parse_suite({"name": "d", "cases": [{
+            "id": "home", "kind": "browser", "url": "http://127.0.0.1:8765/", "expect": expect,
+        }]}).cases[0]
+
+    def measured(self, **changes) -> dict:
+        found = {
+            "route": "/", "measured": True, "loadMs": 800, "readyMs": 500,
+            "firstPaintMs": 300, "requests": 12, "bytes": 200_000, "unmeasured": 0,
+        }
+        found.update(changes)
+        return found
+
+    def test_a_page_inside_every_budget_passes(self) -> None:
+        case = self.case({
+            "max_load_ms": 1000, "max_first_paint_ms": 500,
+            "max_requests": 20, "max_transfer_bytes": 300_000,
+        })
+        self.assertEqual(qa.speed_reasons(case, [self.measured()]), [])
+
+    def test_each_budget_is_reported_on_its_own(self) -> None:
+        case = self.case({
+            "max_load_ms": 100, "max_first_paint_ms": 100,
+            "max_requests": 2, "max_transfer_bytes": 1000,
+        })
+        found = qa.speed_reasons(case, [self.measured()])
+        self.assertEqual(len(found), 4)
+        self.assertIn("took 800 ms", found[0])
+        self.assertIn("first showed anything after 300 ms", found[1])
+        self.assertIn("asked for 12 files", found[2])
+        self.assertIn("pulled down 200000 bytes", found[3])
+
+    def test_a_page_the_browser_could_not_measure_fails(self) -> None:
+        # The old tool asked the browser something it no longer answers, read
+        # the zeros as a fast page, and passed everything.
+        case = self.case({"max_load_ms": 1000})
+        self.assertIn("did not measure", qa.speed_reasons(case, [self.measured(measured=False)])[0])
+        self.assertIn("never measured", qa.speed_reasons(case, [])[0])
+        self.assertIn("did not measure", qa.speed_reasons(case, [self.measured(loadMs=None)])[0])
+
+    def test_files_of_unknown_size_stop_a_byte_budget_being_guessed(self) -> None:
+        case = self.case({"max_transfer_bytes": 1_000_000})
+        found = qa.speed_reasons(case, [self.measured(unmeasured=3)])
+        self.assertIn("would not say how big they were", found[0])
+        self.assertIn("at least 200000 bytes", found[0])
+
+    def test_nothing_is_measured_unless_the_case_asks(self) -> None:
+        plain = self.case({"max_console_errors": 0})
+        self.assertFalse(plain.expect.wants_speed)
+        self.assertEqual(qa.speed_reasons(plain, []), [])
+        runner = qa.QaRunner(LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path.cwd(), [], {}))
+        self.assertFalse(runner._browser_plan(plain, 30)["measure"])
+        self.assertTrue(runner._browser_plan(self.case({"max_load_ms": 10}), 30)["measure"])
+
+    def test_every_page_named_is_judged(self) -> None:
+        case = self.case({"max_load_ms": 500})
+        found = qa.speed_reasons(case, [
+            self.measured(route="/", loadMs=100),
+            self.measured(route="/about", loadMs=900),
+        ])
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].startswith("/about "))
+
+    def test_a_silly_budget_is_refused_when_the_suite_is_read(self) -> None:
+        for expect in (
+            {"max_load_ms": 0}, {"max_load_ms": "fast"}, {"max_requests": -1},
+            {"max_transfer_bytes": -5}, {"max_first_paint_ms": 10_000_000},
+        ):
+            with self.subTest(expect=expect), self.assertRaises(HarnessError):
+                self.case(expect)
+
+
+class LinkTextRuleTests(unittest.TestCase):
+    """Two links reading the same but going somewhere different."""
+
+    def test_the_page_script_holds_the_rule(self) -> None:
+        script = qa.browser_script({"url": "http://127.0.0.1:1/", "routes": ["/"], "steps": []})
+        self.assertIn("Two links say the same thing but go to different places", script)
+        self.assertIn("alreadySaid", script)
+
+    def test_the_problem_counts_towards_the_accessibility_limit(self) -> None:
+        case = qa.parse_suite({"name": "d", "cases": [{
+            "id": "home", "kind": "browser", "url": "http://127.0.0.1:8765/",
+            "expect": {"max_accessibility_problems": 0},
+        }]}).cases[0]
+        report = {
+            "routes": [{"route": "/", "status": 200}],
+            "accessibility": [{
+                "route": "/",
+                "problem": "Two links say the same thing but go to different places",
+                "detail": '"read more" goes to /one and to /two',
+            }],
+            "consoleErrors": [], "pageErrors": [], "requestFailures": [], "steps": [], "text": "",
+        }
+        config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path.cwd(), [], {})
+        reasons, _summary, _full = qa.QaRunner(config)._browser_reasons(case, report)
+        self.assertIn("accessibility problem", reasons[0])
+        self.assertIn("read more", reasons[0])
+
+
+class TidyUpStepTests(unittest.TestCase):
+    """A step that runs even when an earlier one failed."""
+
+    def test_a_step_can_be_marked_to_always_run(self) -> None:
+        suite = qa.parse_suite({
+            "schema_version": 1, "name": "d",
+            "cases": [{
+                "id": "a", "title": "A check", "kind": "browser",
+                "url": "http://127.0.0.1:8000/",
+                "steps": [
+                    {"do": "click", "target": "#one"},
+                    {"do": "click", "target": "#two", "always": True},
+                ],
+            }],
+        })
+        self.assertNotIn("always", suite.cases[0].steps[0])
+        self.assertIs(suite.cases[0].steps[1]["always"], True)
+
+    def test_always_has_to_be_true_or_false(self) -> None:
+        for value in ("yes", 1, None, []):
+            with self.subTest(value=value), self.assertRaises(HarnessError):
+                qa.parse_suite({
+                    "schema_version": 1, "name": "d",
+                    "cases": [{
+                        "id": "a", "title": "A check", "kind": "browser",
+                        "url": "http://127.0.0.1:8000/",
+                        "steps": [{"do": "click", "target": "#one", "always": value}],
+                    }],
+                })
+
+    def test_the_browser_is_told_which_steps_always_run(self) -> None:
+        # The plan handed to the browser has to carry the mark, or the browser
+        # cannot know which steps to run after a failure.
+        suite = qa.parse_suite({
+            "schema_version": 1, "name": "d",
+            "cases": [{
+                "id": "a", "title": "A check", "kind": "browser",
+                "url": "http://127.0.0.1:8000/",
+                "steps": [{"do": "click", "target": "#one", "always": True}],
+            }],
+        })
+        written = suite.cases[0].to_dict()
+        self.assertIs(written["steps"][0]["always"], True)
+
+    def test_a_failed_tidy_up_step_is_named_as_one(self) -> None:
+        case = qa.parse_suite({
+            "schema_version": 1, "name": "d",
+            "cases": [{
+                "id": "a", "title": "A check", "kind": "browser",
+                "url": "http://127.0.0.1:8000/",
+                "steps": [
+                    {"do": "click", "target": "#one"},
+                    {"do": "click", "target": "#two", "always": True},
+                ],
+            }],
+        }).cases[0]
+        runner = qa.QaRunner(LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path.cwd(), [], {}))
+        reasons, _summary, _full = runner._browser_reasons(case, {
+            "steps": [
+                {"route": "/", "label": "the first one", "ok": True},
+                {"route": "/", "label": "putting it back", "ok": False,
+                 "tidyUp": True, "text": "it would not click"},
+            ],
+        })
+        joined = " ".join(reasons)
+        self.assertIn("The tidying up after step 2", joined)
+        self.assertIn("putting it back", joined)
+
+    def test_an_ordinary_failed_step_is_still_called_a_step(self) -> None:
+        case = qa.parse_suite({
+            "schema_version": 1, "name": "d",
+            "cases": [{
+                "id": "a", "title": "A check", "kind": "browser",
+                "url": "http://127.0.0.1:8000/",
+                "steps": [{"do": "click", "target": "#one"}],
+            }],
+        }).cases[0]
+        runner = qa.QaRunner(LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path.cwd(), [], {}))
+        reasons, _summary, _full = runner._browser_reasons(case, {
+            "steps": [{"route": "/", "label": "clicking", "ok": False, "text": "no"}],
+        })
+        joined = " ".join(reasons)
+        self.assertIn("Step 1 of 1 did not work", joined)
+        self.assertNotIn("tidying up", joined)

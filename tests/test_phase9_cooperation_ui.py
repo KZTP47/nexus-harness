@@ -334,11 +334,13 @@ class Phase9ReadAPITests(unittest.TestCase):
             thread.start()
             host = f"127.0.0.1:{server.server_port}"
 
-            def get(path: str, token: str = "") -> tuple[int, dict]:
+            def get(path: str, token: str = "", same_site: bool = False) -> tuple[int, dict]:
                 connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
                 headers = {"Host": host}
                 if token:
                     headers["X-Harness-Token"] = token
+                if same_site:
+                    headers["Sec-Fetch-Site"] = "same-origin"
                 connection.request("GET", path, headers=headers)
                 response = connection.getresponse()
                 body = json.loads(response.read())
@@ -359,7 +361,11 @@ class Phase9ReadAPITests(unittest.TestCase):
             try:
                 status, _ = get("/api/catalog")
                 self.assertEqual(status, 400)
-                status, bootstrap = get("/api/bootstrap")
+                # Only the panel's own page may collect the session key, so
+                # this test asks the way a browser does.
+                status, _ = get("/api/bootstrap")
+                self.assertEqual(status, 400)
+                status, bootstrap = get("/api/bootstrap", same_site=True)
                 self.assertEqual(status, 200)
                 status, catalog = get("/api/catalog", bootstrap["token"])
                 self.assertEqual(status, 200)

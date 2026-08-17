@@ -8,6 +8,7 @@
 .harness/cache/
 .harness/qa/runs/
 .harness/qa/tmp/
+.harness/bundles/
 .harness/qa/history.json
 .harness/qa/candidates.json
 .harness/transaction.lock

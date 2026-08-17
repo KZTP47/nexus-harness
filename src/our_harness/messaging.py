@@ -238,8 +238,11 @@ class MessageBoard:
                 sequence=sequence,
                 sender=_text(item.get("from"), "A stored sender", 128),
                 recipient=_text(item.get("to"), "A stored recipient", 128),
-                subject=_text(item.get("subject"), "A stored subject", board.max_subject_chars),
-                body=_text(item.get("body"), "A stored message", board.max_body_chars),
+                # Stored notes go through the same credential removal as new
+                # ones. A file written before a rule existed, or edited by
+                # hand, must not be able to bring a secret back into the run.
+                subject=board.redact(_text(item.get("subject"), "A stored subject", board.max_subject_chars)),
+                body=board.redact(_text(item.get("body"), "A stored message", board.max_body_chars)),
                 created_at=float(item.get("created_at") or 0.0),
             )
             restored.append(message)

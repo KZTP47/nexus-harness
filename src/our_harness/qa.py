@@ -11,6 +11,7 @@ a candidate and only becomes part of the suite after an explicit accept.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import html
 import json
 import math
@@ -18,21 +19,25 @@ import re
 import socket
 import ssl
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ElementTree
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from . import contracts, datasets, images, scan
 from .config import LoadedConfig
 from .execution import CommandRunner
 from .models import HarnessError
+from .redaction import CredentialRedactor
 from .safety import confined_path
 
 SUITE_SCHEMA_VERSION = 1
-CASE_KINDS = ("command", "file", "http", "browser")
+CASE_KINDS = ("command", "file", "http", "browser", "visual", "secrets", "crawl")
+BASELINE_DIR = ".harness/qa/baselines"
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 STATUS_FLAKY = "flaky"
@@ -90,10 +95,19 @@ class CheckKind:
             raise QaError(f"A plugin may not replace the built-in {self.name} check kind")
         if not callable(self.run):
             raise QaError(f"The {self.name} check kind has no way to run")
-        overlap = (self.fields | self.expectations) & _COMMON_CASE_FIELDS
-        if overlap:
+        # A case field and an expectation live in different places, so a kind
+        # may call an expectation "rows" even though a case field may not.
+        taken_fields = sorted(self.fields & _COMMON_CASE_FIELDS)
+        if taken_fields:
             raise QaError(
-                f"The {self.name} check kind reuses a field the suite already owns: {sorted(overlap)[0]}"
+                f"The {self.name} check kind reuses a case field the suite already owns: {taken_fields[0]}"
+            )
+        built_in_expectations = set().union(*_EXPECT_FIELDS_BY_KIND.values())
+        taken_expectations = sorted(self.expectations & built_in_expectations)
+        if taken_expectations:
+            raise QaError(
+                f"The {self.name} check kind reuses an expectation the suite already owns: "
+                f"{taken_expectations[0]}"
             )
 
 
@@ -137,15 +151,44 @@ class QaExpectation:
     max_page_errors: int | None = None
     max_failed_requests: int | None = None
     max_accessibility_problems: int | None = None
+    # How slow and how heavy a page may be.
+    max_load_ms: int | None = None
+    max_first_paint_ms: int | None = None
+    max_requests: int | None = None
+    max_transfer_bytes: int | None = None
+    # The shape an answer must have. Held as JSON text, so an expectation
+    # stays a plain, unchangeable value.
+    contract: str = ""
+    contract_file: str = ""
+    # How much a screenshot may differ from its saved baseline picture.
+    max_changed_percent: float | None = None
+    max_changed_pixels: int | None = None
+    allowed_color_drift: int | None = None
+    # How many credential-shaped things a scan may find.
+    max_findings: int | None = None
+    # What a walk over a whole site may find.
+    max_broken_pages: int | None = None
+    min_pages: int | None = None
     # Whatever a plugin check kind declared for itself.
     extra: tuple[tuple[str, Any], ...] = ()
+
+    @property
+    def wants_speed(self) -> bool:
+        """True when the case asks about how fast or how heavy the page is."""
+
+        return any(
+            getattr(self, name) is not None
+            for name in ("max_load_ms", "max_first_paint_ms", "max_requests", "max_transfer_bytes")
+        )
 
     def to_dict(self) -> dict[str, Any]:
         value: dict[str, Any] = {}
         for name in (
             "exit_code", "max_duration_ms", "exists", "min_bytes", "max_bytes", "status",
             "max_console_errors", "max_page_errors", "max_failed_requests",
-            "max_accessibility_problems",
+            "max_accessibility_problems", "max_changed_percent", "max_changed_pixels",
+            "allowed_color_drift", "max_load_ms", "max_first_paint_ms", "max_requests",
+            "max_transfer_bytes", "max_findings", "max_broken_pages", "min_pages",
         ):
             found = getattr(self, name)
             if found is not None:
@@ -159,6 +202,10 @@ class QaExpectation:
                 value[name] = list(found)
         if self.json_fields:
             value["json_fields"] = {key: item for key, item in self.json_fields}
+        if self.contract:
+            value["contract"] = json.loads(self.contract)
+        if self.contract_file:
+            value["contract_file"] = self.contract_file
         for key, item in self.extra:
             value[key] = item
         return value
@@ -172,6 +219,10 @@ class QaCase:
     kind: str
     expect: QaExpectation
     tags: tuple[str, ...] = ()
+    # Things this check changes while it runs - a folder of notes, a settings
+    # file, a row in a table. Two checks that name the same thing never run at
+    # the same time, because they would be standing on each other's work.
+    touches: tuple[str, ...] = ()
     retries: int = 0
     timeout_seconds: float = 0.0
     command: tuple[str, ...] = ()
@@ -187,8 +238,24 @@ class QaCase:
     click_all: bool = False
     check_accessibility: bool = False
     steps: tuple[Mapping[str, Any], ...] = ()
+    # How far a crawl goes, and where it may not leave.
+    max_pages: int = 20
+    stay_under: str = ""
+    # Which files a scan reads, and which it leaves alone.
+    paths: tuple[str, ...] = ()
+    skip: tuple[str, ...] = ()
+    # When to keep a picture of the page while the steps run.
+    pictures: str = "failure"
+    # Screenshot checks: where the saved picture lives and what to photograph.
+    baseline: str = ""
+    selector: str = ""
+    full_page: bool = False
     # Whatever a plugin check kind declared for itself.
     extra: tuple[tuple[str, Any], ...] = ()
+    # A table this check runs once for each row of, and the row it is running.
+    rows: tuple[datasets.Row, ...] = ()
+    rows_file: str = ""
+    row: datasets.Row | None = None
 
     def field(self, name: str, default: Any = None) -> Any:
         """One of this case's plugin fields, or the default."""
@@ -210,10 +277,15 @@ class QaCase:
         value: dict[str, Any] = {"id": self.id, "title": self.title, "kind": self.kind}
         if self.tags:
             value["tags"] = list(self.tags)
+        if self.touches:
+            value["touches"] = list(self.touches)
         if self.retries:
             value["retries"] = self.retries
         if self.timeout_seconds:
-            value["timeout_seconds"] = self.timeout_seconds
+            # A whole number stays a whole number, so adding a check does not
+            # rewrite every other line of the file as well.
+            whole = float(self.timeout_seconds).is_integer()
+            value["timeout_seconds"] = int(self.timeout_seconds) if whole else self.timeout_seconds
         if self.kind == "command":
             value["command"] = list(self.command)
             if self.cwd != ".":
@@ -240,11 +312,42 @@ class QaCase:
                 value["check_accessibility"] = True
             if self.steps:
                 value["steps"] = [dict(step) for step in self.steps]
+            if self.pictures != "failure":
+                value["pictures"] = self.pictures
+        elif self.kind == "crawl":
+            value["url"] = self.url
+            value["viewport"] = {"width": self.viewport[0], "height": self.viewport[1]}
+            value["max_pages"] = self.max_pages
+            if self.stay_under:
+                value["stay_under"] = self.stay_under
+            if not self.check_accessibility:
+                value["check_accessibility"] = False
+        elif self.kind == "secrets":
+            value["paths"] = list(self.paths)
+            if self.skip:
+                value["skip"] = list(self.skip)
+        elif self.kind == "visual":
+            value["url"] = self.url
+            if self.routes:
+                value["routes"] = list(self.routes)
+            value["viewport"] = {"width": self.viewport[0], "height": self.viewport[1]}
+            if self.baseline:
+                value["baseline"] = self.baseline
+            if self.selector:
+                value["selector"] = self.selector
+            if self.full_page:
+                value["full_page"] = True
+            if self.steps:
+                value["steps"] = [dict(step) for step in self.steps]
         for key, item in self.extra:
             value[key] = item
         expect = self.expect.to_dict()
         if expect:
             value["expect"] = expect
+        if self.rows:
+            value["rows"] = [row.mapping() for row in self.rows]
+        if self.rows_file:
+            value["rows_file"] = self.rows_file
         return value
 
 
@@ -415,10 +518,20 @@ _EXPECT_FIELDS_BY_KIND: dict[str, frozenset[str]] = {
     "file": frozenset({"exists", "contains", "not_contains", "min_bytes", "max_bytes"}),
     "http": frozenset({
         "status", "max_duration_ms", "body_contains", "body_not_contains", "json_fields",
+        "contract", "contract_file",
     }),
     "browser": frozenset({
         "max_duration_ms", "body_contains", "body_not_contains", "max_console_errors",
         "max_page_errors", "max_failed_requests", "max_accessibility_problems",
+        "max_load_ms", "max_first_paint_ms", "max_requests", "max_transfer_bytes",
+    }),
+    "visual": frozenset({
+        "max_duration_ms", "max_changed_percent", "max_changed_pixels", "allowed_color_drift",
+    }),
+    "secrets": frozenset({"max_duration_ms", "max_findings"}),
+    "crawl": frozenset({
+        "max_duration_ms", "max_broken_pages", "max_console_errors", "max_page_errors",
+        "max_accessibility_problems", "min_pages",
     }),
 }
 
@@ -452,6 +565,63 @@ def _parse_expectation(
     ):
         if name in data:
             fields[name] = _require_whole_number(data[name], f"{label}.{name}", 0, 10_000)
+    for name in ("max_load_ms", "max_first_paint_ms"):
+        if name in data:
+            fields[name] = _require_whole_number(data[name], f"{label}.{name}", 1, 600_000)
+    if "max_requests" in data:
+        fields["max_requests"] = _require_whole_number(
+            data["max_requests"], f"{label}.max_requests", 0, 10_000
+        )
+    if "max_findings" in data:
+        fields["max_findings"] = _require_whole_number(
+            data["max_findings"], f"{label}.max_findings", 0, 10_000
+        )
+    if "max_broken_pages" in data:
+        fields["max_broken_pages"] = _require_whole_number(
+            data["max_broken_pages"], f"{label}.max_broken_pages", 0, 10_000
+        )
+    if "min_pages" in data:
+        fields["min_pages"] = _require_whole_number(
+            data["min_pages"], f"{label}.min_pages", 1, 10_000
+        )
+    if "max_transfer_bytes" in data:
+        fields["max_transfer_bytes"] = _require_whole_number(
+            data["max_transfer_bytes"], f"{label}.max_transfer_bytes", 0, 1_000_000_000
+        )
+    if "contract" in data and "contract_file" in data:
+        raise QaError(f"{label} may hold a contract or name a file holding one, not both")
+    if "contract" in data:
+        shape = data["contract"]
+        if not isinstance(shape, (dict, bool)):
+            raise QaError(f"{label}.contract must be an object describing the shape of the answer")
+        # Read the contract now, so a rule this tool cannot enforce is refused
+        # while the suite is being read, not quietly skipped during a run.
+        contracts.check_schema(shape, f"{label}.contract")
+        fields["contract"] = json.dumps(shape, sort_keys=True)
+    if "contract_file" in data:
+        fields["contract_file"] = _relative_project_path(
+            data["contract_file"], f"{label}.contract_file"
+        )
+    if "max_changed_pixels" in data:
+        fields["max_changed_pixels"] = _require_whole_number(
+            data["max_changed_pixels"], f"{label}.max_changed_pixels", 0, images.MAX_PIXELS
+        )
+    if "allowed_color_drift" in data:
+        fields["allowed_color_drift"] = _require_whole_number(
+            data["allowed_color_drift"], f"{label}.allowed_color_drift", 0, 255
+        )
+    if "max_changed_percent" in data:
+        share = data["max_changed_percent"]
+        if isinstance(share, bool) or not isinstance(share, (int, float)):
+            raise QaError(f"{label}.max_changed_percent must be a number from 0 to 100")
+        if isinstance(share, float) and not math.isfinite(share):
+            raise QaError(f"{label}.max_changed_percent must be a real number")
+        if not 0 <= float(share) <= 100:
+            raise QaError(
+                f"{label}.max_changed_percent must be from 0 to 100. "
+                "It is already a percentage, so 1 means one percent of the picture."
+            )
+        fields["max_changed_percent"] = float(share)
     if fields.get("min_bytes") is not None and fields.get("max_bytes") is not None:
         if fields["min_bytes"] > fields["max_bytes"]:
             raise QaError(f"{label}.min_bytes must not be larger than {label}.max_bytes")
@@ -493,8 +663,21 @@ _CASE_FIELDS_BY_KIND: dict[str, frozenset[str]] = {
     "command": frozenset({"command", "cwd", "stdin"}),
     "file": frozenset({"path"}),
     "http": frozenset({"url", "method", "headers", "body"}),
-    "browser": frozenset({"url", "routes", "viewport", "click_all", "check_accessibility", "steps"}),
+    "browser": frozenset({
+        "url", "routes", "viewport", "click_all", "check_accessibility", "steps", "pictures",
+    }),
+    "visual": frozenset({"url", "routes", "viewport", "steps", "baseline", "selector", "full_page"}),
+    "secrets": frozenset({"paths", "skip"}),
+    "crawl": frozenset({"url", "viewport", "max_pages", "stay_under", "check_accessibility"}),
 }
+
+# The fields a table row or a named setting may be put into. Every case field
+# that holds text belongs here; the ones left out hold a size, a flag, or a
+# word that was already checked when the suite was read.
+_NOT_FILLABLE = frozenset({"viewport", "click_all", "check_accessibility", "full_page", "method"})
+FILLABLE_CASE_FIELDS: tuple[str, ...] = tuple(
+    sorted(set().union(*_CASE_FIELDS_BY_KIND.values()) - _NOT_FILLABLE)
+)
 
 # What a written-down browser step may ask the page to do. Each one names the
 # fields it needs, so a mistake is caught while the suite is read, not mid-run.
@@ -506,10 +689,23 @@ STEP_ACTIONS: dict[str, frozenset[str]] = {
     "expect_text": frozenset({"target", "text"}),
     "expect_visible": frozenset({"target"}),
     "expect_hidden": frozenset({"target"}),
+    "expect_count": frozenset({"target", "count"}),
+    "run": frozenset({"script"}),
     "wait": frozenset({"ms"}),
 }
+# What a step may say beyond the fields its action needs.
+_STEP_EXTRAS: dict[str, frozenset[str]] = {
+    "run": frozenset({"text"}),
+}
 _MAX_STEPS = 60
-_COMMON_CASE_FIELDS = frozenset({"id", "title", "kind", "tags", "retries", "timeout_seconds", "expect"})
+_COMMON_CASE_FIELDS = frozenset({
+    "id", "title", "kind", "tags", "touches", "retries", "timeout_seconds", "expect",
+    "rows", "rows_file",
+})
+# What a check may say it touches: plain words, so the reason two checks are
+# held apart reads as a reason and not as a code.
+_TOUCHES_PATTERN = re.compile(r"^[a-z0-9][a-z0-9 '_-]{0,39}$")
+_MOST_TOUCHES = 6
 
 
 _MAX_PLUGIN_VALUE_CHARS = 20_000
@@ -577,7 +773,11 @@ def _parse_steps(value: object, label: str) -> tuple[Mapping[str, Any], ...]:
                 f"{place}.do must be one of: {', '.join(sorted(STEP_ACTIONS))}"
             )
         needed = STEP_ACTIONS[action]
-        allowed = needed | {"do", "note", "timeout_ms"}
+        allowed = (
+            needed
+            | _STEP_EXTRAS.get(action, frozenset())
+            | {"do", "note", "timeout_ms", "always"}
+        )
         unknown = sorted(set(data) - allowed)
         if unknown:
             raise QaError(f"{place}.{unknown[0]} is not a field a {action} step understands")
@@ -597,9 +797,20 @@ def _parse_steps(value: object, label: str) -> tuple[Mapping[str, Any], ...]:
                 )
         if "ms" in data:
             step["ms"] = _require_whole_number(data["ms"], f"{place}.ms", 0, 60_000)
+        if "count" in data:
+            step["count"] = _require_whole_number(data["count"], f"{place}.count", 0, 10_000)
+        if "script" in data:
+            step["script"] = _require_text(data["script"], f"{place}.script", limit=4000)
         step["timeout_ms"] = _require_whole_number(
             data.get("timeout_ms", 10_000), f"{place}.timeout_ms", 100, 120_000
         )
+        # A step that runs even when an earlier one failed. This is where a
+        # check that changed something puts it back. Without it, the one thing
+        # that must happen after a failure is the one thing that never does.
+        if "always" in data:
+            if not isinstance(data["always"], bool):
+                raise QaError(f"{place}.always must be true or false")
+            step["always"] = data["always"]
         steps.append(step)
     return tuple(steps)
 
@@ -614,6 +825,39 @@ def _parse_web_url(value: object, label: str) -> str:
     if parsed.username or parsed.password:
         raise QaError(f"{label} must not carry a user name or password")
     return url
+
+
+def _parse_page_fields(data: Mapping[str, Any], label: str) -> dict[str, Any]:
+    """The fields both page kinds share: which pages, how big, what to do there."""
+
+    fields: dict[str, Any] = {"url": _parse_web_url(data.get("url"), f"{label}.url")}
+    routes_value = data.get("routes", [])
+    if not isinstance(routes_value, list):
+        raise QaError(f"{label}.routes must be a list of paths such as \"/about\"")
+    if len(routes_value) > 50:
+        raise QaError(f"{label}.routes must hold at most 50 paths")
+    routes: list[str] = []
+    for route in routes_value:
+        text = _require_text(route, f"{label}.routes entry", limit=500)
+        if not text.startswith("/"):
+            raise QaError(f"{label}.routes entry must start with a slash")
+        if "\\" in text or ".." in text:
+            raise QaError(f"{label}.routes entry must not step outside the site")
+        if text not in routes:
+            routes.append(text)
+    fields["routes"] = tuple(routes)
+    viewport = _require_object(data.get("viewport", {}), f"{label}.viewport")
+    unknown_viewport = sorted(set(viewport) - {"width", "height"})
+    if unknown_viewport:
+        raise QaError(f"{label}.viewport only understands width and height")
+    fields["viewport"] = (
+        _require_whole_number(viewport.get("width", 1280), f"{label}.viewport.width", 200, 5000),
+        _require_whole_number(viewport.get("height", 800), f"{label}.viewport.height", 200, 5000),
+    )
+    fields["steps"] = _parse_steps(data.get("steps", []), f"{label}.steps")
+    if len(fields["routes"]) > 1 and fields["steps"]:
+        raise QaError(f"{label} runs its steps on one page, so name at most one route")
+    return fields
 
 
 def _parse_case(
@@ -657,6 +901,20 @@ def _parse_case(
             raise QaError(f"{label}.tags entry must be lowercase letters, digits, dash, or underscore")
         if text not in tags:
             tags.append(text)
+    touches_value = data.get("touches", [])
+    if not isinstance(touches_value, list):
+        raise QaError(f"{label}.touches must be a list of things this check changes")
+    if len(touches_value) > _MOST_TOUCHES:
+        raise QaError(f"{label}.touches must name at most {_MOST_TOUCHES} things")
+    touches: list[str] = []
+    for thing in touches_value:
+        text = _require_text(thing, f"{label}.touches entry", limit=40).lower()
+        if not _TOUCHES_PATTERN.fullmatch(text):
+            raise QaError(
+                f"{label}.touches entry must be plain lowercase words, like \"the vault\""
+            )
+        if text not in touches:
+            touches.append(text)
     retries = _require_whole_number(data.get("retries", 0), f"{label}.retries", 0, _MAX_RETRIES)
     timeout_value = data.get("timeout_seconds", 0)
     if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
@@ -669,6 +927,12 @@ def _parse_case(
         kind,
         f"{label}.expect",
         plugin_kind.expectations if plugin_kind is not None else frozenset(),
+    )
+    if "rows" in data and "rows_file" in data:
+        raise QaError(f"{label} may name a table or hold one, not both")
+    rows = datasets.rows_from_list(data["rows"], f"{label}.rows") if "rows" in data else ()
+    rows_file = (
+        _relative_project_path(data["rows_file"], f"{label}.rows_file") if "rows_file" in data else ""
     )
 
     fields: dict[str, Any] = {}
@@ -701,22 +965,40 @@ def _parse_case(
         if expect.to_dict() == {}:
             expect = QaExpectation(exists=True)
     elif kind == "browser":
+        fields.update(_parse_page_fields(data, label))
+        pictures = _require_text(data.get("pictures", "failure"), f"{label}.pictures", limit=16)
+        if pictures not in ("never", "failure", "every_step"):
+            raise QaError(
+                f"{label}.pictures must be never, failure, or every_step"
+            )
+        fields["pictures"] = pictures
+        for name in ("click_all", "check_accessibility"):
+            found = data.get(name, False)
+            if not isinstance(found, bool):
+                raise QaError(f"{label}.{name} must be true or false")
+            fields[name] = found
+        if expect.to_dict() == {}:
+            expect = QaExpectation(max_console_errors=0, max_page_errors=0)
+    elif kind == "secrets":
+        for name in ("paths", "skip"):
+            value_list = data.get(name, [])
+            if not isinstance(value_list, list):
+                raise QaError(f"{label}.{name} must be a list of file patterns")
+            if len(value_list) > 100:
+                raise QaError(f"{label}.{name} must hold at most 100 patterns")
+            chosen: list[str] = []
+            for item in value_list:
+                text = _relative_project_path(item, f"{label}.{name} entry")
+                if text not in chosen:
+                    chosen.append(text)
+            fields[name] = tuple(chosen)
+        if not fields["paths"]:
+            fields["paths"] = ("**/*",)
+        if expect.to_dict() == {}:
+            # Nothing said means nothing allowed.
+            expect = QaExpectation(max_findings=0)
+    elif kind == "crawl":
         fields["url"] = _parse_web_url(data.get("url"), f"{label}.url")
-        routes_value = data.get("routes", [])
-        if not isinstance(routes_value, list):
-            raise QaError(f"{label}.routes must be a list of paths such as \"/about\"")
-        if len(routes_value) > 50:
-            raise QaError(f"{label}.routes must hold at most 50 paths")
-        routes: list[str] = []
-        for route in routes_value:
-            text = _require_text(route, f"{label}.routes entry", limit=500)
-            if not text.startswith("/"):
-                raise QaError(f"{label}.routes entry must start with a slash")
-            if "\\" in text or ".." in text:
-                raise QaError(f"{label}.routes entry must not step outside the site")
-            if text not in routes:
-                routes.append(text)
-        fields["routes"] = tuple(routes)
         viewport = _require_object(data.get("viewport", {}), f"{label}.viewport")
         unknown_viewport = sorted(set(viewport) - {"width", "height"})
         if unknown_viewport:
@@ -725,16 +1007,39 @@ def _parse_case(
             _require_whole_number(viewport.get("width", 1280), f"{label}.viewport.width", 200, 5000),
             _require_whole_number(viewport.get("height", 800), f"{label}.viewport.height", 200, 5000),
         )
-        for name in ("click_all", "check_accessibility"):
-            found = data.get(name, False)
-            if not isinstance(found, bool):
-                raise QaError(f"{label}.{name} must be true or false")
-            fields[name] = found
-        fields["steps"] = _parse_steps(data.get("steps", []), f"{label}.steps")
-        if len(fields["routes"]) > 1 and fields["steps"]:
-            raise QaError(f"{label} runs its steps on one page, so name at most one route")
+        fields["max_pages"] = _require_whole_number(
+            data.get("max_pages", 20), f"{label}.max_pages", 1, 200
+        )
+        if "stay_under" in data:
+            fields["stay_under"] = _parse_web_url(data["stay_under"], f"{label}.stay_under")
+        found = data.get("check_accessibility", True)
+        if not isinstance(found, bool):
+            raise QaError(f"{label}.check_accessibility must be true or false")
+        fields["check_accessibility"] = found
         if expect.to_dict() == {}:
-            expect = QaExpectation(max_console_errors=0, max_page_errors=0)
+            expect = QaExpectation(max_broken_pages=0, max_page_errors=0)
+    elif kind == "visual":
+        fields.update(_parse_page_fields(data, label))
+        if len(fields["routes"]) > 1:
+            raise QaError(f"{label} takes one picture, so name at most one route")
+        if "baseline" in data:
+            baseline = _relative_project_path(data["baseline"], f"{label}.baseline")
+            if not baseline.lower().endswith(".png"):
+                raise QaError(f"{label}.baseline must be a .png file")
+            fields["baseline"] = baseline
+        if "selector" in data:
+            fields["selector"] = _require_text(data["selector"], f"{label}.selector", limit=500)
+        found = data.get("full_page", False)
+        if not isinstance(found, bool):
+            raise QaError(f"{label}.full_page must be true or false")
+        if found and fields.get("selector"):
+            raise QaError(
+                f"{label} may photograph the whole page or one part of it, not both"
+            )
+        fields["full_page"] = found
+        if expect.to_dict() == {}:
+            # Nothing said, so nothing may change.
+            expect = QaExpectation(max_changed_percent=0.0)
     else:
         url = _parse_web_url(data.get("url"), f"{label}.url")
         fields["url"] = url
@@ -766,8 +1071,11 @@ def _parse_case(
         kind=kind,
         expect=expect,
         tags=tuple(tags),
+        touches=tuple(touches),
         retries=retries,
         timeout_seconds=timeout_seconds,
+        rows=rows,
+        rows_file=rows_file,
         **fields,
     )
 
@@ -878,9 +1186,198 @@ def _excerpt(text: str, limit: int) -> str:
     return text[: max(0, limit - 14)] + "\n... (shortened)"
 
 
-def _quote(value: str) -> str:
-    short = value if len(value) <= 60 else value[:57] + "..."
+def _quote(value: str, limit: int = 60) -> str:
+    short = value if len(value) <= limit else value[: max(1, limit - 3)] + "..."
     return short.replace("\n", " ")
+
+
+def baseline_file(case: QaCase) -> str:
+    """The project path of the saved picture a screenshot check compares with."""
+
+    if case.baseline:
+        return case.baseline
+    plain = re.sub(r"[^a-z0-9_-]+", "-", case.id.lower()).strip("-") or "check"
+    return f"{BASELINE_DIR}/{plain}.png"
+
+
+def speed_reasons(case: QaCase, measurements: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Why a page was too slow or too heavy, page by page.
+
+    A page the browser could not measure is a failure, not a pass. The older
+    tool asked the browser a question it no longer answers, got zeros back, and
+    reported every page as fast enough.
+    """
+
+    expect = case.expect
+    if not expect.wants_speed:
+        return []
+    if not measurements:
+        return ["The page was never measured, so the speed limits could not be judged"]
+    reasons: list[str] = []
+    for found in measurements:
+        route = str(found.get("route") or "/")
+        if not found.get("measured"):
+            reasons.append(
+                f"The browser did not measure {route}, so the speed limits could not be judged"
+            )
+            continue
+        checks = (
+            ("loadMs", expect.max_load_ms, "took {value} ms to finish loading", "ms"),
+            ("firstPaintMs", expect.max_first_paint_ms, "first showed anything after {value} ms", "ms"),
+            ("requests", expect.max_requests, "asked for {value} files", "files"),
+            ("bytes", expect.max_transfer_bytes, "pulled down {value} bytes", "bytes"),
+        )
+        for key, limit, wording, unit in checks:
+            if limit is None:
+                continue
+            value = found.get(key)
+            if value is None:
+                reasons.append(
+                    f"The browser did not measure how {route} loaded, so the {unit} limit "
+                    "could not be judged"
+                )
+                continue
+            if key == "bytes" and int(found.get("unmeasured") or 0):
+                # Some other site would not say how big its files were, so the
+                # total is only a floor. Saying "under budget" would be a guess.
+                reasons.append(
+                    f"{route} loaded {found['unmeasured']} files from somewhere that would not "
+                    f"say how big they were, so the {limit} byte limit cannot be judged. "
+                    "It is at least " + str(value) + " bytes."
+                )
+                continue
+            if value > limit:
+                reasons.append(f"{route} " + wording.format(value=value) + f", more than the {limit} allowed")
+    return reasons
+
+
+def folder_of(url: str) -> str:
+    """The part of an address a walk may stay inside."""
+
+    return _folder_of(url)
+
+
+def _folder_of(url: str) -> str:
+    """The part of an address a walk may stay inside.
+
+    Starting at /shop/index.html means the shop, not that one page, so the last
+    piece of the path is dropped unless the address already ends in a slash.
+    """
+
+    split = urllib.parse.urlsplit(url)
+    path = split.path or "/"
+    if not path.endswith("/"):
+        path = path[: path.rfind("/") + 1] or "/"
+    return urllib.parse.urlunsplit((split.scheme, split.netloc, path, "", ""))
+
+
+def crawl_summary(report: Mapping[str, Any]) -> str:
+    """One line about a walk over a site."""
+
+    pages = report.get("pages") or []
+    broken = [page for page in pages if int(page.get("status") or 0) >= 400 or not page.get("status")]
+    more = int(report.get("morePages") or 0)
+    return (
+        f"Opened {len(pages)} page{'' if len(pages) == 1 else 's'}, "
+        f"{len(broken)} did not answer properly"
+        + (f", and {more} more were still waiting" if more else "")
+        + "."
+    )
+
+
+def crawl_reasons(case: QaCase, report: Mapping[str, Any]) -> tuple[str, ...]:
+    """Why a walk over a site failed, page by page."""
+
+    expect = case.expect
+    reasons: list[str] = []
+    fatal = str(report.get("fatal") or "")
+    if fatal:
+        reasons.append(f"The browser stopped early: {_quote(fatal)}")
+    pages = report.get("pages") or []
+    if not pages:
+        # Nothing was opened, so nothing was checked. That is a failure, not a
+        # quiet pass.
+        reasons.append("No page was opened, so nothing was checked")
+        return tuple(reasons)
+    refused = report.get("refused") or []
+    if refused:
+        reasons.append(
+            f"The walk was sent to {len(refused)} address{'' if len(refused) == 1 else 'es'} this "
+            f"project may not open, and did not read {'it' if len(refused) == 1 else 'them'}. "
+            f"The first was {refused[0]}"
+        )
+    broken = [
+        page for page in pages
+        if int(page.get("status") or 0) >= 400 or not page.get("status") or page.get("problem")
+    ]
+    allowed_broken = expect.max_broken_pages if expect.max_broken_pages is not None else 0
+    if len(broken) > allowed_broken:
+        first = broken[0]
+        reasons.append(
+            f"{len(broken)} of {len(pages)} pages did not answer properly, more than the "
+            f"{allowed_broken} allowed. The first was {first.get('url')} with "
+            f"{first.get('status') or first.get('problem') or 'no answer'}"
+        )
+    if expect.min_pages is not None and len(pages) < expect.min_pages:
+        counted_pages = "1 page was" if len(pages) == 1 else f"{len(pages)} pages were"
+        reasons.append(
+            f"Only {counted_pages} found, fewer than the {expect.min_pages} expected. "
+            "Check the starting address and the links on it."
+        )
+    counted = (
+        ("consoleErrors", expect.max_console_errors, "error message in the browser console"),
+        ("pageErrors", expect.max_page_errors, "page script error"),
+        ("requestFailures", expect.max_failed_requests, "failed network request"),
+        ("accessibility", expect.max_accessibility_problems, "accessibility problem"),
+    )
+    for key, limit, label in counted:
+        found = report.get(key) or []
+        if limit is None or len(found) <= limit:
+            continue
+        first = found[0]
+        detail = first.get("text") or first.get("problem") or ""
+        if first.get("problem") and first.get("detail"):
+            detail = f"{first['problem']}: {first['detail']}"
+        plural = "" if len(found) == 1 else "s"
+        reasons.append(
+            f"Found {len(found)} {label}{plural} while walking the site, more than the "
+            f"{limit} allowed. On {first.get('route', 'a page')}: {_quote(str(detail), 160)}"
+        )
+    return tuple(reasons)
+
+
+def visual_reasons(case: QaCase, difference: images.Difference, baseline: str) -> list[str]:
+    """Why a screenshot check failed, in numbers a person can act on.
+
+    The allowed amounts are read exactly as they were written. A percentage is
+    a percentage, and a count of pixels is a count of pixels. Nothing is
+    converted twice on the way here.
+    """
+
+    reasons: list[str] = []
+    if not difference.same_size:
+        reasons.append(
+            f"The page is now {difference.after_size[0]} by {difference.after_size[1]} pixels, "
+            f"but the saved picture {baseline} is {difference.before_size[0]} by "
+            f"{difference.before_size[1]}. A page that changed size has changed."
+        )
+    percent = case.expect.max_changed_percent
+    count = case.expect.max_changed_pixels
+    if percent is None and count is None:
+        # Nobody said how much may change, so nothing may change.
+        percent = 0.0
+    if percent is not None and difference.percent > percent:
+        reasons.append(
+            f"{difference.changed} of {difference.compared} pixels look different "
+            f"({difference.percent:.2f}%), which is more than the {percent:g}% allowed. "
+            f"The difference picture in the run folder marks them in red."
+        )
+    if count is not None and difference.changed > count:
+        reasons.append(
+            f"{difference.changed} pixels look different, which is more than the "
+            f"{count} allowed."
+        )
+    return reasons
 
 
 class QaRunner:
@@ -894,6 +1391,8 @@ class QaRunner:
         http_fetch: Callable[[QaCase, float], tuple[int, str, int]] | None = None,
         clock: Callable[[], float] = time.monotonic,
         extra_kinds: Mapping[str, CheckKind] | None = None,
+        environment: str = "",
+        update_baselines: bool = False,
     ) -> None:
         self.config = config
         self.root = config.project_root
@@ -906,9 +1405,82 @@ class QaRunner:
             str(item).lower() for item in config.get("qa.allow_hosts", list(_LOOPBACK_HOSTS))
         )
         self.extra_kinds = validated_kinds(extra_kinds)
+        self.environment_name, self.environment = datasets.chosen_environment(config, environment)
+        self.update_baselines = bool(update_baselines)
         self._browser_ready: bool | None = None
+        # Screenshot checks save pictures while they run. Cases run side by side,
+        # so the list of saved files is kept under a lock, one entry per case.
+        self._pictures: dict[str, list[str]] = {}
+        self._picture_lock = threading.Lock()
 
     # -- selection ---------------------------------------------------------
+
+    def expand(self, case: QaCase) -> tuple[QaCase, ...]:
+        """One written check becomes one run for each row of its table.
+
+        Every piece of text in the case is filled in from the row and from the
+        chosen settings, so the rest of the harness sees ordinary cases and
+        every report, retry and flaky rule works unchanged.
+        """
+
+        rows = case.rows
+        if case.rows_file and not rows:
+            rows = datasets.read_rows(self.config, case.rows_file)
+        if not rows:
+            if self.environment:
+                return (self._filled(case, None),)
+            return (case,)
+        built: list[QaCase] = []
+        for row in rows:
+            filled = self._filled(case, row)
+            built.append(
+                replace(
+                    filled,
+                    id=f"{case.id}#{row.number}",
+                    title=f"{case.title} [{row.label}]",
+                    row=row,
+                    rows=(),
+                    rows_file="",
+                )
+            )
+        return tuple(built)
+
+    def _filled(self, case: QaCase, row: datasets.Row | None) -> QaCase:
+        values = row.mapping() if row is not None else {}
+        where = f"Check {case.id}"
+        changes: dict[str, Any] = {}
+        for name in FILLABLE_CASE_FIELDS:
+            found = getattr(case, name)
+            if found:
+                changes[name] = datasets.fill_value(found, values, self.environment, where)
+        if case.extra:
+            changes["extra"] = tuple(
+                (key, datasets.fill_value(item, values, self.environment, where))
+                for key, item in case.extra
+            )
+        expect_changes: dict[str, Any] = {}
+        for name in (
+            "stdout_contains", "stdout_not_contains", "stderr_contains", "stderr_not_contains",
+            "contains", "not_contains", "body_contains", "body_not_contains",
+        ):
+            found = getattr(case.expect, name)
+            if found:
+                expect_changes[name] = tuple(
+                    datasets.fill(item, values, self.environment, where) for item in found
+                )
+        if case.expect.json_fields:
+            expect_changes["json_fields"] = tuple(
+                (key, datasets.fill_value(item, values, self.environment, where))
+                for key, item in case.expect.json_fields
+            )
+        if case.expect.extra:
+            expect_changes["extra"] = tuple(
+                (key, datasets.fill_value(item, values, self.environment, where))
+                for key, item in case.expect.extra
+            )
+        if expect_changes:
+            changes["expect"] = replace(case.expect, **expect_changes)
+        return replace(case, **changes) if changes else case
 
     def select(
         self,
@@ -925,13 +1497,13 @@ class QaRunner:
         unknown_tags = wanted_tags - set(suite.tags())
         if unknown_tags:
             raise QaError(f"No case has this tag: {sorted(unknown_tags)[0]}")
-        chosen = []
+        chosen: list[QaCase] = []
         for case in suite.cases:
             if wanted_ids and case.id not in wanted_ids:
                 continue
             if wanted_tags and not wanted_tags & set(case.tags):
                 continue
-            chosen.append(case)
+            chosen.extend(self.expand(case))
         if not chosen:
             raise QaError("The filter matched no cases")
         return tuple(chosen)
@@ -964,9 +1536,13 @@ class QaRunner:
             artifacts_root.mkdir(parents=True, exist_ok=True)
         started = self.clock()
         results: dict[str, QaCaseResult] = {}
+        # One lock for each thing any check says it touches. Checks still run
+        # several at a time; two that change the same thing simply wait for
+        # each other rather than fighting over it.
+        held = {thing: threading.Lock() for case in selected for thing in case.touches}
         with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
             futures = {
-                pool.submit(self._run_case, case, artifacts_root): case for case in selected
+                pool.submit(self._run_case, case, artifacts_root, held): case for case in selected
             }
             for future in concurrent.futures.as_completed(futures):
                 case = futures[future]
@@ -1000,7 +1576,17 @@ class QaRunner:
         base = _control_path(self.root, str(self.config.get("qa.artifacts_dir", ".harness/qa/runs")))
         if not base.is_dir():
             return
-        folders = sorted((item for item in base.iterdir() if item.is_dir()), key=lambda item: item.name)
+        # Only folders this tool made itself, which means the ones holding a
+        # result it wrote. Nothing else here is touched: if someone points the
+        # runs folder at a place that already holds their own work, tidying up
+        # old runs must not take that with it.
+        folders = sorted(
+            (
+                item for item in base.iterdir()
+                if item.is_dir() and (item / "result.json").is_file()
+            ),
+            key=lambda item: item.name,
+        )
         for stale in folders[:-keep]:
             for path in sorted(stale.rglob("*"), reverse=True):
                 try:
@@ -1014,37 +1600,62 @@ class QaRunner:
 
     # -- one case ----------------------------------------------------------
 
-    def _run_case(self, case: QaCase, artifacts_root: Path | None) -> QaCaseResult:
+    def _run_case(
+        self,
+        case: QaCase,
+        artifacts_root: Path | None,
+        held: Mapping[str, threading.Lock] | None = None,
+    ) -> QaCaseResult:
+        # Always in the same order, so two checks that touch the same two
+        # things can never sit waiting for each other forever.
+        locks = [held[thing] for thing in sorted(case.touches)] if held else []
+        with contextlib.ExitStack() as waiting:
+            for lock in locks:
+                waiting.enter_context(lock)
+            return self._really_run_case(case, artifacts_root)
+
+    def _really_run_case(self, case: QaCase, artifacts_root: Path | None) -> QaCaseResult:
         attempts: list[QaAttempt] = []
         artifacts: list[str] = []
         started = self.clock()
+        case_folder = artifacts_root / case.id if artifacts_root is not None else None
         for number in range(1, case.retries + 2):
-            attempt, evidence_text = self._attempt(case, number)
+            attempt, evidence_text = self._attempt(case, number, case_folder)
             attempts.append(attempt)
-            if artifacts_root is not None and evidence_text:
-                folder = artifacts_root / case.id
-                folder.mkdir(parents=True, exist_ok=True)
+            if case_folder is not None and evidence_text:
+                case_folder.mkdir(parents=True, exist_ok=True)
                 name = f"attempt-{number}.txt"
-                (folder / name).write_text(evidence_text, encoding="utf-8", errors="replace")
+                (case_folder / name).write_text(evidence_text, encoding="utf-8", errors="replace")
                 artifacts.append(f"{case.id}/{name}")
             if attempt.passed:
                 break
+        with self._picture_lock:
+            artifacts.extend(self._pictures.pop(case.id, []))
         duration = int((self.clock() - started) * 1000)
         last = attempts[-1]
-        if last.skipped:
+        # A skipped attempt says "this could not be tried here". It must never
+        # wipe out a real failure that an earlier attempt already found, so the
+        # result is worked out from the attempts that really ran.
+        ran = [item for item in attempts if not item.skipped]
+        if not ran:
             status = STATUS_SKIPPED
-        elif not last.passed:
+            reasons = last.reasons
+        elif not ran[-1].passed:
             status = STATUS_FAILED
-        elif len(attempts) > 1:
+            reasons = ran[-1].reasons
+        elif any(not item.passed for item in ran):
             status = STATUS_FLAKY
-        else:
-            status = STATUS_PASSED
-        reasons = last.reasons if not last.passed or last.skipped else ()
-        if status == STATUS_FLAKY:
             reasons = (
                 f"Passed on attempt {len(attempts)} after failing earlier. "
                 "A test that only passes sometimes is not trustworthy yet.",
             )
+        else:
+            status = STATUS_PASSED
+            reasons = ()
+        if status != STATUS_SKIPPED and last.skipped:
+            # Say plainly that the last try never happened, so nobody wonders
+            # why the numbers do not add up.
+            reasons = (*reasons, f"A later attempt was skipped: {last.reasons[0] if last.reasons else 'no reason given'}")
         return QaCaseResult(
             id=case.id,
             title=case.title,
@@ -1057,7 +1668,9 @@ class QaRunner:
             artifacts=tuple(artifacts),
         )
 
-    def _attempt(self, case: QaCase, number: int) -> tuple[QaAttempt, str]:
+    def _attempt(
+        self, case: QaCase, number: int, folder: Path | None = None
+    ) -> tuple[QaAttempt, str]:
         started = self.clock()
         skipped = ""
         try:
@@ -1069,7 +1682,13 @@ class QaRunner:
             elif case.kind == "file":
                 reasons, evidence, full = self._check_file(case)
             elif case.kind == "browser":
-                reasons, evidence, full = self._check_browser(case)
+                reasons, evidence, full = self._check_browser(case, number, folder)
+            elif case.kind == "visual":
+                reasons, evidence, full = self._check_visual(case, number, folder)
+            elif case.kind == "secrets":
+                reasons, evidence, full = self._check_secrets(case)
+            elif case.kind == "crawl":
+                reasons, evidence, full = self._check_crawl(case)
             else:
                 reasons, evidence, full = self._check_http(case)
         except QaSkipped as exc:
@@ -1176,18 +1795,97 @@ class QaRunner:
         reasons.extend(_text_reasons("The answer", body, expect.body_contains, expect.body_not_contains))
         if expect.json_fields:
             reasons.extend(_json_reasons(body, expect.json_fields))
+        if expect.contract or expect.contract_file:
+            reasons.extend(self._contract_reasons(case, body))
         full = f"{case.method} {case.url}\nstatus: {status}\n\n{body}\n"
         return tuple(reasons), _excerpt(body, 400), full
 
-    def _check_browser(self, case: QaCase) -> tuple[tuple[str, ...], str, str]:
+    def _contract_reasons(self, case: QaCase, body: str) -> list[str]:
+        """Compare the answer with the shape the case says it should have."""
+
+        expect = case.expect
+        if expect.contract_file:
+            if re.split(r"[\\/]", expect.contract_file)[0].lower() == ".git":
+                raise QaError("A contract may not be read from inside the .git folder")
+            path = _control_path(self.root, expect.contract_file)
+            if not path.is_file():
+                # A missing contract means nothing was checked, so it fails.
+                # Passing here would be the worst kind of quiet.
+                return [f"There is no contract at {expect.contract_file}, so nothing was checked"]
+            try:
+                schema = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError) as exc:
+                return [f"Cannot read the contract {expect.contract_file}: {exc}"]
+            except json.JSONDecodeError as exc:
+                return [f"The contract {expect.contract_file} is not valid JSON: {exc.msg}"]
+        else:
+            schema = json.loads(expect.contract)
+        try:
+            answer = json.loads(body)
+        except json.JSONDecodeError as exc:
+            return [f"The answer is not JSON, so its shape could not be checked: {exc.msg}"]
+        try:
+            return list(contracts.problems(answer, schema, "the answer"))
+        except HarnessError as exc:
+            return [str(exc)]
+
+    def walk_over(self, case: QaCase) -> tuple[tuple[str, ...], str, str]:
+        """Open every page a site links to, and say what was found.
+
+        The same walk the crawl check does, offered by name so other parts of
+        the harness can ask for one without pretending to be a check.
+        """
+
+        return self._check_crawl(case)
+
+    def _check_crawl(self, case: QaCase) -> tuple[tuple[str, ...], str, str]:
+        """Open every page the site links to, from one starting address."""
+
         self._check_host(case.url)
-        timeout = case.timeout_seconds or max(self.default_timeout, 120.0)
-        if not self.browser_available():
-            raise QaSkipped(
-                "This machine has no Playwright browser driver yet. Install Node.js, then run "
-                "'npm install playwright' and 'npx playwright install chromium' in the project."
-            )
-        plan = {
+        timeout = case.timeout_seconds or max(self.default_timeout, 180.0)
+        self._ready_for_browser()
+        plan = self._browser_plan(case, timeout)
+        plan["routes"] = []
+        plan["checkAccessibility"] = case.check_accessibility
+        # A walk follows links, so every place it could reach has to be checked,
+        # not only the one it starts from. Without this, one field in a suite
+        # file could send a real browser at any address on the network.
+        boundary = case.stay_under or _folder_of(case.url)
+        self._check_host(boundary)
+        plan["crawl"] = {
+            "maxPages": case.max_pages,
+            # Links are only followed while they stay under this address, so a
+            # walk of your own site never wanders onto somebody else's.
+            "stayUnder": boundary,
+            # And the page checks the host of every link as well, so a redirect
+            # or an odd address cannot slip past the text comparison.
+            "allowedHosts": list(self.allowed_hosts),
+        }
+        report = self._drive_browser(case, plan, timeout)
+        return crawl_reasons(case, report), crawl_summary(report), json.dumps(report, indent=2)
+
+    def _check_secrets(self, case: QaCase) -> tuple[tuple[str, ...], str, str]:
+        """Read the project's own files and look for credentials left in them.
+
+        This one never reports "skipped". A security check that did not run
+        must say so as a failure, or nobody will ever look again.
+        """
+
+        report = scan.scan_project(
+            self.config, include=case.paths or ("**/*",), skip=case.skip
+        )
+        allowed = case.expect.max_findings if case.expect.max_findings is not None else 0
+        reasons = scan.reasons(report, allowed)
+        summary = (
+            f"Read {report.files_read} files, skipped {report.files_skipped}. "
+            f"Found {len(report.real)} to look at"
+            + (f", and {len(report.allowed)} marked as allowed on purpose" if report.allowed else "")
+            + "."
+        )
+        return tuple(reasons), summary, json.dumps(report.to_dict(), indent=2)
+
+    def _browser_plan(self, case: QaCase, timeout: float) -> dict[str, Any]:
+        return {
             "url": case.url,
             "routes": list(case.routes) or ["/"],
             "viewport": {"width": case.viewport[0], "height": case.viewport[1]},
@@ -1196,12 +1894,39 @@ class QaRunner:
             "steps": [dict(step) for step in case.steps],
             "timeoutMs": int(min(timeout, 120) * 1000),
             "settleMs": 250,
+            "screenshot": None,
+            "measure": case.expect.wants_speed,
+            "crawl": None,
+            "pictures": "never",
+            "picturesFolder": "",
+            "attempt": 1,
         }
+
+    def _ready_for_browser(self) -> None:
+        if not self.browser_available():
+            raise QaSkipped(
+                "This machine has no Playwright browser driver yet. Install Node.js, then run "
+                "'npm install playwright' and 'npx playwright install chromium' in the project."
+            )
+
+    def _drive_browser(
+        self, case: QaCase, plan: Mapping[str, Any], timeout: float, keep: Path | None = None
+    ) -> dict[str, Any]:
+        """Write the one-off Playwright script, run it, and read what it says.
+
+        `keep` is a folder the script may leave files in, such as a screenshot.
+        Without it the working folder is removed as soon as the script ends.
+        """
+
         # Each case gets its own folder. Two runs of the same project can then
         # clean up after themselves without one removing the other's script.
         base = _control_path(self.root, ".harness/qa/tmp")
-        base.mkdir(parents=True, exist_ok=True)
-        folder = Path(tempfile.mkdtemp(prefix=f"{case.id}-", dir=base))
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise QaError(f"Cannot use the working folder {base}: {exc}") from exc
+        folder = keep or Path(tempfile.mkdtemp(prefix=f"{case.id}-", dir=base))
+        folder.mkdir(parents=True, exist_ok=True)
         script = folder / "browser.js"
         script.write_text(browser_script(plan), encoding="utf-8")
         try:
@@ -1209,11 +1934,12 @@ class QaRunner:
                 ["node", script.relative_to(self.root).as_posix()], cwd=".", timeout=timeout
             )
         finally:
-            script.unlink(missing_ok=True)
-            try:
-                folder.rmdir()
-            except OSError:
-                pass
+            # Tidying up must never be the thing that fails a check. On Windows
+            # something else - a virus scanner, a file indexer, the browser
+            # letting go a moment late - can still be holding this file, and a
+            # check that passed should not be reported as broken because of a
+            # temporary file nobody will ever look at.
+            _let_go_of(script, folder if keep is None else None)
         marker = "<<<QA_REPORT>>>"
         if marker not in result.stdout:
             detail = (result.stderr or result.stdout).strip()
@@ -1222,6 +1948,32 @@ class QaRunner:
             report = json.loads(result.stdout.split(marker, 1)[1])
         except json.JSONDecodeError as exc:
             raise QaError(f"The browser report is not valid JSON: {exc.msg}") from exc
+        return report
+
+    def _check_browser(
+        self, case: QaCase, number: int = 1, folder: Path | None = None
+    ) -> tuple[tuple[str, ...], str, str]:
+        self._check_host(case.url)
+        timeout = case.timeout_seconds or max(self.default_timeout, 120.0)
+        self._ready_for_browser()
+        plan = self._browser_plan(case, timeout)
+        keep: Path | None = None
+        if case.steps and case.pictures != "never":
+            # Pictures land in the run folder beside the rest of the evidence,
+            # so somebody can see the page as it was when a step went wrong.
+            keep = folder or _control_path(self.root, f".harness/qa/tmp/{case.id}-pictures")
+            keep.mkdir(parents=True, exist_ok=True)
+            plan["pictures"] = case.pictures
+            plan["picturesFolder"] = keep.relative_to(self.root).as_posix()
+            # Each try keeps its own pictures, so a second attempt never paints
+            # over what the first one saw.
+            plan["attempt"] = number
+        report = self._drive_browser(case, plan, timeout, keep=keep)
+        if keep is not None:
+            for step in report.get("steps") or []:
+                name = str(step.get("picture") or "")
+                if name and (keep / name).is_file():
+                    self._remember_picture(case.id, f"{case.id}/{name}")
         return self._browser_reasons(case, report)
 
     def _browser_reasons(
@@ -1239,14 +1991,30 @@ class QaRunner:
             named = str(step.get("label") or "").strip()
             if not named and position <= len(case.steps):
                 named = str(case.steps[position - 1].get("do", "the step"))
+            picture = str(step.get("picture") or "")
+            # A tidy-up step is named as one, because it failing means
+            # something this check changed has been left changed.
+            what = "The tidying up after step" if step.get("tidyUp") else "Step"
             reasons.append(
-                f"Step {position} of {len(case.steps)} did not work: {named or 'the step'}. "
+                f"{what} {position} of {len(case.steps)} did not work: {named or 'the step'}. "
                 f"The browser said: {_quote(str(step.get('text') or 'nothing'))}"
+                + (f" A picture of the page is in the run folder: {picture}" if picture else "")
             )
         if case.steps and len(steps) < len(case.steps) and not fatal:
-            reasons.append(
-                f"Only {len(steps)} of {len(case.steps)} steps ran, so the rest were never checked"
-            )
+            skipped = len(case.steps) - len(steps)
+            if any(not step.get("ok") for step in steps):
+                # Deliberate: once a step has failed the rest of the workflow
+                # means nothing, so it is not run and not reported as broken.
+                reasons.append(
+                    f"{skipped} later step{'' if skipped == 1 else 's'} "
+                    f"{'was' if skipped == 1 else 'were'} skipped after that, "
+                    f"so {'it was' if skipped == 1 else 'they were'} never checked"
+                )
+            else:
+                reasons.append(
+                    f"Only {len(steps)} of {len(case.steps)} steps ran, "
+                    "so the rest were never checked"
+                )
         counted = (
             ("consoleErrors", expect.max_console_errors, "error message in the browser console"),
             ("pageErrors", expect.max_page_errors, "page script error"),
@@ -1260,9 +2028,14 @@ class QaRunner:
             plural = "" if len(found) == 1 else "s"
             first = found[0]
             detail = first.get("text") or first.get("url") or first.get("problem") or ""
+            # An accessibility problem is only useful with the thing it is
+            # about, so say which heading, image, or pair of links it means.
+            if first.get("problem") and first.get("detail"):
+                detail = f"{first['problem']}: {first['detail']}"
             reasons.append(
                 f"Found {len(found)} {label}{plural}, more than the {limit} allowed. "
-                f"First one: {_quote(str(detail))}"
+                # A problem needs enough room to name the thing it is about.
+                f"First one: {_quote(str(detail), 160)}"
             )
         for route in report.get("routes") or []:
             status = int(route.get("status") or 0)
@@ -1270,9 +2043,11 @@ class QaRunner:
                 reasons.append(f"The page {route.get('route')} answered with {status or 'no status'}")
         text = str(report.get("text") or "")
         reasons.extend(_text_reasons("The page text", text, expect.body_contains, expect.body_not_contains))
+        reasons.extend(speed_reasons(case, report.get("speed") or []))
         summary = json.dumps(
             {
                 "routes": report.get("routes"),
+                "speed": report.get("speed"),
                 "console_errors": len(report.get("consoleErrors") or []),
                 "page_errors": len(report.get("pageErrors") or []),
                 "failed_requests": len(report.get("requestFailures") or []),
@@ -1282,6 +2057,118 @@ class QaRunner:
             indent=2,
         )
         return tuple(reasons), summary, json.dumps(report, indent=2)
+
+    # -- screenshot checks -------------------------------------------------
+
+    def baseline_path(self, case: QaCase) -> Path:
+        """Where the saved picture for this check lives."""
+
+        return _control_path(self.root, baseline_file(case))
+
+    def _remember_picture(self, case_id: str, name: str) -> None:
+        with self._picture_lock:
+            self._pictures.setdefault(case_id, []).append(name)
+
+    def _check_visual(
+        self, case: QaCase, number: int, folder: Path | None
+    ) -> tuple[tuple[str, ...], str, str]:
+        self._check_host(case.url)
+        timeout = case.timeout_seconds or max(self.default_timeout, 120.0)
+        self._ready_for_browser()
+        base = _control_path(self.root, ".harness/qa/tmp")
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise QaError(f"Cannot use the working folder {base}: {exc}") from exc
+        workspace = Path(tempfile.mkdtemp(prefix=f"{case.id}-shot-", dir=base))
+        taken = workspace / "screenshot.png"
+        plan = self._browser_plan(case, timeout)
+        plan["screenshot"] = {
+            "path": taken.relative_to(self.root).as_posix(),
+            "selector": case.selector,
+            "fullPage": case.full_page,
+        }
+        try:
+            report = self._drive_browser(case, plan, timeout, keep=workspace)
+            fatal = str(report.get("fatal") or "")
+            if fatal:
+                return (f"The browser stopped early: {_quote(fatal)}",), "", json.dumps(report, indent=2)
+            failed_steps = [step for step in (report.get("steps") or []) if not step.get("ok")]
+            if failed_steps:
+                first = failed_steps[0]
+                return (
+                    (
+                        f"The picture was never taken because a step did not work: "
+                        f"{first.get('label') or 'the step'}. "
+                        f"The browser said: {_quote(str(first.get('text') or 'nothing'))}",
+                    ),
+                    "",
+                    json.dumps(report, indent=2),
+                )
+            if not taken.is_file():
+                raise QaError(
+                    "The browser did not save a picture. "
+                    + (
+                        f"Check that {case.selector} is on the page."
+                        if case.selector
+                        else "The page may never have finished loading."
+                    )
+                )
+            raw = taken.read_bytes()
+            return self._compare_to_baseline(
+                case, number, folder, images.read_png(raw, "the new picture"), raw
+            )
+        finally:
+            for leftover in workspace.glob("*"):
+                leftover.unlink(missing_ok=True)
+            try:
+                workspace.rmdir()
+            except OSError:
+                pass
+
+    def _compare_to_baseline(
+        self, case: QaCase, number: int, folder: Path | None, fresh: images.Image, raw: bytes
+    ) -> tuple[tuple[str, ...], str, str]:
+        baseline = self.baseline_path(case)
+        relative = baseline.relative_to(self.root).as_posix()
+        if not baseline.is_file():
+            if not self.update_baselines:
+                raise QaSkipped(
+                    f"There is no saved picture to compare with yet. Look at the page, then run "
+                    f"'harness qa baseline --case {case.id}' to save {relative} as the one to keep."
+                )
+            baseline.parent.mkdir(parents=True, exist_ok=True)
+            baseline.write_bytes(raw)
+            return (), f"Saved the first picture as {relative}", ""
+        old = images.read_png(baseline.read_bytes(), f"the saved picture {relative}")
+        drift = case.expect.allowed_color_drift or 0
+        difference = images.compare(old, fresh, drift)
+        if folder is not None:
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / f"attempt-{number}-now.png").write_bytes(raw)
+            self._remember_picture(case.id, f"{case.id}/attempt-{number}-now.png")
+            if difference.changed:
+                (folder / f"attempt-{number}-difference.png").write_bytes(
+                    images.write_png(difference.picture)
+                )
+                self._remember_picture(case.id, f"{case.id}/attempt-{number}-difference.png")
+        if self.update_baselines:
+            baseline.write_bytes(raw)
+            return (), f"Saved the new picture as {relative}. {difference.summary()}", ""
+        reasons = tuple(visual_reasons(case, difference, relative))
+        summary = json.dumps(
+            {
+                "baseline": relative,
+                "changed_pixels": difference.changed,
+                "compared_pixels": difference.compared,
+                "changed_percent": round(difference.percent, 4),
+                "biggest_color_gap": difference.biggest_channel_gap,
+                "size_before": list(difference.before_size),
+                "size_after": list(difference.after_size),
+            },
+            indent=2,
+        )
+        return reasons, summary, summary
 
     def browser_available(self) -> bool:
         """True when Node.js can load Playwright from this project."""
@@ -1331,7 +2218,7 @@ class QaRunner:
 
 
 _BROWSER_SCRIPT = r"""
-// Written by Our Harness for one browser case. It is deleted after the run.
+// Written by Nexus Harness for one browser case. It is deleted after the run.
 const { chromium } = require('playwright');
 const plan = __PLAN__;
 
@@ -1356,7 +2243,16 @@ function auditPage() {
     if (!labelled) add('A form field has no label', field.outerHTML.slice(0, 120));
   }
   for (const control of document.querySelectorAll('button, a[href], [role="button"]')) {
+    // Something the page is not drawing right now cannot be read out either,
+    // and nobody can reach it, so it is not a problem to report. It matters:
+    // innerText is empty for anything inside a folded-away panel, so without
+    // this every button in one would be called nameless when it is not.
+    // The words on a control are its name whether the page is drawing them
+    // this second or not. innerText is empty for anything inside a folded-away
+    // panel, and reading only that called every button in one nameless when
+    // each had a perfectly good name written on it.
     const name = (control.innerText || '').trim()
+      || (control.textContent || '').trim()
       || control.getAttribute('aria-label')
       || control.getAttribute('title');
     if (!name) add('A button or link has no readable name', control.outerHTML.slice(0, 120));
@@ -1369,11 +2265,70 @@ function auditPage() {
     }
     previous = level;
   }
+  // Two links reading the same but going somewhere different. Somebody moving
+  // through a page link by link hears "read more, read more" and cannot tell
+  // them apart.
+  const targetByWords = new Map();
+  const alreadySaid = new Set();
+  for (const link of document.querySelectorAll('a[href]')) {
+    const words = (link.innerText || link.textContent || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    if (!words) continue;
+    const target = link.getAttribute('href');
+    if (!targetByWords.has(words)) { targetByWords.set(words, target); continue; }
+    if (targetByWords.get(words) === target || alreadySaid.has(words)) continue;
+    alreadySaid.add(words);
+    add(
+      'Two links say the same thing but go to different places',
+      '"' + words.slice(0, 40) + '" goes to ' + targetByWords.get(words) + ' and to ' + target
+    );
+  }
   return problems;
+}
+
+function measurePage() {
+  // The old way of asking, performance.timing, is gone from the standard and
+  // reads as zeros in some pages, which made every speed check pass. These
+  // entries are the current way and are either real or plainly missing.
+  const entry = performance.getEntriesByType('navigation')[0];
+  const paint = performance.getEntriesByName('first-contentful-paint')[0];
+  const resources = performance.getEntriesByType('resource') || [];
+  let bytes = entry && entry.transferSize ? entry.transferSize : 0;
+  let unmeasured = 0;
+  for (const item of resources) {
+    if (item.transferSize > 0) bytes += item.transferSize;
+    else if (item.duration > 0) unmeasured += 1;   // Another site would not say.
+  }
+  const useful = entry && entry.loadEventEnd > 0;
+  return {
+    measured: Boolean(useful),
+    loadMs: useful ? Math.round(entry.loadEventEnd - entry.startTime) : null,
+    readyMs: useful ? Math.round(entry.domContentLoadedEventEnd - entry.startTime) : null,
+    firstPaintMs: paint ? Math.round(paint.startTime) : null,
+    requests: resources.length + (entry ? 1 : 0),
+    bytes,
+    unmeasured,
+  };
+}
+
+async function pictureOfStep(page, plan, number, worked) {
+  // Pictures are only taken when the case asked for them: always, or only for
+  // the step that went wrong.
+  const wanted = plan.pictures || 'never';
+  if (wanted === 'never' || (wanted === 'failure' && worked)) return '';
+  const attempt = 'attempt-' + String(plan.attempt || 1).padStart(2, '0') + '-';
+  const name = attempt + 'step-' + String(number).padStart(2, '0') + (worked ? '' : '-went-wrong') + '.png';
+  try {
+    await page.screenshot({ path: plan.picturesFolder + '/' + name, animations: 'disabled', scale: 'css' });
+    return name;
+  } catch (error) {
+    return '';
+  }
 }
 
 function describeStep(step) {
   if (step.do === 'wait') return 'wait ' + step.ms + ' ms';
+  if (step.do === 'run') return 'run a snippet in the page';
+  if (step.do === 'expect_count') return 'expect ' + step.count + ' of ' + step.target;
   if (step.text !== undefined) return step.do + ' "' + step.text + '" on ' + step.target;
   if (step.key !== undefined) return step.do + ' ' + step.key + ' on ' + step.target;
   if (step.value !== undefined) return step.do + ' ' + step.value + ' on ' + step.target;
@@ -1383,6 +2338,31 @@ function describeStep(step) {
 async function runStep(page, step) {
   const wait = step.timeout_ms || 10000;
   if (step.do === 'wait') { await page.waitForTimeout(step.ms); return; }
+  if (step.do === 'run') {
+    // The written snippet runs inside the page, the way a person would run it
+    // in the browser's own console. Whatever it gives back is turned into text
+    // and compared with what the step expects.
+    const value = await page.evaluate('(async function () {' + step.script + '})()');
+    const shown = value === undefined ? 'undefined' : String(value);
+    if (step.text === undefined) {
+      if (!value) throw new Error('the snippet gave back "' + shown + '", which is not a yes');
+      return;
+    }
+    if (shown !== step.text) {
+      throw new Error('expected "' + step.text + '" but the snippet gave back "' + shown.slice(0, 200) + '"');
+    }
+    return;
+  }
+  if (step.do === 'expect_count') {
+    const deadline = Date.now() + wait;
+    let seen = -1;
+    while (Date.now() < deadline) {
+      seen = await page.locator(step.target).count();
+      if (seen === step.count) return;
+      await page.waitForTimeout(100);
+    }
+    throw new Error('expected ' + step.count + ' of them but found ' + seen);
+  }
   const target = page.locator(step.target).first();
   if (step.do === 'click') { await target.click({ timeout: wait }); return; }
   if (step.do === 'type') { await target.fill(step.text, { timeout: wait }); return; }
@@ -1419,7 +2399,8 @@ async function runStep(page, step) {
 (async () => {
   const report = {
     routes: [], consoleErrors: [], pageErrors: [], requestFailures: [], accessibility: [],
-    clicks: [], steps: [], text: '', fatal: '',
+    clicks: [], steps: [], text: '', fatal: '', screenshot: '', speed: [],
+    pages: [], morePages: 0, refused: [],
   };
   let current = '/';
   let browser;
@@ -1440,6 +2421,78 @@ async function runStep(page, step) {
         route: current, url: request.url().slice(0, 300), text: failure.errorText || 'request failed',
       });
     });
+    if (plan.crawl) {
+      // Walk the site from one page, following its own links, and report what
+      // each page answered. Nothing outside the starting address is opened.
+      const allowedHost = (address) => {
+        try {
+          const host = new URL(address).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+          return (plan.crawl.allowedHosts || []).includes(host);
+        } catch (error) {
+          return false;
+        }
+      };
+      if (!allowedHost(plan.url)) throw new Error('that address may not be opened by this project');
+      // The boundary is a place in the site, not a piece of text. Comparing
+      // the letters alone would let a walk of /blog wander into /blog-secret,
+      // which is a different part of the site.
+      const boundary = plan.crawl.stayUnder.endsWith('/')
+        ? plan.crawl.stayUnder
+        : plan.crawl.stayUnder + '/';
+      const inside = (address) =>
+        address === plan.crawl.stayUnder || address.startsWith(boundary);
+      // Nothing at all is fetched from a host this project did not allow. This
+      // covers a link, a redirect, and anything the page asks for afterwards,
+      // instead of only the addresses we thought to compare.
+      await page.route('**/*', (route) => {
+        const wanted = route.request().url();
+        if (allowedHost(wanted)) return route.continue();
+        report.refused.push(wanted.slice(0, 200));
+        return route.abort();
+      });
+      const seen = new Set();
+      const waiting = [plan.url];
+      while (waiting.length && report.pages.length < plan.crawl.maxPages) {
+        const address = waiting.shift();
+        if (seen.has(address)) continue;
+        seen.add(address);
+        current = address;
+        let status = 0;
+        try {
+          const answer = await page.goto(address, { waitUntil: 'load', timeout: plan.timeoutMs });
+          status = answer ? answer.status() : 0;
+        } catch (error) {
+          report.pages.push({ url: address, status: 0, problem: String((error && error.message) || error).slice(0, 200) });
+          continue;
+        }
+        const landed = page.url();
+        if (!allowedHost(landed)) {
+          // It went somewhere this project may not open, so nothing on that
+          // page is read.
+          report.pages.push({ url: address, status, problem: 'it went to ' + landed + ', which this project may not open' });
+          report.refused.push(landed.slice(0, 200));
+          continue;
+        }
+        await page.waitForTimeout(plan.settleMs);
+        let problems = [];
+        if (plan.checkAccessibility) {
+          problems = await page.evaluate(auditPage);
+          for (const item of problems) report.accessibility.push({ route: address, ...item });
+        }
+        report.pages.push({ url: address, status, accessibility: problems.length });
+        const links = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('a[href]')).map((link) => link.href)
+        );
+        for (const link of links) {
+          const plain = String(link).split('#')[0];
+          if (!inside(plain)) continue;
+          if (!allowedHost(plain)) continue;
+          if (seen.has(plain) || waiting.includes(plain)) continue;
+          waiting.push(plain);
+        }
+      }
+      report.morePages = waiting.length;
+    }
     for (const route of plan.routes) {
       current = route;
       const target = new URL(route, plan.url).toString();
@@ -1447,19 +2500,63 @@ async function runStep(page, step) {
       report.routes.push({ route, status: answer ? answer.status() : 0 });
       await page.waitForTimeout(plan.settleMs);
       report.text += '\n' + await page.evaluate(() => (document.body ? document.body.innerText : ''));
+      if (plan.measure) {
+        report.speed.push({ route, ...(await page.evaluate(measurePage)) });
+      }
       if (plan.checkAccessibility) {
         const found = await page.evaluate(auditPage);
         for (const item of found) report.accessibility.push({ route, ...item });
       }
+      let stepNumber = 0;
+      let wentWrong = false;
       for (const step of plan.steps || []) {
         const label = step.note || describeStep(step);
+        stepNumber += 1;
+        // Once something has gone wrong the rest of the workflow means nothing,
+        // so it is skipped. A step marked "always" is different: that is where
+        // a check puts back whatever it changed, and skipping it would leave
+        // the project in the state the failure caught it in.
+        if (wentWrong && !step.always) continue;
         try {
           await runStep(page, step);
-          report.steps.push({ route, label, ok: true });
+          report.steps.push({ route, label, ok: true, tidyUp: !!step.always, picture: await pictureOfStep(page, plan, stepNumber, true) });
         } catch (error) {
-          report.steps.push({ route, label, ok: false, text: String((error && error.message) || error).slice(0, 300) });
-          break;
+          report.steps.push({
+            route, label, ok: false, tidyUp: !!step.always,
+            text: String((error && error.message) || error).slice(0, 300),
+            // A picture of the page at the moment it went wrong is worth more
+            // than any wording, especially to somebody new.
+            picture: await pictureOfStep(page, plan, stepNumber, false),
+          });
+          wentWrong = true;
         }
+      }
+      if (plan.screenshot) {
+        // Wait for the letters to settle and stop anything that moves, so the
+        // same page gives the same picture twice.
+        try { await page.evaluate(() => document.fonts && document.fonts.ready); } catch (error) { /* older browser */ }
+        await page.waitForTimeout(plan.settleMs);
+        const shot = {
+          path: plan.screenshot.path,
+          animations: 'disabled',
+          caret: 'hide',
+          scale: 'css',
+          type: 'png',
+        };
+        if (plan.screenshot.selector) {
+          const part = page.locator(plan.screenshot.selector);
+          const found = await part.count();
+          if (found !== 1) {
+            throw new Error(
+              'the picture needs exactly one part of the page, but ' + plan.screenshot.selector
+              + ' matches ' + found
+            );
+          }
+          await part.first().screenshot(shot);
+        } else {
+          await page.screenshot({ ...shot, fullPage: !!plan.screenshot.fullPage });
+        }
+        report.screenshot = plan.screenshot.path;
       }
       if (plan.clickAll) {
         const total = await page.evaluate(() => document.querySelectorAll(
@@ -1495,6 +2592,32 @@ async function runStep(page, step) {
 """
 
 
+def _let_go_of(script: Path, folder: Path | None) -> None:
+    """Remove a temporary file, waiting a moment if something still holds it.
+
+    A file another program has open cannot be removed on Windows, and the
+    something is usually a virus scanner reading a file that was written a
+    second ago. Waiting briefly clears it. Failing to clear it is still not
+    worth failing a check over: the folder is a temporary one, and what is left
+    behind is a few lines of JavaScript nobody will read.
+    """
+
+    for wait in (0.0, 0.1, 0.3, 0.6):
+        if wait:
+            time.sleep(wait)
+        try:
+            script.unlink(missing_ok=True)
+            break
+        except OSError:
+            continue
+    if folder is None:
+        return
+    try:
+        folder.rmdir()
+    except OSError:
+        pass
+
+
 def browser_script(plan: Mapping[str, Any]) -> str:
     """Build the standalone Playwright script for one browser case."""
 
@@ -1521,6 +2644,28 @@ def _text_reasons(
     return reasons
 
 
+def _same_json_value(found: Any, expected: Any) -> bool:
+    """Is this the same value, in the same shape?
+
+    Python says True equals 1 and False equals 0. JSON does not: an answer
+    saying true where a case expects the number 1 is a different answer, and
+    letting it pass means a check that reports success while the thing it
+    watches has changed.
+    """
+
+    if isinstance(found, bool) != isinstance(expected, bool):
+        return False
+    if isinstance(found, (list, tuple)) and isinstance(expected, (list, tuple)):
+        return len(found) == len(expected) and all(
+            _same_json_value(one, two) for one, two in zip(found, expected)
+        )
+    if isinstance(found, dict) and isinstance(expected, dict):
+        return set(found) == set(expected) and all(
+            _same_json_value(found[key], expected[key]) for key in found
+        )
+    return found == expected
+
+
 def _json_reasons(body: str, fields: Sequence[tuple[str, Any]]) -> list[str]:
     try:
         parsed = json.loads(body)
@@ -1540,7 +2685,7 @@ def _json_reasons(body: str, fields: Sequence[tuple[str, Any]]) -> list[str]:
                 break
         if missing:
             reasons.append(f"The answer has no field named {dotted}")
-        elif found != expected:
+        elif not _same_json_value(found, expected):
             reasons.append(
                 f"The field {dotted} holds {json.dumps(found)[:80]}; the case expects {json.dumps(expected)}"
             )
@@ -1582,7 +2727,7 @@ def record_history(config: LoadedConfig, result: QaRunResult) -> Path:
         "passed": result.passed,
         "duration_ms": result.duration_ms,
         "cases": [
-            {"id": case.id, "status": case.status, "duration_ms": case.duration_ms}
+            {"id": plain_xml_text(case.id), "status": case.status, "duration_ms": case.duration_ms}
             for case in result.cases
         ],
     })
@@ -1783,7 +2928,35 @@ def check_health(
 # ---------------------------------------------------------------------------
 
 
-def report_markdown(result: QaRunResult) -> str:
+def _for_people(redactor: "CredentialRedactor | None") -> "CredentialRedactor":
+    """The remover a written report uses.
+
+    A report is a file somebody sends: attached to a ticket, committed beside
+    the build, pasted into a chat. What a check saw is a program's own output,
+    and a program prints whatever it was given, keys included. So credentials
+    come out of every report meant to be read by a person, and a caller that
+    forgets to pass a remover gets one anyway.
+
+    The run folder itself is left as it is. That is this machine's own record,
+    like a log file, and hiding things there would only give false comfort.
+    """
+
+    return redactor or CredentialRedactor(None)
+
+
+def _one_line(text: str) -> str:
+    """A table cell holds one line, whatever the program printed.
+
+    A reason with a line break in it split one row into two, and every row
+    after it stopped being part of the table. The upright bar is the column
+    mark, so that goes too.
+    """
+
+    return " ".join(str(text).split()).replace("|", "/")
+
+
+def report_markdown(result: QaRunResult, redactor: "CredentialRedactor | None" = None) -> str:
+    hide = _for_people(redactor).text
     counts = result.counts
     lines = [
         f"# Test run {result.run_id}",
@@ -1802,28 +2975,63 @@ def report_markdown(result: QaRunResult) -> str:
     for case in result.cases:
         reason = "; ".join(case.reasons) if case.reasons else "As expected"
         lines.append(
-            f"| {case.id} | {case.status} | {case.duration_ms} ms | {reason.replace('|', '/')} |"
+            f"| {_one_line(hide(case.id))} | {case.status} | {case.duration_ms} ms | "
+            f"{_one_line(hide(reason))} |"
         )
     failures = [case for case in result.cases if case.status == STATUS_FAILED]
     if failures:
         lines += ["", "## Failures", ""]
         for case in failures:
-            lines.append(f"### {case.id}: {case.title}")
+            lines.append(f"### {hide(case.id)}: {hide(case.title)}")
             for reason in case.reasons:
-                lines.append(f"- {reason}")
+                lines.append(f"- {hide(reason)}")
             evidence = case.attempts[-1].evidence if case.attempts else ""
             if evidence:
-                lines += ["", "```text", evidence, "```"]
+                lines += ["", "```text", hide(evidence), "```"]
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def report_junit_xml(result: QaRunResult) -> str:
+def plain_xml_text(value: str) -> str:
+    """Text an XML reader will accept.
+
+    What a check saw comes from a program's own output, which can hold bytes
+    that mean "ring the bell" or "start a colour". XML has no way to write
+    those, so a build server would refuse the whole report over one stray byte
+    in one check. They become spaces here, and the words stay.
+    """
+
+    keep = ("\t", "\n", "\r")
+
+    def allowed(character: str) -> bool:
+        if character in keep:
+            return True
+        number = ord(character)
+        if number < 0x20:
+            return False
+        # XML has no way to write these either, however ordinary they look in
+        # Python: the two non-characters at the end of each block, the block
+        # kept aside in the middle, and half of a pair that lost its other
+        # half. One of them anywhere made a build server refuse the whole
+        # report, and a lone half stopped the file being written at all.
+        if 0xD800 <= number <= 0xDFFF:
+            return False
+        if 0xFDD0 <= number <= 0xFDEF:
+            return False
+        if number in (0xFFFE, 0xFFFF):
+            return False
+        return True
+
+    return "".join(character if allowed(character) else " " for character in str(value))
+
+
+def report_junit_xml(result: QaRunResult, redactor: "CredentialRedactor | None" = None) -> str:
+    hide = _for_people(redactor).text
     counts = result.counts
     suites = ElementTree.Element(
         "testsuites",
         {
-            "name": result.suite_name,
+            "name": plain_xml_text(result.suite_name),
             "tests": str(counts["total"]),
             "failures": str(counts[STATUS_FAILED]),
             "skipped": str(counts[STATUS_SKIPPED]),
@@ -1834,12 +3042,12 @@ def report_junit_xml(result: QaRunResult) -> str:
         suites,
         "testsuite",
         {
-            "name": result.suite_name,
+            "name": plain_xml_text(result.suite_name),
             "tests": str(counts["total"]),
             "failures": str(counts[STATUS_FAILED]),
             "skipped": str(counts[STATUS_SKIPPED]),
             "time": f"{result.duration_ms / 1000:.3f}",
-            "timestamp": result.started_at,
+            "timestamp": plain_xml_text(result.started_at),
         },
     )
     for case in result.cases:
@@ -1847,24 +3055,29 @@ def report_junit_xml(result: QaRunResult) -> str:
             suite,
             "testcase",
             {
-                "name": case.title,
-                "classname": f"{result.suite_name}.{case.kind}",
-                "id": case.id,
+                "name": plain_xml_text(hide(case.title)),
+                "classname": plain_xml_text(f"{result.suite_name}.{case.kind}"),
+                "id": plain_xml_text(hide(case.id)),
                 "time": f"{case.duration_ms / 1000:.3f}",
             },
         )
         if case.status == STATUS_FAILED:
             failure = ElementTree.SubElement(
-                node, "failure", {"message": case.reasons[0] if case.reasons else "failed"}
+                node,
+                "failure",
+                {"message": plain_xml_text(hide(case.reasons[0] if case.reasons else "failed"))},
             )
-            failure.text = "\n".join(case.reasons) + (
-                "\n\n" + case.attempts[-1].evidence if case.attempts else ""
+            failure.text = plain_xml_text(
+                hide(
+                    "\n".join(case.reasons)
+                    + ("\n\n" + case.attempts[-1].evidence if case.attempts else "")
+                )
             )
         elif case.status == STATUS_SKIPPED:
             ElementTree.SubElement(node, "skipped")
         elif case.status == STATUS_FLAKY:
             output = ElementTree.SubElement(node, "system-out")
-            output.text = "\n".join(case.reasons)
+            output.text = plain_xml_text(hide("\n".join(case.reasons)))
     return '<?xml version="1.0" encoding="utf-8"?>\n' + ElementTree.tostring(
         suites, encoding="unicode"
     )
@@ -1890,7 +3103,8 @@ details { margin: .5rem 0; }
 """
 
 
-def report_html(result: QaRunResult) -> str:
+def report_html(result: QaRunResult, redactor: "CredentialRedactor | None" = None) -> str:
+    hide = _for_people(redactor).text
     counts = result.counts
     headline = "All checks passed" if result.passed else "Some checks failed"
     rows = []
@@ -1898,10 +3112,10 @@ def report_html(result: QaRunResult) -> str:
         reason = "; ".join(case.reasons) if case.reasons else "As expected"
         rows.append(
             "<tr>"
-            f"<td><code>{html.escape(case.id)}</code><br>{html.escape(case.title)}</td>"
+            f"<td><code>{html.escape(hide(case.id))}</code><br>{html.escape(hide(case.title))}</td>"
             f'<td class="status {case.status}">{case.status}</td>'
             f"<td>{case.duration_ms} ms</td>"
-            f"<td>{html.escape(reason)}</td>"
+            f"<td>{html.escape(hide(reason))}</td>"
             "</tr>"
         )
     details = []
@@ -1910,9 +3124,9 @@ def report_html(result: QaRunResult) -> str:
             continue
         evidence = case.attempts[-1].evidence
         details.append(
-            f"<details><summary>{html.escape(case.id)}: {html.escape(case.title)}</summary>"
-            + "".join(f"<p>{html.escape(reason)}</p>" for reason in case.reasons)
-            + (f"<pre>{html.escape(evidence)}</pre>" if evidence else "")
+            f"<details><summary>{html.escape(hide(case.id))}: {html.escape(hide(case.title))}</summary>"
+            + "".join(f"<p>{html.escape(hide(reason))}</p>" for reason in case.reasons)
+            + (f"<pre>{html.escape(hide(evidence))}</pre>" if evidence else "")
             + "</details>"
         )
     return (
@@ -1938,15 +3152,21 @@ def report_html(result: QaRunResult) -> str:
 REPORT_FORMATS = ("json", "markdown", "junit", "html")
 
 
-def render_report(result: QaRunResult, output_format: str) -> str:
+def render_report(
+    result: QaRunResult,
+    output_format: str,
+    redactor: "CredentialRedactor | None" = None,
+) -> str:
     if output_format == "json":
+        # This machine's own record, the same thing the run folder already
+        # holds. Hiding things here would only give false comfort.
         return json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n"
     if output_format == "markdown":
-        return report_markdown(result)
+        return report_markdown(result, redactor)
     if output_format == "junit":
-        return report_junit_xml(result) + "\n"
+        return report_junit_xml(result, redactor) + "\n"
     if output_format == "html":
-        return report_html(result)
+        return report_html(result, redactor)
     raise QaError(f"Report format must be one of: {', '.join(REPORT_FORMATS)}")
 
 

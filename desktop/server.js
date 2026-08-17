@@ -81,6 +81,19 @@ function isLoopbackUrl(candidate) {
   return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
+function isWebAddress(candidate) {
+  // Only an ordinary web address may be handed to the system to open. A file
+  // path, a network share, a mail link or any other kind of address would let
+  // whatever the window is showing start something on this machine.
+  let parsed;
+  try {
+    parsed = new URL(candidate);
+  } catch (error) {
+    return false;
+  }
+  return parsed.protocol === "http:" || parsed.protocol === "https:";
+}
+
 class HarnessServer {
   constructor(options = {}) {
     this.spawnProcess = options.spawn || spawn;
@@ -101,18 +114,32 @@ class HarnessServer {
     return this.log.join("\n");
   }
 
-  // Try each Python command in turn. The first one that prints the ready line
-  // wins; the rest are only tried when the command itself is missing.
+  // Try each Python command in turn until one prints the ready line. A machine
+  // often has several, and only one of them has the harness installed, so all
+  // of them are tried.
+  //
+  // What is said when none works is chosen with care. Reporting whichever was
+  // tried last points at a command the person never chose: "python3 is not
+  // here" when the real answer is "py ran, and the harness is not installed in
+  // it". So the failure from a Python that really ran is kept and reported,
+  // and "not on this machine" is only the answer when that was true of all of
+  // them.
   async start(projectPath) {
-    let lastProblem = "No Python command was found.";
+    const missing = [];
+    let realProblem = null;
     for (const [command, leadingArguments] of this.candidates) {
       try {
         return await this.startOnce(command, leadingArguments, projectPath);
       } catch (error) {
-        lastProblem = error.message;
+        if (error.commandIsMissing) missing.push(command);
+        else if (!realProblem) realProblem = error;
       }
     }
-    throw new Error(lastProblem);
+    if (realProblem) throw realProblem;
+    throw new Error(
+      `No Python was found on this machine. Tried: ${missing.join(", ")}. `
+      + "Install Python 3.11 or newer, or name yours with HARNESS_PYTHON."
+    );
   }
 
   startOnce(command, leadingArguments, projectPath) {
@@ -123,11 +150,18 @@ class HarnessServer {
       "ui", "--port", "0", "--no-open-browser",
     ];
     return new Promise((resolve, reject) => {
+      // A command that is not on this machine is not a failure worth showing:
+      // it only means try the next one. Anything else is the real answer.
+      const notHere = (error) => {
+        const problem = new Error(`Could not start ${command}: ${error.message}`);
+        problem.commandIsMissing = error.code === "ENOENT" || error.code === "EACCES";
+        return problem;
+      };
       let child;
       try {
         child = this.spawnProcess(command, argv, { cwd: projectPath, windowsHide: true });
       } catch (error) {
-        reject(new Error(`Could not start ${command}: ${error.message}`));
+        reject(notHere(error));
         return;
       }
       let settled = false;
@@ -167,7 +201,7 @@ class HarnessServer {
       };
       readStream(child.stdout);
       readStream(child.stderr);
-      child.on("error", (error) => finish(new Error(`Could not start ${command}: ${error.message}`)));
+      child.on("error", (error) => finish(notHere(error)));
       child.on("exit", (code) => {
         const detail = this.recentLog().split("\n").slice(-6).join("\n");
         finish(new Error(`${command} stopped with code ${code}.\n${detail}`));
@@ -193,4 +227,4 @@ class HarnessServer {
   }
 }
 
-module.exports = { HarnessServer, pythonCandidates, readReadyLine, isLoopbackUrl, isOwnPage, READY_MARKER };
+module.exports = { HarnessServer, pythonCandidates, readReadyLine, isLoopbackUrl, isWebAddress, isOwnPage, READY_MARKER };

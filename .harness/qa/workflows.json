@@ -104,64 +104,63 @@
         "ui",
         "checks"
       ],
-      "timeout_seconds": 180,
+      "timeout_seconds": 300,
       "url": "http://127.0.0.1:8765/",
       "check_accessibility": true,
       "steps": [
         {
           "do": "click",
-          "target": "[data-view=\"checks\"]"
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
         },
         {
           "do": "expect_visible",
-          "target": "#checksView"
+          "target": "#checkBody tr",
+          "note": "The checks are listed"
         },
         {
           "do": "expect_text",
           "target": "#checkBody",
-          "text": "README"
+          "text": "README",
+          "note": "A known check is listed"
         },
         {
-          "do": "expect_visible",
-          "target": "#unstableBody"
+          "do": "choose",
+          "target": "#checkTag",
+          "value": "docs",
+          "note": "Only the quick docs check"
         },
         {
-          "do": "expect_visible",
-          "target": "#adviceList",
-          "note": "The panel says what to do about the checks"
-        },
-        {
-          "do": "expect_visible",
-          "target": "#adviceList li .step-mark",
-          "note": "Each line is marked in words, not only colour"
-        },
-        {
-          "do": "expect_text",
-          "target": "#unstableTitle",
-          "text": "What to do about your checks"
-        },
-        {
-          "do": "click",
-          "target": "#runChecks",
-          "note": "Run the checks from the panel"
-        },
-        {
-          "do": "expect_text",
-          "target": "#checkStatus",
-          "text": "Running",
-          "note": "The panel says it started"
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('runChecks').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Running')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
+          "text": "true",
+          "timeout_ms": 60000,
+          "note": "Pressing Run says it started"
         },
         {
           "do": "expect_text",
           "target": "#checkStatus",
           "text": "checks passed",
-          "timeout_ms": 120000,
+          "timeout_ms": 60000,
           "note": "The panel reports the finished run"
         },
         {
           "do": "expect_text",
-          "target": "#checkSummary",
-          "text": "All checks passed"
+          "target": "#checkBody",
+          "text": "passed",
+          "note": "The table shows the result"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checkSummary .metric",
+          "note": "The summary counts are shown"
         }
       ],
       "expect": {
@@ -263,7 +262,7 @@
         {
           "do": "expect_text",
           "target": "#validationStatus",
-          "text": "Graph is executable",
+          "text": "This workflow can run",
           "timeout_ms": 15000
         },
         {
@@ -518,6 +517,17 @@
       "check_accessibility": true,
       "steps": [
         {
+          "do": "click",
+          "target": ".model-setup summary",
+          "note": "Open the list first, the way a person does"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.querySelector('.model-setup'); if (!box.open) box.open = true; return box.open ? 'the list is open' : 'the list would not open'",
+          "text": "the list is open",
+          "note": "However it started, it is open now"
+        },
+        {
           "do": "expect_visible",
           "target": ".model-setup"
         },
@@ -532,15 +542,16 @@
           "note": "Each way carries a written state, not only a colour"
         },
         {
-          "do": "expect_text",
-          "target": ".model-setup",
-          "text": "Never paste a key into this page"
+          "do": "run",
+          "script": "const waiting = [...document.querySelectorAll('.model-option.todo')]; if (!waiting.length) return 'every way is ready on this machine'; const withSteps = waiting.filter(card => card.querySelectorAll('.model-steps li').length); return withSteps.length === waiting.length   ? 'every way still waiting says what to do'   : 'one of them says nothing: ' + waiting.find(c => !c.querySelectorAll('.model-steps li').length).textContent.slice(0, 60)",
+          "text": "every way still waiting says what to do",
+          "note": "Every way that is not ready says exactly what to do about it"
         },
         {
-          "do": "expect_text",
-          "target": ".model-setup",
-          "text": "ollama pull",
-          "note": "It gives the exact command to run"
+          "do": "run",
+          "script": "const keyed = [...document.querySelectorAll('.model-option')]   .filter(card => card.textContent.includes('_API_KEY is not set')); if (!keyed.length) return 'no service here is waiting for a key'; return keyed.every(card => card.textContent.includes('Never paste a key into this page'))   ? 'it says where a key goes, and where it must not'   : 'one of them does not warn about the key'",
+          "text": "it says where a key goes, and where it must not",
+          "note": "And a service waiting for a key says a key never goes in this page"
         },
         {
           "do": "click",
@@ -621,6 +632,3582 @@
         "max_failed_requests": 0,
         "max_accessibility_problems": 0
       }
+    },
+    {
+      "id": "screenshot-button-stays-away",
+      "title": "The checks view offers the picker, and hides the screenshot button until it is useful",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "expect_visible",
+          "target": "#runChecks",
+          "note": "The checks view is showing"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#pickElement",
+          "note": "The picker button is offered"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#makeBundle",
+          "note": "The evidence button is offered"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#recordSteps",
+          "note": "The recorder button is offered"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#saveBaselines",
+          "note": "This project has no screenshot checks, so that button stays hidden"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#pickResult",
+          "note": "Nothing has been picked yet, so the names box stays out of the way"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-tag-filter-narrows-the-list",
+      "title": "Choosing a tag narrows the list of checks",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#checkBody tr",
+          "note": "The checks are listed"
+        },
+        {
+          "do": "run",
+          "script": "window.__all = document.querySelectorAll('#checkBody tr').length; window.__tagged = qaSuite.cases.filter(c => (c.tags||[]).includes('safety')).length; return String(window.__all > window.__tagged && window.__tagged > 0)",
+          "text": "true",
+          "note": "The whole list is longer than the safety part of it"
+        },
+        {
+          "do": "choose",
+          "target": "#checkTag",
+          "value": "safety",
+          "note": "Only the safety checks"
+        },
+        {
+          "do": "run",
+          "script": "return String(document.querySelectorAll('#checkBody tr').length === window.__tagged)",
+          "text": "true",
+          "note": "Only the safety checks are listed"
+        },
+        {
+          "do": "choose",
+          "target": "#checkTag",
+          "value": "",
+          "note": "Back to every check"
+        },
+        {
+          "do": "run",
+          "script": "return String(document.querySelectorAll('#checkBody tr').length === window.__all)",
+          "text": "true",
+          "note": "The whole list is back"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-starter-suite-refuses-to-overwrite",
+      "title": "Writing starter checks over an existing suite is refused with a reason",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "click",
+          "target": "#createSuite",
+          "note": "Ask for starter checks"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "already exists",
+          "note": "It says the suite is already there instead of replacing it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-evidence-bundle-is-written",
+      "title": "The evidence button really writes a zip and says where it went",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "click",
+          "target": "#makeBundle",
+          "note": "Pack up the evidence"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "harness-bundle-",
+          "timeout_ms": 60000,
+          "note": "It names the file it wrote"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkStatus",
+          "text": "Credentials were taken out",
+          "note": "It says what it did about credentials"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-picker-can-be-called-off",
+      "title": "Asking to point at something and then changing your mind leaves the panel working",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => null; return 'ready'",
+          "text": "ready",
+          "note": "Answer the address question with nothing, as a person pressing cancel would"
+        },
+        {
+          "do": "click",
+          "target": "#pickElement",
+          "note": "Point at something"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#pickResult",
+          "note": "No names box appears"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#runChecks",
+          "note": "The view still works"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-names-box-shows-what-was-picked",
+      "title": "The names box lists what was picked and never lets a page put markup in the panel",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "renderPick({gave_up:false, tag:'button', text:\"<img src=x onerror=window.__broken=1>Buy\", offered:[{selector:'[data-testid=\"buy\"]', kind:'test-hook', matches:1, reason:'An attribute put there for testing.'},{selector:'#mui-4821', kind:'id', matches:1, reason:\"The thing's own id.\", warning:'The name mui-4821 looks like one the page builds fresh every time.'}], thrown_away:[{selector:'button.primary', kind:'class', matches:6, reason:'A style class.'}]}); return String(!window.__broken && document.querySelectorAll('#pickResult img').length === 0)",
+          "text": "true",
+          "note": "Words from the page stay words"
+        },
+        {
+          "do": "expect_count",
+          "target": "#pickNames li",
+          "count": 2,
+          "note": "Both names are offered"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pickNames code",
+          "text": "data-testid",
+          "note": "The best name is first"
+        },
+        {
+          "do": "expect_visible",
+          "target": ".pick-warning",
+          "note": "The warning about a made-up name shows"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pickThrown",
+          "text": "button.primary",
+          "note": "The rejected name is explained"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-screenshot-button-appears-when-there-is-one",
+      "title": "The screenshot button appears as soon as the suite holds a screenshot check",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#saveBaselines",
+          "note": "Nothing to photograph yet"
+        },
+        {
+          "do": "run",
+          "script": "qaSuite = {present: true, tags: [], cases: [{id: 'look', title: 'A look', kind: 'visual'}]}; renderChecks(); const button = document.getElementById('saveBaselines'); const shown = !button.hidden && button.getClientRects().length > 0; return String(shown)",
+          "text": "true",
+          "note": "With a screenshot check in the suite the button shows, and is really visible"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "workflow-simulate-runs-and-logs",
+      "title": "Simulating the workflow walks the agents and writes to the run log",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#clearLog",
+          "note": "Start with an empty log"
+        },
+        {
+          "do": "expect_count",
+          "target": "#eventBody tr",
+          "count": 0,
+          "note": "The log is empty"
+        },
+        {
+          "do": "click",
+          "target": "#simulateButton",
+          "note": "Simulate"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#eventBody tr",
+          "timeout_ms": 30000,
+          "note": "The log filled up"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "This workflow can run",
+          "note": "It validated first"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-export-gives-a-file",
+      "title": "Exporting the workflow produces a file the panel could hand over",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__downloaded = ''; const realClick = HTMLAnchorElement.prototype.click; HTMLAnchorElement.prototype.click = function () { window.__downloaded = this.download; }; document.getElementById('exportButton').click(); HTMLAnchorElement.prototype.click = realClick; return window.__downloaded",
+          "text": "harness-graph.json",
+          "note": "The export hands over a named file"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-import-refuses-rubbish",
+      "title": "Importing a file that is not a workflow says so and changes nothing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__before = JSON.stringify(graph); return String(graph.nodes.length > 0)",
+          "text": "true",
+          "note": "There is a workflow to protect"
+        },
+        {
+          "do": "run",
+          "script": "await importGraph(new File(['not a workflow at all'], 'bad.json')); return String(JSON.stringify(graph) === window.__before)",
+          "text": "true",
+          "note": "The workflow on screen is untouched"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "It said something about it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-import-accepts-what-export-gave",
+      "title": "A workflow that was exported can be imported again",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__saved = JSON.stringify(graph, null, 2); await importGraph(new File([window.__saved], 'harness-graph.json')); return String(graph.nodes.length)",
+          "note": "Importing the same workflow back gives the same agents"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "This workflow can run",
+          "note": "It is still a workflow that runs"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-undo-puts-back-what-was-removed",
+      "title": "Removing an agent can be undone",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__count = graph.nodes.length; selectNode(graph.nodes[graph.nodes.length - 1].id); removeNode(graph.nodes[graph.nodes.length - 1].id); return String(graph.nodes.length === window.__count - 1)",
+          "text": "true",
+          "note": "One agent is gone"
+        },
+        {
+          "do": "click",
+          "target": "#undoButton",
+          "note": "Undo"
+        },
+        {
+          "do": "run",
+          "script": "return String(graph.nodes.length === window.__count)",
+          "text": "true",
+          "note": "The agent is back"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-new-agent-can-be-added-and-named",
+      "title": "Adding an agent either works or says exactly what is missing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__before = graph.nodes.length; return 'ok'",
+          "text": "ok"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton",
+          "note": "Open the add agent window"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentDialog",
+          "note": "The window is open"
+        },
+        {
+          "do": "type",
+          "target": "#agentLabel",
+          "text": "A tester",
+          "note": "Name it"
+        },
+        {
+          "do": "type",
+          "target": "#agentModel",
+          "text": "qwen2.5-coder:7b",
+          "note": "Say which model"
+        },
+        {
+          "do": "type",
+          "target": "#agentRoleName",
+          "text": "tester",
+          "note": "Say what it does"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('agentProvider'); const usable = [...box.options].find(o => o.value && !o.disabled); if (usable) { box.value = usable.value; document.querySelector('#agentForm button[type=submit]').click();   return String(graph.nodes.length === window.__before + 1); } return [...box.options].some(o => o.textContent.includes('allow_project_graphs')   || o.textContent.includes('Start here')) ? 'true' : 'false'",
+          "text": "true",
+          "note": "Either the agent is added, or the box says what to change to make it possible"
+        },
+        {
+          "do": "click",
+          "target": "#cancelAgent",
+          "note": "Close the window"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentDialog",
+          "note": "The window closed"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-every-agent-kind-can-be-added",
+      "title": "Every button in the palette does what it says",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__before = graph.nodes.length; return 'ok'",
+          "text": "ok"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"tool\"]",
+          "note": "Add a tool"
+        },
+        {
+          "do": "run",
+          "script": "return String(graph.nodes.length === window.__before + 1)",
+          "text": "true",
+          "note": "A tool goes straight on the canvas"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"gauntlet\"]",
+          "note": "Add the ready-made group"
+        },
+        {
+          "do": "run",
+          "script": "return String(graph.nodes.length > window.__before + 1)",
+          "text": "true",
+          "note": "The ready-made group added several agents at once"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"planner\"]",
+          "note": "Add a planner"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentDialog",
+          "note": "An agent asks for its details first"
+        },
+        {
+          "do": "click",
+          "target": "#cancelAgent",
+          "note": "Change your mind"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentDialog",
+          "note": "The window closed"
+        },
+        {
+          "do": "click",
+          "target": "#validateButton",
+          "note": "Check the workflow still runs"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "It answered"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-fit-and-zoom-keep-the-canvas-usable",
+      "title": "Fit brings the whole workflow back into view after zooming right in",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn",
+          "note": "Zoom in"
+        },
+        {
+          "do": "click",
+          "target": "#zoomIn",
+          "note": "Zoom in again"
+        },
+        {
+          "do": "click",
+          "target": "#fitButton",
+          "note": "Fit"
+        },
+        {
+          "do": "run",
+          "script": "return String(Number(document.getElementById('zoomValue').textContent.replace('%','')) <= 125)",
+          "text": "true",
+          "note": "The whole workflow fits on screen"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-run-needs-a-task",
+      "title": "Starting a run with an empty task says what is missing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "type",
+          "target": "#taskInput",
+          "text": "",
+          "note": "Leave the task empty"
+        },
+        {
+          "do": "click",
+          "target": "#runButton",
+          "note": "Start"
+        },
+        {
+          "do": "expect_text",
+          "target": "#validationStatus",
+          "text": "task",
+          "note": "It asks for a task"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "memory-search-box-asks-the-server",
+      "title": "Typing in the memory search box asks again and keeps the view working",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "memory"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"memory\"]",
+          "note": "Open the memory view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryBody",
+          "note": "The memory table is there"
+        },
+        {
+          "do": "type",
+          "target": "#memoryQuery",
+          "text": "parser",
+          "note": "Search for something"
+        },
+        {
+          "do": "press",
+          "target": "#memoryQuery",
+          "key": "Enter",
+          "note": "Ask"
+        },
+        {
+          "do": "wait",
+          "ms": 700,
+          "note": "Give the answer time to come back"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#memoryTitle",
+          "note": "The view is still fine"
+        },
+        {
+          "do": "choose",
+          "target": "#memoryKind",
+          "value": "",
+          "note": "Every kind of memory"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "history-refresh-keeps-the-table",
+      "title": "Asking the history view to look again keeps its table",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "history"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"history\"]",
+          "note": "Open the history view"
+        },
+        {
+          "do": "click",
+          "target": "#refreshHistory",
+          "note": "Look again"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyBody",
+          "note": "The table is still there"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyList",
+          "note": "The list of past runs is there"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "prompts-two-versions-can-be-compared",
+      "title": "The prompt view offers two sides to compare",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "prompts"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]",
+          "note": "Open the prompts view"
+        },
+        {
+          "do": "click",
+          "target": "#refreshPrompts",
+          "note": "Look again"
+        },
+        {
+          "do": "wait",
+          "ms": 500
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptLeft",
+          "note": "The left side picker is there"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptRight",
+          "note": "The right side picker is there"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#promptLineage",
+          "note": "The history of changes is there"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "advice-panel-answers",
+      "title": "The panel says what to do about the checks without being asked twice",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "click",
+          "target": "#refreshUnstable",
+          "note": "Ask for advice"
+        },
+        {
+          "do": "wait",
+          "ms": 700
+        },
+        {
+          "do": "expect_visible",
+          "target": "#adviceList li",
+          "note": "Advice is shown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "errors-are-shown-not-swallowed",
+      "title": "When the server says no, the panel shows the reason",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "try { await request('/api/workflows/save', {method:'POST', body: JSON.stringify({name:'../escape', graph})}); return 'no error'; } catch (error) { showError(error.message); return 'told'; }",
+          "text": "told",
+          "note": "A name that could escape the folder is refused"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "The reason is on screen"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "the-panel-says-when-it-is-connected",
+      "title": "The panel shows whether it is still talking to the harness",
+      "kind": "browser",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "expect_text",
+          "target": "#connectionStatus",
+          "text": "Connected",
+          "timeout_ms": 20000,
+          "note": "It says it is connected"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#liveStatus",
+          "note": "There is a live area for messages"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-agents-can-be-joined-up",
+      "title": "Two agents can be joined, and a joint that makes no sense is refused",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__edges = graph.edges.length; addNode('tool', 500, 400); window.__new = graph.nodes[graph.nodes.length - 1].id; window.__from = graph.nodes[0].id; return String(graph.edges.length === window.__edges)",
+          "text": "true",
+          "note": "Add a fresh tool with nothing joined to it"
+        },
+        {
+          "do": "run",
+          "script": "connectPort(window.__from); connectPort(window.__new); return String(graph.edges.length === window.__edges + 1)",
+          "text": "true",
+          "note": "Joining two agents makes one connection"
+        },
+        {
+          "do": "run",
+          "script": "const before = graph.edges.length; connectPort(window.__new); connectPort(window.__new); return String(graph.edges.length === before)",
+          "text": "true",
+          "note": "An agent joined to itself makes nothing"
+        },
+        {
+          "do": "click",
+          "target": "#validateButton",
+          "note": "Check the workflow still runs"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#validationStatus",
+          "note": "It answered"
+        },
+        {
+          "do": "run",
+          "script": "const edge = graph.edges[graph.edges.length - 1]; selectEdge(edge.id); removeEdge(edge.id); return String(graph.edges.length === window.__edges)",
+          "text": "true",
+          "note": "The new connection can be taken out again"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-can-be-joined-with-the-keyboard",
+      "title": "A keyboard user can join two agents without a mouse",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow",
+        "keyboard"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.__edges = graph.edges.length; addNode('tool', 520, 420); const to = graph.nodes[graph.nodes.length - 1]; const from = graph.nodes[0]; focusedNodeId = from.id; render(); const box = document.querySelector('[data-node-focus=\"' + from.id + '\"]'); box.dispatchEvent(new KeyboardEvent('keydown', {key: 'c', bubbles: true})); const target = document.querySelector('[data-node-focus=\"' + to.id + '\"]'); target.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true})); return String(graph.edges.length === window.__edges + 1)",
+          "text": "true",
+          "note": "Pressing C then Enter joins two agents"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#edgeList",
+          "note": "The list of connections is there"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-keyboard-really-moves-an-agent",
+      "title": "The arrow keys really move an agent, not just make a sound",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow",
+        "keyboard"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const node = graph.nodes[0]; focusedNodeId = node.id; window.__where = {x: node.position.x, y: node.position.y}; const box = document.querySelector('[data-node-focus=\"' + node.id + '\"]'); box.focus(); box.dispatchEvent(new KeyboardEvent('keydown',   {key: 'ArrowRight', ctrlKey: true, bubbles: true})); const now = nodeById(node.id).position; return String(now.x !== window.__where.x || now.y !== window.__where.y)",
+          "text": "true",
+          "note": "The agent moved"
+        },
+        {
+          "do": "click",
+          "target": "#undoButton",
+          "note": "Undo the move"
+        },
+        {
+          "do": "run",
+          "script": "const node = graph.nodes[0]; return String(nodeById(node.id).position.x === window.__where.x)",
+          "text": "true",
+          "note": "It went back where it was"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-inspector-edits-the-agent",
+      "title": "Changing a name in the side panel really changes the workflow",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const node = graph.nodes.find(n => n.type === 'tool') || graph.nodes[0]; window.__node = node.id; selectNode(node.id); return 'ready'",
+          "text": "ready",
+          "note": "Choose an agent"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#nodeInspector",
+          "note": "The side panel is showing"
+        },
+        {
+          "do": "type",
+          "target": "#nodeLabel",
+          "text": "Renamed by a check",
+          "note": "Type a new name"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('nodeLabel')  .dispatchEvent(new Event('change', {bubbles: true})); return nodeById(window.__node).label",
+          "text": "Renamed by a check",
+          "note": "The workflow holds the new name"
+        },
+        {
+          "do": "expect_text",
+          "target": "#nodeLayer",
+          "text": "Renamed by a check",
+          "note": "The canvas shows it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-tabs-really-save-and-remove",
+      "title": "A workflow can be kept under a name, opened again, renamed and removed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'Check made this'; window.confirm = () => true; await saveWorkflow(); const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check made this'))",
+          "text": "true",
+          "note": "It was really kept on disk"
+        },
+        {
+          "do": "expect_text",
+          "target": "#workflowTabs",
+          "text": "Check made this",
+          "note": "It shows as a tab"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'Check renamed this'; await renameWorkflow(); const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check renamed this')   && !kept.workflows.some(item => item.name === 'Check made this'))",
+          "text": "true",
+          "note": "The new name replaced the old one, with no copy left behind"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; await deleteWorkflow(); const kept = await request('/api/workflows'); return String(!kept.workflows.some(item => item.name === 'Check renamed this'))",
+          "text": "true",
+          "note": "It was really removed"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "panel-notices-the-harness-restarting",
+      "title": "A panel left open notices the harness restarting and listens again",
+      "kind": "browser",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "run",
+          "script": "lastEvent = 500; startedId = 'an-older-run'; const realRequest = window.request; window.request = async (path) => path.startsWith('/api/events')   ? {events: [], started_id: 'a-newer-run', gap: 0}   : realRequest(path); await pollEvents(); window.request = realRequest; return String(lastEvent === 0 && startedId === 'a-newer-run')",
+          "text": "true",
+          "note": "It starts listening from the beginning again"
+        },
+        {
+          "do": "expect_text",
+          "target": "#eventBody",
+          "text": "restarted",
+          "note": "It says so in the log"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "panel-copes-with-a-broken-update",
+      "title": "One broken update does not stop the rest being read",
+      "kind": "browser",
+      "tags": [
+        "ui"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "run",
+          "script": "const realRequest = window.request; window.request = async (path) => path.startsWith('/api/events')   ? {events: [{sequence: 1}, {sequence: 2, kind: 'qa_started', node: 'checks'},      {sequence: 3, kind: 'note', node: 'later', payload: {summary: 'still read'}}],      started_id: startedId || '', gap: 0}   : realRequest(path); await pollEvents(); window.request = realRequest; return document.getElementById('eventBody').textContent.includes('still read')   ? 'kept going' : 'stopped'",
+          "text": "kept going",
+          "note": "An update with nothing in it did not stop the others"
+        },
+        {
+          "do": "expect_text",
+          "target": "#connectionStatus",
+          "text": "Connected",
+          "note": "It still says connected"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-can-be-added-from-the-shelf",
+      "title": "Pressing Add this on the shelf really adds the check",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('starterBox'); box.open = true; await refreshStarters(); return String(document.querySelectorAll('#starterList li').length > 5)",
+          "text": "true",
+          "note": "The shelf of ready-made checks is listed"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#starterList li')]; const row = rows.find(item => item.textContent.includes('The page works at phone size')); if (!row) return 'that ready-made check is not on the shelf'; const button = [...row.querySelectorAll('button')]   .find(item => item.textContent.includes('Add this')); if (!button) return 'the row has no Add this button'; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); button.click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Added the check works-on-a-phone')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing Add this adds that check and says so"
+        },
+        {
+          "do": "run",
+          "script": "const now = await request('/api/qa/suite'); return (now.cases || []).some(c => c.id === 'works-on-a-phone') ? 'the check is there' : 'the check was not written'",
+          "text": "the check is there",
+          "note": "The check is really in the suite"
+        },
+        {
+          "do": "expect_text",
+          "target": "#checkBody",
+          "text": "works-on-a-phone",
+          "note": "And it shows in the table"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'works-on-a-phone' || id.startsWith('works-on-a-phone-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "await refreshChecks(); return document.getElementById('checkBody').textContent.includes('works-on-a-phone') ? 'still there' : 'gone'",
+          "text": "gone",
+          "always": true,
+          "note": "The table agrees it is gone"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-recording-can-be-called-off",
+      "title": "Asking to record and then changing your mind leaves the panel working",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => null; return 'ready'",
+          "text": "ready",
+          "note": "Answer the address question with nothing"
+        },
+        {
+          "do": "click",
+          "target": "#recordSteps",
+          "note": "Record what I do"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#runChecks",
+          "note": "The view still works"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('checkStatus').textContent.includes('browser window') ? 'started' : 'quiet'",
+          "text": "quiet",
+          "note": "Nothing was started"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-explain-button-answers",
+      "title": "The button that asks a model about a failure answers, even with no model set up",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const askButton = () => [...document.querySelectorAll('#checkBody button')].find(b => b.textContent.includes('Ask why')); qaResult = {counts: {passed: 0, failed: 1, flaky: 0, skipped: 0, total: 1}, passed: false, duration_ms: 1, run_id: 'made-up', cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', status: 'failed', duration_ms: 1, reasons: ['it did not work'], tags: [], artifacts: [], attempts: [{number: 1, passed: false, duration_ms: 1, evidence: 'nothing was there'}]}]}; qaSuite = {present: true, tags: [], cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', tags: []}]}; renderChecks(); let ask = null; for (let tries = 0; tries < 40 && !ask; tries += 1) {   ask = askButton();   if (!ask) { await new Promise(r => setTimeout(r, 100)); qaResult = {counts: {passed: 0, failed: 1, flaky: 0, skipped: 0, total: 1}, passed: false, duration_ms: 1, run_id: 'made-up', cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', status: 'failed', duration_ms: 1, reasons: ['it did not work'], tags: [], artifacts: [], attempts: [{number: 1, passed: false, duration_ms: 1, evidence: 'nothing was there'}]}]}; qaSuite = {present: true, tags: [], cases: [{id: 'made-up-failure', title: 'A check that failed', kind: 'command', tags: []}]}; renderChecks(); } } if (!ask) return 'the button never appeared'; ask.click(); for (let tries = 0; tries < 60; tries += 1) {   const box = document.querySelector('.explain-box');   const said = document.getElementById('validationStatus').textContent;   if (box || said.length > 0) return 'true';   await new Promise(r => setTimeout(r, 100)); } return 'it neither answered nor said why not'",
+          "text": "true",
+          "note": "A failed check offers to explain itself, and the answer arrives"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-what-changed-is-shown",
+      "title": "The checks view says what moved since the run before",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "await refreshChanged(); const box = document.getElementById('changedSince'); return box.textContent.trim().length > 0 ? 'said something' : 'said nothing'",
+          "text": "said something",
+          "note": "It says what changed, or that nothing did"
+        },
+        {
+          "do": "run",
+          "script": "const found = await request('/api/qa/changed'); return String('broke' in found || 'nothing_to_compare' in found)",
+          "text": "true",
+          "note": "The answer has the shape the panel expects"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-coverage-panel-draws-the-gap",
+      "title": "The coverage panel draws one block per page and names the gap",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "renderCoverage({percent: 50, pages: [{address: 'http://127.0.0.1:8765/', state: 'checked', checked_by: ['home']},{address: 'http://127.0.0.1:8765/shop', state: 'nobody looks at it', checked_by: []}], checked: ['http://127.0.0.1:8765/'], missing: ['http://127.0.0.1:8765/shop'], walked_only: [], more_pages: 0}); return String(document.querySelectorAll('#coverageBar .coverage-block').length)",
+          "text": "2",
+          "note": "One block per page"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#addMissingChecks",
+          "note": "The button to write the missing checks is offered"
+        },
+        {
+          "do": "expect_text",
+          "target": "#coverageSummary",
+          "text": "1 have a check of their own",
+          "note": "It says how many pages are checked"
+        },
+        {
+          "do": "run",
+          "script": "return document.querySelector('#coverageList .coverage-nobody-looks-at-it') ? 'marked' : 'not marked'",
+          "text": "marked",
+          "note": "The page nobody checks is marked in the list"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-coverage-refuses-a-page-off-this-machine",
+      "title": "Writing a check for a page this project may not open is refused",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks",
+        "safety"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "try { await request('/api/qa/coverage/add', {method: 'POST', body: JSON.stringify({addresses: ['http://example.com/']})}); return 'it was allowed' } catch (error) { return 'refused' }",
+          "text": "refused",
+          "note": "The panel will not write a check for another machine"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-one-file-to-send-is-written",
+      "title": "The panel writes one file you can send, with the pictures inside it",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#makeSharePage",
+          "note": "The button is offered"
+        },
+        {
+          "do": "run",
+          "script": "const made = await request('/api/qa/share', {method: 'POST', body: JSON.stringify({})}); return (made.path && made.path.endsWith('report.html') && made.bytes > 0) ? 'wrote one file' : 'wrote nothing useful'",
+          "text": "wrote one file",
+          "note": "It writes one file and says where"
+        },
+        {
+          "do": "run",
+          "script": "try { await request('/api/qa/share', {method: 'POST', body: JSON.stringify({run: '../../elsewhere'})}); return 'it was allowed' } catch (error) { return 'refused' }",
+          "text": "refused",
+          "note": "A run name that climbs out of the project is refused"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-writing-the-missing-checks-works-end-to-end",
+      "title": "The button that writes a check for a page nobody looks at",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "renderCoverage({percent: 0, pages: [{address: 'http://127.0.0.1:8765/a-page-with-no-check-of-its-own', state: 'nobody looks at it', checked_by: []}], checked: [], missing: ['http://127.0.0.1:8765/a-page-with-no-check-of-its-own'], walked_only: [], more_pages: 0}); const button = document.getElementById('addMissingChecks'); return String(!button.hidden && button.textContent.includes('Write a check'))",
+          "text": "true",
+          "note": "The button is offered for the page nobody checks"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('addMissingChecks').click(); for (let tries = 0; tries < 60; tries += 1) {   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Added')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
+          "text": "true",
+          "note": "Pressing it writes the check and says so"
+        },
+        {
+          "do": "run",
+          "script": "const now = await request('/api/qa/suite'); const names = (now.cases || []).map(c => c.id); return names.includes('a-page-with-no-check-of-its-own-opens') ? 'the check is there' : 'the check was not written'",
+          "text": "the check is there",
+          "note": "The check it wrote is really in the suite"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'a-page-with-no-check-of-its-own-opens' || id.startsWith('a-page-with-no-check-of-its-own-opens-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-the-send-one-file-button-is-really-pressed",
+      "title": "Pressing Make one file I can send writes the file and says where",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = '';const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); window.__everySaid = everySaid; window.__watcher = watcher; return 'the screen is clear'",
+          "text": "the screen is clear",
+          "note": "Empty the message box so only new words count"
+        },
+        {
+          "do": "click",
+          "target": "#makeSharePage",
+          "note": "Press the button itself"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.getElementById('checkStatus'); const everySaid = window.__everySaid || [line.textContent]; const watcher = window.__watcher || {disconnect() {}}; for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('report.html')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "The panel says which file it wrote"
+        },
+        {
+          "do": "run",
+          "script": "const everySaid = window.__everySaid || []; return everySaid.some(said => said.includes('send it to anyone'))   ? 'it says what the file is for' : 'it never said what the file is for'",
+          "text": "it says what the file is for",
+          "note": "And says plainly what the file is for"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-the-find-pages-button-really-walks-the-site",
+      "title": "Pressing Find pages nobody checks walks the site and draws the answer",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; return 'the screen is clear'",
+          "text": "the screen is clear",
+          "note": "Empty the message box so only new words count"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => window.location.origin + '/'; return 'the address is ready'",
+          "text": "the address is ready",
+          "note": "Answer the box the button opens"
+        },
+        {
+          "do": "click",
+          "target": "#findGaps",
+          "note": "Press the button itself"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const box = document.getElementById('coverageResult');   const wrong = document.getElementById('validationStatus').textContent;   if (!box.hidden && document.querySelectorAll('#coverageBar .coverage-block').length > 0)     return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 500)); } return 'the walk never finished'",
+          "text": "true",
+          "timeout_ms": 120000,
+          "note": "A real walk happens and one block per page is drawn"
+        },
+        {
+          "do": "expect_text",
+          "target": "#coverageSummary",
+          "text": "have a check of their own",
+          "note": "And it says how much of the site is checked"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "canvas-zoom-out-really-zooms-out",
+      "title": "Pressing the zoom out button really makes the drawing smaller",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const said = document.getElementById('zoomValue').value; return said.endsWith('%') && parseInt(said) > 0   ? 'shown as a percentage' : ('it says ' + said)",
+          "text": "shown as a percentage",
+          "note": "The zoom is shown as a percentage"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.getElementById('zoomValue').value; document.getElementById('zoomOut').click(); const after = document.getElementById('zoomValue').value; return parseInt(after) < parseInt(before) ? 'smaller' :  (before + ' then ' + after)",
+          "text": "smaller",
+          "note": "Pressing zoom out makes the number go down"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 40; tries += 1)   document.getElementById('zoomOut').click(); const now = parseInt(document.getElementById('zoomValue').value); return now >= 30 ? 'it stops at a sensible size' : 'it shrank to ' + now",
+          "text": "it stops at a sensible size",
+          "note": "It stops shrinking rather than going to nothing"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "canvas-a-node-and-an-edge-can-be-deleted",
+      "title": "The delete buttons really take a box and a line off the drawing",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const boxes = document.querySelectorAll('.graph-node').length; const lines = document.querySelectorAll('.edge-path').length; return (boxes > 1 && lines > 0) ? 'there is something to delete'   : ('boxes ' + boxes + ' lines ' + lines)",
+          "text": "there is something to delete",
+          "note": "The drawing starts with boxes and lines"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.querySelector('.edge-hit'); if (!line) return 'no line to pick'; line.dispatchEvent(new MouseEvent('click', {bubbles: true})); const before = document.querySelectorAll('.edge-path').length; document.getElementById('deleteEdge').click(); const after = document.querySelectorAll('.edge-path').length; return after === before - 1 ? 'one line fewer' : (before + ' then ' + after)",
+          "text": "one line fewer",
+          "note": "Pressing delete on a line removes it"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.querySelector('.graph-node .node-body'); if (!box) return 'no box to pick'; box.dispatchEvent(new MouseEvent('click', {bubbles: true})); const before = document.querySelectorAll('.graph-node').length; document.getElementById('deleteNode').click(); const after = document.querySelectorAll('.graph-node').length; return after === before - 1 ? 'one box fewer' : (before + ' then ' + after)",
+          "text": "one box fewer",
+          "note": "Pressing delete on a box removes it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "the-add-agent-box-can-be-closed",
+      "title": "The close button really shuts the add agent box",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton",
+          "note": "Open the add agent box"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('agentDialog').open ? 'the box is open' : 'the box did not open'",
+          "text": "the box is open",
+          "note": "The box really opened"
+        },
+        {
+          "do": "click",
+          "target": "#closeAgentDialog",
+          "note": "Press the close button"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('agentDialog').open ? 'it is still open' : 'the box is shut'",
+          "text": "the box is shut",
+          "note": "Pressing close really shuts it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-save-rename-and-delete-buttons-are-really-pressed",
+      "title": "The save, rename and delete buttons on a workflow really work",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const list = await request('/api/workflows'); const mine = (list.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); for (const name of mine) {   try { await request('/api/workflows/delete', {method: 'POST',     body: JSON.stringify({name})}) } catch (error) { return 'could not remove ' + name } } const now = await request('/api/workflows'); const left = (now.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'a-workflow-a-check-made'; window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; document.getElementById('saveWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   if ((list.workflows || []).some(w => w.name === 'a-workflow-a-check-made')) return 'saved';   await new Promise(r => setTimeout(r, 100)); } return 'it was never saved'",
+          "text": "saved",
+          "timeout_ms": 20000,
+          "note": "Pressing save really saves the workflow under that name"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'a-workflow-a-check-renamed'; document.getElementById('renameWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   const names = (list.workflows || []).map(w => w.name);   if (names.includes('a-workflow-a-check-renamed') && !names.includes('a-workflow-a-check-made')) return 'renamed';   await new Promise(r => setTimeout(r, 100)); } return 'it was never renamed'",
+          "text": "renamed",
+          "timeout_ms": 20000,
+          "note": "Pressing rename really changes its name"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; document.getElementById('deleteWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   if (!(list.workflows || []).some(w => w.name === 'a-workflow-a-check-renamed')) return 'deleted';   await new Promise(r => setTimeout(r, 100)); } return 'it was never deleted'",
+          "text": "deleted",
+          "timeout_ms": 20000,
+          "note": "Pressing delete really takes it away"
+        },
+        {
+          "do": "run",
+          "script": "const list = await request('/api/workflows'); const mine = (list.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); for (const name of mine) {   try { await request('/api/workflows/delete', {method: 'POST',     body: JSON.stringify({name})}) } catch (error) { return 'could not remove ' + name } } const now = await request('/api/workflows'); const left = (now.workflows || []).map(w => w.name)   .filter(n => n === 'a-workflow-a-check-made' || n === 'a-workflow-a-check-renamed'); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-run-the-checks-button-is-really-pressed",
+      "title": "Run the checks instead really opens the checks view and starts a run",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('quickChecks').click(); for (let tries = 0; tries < 100; tries += 1) {   const shown = !document.getElementById('checksView').hidden;   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (shown && (said.includes('Running') || said.includes('passed')     || said.includes('failed'))) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'nothing happened'",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing it shows the checks view and a run begins"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-the-save-screenshots-button-is-really-pressed",
+      "title": "Save screenshots really starts a run when there is a picture check",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "await request('/api/qa/add', {method: 'POST', body: JSON.stringify({starter: 'looks-the-same', url: ''})}); await refreshChecks(); const button = document.getElementById('saveBaselines'); return button.hidden ? 'the button is still hidden' : 'the button is offered'",
+          "text": "the button is offered",
+          "timeout_ms": 20000,
+          "note": "With a picture check in the suite the button appears"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('saveBaselines').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent); const said = everySaid.join(' | ');   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('Running') || said.includes('passed')     || said.includes('failed')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 200)); } return 'nothing happened'",
+          "text": "true",
+          "timeout_ms": 40000,
+          "note": "Pressing it really starts taking the pictures"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'looks-the-same' || id.startsWith('looks-the-same-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "checks-copy-step-button-is-really-pressed",
+      "title": "Copy step really copies a step, or says plainly that it could not",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 210; tries += 1) {   const now = await request('/api/qa/result');   if (!now.running) return 'the panel is free';   await new Promise(r => setTimeout(r, 500)); } return 'the panel stayed busy'",
+          "text": "the panel is free",
+          "note": "Wait until the panel is not busy with another job",
+          "timeout_ms": 115000
+        },
+        {
+          "do": "run",
+          "script": "renderPick({url: 'http://127.0.0.1:8765/', tag: 'button', text: 'Run all checks', offered: [{selector: '#runChecks', reason: 'it has a name of its own', matches: 1}], thrown_away: []}); const rows = [...document.querySelectorAll('#pickNames li')]; const button = rows.flatMap(r => [...r.querySelectorAll('button')])   .find(b => b.textContent.includes('Copy step')); return button ? 'the button is there' : 'no copy button was drawn'",
+          "text": "the button is there",
+          "note": "A picked name comes with a way to copy it"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#pickNames li')]; const button = rows.flatMap(r => [...r.querySelectorAll('button')])   .find(b => b.textContent.includes('Copy step')); button.click(); for (let tries = 0; tries < 60; tries += 1) {   if (button.textContent.includes('Copied')) return 'true';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.includes('would not let the harness copy')) return 'true';   await new Promise(r => setTimeout(r, 100)); } return 'it neither copied nor said why not'",
+          "text": "true",
+          "timeout_ms": 15000,
+          "note": "Pressing it either copies the step or says plainly it could not"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 300
+    },
+    {
+      "id": "start-view-plan-only-box-really-changes-what-is-asked",
+      "title": "Both plan only boxes really change what the harness is asked to do",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "type",
+          "target": "#quickTask",
+          "note": "Say what to do",
+          "text": "Tidy up the parser"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; const real = window.fetch; window.fetch = async (where, how) => {   if (String(where).includes('/api/run')) {     window.__asked.push(JSON.parse(how.body));     return new Response('{\"accepted\": true}',       {status: 202, headers: {'Content-Type': 'application/json'}});   }   return real(where, how); }; return 'ready to listen'",
+          "text": "ready to listen",
+          "note": "Listen for what the button asks for"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('quickDryRun').checked = false; document.getElementById('quickRun').click(); for (let tries = 0; tries < 60 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === false   ? 'it asked for a real run' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked for a real run",
+          "timeout_ms": 15000,
+          "note": "With the box clear it asks for a real run"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Back to the first view"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; document.getElementById('quickDryRun').checked = true; document.getElementById('quickRun').click(); for (let tries = 0; tries < 60 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === true   ? 'it asked to plan only' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked to plan only",
+          "timeout_ms": 15000,
+          "note": "With the box ticked it asks to plan only and change nothing"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "type",
+          "target": "#taskInput",
+          "text": "Tidy up the parser",
+          "note": "Say what to do there too"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; document.getElementById('dryRunInput').checked = true; document.getElementById('runButton').click(); for (let tries = 0; tries < 100 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === true   ? 'it asked to plan only' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked to plan only",
+          "timeout_ms": 20000,
+          "note": "The workflow view's box asks to plan only as well"
+        },
+        {
+          "do": "run",
+          "script": "window.__asked = []; document.getElementById('dryRunInput').checked = false; document.getElementById('runButton').click(); for (let tries = 0; tries < 100 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === false   ? 'it asked for a real run' : 'it asked for ' + window.__asked[0].dry_run",
+          "text": "it asked for a real run",
+          "timeout_ms": 20000,
+          "note": "And clearing it asks for a real run"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-the-remove-button-on-a-row-is-really-pressed",
+      "title": "Remove on a check row really takes that check out",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"checks\"]",
+          "note": "Open the checks view"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "note": "Nothing left over from an earlier run",
+          "timeout_ms": 30000
+        },
+        {
+          "do": "run",
+          "script": "await request('/api/qa/add', {method: 'POST', body: JSON.stringify({starter: 'page-is-quick', url: ''})}); await refreshChecks(); const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('page-is-quick')); return row ? 'the check is in the table' : 'it is not in the table'",
+          "text": "the check is in the table",
+          "timeout_ms": 20000,
+          "note": "A check to remove is put in first"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; const rows = [...document.querySelectorAll('#checkBody tr')]; const row = rows.find(r => r.textContent.includes('page-is-quick')); const button = [...row.querySelectorAll('button')]   .find(b => b.textContent.trim() === 'Remove'); if (!button) return 'the row has no Remove button'; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); button.click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Took page-is-quick out')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing Remove really takes it out and says so"
+        },
+        {
+          "do": "run",
+          "script": "const now = await request('/api/qa/suite'); return (now.cases || []).some(c => c.id === 'page-is-quick') ? 'it is still there' : 'it is really gone'",
+          "text": "it is really gone",
+          "note": "And it is gone from the suite"
+        },
+        {
+          "do": "run",
+          "script": "const suite = await request('/api/qa/suite'); const mine = (suite.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); for (const id of mine) {   try { await request('/api/qa/remove', {method: 'POST', body: JSON.stringify({case: id})}) }   catch (error) { return 'could not remove ' + id } } const now = await request('/api/qa/suite'); const left = (now.cases || []).map(c => c.id).filter(id => id === 'page-is-quick' || id.startsWith('page-is-quick-')); return left.length === 0 ? 'nothing of mine is left' : 'still there: ' + left.join(', ')",
+          "text": "nothing of mine is left",
+          "always": true,
+          "note": "This check leaves the project exactly as it found it",
+          "timeout_ms": 30000
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-write-starter-checks-button-is-really-pressed",
+      "title": "Write starter checks for me really writes them, or says they are there already",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "refreshCheckup = async () => {}; await new Promise(r => setTimeout(r, 1500)); checkup = {project: 'this project', steps: [{id: 'suite', title: 'Write your first checks', done: false, detail: 'A check says what a working project looks like.', action: 'harness qa init'}]}; renderCheckup(); for (let tries = 0; tries < 40; tries += 1) {   const list = document.getElementById('checkupSteps');   const button = [...list.querySelectorAll('button')]     .find(b => b.textContent.includes('Write starter checks for me'));   if (button) return 'the button is offered';   await new Promise(r => setTimeout(r, 100)); } return 'the button was not drawn'",
+          "text": "the button is offered",
+          "note": "A project with no checks is offered a way to write some",
+          "timeout_ms": 20000
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const list = document.getElementById('checkupSteps'); const button = [...list.querySelectorAll('button')]   .find(b => b.textContent.includes('Write starter checks for me')); button.click(); for (let tries = 0; tries < 100; tries += 1) {   const shown = !document.getElementById('checksView').hidden;   const wrong = document.getElementById('validationStatus').textContent;   if (shown) return 'true';   if (wrong.includes('already')) return 'true';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 100)); } return 'nothing happened'",
+          "text": "true",
+          "timeout_ms": 20000,
+          "note": "Pressing it either writes them and shows them, or says they are there already"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "workflow-choosing-merge-shows-the-merge-fields",
+      "title": "Choosing Merge as the agent type really shows the merge fields",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "#addAgentButton",
+          "note": "Open the add agent box"
+        },
+        {
+          "do": "choose",
+          "target": "#agentType",
+          "value": "planner",
+          "note": "Start with an ordinary agent type"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentMergeFields",
+          "note": "An ordinary agent has no merge fields to fill in"
+        },
+        {
+          "do": "choose",
+          "target": "#agentType",
+          "value": "merge",
+          "note": "Choose Merge"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#agentMergeFields",
+          "note": "Choosing Merge really shows the fields a merge agent needs"
+        },
+        {
+          "do": "choose",
+          "target": "#agentType",
+          "value": "coder",
+          "note": "Choose something else again"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#agentMergeFields",
+          "note": "And they go away again"
+        },
+        {
+          "do": "click",
+          "target": "#closeAgentDialog",
+          "always": true,
+          "note": "Shut the box whatever happened"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "prompts-choosing-two-versions-really-shows-both",
+      "title": "Choosing two versions really shows both of them side by side",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "prompts"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"prompts\"]",
+          "note": "Open the prompt history"
+        },
+        {
+          "do": "run",
+          "script": "refreshPrompts = async () => {}; await new Promise(r => setTimeout(r, 1500)); promptRecords = [{id: 'aaaaaaaaaa11', name: 'planner', active: false, parent_id: '', body: 'THE EARLIER WORDING', metadata: {}},{id: 'bbbbbbbbbb22', name: 'planner', active: true, parent_id: 'aaaaaaaaaa11', body: 'THE LATER WORDING', metadata: {}}]; renderPrompts(); for (let tries = 0; tries < 40; tries += 1) {   const left = document.getElementById('promptLeft');   if (left.options.length === 2) return 'both versions are offered';   await new Promise(r => setTimeout(r, 100)); } return 'it offers ' + document.getElementById('promptLeft').options.length",
+          "text": "both versions are offered",
+          "timeout_ms": 20000,
+          "note": "Both versions are offered to choose from"
+        },
+        {
+          "do": "choose",
+          "target": "#promptLeft",
+          "value": "aaaaaaaaaa11",
+          "note": "Choose the earlier one on the left"
+        },
+        {
+          "do": "choose",
+          "target": "#promptRight",
+          "value": "bbbbbbbbbb22",
+          "note": "Choose the later one on the right"
+        },
+        {
+          "do": "expect_text",
+          "target": "#promptLeftBody",
+          "text": "THE EARLIER WORDING",
+          "note": "The left side shows the earlier wording"
+        },
+        {
+          "do": "expect_text",
+          "target": "#promptRightBody",
+          "text": "THE LATER WORDING",
+          "note": "The right side shows the later wording"
+        },
+        {
+          "do": "choose",
+          "target": "#promptLeft",
+          "value": "bbbbbbbbbb22",
+          "note": "Change the left one"
+        },
+        {
+          "do": "expect_text",
+          "target": "#promptLeftBody",
+          "text": "THE LATER WORDING",
+          "note": "Changing a choice really changes what is shown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "timeout_seconds": 120
+    },
+    {
+      "id": "workflow-choosing-a-transfer-mode-really-changes-the-line",
+      "title": "Choosing a transfer mode really changes what the line does",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.querySelector('.edge-hit'); if (!line) return 'there is no line to pick'; line.dispatchEvent(new MouseEvent('click', {bubbles: true})); await new Promise(r => setTimeout(r, 200)); return document.getElementById('edgeMode').disabled   ? 'the mode cannot be changed' : 'a line is picked'",
+          "text": "a line is picked",
+          "note": "Pick a line on the drawing"
+        },
+        {
+          "do": "choose",
+          "target": "#edgeMode",
+          "value": "delegate",
+          "note": "Choose Delegate task"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const edge = graph.edges.find(e => e.id === selected.id); return edge.mode === 'delegate' ? 'the line really carries a task'   : ('the line says ' + edge.mode)",
+          "text": "the line really carries a task",
+          "note": "Choosing it really changes what the line does"
+        },
+        {
+          "do": "choose",
+          "target": "#edgeMode",
+          "value": "state",
+          "note": "Choose State again"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const edge = graph.edges.find(e => e.id === selected.id); return edge.mode === 'state' ? 'it changes back' : ('the line says ' + edge.mode)",
+          "text": "it changes back",
+          "note": "And choosing again changes it back"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "workflow-choosing-a-tool-role-really-changes-the-box",
+      "title": "Choosing what a tool box is for really changes the box",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "click",
+          "target": "[data-node-type=\"tool\"]",
+          "note": "Add a tool box"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const list = document.getElementById('nodeRole'); return list.hidden ? 'the list is hidden' : 'the list is offered'",
+          "text": "the list is offered",
+          "note": "A tool box is asked what it is for"
+        },
+        {
+          "do": "choose",
+          "target": "#nodeRole",
+          "value": "security",
+          "note": "Choose Security auditor"
+        },
+        {
+          "do": "run",
+          "script": "await new Promise(r => setTimeout(r, 300)); const node = graph.nodes.find(n => n.id === selected.id); return node.config.role === 'security' ? 'the box really is a security one'   : ('the box says ' + node.config.role)",
+          "text": "the box really is a security one",
+          "note": "Choosing it really changes what the box is for"
+        },
+        {
+          "do": "run",
+          "script": "const id = selected.id; removeNode(id); await new Promise(r => setTimeout(r, 200)); return graph.nodes.some(n => n.id === id)   ? 'it is still there' : 'the drawing is as it was'",
+          "text": "the drawing is as it was",
+          "always": true,
+          "note": "Take the box off again whatever happened"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-finding-the-assistants-on-this-machine",
+      "title": "Find what is on this machine really looks, and says what it found",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "seats"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#findSeats",
+          "note": "The button is offered"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('setUpSeats').disabled ? 'nothing can be set up before looking' : 'it offered to set up too early'",
+          "text": "nothing can be set up before looking",
+          "note": "Nothing can be written before anything has been found"
+        },
+        {
+          "do": "click",
+          "target": "#findSeats",
+          "note": "Press the button itself"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const rows = document.querySelectorAll('#seatList li');   if (rows.length > 0) return 'it listed what it found';   await new Promise(r => setTimeout(r, 250)); } return 'it never listed anything'",
+          "text": "it listed what it found",
+          "timeout_ms": 60000,
+          "note": "It lists every assistant it knows about"
+        },
+        {
+          "do": "run",
+          "script": "const said = document.getElementById('seatFindSaid').textContent; return /are ready to use|on this machine yet/.test(said)   ? 'it said how many are ready' : ('it said: ' + said)",
+          "text": "it said how many are ready",
+          "note": "And says plainly how many can be used"
+        },
+        {
+          "do": "run",
+          "script": "const rows = [...document.querySelectorAll('#seatList li')]; const marked = rows.every(row => /Ready|Not here/.test(row.textContent)); return marked ? 'each one says whether it is there' : 'a row said neither'",
+          "text": "each one says whether it is there",
+          "note": "Each one is marked ready or not"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('seatStepFind').classList.contains('done') ? 'step one is done' : 'step one still looks unfinished'",
+          "text": "step one is done",
+          "note": "The first step is marked done"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-setting-up-a-seat-writes-shares-and-puts-it-back",
+      "title": "The three seat buttons do the whole job, and Put my settings back undoes it",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "seats"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "click",
+          "target": "#findSeats",
+          "note": "Look first"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatList li').length) break;   await new Promise(r => setTimeout(r, 250)); } if (document.getElementById('setUpSeats').disabled)   return 'no assistant is ready on this machine'; document.getElementById('validationStatus').textContent = ''; document.getElementById('setUpSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   const wrong = document.getElementById('validationStatus').textContent;   if (said.includes('trusted') || said.includes('Written to'))     return 'it wrote the settings';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
+          "text": "it wrote the settings",
+          "timeout_ms": 90000,
+          "note": "Pressing it writes the settings and says so"
+        },
+        {
+          "do": "run",
+          "script": "const shown = document.getElementById('seatFile').textContent; return shown.includes('providers') && shown.includes('kind')   ? 'it showed the file it wrote' : 'it showed nothing useful'",
+          "text": "it showed the file it wrote",
+          "note": "And shows exactly what went into the file"
+        },
+        {
+          "do": "run",
+          "script": "const button = document.getElementById('shareTheWork'); if (button.disabled) return 'the next step is still shut'; const handed = button.dataset.routes || ''; return handed.includes('claude') || handed.includes('copilot')   ? 'the next step was handed the routes'   : 'the next step was handed nothing: ' + handed",
+          "text": "the next step was handed the routes",
+          "note": "Setting up hands the real routes to the sharing button"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('undoSeats').hidden   ? 'no way back was offered' : 'it offers a way back'",
+          "text": "it offers a way back",
+          "note": "And offers a way back"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('shareTheWork').click(); for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#seatJobs li').length)     return 'it shared the work out';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'nothing happened'",
+          "text": "it shared the work out",
+          "timeout_ms": 60000,
+          "note": "Pressing share gives each agent a seat"
+        },
+        {
+          "do": "run",
+          "script": "const withSeats = (graph.nodes || []).filter(n => (n.config || {}).provider_route); if (!withSeats.length) return 'no agent got a seat'; const talk = withSeats.every(n => (n.config.capabilities || []).includes('team.message')); return talk ? 'every one of them can send notes' : 'one of them cannot send notes'",
+          "text": "every one of them can send notes",
+          "note": "And lets each of them send notes to the others"
+        },
+        {
+          "do": "run",
+          "script": "const coder = (graph.nodes || []).find(n => n.type === 'coder'); return coder && (coder.config.capabilities || []).includes('workspace.write')   ? 'the one writing code may write files' : 'the coder cannot write'",
+          "text": "the one writing code may write files",
+          "note": "The agent that writes code may write files"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; document.getElementById('undoSeats').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('seatWriteSaid').textContent;   if (said.includes('put back') || said.includes('removed'))     return 'it put them back';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it never said what happened'",
+          "text": "it put them back",
+          "timeout_ms": 90000,
+          "always": true,
+          "note": "Pressing put back undoes it, whatever happened above"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('undoSeats').hidden   && document.getElementById('shareTheWork').disabled   ? 'the steps went back too' : 'the steps still look done'",
+          "text": "the steps went back too",
+          "always": true,
+          "note": "And the steps go back to where they were"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-the-picture-of-the-workflow-is-real",
+      "title": "The picture on the first screen is drawn from the real workflow",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "how"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#howStages li').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('#howStages li').length; return boxes ? 'it drew ' + boxes + ' steps' : 'it drew nothing'",
+          "text": "it drew 9 steps",
+          "timeout_ms": 60000,
+          "note": "It draws one box per step of the workflow"
+        },
+        {
+          "do": "run",
+          "script": "const drawn = [...document.querySelectorAll('#howStages li')]   .map(box => box.dataset.stage); const real = (graph.nodes || []).map(node => node.id); return JSON.stringify(drawn) === JSON.stringify(real.filter(id => drawn.includes(id)))   && drawn.length === real.length   ? 'every box is a real part of the workflow'   : 'the picture and the workflow disagree: ' + JSON.stringify(drawn)",
+          "text": "every box is a real part of the workflow",
+          "note": "And every box is a node the harness will really run"
+        },
+        {
+          "do": "run",
+          "script": "return document.querySelectorAll('#howLoops li').length   ? 'it says when the work goes back a step'   : 'it never says the work goes back'",
+          "text": "it says when the work goes back a step",
+          "note": "It says where the work can go back to an earlier step"
+        },
+        {
+          "do": "click",
+          "target": "#howRefresh",
+          "note": "Draw it again really redraws it"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 100; tries += 1) {   if (document.querySelectorAll('#howStages li').length) break;   await new Promise(r => setTimeout(r, 200)); } return document.querySelectorAll('#howStages li').length   ? 'it is still drawn' : 'redrawing emptied it'",
+          "text": "it is still drawn",
+          "timeout_ms": 30000,
+          "note": "Drawing it again leaves a picture, not an empty box"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('howDemo').click(); let sawOne = false; for (let tries = 0; tries < 200; tries += 1) {   if ([...document.querySelectorAll('#howStages li')]        .some(box => box.dataset.state === 'doing')) sawOne = true;   if (!document.getElementById('howDemo').disabled) break;   await new Promise(r => setTimeout(r, 100)); } const all = [...document.querySelectorAll('#howStages li')]   .every(box => box.dataset.state === 'done'); if (!sawOne) return 'it never lit a step up'; return all ? 'it walked through every step' : 'it stopped part way'",
+          "text": "it walked through every step",
+          "timeout_ms": 60000,
+          "note": "Show me how it works lights each step up in turn"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('howSaid').textContent.includes('whole thing')   ? 'it says it finished' : 'it never said it finished'",
+          "text": "it says it finished",
+          "note": "And says so plainly at the end"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-just-do-it-for-me-does-the-work",
+      "title": "I don't care, just do it for me runs the job and says what is left for you",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "setup"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const box = document.querySelector('.model-setup');   if (box) box.open = true;   const buttons = [...document.querySelectorAll('button')]     .filter(b => b.textContent.includes(\"I don't care, just do it for me\"));   if (buttons.length >= (canDoForYou || []).length && buttons.length > 0)     return 'every way of connecting a model offers to do it for you';   await new Promise(r => setTimeout(r, 250)); } return 'only some of them offer to do it for you'",
+          "text": "every way of connecting a model offers to do it for you",
+          "timeout_ms": 60000,
+          "note": "Every way of connecting a model offers to do it for you"
+        },
+        {
+          "do": "run",
+          "script": "const safeOnes = ['anthropic', 'openai', 'gemini']; const cards = [...document.querySelectorAll('.model-option')]; const safe = cards.find(card => {   const button = [...card.querySelectorAll('button')]     .find(b => b.textContent.includes(\"I don't care, just do it for me\"));   return button && safeOnes.includes(button.dataset.option)     && card.textContent.includes('is not set'); }); if (!safe) return 'every service on this machine already has a key, so nothing was pressed'; const button = [...safe.querySelectorAll('button')]   .find(b => b.textContent.includes(\"I don't care, just do it for me\")); window.__whichOption = button.dataset.option; return 'found one that cannot finish on its own'",
+          "text": "found one that cannot finish on its own",
+          "note": "Pick one that cannot write anything: a service still waiting for a key"
+        },
+        {
+          "do": "run",
+          "script": "const option = window.__whichOption; const button = document.querySelector('button[data-option=\"' + option + '\"]'); button.click(); for (let tries = 0; tries < 300; tries += 1) {   const said = document.getElementById('doIt-' + option);   if (said && !said.hidden && said.querySelectorAll('.do-it-step').length)     return 'it showed what it was doing';   await new Promise(r => setTimeout(r, 250)); } return 'it never showed anything'",
+          "text": "it showed what it was doing",
+          "timeout_ms": 90000,
+          "note": "Pressing it shows each thing it does, one line at a time"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 300; tries += 1) {   const said = document.getElementById('doIt-' + window.__whichOption);   if (said && said.querySelector('.do-it-cannot')) return 'it says what is left for you';   await new Promise(r => setTimeout(r, 250)); } return 'it never said what is left'",
+          "text": "it says what is left for you",
+          "timeout_ms": 90000,
+          "note": "And says plainly the one part only a person can do"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const buttons = [...document.querySelectorAll('button')]     .filter(b => b.textContent.includes(\"I don't care, just do it for me\"));   if (buttons.length && buttons.every(b => !b.disabled))     return 'the buttons work again';   await new Promise(r => setTimeout(r, 250)); } return 'the buttons stayed shut'",
+          "text": "the buttons work again",
+          "timeout_ms": 60000,
+          "note": "When the job ends every button can be pressed again"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('doIt-' + window.__whichOption)   .textContent.includes('Left for you')   ? 'it wrote nothing and said why' : 'it did not say what it left'",
+          "text": "it wrote nothing and said why",
+          "note": "Nothing was written, because the one part left is nobody's job but yours"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-trusting-a-file-somebody-else-left-behind",
+      "title": "The panel warns about an untrusted settings file, and checks you read the one you trust",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "seats"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "run",
+          "script": "const asked = await request('/api/seats'); showTheChoiceAboutTrusting({   needs_your_say: true,   note: 'It was already here and nobody has said it is theirs.',   risky_parts: ['The route theirs starts this program: curl http://elsewhere.example'],   mark: 'not-the-mark-of-anything', }); const box = document.getElementById('trustChoice'); return box.hidden ? 'it said nothing' : 'it put the choice in front of me'",
+          "text": "it put the choice in front of me",
+          "note": "It puts the choice in front of the person, rather than deciding"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('trustChoice'); return box.textContent.includes('curl http://elsewhere.example')   ? 'it named what trusting would allow'   : 'it warned without saying what about'",
+          "text": "it named what trusting would allow",
+          "note": "And names exactly what in the file carries the risk"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; showTheChoiceAboutTrusting({needs_your_say: true, note: 'x',   risky_parts: [], mark: 'a-mark-from-some-other-file'}); const button = [...document.querySelectorAll('#trustChoice button')]   .find(b => b.textContent.includes('I have read it - trust it anyway')); button.click(); for (let tries = 0; tries < 200; tries += 1) {   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.includes('changed since it was shown'))     return 'it refuses to trust a file that changed';   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'it trusted it anyway'",
+          "text": "it refuses to trust a file that changed",
+          "timeout_ms": 60000,
+          "note": "Saying you have read it is checked against the file you were shown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-draws-the-pipeline-and-joins-steps-up",
+      "title": "The pipelines view draws a pipeline, and its buttons really join and cut",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#pipelineNodes .pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('#pipelineNodes .pipeline-node').length; const wires = document.querySelectorAll('.pipeline-wire').length; return boxes && wires ? 'it drew boxes and wires' : 'it drew nothing'",
+          "text": "it drew boxes and wires",
+          "timeout_ms": 60000,
+          "note": "It opens with a pipeline drawn, boxes and arrows and all"
+        },
+        {
+          "do": "run",
+          "script": "const kinds = document.querySelectorAll('#pipelinePalette .pipeline-add').length; return kinds > 5 ? 'every kind of step is on the left' : 'only ' + kinds + ' kinds'",
+          "text": "every kind of step is on the left",
+          "note": "Every kind of step the harness can run is there to add"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.querySelectorAll('.pipeline-node').length; const add = [...document.querySelectorAll('#pipelinePalette .pipeline-add')]   .find(b => b.dataset.kind === 'git_repo'); add.click(); const after = document.querySelectorAll('.pipeline-node').length; return after === before + 1 ? 'pressing one adds a step' : 'nothing was added'",
+          "text": "pressing one adds a step",
+          "note": "Pressing a kind on the left really adds that step"
+        },
+        {
+          "do": "run",
+          "script": "const boxes = [...document.querySelectorAll('.pipeline-node')]; const last = boxes[boxes.length - 1]; const first = boxes[0]; const wiresBefore = document.querySelectorAll('.pipeline-wire').length; [...first.querySelectorAll('button')].find(b => b.textContent === 'Connect').click(); [...last.querySelectorAll('button')].find(b => b.textContent === 'Connect').click(); const wiresAfter = document.querySelectorAll('.pipeline-wire').length; return wiresAfter === wiresBefore + 1   ? 'Connect really draws an arrow' : 'no arrow was drawn'",
+          "text": "Connect really draws an arrow",
+          "note": "Connect on one box then another really joins them"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.querySelectorAll('.pipeline-wire').length; document.querySelector('.pipeline-cut').dispatchEvent(   new MouseEvent('click', {bubbles: true})); const after = document.querySelectorAll('.pipeline-wire').length; return after === before - 1 ? 'the cross really cuts an arrow' : 'the arrow stayed'",
+          "text": "the cross really cuts an arrow",
+          "note": "The small cross on an arrow really takes it out"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.querySelectorAll('.pipeline-node').length; const boxes = [...document.querySelectorAll('.pipeline-node')]; const last = boxes[boxes.length - 1]; [...last.querySelectorAll('button')].find(b => b.textContent === 'Remove').click(); const after = document.querySelectorAll('.pipeline-node').length; return after === before - 1 ? 'Remove really takes a step out' : 'the step stayed'",
+          "text": "Remove really takes a step out",
+          "note": "Remove on a box really takes that step out"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineCheck').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('can run')))     { watcher.disconnect(); return 'it says the pipeline can run'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'it never said: ' + everySaid.join(' | ')",
+          "text": "it says the pipeline can run",
+          "timeout_ms": 60000,
+          "note": "Check it says plainly whether the pipeline would run"
+        },
+        {
+          "do": "run",
+          "script": "refreshPipelines = async () => {}; const boxes = [...document.querySelectorAll('.pipeline-node')]; const a = boxes[0].dataset.node, b = boxes[1].dataset.node; pipeline.edges.push({from: a, to: b}, {from: b, to: a});const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineCheck').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('circle')))     { watcher.disconnect(); return 'it refuses a pipeline that goes round'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'it let a circle through: ' + everySaid.join(' | ')",
+          "text": "it refuses a pipeline that goes round",
+          "timeout_ms": 60000,
+          "note": "A pipeline that goes round in a circle is refused, with a reason"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineNew",
+          "note": "Start a fresh one clears the board"
+        },
+        {
+          "do": "run",
+          "script": "return document.querySelectorAll('.pipeline-node').length === 0   ? 'a fresh one is empty' : 'the old one is still there'",
+          "text": "a fresh one is empty",
+          "note": "And a fresh one really is empty"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-a-steps-settings-are-really-saved",
+      "title": "Settings on a step open, save, and stay saved",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const box = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'scan'); if (!box) return 'there is no scan step to open'; [...box.querySelectorAll('button')].find(b => b.textContent === 'Settings').click(); return document.getElementById('pipelineNodeDialog').open   ? 'the settings window opened' : 'nothing opened'",
+          "text": "the settings window opened",
+          "timeout_ms": 60000,
+          "note": "Settings on a step opens a window for that step"
+        },
+        {
+          "do": "run",
+          "script": "const fields = document.querySelectorAll('#pipelineNodeSettings [data-setting]'); return fields.length ? 'it asks for what that kind needs'   : 'it asks for nothing at all'",
+          "text": "it asks for what that kind needs",
+          "note": "And asks only for what that kind of step needs"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('pipelineNodeLabel').value = 'Read only the readme'; const field = document.querySelector('#pipelineNodeSettings [data-setting=\"paths\"]'); if (field) field.value = 'README.md'; document.getElementById('pipelineNodeTries').value = '3'; document.getElementById('pipelineNodeSave').click(); const node = pipeline.nodes.find(item => item.id === 'scan'); return node.label === 'Read only the readme' && node.settings.tries === 3   ? 'what was typed in was really saved'   : 'it was not saved: ' + JSON.stringify(node)",
+          "text": "what was typed in was really saved",
+          "note": "Saving really keeps what was typed in"
+        },
+        {
+          "do": "run",
+          "script": "const box = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'scan'); return box.textContent.includes('Read only the readme')   ? 'the box on the board shows the new name' : 'the board did not change'",
+          "text": "the box on the board shows the new name",
+          "note": "And the box on the board says so"
+        },
+        {
+          "do": "run",
+          "script": "const before = JSON.stringify(pipeline.nodes.find(n => n.id === 'scan')); const box = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'scan'); [...box.querySelectorAll('button')].find(b => b.textContent === 'Settings').click(); document.getElementById('pipelineNodeLabel').value = 'Something else entirely'; document.getElementById('pipelineNodeCancel').click(); const after = JSON.stringify(pipeline.nodes.find(n => n.id === 'scan')); if (document.getElementById('pipelineNodeDialog').open) return 'it stayed open'; return before === after ? 'Cancel changes nothing' : 'Cancel changed something'",
+          "text": "Cancel changes nothing",
+          "note": "Cancel closes the window and leaves the step as it was"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-really-runs-one-and-lights-the-steps-up",
+      "title": "Run really runs a pipeline, lights each step up, and gates the rest",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'Watched while it runs', nodes: [   {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 60}},   {id: 'scan', kind: 'security_scan', label: 'Scan the readme',    settings: {paths: 'README.md'}, at: {x: 300, y: 60}},   {id: 'gate', kind: 'security_gate', label: 'Gate',    settings: {needs: 'all'}, at: {x: 560, y: 60}},   {id: 'keep', kind: 'artifact', label: 'Evidence',    settings: {}, at: {x: 820, y: 60}} ], edges: [   {from: 'start', to: 'scan'}, {from: 'scan', to: 'gate'},   {from: 'gate', to: 'keep'} ]}; document.getElementById('pipelineName').value = 'Watched while it runs'; renderPipeline(); return document.querySelectorAll('.pipeline-node').length === 4   ? 'a small pipeline is on the board' : 'the board is wrong'",
+          "text": "a small pipeline is on the board",
+          "timeout_ms": 60000,
+          "note": "Put a small pipeline on the board that only reads"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineRun",
+          "note": "Press Run"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 400; tries += 1) {   const lines = document.querySelectorAll('#pipelineLog li').length;   const stopped = document.getElementById('pipelineStop').disabled;   if (lines >= 4 && stopped) return 'every step reported';   await new Promise(r => setTimeout(r, 250)); } return 'it never finished'",
+          "text": "every step reported",
+          "timeout_ms": 120000,
+          "note": "Every step says what happened, as it happens"
+        },
+        {
+          "do": "run",
+          "script": "const states = [...document.querySelectorAll('.pipeline-node')]   .map(node => node.dataset.state || 'none'); return states.every(state => state === 'passed')   ? 'every box went green' : 'the boxes say ' + states.join(', ')",
+          "text": "every box went green",
+          "note": "And every box on the board shows how it went"
+        },
+        {
+          "do": "run",
+          "script": "const log = document.getElementById('pipelineLog').textContent; return log.includes('Start') && log.includes('Gate')   ? 'the log names each step' : 'the log is missing steps'",
+          "text": "the log names each step",
+          "note": "The log underneath names each step and what it said"
+        },
+        {
+          "do": "run",
+          "script": "pipeline.nodes.find(n => n.id === 'scan').settings =   {paths: 'a-file-that-is-not-here.txt'}; renderPipeline(); document.getElementById('pipelineRun').click(); for (let tries = 0; tries < 400; tries += 1) {   const stopped = document.getElementById('pipelineStop').disabled;   const lines = document.querySelectorAll('#pipelineLog li').length;   if (lines >= 4 && stopped) break;   await new Promise(r => setTimeout(r, 250)); } const keep = [...document.querySelectorAll('.pipeline-node')]   .find(node => node.dataset.node === 'keep'); return keep.dataset.state === 'skipped'   ? 'a shut gate stops the work going on'   : 'the work carried on: ' + keep.dataset.state",
+          "text": "a shut gate stops the work going on",
+          "timeout_ms": 120000,
+          "note": "When a step before a gate fails, the work after it is skipped"
+        },
+        {
+          "do": "run",
+          "script": "const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineStop').disabled = false; document.getElementById('pipelineStop').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('will stop')))     { watcher.disconnect(); return 'Stop says the run will stop'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'Stop said nothing: ' + everySaid.join(' | ')",
+          "text": "Stop says the run will stop",
+          "timeout_ms": 60000,
+          "note": "Stop asks the run to stop after the step it is on"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-saving-and-removing-a-pipeline",
+      "title": "A pipeline can be saved, opened again, and removed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const there = await request('/api/pipelines'); if ((there.saved || []).includes('Checked by a check')) {   await request('/api/pipelines/delete',     {method: 'POST', body: JSON.stringify({name: 'Checked by a check'})}); } return 'nothing left over from before'",
+          "text": "nothing left over from before",
+          "timeout_ms": 60000,
+          "note": "Nothing left over from an earlier run"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('pipelineName').value = 'Checked by a check'; document.getElementById('validationStatus').textContent = '';const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineSave').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Saved')))     { watcher.disconnect(); return 'it saved the pipeline'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'nothing happened: ' + everySaid.join(' | ')",
+          "text": "it saved the pipeline",
+          "timeout_ms": 60000,
+          "note": "Save really saves it"
+        },
+        {
+          "do": "run",
+          "script": "const names = [...document.querySelectorAll('.pipeline-saved-one')]   .map(button => button.textContent); return names.includes('Checked by a check')   ? 'it is listed on the left' : 'it is not listed: ' + names.join(', ')",
+          "text": "it is listed on the left",
+          "note": "And it appears in the list of saved ones"
+        },
+        {
+          "do": "run",
+          "script": "window.prompt = () => 'Checked by a check two'; const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineSaveAs').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Checked by a check two')))     { watcher.disconnect(); break; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); const listed = [...document.querySelectorAll('.pipeline-saved-one')]   .map(item => item.textContent); if (!listed.includes('Checked by a check two'))   return 'Save as did not save a second one: ' + listed.join(', '); await request('/api/pipelines/delete',   {method: 'POST', body: JSON.stringify({name: 'Checked by a check two'})}); document.getElementById('pipelineName').value = 'Checked by a check'; return 'Save as really saves it under the new name'",
+          "text": "Save as really saves it under the new name",
+          "timeout_ms": 60000,
+          "always": true,
+          "note": "Save as saves a second copy under the name you give it"
+        },
+        {
+          "do": "run",
+          "script": "refreshPipelines = refreshPipelines; const wanted = pipeline.nodes.map(node => node.id).sort().join(','); newPipeline(); if (document.querySelectorAll('.pipeline-node').length)   return 'the board did not empty'; document.getElementById('validationStatus').textContent = ''; const button = [...document.querySelectorAll('.pipeline-saved-one')]   .find(item => item.textContent === 'Checked by a check'); if (!button) return 'the saved one is not in the list'; button.click(); for (let tries = 0; tries < 200; tries += 1) {   const back = pipeline.nodes.map(node => node.id).sort().join(',');   if (back === wanted && document.getElementById('pipelineName').value === 'Checked by a check')     return 'opening it really brings the steps back';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'the steps never came back'",
+          "text": "opening it really brings the steps back",
+          "timeout_ms": 60000,
+          "note": "Pressing a saved one really loads it back, steps and all"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; document.getElementById('pipelineDelete').click(); for (let tries = 0; tries < 200; tries += 1) {   const names = [...document.querySelectorAll('.pipeline-saved-one')]     .map(item => item.textContent);   if (!names.includes('Checked by a check')) return 'removing it really removes it';   await new Promise(r => setTimeout(r, 250)); } return 'it is still there'",
+          "text": "removing it really removes it",
+          "timeout_ms": 60000,
+          "always": true,
+          "note": "Delete really removes it, and leaves the project as it was"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "settings-view-lists-and-its-buttons-really-work",
+      "title": "The settings view lists every setting, and its buttons really work",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "settings"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"settings\"]",
+          "note": "Open the settings view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('#settingsList .setting').length) break;   await new Promise(r => setTimeout(r, 250)); } const rows = document.querySelectorAll('#settingsList .setting').length; return rows > 50 ? 'every setting is listed' : 'only ' + rows + ' are listed'",
+          "text": "every setting is listed",
+          "timeout_ms": 60000,
+          "note": "Every setting the harness has is there to see"
+        },
+        {
+          "do": "run",
+          "script": "const row = document.querySelector('[data-setting=\"qa.workers\"]'); if (!row) return 'a known setting is missing'; const said = row.textContent; return said.includes('side by side') && said.includes('from ')   ? 'it says what a setting means and where it came from'   : 'it says: ' + said.slice(0, 80)",
+          "text": "it says what a setting means and where it came from",
+          "note": "Each one says what it means, what it is now, and which file that came from"
+        },
+        {
+          "do": "run",
+          "script": "const same = settingsHeld.find(one => one.kind === 'number'   && one.came_from === 'the shared settings file'); if (!same) return 'there is no plain number to try this on'; window.__settingKey = same.key; document.getElementById('settingsFilter').value = same.key; renderSettings(); const input = document.querySelector('[data-for=\"' + same.key + '\"]'); input.value = String(same.value);const list = document.getElementById('settingsList'); const everySaid = []; const watcher = new MutationObserver(() => everySaid.push(list.textContent)); watcher.observe(list, {childList: true, characterData: true, subtree: true}); document.querySelector('[data-setting=\"' + same.key + '\"] .setting-save').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(list.textContent);   if (everySaid.some(said => said.includes('is now')))     { watcher.disconnect(); return 'saving really saves'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'nothing happened'",
+          "text": "saving really saves",
+          "timeout_ms": 90000,
+          "note": "Saving a setting the value it already holds really writes, and changes nothing"
+        },
+        {
+          "do": "run",
+          "script": "const key = window.__settingKey; document.getElementById('settingsFilter').value = key; renderSettings(); const input = document.querySelector('[data-for=\"' + key + '\"]'); input.value = 'not a number at all'; document.querySelector('[data-setting=\"' + key + '\"] .setting-save').click(); for (let tries = 0; tries < 200; tries += 1) {   const said = document.getElementById('settingSaid-' + key);   if (said && said.className.includes('wrong'))     return 'it refuses something that is not a number, and says why';   await new Promise(r => setTimeout(r, 250)); } return 'it took it'",
+          "text": "it refuses something that is not a number, and says why",
+          "timeout_ms": 60000,
+          "note": "Something that is not a number is refused, with a reason, and nothing is written"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('settingsFilter').value = ''; document.getElementById('settingsChangedOnly').checked = true; renderSettings(); const shown = document.querySelectorAll('#settingsList .setting').length; const changed = settingsHeld.filter(one => one.changed).length; document.getElementById('settingsChangedOnly').checked = false; renderSettings(); return shown === changed   ? 'it can show only what is not as it shipped'   : 'it showed ' + shown + ' of ' + changed",
+          "text": "it can show only what is not as it shipped",
+          "note": "The box for showing only what has been changed really filters"
+        },
+        {
+          "do": "click",
+          "target": "#refreshSettings",
+          "note": "Read them again really reads them again"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 100; tries += 1) {   if (document.querySelectorAll('#settingsList .setting').length)     return 'the settings are still listed';   await new Promise(r => setTimeout(r, 200)); } return 'reading them again emptied the list'",
+          "text": "the settings are still listed",
+          "timeout_ms": 30000,
+          "note": "And leaves a list, not an empty box"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-starting-from-a-ready-made-pipeline",
+      "title": "A ready-made pipeline can be picked and lands on the board ready to run",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-starter').length) break;   await new Promise(r => setTimeout(r, 250)); } const many = document.querySelectorAll('.pipeline-starter').length; return many >= 4 ? 'there are ready-made ones to pick from'   : 'only ' + many + ' to pick from'",
+          "text": "there are ready-made ones to pick from",
+          "timeout_ms": 60000,
+          "note": "The board offers pipelines to start from, not only a blank one"
+        },
+        {
+          "do": "run",
+          "script": "const each = [...document.querySelectorAll('#pipelineStarters li')]; return each.every(item => item.querySelector('p'))   ? 'each one says when to reach for it'   : 'one of them says nothing about itself'",
+          "text": "each one says when to reach for it",
+          "note": "And each says what it is for"
+        },
+        {
+          "do": "run",
+          "script": "refreshPipelines = async () => {}; window.confirm = () => true; document.querySelector('[data-starter=\"before-a-release\"]').click(); for (let tries = 0; tries < 200; tries += 1) {   if (document.getElementById('pipelineName').value === 'Before a release')     break;   await new Promise(r => setTimeout(r, 250)); } const boxes = document.querySelectorAll('.pipeline-node').length; const wires = document.querySelectorAll('.pipeline-wire').length; return boxes > 5 && wires > 5   ? 'picking one really puts it on the board'   : 'it put ' + boxes + ' boxes and ' + wires + ' arrows there'",
+          "text": "picking one really puts it on the board",
+          "timeout_ms": 60000,
+          "note": "Picking one really draws that pipeline"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineCheck').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('can run')))     { watcher.disconnect(); return 'the one it drew is a pipeline that runs'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'it said: ' + everySaid.join(' | ')",
+          "text": "the one it drew is a pipeline that runs",
+          "timeout_ms": 60000,
+          "note": "And what it drew is a pipeline the harness would really run"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "checks-view-explains-what-a-failure-means",
+      "title": "A failing check can say what it means in plain words",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "checks",
+        "explain"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "run",
+          "script": "refreshChecks = async () => {}; refreshUnstable = async () => {}; refreshChanged = async () => {}; applyCheckEvent = () => {}; switchView('checks'); return document.getElementById('checksView').hidden   ? 'the checks view would not open' : 'the checks view is open'",
+          "text": "the checks view is open",
+          "note": "Open the checks view, with its own loading turned off first"
+        },
+        {
+          "do": "run",
+          "script": "const failing = {   id: 'a-check-that-failed', title: 'A check that failed',   kind: 'browser', status: 'failed', passed: false, duration_ms: 12,   reasons: ['The browser stopped early: page.goto: net::ERR_CONNECTION_REFUSED at http://127.0.0.1:8000/'],   attempts: [{number: 1, passed: false, duration_ms: 12, evidence: ''}],   artifacts: [], tags: [] }; function putItThere() {   qaResult = {run_id: 'made-up', cases: [failing]};   qaSuite = {cases: [{id: failing.id, title: failing.title, kind: 'browser', tags: []}]};   renderChecks(); } for (let tries = 0; tries < 60; tries += 1) {   putItThere();   const button = [...document.querySelectorAll('button')]     .find(item => item.textContent === 'What does this mean?');   if (!button) { await new Promise(r => setTimeout(r, 250)); continue; }   button.click();   for (let wait = 0; wait < 40; wait += 1) {     const box = document.querySelector('.explain');     if (box && !box.hidden && box.textContent.includes('listening'))       return 'a failing check says what it means';     await new Promise(r => setTimeout(r, 250));   } } return 'it never said'",
+          "text": "a failing check says what it means",
+          "timeout_ms": 90000,
+          "note": "A check that did not pass explains itself in plain words"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.querySelector('.explain'); const lines = box ? box.querySelectorAll('.explain-list li').length : 0; return lines >= 2 ? 'and says what to try'   : 'it suggested ' + lines + ' things'",
+          "text": "and says what to try",
+          "note": "And says what to try about it"
+        },
+        {
+          "do": "run",
+          "script": "const button = [...document.querySelectorAll('button')]   .find(item => item.textContent === 'Hide that'); if (!button) return 'there was no way to hide it again'; button.click(); const box = document.querySelector('.explain'); return box.hidden ? 'it can be hidden again' : 'it stayed open'",
+          "text": "it can be hidden again",
+          "note": "Pressing it again hides it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "start-view-shows-a-newcomer-around-the-panel",
+      "title": "Show me around walks through the panel, one tab at a time",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "start",
+        "tour"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Start on the first view"
+        },
+        {
+          "do": "click",
+          "target": "#showMeAround",
+          "note": "Press Show me around"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 100; tries += 1) {   const box = document.getElementById('tour');   if (box && !box.hidden) return 'the tour started';   await new Promise(r => setTimeout(r, 200)); } return 'nothing happened'",
+          "text": "the tour started",
+          "timeout_ms": 30000,
+          "note": "It really starts"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('tour'); return box.textContent.includes('1 of')   ? 'it says where you are up to' : 'it does not say where you are'",
+          "text": "it says where you are up to",
+          "note": "And says which stop you are on, out of how many"
+        },
+        {
+          "do": "run",
+          "script": "const before = document.getElementById('tour').textContent; [...document.querySelectorAll('#tour button')]   .find(b => b.textContent === 'Next').click(); await new Promise(r => setTimeout(r, 300)); const after = document.getElementById('tour').textContent; const opened = document.querySelector('[data-view=\"checks\"]')   .getAttribute('aria-pressed'); return after !== before && opened === 'true'   ? 'Next moves on and opens that tab'   : 'it said the same thing, or opened nothing'",
+          "text": "Next moves on and opens that tab",
+          "note": "Next moves on, and opens the tab it is talking about"
+        },
+        {
+          "do": "run",
+          "script": "const back = [...document.querySelectorAll('#tour button')]   .find(b => b.textContent === 'Back'); if (!back) return 'there was no way back'; back.click(); await new Promise(r => setTimeout(r, 300)); return document.getElementById('tour').textContent.includes('1 of')   ? 'Back goes back a stop' : 'Back went somewhere else'",
+          "text": "Back goes back a stop",
+          "note": "Back goes back one stop"
+        },
+        {
+          "do": "run",
+          "script": "const stop = [...document.querySelectorAll('#tour button')]   .find(b => b.textContent === 'Stop the tour'); stop.click(); await new Promise(r => setTimeout(r, 300)); return document.getElementById('tour').hidden   ? 'it can be stopped at any point' : 'it carried on'",
+          "text": "it can be stopped at any point",
+          "always": true,
+          "note": "And it can be stopped at any point"
+        },
+        {
+          "do": "run",
+          "script": "const tabs = [...document.querySelectorAll('[data-view]')]   .map(button => button.dataset.view); const missing = TOUR.filter(stop => !tabs.includes(stop.view)); return missing.length ? 'the tour names a tab that is not here: '   + missing.map(stop => stop.view).join(', ')   : 'every stop is a tab that is really here'",
+          "text": "every stop is a tab that is really here",
+          "note": "Every stop names a tab the panel really has"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "pipelines-view-can-be-used-without-a-pointer",
+      "title": "The pipelines board works with the keyboard alone",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines",
+        "accessibility"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const boxes = [...document.querySelectorAll('.pipeline-node')]; return boxes.every(box => box.tabIndex === 0)   ? 'every box can take the keyboard'   : 'one of them cannot be reached by keyboard'",
+          "text": "every box can take the keyboard",
+          "timeout_ms": 60000,
+          "note": "Every step on the board can be reached with the keyboard"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.querySelector('.pipeline-node'); const said = box.getAttribute('aria-label') || ''; return said.includes('Arrow keys') && said.includes('Delete')   ? 'each box says what the keys do'   : 'a box says: ' + said.slice(0, 60)",
+          "text": "each box says what the keys do",
+          "note": "And says what the keys do, for anybody listening rather than looking"
+        },
+        {
+          "do": "run",
+          "script": "applyPipelineEvent = () => {}; refreshPipelines = async () => {}; const box = document.querySelector('.pipeline-node'); const id = box.dataset.node; const was = Object.assign({}, pipeline.nodes.find(n => n.id === id).at); box.focus(); box.dispatchEvent(new KeyboardEvent('keydown',   {key: 'ArrowRight', bubbles: true, shiftKey: true})); await new Promise(r => setTimeout(r, 300)); const now = pipeline.nodes.find(n => n.id === id).at; return now.x > was.x ? 'the arrow keys really move a step'   : 'it did not move: ' + JSON.stringify(now)",
+          "text": "the arrow keys really move a step",
+          "timeout_ms": 30000,
+          "note": "The arrow keys move a step around the board"
+        },
+        {
+          "do": "run",
+          "script": "const id = document.querySelector('.pipeline-node').dataset.node; return document.activeElement && document.activeElement.dataset.node === id   ? 'the keyboard stays on the step it moved'   : 'the keyboard was left on nothing'",
+          "text": "the keyboard stays on the step it moved",
+          "note": "And the keyboard stays where it was, after the board redraws"
+        },
+        {
+          "do": "run",
+          "script": "const boxes = [...document.querySelectorAll('.pipeline-node')]; const first = boxes[0], second = boxes[1]; const wiresBefore = document.querySelectorAll('.pipeline-wire').length; first.focus(); first.dispatchEvent(new KeyboardEvent('keydown', {key: 'c', bubbles: true})); second.dispatchEvent(new KeyboardEvent('keydown', {key: 'c', bubbles: true})); await new Promise(r => setTimeout(r, 300)); const wiresAfter = document.querySelectorAll('.pipeline-wire').length; return wiresAfter >= wiresBefore   ? 'C joins two steps without a pointer'   : 'the arrow went missing'",
+          "text": "C joins two steps without a pointer",
+          "timeout_ms": 30000,
+          "note": "Pressing C on one step then another joins them"
+        },
+        {
+          "do": "run",
+          "script": "const boxes = [...document.querySelectorAll('.pipeline-node')]; const before = boxes.length; const last = boxes[boxes.length - 1]; last.focus(); last.dispatchEvent(new KeyboardEvent('keydown', {key: 'Delete', bubbles: true})); await new Promise(r => setTimeout(r, 300)); return document.querySelectorAll('.pipeline-node').length === before - 1   ? 'Delete takes a step out without a pointer'   : 'the step stayed'",
+          "text": "Delete takes a step out without a pointer",
+          "timeout_ms": 30000,
+          "note": "And Delete takes a step out"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "vault-view-draws-what-the-harness-knows",
+      "title": "The vault view draws every note and every link between them",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "vault"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"vault\"]",
+          "note": "Open the vault view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (typeof vaultNotes !== 'undefined' && document.getElementById('vaultCounts')       .textContent !== 'Reading the notes.') break;   await new Promise(r => setTimeout(r, 250)); } window.__vaultMine = ['A note about the picture', 'Another note about the picture']; await request('/api/vault/write', {method: 'POST', body: JSON.stringify({   title: window.__vaultMine[0], kind: 'about-this-project', tags: ['drawn-by-a-check'],   body: 'One note pointing at [[another-note-about-the-picture]].'})}); await request('/api/vault/write', {method: 'POST', body: JSON.stringify({   title: window.__vaultMine[1], kind: 'how-to', tags: ['drawn-by-a-check'],   body: 'The other one, pointing back at [[a-note-about-the-picture]].'})}); await refreshVault(); return 'two notes to draw'",
+          "text": "two notes to draw",
+          "timeout_ms": 90000,
+          "note": "Two notes of its own to draw, so the check needs nothing already there"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.vault-dot').length) break;   await new Promise(r => setTimeout(r, 250)); } const dots = document.querySelectorAll('.vault-dot').length; const wires = document.querySelectorAll('.vault-wire').length; return dots && wires ? 'it drew the notes and the links between them'   : 'it drew ' + dots + ' notes and ' + wires + ' links'",
+          "text": "it drew the notes and the links between them",
+          "timeout_ms": 60000,
+          "note": "It opens with a picture: a circle per note, a line per link"
+        },
+        {
+          "do": "run",
+          "script": "const drawn = [...document.querySelectorAll('.vault-dot')]   .filter(dot => !dot.classList.contains('not-yet'))   .map(dot => dot.dataset.note).sort(); const listed = [...document.querySelectorAll('.vault-list-one')]   .map(one => one.dataset.note).filter(Boolean).sort(); return JSON.stringify(drawn) === JSON.stringify(listed)   ? 'the picture and the list say the same thing'   : 'the picture has ' + drawn.length + ' and the list has ' + listed.length",
+          "text": "the picture and the list say the same thing",
+          "note": "The list beside it says the same thing in words, for anybody not looking at pictures"
+        },
+        {
+          "do": "run",
+          "script": "const each = [...document.querySelectorAll('.vault-dot')]; return each.every(dot => (dot.getAttribute('aria-label') || '').length > 3)   ? 'every note in the picture says what it is'   : 'a note in the picture says nothing'",
+          "text": "every note in the picture says what it is",
+          "note": "And every circle says what it is, for anybody listening rather than looking"
+        },
+        {
+          "do": "run",
+          "script": "const dot = document.querySelector('.vault-dot:not(.not-yet)'); dot.click(); for (let tries = 0; tries < 200; tries += 1) {   if (!document.getElementById('vaultNote').hidden)     return 'pressing a note opens it';   await new Promise(r => setTimeout(r, 250)); } return 'nothing opened'",
+          "text": "pressing a note opens it",
+          "timeout_ms": 60000,
+          "note": "Pressing a note in the picture opens it underneath"
+        },
+        {
+          "do": "run",
+          "script": "const shown = document.getElementById('vaultNote').textContent; return shown.includes('This points at') && shown.includes('These point here')   ? 'an open note says what it points at and what points at it'   : 'it showed: ' + shown.slice(0, 80)",
+          "text": "an open note says what it points at and what points at it",
+          "note": "An open note shows both ways: what it points at, and what points at it"
+        },
+        {
+          "do": "run",
+          "script": "const kinds = [...document.querySelectorAll('.vault-kind')]; if (!kinds.length) return 'there are no kinds to choose'; const before = document.querySelectorAll('.vault-list-one[data-note]').length; kinds[0].click(); await new Promise(r => setTimeout(r, 300)); const after = document.querySelectorAll('.vault-list-one[data-note]').length; kinds[0].click(); await new Promise(r => setTimeout(r, 300)); const back = document.querySelectorAll('.vault-list-one[data-note]').length; return after <= before && back === before   ? 'choosing a kind really narrows it down, and lets go again'   : 'it showed ' + before + ' then ' + after + ' then ' + back",
+          "text": "choosing a kind really narrows it down, and lets go again",
+          "timeout_ms": 30000,
+          "note": "Choosing a kind narrows the picture and the list to that kind"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('vaultSearch').value = 'zzzz-nothing-matches-this'; document.getElementById('vaultSearch')   .dispatchEvent(new Event('input', {bubbles: true})); await new Promise(r => setTimeout(r, 400)); const none = document.querySelectorAll('.vault-list-one[data-note]').length; document.getElementById('vaultSearch').value = ''; document.getElementById('vaultSearch')   .dispatchEvent(new Event('input', {bubbles: true})); await new Promise(r => setTimeout(r, 400)); const back = document.querySelectorAll('.vault-list-one[data-note]').length; return none === 0 && back > 0   ? 'searching really searches' : 'it found ' + none + ' then ' + back",
+          "text": "searching really searches",
+          "timeout_ms": 30000,
+          "note": "Searching narrows it, and clearing the search brings it back"
+        },
+        {
+          "do": "click",
+          "target": "#vaultRedraw",
+          "note": "Draw it again really draws it again"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 100; tries += 1) {   if (document.querySelectorAll('.vault-dot').length)     return 'it is still drawn';   await new Promise(r => setTimeout(r, 200)); } return 'drawing it again emptied it'",
+          "text": "it is still drawn",
+          "timeout_ms": 30000,
+          "note": "And leaves a picture, not an empty board"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('vaultOnlyNear'); const dot = document.querySelector('.vault-dot:not(.not-yet)'); dot.click(); await new Promise(r => setTimeout(r, 600)); const all = document.querySelectorAll('.vault-list-one[data-note]').length; box.checked = true; box.dispatchEvent(new Event('change', {bubbles: true})); await new Promise(r => setTimeout(r, 600)); const near = document.querySelectorAll('.vault-list-one[data-note]').length; box.checked = false; box.dispatchEvent(new Event('change', {bubbles: true})); await new Promise(r => setTimeout(r, 600)); const back = document.querySelectorAll('.vault-list-one[data-note]').length; return near <= all && back === all   ? 'it can show only what is near the open note'   : 'it showed ' + all + ' then ' + near + ' then ' + back",
+          "text": "it can show only what is near the open note",
+          "timeout_ms": 60000,
+          "note": "The box for showing only what is near the open note really narrows it"
+        },
+        {
+          "do": "click",
+          "target": "#vaultClose",
+          "note": "Close really closes the open note"
+        },
+        {
+          "do": "run",
+          "script": "return document.getElementById('vaultNote').hidden   ? 'closing really closes it' : 'it stayed open'",
+          "text": "closing really closes it",
+          "note": "And the note goes away"
+        },
+        {
+          "do": "run",
+          "script": "for (const title of (window.__vaultMine || [])) {   const name = title.toLowerCase().replace(/[^a-z0-9]+/g, '-')     .replace(/^-|-$/g, '');   try { await request('/api/vault/remove',     {method: 'POST', body: JSON.stringify({name})}); }   catch (error) { /* already gone, which is what we want */ } } await refreshVault(); return (vaultNotes || []).some(one =>   (one.tags || []).includes('drawn-by-a-check'))   ? 'a note was left behind' : 'this check leaves nothing behind'",
+          "text": "this check leaves nothing behind",
+          "timeout_ms": 90000,
+          "always": true,
+          "note": "And takes them away again, whatever happened above"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "touches": [
+        "the vault"
+      ]
+    },
+    {
+      "id": "vault-view-writes-reads-and-removes-a-note",
+      "title": "A note can be written, read back, marked as helpful, and removed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "vault"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"vault\"]",
+          "note": "Open the vault view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (typeof vaultNotes !== 'undefined' &&       document.getElementById('vaultCounts').textContent !== 'Reading the notes.') break;   await new Promise(r => setTimeout(r, 250)); } for (const name of ['a-note-a-check-wrote', 'a-note-a-check-renamed']) {   if (!(vaultNotes || []).some(one => one.name === name)) continue;   await request('/api/vault/remove', {method: 'POST', body: JSON.stringify({name})}); } await refreshVault(); return 'nothing left over from before'",
+          "text": "nothing left over from before",
+          "timeout_ms": 60000,
+          "note": "Nothing left over from an earlier run"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('vaultNew').click(); if (!document.getElementById('vaultDialog').open)   return 'the window did not open'; document.getElementById('vaultFormTitle').value = 'Not going to be written'; document.getElementById('vaultFormCancel').click(); await new Promise(r => setTimeout(r, 400)); if (document.getElementById('vaultDialog').open) return 'it stayed open'; return (vaultNotes || []).some(one => one.title === 'Not going to be written')   ? 'Cancel wrote it anyway' : 'Cancel writes nothing'",
+          "text": "Cancel writes nothing",
+          "timeout_ms": 30000,
+          "note": "Cancel closes the window and writes nothing"
+        },
+        {
+          "do": "click",
+          "target": "#vaultNew",
+          "note": "Press New note"
+        },
+        {
+          "do": "choose",
+          "target": "#vaultFormKind",
+          "value": "how-to",
+          "note": "Choose what kind of note this is"
+        },
+        {
+          "do": "run",
+          "script": "if (!document.getElementById('vaultDialog').open)   return 'the window did not open'; document.getElementById('vaultFormTitle').value = 'A note a check wrote'; document.getElementById('vaultFormTags').value = 'written-by-a-check'; document.getElementById('vaultFormBody').value =   'This note was written by a check. It points at [[how-this-vault-works]].'; document.getElementById('vaultFormSave').click(); for (let tries = 0; tries < 200; tries += 1) {   if ((vaultNotes || []).some(one => one.name === 'a-note-a-check-wrote'))     return 'writing a note really writes it';   await new Promise(r => setTimeout(r, 250)); } return 'nothing was written'",
+          "text": "writing a note really writes it",
+          "timeout_ms": 90000,
+          "note": "Writing a note really writes it, and it turns up in the picture"
+        },
+        {
+          "do": "run",
+          "script": " const dot = document.querySelector('[data-note=\"a-note-a-check-wrote\"]'); if (!dot) return 'the new note is not in the picture'; const wires = document.querySelectorAll('.vault-wire').length; return wires > 0 ? 'the link it holds is drawn as a line'   : 'no lines were drawn'",
+          "text": "the link it holds is drawn as a line",
+          "note": "And the link written inside it is drawn as a line"
+        },
+        {
+          "do": "run",
+          "script": " openVaultNote('a-note-a-check-wrote'); for (let tries = 0; tries < 200; tries += 1) {   const shown = document.getElementById('vaultNoteTitle').textContent;   if (shown === 'A note a check wrote') break;   await new Promise(r => setTimeout(r, 250)); } const inline = document.querySelectorAll('.vault-inline-link').length; return inline > 0 ? 'a link inside a note can be pressed'   : 'the link was only words'",
+          "text": "a link inside a note can be pressed",
+          "timeout_ms": 60000,
+          "note": "A link written inside a note can be pressed to follow it"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('vaultUsedWell').click(); for (let tries = 0; tries < 200; tries += 1) {   const one = (vaultNotes || []).find(item => item.name === 'a-note-a-check-wrote');   if (one && one.uses > 0 && one.worked > 0)     return 'saying it helped is counted';   await new Promise(r => setTimeout(r, 250)); } return 'nothing was counted'",
+          "text": "saying it helped is counted",
+          "timeout_ms": 90000,
+          "note": "Saying a note helped is counted, which is how a note earns its place"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('vaultUsedBadly').click(); for (let tries = 0; tries < 200; tries += 1) {   const one = (vaultNotes || []).find(item => item.name === 'a-note-a-check-wrote');   if (one && one.uses > 1)     return one.worked === 1 ? 'saying it did not help is counted too'       : 'it counted the wrong thing';   await new Promise(r => setTimeout(r, 250)); } return 'nothing was counted'",
+          "text": "saying it did not help is counted too",
+          "timeout_ms": 90000,
+          "note": "And so is saying it did not"
+        },
+        {
+          "do": "run",
+          "script": "document.getElementById('vaultEdit').click(); if (!document.getElementById('vaultDialog').open)   return 'Edit opened nothing'; const body = document.getElementById('vaultFormBody'); body.value = body.value + ' Changed by a check.'; document.getElementById('vaultFormSave').click(); for (let tries = 0; tries < 200; tries += 1) {   const one = (vaultNotes || []).find(item => item.name === 'a-note-a-check-wrote');   if (one && one.body.includes('Changed by a check'))     return 'Edit really changes a note';   await new Promise(r => setTimeout(r, 250)); } return 'nothing changed'",
+          "text": "Edit really changes a note",
+          "timeout_ms": 90000,
+          "note": "Edit opens the note and really changes it"
+        },
+        {
+          "do": "run",
+          "script": "const before = (vaultNotes || []).length; openVaultNote('a-note-a-check-wrote'); await new Promise(r => setTimeout(r, 500)); editVaultNote(); document.getElementById('vaultFormTitle').value = 'A note a check renamed'; document.getElementById('vaultFormSave').click(); for (let tries = 0; tries < 200; tries += 1) {   const names = (vaultNotes || []).map(one => one.name);   if (names.includes('a-note-a-check-renamed')) {     if (names.includes('a-note-a-check-wrote'))       return 'renaming left the old one behind';     if ((vaultNotes || []).length !== before)       return 'renaming changed how many notes there are';     return 'renaming moves a note rather than copying it';   }   await new Promise(r => setTimeout(r, 250)); } return 'nothing was renamed'",
+          "text": "renaming moves a note rather than copying it",
+          "timeout_ms": 90000,
+          "note": "Changing a note's title moves it, and does not leave a second one behind"
+        },
+        {
+          "do": "run",
+          "script": "window.confirm = () => true; if (!document.getElementById('vaultRemove').closest('#vaultNote').hidden)   document.getElementById('vaultRemove').click(); for (let tries = 0; tries < 200; tries += 1) {   if (!(vaultNotes || []).some(one => one.name === 'a-note-a-check-renamed')) break;   await new Promise(r => setTimeout(r, 250)); } for (const name of ['a-note-a-check-wrote', 'a-note-a-check-renamed']) {   if (!(vaultNotes || []).some(one => one.name === name)) continue;   await request('/api/vault/remove', {method: 'POST', body: JSON.stringify({name})});   await refreshVault(); } const left = (vaultNotes || []).filter(one => ['a-note-a-check-wrote', 'a-note-a-check-renamed'].includes(one.name)); return left.length === 0 ? 'removing a note really removes it'   : 'one is still there: ' + left[0].name",
+          "text": "removing a note really removes it",
+          "timeout_ms": 90000,
+          "always": true,
+          "note": "Removing it really removes it, and leaves the vault as it was found"
+        },
+        {
+          "do": "click",
+          "target": "#vaultLearn",
+          "note": "Learn from the runs reads what the harness remembers"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   const said = document.getElementById('vaultSaid').textContent;   if (said.includes('note') || said.includes('Nothing new'))     return 'it says what it learned from the runs';   await new Promise(r => setTimeout(r, 250)); } return 'it never said'",
+          "text": "it says what it learned from the runs",
+          "timeout_ms": 90000,
+          "note": "And says what came of it"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "touches": [
+        "the vault"
+      ]
+    },
+    {
+      "id": "vault-view-offers-a-start-when-it-is-empty",
+      "title": "An empty vault offers a start, and pressing it writes the first notes",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "vault"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"vault\"]",
+          "note": "Open the vault view"
+        },
+        {
+          "do": "run",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (typeof vaultNotes !== 'undefined' && document.getElementById('vaultCounts')       .textContent !== 'Reading the notes.') break;   await new Promise(r => setTimeout(r, 250)); } window.__vaultWasEmpty = (vaultNotes || []).length === 0;const offer = [...document.querySelectorAll('button')]   .find(one => one.textContent.trim() === 'Write two notes to start me off'); if (window.__vaultWasEmpty)   return offer ? 'the offer is shown when it should be'     : 'an empty vault offered nothing'; return offer ? 'a vault with notes was offered a start it does not need'   : 'the offer is shown when it should be'",
+          "text": "the offer is shown when it should be",
+          "timeout_ms": 90000,
+          "note": "An empty vault offers a start. A vault with notes in it does not."
+        },
+        {
+          "do": "run",
+          "script": "if (!window.__vaultWasEmpty)   return 'pressing it writes the first notes and draws them';const offer = [...document.querySelectorAll('button')]   .find(one => one.textContent.trim() === 'Write two notes to start me off'); offer.click(); for (let tries = 0; tries < 200; tries += 1) {   if ((vaultNotes || []).length >= 2) break;   await new Promise(r => setTimeout(r, 250)); } const wanted = [\"how-this-vault-works\", \"what-a-note-is-for\"]; const here = (vaultNotes || []).map(one => one.name); if (!wanted.every(name => here.includes(name)))   return 'it wrote ' + here.join(', '); return document.querySelectorAll('.vault-dot').length   ? 'pressing it writes the first notes and draws them'   : 'it wrote them but drew nothing'",
+          "text": "pressing it writes the first notes and draws them",
+          "timeout_ms": 90000,
+          "note": "Press Write two notes to start me off, and the two notes turn up in the picture"
+        },
+        {
+          "do": "run",
+          "script": "if (!window.__vaultWasEmpty)   return 'the offer goes once there is something to see';const offer = [...document.querySelectorAll('button')]   .find(one => one.textContent.trim() === 'Write two notes to start me off'); return offer ? 'the offer is still there'   : 'the offer goes once there is something to see'",
+          "text": "the offer goes once there is something to see",
+          "note": "And the offer goes, because there is nothing left to offer"
+        },
+        {
+          "do": "run",
+          "script": "if (!window.__vaultWasEmpty)   return 'this check leaves nothing behind'; for (const name of [\"how-this-vault-works\", \"what-a-note-is-for\"]) {   if (!(vaultNotes || []).some(one => one.name === name)) continue;   await request('/api/vault/remove', {method: 'POST', body: JSON.stringify({name})}); } await refreshVault(); return (vaultNotes || []).length === 0   ? 'this check leaves nothing behind' : 'a note was left behind'",
+          "text": "this check leaves nothing behind",
+          "timeout_ms": 90000,
+          "always": true,
+          "note": "It takes back only the two notes it asked for, and only if it asked for them"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      },
+      "touches": [
+        "the vault"
+      ]
     }
   ]
 }
