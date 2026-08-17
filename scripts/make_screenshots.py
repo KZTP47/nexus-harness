@@ -131,7 +131,7 @@ def already_answering(port: int) -> bool:
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
-SHOTS = """
+SHOTS = r"""
 const { chromium } = require('playwright');
 
 const wide = { width: WIDTH, height: HEIGHT };
@@ -279,6 +279,35 @@ async function settle(page, ms = 1200) {
   });
   await settle(page, 400);
   await page.screenshot({ path: out + '/pipelines.png' });
+
+  // What the harness has learned, as a picture. A few notes are written first,
+  // in the throwaway project, so the picture has something to show.
+  await page.click('[data-view="vault"]');
+  for (let tries = 0; tries < 60; tries += 1) {
+    if (await page.locator('.vault-dot').count()) break;
+    await page.waitForTimeout(250);
+  }
+  await page.evaluate(async () => {
+    const notes = [
+      {title: 'They want plain English', kind: 'about-you', tags: ['writing'], sure: 0.9,
+       body: 'Short answers, no jargon. See [[how-to-answer-them]].'},
+      {title: 'How to answer them', kind: 'how-to', tags: ['writing'], sure: 0.8,
+       body: 'Lead with what changed. One table beats three paragraphs. Related: [[they-want-plain-english]].'},
+      {title: 'How to run the checks here', kind: 'how-to', tags: ['checks'], sure: 0.7,
+       body: 'Start the panel first. See [[the-panel-must-be-running]].'},
+      {title: 'The panel must be running', kind: 'lesson', tags: ['checks'], sure: 1.0,
+       body: 'Browser checks talk to a panel that is already up. Without one they all fail at once.'},
+      {title: 'This project keeps its checks in one file', kind: 'about-this-project',
+       tags: ['checks'], sure: 0.9,
+       body: 'They live beside the settings. See [[how-to-run-the-checks-here]].'},
+    ];
+    for (const note of notes) {
+      await request('/api/vault/write', {method: 'POST', body: JSON.stringify(note)});
+    }
+    await refreshVault();
+  });
+  await settle(page, 900);
+  await page.screenshot({ path: out + '/what-it-knows.png' });
 
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });

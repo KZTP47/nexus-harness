@@ -19,11 +19,15 @@
     </div>
   </header>
 
+  <div id="tour" class="tour" role="status" hidden></div>
+
   <nav class="view-nav" aria-label="Control panel views">
     <button type="button" data-view="start" aria-pressed="true" title="Set up your project and ask for a change">Start here</button>
     <button type="button" data-view="checks" aria-pressed="false" title="Your tests: what a working project looks like">Checks</button>
     <button type="button" data-view="workflow" aria-pressed="false" title="For later: rewire the agents yourself">Workflow</button>
     <button type="button" data-view="pipelines" aria-pressed="false" title="Wire many jobs together with gates between them">Pipelines</button>
+    <button type="button" data-view="vault" aria-pressed="false" title="What the harness has learned about you and this project">What it knows</button>
+    <button type="button" data-view="settings" aria-pressed="false" title="Change any setting, without opening a file">Settings</button>
     <button type="button" data-view="history" aria-pressed="false" title="What past runs did, step by step">History</button>
     <button type="button" data-view="memory" aria-pressed="false" title="What the harness has learnt about this project">Memory</button>
     <button type="button" data-view="prompts" aria-pressed="false" title="How the harness instructions changed over time">Prompt history</button>
@@ -36,7 +40,10 @@
           <h2 id="startTitle">Welcome</h2>
           <p>Four short steps get this project ready. You can do them in any order.</p>
         </div>
-        <button id="refreshCheckup" type="button">Check again</button>
+        <div class="button-row">
+          <button id="showMeAround" class="primary" type="button">Show me around</button>
+          <button id="refreshCheckup" type="button">Check again</button>
+        </div>
       </div>
       <p id="checkupSummary" class="callout" role="status">Looking at your project.</p>
       <ol id="checkupSteps" class="step-list"></ol>
@@ -365,6 +372,8 @@
         <button id="pipelineStop" type="button" disabled>Stop</button>
         <button id="pipelineDelete" type="button">Delete</button>
       </div>
+      <h3 id="pipelineStartersTitle">Start from a ready-made one</h3>
+      <ul id="pipelineStarters" class="pipeline-starters" aria-labelledby="pipelineStartersTitle"></ul>
       <h3 id="pipelinePaletteTitle">Add a step</h3>
       <div id="pipelinePalette" class="pipeline-palette" aria-labelledby="pipelinePaletteTitle"></div>
     </aside>
@@ -374,6 +383,7 @@
         <div>
           <h2 id="pipelineTitle">Pipelines</h2>
           <p class="hint">Wire jobs together. An arrow means "after". A gate decides whether the work goes on.</p>
+          <p class="hint">Keyboard: Tab to a box, arrow keys move it, C connects, S for settings, Delete takes it out.</p>
         </div>
         <div class="pipeline-bar-fields">
           <label for="pipelineName">Name</label>
@@ -384,7 +394,7 @@
       </div>
       <p id="pipelineSaid" class="pipeline-said" role="status">Draw a pipeline, then press Run.</p>
       <div id="pipelineCanvas" class="pipeline-canvas" role="application" aria-label="Pipeline" aria-describedby="pipelineHelp">
-        <p id="pipelineHelp" class="sr-only">Each step is a box. Press Connect on a box, then press another box to draw an arrow between them.</p>
+        <p id="pipelineHelp" class="sr-only">Each step is a box. Press Connect on a box, then press another box to draw an arrow between them. With the keyboard: Tab to a box, arrow keys move it, C connects it to another, S opens its settings, Delete takes it out.</p>
         <div id="pipelineNodes" class="pipeline-nodes">
           <svg id="pipelineWires" class="pipeline-wires" aria-hidden="true"></svg>
         </div>
@@ -411,6 +421,102 @@
       </div>
     </form>
   </dialog>
+
+  <div id="vaultView" data-view-panel="vault" class="vault-shell" hidden>
+    <aside class="vault-side" aria-labelledby="vaultSideTitle">
+      <div class="vault-side-head">
+        <h2 id="vaultSideTitle">What it knows</h2>
+        <p id="vaultCounts" class="hint">Reading the notes.</p>
+      </div>
+      <label class="sr-only" for="vaultSearch">Search the notes</label>
+      <input id="vaultSearch" type="search" placeholder="Search notes and links">
+      <div class="vault-side-buttons">
+        <button id="vaultNew" class="primary" type="button">New note</button>
+        <button id="vaultLearn" type="button">Learn from the runs</button>
+      </div>
+      <h3 id="vaultKindsTitle">Kinds</h3>
+      <div id="vaultKinds" class="vault-kinds" role="group" aria-labelledby="vaultKindsTitle"></div>
+      <h3 id="vaultTagsTitle">Tags</h3>
+      <div id="vaultTags" class="vault-tags" role="group" aria-labelledby="vaultTagsTitle"></div>
+      <h3 id="vaultListTitle">Notes</h3>
+      <ul id="vaultList" class="vault-list" aria-labelledby="vaultListTitle"></ul>
+    </aside>
+
+    <section class="vault-main" aria-labelledby="vaultTitle">
+      <div class="vault-bar">
+        <div>
+          <h2 id="vaultTitle">What the harness has learned</h2>
+          <p class="hint">Every note is a file in .harness/vault. Links are written in double brackets, and each one is a line in the picture.</p>
+        </div>
+        <div class="vault-bar-buttons">
+          <label class="check-row"><input id="vaultOnlyNear" type="checkbox"> Only what is near the open note</label>
+          <button id="vaultRedraw" type="button">Draw it again</button>
+        </div>
+      </div>
+      <p id="vaultSaid" class="vault-said" role="status">Press a note in the picture to read it.</p>
+      <div id="vaultGraph" class="vault-graph" role="application" aria-label="What the harness has learned, as a picture" aria-describedby="vaultGraphHelp" tabindex="0">
+        <p id="vaultGraphHelp" class="sr-only">Every note is a circle and every link is a line. Tab to the picture, then use the arrow keys to move between notes and Enter to open one. The list on the left says the same thing in words.</p>
+        <svg id="vaultWires" class="vault-wires" aria-hidden="true"></svg>
+        <div id="vaultNodes" class="vault-nodes"></div>
+      </div>
+      <div id="vaultNote" class="vault-note" hidden>
+        <div class="vault-note-head">
+          <div>
+            <h3 id="vaultNoteTitle">A note</h3>
+            <p id="vaultNoteAbout" class="hint"></p>
+          </div>
+          <div class="vault-note-buttons">
+            <button id="vaultUsedWell" type="button">That helped</button>
+            <button id="vaultUsedBadly" type="button">That did not help</button>
+            <button id="vaultEdit" type="button">Edit</button>
+            <button id="vaultRemove" type="button">Remove</button>
+            <button id="vaultClose" type="button">Close</button>
+          </div>
+        </div>
+        <div id="vaultNoteBody" class="vault-note-body"></div>
+        <div id="vaultNoteLinks" class="vault-note-links"></div>
+      </div>
+    </section>
+  </div>
+
+  <dialog id="vaultDialog" aria-labelledby="vaultDialogTitle">
+    <form id="vaultForm" method="dialog">
+      <h2 id="vaultDialogTitle">A note</h2>
+      <label for="vaultFormTitle">What it is about</label>
+      <input id="vaultFormTitle" type="text" maxlength="80" placeholder="They prefer short answers">
+      <label for="vaultFormKind">What kind of thing this is</label>
+      <select id="vaultFormKind"></select>
+      <label for="vaultFormTags">Tags, separated by commas</label>
+      <input id="vaultFormTags" type="text" maxlength="200" placeholder="writing, preferences">
+      <label for="vaultFormSure">How sure the harness is</label>
+      <input id="vaultFormSure" type="range" min="0" max="1" step="0.05" value="0.5">
+      <label for="vaultFormBody">The note itself. Link to another with [[its name]].</label>
+      <textarea id="vaultFormBody" rows="10" placeholder="They asked twice for shorter answers. See [[how-this-vault-works]]."></textarea>
+      <div class="dialog-buttons">
+        <button id="vaultFormCancel" type="button">Cancel</button>
+        <button id="vaultFormSave" class="primary" type="button">Save the note</button>
+      </div>
+    </form>
+  </dialog>
+
+  <main id="settingsView" data-view-panel="settings" class="data-view" hidden>
+    <section class="glass data-panel" aria-labelledby="settingsTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="settingsTitle">Settings</h2>
+          <p>Everything the harness can be told, in plain words. Change one here and nothing has to be edited by hand.</p>
+        </div>
+        <button id="refreshSettings" type="button">Read them again</button>
+      </div>
+      <div class="filter-row">
+        <label for="settingsFilter">Find a setting</label>
+        <input id="settingsFilter" type="search" placeholder="workers, timeout, model">
+        <label class="check-row"><input id="settingsChangedOnly" type="checkbox"> Only the ones that are not as they shipped</label>
+      </div>
+      <p id="settingsSaid" class="field-help" role="status">Reading your settings.</p>
+      <div id="settingsList" class="settings-list"></div>
+    </section>
+  </main>
 
   <main id="memoryView" data-view-panel="memory" class="data-view" hidden>
     <section class="glass data-panel" aria-labelledby="memoryTitle"><div class="section-heading"><div><h2 id="memoryTitle">Shared memory</h2><p>Links show which agent wrote or read a record.</p></div><button id="refreshMemory" type="button">Refresh</button></div><div class="filter-row"><label for="memoryQuery">Filter</label><input id="memoryQuery" type="search"><label for="memoryKind">Kind</label><select id="memoryKind"><option value="">All</option><option value="episode">Episode</option><option value="document">Source</option><option value="prompt">Prompt</option></select></div><div id="memoryGraph" class="memory-map" role="img" aria-label="Memory provenance map"></div><div class="table-scroll"><table><thead><tr><th scope="col">Kind</th><th scope="col">Record</th><th scope="col">Summary</th><th scope="col">Provenance</th></tr></thead><tbody id="memoryBody"></tbody></table></div></section>

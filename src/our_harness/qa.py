@@ -11,6 +11,7 @@ a candidate and only becomes part of the suite after an explicit accept.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import html
 import json
 import math
@@ -218,6 +219,10 @@ class QaCase:
     kind: str
     expect: QaExpectation
     tags: tuple[str, ...] = ()
+    # Things this check changes while it runs - a folder of notes, a settings
+    # file, a row in a table. Two checks that name the same thing never run at
+    # the same time, because they would be standing on each other's work.
+    touches: tuple[str, ...] = ()
     retries: int = 0
     timeout_seconds: float = 0.0
     command: tuple[str, ...] = ()
@@ -272,6 +277,8 @@ class QaCase:
         value: dict[str, Any] = {"id": self.id, "title": self.title, "kind": self.kind}
         if self.tags:
             value["tags"] = list(self.tags)
+        if self.touches:
+            value["touches"] = list(self.touches)
         if self.retries:
             value["retries"] = self.retries
         if self.timeout_seconds:
@@ -692,8 +699,13 @@ _STEP_EXTRAS: dict[str, frozenset[str]] = {
 }
 _MAX_STEPS = 60
 _COMMON_CASE_FIELDS = frozenset({
-    "id", "title", "kind", "tags", "retries", "timeout_seconds", "expect", "rows", "rows_file",
+    "id", "title", "kind", "tags", "touches", "retries", "timeout_seconds", "expect",
+    "rows", "rows_file",
 })
+# What a check may say it touches: plain words, so the reason two checks are
+# held apart reads as a reason and not as a code.
+_TOUCHES_PATTERN = re.compile(r"^[a-z0-9][a-z0-9 '_-]{0,39}$")
+_MOST_TOUCHES = 6
 
 
 _MAX_PLUGIN_VALUE_CHARS = 20_000
@@ -889,6 +901,20 @@ def _parse_case(
             raise QaError(f"{label}.tags entry must be lowercase letters, digits, dash, or underscore")
         if text not in tags:
             tags.append(text)
+    touches_value = data.get("touches", [])
+    if not isinstance(touches_value, list):
+        raise QaError(f"{label}.touches must be a list of things this check changes")
+    if len(touches_value) > _MOST_TOUCHES:
+        raise QaError(f"{label}.touches must name at most {_MOST_TOUCHES} things")
+    touches: list[str] = []
+    for thing in touches_value:
+        text = _require_text(thing, f"{label}.touches entry", limit=40).lower()
+        if not _TOUCHES_PATTERN.fullmatch(text):
+            raise QaError(
+                f"{label}.touches entry must be plain lowercase words, like \"the vault\""
+            )
+        if text not in touches:
+            touches.append(text)
     retries = _require_whole_number(data.get("retries", 0), f"{label}.retries", 0, _MAX_RETRIES)
     timeout_value = data.get("timeout_seconds", 0)
     if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
@@ -1045,6 +1071,7 @@ def _parse_case(
         kind=kind,
         expect=expect,
         tags=tuple(tags),
+        touches=tuple(touches),
         retries=retries,
         timeout_seconds=timeout_seconds,
         rows=rows,
@@ -1509,9 +1536,13 @@ class QaRunner:
             artifacts_root.mkdir(parents=True, exist_ok=True)
         started = self.clock()
         results: dict[str, QaCaseResult] = {}
+        # One lock for each thing any check says it touches. Checks still run
+        # several at a time; two that change the same thing simply wait for
+        # each other rather than fighting over it.
+        held = {thing: threading.Lock() for case in selected for thing in case.touches}
         with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
             futures = {
-                pool.submit(self._run_case, case, artifacts_root): case for case in selected
+                pool.submit(self._run_case, case, artifacts_root, held): case for case in selected
             }
             for future in concurrent.futures.as_completed(futures):
                 case = futures[future]
@@ -1569,7 +1600,21 @@ class QaRunner:
 
     # -- one case ----------------------------------------------------------
 
-    def _run_case(self, case: QaCase, artifacts_root: Path | None) -> QaCaseResult:
+    def _run_case(
+        self,
+        case: QaCase,
+        artifacts_root: Path | None,
+        held: Mapping[str, threading.Lock] | None = None,
+    ) -> QaCaseResult:
+        # Always in the same order, so two checks that touch the same two
+        # things can never sit waiting for each other forever.
+        locks = [held[thing] for thing in sorted(case.touches)] if held else []
+        with contextlib.ExitStack() as waiting:
+            for lock in locks:
+                waiting.enter_context(lock)
+            return self._really_run_case(case, artifacts_root)
+
+    def _really_run_case(self, case: QaCase, artifacts_root: Path | None) -> QaCaseResult:
         attempts: list[QaAttempt] = []
         artifacts: list[str] = []
         started = self.clock()
@@ -1889,12 +1934,12 @@ class QaRunner:
                 ["node", script.relative_to(self.root).as_posix()], cwd=".", timeout=timeout
             )
         finally:
-            script.unlink(missing_ok=True)
-            if keep is None:
-                try:
-                    folder.rmdir()
-                except OSError:
-                    pass
+            # Tidying up must never be the thing that fails a check. On Windows
+            # something else - a virus scanner, a file indexer, the browser
+            # letting go a moment late - can still be holding this file, and a
+            # check that passed should not be reported as broken because of a
+            # temporary file nobody will ever look at.
+            _let_go_of(script, folder if keep is None else None)
         marker = "<<<QA_REPORT>>>"
         if marker not in result.stdout:
             detail = (result.stderr or result.stdout).strip()
@@ -2545,6 +2590,32 @@ async function runStep(page, step) {
   process.stdout.write('<<<QA_REPORT>>>' + JSON.stringify(report));
 })();
 """
+
+
+def _let_go_of(script: Path, folder: Path | None) -> None:
+    """Remove a temporary file, waiting a moment if something still holds it.
+
+    A file another program has open cannot be removed on Windows, and the
+    something is usually a virus scanner reading a file that was written a
+    second ago. Waiting briefly clears it. Failing to clear it is still not
+    worth failing a check over: the folder is a temporary one, and what is left
+    behind is a few lines of JavaScript nobody will read.
+    """
+
+    for wait in (0.0, 0.1, 0.3, 0.6):
+        if wait:
+            time.sleep(wait)
+        try:
+            script.unlink(missing_ok=True)
+            break
+        except OSError:
+            continue
+    if folder is None:
+        return
+    try:
+        folder.rmdir()
+    except OSError:
+        pass
 
 
 def browser_script(plan: Mapping[str, Any]) -> str:

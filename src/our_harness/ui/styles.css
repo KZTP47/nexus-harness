@@ -448,3 +448,149 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
   .pipeline-shell { grid-template-columns: 1fr; height: auto; }
   .pipeline-side { border-right: none; border-bottom: 1px solid #d7dce3; }
 }
+
+/* Settings. One row per setting: what it is, what it is now, where that came
+   from, and a box to change it. Grouped and folded away, because eighty-eight
+   rows at once is a wall, and the ones that are not as they shipped are opened
+   first because those are the ones somebody is looking for. */
+.settings-list { display: grid; gap: 10px; margin-top: 12px; }
+.settings-group { border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.settings-group > summary { cursor: pointer; }
+.settings-count { color: var(--muted); font-weight: 400; }
+.setting { padding: 10px 0; border-top: 1px solid var(--line); }
+.setting:first-of-type { border-top: none; }
+.setting p { margin: 2px 0 0; font-size: .84rem; }
+.setting-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.setting-key { color: var(--muted); font-size: .76rem; }
+.setting-mark { font-size: .7rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--cyan); border: 1px solid var(--cyan); border-radius: 999px; padding: 1px 7px; }
+.setting-mark.yours { color: var(--yellow); border-color: var(--yellow); }
+.setting-line { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; margin-top: 7px; }
+.setting-line input, .setting-line select, .setting-line textarea { flex: 1 1 240px; min-width: 0; }
+.setting-save, .setting-reset { flex: none; }
+.setting-said { margin-top: 6px; font-size: .82rem; color: var(--muted); }
+.setting-said.good { color: var(--green); }
+.setting-said.wrong { color: var(--yellow); }
+.setting.changed { border-left: 3px solid var(--cyan); padding-left: 9px; }
+
+/* What does this mean: the plain-words answer under a failing check. */
+.explain-button { margin-top: 8px; }
+.explain { margin-top: 8px; padding: 10px 12px; border: 1px solid var(--cyan); border-radius: 10px; background: rgba(120, 220, 232, .06); }
+.explain strong { display: block; margin-bottom: 5px; }
+.explain p { margin: 0 0 6px; font-size: .85rem; }
+.explain-list { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: .85rem; }
+
+/* Ready-made pipelines, above the steps you can add one at a time. */
+.pipeline-starters { list-style: none; margin: 0 0 4px; padding: 0; display: grid; gap: 8px; }
+.pipeline-starters .field-help { margin: 2px 0 0; color: #64748b; font-size: .76rem; }
+.pipeline-starter { width: 100%; text-align: left; background: #fff; border: 1px solid #cbd2db; color: #1f2933; border-radius: 8px; padding: 7px 10px; font-size: .84rem; font-weight: 600; }
+.pipeline-starter:hover { border-color: #2563eb; color: #1d4ed8; }
+
+/* A box with the keyboard on it says so plainly, and the outline is thick
+   enough to see against a coloured card. */
+.pipeline-node:focus-visible { outline: 3px solid #1d4ed8; outline-offset: 2px; }
+.pipeline-node:focus { outline: 3px solid #1d4ed8; outline-offset: 2px; }
+
+/* Show me around: one short stop at a time, with the tab it is talking about
+   opened as it goes. Sits at the top of the first screen, where somebody who
+   has just arrived is already looking. */
+.tour { margin: 10px 18px 0; padding: 12px 14px; border: 1px solid var(--cyan); border-radius: 12px; background: rgba(120, 220, 232, .07); }
+.tour-where { display: block; font-size: .74rem; text-transform: uppercase; letter-spacing: .06em; color: var(--cyan); margin-bottom: 4px; }
+.tour strong { display: block; margin-bottom: 4px; }
+.tour p { margin: 0 0 10px; font-size: .88rem; }
+.tour-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* What it knows: the vault of notes, drawn the way people already draw notes.
+   A dark board, a circle per note, a line per link, and a purple that says
+   "these are somebody's notes" rather than "this is a dashboard". Colour says
+   what kind of note it is, size says how connected and how used it is, and a
+   dimmed circle is one nothing has touched for months. */
+.vault-shell { display: grid; grid-template-columns: 268px 1fr; height: calc(100vh - 132px); background: #14131c; }
+.vault-side { background: #191825; border-right: 1px solid #262436; padding: 14px; overflow: auto; color: #d8d5e6; }
+.vault-side-head h2 { margin: 0; font-size: 1rem; color: #efedf7; }
+.vault-side .hint { margin: 3px 0 10px; color: #918cab; font-size: .78rem; }
+.vault-side h3 { margin: 16px 0 7px; font-size: .74rem; text-transform: uppercase; letter-spacing: .08em; color: #918cab; }
+.vault-side input[type="search"] { width: 100%; background: #211f2e; border: 1px solid #302d44; color: #efedf7; border-radius: 8px; padding: 7px 9px; }
+.vault-side-buttons { display: flex; gap: 6px; margin-top: 9px; }
+.vault-side-buttons button { flex: 1; background: #211f2e; border: 1px solid #302d44; color: #d8d5e6; border-radius: 8px; padding: 6px 8px; font-size: .8rem; }
+.vault-side-buttons button.primary { background: #7c6bd8; border-color: #7c6bd8; color: #fff; }
+.vault-side-buttons button:disabled { opacity: .55; }
+
+.vault-kinds, .vault-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.vault-kind, .vault-tag { background: #211f2e; border: 1px solid #302d44; color: #d8d5e6; border-radius: 999px; padding: 3px 10px; font-size: .76rem; }
+.vault-kind.chosen, .vault-tag.chosen { border-color: #a898ff; color: #fff; background: #2b2740; }
+.vault-kind.kind-about-you { border-left: 4px solid #e2a3ff; }
+.vault-kind.kind-how-to { border-left: 4px solid #7fd9c0; }
+.vault-kind.kind-about-this-project { border-left: 4px solid #8fb4ff; }
+.vault-kind.kind-lesson { border-left: 4px solid #ffc48a; }
+
+.vault-list { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 3px; }
+.vault-list .hint { color: #918cab; font-size: .8rem; }
+.vault-list-one { width: 100%; text-align: left; background: transparent; border: 1px solid transparent; border-left: 3px solid #4c4763; color: #d8d5e6; border-radius: 7px; padding: 5px 9px; font-size: .82rem; }
+.vault-list-one:hover { background: #211f2e; }
+.vault-list-one.chosen { background: #2b2740; border-color: #7c6bd8; color: #fff; }
+.vault-list-one.stale { opacity: .55; font-style: italic; }
+.vault-list-one.kind-about-you { border-left-color: #e2a3ff; }
+.vault-list-one.kind-how-to { border-left-color: #7fd9c0; }
+.vault-list-one.kind-about-this-project { border-left-color: #8fb4ff; }
+.vault-list-one.kind-lesson { border-left-color: #ffc48a; }
+
+.vault-main { display: flex; flex-direction: column; overflow: hidden; color: #d8d5e6; }
+.vault-bar { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: flex-end; padding: 12px 16px; background: #191825; border-bottom: 1px solid #262436; }
+.vault-bar h2 { margin: 0; font-size: 1.05rem; color: #efedf7; }
+.vault-bar .hint { margin: 2px 0 0; color: #918cab; font-size: .8rem; max-width: 60ch; }
+.vault-bar-buttons { display: flex; align-items: center; gap: 10px; }
+.vault-bar-buttons button { background: #211f2e; border: 1px solid #302d44; color: #d8d5e6; border-radius: 8px; padding: 6px 10px; font-size: .8rem; }
+.vault-bar-buttons .check-row { color: #918cab; font-size: .8rem; }
+.vault-said { margin: 0; padding: 8px 16px; background: #16151f; border-bottom: 1px solid #262436; color: #c9c5da; font-size: .84rem; }
+
+.vault-graph { position: relative; flex: 1; min-height: 300px; overflow: hidden; background:
+  radial-gradient(circle at 30% 25%, rgba(124, 107, 216, .10), transparent 55%),
+  radial-gradient(circle at 72% 70%, rgba(127, 217, 192, .07), transparent 55%), #14131c; }
+.vault-graph:focus-visible { outline: 2px solid #a898ff; outline-offset: -2px; }
+.vault-wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.vault-wire { stroke: #3a3552; stroke-width: 1.4; }
+.vault-wire.near { stroke: #a898ff; stroke-width: 2.2; }
+.vault-wire.not-yet { stroke: #4c4763; stroke-dasharray: 4 4; }
+.vault-nodes { position: absolute; inset: 0; }
+
+/* A circle, and nothing the rest of the panel says about buttons is allowed
+   to stretch it into an egg. */
+.vault-dot { position: absolute; transform: translate(-50%, -50%); border-radius: 50%; border: 2px solid transparent; padding: 0; margin: 0; cursor: pointer; background: #8fb4ff; box-shadow: 0 0 0 4px rgba(20, 19, 28, .85); box-sizing: border-box; min-width: 0; min-height: 0; line-height: 0; font-size: 0; flex: none; appearance: none; }
+.vault-dot:hover { filter: brightness(1.25); }
+.vault-dot:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+.vault-dot.kind-about-you { background: #e2a3ff; }
+.vault-dot.kind-how-to { background: #7fd9c0; }
+.vault-dot.kind-about-this-project { background: #8fb4ff; }
+.vault-dot.kind-lesson { background: #ffc48a; }
+.vault-dot.chosen { border-color: #fff; box-shadow: 0 0 0 4px rgba(168, 152, 255, .35); }
+.vault-dot.stale { opacity: .45; }
+.vault-dot.not-yet { width: 13px; height: 13px; background: transparent; border: 2px dashed #6f6890; }
+.vault-label { position: absolute; transform: translateX(-50%); color: #b9b4cf; font-size: .72rem; white-space: nowrap; pointer-events: none; text-shadow: 0 1px 3px #14131c, 0 0 6px #14131c; }
+.vault-label.chosen { color: #fff; }
+
+.vault-note { border-top: 1px solid #262436; background: #191825; padding: 12px 16px; max-height: 44%; overflow: auto; }
+.vault-note-head { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; align-items: flex-start; }
+.vault-note-head h3 { margin: 0; color: #efedf7; font-size: 1rem; }
+.vault-note-head .hint { margin: 3px 0 0; color: #918cab; font-size: .78rem; }
+.vault-note-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+.vault-note-buttons button { background: #211f2e; border: 1px solid #302d44; color: #d8d5e6; border-radius: 8px; padding: 5px 9px; font-size: .78rem; }
+.vault-note-body { margin-top: 10px; font-size: .88rem; line-height: 1.55; }
+.vault-note-body p { margin: 0 0 8px; }
+.vault-inline-link { background: transparent; border: none; padding: 0; color: #a898ff; font: inherit; text-decoration: underline; cursor: pointer; }
+.vault-inline-link.not-yet { color: #6f6890; text-decoration: underline dashed; }
+.vault-note-links { display: flex; flex-wrap: wrap; gap: 22px; margin-top: 12px; }
+.vault-side-list h4 { margin: 0 0 5px; font-size: .74rem; text-transform: uppercase; letter-spacing: .07em; color: #918cab; }
+.vault-side-list ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.vault-note-tags { display: flex; flex-wrap: wrap; gap: 5px; margin: 0; }
+
+#vaultDialog { color: inherit; }
+#vaultDialog textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .84rem; }
+
+@media (max-width: 900px) {
+  .vault-shell { grid-template-columns: 1fr; height: auto; }
+  .vault-side { border-right: none; border-bottom: 1px solid #262436; }
+  .vault-graph { min-height: 320px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .vault-dot { transition: filter .15s ease, opacity .15s ease; }
+}

@@ -615,7 +615,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -847,6 +847,18 @@ function renderChecks() {
     const status = found ? found.status : "not run yet";
     const outcome = make("td", "");
     outcome.append(make("p", "", found && found.reasons.length ? found.reasons.join(" ") : found ? "As expected" : "Press Run all checks to try this one."));
+    // A failure says what happened. What to do about it is a different
+    // question, and the one somebody new actually has.
+    if (found && !found.passed) {
+      const why = make("button", "explain-button", "What does this mean?");
+      why.type = "button";
+      why.addEventListener("click", () => explainThis(why, found));
+      outcome.append(why);
+      const meaning = make("div", "explain");
+      meaning.id = `explain-${item.id}`;
+      meaning.hidden = true;
+      outcome.append(meaning);
+    }
     const evidence = found?.attempts?.at(-1)?.evidence || "";
     if (evidence) {
       const box = make("details", "");
@@ -1409,6 +1421,775 @@ function renderSeats(found) {
   announce($("seatFindSaid").textContent);
 }
 
+/* ---- What does this mean? ----
+
+   A failing check says what happened. This says what it means and what to try,
+   in the words somebody who has not seen it before would use.
+*/
+
+async function explainThis(button, found) {
+  const box = $(`explain-${found.id}`);
+  if (!box) return;
+  if (!box.hidden) { box.hidden = true; button.textContent = "What does this mean?"; return; }
+  button.disabled = true;
+  try {
+    const said = [
+      ...(found.reasons || []),
+      found.attempts?.at(-1)?.evidence || "",
+    ].join("\n");
+    const meaning = await request("/api/explain", {
+      method: "POST", body: JSON.stringify({said, kind: found.kind}),
+    });
+    box.replaceChildren();
+    box.append(make("strong", "", meaning.headline));
+    if (meaning.because) box.append(make("p", "", meaning.because));
+    if ((meaning.try_this || []).length) {
+      box.append(make("p", "field-help", "Worth trying:"));
+      const list = make("ul", "explain-list");
+      for (const line of meaning.try_this) list.append(make("li", "", line));
+      box.append(list);
+    }
+    if (!meaning.sure) {
+      box.append(make("p", "field-help",
+        "That is a guess at what to look at, not a diagnosis. The harness did not "
+        + "recognise this one."));
+    }
+    box.hidden = false;
+    button.textContent = "Hide that";
+    announce(meaning.headline);
+  } catch (error) { showError(error.message); }
+  button.disabled = false;
+}
+
+/* ---- What it knows ----
+
+   Everything the harness has learned, drawn the way people already draw notes:
+   a circle for each note, a line for each link, and the whole thing settling
+   into a shape by pushing every circle apart and pulling linked ones together.
+
+   The picture is the point, so it says as much as a picture can: a note used
+   often is bigger, a note nothing has touched for months is dimmed, a link to
+   a note nobody has written yet is drawn as an outline. None of that needs
+   reading a word.
+*/
+
+let vaultNotes = [];
+let vaultLinks = [];
+let vaultMissing = [];
+let vaultTags = [];
+let vaultKinds = [];
+let vaultOpen = "";
+let vaultLooking = "";
+// What was asked of the harness, when the vault is too large to sift here.
+let vaultAskingFor = "";
+let vaultKindsWanted = new Set();
+let vaultTagWanted = "";
+let vaultPlaces = new Map();
+let vaultSettling = null;
+let vaultEditing = "";
+let vaultReached = "";
+
+async function refreshVault(name) {
+  try {
+    // With more notes than the picture draws, the sifting happens where the
+    // notes are; below that the page sifts what it already has, which is
+    // quicker than asking.
+    const parts = [];
+    if (name) parts.push(`name=${encodeURIComponent(name)}`);
+    if (vaultAskingFor) parts.push(`q=${encodeURIComponent(vaultAskingFor)}`);
+    const asked = parts.length ? `?${parts.join("&")}` : "";
+    const said = await request(`/api/vault${asked}`);
+    vaultNotes = said.notes || [];
+    vaultLinks = said.links || [];
+    vaultMissing = said.not_written_yet || [];
+    vaultTags = said.tags || [];
+    vaultKinds = said.kinds || [];
+    const counts = said.counts || {};
+    $("vaultCounts").textContent =
+      `${counts.notes || 0} notes, ${counts.links || 0} links`
+      + (counts.not_written_yet ? `, ${counts.not_written_yet} not written yet` : "")
+      + (counts.stale ? `, ${counts.stale} going stale` : "");
+    renderVaultKinds();
+    renderVaultTags();
+    renderVaultList();
+    settleTheVault();
+    offerToStartTheVault();
+    if (said.open) showVaultNote(said.open);
+    else if (said.gone) {
+      // Removed here, or in an editor, since this page last looked.
+      vaultOpen = "";
+      $("vaultNote").hidden = true;
+      $("vaultSaid").textContent = `${said.gone} is not here any more.`;
+      renderVaultList();
+    }
+  } catch (error) { showError(error.message); $("vaultSaid").textContent = error.message; }
+}
+
+// An empty vault is a blank page, which is the hardest thing to hand anybody.
+// It is offered a start rather than given one: opening a tab must never leave
+// files behind in somebody's project.
+function offerToStartTheVault() {
+  const said = $("vaultSaid");
+  if (vaultNotes.length) {
+    const offer = document.getElementById("vaultStart");
+    if (offer) offer.remove();
+    return;
+  }
+  if (document.getElementById("vaultStart")) return;
+  said.textContent = "Nothing has been written down yet.";
+  const start = make("button", "primary", "Write two notes to start me off");
+  start.type = "button";
+  start.id = "vaultStart";
+  start.addEventListener("click", async () => {
+    start.disabled = true;
+    try {
+      const answer = await request("/api/vault/start", {method: "POST", body: "{}"});
+      await refreshVault();
+      $("vaultSaid").textContent = answer.note;
+      announce(answer.note);
+    } catch (error) { showError(error.message); start.disabled = false; }
+  });
+  said.after(start);
+}
+
+function vaultShown() {
+  const looking = vaultLooking.trim().toLowerCase();
+  return vaultNotes.filter((note) => {
+    if (vaultKindsWanted.size && !vaultKindsWanted.has(note.kind)) return false;
+    if (vaultTagWanted && !(note.tags || []).includes(vaultTagWanted)) return false;
+    if (looking) {
+      const haystack = `${note.title} ${note.body} ${(note.tags || []).join(" ")}`.toLowerCase();
+      if (!haystack.includes(looking)) return false;
+    }
+    if ($("vaultOnlyNear").checked && vaultOpen) {
+      if (note.name === vaultOpen) return true;
+      return vaultLinks.some((link) =>
+        (link.from === vaultOpen && link.to === note.name)
+        || (link.to === vaultOpen && link.from === note.name));
+    }
+    return true;
+  });
+}
+
+function renderVaultKinds() {
+  const box = $("vaultKinds");
+  box.replaceChildren();
+  for (const kind of vaultKinds) {
+    const many = vaultNotes.filter((note) => note.kind === kind.kind).length;
+    const button = make("button", `vault-kind kind-${kind.kind}${vaultKindsWanted.has(kind.kind) ? " chosen" : ""}`,
+      `${kind.name} (${many})`);
+    button.type = "button";
+    button.title = kind.means;
+    button.dataset.kind = kind.kind;
+    button.setAttribute("aria-pressed", String(vaultKindsWanted.has(kind.kind)));
+    button.addEventListener("click", () => {
+      if (vaultKindsWanted.has(kind.kind)) vaultKindsWanted.delete(kind.kind);
+      else vaultKindsWanted.add(kind.kind);
+      renderVaultKinds();
+      renderVaultList();
+      settleTheVault();
+    });
+    box.append(button);
+  }
+}
+
+function renderVaultTags() {
+  const box = $("vaultTags");
+  box.replaceChildren();
+  if (!vaultTags.length) {
+    box.append(make("p", "hint", "No tags yet."));
+    return;
+  }
+  for (const tag of vaultTags) {
+    const button = make("button", `vault-tag${vaultTagWanted === tag.tag ? " chosen" : ""}`,
+      `#${tag.tag} ${tag.notes}`);
+    button.type = "button";
+    button.dataset.tag = tag.tag;
+    button.setAttribute("aria-pressed", String(vaultTagWanted === tag.tag));
+    button.addEventListener("click", () => {
+      vaultTagWanted = vaultTagWanted === tag.tag ? "" : tag.tag;
+      renderVaultTags();
+      renderVaultList();
+      settleTheVault();
+    });
+    box.append(button);
+  }
+}
+
+function renderVaultList() {
+  const list = $("vaultList");
+  list.replaceChildren();
+  const shown = vaultShown();
+  if (!shown.length) {
+    list.append(make("li", "hint", "No notes match that."));
+    return;
+  }
+  for (const note of shown) {
+    const item = make("li", "");
+    const button = make("button", `vault-list-one kind-${note.kind}${note.name === vaultOpen ? " chosen" : ""}${note.stale ? " stale" : ""}`, note.title);
+    button.type = "button";
+    button.dataset.note = note.name;
+    button.addEventListener("click", () => openVaultNote(note.name));
+    item.append(button);
+    list.append(item);
+  }
+}
+
+/* ---- the picture ---- */
+
+// Every circle pushes every other away, every link pulls its two together, and
+// the middle pulls gently on everything so nothing drifts off the page. Run a
+// few hundred times, that settles into a shape where linked notes sit together
+// - which is the whole point of drawing it at all.
+// The most notes worth drawing at once. Beyond this the picture is a cloud
+// nobody can read anyway, and the settling is slow enough to be felt.
+const MOST_TO_DRAW = 300;
+
+// Settling is heavy, and a search box sends a letter at a time. Waiting for
+// somebody to stop typing turns twelve settlings into one.
+function settleTheVaultSoon() {
+  if (vaultSettling) window.clearTimeout(vaultSettling);
+  vaultSettling = window.setTimeout(() => { vaultSettling = null; settleTheVault(); }, 180);
+}
+
+function settleTheVault() {
+  if (vaultSettling) { window.clearTimeout(vaultSettling); vaultSettling = null; }
+  const all = vaultShown();
+  const shown = all.slice(0, MOST_TO_DRAW);
+  if (all.length > shown.length) {
+    $("vaultSaid").textContent =
+      `Drawing the first ${shown.length} of ${all.length} notes. Search, or choose a kind, to see fewer.`;
+  }
+  const names = shown.map((note) => note.name);
+  const box = $("vaultGraph").getBoundingClientRect();
+  const wide = Math.max(320, box.width - 40);
+  const tall = Math.max(260, box.height - 40);
+  const places = new Map();
+  shown.forEach((note, spot) => {
+    const already = vaultPlaces.get(note.name);
+    const round = (spot / Math.max(1, shown.length)) * Math.PI * 2;
+    places.set(note.name, already || {
+      x: wide / 2 + Math.cos(round) * Math.min(wide, tall) * 0.32,
+      y: tall / 2 + Math.sin(round) * Math.min(wide, tall) * 0.32,
+    });
+  });
+  const near = vaultLinks.filter((link) => names.includes(link.from) && names.includes(link.to));
+  const rounds = shown.length > 120 ? 60 : shown.length > 60 ? 120 : 260;
+  for (let round = 0; round < rounds; round += 1) {
+    for (const one of names) {
+      for (const other of names) {
+        if (one === other) continue;
+        const a = places.get(one), b = places.get(other);
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let far = Math.sqrt(dx * dx + dy * dy) || 0.01;
+        if (far > 260) continue;
+        const push = 900 / (far * far);
+        a.x += (dx / far) * push;
+        a.y += (dy / far) * push;
+      }
+    }
+    for (const link of near) {
+      const a = places.get(link.from), b = places.get(link.to);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const far = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const pull = (far - 150) * 0.012;
+      a.x += (dx / far) * pull; a.y += (dy / far) * pull;
+      b.x -= (dx / far) * pull; b.y -= (dy / far) * pull;
+    }
+    for (const one of names) {
+      const at = places.get(one);
+      at.x += (wide / 2 - at.x) * 0.006;
+      at.y += (tall / 2 - at.y) * 0.006;
+      at.x = Math.max(30, Math.min(wide - 30, at.x));
+      at.y = Math.max(30, Math.min(tall - 30, at.y));
+    }
+  }
+  // Settling gives a shape; it does not give a size. Left alone, a handful of
+  // notes ends up huddled in one corner of a large board with their names on
+  // top of each other. So the shape is stretched to fill the space it has,
+  // keeping every distance in proportion.
+  vaultPlaces = spreadOut(places, wide, tall);
+  drawTheVault();
+}
+
+// Take a settled shape and fit it to the board, without changing the shape.
+function spreadOut(places, wide, tall) {
+  const all = [...places.values()];
+  if (all.length < 2) {
+    if (all.length === 1) { all[0].x = wide / 2; all[0].y = tall / 2; }
+    return places;
+  }
+  const left = Math.min(...all.map((at) => at.x));
+  const right = Math.max(...all.map((at) => at.x));
+  const top = Math.min(...all.map((at) => at.y));
+  const bottom = Math.max(...all.map((at) => at.y));
+  // Room for the names, which sit under each circle.
+  const edge = 70;
+  const room = {wide: Math.max(80, wide - edge * 2), tall: Math.max(80, tall - edge * 2)};
+  const spread = Math.min(
+    room.wide / Math.max(1, right - left),
+    room.tall / Math.max(1, bottom - top),
+    2.4,
+  );
+  const middleX = (left + right) / 2, middleY = (top + bottom) / 2;
+  for (const at of all) {
+    at.x = wide / 2 + (at.x - middleX) * spread;
+    at.y = tall / 2 + (at.y - middleY) * spread;
+  }
+  return places;
+}
+
+function drawTheVault() {
+  // Only what has a place: the settling draws the first so many, and a circle
+  // with nowhere to be would land in the corner.
+  const shown = vaultShown().filter((note) => vaultPlaces.has(note.name));
+  const names = new Set(shown.map((note) => note.name));
+  const wires = $("vaultWires");
+  const box = $("vaultNodes");
+  wires.replaceChildren();
+  box.replaceChildren();
+
+  for (const link of vaultLinks) {
+    if (!names.has(link.from) || !names.has(link.to)) continue;
+    const a = vaultPlaces.get(link.from), b = vaultPlaces.get(link.to);
+    if (!a || !b) continue;
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(a.x)); line.setAttribute("y1", String(a.y));
+    line.setAttribute("x2", String(b.x)); line.setAttribute("y2", String(b.y));
+    const touching = vaultOpen && (link.from === vaultOpen || link.to === vaultOpen);
+    line.setAttribute("class", `vault-wire${touching ? " near" : ""}`);
+    wires.append(line);
+  }
+
+  for (const note of shown) {
+    const at = vaultPlaces.get(note.name);
+    if (!at) continue;
+    const many = vaultLinks.filter((link) => link.from === note.name || link.to === note.name).length;
+    const size = Math.round(13 + Math.min(16, many * 2.2 + note.uses * 1.2));
+    const dot = make("button", `vault-dot kind-${note.kind}${note.name === vaultOpen ? " chosen" : ""}${note.stale ? " stale" : ""}`);
+    dot.type = "button";
+    dot.dataset.note = note.name;
+    dot.style.left = `${at.x}px`;
+    dot.style.top = `${at.y}px`;
+    dot.style.width = `${size}px`;
+    dot.style.height = `${size}px`;
+    dot.title = `${note.title} - ${note.kind}${note.stale ? ", going stale" : ""}`;
+    dot.setAttribute("aria-label",
+      `${note.title}. ${note.kind}. ${many} link${many === 1 ? "" : "s"}.`
+      + (note.stale ? " Going stale." : ""));
+    dot.addEventListener("click", () => openVaultNote(note.name));
+    dot.addEventListener("focus", () => { vaultReached = note.name; });
+    box.append(dot);
+    const label = make("span", `vault-label${note.name === vaultOpen ? " chosen" : ""}`, note.title);
+    label.style.left = `${at.x}px`;
+    label.style.top = `${at.y + size / 2 + 3}px`;
+    label.setAttribute("aria-hidden", "true");
+    box.append(label);
+  }
+
+  // A link to a note nobody has written yet, drawn as an outline. These are the
+  // most useful thing in the picture: what somebody meant to write down.
+  for (const link of vaultMissing) {
+    if (!names.has(link.from)) continue;
+    const a = vaultPlaces.get(link.from);
+    if (!a) continue;
+    const spot = {x: Math.max(24, a.x + 70), y: Math.max(24, a.y - 46)};
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(a.x)); line.setAttribute("y1", String(a.y));
+    line.setAttribute("x2", String(spot.x)); line.setAttribute("y2", String(spot.y));
+    line.setAttribute("class", "vault-wire not-yet");
+    wires.append(line);
+    const dot = make("button", "vault-dot not-yet", "");
+    dot.type = "button";
+    dot.dataset.note = `not-yet-${link.to}`;
+    dot.style.left = `${spot.x}px`;
+    dot.style.top = `${spot.y}px`;
+    dot.title = `${link.to} - nobody has written this one yet. Press to write it.`;
+    dot.setAttribute("aria-label", `${link.to}, not written yet. Press to write it.`);
+    dot.addEventListener("click", () => writeTheMissingNote(link.to));
+    box.append(dot);
+  }
+}
+
+function openVaultNote(name) {
+  vaultOpen = name;
+  renderVaultList();
+  drawTheVault();
+  refreshVault(name);
+}
+
+async function writeTheMissingNote(name) {
+  openVaultDialog({
+    title: String(name || "").replace(/-/g, " "),
+    kind: "about-this-project",
+    tags: [],
+    sure: 0.5,
+    body: "",
+  }, "");
+}
+
+function showVaultNote(around) {
+  const note = around.note;
+  vaultOpen = note.name;
+  $("vaultNote").hidden = false;
+  $("vaultNoteTitle").textContent = note.title;
+  const kind = (vaultKinds.find((one) => one.kind === note.kind) || {}).name || note.kind;
+  $("vaultNoteAbout").textContent =
+    `${kind}. Learned ${note.learned || "at some point"}, last touched ${note.touched || "then"}.`
+    + (note.came_from ? ` From ${note.came_from}.` : "")
+    + (note.uses ? ` Used ${note.uses} time${note.uses === 1 ? "" : "s"}, helped ${note.worked}.` : "")
+    + (note.stale ? " Nothing has touched this for a long time, so it may no longer be true." : "");
+  const body = $("vaultNoteBody");
+  body.replaceChildren();
+  for (const line of (note.body || "").split("\n")) {
+    if (!line.trim()) continue;
+    body.append(vaultLine(line));
+  }
+  const links = $("vaultNoteLinks");
+  links.replaceChildren();
+  links.append(vaultSideList("This points at", around.points_at));
+  links.append(vaultSideList("These point here", around.points_here));
+  const tags = make("p", "vault-note-tags", "");
+  for (const tag of note.tags || []) {
+    const one = make("button", "vault-tag", `#${tag}`);
+    one.type = "button";
+    one.addEventListener("click", () => {
+      vaultTagWanted = tag; renderVaultTags(); renderVaultList(); settleTheVault();
+    });
+    tags.append(one);
+  }
+  if ((note.tags || []).length) links.append(tags);
+  $("vaultSaid").textContent = `${note.title} is open.`;
+}
+
+// A line of a note, with [[links]] turned into something you can press.
+function vaultLine(line) {
+  const held = make("p", "");
+  const parts = String(line).split(/(\[\[[^\]]+\]\])/g);
+  for (const part of parts) {
+    const found = /^\[\[([^\]|]+)(?:\|([^\]]+))?\]\]$/.exec(part);
+    if (!found) { held.append(document.createTextNode(part)); continue; }
+    const name = found[1].trim();
+    const words = (found[2] || found[1]).trim();
+    const there = vaultNotes.some((note) => note.name === asAVaultName(name));
+    const link = make("button", `vault-inline-link${there ? "" : " not-yet"}`, words);
+    link.type = "button";
+    link.title = there ? `Open ${name}` : `${name} is not written yet. Press to write it.`;
+    link.addEventListener("click", () =>
+      there ? openVaultNote(asAVaultName(name)) : writeTheMissingNote(asAVaultName(name)));
+    held.append(link);
+  }
+  return held;
+}
+
+function asAVaultName(title) {
+  return String(title || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function vaultSideList(said, notes) {
+  const box = make("div", "vault-side-list");
+  box.append(make("h4", "", `${said} (${(notes || []).length})`));
+  if (!(notes || []).length) {
+    box.append(make("p", "hint", "Nothing yet."));
+    return box;
+  }
+  const list = make("ul", "");
+  for (const note of notes) {
+    const item = make("li", "");
+    const button = make("button", `vault-list-one kind-${note.kind}`, note.title);
+    button.type = "button";
+    button.addEventListener("click", () => openVaultNote(note.name));
+    item.append(button);
+    list.append(item);
+  }
+  box.append(list);
+  return box;
+}
+
+/* ---- writing one ---- */
+
+function openVaultDialog(note, changing) {
+  vaultEditing = changing || "";
+  const kinds = $("vaultFormKind");
+  kinds.replaceChildren();
+  for (const kind of vaultKinds) {
+    const option = make("option", "", kind.name);
+    option.value = kind.kind;
+    kinds.append(option);
+  }
+  $("vaultDialogTitle").textContent = vaultEditing ? "Change this note" : "A new note";
+  $("vaultFormTitle").value = note.title || "";
+  $("vaultFormKind").value = note.kind || "about-this-project";
+  $("vaultFormTags").value = (note.tags || []).join(", ");
+  $("vaultFormSure").value = String(note.sure ?? 0.5);
+  $("vaultFormBody").value = note.body || "";
+  $("vaultDialog").showModal();
+}
+
+function newVaultNote() {
+  openVaultDialog({title: "", kind: "about-you", tags: [], sure: 0.5, body: ""}, "");
+}
+
+function editVaultNote() {
+  const note = vaultNotes.find((one) => one.name === vaultOpen);
+  if (!note) return;
+  openVaultDialog(note, note.name);
+}
+
+async function saveVaultNote() {
+  const tags = $("vaultFormTags").value.split(",").map((tag) => tag.trim()).filter(Boolean);
+  try {
+    const said = await request("/api/vault/write", {
+      method: "POST",
+      body: JSON.stringify({
+        // Which note this is, when it is one that already exists. Without it a
+        // change of title would leave the old file behind and the vault would
+        // quietly hold two.
+        was: vaultEditing,
+        title: $("vaultFormTitle").value,
+        kind: $("vaultFormKind").value,
+        tags,
+        sure: Number($("vaultFormSure").value),
+        body: $("vaultFormBody").value,
+      }),
+    });
+    $("vaultDialog").close();
+    vaultEditing = "";
+    await refreshVault(said.note.name);
+    $("vaultSaid").textContent = `${said.note.title} is written down.`;
+    announce($("vaultSaid").textContent);
+  } catch (error) { showError(error.message); $("vaultSaid").textContent = error.message; }
+}
+
+async function removeVaultNote() {
+  const note = vaultNotes.find((one) => one.name === vaultOpen);
+  if (!note) return;
+  if (!window.confirm(`Remove the note "${note.title}"? The file is deleted.`)) return;
+  try {
+    const said = await request("/api/vault/remove", {
+      method: "POST", body: JSON.stringify({name: note.name}),
+    });
+    vaultOpen = "";
+    $("vaultNote").hidden = true;
+    await refreshVault();
+    $("vaultSaid").textContent = said.note;
+  } catch (error) { showError(error.message); }
+}
+
+// Saying a note helped is what turns a pile of them into something that gets
+// better: the ones that earn their place grow, and the ones that do not fade.
+async function vaultNoteWasUsed(wentWell) {
+  const note = vaultNotes.find((one) => one.name === vaultOpen);
+  if (!note) return;
+  try {
+    const said = await request("/api/vault/used", {
+      method: "POST", body: JSON.stringify({name: note.name, went_well: wentWell}),
+    });
+    await refreshVault(said.note.name);
+    $("vaultSaid").textContent = wentWell
+      ? `${said.note.title} has helped ${said.note.worked} of ${said.note.uses} times.`
+      : `${said.note.title} did not help that time. It is marked down.`;
+    announce($("vaultSaid").textContent);
+  } catch (error) { showError(error.message); }
+}
+
+async function vaultLearnFromRuns() {
+  const button = $("vaultLearn");
+  button.disabled = true;
+  $("vaultSaid").textContent = "Reading what the harness remembers.";
+  try {
+    const said = await request("/api/vault/learn", {method: "POST", body: "{}"});
+    await refreshVault();
+    $("vaultSaid").textContent = said.note;
+    announce(said.note);
+  } catch (error) { showError(error.message); $("vaultSaid").textContent = error.message; }
+  button.disabled = false;
+}
+
+// The picture without a pointer: arrow keys walk the notes, Enter opens one.
+function vaultGraphKey(event) {
+  const dots = [...$("vaultNodes").querySelectorAll(".vault-dot:not(.not-yet)")];
+  if (!dots.length) return;
+  const at = dots.findIndex((dot) => dot.dataset.note === vaultReached);
+  const forward = ["ArrowRight", "ArrowDown"].includes(event.key);
+  const back = ["ArrowLeft", "ArrowUp"].includes(event.key);
+  if (forward || back) {
+    event.preventDefault();
+    const next = at < 0 ? 0 : (at + (forward ? 1 : -1) + dots.length) % dots.length;
+    vaultReached = dots[next].dataset.note;
+    dots[next].focus();
+    const note = vaultNotes.find((one) => one.name === vaultReached);
+    if (note) $("vaultSaid").textContent = `${note.title}. Press Enter to open it.`;
+    return;
+  }
+  if (event.key === "Enter" && vaultReached) {
+    event.preventDefault();
+    openVaultNote(vaultReached);
+  }
+}
+
+/* ---- Settings ----
+
+   Every setting the harness has, in plain words, with what it is set to, what
+   it shipped as, and which file that value came from. Changing one writes it
+   and reads the whole thing back; anything the harness refuses is put straight
+   back, with the reason.
+*/
+
+let settingsHeld = [];
+let settingsGroups = [];
+
+async function refreshSettings() {
+  try {
+    const said = await request("/api/settings");
+    settingsHeld = said.settings || [];
+    settingsGroups = said.groups || [];
+    renderSettings();
+    $("settingsSaid").textContent =
+      `${settingsHeld.length} settings. ${settingsHeld.filter((one) => one.changed).length} are not as they shipped.`;
+  } catch (error) { showError(error.message); $("settingsSaid").textContent = error.message; }
+}
+
+function renderSettings() {
+  const list = $("settingsList");
+  list.replaceChildren();
+  const looking = $("settingsFilter").value.trim().toLowerCase();
+  const onlyChanged = $("settingsChangedOnly").checked;
+  const shown = settingsHeld.filter((one) => {
+    if (onlyChanged && !one.changed) return false;
+    if (!looking) return true;
+    return `${one.key} ${one.label} ${one.means}`.toLowerCase().includes(looking);
+  });
+  if (!shown.length) {
+    list.append(make("p", "field-help", "Nothing matches that."));
+    return;
+  }
+  const byGroup = [];
+  for (const one of shown) {
+    let group = byGroup.find((item) => item.name === one.group);
+    if (!group) { group = {name: one.group, items: []}; byGroup.push(group); }
+    group.items.push(one);
+  }
+  for (const group of byGroup) {
+    const box = make("details", "settings-group");
+    box.open = Boolean(looking) || onlyChanged || group.items.some((one) => one.changed);
+    const about = settingsGroups.find((item) => item.name === group.name)?.about || "";
+    const heading = make("summary", "");
+    heading.append(make("strong", "", group.name), make("span", "settings-count", ` ${group.items.length}`));
+    box.append(heading);
+    if (about) box.append(make("p", "field-help", about));
+    for (const one of group.items) box.append(settingRow(one));
+    list.append(box);
+  }
+}
+
+function settingRow(one) {
+  const row = make("div", `setting${one.changed ? " changed" : ""}`);
+  row.dataset.setting = one.key;
+  const head = make("div", "setting-head");
+  head.append(make("strong", "", one.label), make("code", "setting-key", one.key));
+  if (one.changed) head.append(make("span", "setting-mark", "changed"));
+  if (one.needs_your_own_file) head.append(make("span", "setting-mark yours", "your own file"));
+  row.append(head);
+  if (one.means) row.append(make("p", "", one.means));
+  row.append(make("p", "field-help", `Now: ${short(one.value)} - from ${one.came_from}. It shipped as ${short(one.shipped)}.`));
+
+  const line = make("div", "setting-line");
+  let input;
+  if (one.kind === "yes or no") {
+    input = make("select", "");
+    for (const choice of ["yes", "no"]) {
+      const option = make("option", "", choice);
+      option.value = choice;
+      input.append(option);
+    }
+    input.value = one.value ? "yes" : "no";
+  } else if (one.kind === "list" || one.kind === "settings of its own") {
+    input = make("textarea", "");
+    input.rows = 2;
+    input.value = asText(one);
+  } else {
+    input = make("input", "");
+    input.type = one.kind === "number" ? "number" : "text";
+    input.step = "any";
+    input.value = one.value === null || one.value === undefined ? "" : String(one.value);
+  }
+  input.id = `setting-${one.key}`;
+  input.dataset.for = one.key;
+  const label = make("label", "sr-only", `${one.label}, ${one.key}`);
+  label.htmlFor = input.id;
+  const save = make("button", "setting-save", "Save");
+  save.type = "button";
+  save.addEventListener("click", () => changeSetting(one.key, input));
+  const back = make("button", "setting-reset", "Put it back");
+  back.type = "button";
+  back.disabled = !one.changed;
+  back.addEventListener("click", () => resetSetting(one.key));
+  line.append(label, input, save, back);
+  row.append(line);
+  const said = make("p", "setting-said");
+  said.id = `settingSaid-${one.key}`;
+  row.append(said);
+  return row;
+}
+
+function asText(one) {
+  if (one.kind === "list" && Array.isArray(one.value)) {
+    // A command is a program and its arguments. Shown as somebody would type
+    // it, one per line, rather than as the nest of lists it is kept as.
+    if (one.key.endsWith("_commands")) {
+      return one.value.map((command) => (Array.isArray(command) ? command.join(" ") : String(command))).join("\n");
+    }
+    return one.value.join(", ");
+  }
+  return JSON.stringify(one.value);
+}
+
+function short(value) {
+  const said = typeof value === "string" ? value : JSON.stringify(value);
+  if (said === undefined || said === null) return "nothing";
+  return said.length > 80 ? `${said.slice(0, 77)}...` : said || "nothing";
+}
+
+async function changeSetting(key, input) {
+  const said = $(`settingSaid-${key}`);
+  said.className = "setting-said";
+  said.textContent = "Saving.";
+  try {
+    const done = await request("/api/settings/change", {
+      method: "POST", body: JSON.stringify({key, value: input.value}),
+    });
+    said.className = "setting-said good";
+    said.textContent = done.note;
+    announce(done.note);
+    await refreshSettings();
+    refreshCheckup();
+  } catch (error) {
+    said.className = "setting-said wrong";
+    said.textContent = error.message;
+    announce(error.message, true);
+  }
+}
+
+async function resetSetting(key) {
+  const said = $(`settingSaid-${key}`);
+  said.className = "setting-said";
+  said.textContent = "Putting it back.";
+  try {
+    const done = await request("/api/settings/reset", {
+      method: "POST", body: JSON.stringify({key}),
+    });
+    said.className = "setting-said good";
+    said.textContent = done.note;
+    announce(done.note);
+    await refreshSettings();
+    refreshCheckup();
+  } catch (error) {
+    said.className = "setting-said wrong";
+    said.textContent = error.message;
+  }
+}
+
 /* ---- Pipelines ----
 
    Many jobs wired together, with gates between them. A pipeline is nodes and
@@ -1422,6 +2203,7 @@ function renderSeats(found) {
 let pipeline = {name: "First pipeline", nodes: [], edges: []};
 let pipelineKinds = [];
 let pipelineSaved = [];
+let pipelineStarters = [];
 let pipelineJoining = "";      // the node an arrow is being drawn from
 let pipelineDragging = null;
 let pipelineEditing = "";
@@ -1432,11 +2214,13 @@ async function refreshPipelines(name) {
     const said = await request(`/api/pipelines${name ? `?name=${encodeURIComponent(name)}` : ""}`);
     pipelineKinds = said.kinds || [];
     pipelineSaved = said.saved || [];
+    pipelineStarters = said.starters || [];
     pipeline = said.pipeline;
     pipelineStates = new Map();
     $("pipelineName").value = pipeline.name || "";
     $("pipelineStop").disabled = !said.running;
     renderPipelinePalette();
+    renderPipelineStarters();
     renderPipelineSaved();
     renderPipeline();
     if (said.last_run) showPipelineRun(said.last_run);
@@ -1458,6 +2242,40 @@ function renderPipelineSaved() {
     item.append(button);
     list.append(item);
   }
+}
+
+// Ready-made pipelines. A blank board is the hardest thing to hand somebody
+// who has not done this before, so these are the shapes people actually want,
+// each made of steps anybody could have dragged out themselves.
+function renderPipelineStarters() {
+  const list = $("pipelineStarters");
+  list.replaceChildren();
+  for (const starter of pipelineStarters) {
+    const item = make("li", "");
+    const button = make("button", "pipeline-starter", starter.title);
+    button.type = "button";
+    button.title = `${starter.when} ${starter.steps} steps.`;
+    button.dataset.starter = starter.key;
+    button.addEventListener("click", () => usePipelineStarter(starter));
+    item.append(button, make("p", "field-help", starter.when));
+    list.append(item);
+  }
+}
+
+async function usePipelineStarter(starter) {
+  if (pipeline.nodes.length
+      && !window.confirm(`Replace what is on the board with "${starter.title}"?`)) return;
+  try {
+    const said = await request("/api/pipelines/starter", {
+      method: "POST", body: JSON.stringify({key: starter.key}),
+    });
+    pipeline = said.pipeline;
+    pipelineStates = new Map();
+    $("pipelineName").value = pipeline.name;
+    $("pipelineLog").replaceChildren();
+    renderPipeline();
+    say(`${starter.title} is on the board. Press Run, or change it first.`);
+  } catch (error) { showError(error.message); say(error.message); }
 }
 
 function renderPipelinePalette() {
@@ -1541,6 +2359,14 @@ function renderPipeline() {
     buttons.append(join, settings, remove);
     card.append(buttons);
 
+    // The board is usable without a pointer. A box takes the keyboard, the
+    // arrow keys move it, and the same three things it can do are on keys.
+    card.tabIndex = 0;
+    card.setAttribute("role", "group");
+    card.setAttribute("aria-label",
+      `${node.label || kind.label}, ${kind.label}. Arrow keys move it. `
+      + "C connects, S for settings, Delete removes it.");
+    card.addEventListener("keydown", (event) => pipelineKey(event, node));
     card.addEventListener("pointerdown", (event) => startPipelineDrag(event, node));
     card.addEventListener("click", () => { if (pipelineJoining && pipelineJoining !== node.id) joinPipelineNodes(node.id); });
     box.append(card);
@@ -1610,6 +2436,42 @@ function removePipelineNode(nodeId) {
   if (pipelineJoining === nodeId) pipelineJoining = "";
   renderPipeline();
   say(`Took ${nodeId} out.`);
+}
+
+// The keyboard, on a box. Everything the mouse can do, a key can do.
+function pipelineKey(event, node) {
+  const step = event.shiftKey ? 40 : 10;
+  const moves = {
+    ArrowLeft: [-step, 0], ArrowRight: [step, 0],
+    ArrowUp: [0, -step], ArrowDown: [0, step],
+  };
+  if (moves[event.key]) {
+    event.preventDefault();
+    node.at = {
+      x: Math.max(0, (node.at?.x || 0) + moves[event.key][0]),
+      y: Math.max(0, (node.at?.y || 0) + moves[event.key][1]),
+    };
+    renderPipeline();
+    keepPipelineFocus(node.id);
+    say(`${node.label} is at ${Math.round(node.at.x)}, ${Math.round(node.at.y)}.`);
+    return;
+  }
+  const key = event.key.toLowerCase();
+  if (key === "c") { event.preventDefault(); joinPipelineNodes(node.id); keepPipelineFocus(node.id); return; }
+  if (key === "s") { event.preventDefault(); openPipelineNode(node.id); return; }
+  if (event.key === "Delete" || event.key === "Backspace") {
+    event.preventDefault();
+    removePipelineNode(node.id);
+    const first = $("pipelineNodes").querySelector(".pipeline-node");
+    if (first) first.focus();
+  }
+}
+
+// Redrawing the board builds new boxes, and the keyboard would otherwise be
+// left on nothing at all.
+function keepPipelineFocus(nodeId) {
+  const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(nodeId)}"]`);
+  if (card) card.focus();
 }
 
 function startPipelineDrag(event, node) {
@@ -1834,6 +2696,105 @@ function showPipelineRun(run) {
   }
   renderPipeline();
   if (run.said) say(run.said);
+}
+
+/* ---- Show me around ----
+
+   Six short stops, one per tab, each opening the tab it is talking about. A
+   person who has just opened this has no idea which of these words mean
+   anything, and reading a page of documentation to find out is exactly what
+   they will not do.
+
+   Every stop names a tab that is really in the panel: a stop pointing at a tab
+   nobody built would be a tour of somewhere else.
+*/
+
+const TOUR = [
+  {
+    view: "start",
+    where: "Start here",
+    title: "This screen gets the project ready",
+    said: "Four short steps, in any order. When they are all done, you can ask for a "
+      + "change in your own words at the bottom of this screen.",
+  },
+  {
+    view: "checks",
+    where: "Checks",
+    title: "Your checks live here",
+    said: "A check says what a working project looks like. Write one from a ready-made "
+      + "shelf, record yourself using the site, or point at something on a page.",
+  },
+  {
+    view: "pipelines",
+    where: "Pipelines",
+    title: "Many jobs, wired together",
+    said: "Run your checks and a security scan side by side, and only carry on if they "
+      + "passed. Start from a ready-made one on the left.",
+  },
+  {
+    view: "workflow",
+    where: "Workflow",
+    title: "Who does what, when you ask for a change",
+    said: "The agents that plan, change the files, and review the result. You can rewire "
+      + "them, and the picture on the first screen follows what you do here.",
+  },
+  {
+    view: "settings",
+    where: "Settings",
+    title: "Everything the harness can be told",
+    said: "Every setting in plain words, what it is now, and where that came from. "
+      + "Nothing has to be edited by hand.",
+  },
+  {
+    view: "history",
+    where: "History",
+    title: "What past runs did",
+    said: "Every run, step by step, with what each agent said and what it cost. This is "
+      + "where to look when something went differently from last time.",
+  },
+];
+
+let tourAt = -1;
+
+function showMeAround() {
+  tourAt = 0;
+  drawTour();
+}
+
+function drawTour() {
+  const box = $("tour");
+  if (tourAt < 0 || tourAt >= TOUR.length) {
+    box.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  const stop = TOUR[tourAt];
+  // The tour sits above the tabs, so opening the tab it is talking about shows
+  // that tab and nothing else. Holding the first screen open as well drew two
+  // whole views one after the other, which is exactly the confusion a tour is
+  // supposed to save somebody from.
+  switchView(stop.view);
+  box.replaceChildren();
+  box.hidden = false;
+  box.append(make("span", "tour-where", `${stop.where} - ${tourAt + 1} of ${TOUR.length}`));
+  box.append(make("strong", "", stop.title));
+  box.append(make("p", "", stop.said));
+  const buttons = make("div", "tour-buttons");
+  if (tourAt > 0) {
+    const back = make("button", "", "Back");
+    back.type = "button";
+    back.addEventListener("click", () => { tourAt -= 1; drawTour(); });
+    buttons.append(back);
+  }
+  const on = make("button", "primary", tourAt === TOUR.length - 1 ? "That is the lot" : "Next");
+  on.type = "button";
+  on.addEventListener("click", () => { tourAt += 1; drawTour(); });
+  const stop_it = make("button", "", "Stop the tour");
+  stop_it.type = "button";
+  stop_it.addEventListener("click", () => { tourAt = -1; switchView("start"); drawTour(); });
+  buttons.append(on, stop_it);
+  box.append(buttons);
+  announce(`${stop.where}. ${stop.title}. ${stop.said}`);
 }
 
 /* ---- What happens when you ask for a change ---- */
@@ -2259,7 +3220,7 @@ function bindEvents() {
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
-  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", runPipeline); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
+  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", runPipeline); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("refreshMemory").addEventListener("click", refreshMemory); $("memoryQuery").addEventListener("change", refreshMemory); $("memoryKind").addEventListener("change", refreshMemory); $("refreshPrompts").addEventListener("click", refreshPrompts); $("promptLeft").addEventListener("change", renderPromptCompare); $("promptRight").addEventListener("change", renderPromptCompare);
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && edgeDrag) { event.preventDefault(); finishEdgeDrag({pointerId: edgeDrag.pointerId}, true); } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z" && !$("agentDialog").open) { event.preventDefault(); undo(); } });
 }

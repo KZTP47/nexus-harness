@@ -489,6 +489,119 @@ def command_seats(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_start(args: argparse.Namespace) -> int:
+    """Set this project up and open the panel, in one go.
+
+    Four commands got somebody from nothing to a working panel: init, doctor,
+    qa init, ui. Each one is worth having on its own and none of them is worth
+    knowing about on your first afternoon. This does all four, says plainly
+    what it did and what is left, and then opens the panel.
+
+    Nothing here is new: every step is a command that already existed, run in
+    the order somebody would have run them.
+    """
+
+    root = Path(args.path or getattr(args, "project", None) or ".").resolve()
+    if not root.is_dir():
+        raise HarnessError(f"Project path is not a directory: {root}")
+    print(f"Setting up {root.name}.")
+    print("")
+
+    # 1. Settings, if there are none yet.
+    settings_file = root / ".harness" / "config.json"
+    if settings_file.is_file():
+        print(f"  Already set up: {settings_file.name} is there.")
+    else:
+        made = argparse.Namespace(
+            path=str(root), project=str(root), config=None, provider="ollama",
+            model=None, endpoint=None, api_key_env=None, yes=True, force=False,
+        )
+        try:
+            command_init(made)
+        except HarnessError as exc:
+            # A project part way through being set up - a settings file of your
+            # own but no shared one - is an ordinary state to be in, and this
+            # is the command somebody runs to get out of it. Stopping here
+            # would leave them exactly where they started.
+            print(f"  Could not write the shared settings: {exc}")
+            print("  Carrying on with what is here.")
+        print("")
+
+    config = _config(argparse.Namespace(project=str(root), config=None))
+
+    # 2. Checks, if there are none yet, written from the commands this project
+    #    already uses.
+    suite_file = qa.suite_path(config)
+    if suite_file.is_file():
+        print(f"  Already written: {suite_file.name} holds your checks.")
+    else:
+        detections = detect_project(config.project_root)
+        commands = {
+            kind: list(config.get(f"project.{kind}_commands") or [])
+            or combined_commands(detections, kind)
+            for kind in ("test", "lint", "build")
+        }
+        suite = qa.starter_suite(commands["test"], commands["lint"], commands["build"])
+        written = qa.write_suite(config, suite)
+        print(f"  Wrote {_count(len(suite.cases), 'starter check')} to {written.name}.")
+
+    # 3. What is missing, said plainly rather than left to be discovered.
+    print("")
+    report = run_doctor(config)
+    for check in report["checks"]:
+        mark = {"ok": "OK  ", "warn": "note", "error": "todo"}.get(str(check.get("level")), "    ")
+        print(f"  {mark} {check.get('name')}: {check.get('message')}")
+    left = [check for check in report["checks"] if str(check.get("level")) == "error"]
+    print("")
+    if left:
+        print(f"{len(left)} thing(s) still to do. The panel will walk you through them.")
+    else:
+        print("Everything is ready.")
+
+    if args.no_panel:
+        print("")
+        print("Open the panel yourself with: harness ui")
+        return 0
+    print("")
+    print("Opening the panel. Press Control and C here to stop it.")
+    return command_ui(argparse.Namespace(
+        project=str(root), config=None, port=args.port, host="127.0.0.1",
+        open_browser=not args.no_open_browser,
+    ))
+
+
+def command_carry(args: argparse.Namespace) -> int:
+    """Pack this setup up to carry to another machine, or unpack one here."""
+
+    from . import carry
+
+    config = _config(args)
+    if args.carry_command == "pack":
+        packed = carry.write_to(config, args.output)
+        print(f"Wrote {packed.file}")
+        for line in packed.holds:
+            print(f"  it holds {line}")
+        for line in packed.left_out:
+            print(f"  left out: {line}")
+        print("")
+        print("Copy that file to the other machine and run: harness carry unpack <file>")
+        return 0
+
+    where = confined_path(config.project_root, args.file, allow_missing=False)
+    try:
+        carried = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HarnessError(f"{where.name} cannot be read: {exc}") from exc
+    done = carry.unpack(config, carried, over_the_top=args.over_the_top)
+    for line in done.written:
+        print(f"  wrote {line}")
+    for line in done.left_alone:
+        print(f"  left alone: {line}")
+    print("")
+    print(done.note)
+    return 0
+
+
 def command_trust(args: argparse.Namespace) -> int:
     """Say that the local config file in this project is yours and may be used."""
 
@@ -1181,6 +1294,33 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--project", help="Project root or a path inside it")
     root.add_argument("--config", help="Extra config file loaded after project config")
     sub = root.add_subparsers(dest="command", required=True)
+
+    start = sub.add_parser(
+        "start",
+        help="Set this project up and open the panel, in one go. The one to run first.",
+    )
+    start.add_argument("path", nargs="?", default="")
+    start.add_argument("--port", type=int, default=0, help="Port for the panel; 0 asks for a free one")
+    start.add_argument("--no-panel", action="store_true", help="Set up, but do not open the panel")
+    start.add_argument(
+        "--no-open-browser", action="store_true", help="Start the panel without opening a browser"
+    )
+    start.set_defaults(handler=command_start)
+
+    carry_it = sub.add_parser(
+        "carry", help="Carry this setup to another machine, or unpack one here"
+    )
+    carry_sub = carry_it.add_subparsers(dest="carry_command", required=True)
+    packing = carry_sub.add_parser("pack", help="Write the setup to one file")
+    packing.add_argument("--output", default="harness-setup.json")
+    packing.set_defaults(handler=command_carry)
+    unpacking = carry_sub.add_parser("unpack", help="Write a carried setup into this project")
+    unpacking.add_argument("file")
+    unpacking.add_argument(
+        "--over-the-top", action="store_true",
+        help="Write over anything already here. Off by default, on purpose.",
+    )
+    unpacking.set_defaults(handler=command_carry)
 
     init = sub.add_parser("init", help="Scan a project and create .harness/config.json")
     init.add_argument("path", nargs="?", default="")

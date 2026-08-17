@@ -168,9 +168,16 @@ def racing_steps(case: dict, table: dict[str, set[str]]) -> list[str]:
     # everywhere and always.
     at_risk = table.get(view_of(case), set()) | what_the_poller_reloads()
     found: list[str] = []
+    # Turning the loading off in an earlier step is better than doing it in the
+    # same one, not worse: it is off before the view is even opened, which is
+    # where the loading starts. Once a check has turned it off, it stays off.
+    turned_off = False
     for index, step in enumerate(steps):
         script = str(step.get("script") or "")
         if _TURNS_IT_OFF.search(script):
+            turned_off = True
+            continue
+        if turned_off:
             continue
         if not steps[index + 1:]:
             continue

@@ -153,6 +153,21 @@ class WrittenButtonTests(unittest.TestCase):
         )
 
 
+# The same thing for the buttons the panel builds while it runs, keyed by the
+# words on them rather than by a name in the page.
+BUILT_ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
+    "Put it back": (
+        "Pressing it takes a setting out of this project's own settings file. "
+        "On a project whose settings file writes everything out - like this one "
+        "- there is no setting where that changes nothing, so a check pressing "
+        "it would change the settings of the project it is checking. What it "
+        "really does, both when there is something to put back and when there "
+        "is not, is proven in tests/test_settings.py, on a throwaway project "
+        "where breaking one costs nothing."
+    ),
+}
+
+
 class BuiltButtonTests(unittest.TestCase):
     """The buttons the page builds while it runs, which have no name to find."""
 
@@ -165,7 +180,9 @@ class BuiltButtonTests(unittest.TestCase):
         missing = [
             label
             for label in built_buttons()
-            if label not in said and _first_words(label) not in said
+            if label not in said
+            and _first_words(label) not in said
+            and label not in BUILT_ALLOWED_TO_BE_UNPRESSED
         ]
         self.assertEqual(
             missing,

@@ -40,7 +40,10 @@ single check that looks for a README, so you have something to edit.
 
 Every case needs an `id` and a `kind`. Everything else has a sensible default.
 An id is lowercase letters, digits, dash, or underscore, and no two cases may
-share one. Tags let you run part of the suite.
+share one. Tags let you run part of the suite. `touches` says what a check
+changes while it runs, so two checks that change the same thing wait for each
+other instead of colliding — see [Two checks that change the same
+thing](#two-checks-that-change-the-same-thing).
 
 ## The six kinds of check
 
@@ -451,6 +454,27 @@ thing that must happen after a failure is the one thing that never does.
 
 If a tidy-up step fails, the report names it as one, because that means
 something the check changed has been left changed.
+
+## Two checks that change the same thing
+
+Checks run several at a time. That is what keeps a big suite quick, and it is
+also how a check that writes something ends up standing on another one's work:
+one empties a folder while the other is counting what is in it, and the run
+fails for a reason that has nothing to do with your code.
+
+Say what a check changes, in plain words:
+
+```json
+{"id": "notes-can-be-written", "kind": "browser", "touches": ["the vault"]}
+```
+
+Two checks that name the same thing never run at the same time. Everything else
+carries on running together, so this costs nothing where it is not needed. The
+words are yours to choose — `the vault`, `the settings file`, `the test
+database` — they only have to match between the checks that share the thing.
+
+A check that fails one run in three, and passes on its own every time, is
+almost always two checks sharing something. This is the fix.
 
 ## Which pages nobody checks
 

@@ -20,12 +20,16 @@ from . import comparison
 from . import coverage
 from . import handover
 from . import autosetup
+from . import explain as explainer
+from . import pipeline_starters
 from . import pipelines as pipeline_lab
 from . import plain_graph
 from . import qa as qalab
 from . import recorder
 from . import starters
 from . import seats as seat_setup
+from . import settings as settings_lab
+from . import vault as vault_lab
 from . import selectors
 from . import share
 from .config import LoadedConfig
@@ -140,6 +144,11 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # would each write what the other did not know about, and one
         # change would quietly disappear while both said they worked.
         self.suite_lock = threading.Lock()
+        # The notes have a lock of their own. Changing the suite has nothing to
+        # do with them, and reading them has to wait for a write to finish: a
+        # change of title writes the new file and then takes the old one away,
+        # so a read caught in the middle of that would see the same note twice.
+        self.vault_lock = threading.Lock()
         self.qa_result: dict[str, Any] | None = None
         # Seat setup has a lock of its own. It asks each assistant its version,
         # and a tool waiting on a sign-in can sit there for the best part of a
@@ -638,6 +647,58 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         before, after, redactor=CredentialRedactor(self.server.config)
                     ).to_dict()
                 )
+            elif parsed.path == "/api/vault":
+                self._require_token()
+                config = self.server.config
+                query = urllib.parse.parse_qs(parsed.query)
+                # Reading takes the same lock as writing. Everything below is
+                # several passes over the same folder, and a write landing
+                # between two of them would answer with a vault that never
+                # existed - a note in the picture and not in the list, or the
+                # same note twice while a change of title is halfway done.
+                with self.server.vault_lock:
+                    answer = vault_lab.everything(config)
+                    # A vault too large to hand over whole is sifted where the
+                    # notes are, rather than sending every one to be sifted here.
+                    looking = (query.get("q", [""])[0] or "").strip()
+                    if looking:
+                        matched = {note.name for note in vault_lab.search(config, looking)}
+                        answer["notes"] = [
+                            note for note in answer["notes"] if note["name"] in matched
+                        ]
+                        answer["links"] = [
+                            link for link in answer["links"]
+                            if link["from"] in matched and link["to"] in matched
+                        ]
+                        answer["searched_for"] = looking
+                    wanted = (query.get("name", [""])[0] or "").strip()
+                    if wanted:
+                        try:
+                            answer["open"] = vault_lab.neighbours(config, wanted)
+                        except HarnessError:
+                            # The note was removed, here or in an editor. Losing
+                            # the whole view over one missing note would be a
+                            # poor trade.
+                            answer["open"] = None
+                            answer["gone"] = wanted
+                    answer["going_stale"] = [
+                        note.to_dict() for note in vault_lab.going_stale(config)
+                    ]
+                    answer["lately"] = [note.to_dict() for note in vault_lab.lately(config, 14)]
+                self._json(answer)
+            elif parsed.path == "/api/settings":
+                self._require_token()
+                # Read fresh: a setting changed a moment ago has to show as
+                # changed, and the panel's own copy was loaded at start.
+                now = self._settings_now()
+                self._json({
+                    "settings": [item.to_dict() for item in settings_lab.everything(now)],
+                    "groups": settings_lab.groups(),
+                    "files": {
+                        "shared": settings_lab.SHAREABLE,
+                        "yours": settings_lab.YOURS,
+                    },
+                })
             elif parsed.path == "/api/pipelines":
                 self._require_token()
                 config = self.server.config
@@ -649,6 +710,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "running": self.server.pipeline_running,
                     "last_run": self.server.pipeline_run,
                 }
+                answer["starters"] = pipeline_starters.listed()
                 answer["pipeline"] = (
                     pipeline_lab.load(config, wanted)
                     if wanted
@@ -940,6 +1002,78 @@ class HarnessHandler(BaseHTTPRequestHandler):
                   self.server.seats_were_set_up = False
                   self.server.seats_before = None
                   self._json({"note": said})
+            elif self.path == "/api/vault/start":
+                # Writing the first two notes is a thing somebody asks for, not
+                # something that happens because they opened a tab. Looking at
+                # a view must never leave files behind.
+                with self.server.vault_lock:
+                    made = vault_lab.start_it_off(self.server.config)
+                    self._json({
+                        "made": [note.name for note in made],
+                        "note": (
+                            f"{len(made)} note(s) written to start you off."
+                            if made
+                            else "There are notes here already, so nothing was written."
+                        ),
+                    })
+            elif self.path == "/api/vault/write":
+                with self.server.vault_lock:
+                    note = vault_lab.Note(
+                        name="",
+                        title=str(body.get("title") or ""),
+                        kind=str(body.get("kind") or "about-this-project"),
+                        body=str(body.get("body") or "")[:vault_lab.MOST_LETTERS],
+                        tags=[str(tag) for tag in (body.get("tags") or [])][:12],
+                        sure=float(body.get("sure") or 0.5),
+                        learned=str(body.get("learned") or ""),
+                        came_from=str(body.get("came_from") or "you"),
+                        uses=int(body.get("uses") or 0),
+                        worked=int(body.get("worked") or 0),
+                    )
+                    # Which note this is, when it is one that already exists.
+                    # Without it a change of title leaves the old file behind.
+                    was = str(body.get("was") or "")
+                    self._json({
+                        "note": vault_lab.write_one(
+                            self.server.config, note, was=was
+                        ).to_dict()
+                    })
+            elif self.path == "/api/vault/remove":
+                with self.server.vault_lock:
+                    self._json({
+                        "note": vault_lab.remove(self.server.config, str(body.get("name") or ""))
+                    })
+            elif self.path == "/api/vault/used":
+                with self.server.vault_lock:
+                    note = vault_lab.used(
+                        self.server.config,
+                        str(body.get("name") or ""),
+                        went_well=bool(body.get("went_well")),
+                    )
+                    self._json({"note": note.to_dict()})
+            elif self.path == "/api/vault/learn":
+                with self.server.vault_lock:
+                    self._json(vault_lab.learn_from_memory(self.server.config))
+            elif self.path == "/api/settings/change":
+                with self.server.seats_lock:
+                    done = settings_lab.change(
+                        self._settings_now(), str(body.get("key") or ""), body.get("value")
+                    )
+                self._json(done.to_dict())
+            elif self.path == "/api/settings/reset":
+                with self.server.seats_lock:
+                    done = settings_lab.reset(
+                        self._settings_now(), str(body.get("key") or "")
+                    )
+                self._json(done.to_dict())
+            elif self.path == "/api/pipelines/starter":
+                self._json({"pipeline": pipeline_starters.build(str(body.get("key") or ""))})
+            elif self.path == "/api/explain":
+                # What a failure means, in words. Nothing is looked up
+                # anywhere: it reads what the check already said.
+                self._json(explainer.what_it_means(
+                    str(body.get("said") or "")[:20000], kind=str(body.get("kind") or "")
+                ).to_dict())
             elif self.path == "/api/pipelines/save":
                 with self.server.suite_lock:
                     self._json({"pipeline": pipeline_lab.save(self.server.config, body.get("pipeline"))})

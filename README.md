@@ -66,17 +66,22 @@ npx playwright install chromium
 
 ---
 
-## Two minutes to your first check
+## One command
 
 ```bash
 cd your-project
-harness qa init        # writes a starter suite from the commands you already use
-harness qa run         # runs them side by side and reports
+harness start
 ```
 
-That is enough to be useful. Everything below is optional.
+That reads your project, writes a starter suite from the commands you already
+use, says what is still missing, and opens the panel. Press **Show me around**
+on the first screen and it walks you through the rest.
+
+The same thing, a step at a time, if you would rather:
 
 ```bash
+harness qa init        # writes a starter suite from the commands you already use
+harness qa run         # runs them side by side and reports
 harness ui             # open the control panel in your browser
 ```
 
@@ -95,6 +100,42 @@ real run is going, the same boxes light up as the work reaches them.
 Every box is one agent or one check from the Workflow tab. Rewire it there and
 this picture changes with it, because it is drawn from the workflow that will
 really run — not from a drawing somebody has to remember to update.
+
+---
+
+## What it knows about you
+
+A harness that runs against the same project every day learns things: how you
+like to be answered, which command really runs the tests here, what went wrong
+last time and what fixed it. Kept in a database, that is the harness's private
+business. Kept as notes, it is yours.
+
+![What the harness has learned](docs/images/what-it-knows.png)
+
+Every note is one markdown file in `.harness/vault`, with a few lines at the
+top and links written `[[like this]]`. Open the folder in any editor and it is
+a set of notes about your project. Nothing needs the harness to read it.
+
+| Kind of note | What it holds |
+| --- | --- |
+| About you | How you like to be worked with. |
+| How to | Something that worked, written down so it can be done again. |
+| About this project | What the harness has worked out about the code. |
+| Lesson | Something that went wrong once, and what fixed it. |
+
+The picture is the point. A circle is a note, a line is a link, colour says
+which kind, and size says how connected and how used it is. A note nothing has
+touched for months is dimmed rather than believed for ever, and a link to a
+note nobody has written yet is drawn as a dashed outline you can press to write
+it.
+
+**How a note earns its place.** Open one and say whether it helped. A note that
+is used and goes well grows and rises; one that does not fade. That is the
+whole loop: the harness writes down what worked, you correct what did not, and
+what is left is true.
+
+**Learn from the runs** reads what the harness already remembers and writes the
+parts worth keeping as notes. It never writes over a note you have edited.
 
 ---
 
@@ -146,6 +187,57 @@ the route into your own settings file, and trust that file. It will not install
 software, make an account, or ask you for a key — so it says which single part
 is left for you, and where to do it. A key is never typed into the page and
 never written into a settings file.
+
+---
+
+## Change any setting without opening a file
+
+Everything the harness can be told, in plain words: what it is set to now,
+which file that came from, and what it shipped as. Type a new value and press
+Save. A setting that only counts from your own file goes there by itself, and
+anything the harness would refuse is put straight back with the reason.
+
+```bash
+harness ui             # then open Settings
+```
+
+There is no list of key names to learn and no JSON to edit. A command can be
+typed the way you would type it in a terminal: `pytest -q`, not
+`[["pytest", "-q"]]`.
+
+---
+
+## When a check fails
+
+Every failing check has a **What does this mean?** button. It turns the error
+into a sentence and a short list of things to try:
+
+```text
+Nothing was listening at that address.
+The check asked a server on this machine for a page, and no server answered.
+
+Worth trying:
+  - Start the thing being checked, then run the check again.
+  - Look at the address in the check: a different port is the usual reason.
+  - If it is the harness's own panel, run: harness ui
+```
+
+If it does not recognise a failure it says so, rather than guessing. A
+confident wrong answer sends you looking in the wrong place for an hour.
+
+---
+
+## Carrying a setup to another machine
+
+```bash
+harness carry pack                       # writes harness-setup.json
+harness carry unpack harness-setup.json  # on the other machine
+```
+
+Your checks, your pipelines and the shared settings travel. Your own settings
+file never does: it names the tools on your machine, the addresses you call,
+and the variables holding your keys. Nothing already on the other machine is
+written over unless you say so.
 
 ---
 
@@ -367,6 +459,7 @@ Reports come out as JSON, Markdown, JUnit XML, or a single HTML page.
 ## Every command
 
 ```text
+harness start                       Set a project up and open the panel, in one go
 harness init                        Scan a project and write its settings
 harness doctor                      Say what is missing and how to fix it
 harness run <task>                  Plan, edit, test, review, repair
@@ -377,6 +470,8 @@ harness qa watch                    Run them again whenever a file changes
 harness qa coverage --url <address> Which pages have no check at all
 harness qa changed                  What moved since the run before
 harness qa share                    One page of a run you can send to anyone
+harness carry pack                  Pack this setup up to carry to another machine
+harness carry unpack <file>         Write a carried setup into this project
 harness qa record --url <address>   Do a workflow by hand and get a check from it
 harness qa pick --url <address>     Click a thing and get a name a check can use
 harness qa starters | add <name>    Ready-made checks
@@ -414,6 +509,7 @@ Cloning a repository never gives that repository the right to run code.
 | --- | --- |
 | [QA.md](docs/QA.md) | Checks, in full: every kind, every option, every command |
 | [PIPELINES.md](docs/PIPELINES.md) | Wiring many jobs together, with gates between them |
+| [WHAT_IT_KNOWS.md](docs/WHAT_IT_KNOWS.md) | The notes the harness keeps about you and your project |
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting and where it may come from |
 | [SECURITY.md](docs/SECURITY.md) | What is fenced off, and how |
 | [SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md) | Using a Claude or Copilot seat instead of a key |
