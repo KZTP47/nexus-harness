@@ -77,6 +77,14 @@ jobs:
         run: |
           npm ci
           npx playwright install chromium
+      - name: Say this checkout is ours
+        # The settings file in this repository names the commands the harness
+        # may run. A machine will not read that from a file somebody handed it
+        # until it is told the file is trusted, which is the whole point of the
+        # rule. Saying so here is deliberate: this is our own repository.
+        env:
+          PYTHONPATH: src
+        run: python -m our_harness trust --yes
       - name: Start the control panel
         run: |
           $env:PYTHONPATH = "src"
@@ -148,6 +156,14 @@ jobs:
         run: |
           npm ci
           npx playwright install chromium
+      - name: Say this checkout is ours
+        # The settings file in this repository names the commands the harness
+        # may run. A machine will not read that from a file somebody handed it
+        # until it is told the file is trusted, which is the whole point of the
+        # rule. Saying so here is deliberate: this is our own repository.
+        env:
+          PYTHONPATH: src
+        run: python -m our_harness trust --yes
       - name: Run the suite
         env:
           PYTHONPATH: src
@@ -185,6 +201,12 @@ jobs:
       - name: Run its tests
         working-directory: desktop
         run: npm test
+      - name: Fetch the browser driver
+        # The smoke check opens the app in a real browser. The driver lives at
+        # the top of the repository, not inside the desktop folder.
+        run: |
+          npm ci
+          npx playwright install chromium
       - name: Start it and see that it answers
         working-directory: desktop
         run: npm run smoke

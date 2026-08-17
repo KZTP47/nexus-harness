@@ -326,7 +326,11 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             config = load_config(root, explicit=local)
-            self.assertEqual(config.provenance["provider.endpoint"], str(local))
+            # Windows hands out short names for temporary folders, and the
+            # harness writes down the long one. Same file, two spellings.
+            self.assertEqual(
+                Path(config.provenance["provider.endpoint"]).resolve(), local.resolve()
+            )
             self.assertEqual(config.get("mcp.servers"), [])
 
     def test_shared_endpoint_cannot_compose_with_trusted_credential_binding(self) -> None:

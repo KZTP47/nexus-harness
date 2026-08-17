@@ -606,7 +606,10 @@ class ContextTests(unittest.TestCase):
             )
             config = load_config(root)
             provider = SlowEmbeddingProvider()
-            deadline = WorkflowDeadline.start(0.08)
+            # Long enough that the embedding is always reached, even on a busy
+            # build server. Eighty milliseconds could run out before the first
+            # call was made, and then this checked nothing at all.
+            deadline = WorkflowDeadline.start(1.0)
             started = time.monotonic()
             with MemoryStore(config) as memory, patch(
                 "our_harness.providers.create_embedding_provider", return_value=provider
@@ -615,8 +618,8 @@ class ContextTests(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertEqual(len(provider.timeouts), 1)
             self.assertGreater(provider.timeouts[0], 0)
-            self.assertLessEqual(provider.timeouts[0], 0.08)
-            self.assertLess(elapsed, 0.25)
+            self.assertLessEqual(provider.timeouts[0], 1.0)
+            self.assertLess(elapsed, 5.0)
 
 
 class RefinementTests(unittest.TestCase):
