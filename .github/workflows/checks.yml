@@ -167,7 +167,14 @@ jobs:
           npm ci
           npx playwright install chromium
       - name: Prove the browser driver is really there
-        run: node -e "require.resolve('playwright'); console.log('the browser driver is here')"
+        # Twice: once as this shell sees it, and once as the harness itself
+        # sees it, because those are two different questions and only the
+        # second one decides whether a browser check runs.
+        env:
+          PYTHONPATH: src
+        run: |
+          node -e "require.resolve('playwright'); console.log('this shell can see playwright')"
+          python -c "from pathlib import Path; from our_harness.config import load_config; from our_harness.qa import QaRunner; r = QaRunner(load_config(Path('.'))); print('the harness can see it:', r.browser_available())"
       - name: Install the harness itself
         # This suite runs the harness by name, and the commands in it start
         # their own programs. What a started program is allowed to see is a
