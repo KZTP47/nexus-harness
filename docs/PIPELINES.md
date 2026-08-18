@@ -1,14 +1,33 @@
-# Pipelines
+# Pipelines: work that runs itself
 
-Many jobs, wired together, with gates between them.
+This is the tab for automating work. Draw each job as a box, join the boxes
+with arrows, and press Run.
+
+**What you can do here**
+
+| | |
+| --- | --- |
+| Chain up the jobs you already run | Your checks, your tests, a scan for credentials, a look at the repository |
+| Stop the work when something is wrong | A gate lets it go on only if what came before passed |
+| Try again, and wait before you do | Up to five tries, with the same wait each time or a longer one each time |
+| Do something when it breaks | A step can run only on failure, or whatever happened |
+| Stop and ask a person | The run waits, shows your question, and carries on when somebody says so |
+| Ask an assistant one question | Part way through, with the answer kept beside the run |
+| Run one of your other pipelines | As a single step, instead of copying its steps |
+| Ask you a couple of questions at the start | So one saved pipeline covers the quick run and the full one |
+| Run less than all of it | One step on its own, or from the step that broke onwards |
+| Keep what you had | Every save keeps the version before it, and any can be put back |
+| Show you what happened | Every box lights up as the work reaches it, and a timeline names the slow step |
+| Start from a ready-made one | Ten of them, with a search box |
+
+Not to be confused with the **Workflow** tab, which is about how the assistants
+work on one change - who plans, who writes, who reviews. This tab is about jobs
+on this machine.
 
 A check suite answers one question: does this project work? A pipeline answers a
 bigger one. Run these suites at the same time, scan the code for credentials,
 only carry on if that went well enough, then run the unit tests, and try the
 flaky one again before giving up.
-
-Every piece of that already existed in the harness. What was missing was a way
-to say how the pieces fit together, and a picture of it while it runs.
 
 ---
 
@@ -188,3 +207,84 @@ Open `harness ui` and go to **Pipelines**.
 
 One pipeline runs at a time. A pipeline starts real suites and real commands,
 and two at once would fight over the same project.
+
+---
+
+## When a step runs
+
+Most steps run when everything before them passed. That is what anybody
+expects, and it is what you get without touching anything.
+
+Two others exist for the work that is only there because things go wrong.
+Pick one in **Settings** on the box.
+
+| Choice | What it does |
+| --- | --- |
+| When everything before it passed | The usual one. Anything before it failed, and this is skipped. |
+| Only when something before it failed | For putting things right, or telling somebody. Skipped when all is well. |
+| Whatever happened before it | Runs either way. For the step that writes down what happened. |
+
+A step that only runs on failure does **not** make a good run look bad when it
+is skipped, and a step that always runs does **not** make a bad run look good
+when it passes. The run says which steps were only there for trouble that
+never came.
+
+```json
+{"id": "tell-the-team", "kind": "webhook", "label": "Tell the team",
+ "settings": {"when": "when-something-failed"}}
+```
+
+---
+
+## Waiting before trying again
+
+A step can try more than once. Trying again straight away is the wrong answer
+for anything that failed because something else was busy - a port still held, a
+service still starting, a file still locked.
+
+| Choice | What it does |
+| --- | --- |
+| Straight away | No wait. For a step that fails for its own reasons. |
+| Wait a few seconds each time | Two seconds before every try. For a test that needs a moment. |
+| Wait longer each time | Two seconds, then four, then eight, up to thirty. |
+
+The wait is only offered once the step is set to try more than once, because
+with one try there is nothing to wait for. Pressing **Stop** during a wait
+stops the run then, not after the wait.
+
+```json
+{"id": "tests", "kind": "unit_test", "label": "The tests",
+ "settings": {"command_kind": "test", "tries": 3, "wait": "growing-wait"}}
+```
+
+---
+
+## How it looked before
+
+Every time you save over a pipeline, the one that was there is kept. Open
+**How it looked before** next to the picture to see them, newest first, each
+with a line saying what changed.
+
+**Put this one back** puts an older version on the board and saves it. What was
+on the board is kept too, so you can swap straight back. Twenty versions are
+kept for each pipeline. Deleting a pipeline deletes its old versions with it.
+
+```text
+.harness/pipelines/before/my-pipeline.json
+```
+
+---
+
+## Asking an assistant mid-run
+
+The **Ask an assistant** step puts one question to an assistant you already pay
+for and keeps the answer with the run. "Is the old parser still used anywhere?"
+"Which of these two is the real entry point?"
+
+It cannot read files, run commands, or change anything. It is asked one thing
+and it answers. The answer's first line shows in the log; the whole answer is
+underneath it.
+
+It goes through the same model routes as everything else, so a route nobody set
+up is a route it cannot use. Leave **Which assistant** empty for the one this
+project already uses.

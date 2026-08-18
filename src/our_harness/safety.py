@@ -233,6 +233,30 @@ def safe_environment(names: list[str]) -> dict[str, str]:
     return result
 
 
+def take_the_file_away(path: Path, *, missing_ok: bool = False) -> None:
+    """Delete a file that somebody else may have open for a moment.
+
+    Windows will not delete a file while anything has it open, even only to
+    read it. That somebody is usually the panel refreshing, and it lets go in a
+    moment - so this waits rather than handing back a page of machine detail
+    for a delete that would have worked a tenth of a second later.
+    """
+
+    for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8):
+        try:
+            path.unlink(missing_ok=missing_ok)
+            return
+        except PermissionError:
+            time.sleep(wait)
+    try:
+        path.unlink(missing_ok=missing_ok)
+    except PermissionError as exc:
+        raise HarnessError(
+            f"{path.name} is held open by something else, so it could not be "
+            "removed. Close whatever has it open and try again."
+        ) from exc
+
+
 def redact(value: str, secrets: list[str]) -> str:
     output = value
     for secret in sorted({item for item in secrets if len(item) >= 6}, key=len, reverse=True):

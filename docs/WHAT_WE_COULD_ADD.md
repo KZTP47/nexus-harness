@@ -28,37 +28,21 @@ runner and its job store already exist; this is mostly wiring a clock to them.
 **Worth it: high.** Our own notes already list this as missing, and it needs
 nothing but this machine's clock.
 
-### 2. Let an agent call for help part way through
+### 2. Let an agent call for help part way through — **built**
 
-**What it is.** While working, an agent can say "somebody go and check this one
-thing" and start a short-lived helper using a seat we already pay for, instead
-of only the fixed planner, writer and reviewer wired up beforehand.
+Done. `helper.py` asks one assistant one question and hands back the answer,
+through the same model routes as everything else. It cannot read files, run
+anything, or change anything. There is an **Ask an assistant** step in
+pipelines, so a run can put a question mid-way and keep the answer with the
+rest of what happened. See [PIPELINES.md](PIPELINES.md).
 
-**Where they do it.** DeepSeek has this properly: one agent starts a real child
-agent, including a real Claude Code child and a real Codex child, and gets a
-report back.
+### 3. Real code navigation instead of guessing — **built**
 
-**What it would take.** A new tool in `agent_tools.py`, using the provider
-routes we already have for the command line tools. Today the fan-out is fixed
-boxes in a graph, not something a model can ask for.
-
-**Worth it: high.** It is new capability on top of seats we already pay for.
-
-### 3. Real code navigation instead of guessing
-
-**What it is.** Instead of guessing where a function is defined by matching
-text, ask the tool built for that language and get the exact answer — the same
-thing that powers "jump to definition" in an editor.
-
-**Where they do it.** DeepSeek gives the model four fixed moves: go to
-definition, find references, go to implementation, and hover.
-
-**What it would take.** Changes in `indexer.py` and `context.py`, which today
-fall back to matching text for every language except Python. It needs a
-language server installed on the machine, which is free and needs no account.
-
-**Worth it: high** for anything that is not Python. Our own architecture notes
-already admit this gap.
+Done. `navigate.py` speaks to a language server — the same tool your editor
+asks — and answers where is it, what uses it, and what is it. Every answer says
+whether it is exact or a guess, which is the part that decides what you do
+next. There is a **Look it up** tab and a `harness look-up` command. See
+[LOOK_IT_UP.md](LOOK_IT_UP.md).
 
 ### 4. Being an agent inside somebody else's editor
 

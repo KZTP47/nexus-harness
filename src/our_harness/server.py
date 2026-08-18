@@ -23,6 +23,8 @@ from . import autosetup
 from . import explain as explainer
 from . import pipeline_starters
 from . import pipelines as pipeline_lab
+from . import chat as chat_lab
+from . import navigate as navigate_lab
 from . import plain_graph
 from . import qa as qalab
 from . import recorder
@@ -156,6 +158,11 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # minute. Sharing the suite lock would stop every other change to the
         # checks for that whole time, for a job that has nothing to do with them.
         self.seats_lock = threading.Lock()
+        # Pipelines have their own lock, and reads take it as well as writes.
+        # Saving one writes the file and then writes its old versions, and a
+        # panel refreshing in the middle of that read a pipeline whose history
+        # did not match it - or, on Windows, a file being moved into place.
+        self.pipelines_lock = threading.Lock()
         # "I don't care, just do it for me" runs one job at a time, in the
         # background, because fetching a model can take a long while and the
         # page has to keep saying what is happening.
@@ -571,6 +578,33 @@ class HarnessHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _something_nobody_expected(self, exc: Exception) -> str:
+        """What to put on the screen when something went wrong that nothing expected.
+
+        Not the message. Everything the harness raises on purpose is a plain
+        sentence that has been through the redactor; anything reaching here has
+        been through nothing, and the one that started this was a name and
+        password written into an address, coming back inside "nonnumeric port:
+        'supersecretpassword@gateway.example'". A redactor takes out the shapes
+        it knows, and a password somebody chose is not one of them.
+
+        So the screen gets the kind of failure and where to read the rest. The
+        rest goes to the window the panel was started from, which is this
+        person's own machine and nobody else's.
+        """
+
+        from .redaction import CredentialRedactor
+
+        try:
+            detail = CredentialRedactor(self.server.config).text(str(exc))
+        except Exception:  # noqa: BLE001 - saying less beats saying a key
+            detail = "(it could not be written down safely)"
+        self.log_message("unexpected %s: %s", type(exc).__name__, detail)
+        return (
+            f"Something went wrong that the panel did not expect ({type(exc).__name__}). "
+            "The rest is in the window the panel was started from."
+        )
+
     def _require_token(self) -> None:
         if not secrets.compare_digest(self._single_header("X-Harness-Token"), self.server.token):
             raise HarnessError("Missing or invalid session token")
@@ -720,20 +754,78 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 config = self.server.config
                 query = urllib.parse.parse_qs(parsed.query)
                 wanted = (query.get("name", [""])[0] or "").strip()
+                # Reading takes the lock as well. A read that does not wait for
+                # a write is a read that can see half of one.
+                with self.server.pipelines_lock:
+                    saved_now = pipeline_lab.saved_ones(config)
+                    kept_now = pipeline_lab.older_ones(config, wanted) if wanted else []
+                    on_screen = (
+                        pipeline_lab.load(config, wanted)
+                        if wanted
+                        else pipeline_lab.a_starting_pipeline()
+                    )
                 answer: dict[str, Any] = {
-                    "saved": pipeline_lab.saved_ones(config),
+                    "saved": saved_now,
                     "kinds": [kind.to_dict() for kind in pipeline_lab.KINDS.values()],
                     "running": self.server.pipeline_running,
                     "waiting_at": self.server.pipeline_waiting_at,
                     "last_run": self.server.pipeline_run,
                 }
                 answer["starters"] = pipeline_starters.listed()
-                answer["pipeline"] = (
-                    pipeline_lab.load(config, wanted)
-                    if wanted
-                    else pipeline_lab.a_starting_pipeline()
+                # The words for the two choices every step has: when it runs,
+                # and how it waits before trying again. Kept beside the kinds so
+                # the page and the engine cannot disagree about what exists.
+                answer["when_it_runs"] = [
+                    {"when": key, "label": label, "means": means}
+                    for key, label, means in pipeline_lab.WHEN_IT_RUNS
+                ]
+                answer["waits"] = [
+                    {"wait": key, "label": label, "means": means}
+                    for key, label, means in pipeline_lab.WAITS
+                ]
+                # What this pipeline looked like before the last few saves, so
+                # a person can put one back rather than redrawing it.
+                answer["older_ones"] = (
+                    [
+                        {key: value for key, value in one.items() if key != "pipeline"}
+                        for one in kept_now
+                    ]
+                    if wanted else []
                 )
+                answer["pipeline"] = on_screen
                 self._json(answer)
+            elif parsed.path == "/api/chat":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                wanted = query.get("who", [""])[0]
+                everyone = chat_lab.who_can_talk(self.server.config)
+                # Which one is open. Whatever was asked for if it can answer,
+                # otherwise the first one that can.
+                ready = [one for one in everyone if one["ready"]]
+                if not any(one["route"] == wanted for one in ready):
+                    wanted = ready[0]["route"] if ready else ""
+                self._json({
+                    "who": everyone,
+                    "open": wanted,
+                    "said": [
+                        one.to_dict()
+                        for one in chat_lab.read_it(self.server.config, wanted)
+                    ] if ready else [],
+                    "most_letters": chat_lab.MOST_LETTERS,
+                    "most_kept": chat_lab.MOST_KEPT,
+                })
+            elif parsed.path == "/api/look-up":
+                self._require_token()
+                # Only which servers are here. Asking one a question is a POST,
+                # because it starts a program.
+                self._json({
+                    "servers": navigate_lab.what_is_on_this_machine(),
+                    "asking": [
+                        {"asking": "where-is-it", "label": "Where is it?"},
+                        {"asking": "what-uses-it", "label": "What uses it?"},
+                        {"asking": "what-is-it", "label": "What is it?"},
+                    ],
+                })
             elif parsed.path == "/api/who-is-on-it":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -874,7 +966,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
             # whatever opened the next page.
             self.close_connection = True
         except Exception as exc:
-            self._json({"error": f"Server error: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            # Whatever went wrong that nothing expected, said without whatever
+            # was in it. Anything that gets this far has not been through the
+            # redactor on its own way, and an address with a password in it is
+            # exactly the sort of thing that turns up in one of these.
+            self._json(
+                {"error": self._something_nobody_expected(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def do_POST(self) -> None:
         try:
@@ -1116,6 +1215,38 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json(explainer.what_it_means(
                     str(body.get("said") or "")[:20000], kind=str(body.get("kind") or "")
                 ).to_dict())
+            elif self.path == "/api/chat/say":
+                # No lock here: the conversation has one of its own, taken by
+                # every way of reaching it, including asking everyone at once.
+                self._json(chat_lab.say(
+                    self.server.config,
+                    str(body.get("who") or ""),
+                    str(body.get("text") or ""),
+                ))
+            elif self.path == "/api/chat/ask-everyone":
+                # Every one of them, at the same time. Six one after another is
+                # six waits.
+                self._json({
+                    "answers": chat_lab.ask_everyone(
+                        self.server.config, str(body.get("text") or "")
+                    )
+                })
+            elif self.path == "/api/chat/start-again":
+                self._json({
+                    "note": chat_lab.start_again(
+                        self.server.config, str(body.get("who") or "")
+                    ),
+                    "said": [],
+                })
+            elif self.path == "/api/look-up":
+                self._json(navigate_lab.look_it_up(
+                    self.server.config,
+                    asking=str(body.get("asking") or ""),
+                    path=str(body.get("path") or ""),
+                    line=int(body.get("line") or 0),
+                    column=int(body.get("column") or 0),
+                    name=str(body.get("name") or ""),
+                ).to_dict())
             elif self.path == "/api/who-is-on-it/save":
                 # Saving a team looks at the machine, which runs each
                 # assistant's own tool. That belongs to the seats lock: holding
@@ -1157,10 +1288,33 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "plain": team_lab.in_plain_words(body.get("team")),
                 })
             elif self.path == "/api/pipelines/save":
-                with self.server.suite_lock:
+                with self.server.pipelines_lock:
                     self._json({"pipeline": pipeline_lab.save(self.server.config, body.get("pipeline"))})
+            elif self.path == "/api/pipelines/put-one-back":
+                # Bringing an old version back is itself a save, so what is on
+                # disk now goes on the pile too. Nothing is ever lost by this.
+                with self.server.pipelines_lock:
+                    name = str(body.get("name") or "")
+                    which = int(body.get("which") or 0)
+                    kept = pipeline_lab.older_ones(self.server.config, name)
+                    if not 0 <= which < len(kept):
+                        raise HarnessError(
+                            f"There is no earlier version {which + 1} of {name}."
+                        )
+                    put_back = pipeline_lab.save(self.server.config, kept[which]["pipeline"])
+                    self._json({
+                        "pipeline": put_back,
+                        "older_ones": [
+                            {key: value for key, value in one.items() if key != "pipeline"}
+                            for one in pipeline_lab.older_ones(self.server.config, name)
+                        ],
+                        "note": (
+                            f"Put back the version from {kept[which]['saved_at']}. "
+                            "What was there a moment ago is on the pile too."
+                        ),
+                    })
             elif self.path == "/api/pipelines/delete":
-                with self.server.suite_lock:
+                with self.server.pipelines_lock:
                     self._json({
                         "note": pipeline_lab.remove(self.server.config, str(body.get("name") or "")),
                         "saved": pipeline_lab.saved_ones(self.server.config),
@@ -1411,7 +1565,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
             # whatever opened the next page.
             self.close_connection = True
         except Exception as exc:
-            self._json({"error": f"Server error: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            # Whatever went wrong that nothing expected, said without whatever
+            # was in it. Anything that gets this far has not been through the
+            # redactor on its own way, and an address with a password in it is
+            # exactly the sort of thing that turns up in one of these.
+            self._json(
+                {"error": self._something_nobody_expected(exc)},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def _run_record(self, url: str) -> None:
         events = self.server.events

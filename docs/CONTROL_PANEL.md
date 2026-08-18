@@ -25,6 +25,33 @@ Trusting follows the same rule as everywhere else. A settings file that was
 already there and never trusted is left untrusted, because it can start
 programs and nobody has read it. The panel says so and gives the command.
 
+## Talk to them
+
+A box to type in, and whichever assistant you have hooked up answers. Everything
+set up on this machine is in the list on the left; anything on the machine but
+not wired up yet is there too, greyed, with what to do about it.
+
+The conversation is kept, so it survives closing the panel. **Ask all of them**
+puts the same question to every one that is ready, at the same time, and lays
+the answers out side by side.
+
+It cannot read files, run anything, or change anything. See
+[TALK_TO_THEM.md](TALK_TO_THEM.md).
+
+## Look it up
+
+Three questions about your own code, on their own tab: **Where is it?**, **What
+uses it?**, **What is it?**
+
+Type a name and press one of the three. Every answer says whether it is exact -
+a tool built for that language was asked - or a guess from matching the text of
+your files. Click a place it found and the file and line fill in, so the next
+question is exact.
+
+The second panel lists the language servers it knows about, says which are
+installed, and gives the one command that installs each missing one. See
+[LOOK_IT_UP.md](LOOK_IT_UP.md).
+
 ## Agent nodes
 
 Select **Add agent**, then set:

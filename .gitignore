@@ -10,6 +10,13 @@
 .harness/qa/tmp/
 .harness/bundles/
 .harness/qa/history.json
+# What you said to an assistant, and what it said back. Yours, and about this
+# machine, so it never goes into a repository.
+.harness/chats/
+# The report from a run of the checks. Written every time anybody runs them,
+# and about that machine at that moment, so it is nobody else's business.
+.harness/qa/full-report.json
+.harness/qa/ci-report.json
 .harness/qa/candidates.json
 .harness/transaction.lock
 

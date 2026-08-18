@@ -406,6 +406,16 @@ def _validate_endpoint(value: object, name: str = "provider.endpoint") -> None:
         raise HarnessError(f"{name} must be a valid URL")
     if parsed.scheme != "https" and not _is_loopback_endpoint(value):
         raise HarnessError(f"Remote {name} URLs must use HTTPS")
+    # A name and password written into the address itself. Every named route
+    # was checked for this and the plain one was not, so the one setting a
+    # person makes without knowing about routes was the one that let a password
+    # through - into the settings file, and from there onto the screen the
+    # first time anything went wrong.
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise HarnessError(
+            f"{name} must not contain a name and password, a query, or a #part. "
+            "Put the key in an environment variable and name it in api_key_env."
+        )
 
 
 def _same_source(provenance: dict[str, str], key: str, source: str) -> bool:
@@ -795,7 +805,11 @@ def validate_config(data: dict[str, Any]) -> None:
             _validate_endpoint(endpoint, f"{dotted}.endpoint")
             parsed_profile_endpoint = urllib.parse.urlsplit(endpoint)
             if parsed_profile_endpoint.username or parsed_profile_endpoint.password or parsed_profile_endpoint.query or parsed_profile_endpoint.fragment:
-                raise HarnessError(f"{dotted}.endpoint must not contain credentials, query parameters, or a fragment")
+                raise HarnessError(
+                    f"{dotted}.endpoint must not contain a name and password, a "
+                    "query, or a #part. Put the key in an environment variable "
+                    "and name it in api_key_env."
+                )
         elif endpoint:
             raise HarnessError(f"{dotted}.endpoint must be empty for codex-cli")
         api_key_env = _require_string(profile.get("api_key_env", ""), f"{dotted}.api_key_env")

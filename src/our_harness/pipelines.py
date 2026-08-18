@@ -25,8 +25,10 @@ What it will not do
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,7 +36,7 @@ from typing import Any, Callable, Iterable
 
 from .config import LoadedConfig
 from .models import HarnessError
-from .safety import confined_path
+from .safety import confined_path, take_the_file_away
 
 WAITING = "waiting"
 RUNNING = "running"
@@ -140,6 +142,11 @@ KINDS: dict[str, Kind] = {
         summary="Stops here until somebody says to carry on. For the step before something that matters.",
         settings=("question",),
     ),
+    "ask_for_help": Kind(
+        id="ask_for_help", label="Ask an assistant", colour="cyan", group="Integrations",
+        summary="Asks one question and keeps the answer. It cannot change anything.",
+        settings=("question", "who"),
+    ),
     "another_pipeline": Kind(
         id="another_pipeline", label="Run another pipeline", colour="blue", group="Flow",
         summary="Runs one of your saved pipelines as a single step, so nobody copies steps about.",
@@ -149,6 +156,50 @@ KINDS: dict[str, Kind] = {
 
 # Which gate kinds decide whether the work goes on.
 GATES = {"gate", "security_gate"}
+
+# When a step runs. Most steps run when everything before them passed, which is
+# what anybody expects. The other two are for the work that has to happen when
+# things go wrong, and the work that has to happen either way.
+WHEN_IT_RUNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "when-all-is-well",
+        "When everything before it passed",
+        "The usual one. If anything before it failed, this is skipped.",
+    ),
+    (
+        "when-something-failed",
+        "Only when something before it failed",
+        "For putting things right, or telling somebody. Skipped when all is well.",
+    ),
+    (
+        "whatever-happens",
+        "Whatever happened before it",
+        "Runs either way. For the step that writes down what happened, which is "
+        "needed most when the run went badly.",
+    ),
+)
+WHEN_NAMES = {key for key, _label, _means in WHEN_IT_RUNS}
+
+# How long a step waits before trying again. Trying again at once is the wrong
+# answer for anything that failed because something else was busy.
+WAITS: tuple[tuple[str, str, str], ...] = (
+    ("no-wait", "Straight away", "No wait at all. For a step that fails for its own reasons."),
+    (
+        "same-wait",
+        "Wait a few seconds each time",
+        "The same short wait before every try. For a test that needs a moment.",
+    ),
+    (
+        "growing-wait",
+        "Wait longer each time",
+        "Two seconds, then four, then eight. For something busy that needs room.",
+    ),
+)
+WAIT_NAMES = {key for key, _label, _means in WAITS}
+# The first wait, in seconds, and the longest any single wait may be. Small
+# enough that a person watching does not think it has hung.
+FIRST_WAIT_SECONDS = 2.0
+LONGEST_WAIT_BETWEEN_TRIES = 30.0
 
 # How deep one pipeline may call another. A pipeline that runs itself, or two
 # that run each other, would go round forever, and each round would look like
@@ -265,7 +316,7 @@ def read_it(pipeline: Any) -> dict[str, Any]:
         settings = node.get("settings") or {}
         if not isinstance(settings, dict):
             raise PipelineError(f"The settings on {node_id} are not settings")
-        allowed = set(KINDS[kind].settings) | {"tries", "asks"}
+        allowed = set(KINDS[kind].settings) | {"tries", "asks", "when", "wait"}
         extra = sorted(set(settings) - allowed)
         if extra:
             raise PipelineError(f"{node_id} has a setting it cannot use: {extra[0]}")
@@ -282,8 +333,19 @@ def read_it(pipeline: Any) -> dict[str, Any]:
         tries = settings.get("tries", 1)
         if not isinstance(tries, int) or isinstance(tries, bool) or not 1 <= tries <= MOST_TRIES:
             raise PipelineError(f"Tries on {node_id} has to be a whole number from 1 to {MOST_TRIES}")
+        when = settings.get("when", "when-all-is-well")
+        if when not in WHEN_NAMES:
+            raise PipelineError(
+                f"When {node_id} runs has to be one of: " + ", ".join(sorted(WHEN_NAMES))
+            )
+        wait = settings.get("wait", "no-wait")
+        if wait not in WAIT_NAMES:
+            raise PipelineError(
+                f"How {node_id} waits before trying again has to be one of: "
+                + ", ".join(sorted(WAIT_NAMES))
+            )
         for key, value in settings.items():
-            if key in ("tries", "asks"):
+            if key in ("tries", "asks", "when", "wait"):
                 continue
             if isinstance(value, list):
                 for item in value:
@@ -382,6 +444,50 @@ def in_running_order(pipeline: dict[str, Any]) -> list[str]:
     return order
 
 
+def _and_everything_after(
+    node_id: str, going_to: dict[str, list[str]], found: set[str]
+) -> None:
+    """This step and every step downstream of it, however far down."""
+
+    if node_id in found:
+        return
+    found.add(node_id)
+    for next_one in going_to.get(node_id, []):
+        _and_everything_after(next_one, going_to, found)
+
+
+def _handlers_last(
+    order: list[str], by_id: dict[str, Any], coming_from: dict[str, list[str]]
+) -> list[str]:
+    """Steps that only run when something failed go after everything else.
+
+    Two steps that do not wait on each other are put in order by their names,
+    which is fine until one of them is there to catch the other one failing.
+    Then "tell somebody it broke" runs first, sees nothing broken yet, and is
+    skipped one line before the break happens - which is the whole feature not
+    working, quietly, depending on what somebody called their steps.
+
+    So a step that only runs on failure, and everything waiting on it, is moved
+    to the end. Their own order between themselves is kept, and everything they
+    wait on is still before them, so this is still an order nothing runs early
+    in.
+    """
+
+    going_to: dict[str, list[str]] = {node_id: [] for node_id in order}
+    for node_id, before in coming_from.items():
+        for other in before:
+            going_to.setdefault(other, []).append(node_id)
+    later: set[str] = set()
+    for node_id in order:
+        settings = by_id[node_id].get("settings") or {}
+        if settings.get("when") == "when-something-failed":
+            _and_everything_after(node_id, going_to, later)
+    if not later:
+        return order
+    return ([one for one in order if one not in later]
+            + [one for one in order if one in later])
+
+
 # ---- where they are kept ----------------------------------------------------
 
 
@@ -412,7 +518,7 @@ def saved_ones(config: LoadedConfig) -> list[str]:
     found = []
     for path in sorted(where.glob("*.json")):
         try:
-            held = json.loads(path.read_text(encoding="utf-8"))
+            held = _read_it_whole(path)
         except (OSError, json.JSONDecodeError):
             continue
         if isinstance(held, dict) and isinstance(held.get("name"), str):
@@ -437,7 +543,7 @@ def _the_one_called(config: LoadedConfig, name: str) -> tuple[Path, dict[str, An
     if not path.is_file():
         raise PipelineError(f"There is no pipeline called {name}")
     try:
-        held = json.loads(path.read_text(encoding="utf-8"))
+        held = _read_it_whole(path)
     except (OSError, json.JSONDecodeError) as exc:
         raise PipelineError(f"{path.name} cannot be read: {exc}") from exc
     there = str(held.get("name") or "") if isinstance(held, dict) else ""
@@ -449,6 +555,138 @@ def _the_one_called(config: LoadedConfig, name: str) -> tuple[Path, dict[str, An
     return path, read_it(held)
 
 
+# How many earlier versions of one pipeline are kept. Enough to undo an
+# afternoon of changes; few enough that nobody has to scroll to find the one
+# they meant.
+HOW_MANY_KEPT = 20
+OLD_ONES = ".harness/pipelines/before"
+
+
+def _write_it_whole(path: Path, written: str) -> None:
+    """Write the file beside itself, then move it into place.
+
+    Writing straight over a file empties it first and fills it after. A panel
+    refreshing in that moment reads an empty file and tells somebody their
+    pipeline cannot be read, about a pipeline that is perfectly fine. Moving a
+    finished file into place is one step as far as any reader is concerned.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # One name each, so two writers never share the file beside it.
+    beside = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.part")
+    beside.write_text(written, encoding="utf-8")
+    # Windows will not move a file into place while somebody has it open, even
+    # only to read. That somebody lets go in a moment, so this waits rather
+    # than losing the change.
+    for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8):
+        try:
+            os.replace(beside, path)
+            return
+        except PermissionError:
+            time.sleep(wait)
+    try:
+        os.replace(beside, path)
+    except PermissionError:
+        beside.unlink(missing_ok=True)
+        raise PipelineError(
+            f"{path.name} is held open by something else, so it could not be "
+            "saved. Close whatever has it open and try again."
+        ) from None
+
+
+def _read_it_whole(path: Path) -> Any:
+    """Read a file that something else may be moving into place right now."""
+
+    for wait in (0.0, 0.02, 0.05, 0.1, 0.2):
+        if wait:
+            time.sleep(wait)
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except PermissionError:
+            continue
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _where_the_old_ones_live(config: LoadedConfig, name: str) -> Path:
+    safe = check_the_name(name).replace(" ", "-").lower()
+    return confined_path(
+        config.project_root, f"{OLD_ONES}/{safe}.json",
+        allow_missing=True, allow_control=True,
+    )
+
+
+def older_ones(config: LoadedConfig, name: str) -> list[dict[str, Any]]:
+    """Every version of this pipeline that was saved over, newest first."""
+
+    where = _where_the_old_ones_live(config, name)
+    if not where.is_file():
+        return []
+    try:
+        held = _read_it_whole(where)
+    except (OSError, json.JSONDecodeError):
+        # A record of what came before is worth having and not worth failing
+        # over. An unreadable one means there is nothing to go back to.
+        return []
+    if not isinstance(held, list):
+        return []
+    kept = []
+    for one in held:
+        if not isinstance(one, dict) or not isinstance(one.get("pipeline"), dict):
+            continue
+        kept.append({
+            "saved_at": str(one.get("saved_at") or ""),
+            "steps": len(one["pipeline"].get("nodes") or []),
+            "arrows": len(one["pipeline"].get("edges") or []),
+            "what_changed": str(one.get("what_changed") or ""),
+            "pipeline": one["pipeline"],
+        })
+    return kept
+
+
+def _keep_what_was_there(config: LoadedConfig, was: dict[str, Any], now: dict[str, Any]) -> None:
+    """Put the version being saved over on the pile, before it is gone."""
+
+    where = _where_the_old_ones_live(config, was["name"])
+    kept = [
+        {"saved_at": one["saved_at"], "what_changed": one["what_changed"],
+         "pipeline": one["pipeline"]}
+        for one in older_ones(config, was["name"])
+    ]
+    kept.insert(0, {
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "what_changed": _what_changed(was, now),
+        "pipeline": was,
+    })
+    del kept[HOW_MANY_KEPT:]
+    _write_it_whole(where, json.dumps(kept, indent=2) + "\n")
+
+
+def _what_changed(was: dict[str, Any], now: dict[str, Any]) -> str:
+    """One line saying how the two differ, so a list of versions can be read."""
+
+    was_steps = {node["id"]: node for node in was.get("nodes", [])}
+    now_steps = {node["id"]: node for node in now.get("nodes", [])}
+    added = sorted(set(now_steps) - set(was_steps))
+    gone = sorted(set(was_steps) - set(now_steps))
+    changed = sorted(
+        one for one in set(was_steps) & set(now_steps)
+        if was_steps[one] != now_steps[one]
+    )
+    said = []
+    if added:
+        said.append(f"{len(added)} step(s) added: " + ", ".join(
+            now_steps[one].get("label", one) for one in added[:3]))
+    if gone:
+        said.append(f"{len(gone)} taken out: " + ", ".join(
+            was_steps[one].get("label", one) for one in gone[:3]))
+    if changed:
+        said.append(f"{len(changed)} changed: " + ", ".join(
+            now_steps[one].get("label", one) for one in changed[:3]))
+    if len(was.get("edges", [])) != len(now.get("edges", [])):
+        said.append("the arrows changed")
+    return "; ".join(said) or "nothing that shows here"
+
+
 def save(config: LoadedConfig, pipeline: Any) -> dict[str, Any]:
     tidy = read_it(pipeline)
     path = file_for(config, tidy["name"])
@@ -456,7 +694,7 @@ def save(config: LoadedConfig, pipeline: Any) -> dict[str, Any]:
     # anyway would throw one of them away without a word.
     if path.is_file():
         try:
-            already = json.loads(path.read_text(encoding="utf-8"))
+            already = _read_it_whole(path)
         except (OSError, json.JSONDecodeError):
             already = {}
         there = str(already.get("name") or "") if isinstance(already, dict) else ""
@@ -466,14 +704,27 @@ def save(config: LoadedConfig, pipeline: Any) -> dict[str, Any]:
                 f"would write over it. Give {tidy['name']} a name that is different "
                 "by more than capitals and spaces."
             )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(tidy, indent=2) + "\n", encoding="utf-8")
+    # Whatever is there now goes on the pile before it is written over. This
+    # is the one place a person could lose work by pressing Save.
+    if path.is_file():
+        try:
+            was = read_it(_read_it_whole(path))
+        except (OSError, json.JSONDecodeError, PipelineError):
+            was = None
+        if was is not None and was != tidy:
+            _keep_what_was_there(config, was, tidy)
+    _write_it_whole(path, json.dumps(tidy, indent=2) + "\n")
     return tidy
 
 
 def remove(config: LoadedConfig, name: str) -> str:
     path, held = _the_one_called(config, name)
-    path.unlink()
+    take_the_file_away(path)
+    # And the versions kept for it. Leaving those behind would keep a copy of
+    # something somebody asked to be rid of.
+    take_the_file_away(
+        _where_the_old_ones_live(config, held["name"]), missing_ok=True
+    )
     return f"{held['name']} was removed."
 
 
@@ -713,10 +964,25 @@ def _run_artifact(config: LoadedConfig, node: dict[str, Any], _kinds, so_far=Non
     return True, f"Wrote {where.name}", f"{len(so_far or [])} step(s) recorded"
 
 
+def _was_not_needed(item: "NodeResult") -> bool:
+    """True for a step that was only there for trouble, on a run with none.
+
+    Not the same as a step this run left as it was, which is marked the same
+    way but passed in an earlier run and still counts. Telling the two apart is
+    what keeps "carry on from here" honest.
+    """
+
+    return item.state == SKIPPED and item.skipped_this_time
+
+
 def _decide_a_gate(node: dict[str, Any], before: list[NodeResult]) -> tuple[bool, str, str]:
     needs = str(node["settings"].get("needs") or "all").lower()
     if needs not in ("all", "any"):
         raise PipelineError("A gate needs either all or any of what came before it")
+    # A step that was only there for when something goes wrong, on a run where
+    # nothing did, is not something this gate is waiting on. Counting it would
+    # shut every gate downstream of a handler on every clean run.
+    before = [item for item in before if not _was_not_needed(item)]
     if not before:
         return True, "Nothing came before this gate", ""
     good = [item for item in before if item.state == PASSED]
@@ -770,6 +1036,7 @@ def run_it(
     coming_from: dict[str, list[str]] = {node_id: [] for node_id in by_id}
     for edge in tidy["edges"]:
         coming_from[edge["to"]].append(edge["from"])
+    order = _handlers_last(order, by_id, coming_from)
 
     results: dict[str, NodeResult] = {
         node_id: NodeResult(id=node_id, kind=by_id[node_id]["kind"], label=by_id[node_id]["label"])
@@ -792,6 +1059,12 @@ def run_it(
         node = by_id[node_id]
         result = results[node_id]
         before = [results[other] for other in coming_from[node_id]]
+        # When the run reached this step, stamped whatever happens to it next.
+        # A step that was skipped still happened at a moment, and the timeline
+        # draws every step by this number: left at nought, a step skipped after
+        # two minutes of work was drawn at the far left, as if it had run
+        # alongside the very first one.
+        result.started_after = int((time.monotonic() - started_everything) * 1000)
         if node_id not in doing:
             result.state = PASSED
             result.said = "Left as it was, from an earlier run"
@@ -811,10 +1084,34 @@ def run_it(
             result.said = "The run was stopped"
             say(result)
             continue
-        # A node whose way here was blocked never runs. Saying so beats leaving
-        # it at waiting, which reads as "still to come".
-        blocked = [item for item in before if item.state in (FAILED, SKIPPED)]
-        if blocked and node["kind"] not in GATES:
+        # A node whose way here was blocked never runs - unless it was put
+        # there for exactly that. Saying so beats leaving it at waiting, which
+        # reads as "still to come".
+        when = str(node["settings"].get("when", "when-all-is-well"))
+        # A step that was skipped because it was never needed did not fail, so
+        # nothing after it is blocked by it. Without this, an ordinary step
+        # after a "tell somebody it broke" step was skipped on every run where
+        # nothing broke, and told it was skipped because that step "did not
+        # pass" - one line under that step saying nothing went wrong.
+        blocked = [
+            item for item in before
+            if item.state in (FAILED, SKIPPED) and not _was_not_needed(item)
+        ]
+        anything_wrong = any(
+            item.state in (FAILED, SKIPPED) and not _was_not_needed(item)
+            for item in results.values()
+        )
+        # Somebody who pressed "run only this" on a step, or "carry on from
+        # here" starting at one, asked for that step. Skipping it because
+        # nothing went wrong would be the panel arguing with the button.
+        asked_for = node_id in (only, from_here)
+        if when == "when-something-failed" and not anything_wrong and not asked_for:
+            result.state = SKIPPED
+            result.said = "Nothing went wrong, so this was not needed"
+            result.skipped_this_time = True
+            say(result)
+            continue
+        if blocked and node["kind"] not in GATES and when == "when-all-is-well":
             result.state = SKIPPED
             result.said = f"Skipped, because {blocked[0].label} did not pass"
             say(result)
@@ -852,7 +1149,10 @@ def run_it(
         for attempt in range(1, tries + 1):
             result.tries = attempt
             try:
-                passed, said, detail = _do_one(config, node, before, results, order, check_kinds, depth)
+                passed, said, detail = _do_one(
+                    config, node, before, results, order, check_kinds, depth,
+                    stopping, waiting_on,
+                )
             except HarnessError as exc:
                 passed, said, detail = False, str(exc), ""
             except Exception as exc:  # noqa: BLE001 - one bad node must not end the run
@@ -865,7 +1165,25 @@ def run_it(
                     f"{int(LONGEST_STEP_SECONDS / 60)} minutes, so it was not tried again."
                 )
                 break
-            say(result)
+            # Waiting before trying again. Trying at once is the wrong answer
+            # for anything that failed because something else was busy, and it
+            # is the only answer we used to have.
+            holding = _how_long_to_wait(str(node["settings"].get("wait", "no-wait")), attempt)
+            if holding:
+                result.said = (
+                    f"{said} Trying again in {int(holding)} second"
+                    f"{'' if int(holding) == 1 else 's'}."
+                )
+                say(result)
+                _hold_on(holding, stopping)
+            else:
+                say(result)
+            # Stop means stop. Without this, pressing Stop during a wait only
+            # cut the wait short and then ran the step one more time, which is
+            # the opposite of what the button says.
+            if stopping and stopping():
+                said = f"{said} The run was stopped, so it was not tried again."
+                break
         result.state = PASSED if passed else FAILED
         result.said = said
         result.detail = detail
@@ -874,12 +1192,19 @@ def run_it(
 
     ordered = [results[node_id] for node_id in order]
     failed = [item for item in ordered if item.state == FAILED]
-    skipped = [item for item in ordered if item.state == SKIPPED]
     # A step that never ran is not a step that passed. Being stopped part way,
     # or nobody answering, leaves work undone, and a run with work left undone
     # must not read like one that finished. The only steps that do not count
-    # against it are the ones this run deliberately left alone.
-    left_alone = [item for item in ordered if item.skipped_this_time]
+    # against it are the ones this run deliberately left alone: the ones an
+    # earlier run already did, and the ones that were only ever there for when
+    # something goes wrong.
+    skipped = [
+        item for item in ordered if item.state == SKIPPED and not item.skipped_this_time
+    ]
+    not_needed = [item for item in ordered if _was_not_needed(item)]
+    left_alone = [
+        item for item in ordered if item.state == PASSED and item.skipped_this_time
+    ]
     run = Run(
         name=tidy["name"],
         nodes=ordered,
@@ -895,12 +1220,17 @@ def run_it(
             f"Everything that ran passed, and {len(skipped)} step(s) never ran: "
             + ", ".join(item.label for item in skipped[:4])
         )
-    elif left_alone:
-        ran = len(ordered) - len(left_alone)
-        run.said = (
-            f"Every one of the {ran} step(s) this run covered passed. "
-            f"{len(left_alone)} were left as they were."
-        )
+    elif left_alone or not_needed:
+        ran = len(ordered) - len(left_alone) - len(not_needed)
+        said = [f"Every one of the {ran} step(s) this run covered passed."]
+        if left_alone:
+            said.append(f"{len(left_alone)} were left as they were.")
+        if not_needed:
+            said.append(
+                f"{len(not_needed)} were only for when something goes wrong, "
+                "and nothing did."
+            )
+        run.said = " ".join(said)
     else:
         run.said = f"Every one of the {len(ordered)} steps passed."
     return run
@@ -931,6 +1261,29 @@ def _wait_for_a_person(node_id, waiting_on, stopping, started) -> bool | None:
         time.sleep(0.25)
 
 
+def _how_long_to_wait(wait: str, attempt: int) -> float:
+    """How long to hold on before trying a step again."""
+
+    if wait == "same-wait":
+        return FIRST_WAIT_SECONDS
+    if wait == "growing-wait":
+        return min(FIRST_WAIT_SECONDS * (2 ** (attempt - 1)), LONGEST_WAIT_BETWEEN_TRIES)
+    return 0.0
+
+
+def _hold_on(seconds: float, stopping) -> None:
+    """Wait, and notice at once if somebody presses Stop while waiting."""
+
+    until = time.monotonic() + seconds
+    while time.monotonic() < until:
+        if stopping and stopping():
+            return
+        # Never a negative sleep. The clock can pass `until` between the line
+        # above and this one, and asking to sleep for less than no time at all
+        # ends the run with an error instead of a pipeline.
+        time.sleep(max(0.0, min(0.2, until - time.monotonic())))
+
+
 def _from_here_on(
     order: list[str], coming_from: dict[str, list[str]], from_here: str
 ) -> set[str]:
@@ -943,7 +1296,32 @@ def _from_here_on(
     return doing
 
 
-def _run_another_pipeline(config, node, check_kinds, depth: int) -> tuple[bool, str, str]:
+def _ask_for_help(config, node) -> tuple[bool, str, str]:
+    """Ask an assistant one question, part way through a run.
+
+    It reads nothing and changes nothing: it is asked something and it answers.
+    The answer is kept with the run, which is where somebody reading what
+    happened will look for it.
+    """
+
+    from . import helper
+
+    question = str(node["settings"].get("question") or "").strip()
+    if not question:
+        return False, "This step does not say what to ask.", ""
+    try:
+        said = helper.ask_for_help(
+            config, question, who=str(node["settings"].get("who") or "")
+        )
+    except HarnessError as exc:
+        return False, str(exc), ""
+    first = said.answer.strip().splitlines()[0] if said.answer.strip() else ""
+    return True, f"{said.who} answered: {first[:160]}", said.answer
+
+
+def _run_another_pipeline(
+    config, node, check_kinds, depth: int, stopping=None, waiting_on=None
+) -> tuple[bool, str, str]:
     """Run one saved pipeline as a single step of this one."""
 
     name = str(node["settings"].get("pipeline") or "").strip()
@@ -960,7 +1338,16 @@ def _run_another_pipeline(config, node, check_kinds, depth: int) -> tuple[bool, 
         held = load(config, name)
     except PipelineError as exc:
         return False, str(exc), ""
-    run = run_it(config, held, check_kinds=check_kinds, depth=depth + 1)
+    # Stop is handed down. Without it, a pipeline inside a pipeline carried on
+    # to the end after somebody pressed Stop, which is the one place the button
+    # could be pressed and nothing happen.
+    # Stop and "somebody answered" are both handed down. Without the second,
+    # a "wait for a person" step inside a nested pipeline was never asked, and
+    # came back as nobody answering however loudly somebody answered.
+    run = run_it(
+        config, held, check_kinds=check_kinds, depth=depth + 1,
+        stopping=stopping, waiting_on=waiting_on,
+    )
     # Why it failed, not only that it did. Without this the reason is buried a
     # pipeline down, where nobody reading the outer one will find it.
     went_wrong = next((one for one in run.nodes if one.state == FAILED and one.said), None)
@@ -973,7 +1360,10 @@ def _run_another_pipeline(config, node, check_kinds, depth: int) -> tuple[bool, 
     return run.passed, said, detail
 
 
-def _do_one(config, node, before, results, order, check_kinds, depth: int = 0) -> tuple[bool, str, str]:
+def _do_one(
+    config, node, before, results, order, check_kinds, depth: int = 0,
+    stopping=None, waiting_on=None,
+) -> tuple[bool, str, str]:
     """One node, once. Kept apart so trying again is plainly the same work."""
 
     kind = node["kind"]
@@ -991,8 +1381,12 @@ def _do_one(config, node, before, results, order, check_kinds, depth: int = 0) -
         return _run_git_repo(config, node, check_kinds)
     if kind == "ai_unit_test":
         return _run_ai_unit_test(config, node, check_kinds)
+    if kind == "ask_for_help":
+        return _ask_for_help(config, node)
     if kind == "another_pipeline":
-        return _run_another_pipeline(config, node, check_kinds, depth)
+        return _run_another_pipeline(
+            config, node, check_kinds, depth, stopping, waiting_on
+        )
     if kind == "artifact":
         # Everything that has finished - not this step itself, which is running
         # right now. Keeping the record of a run is the one job where writing

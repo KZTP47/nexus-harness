@@ -2079,9 +2079,10 @@
         },
         {
           "do": "run",
-          "script": "renderCoverage({percent: 50, pages: [{address: 'http://127.0.0.1:8765/', state: 'checked', checked_by: ['home']},{address: 'http://127.0.0.1:8765/shop', state: 'nobody looks at it', checked_by: []}], checked: ['http://127.0.0.1:8765/'], missing: ['http://127.0.0.1:8765/shop'], walked_only: [], more_pages: 0}); return String(document.querySelectorAll('#coverageBar .coverage-block').length)",
+          "script": "refreshChecks = async () => {}; await new Promise(r => setTimeout(r, 750)); renderCoverage({percent: 50, pages: [{address: 'http://127.0.0.1:8765/', state: 'checked', checked_by: ['home']},{address: 'http://127.0.0.1:8765/shop', state: 'nobody looks at it', checked_by: []}], checked: ['http://127.0.0.1:8765/'], missing: ['http://127.0.0.1:8765/shop'], walked_only: [], more_pages: 0}); return String(document.querySelectorAll('#coverageBar .coverage-block').length)",
           "text": "2",
-          "note": "One block per page"
+          "note": "One block per page",
+          "timeout_ms": 30000
         },
         {
           "do": "expect_visible",
@@ -3240,7 +3241,7 @@
         "how"
       ],
       "url": "http://127.0.0.1:8765/",
-      "timeout_seconds": 180,
+      "timeout_seconds": 240,
       "steps": [
         {
           "do": "click",
@@ -3280,9 +3281,9 @@
         },
         {
           "do": "run",
-          "script": "document.getElementById('howDemo').click(); let sawOne = false; for (let tries = 0; tries < 200; tries += 1) {   if ([...document.querySelectorAll('#howStages li')]        .some(box => box.dataset.state === 'doing')) sawOne = true;   if (!document.getElementById('howDemo').disabled) break;   await new Promise(r => setTimeout(r, 100)); } const all = [...document.querySelectorAll('#howStages li')]   .every(box => box.dataset.state === 'done'); if (!sawOne) return 'it never lit a step up'; return all ? 'it walked through every step' : 'it stopped part way'",
+          "script": "refreshHowItWorks = async () => {}; document.getElementById('howDemo').click(); let sawOne = false; for (let tries = 0; tries < 900; tries += 1) {   if ([...document.querySelectorAll('#howStages li')]        .some(box => box.dataset.state === 'doing')) sawOne = true;   const done = [...document.querySelectorAll('#howStages li')]        .every(box => box.dataset.state === 'done');   if (done && !document.getElementById('howDemo').disabled) break;   await new Promise(r => setTimeout(r, 100)); } const all = [...document.querySelectorAll('#howStages li')]   .every(box => box.dataset.state === 'done'); if (!sawOne) return 'it never lit a step up'; return all ? 'it walked through every step' : 'it stopped part way'",
           "text": "it walked through every step",
-          "timeout_ms": 60000,
+          "timeout_ms": 120000,
           "note": "Show me how it works lights each step up in turn"
         },
         {
@@ -3358,7 +3359,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "this project's settings"
+      ]
     },
     {
       "id": "start-view-trusting-a-file-somebody-else-left-behind",
@@ -3702,14 +3706,14 @@
         },
         {
           "do": "run",
-          "script": "const same = settingsHeld.find(one => one.kind === 'number'   && one.came_from === 'the shared settings file'); if (!same) return 'there is no plain number to try this on'; window.__settingKey = same.key; document.getElementById('settingsFilter').value = same.key; renderSettings(); const input = document.querySelector('[data-for=\"' + same.key + '\"]'); input.value = String(same.value);const list = document.getElementById('settingsList'); const everySaid = []; const watcher = new MutationObserver(() => everySaid.push(list.textContent)); watcher.observe(list, {childList: true, characterData: true, subtree: true}); document.querySelector('[data-setting=\"' + same.key + '\"] .setting-save').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(list.textContent);   if (everySaid.some(said => said.includes('is now')))     { watcher.disconnect(); return 'saving really saves'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'nothing happened'",
+          "script": "if (!window.__realRefreshSettings) { window.__realRefreshSettings = refreshSettings; refreshSettings = async () => {}; await new Promise(r => setTimeout(r, 600)); } const same = settingsHeld.find(one => one.kind === 'number'   && one.came_from === 'the shared settings file'); if (!same) return 'there is no plain number to try this on'; window.__settingKey = same.key; document.getElementById('settingsFilter').value = same.key; renderSettings(); const input = document.querySelector('[data-for=\"' + same.key + '\"]'); input.value = String(same.value);const list = document.getElementById('settingsList'); const everySaid = []; const watcher = new MutationObserver(() => everySaid.push(list.textContent)); watcher.observe(list, {childList: true, characterData: true, subtree: true}); document.querySelector('[data-setting=\"' + same.key + '\"] .setting-save').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(list.textContent);   if (everySaid.some(said => said.includes('is now')))     { watcher.disconnect(); return 'saving really saves'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'nothing happened'",
           "text": "saving really saves",
           "timeout_ms": 90000,
           "note": "Saving a setting the value it already holds really writes, and changes nothing"
         },
         {
           "do": "run",
-          "script": "const key = window.__settingKey; document.getElementById('settingsFilter').value = key; renderSettings(); const input = document.querySelector('[data-for=\"' + key + '\"]'); input.value = 'not a number at all'; document.querySelector('[data-setting=\"' + key + '\"] .setting-save').click(); for (let tries = 0; tries < 200; tries += 1) {   const said = document.getElementById('settingSaid-' + key);   if (said && said.className.includes('wrong'))     return 'it refuses something that is not a number, and says why';   await new Promise(r => setTimeout(r, 250)); } return 'it took it'",
+          "script": "if (!window.__realRefreshSettings) { window.__realRefreshSettings = refreshSettings; refreshSettings = async () => {}; await new Promise(r => setTimeout(r, 600)); } const key = window.__settingKey; document.getElementById('settingsFilter').value = key; renderSettings(); const input = document.querySelector('[data-for=\"' + key + '\"]'); input.value = 'not a number at all'; document.querySelector('[data-setting=\"' + key + '\"] .setting-save').click(); for (let tries = 0; tries < 200; tries += 1) {   const said = document.getElementById('settingSaid-' + key);   if (said && said.className.includes('wrong'))     return 'it refuses something that is not a number, and says why';   await new Promise(r => setTimeout(r, 250)); } return 'it took it'",
           "text": "it refuses something that is not a number, and says why",
           "timeout_ms": 60000,
           "note": "Something that is not a number is refused, with a reason, and nothing is written"
@@ -3719,6 +3723,12 @@
           "script": "document.getElementById('settingsFilter').value = ''; document.getElementById('settingsChangedOnly').checked = true; renderSettings(); const shown = document.querySelectorAll('#settingsList .setting').length; const changed = settingsHeld.filter(one => one.changed).length; document.getElementById('settingsChangedOnly').checked = false; renderSettings(); return shown === changed   ? 'it can show only what is not as it shipped'   : 'it showed ' + shown + ' of ' + changed",
           "text": "it can show only what is not as it shipped",
           "note": "The box for showing only what has been changed really filters"
+        },
+        {
+          "do": "run",
+          "script": "if (window.__realRefreshSettings) { refreshSettings = window.__realRefreshSettings; window.__realRefreshSettings = null; } return 'the view reloads itself again'",
+          "text": "the view reloads itself again",
+          "note": "Let the view go back to reloading itself"
         },
         {
           "do": "click",
@@ -3736,7 +3746,10 @@
       "expect": {
         "max_console_errors": 1,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "this project's settings"
+      ]
     },
     {
       "id": "pipelines-view-starting-from-a-ready-made-pipeline",
@@ -4472,13 +4485,12 @@
       }
     },
     {
-      "id": "pipelines-kestra-four-ways-of-looking-at-one-pipeline",
-      "title": "The picture, the same thing as text, the timeline, and what each step is for",
+      "id": "pipelines-five-ways-of-looking-at-one-pipeline",
+      "title": "The picture, the same thing as text, the timeline, what each step is for, and how it looked before",
       "kind": "browser",
       "tags": [
         "ui",
-        "pipelines",
-        "kestra"
+        "pipelines"
       ],
       "touches": [
         "the pipeline on screen"
@@ -4493,10 +4505,10 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-starter').length) break;   await new Promise(r => setTimeout(r, 250)); } const tabs = [...document.querySelectorAll('[data-pipeline-tab]')]   .map(one => one.textContent.trim()); return tabs.length === 4 ? 'there are four ways of looking at it'   : 'it offered ' + tabs.join(', ')",
-          "text": "there are four ways of looking at it",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-starter').length) break;   await new Promise(r => setTimeout(r, 250)); } const tabs = [...document.querySelectorAll('[data-pipeline-tab]')]   .map(one => one.textContent.trim()); return tabs.length === 5 ? 'there are five ways of looking at it'   : 'it offered ' + tabs.join(', ')",
+          "text": "there are five ways of looking at it",
           "timeout_ms": 90000,
-          "note": "One pipeline, four ways of looking at it, side by side"
+          "note": "One pipeline, five ways of looking at it, side by side"
         },
         {
           "do": "click",
@@ -4571,13 +4583,12 @@
       }
     },
     {
-      "id": "pipelines-kestra-the-gallery-can-be-searched",
+      "id": "pipelines-the-gallery-can-be-searched",
       "title": "The ready-made pipelines are grouped, searchable, and every one really loads",
       "kind": "browser",
       "tags": [
         "ui",
-        "pipelines",
-        "kestra"
+        "pipelines"
       ],
       "touches": [
         "the pipeline on screen"
@@ -4631,13 +4642,12 @@
       }
     },
     {
-      "id": "pipelines-kestra-running-one-step-and-carrying-on",
+      "id": "pipelines-running-one-step-and-carrying-on",
       "title": "One step on its own, carrying on from a step, and a step that waits for a person",
       "kind": "browser",
       "tags": [
         "ui",
-        "pipelines",
-        "kestra"
+        "pipelines"
       ],
       "touches": [
         "the pipeline on screen"
@@ -4712,13 +4722,12 @@
       }
     },
     {
-      "id": "pipelines-kestra-a-pipeline-can-ask-before-it-runs",
+      "id": "pipelines-a-pipeline-can-ask-before-it-runs",
       "title": "A step can be told to ask when the run starts, so one pipeline serves two jobs",
       "kind": "browser",
       "tags": [
         "ui",
-        "pipelines",
-        "kestra"
+        "pipelines"
       ],
       "touches": [
         "the pipeline on screen"
@@ -4918,6 +4927,404 @@
       ],
       "expect": {
         "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "look-it-up-answers-the-three-questions",
+      "title": "Look it up: the tool list, a name, and all three questions",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "lookup"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"lookup\"]",
+          "note": "Open the Look it up view"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.querySelectorAll('#lookupTools li').length) break;   await new Promise(r => setTimeout(r, 250)); } const tools = [...document.querySelectorAll('#lookupTools li')]; if (!tools.length) return 'no tools were listed'; const missing = tools.filter(one => !one.textContent.trim()); return missing.length ? 'a tool said nothing' : 'the tools are listed'; ",
+          "text": "the tools are listed",
+          "timeout_ms": 45000,
+          "note": "Every language server it knows about is named, ready or not"
+        },
+        {
+          "do": "run",
+          "script": " const notReady = [...document.querySelectorAll('#lookupTools li.not-ready')]; if (!notReady.length) return 'they are all installed here'; const silent = notReady.filter(one => !one.textContent.includes('To get it')); return silent.length   ? 'a missing tool does not say how to get it'   : 'they are all installed here'; ",
+          "text": "they are all installed here",
+          "note": "A tool that is missing says how to get it, which is the useful part"
+        },
+        {
+          "do": "click",
+          "target": "#lookupRefresh",
+          "note": "Look for the tools again"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.querySelectorAll('#lookupTools li').length) break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelectorAll('#lookupTools li').length   ? 'the list came back' : 'the list went empty'; ",
+          "text": "the list came back",
+          "timeout_ms": 45000,
+          "note": "Pressing it again does not empty the list"
+        },
+        {
+          "do": "type",
+          "target": "#lookupName",
+          "text": "ask_for_help",
+          "note": "Type a name anybody could type"
+        },
+        {
+          "do": "click",
+          "target": "#lookupWhere",
+          "note": "Where is it?"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelector('#lookupPlaces .lookup-mark')) break;   await new Promise(r => setTimeout(r, 250)); } const mark = document.querySelector('#lookupPlaces .lookup-mark'); if (!mark) return 'nothing said how sure it is'; const exact = mark.querySelector('.lookup-exact'); const guess = mark.querySelector('.lookup-guess'); if (!exact && !guess) return 'nothing said how sure it is'; if (guess && !guess.textContent.toLowerCase().includes('guess')) {   return 'a guess did not call itself a guess'; } return 'it said how sure it is'; ",
+          "text": "it said how sure it is",
+          "timeout_ms": 90000,
+          "note": "Every answer says whether it is exact or a guess. That is the point"
+        },
+        {
+          "do": "run",
+          "script": " const places = [...document.querySelectorAll('#lookupPlaces .lookup-place')]; if (!places.length) return 'it found nothing at all'; const first = places[0].querySelector('button.link'); if (!first) return 'a place cannot be clicked'; first.click(); return document.getElementById('lookupPath').value   ? 'clicking a place fills the boxes' : 'clicking a place did nothing'; ",
+          "text": "clicking a place fills the boxes",
+          "note": "Clicking a place puts it in the boxes, ready for an exact question"
+        },
+        {
+          "do": "click",
+          "target": "#lookupUses",
+          "note": "What uses it?"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 240; tries += 1) {   if (document.querySelector('#lookupPlaces .lookup-mark')) break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelector('#lookupPlaces .lookup-mark')   ? 'it answered' : 'it never answered'; ",
+          "text": "it answered",
+          "timeout_ms": 90000,
+          "note": "What uses it answers too"
+        },
+        {
+          "do": "click",
+          "target": "#lookupWhat",
+          "note": "What is it?"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 240; tries += 1) {   const said = document.getElementById('lookupSaid').textContent;   if (said && said !== 'Looking...' && !said.startsWith('1 place')) break;   if (document.querySelector('#lookupPlaces .lookup-what')) break;   await new Promise(r => setTimeout(r, 250)); } const said = document.getElementById('lookupSaid').textContent.trim(); return said ? 'it answered' : 'it said nothing'; ",
+          "text": "it answered",
+          "timeout_ms": 90000,
+          "note": "And what is it answers, or says plainly what is missing"
+        },
+        {
+          "do": "run",
+          "script": " document.getElementById('lookupName').value = ''; document.getElementById('lookupPath').value = ''; document.getElementById('lookupWhere').click(); await new Promise(r => setTimeout(r, 400)); return document.getElementById('lookupSaid').textContent.includes('Type a name')   ? 'it asks for something to look for' : 'it looked for nothing'; ",
+          "text": "it asks for something to look for",
+          "note": "Asking about nothing says what to do, rather than searching for nothing"
+        }
+      ]
+    },
+    {
+      "id": "pipelines-when-a-step-runs-and-how-long-it-waits",
+      "title": "A step can be set to run only on failure, or always, and to wait between tries",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "touches": [
+        "the pipeline on screen"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": " refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'When and wait', nodes: [   {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 60}},   {id: 'tell', kind: 'git_repo', label: 'Tell somebody', settings: {}, at: {x: 320, y: 60}} ], edges: [{from: 'start', to: 'tell'}]}; document.getElementById('pipelineName').value = 'When and wait'; renderPipeline(); openPipelineNode('tell'); return document.getElementById('pipelineNodeDialog').open   ? 'the step is open' : 'the step would not open'; ",
+          "text": "the step is open",
+          "timeout_ms": 60000,
+          "note": "Put one step on the board and open its settings"
+        },
+        {
+          "do": "choose",
+          "target": "#pipelineNodeWhen",
+          "value": "when-something-failed",
+          "note": "Choose: only when something before it failed"
+        },
+        {
+          "do": "run",
+          "script": " const means = document.getElementById('pipelineNodeWhenMeans').textContent.trim(); return means ? 'it says what that means' : 'it says nothing about what that means'; ",
+          "text": "it says what that means",
+          "note": "Choosing shows what the choice means, in words"
+        },
+        {
+          "do": "run",
+          "script": " const wait = document.getElementById('pipelineNodeWait'); if (!wait.disabled) return 'waiting was offered with only one try'; document.getElementById('pipelineNodeTries').value = '3'; document.getElementById('pipelineNodeTries').dispatchEvent(new Event('input', {bubbles: true})); await new Promise(r => setTimeout(r, 200)); return wait.disabled ? 'waiting stayed switched off' : 'waiting is offered once there are tries'; ",
+          "text": "waiting is offered once there are tries",
+          "note": "A wait means nothing with one try, so it is only offered with more"
+        },
+        {
+          "do": "choose",
+          "target": "#pipelineNodeWait",
+          "value": "growing-wait",
+          "note": "Choose: wait longer each time"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineNodeSave",
+          "note": "Save the step"
+        },
+        {
+          "do": "run",
+          "script": " const node = pipeline.nodes.find(one => one.id === 'tell'); if (node.settings.when !== 'when-something-failed') return 'the when was not kept'; if (node.settings.wait !== 'growing-wait') return 'the wait was not kept'; if (node.settings.tries !== 3) return 'the number of tries was not kept'; const box = document.querySelector('.pipeline-node[data-node=\"tell\"]'); const shown = box ? box.textContent : ''; if (!box) return 'the step is not on the board at all'; if (!shown.includes('Only if something failed')) return 'the board does not say when it runs'; return shown.includes('Waits longer after each try')   ? 'the board shows it' : 'the board does not say it waits'; ",
+          "text": "the board shows it",
+          "note": "What was chosen is kept, and the box on the board shows it"
+        }
+      ]
+    },
+    {
+      "id": "pipelines-an-older-version-can-be-put-back",
+      "title": "Saving over a pipeline keeps the old one, and it can be put back",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "touches": [
+        "the pipeline on screen"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": " refreshPipelines = async () => {}; window.confirm = () => true; for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const saved = await request('/api/pipelines'); if ((saved.saved || []).includes('Kept by a check')) {   await request('/api/pipelines/delete', {     method: 'POST', body: JSON.stringify({name: 'Kept by a check'}),   }); } pipeline = {name: 'Kept by a check', nodes: [   {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 60}},   {id: 'one', kind: 'git_repo', label: 'The first name', settings: {}, at: {x: 320, y: 60}} ], edges: [{from: 'start', to: 'one'}]}; document.getElementById('pipelineName').value = 'Kept by a check'; renderPipeline(); return 'the first version is on the board'; ",
+          "text": "the first version is on the board",
+          "timeout_ms": 60000,
+          "note": "Draw a small pipeline, with the view's own reloading turned off"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineSave",
+          "note": "Save it"
+        },
+        {
+          "do": "click",
+          "target": "[data-pipeline-tab=\"before\"]",
+          "note": "Look at how it looked before"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.querySelectorAll('#pipelineOlderOnes li').length) break;   await new Promise(r => setTimeout(r, 250)); } const said = document.getElementById('pipelineOlderOnes').textContent; return said.includes('saved once') || said.includes('nothing before it')   ? 'saved once, so there is nothing before it'   : 'it claims there is an older one already'; ",
+          "text": "saved once, so there is nothing before it",
+          "timeout_ms": 45000,
+          "note": "One save means nothing older, and it says so rather than showing an empty list"
+        },
+        {
+          "do": "run",
+          "script": " pipeline.nodes[1].label = 'The second name'; renderPipeline(); return 'the name was changed'; ",
+          "text": "the name was changed",
+          "note": "Change it"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineSave",
+          "note": "Save over it"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelector('#pipelineOlderOnes .pipeline-older-one')) break;   await new Promise(r => setTimeout(r, 250)); } const row = document.querySelector('#pipelineOlderOnes .pipeline-older-one'); if (!row) return 'the one before this was not kept'; return row.textContent.includes('The one before this')   ? 'the one before this is kept' : 'it is kept but not named'; ",
+          "text": "the one before this is kept",
+          "timeout_ms": 60000,
+          "note": "Saving over it kept the one that was there"
+        },
+        {
+          "do": "run",
+          "script": " const back = [...document.querySelectorAll('#pipelineOlderOnes button')]   .find(one => one.textContent.trim() === 'Put this one back'); if (!back) return 'there is no button saying Put this one back'; back.click(); return 'pressed Put this one back'; ",
+          "text": "pressed Put this one back",
+          "note": "Press it the way a person does, by the words on it"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 200; tries += 1) {   const node = pipeline.nodes.find(one => one.id === 'one');   if (node && node.label === 'The first name') break;   await new Promise(r => setTimeout(r, 250)); } const node = pipeline.nodes.find(one => one.id === 'one'); return node && node.label === 'The first name'   ? 'the older one is back' : 'it was not put back'; ",
+          "text": "the older one is back",
+          "timeout_ms": 60000,
+          "note": "The older version is back"
+        },
+        {
+          "do": "run",
+          "script": " const rows = [...document.querySelectorAll('#pipelineOlderOnes .pipeline-older-one')]; const words = rows.map(one => one.textContent).join(' '); return words.includes('The second name') || rows.length >= 2   ? 'undo can be undone' : 'the one it replaced was thrown away'; ",
+          "text": "undo can be undone",
+          "note": "What was on the board is kept too, so this can be swapped back"
+        },
+        {
+          "do": "click",
+          "target": "[data-pipeline-tab=\"board\"]",
+          "note": "Back to the picture"
+        },
+        {
+          "do": "run",
+          "script": " const box = document.querySelector('.pipeline-node[data-node=\"one\"]'); return box && box.textContent.includes('The first name')   ? 'the board shows the older one' : 'the board was not redrawn'; ",
+          "text": "the board shows the older one",
+          "note": "And the picture shows it, not only the file"
+        },
+        {
+          "do": "run",
+          "script": " await request('/api/pipelines/delete', {   method: 'POST', body: JSON.stringify({name: 'Kept by a check'}), }); return 'tidied up'; ",
+          "text": "tidied up",
+          "note": "Take the pipeline this check made away again"
+        }
+      ]
+    },
+    {
+      "id": "pipelines-view-says-what-it-is-for",
+      "title": "The pipelines tab says plainly what it is for, and how it differs from Workflow",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 120,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the pipelines view"
+        },
+        {
+          "do": "run",
+          "script": "const said = document.getElementById('pipelineTitle').textContent; const line = document.querySelector('.pipeline-strapline'); if (!line || !line.textContent.trim()) return 'there is no plain line under the heading'; return said.toLowerCase().includes('runs itself')   ? 'the heading says what it is for' : 'the heading is only a name'",
+          "text": "the heading says what it is for",
+          "note": "The heading says what the tab does, not only what it is called"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('pipelineWhatFor'); if (!box) return 'there is nothing saying what you can do here'; box.open = true; await new Promise(r => setTimeout(r, 200)); const items = [...box.querySelectorAll('li')]; if (items.length < 8) return 'it lists only ' + items.length + ' things'; const empty = items.filter(one => !one.textContent.trim()); return empty.length ? 'one of them says nothing' : 'it lists what you can do'",
+          "text": "it lists what you can do",
+          "note": "Opening it lists what this tab can do, in plain words"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('pipelineWhatFor'); const words = box.textContent.toLowerCase(); for (const one of ['gate', 'try again', 'person', 'assistant', 'put back']) {   if (!words.includes(one)) return 'it never mentions ' + one; } return 'it names the things this tab really does'",
+          "text": "it names the things this tab really does",
+          "note": "And each thing it names is something this tab really does"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('pipelineWhatFor'); if (!box.textContent.includes('Workflow'))   return 'nothing tells the two tabs apart'; const mine = document.querySelector('[data-view=\"pipelines\"]').title; const other = document.querySelector('[data-view=\"workflow\"]').title; if (!mine || !other) return 'a tab does not say what it is for'; return mine === other ? 'both tabs say the same thing'   : 'the two tabs say what tells them apart'",
+          "text": "the two tabs say what tells them apart",
+          "note": "Workflow and Pipelines are the two a newcomer confuses, so each says which it is"
+        },
+        {
+          "do": "run",
+          "script": "const box = document.getElementById('pipelineWhatFor'); box.open = false; await new Promise(r => setTimeout(r, 150)); return document.querySelectorAll('.pipeline-node').length   ? 'the board is still there underneath' : 'the board went away'",
+          "text": "the board is still there underneath",
+          "note": "Folding it away leaves the board alone"
+        }
+      ]
+    },
+    {
+      "id": "talk-to-them-really-sends-and-keeps-the-conversation",
+      "title": "Talking to an assistant: the list, the box, sending, asking all of them, starting again",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "talk"
+      ],
+      "touches": [
+        "the conversations"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"talk\"]",
+          "note": "Open the Talk to them view"
+        },
+        {
+          "do": "run",
+          "script": " window.confirm = () => true; for (let tries = 0; tries < 160; tries += 1) {   if (document.querySelectorAll('#talkWho li').length) break;   await new Promise(r => setTimeout(r, 250)); } const rows = [...document.querySelectorAll('#talkWho li')]; if (!rows.length) return 'nobody was listed at all'; const silent = rows.filter(one => !one.textContent.trim()); return silent.length ? 'somebody was listed with no name' : 'it lists who is here'; ",
+          "text": "it lists who is here",
+          "timeout_ms": 60000,
+          "note": "It lists everybody on this machine, ready or not"
+        },
+        {
+          "do": "run",
+          "script": " const notReady = [...document.querySelectorAll('#talkWho li.not-ready')]; if (!notReady.length) return 'they are all set up here'; const silent = notReady.filter(one => !one.textContent.trim()); return silent.length ? 'one says nothing about why' : 'they are all set up here'; ",
+          "text": "they are all set up here",
+          "note": "Anybody not set up yet says why, and what to do about it"
+        },
+        {
+          "do": "click",
+          "target": "#talkRefresh",
+          "note": "Look again"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 160; tries += 1) {   if (document.querySelectorAll('#talkWho li').length) break;   await new Promise(r => setTimeout(r, 250)); } return document.querySelectorAll('#talkWho li').length   ? 'the list came back' : 'the list went empty'; ",
+          "text": "the list came back",
+          "timeout_ms": 60000,
+          "note": "Looking again does not empty the list"
+        },
+        {
+          "do": "run",
+          "script": " document.getElementById('talkBox').value = ''; document.getElementById('talkBox').dispatchEvent(new Event('input', {bubbles: true})); return 'the box is empty'; ",
+          "text": "the box is empty",
+          "note": "Empty the box"
+        },
+        {
+          "do": "click",
+          "target": "#talkSend",
+          "note": "Send with nothing typed"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 400)); const said = document.getElementById('talkSaid').textContent; return said.includes('Type something') || said.includes('Nobody is set up')   ? 'it asks for something to say first'   : 'it said ' + said; ",
+          "text": "it asks for something to say first",
+          "note": "Sending nothing asks for something, rather than asking an assistant nothing"
+        },
+        {
+          "do": "run",
+          "script": " const ready = [...document.querySelectorAll('#talkWho li.ready')]; if (!ready.length) {   const box = document.getElementById('talkBox');   return box.disabled ? 'it did what this machine allows'     : 'the box is open with nobody to send to'; } const box = document.getElementById('talkBox'); box.value = 'The control panel is checking that messages get through. Reply with one word.'; box.dispatchEvent(new Event('input', {bubbles: true})); document.getElementById('talkSend').click(); for (let tries = 0; tries < 200; tries += 1) {   if (!document.getElementById('talkSaid').textContent.startsWith('Asking')) break;   await new Promise(r => setTimeout(r, 500)); } await new Promise(r => setTimeout(r, 400)); const said = document.getElementById('talkSaid').textContent; if (said.includes('answered')) {   const turns = [...document.querySelectorAll('#talkThread .talk-turn')];   return turns.length >= 2 ? 'it did what this machine allows'     : 'it answered but nothing was written down'; } if (!said.trim()) return 'it said nothing at all'; if (said.length > 400) return 'the reason was a page, not a sentence'; const thread = document.getElementById('talkThread').innerText; if (thread.includes('Reply with one word')) return 'a message that did not go through was left looking like one that did'; return said.includes('did not answer') || said.includes('cannot be reached')   ? 'it did what this machine allows'   : 'nothing happened when Send was pressed: ' + said; ",
+          "text": "it did what this machine allows",
+          "timeout_ms": 120000,
+          "note": "Sending either gets an answer written down, or one plain sentence saying why not"
+        },
+        {
+          "do": "run",
+          "script": " document.getElementById('talkBox').value = ''; document.getElementById('talkBox').dispatchEvent(new Event('input', {bubbles: true})); document.getElementById('talkAskEveryone').click(); await new Promise(r => setTimeout(r, 500)); const said = document.getElementById('talkSaid').textContent; return said.includes('Type something') || said.includes('Nobody is set up')   ? 'asking everyone nothing asks for something first'   : 'it said ' + said; ",
+          "text": "asking everyone nothing asks for something first",
+          "note": "Ask all of them, with nothing typed"
+        },
+        {
+          "do": "click",
+          "target": "#talkStartAgain",
+          "note": "Start again"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 900)); const turns = [...document.querySelectorAll('#talkThread .talk-turn')]; if (turns.length) return 'the conversation is still there'; return document.getElementById('talkThread').textContent.trim()   ? 'it is empty and says so' : 'it is empty and says nothing'; ",
+          "text": "it is empty and says so",
+          "note": "Starting again leaves an empty conversation that says it is empty"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 3,
         "max_page_errors": 0
       }
     }

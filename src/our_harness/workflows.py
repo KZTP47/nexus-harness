@@ -22,7 +22,7 @@ from typing import Any
 from .config import LoadedConfig
 from .graphs import migrate_graph, validate_graph
 from .models import HarnessError
-from .safety import confined_path
+from .safety import confined_path, take_the_file_away
 
 WORKFLOW_FOLDER = ".harness/workflows"
 MAX_WORKFLOWS = 100
@@ -230,7 +230,7 @@ def delete(config: LoadedConfig, name: str) -> str:
     path = folder(config) / file_name(clean)
     if not path.is_file():
         raise WorkflowError(f"There is no workflow named {clean}")
-    path.unlink()
+    take_the_file_away(path)
     return clean
 
 

@@ -277,6 +277,12 @@ async function settle(page, ms = 1200) {
       if (box && state !== 'waiting') box.dataset.state = state;
     }
   });
+  // Open the list saying what this tab is for, which is the part somebody
+  // looking at the picture is trying to work out.
+  await page.evaluate(() => {
+    const box = document.getElementById('pipelineWhatFor');
+    if (box) box.open = true;
+  });
   await settle(page, 400);
   await page.screenshot({ path: out + '/pipelines.png' });
 
@@ -341,6 +347,51 @@ async function settle(page, ms = 1200) {
   }
   await settle(page, 600);
   await page.screenshot({ path: out + '/your-team.png' });
+
+  // Talking to them. The demo project has whatever is really on this machine,
+  // so this picture is honest about a machine with one assistant as much as
+  // one with three.
+  await page.click('[data-view="talk"]');
+  for (let tries = 0; tries < 80; tries += 1) {
+    if (await page.locator('#talkWho li').count()) break;
+    await page.waitForTimeout(250);
+  }
+  await page.fill('#talkBox', 'Is the old parser still used anywhere?');
+  // Where a tool was found is a path on this machine, and a path carries an
+  // account name in it.
+  await page.evaluate(() => {
+    document.querySelectorAll('#talkWho .hint').forEach((line) => {
+      if (/[A-Za-z]:[\/]/.test(line.textContent)) {
+        line.textContent = 'the usual place for this machine';
+      }
+    });
+  });
+  await settle(page, 500);
+  await page.screenshot({ path: out + '/talk-to-them.png' });
+
+  // Looking something up in the code. The demo project is tiny, so the answer
+  // here is the honest guess, which is the half of this feature worth showing:
+  // it says out loud how sure it is.
+  await page.click('[data-view="lookup"]');
+  for (let tries = 0; tries < 80; tries += 1) {
+    if (await page.locator('#lookupTools li').count()) break;
+    await page.waitForTimeout(250);
+  }
+  await page.fill('#lookupName', 'total');
+  await page.click('#lookupWhere');
+  for (let tries = 0; tries < 120; tries += 1) {
+    if (await page.locator('#lookupPlaces .lookup-mark').count()) break;
+    await page.waitForTimeout(250);
+  }
+  // Where a tool was found is a path on this machine, and a path carries an
+  // account name in it.
+  await page.evaluate(() => {
+    document.querySelectorAll('#lookupTools .hint').forEach((line) => {
+      line.textContent = 'the usual place for this machine';
+    });
+  });
+  await settle(page, 500);
+  await page.screenshot({ path: out + '/look-it-up.png' });
 
   await browser.close();
 })().catch((error) => { console.error(error); process.exit(1); });

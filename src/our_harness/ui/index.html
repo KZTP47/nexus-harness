@@ -24,9 +24,11 @@
   <nav class="view-nav" aria-label="Control panel views">
     <button type="button" data-view="start" aria-pressed="true" title="Set up your project and ask for a change">Start here</button>
     <button type="button" data-view="checks" aria-pressed="false" title="Your tests: what a working project looks like">Checks</button>
-    <button type="button" data-view="workflow" aria-pressed="false" title="For later: rewire the agents yourself">Workflow</button>
-    <button type="button" data-view="pipelines" aria-pressed="false" title="Wire many jobs together with gates between them">Pipelines</button>
+    <button type="button" data-view="workflow" aria-pressed="false" title="How the assistants work on one change: who plans, who writes, who reviews">Workflow</button>
+    <button type="button" data-view="pipelines" aria-pressed="false" title="Work that runs itself: draw the jobs as boxes, join them with arrows, press Run">Automations</button>
     <button type="button" data-view="team" aria-pressed="false" title="The assistants you already pay for, and how they work together">Your team</button>
+    <button type="button" data-view="talk" aria-pressed="false" title="Type something to any assistant you have hooked up, and keep the conversation">Talk to them</button>
+    <button type="button" data-view="lookup" aria-pressed="false" title="Where is this, what uses it, what is it">Look it up</button>
     <button type="button" data-view="vault" aria-pressed="false" title="What the harness has learned about you and this project">What it knows</button>
     <button type="button" data-view="settings" aria-pressed="false" title="Change any setting, without opening a file">Settings</button>
     <button type="button" data-view="history" aria-pressed="false" title="What past runs did, step by step">History</button>
@@ -364,7 +366,7 @@
 
   <div id="pipelinesView" data-view-panel="pipelines" class="pipeline-shell" hidden>
     <aside class="pipeline-side" aria-labelledby="pipelineSideTitle">
-      <h2 id="pipelineSideTitle">Saved pipelines</h2>
+      <h2 id="pipelineSideTitle">Your automations</h2>
       <ul id="pipelineList" class="pipeline-saved"></ul>
       <div class="pipeline-side-buttons">
         <button id="pipelineSave" type="button">Save</button>
@@ -384,8 +386,39 @@
     <section class="pipeline-main" aria-labelledby="pipelineTitle">
       <div class="pipeline-bar">
         <div>
-          <h2 id="pipelineTitle">Pipelines</h2>
-          <p class="hint">Wire jobs together. An arrow means "after". A gate decides whether the work goes on.</p>
+          <h2 id="pipelineTitle">Automations: work that runs itself</h2>
+          <p class="pipeline-strapline">Draw each job as a box, join the boxes with arrows, and press Run.
+            An arrow means "after". A gate decides whether the work goes on.</p>
+          <details id="pipelineWhatFor" class="pipeline-what-for">
+            <summary>What you can do here</summary>
+            <ul class="pipeline-what-for-list">
+              <li><strong>Chain up the jobs you already run.</strong> Your checks, your tests,
+                a scan of the code for credentials, a look at the repository.</li>
+              <li><strong>Stop the work when something is wrong.</strong> A gate lets it go on
+                only if what came before passed - all of it, or any of it.</li>
+              <li><strong>Try again, and wait before you do.</strong> Up to five tries, with the
+                same short wait each time or a longer one each time.</li>
+              <li><strong>Do something when it breaks.</strong> A step can be set to run only when
+                something before it failed, or to run whatever happened.</li>
+              <li><strong>Stop and ask a person.</strong> The run waits, shows your question, and
+                carries on when somebody says so.</li>
+              <li><strong>Ask an assistant one question</strong> part way through, and keep the
+                answer with the run.</li>
+              <li><strong>Run one of your other pipelines</strong> as a single step, instead of
+                copying its steps.</li>
+              <li><strong>Ask you a couple of questions when it starts</strong>, so one saved
+                pipeline covers the quick run and the full one.</li>
+              <li><strong>Run less than all of it:</strong> one step on its own, or from the step
+                that broke onwards.</li>
+              <li><strong>Keep what you had.</strong> Every save keeps the version before it, and
+                any of them can be put back.</li>
+              <li><strong>Show you what happened:</strong> every box lights up as the work reaches
+                it, and a timeline says which step was the slow one.</li>
+              <li><strong>Start from a ready-made one.</strong> Ten of them, with a search box.</li>
+            </ul>
+            <p class="hint">Not to be confused with <strong>Workflow</strong>, which is about how the
+              assistants work on one change. This tab is about jobs on this machine.</p>
+          </details>
           <p class="hint">Keyboard: Tab to a box, arrow keys move it, C connects, S for settings, Delete takes it out.</p>
         </div>
         <div class="pipeline-bar-fields">
@@ -402,6 +435,7 @@
         <button type="button" role="tab" data-pipeline-tab="code" aria-selected="false">The same thing as text</button>
         <button type="button" role="tab" data-pipeline-tab="timeline" aria-selected="false">How long each step took</button>
         <button type="button" role="tab" data-pipeline-tab="help" aria-selected="false">What each step is for</button>
+        <button type="button" role="tab" data-pipeline-tab="before" aria-selected="false">How it looked before</button>
       </div>
       <div id="pipelinePaneCode" class="pipeline-pane" data-pipeline-pane="code" hidden>
         <p class="hint">The same pipeline, written out. Change it here and the picture changes with it.</p>
@@ -416,6 +450,11 @@
       <div id="pipelinePaneTimeline" class="pipeline-pane" data-pipeline-pane="timeline" hidden>
         <p class="hint">One bar per step of the last run, laid out in time. The long one is the slow one.</p>
         <ol id="pipelineTimeline" class="pipeline-timeline"></ol>
+      </div>
+      <div id="pipelinePaneBefore" class="pipeline-pane" data-pipeline-pane="before" hidden>
+        <p class="hint">Every time you save over a pipeline, the one that was there is kept.
+          Put any of them back and the current one is kept too, so nothing is ever lost.</p>
+        <ol id="pipelineOlderOnes" class="pipeline-older"></ol>
       </div>
       <div id="pipelinePaneHelp" class="pipeline-pane" data-pipeline-pane="help" hidden>
         <p class="hint">Every kind of step you can put on the board, and what it does.</p>
@@ -459,14 +498,117 @@
         <p class="hint">Anything ticked here is asked each time instead of being fixed now.</p>
         <div id="pipelineNodeAskList"></div>
       </fieldset>
+      <label for="pipelineNodeWhen">When this step runs</label>
+      <select id="pipelineNodeWhen"></select>
+      <p id="pipelineNodeWhenMeans" class="hint"></p>
       <label for="pipelineNodeTries">Try again this many times if it fails</label>
       <input id="pipelineNodeTries" type="number" min="1" max="5" value="1">
+      <label for="pipelineNodeWait">How long to wait before trying again</label>
+      <select id="pipelineNodeWait"></select>
+      <p id="pipelineNodeWaitMeans" class="hint"></p>
       <div class="dialog-buttons">
         <button id="pipelineNodeCancel" type="button">Cancel</button>
         <button id="pipelineNodeSave" class="primary" type="button">Save</button>
       </div>
     </form>
   </dialog>
+
+  <div id="talkView" data-view-panel="talk" class="talk-shell" hidden>
+    <aside class="talk-side" aria-labelledby="talkSideTitle">
+      <h2 id="talkSideTitle">Who you can talk to</h2>
+      <p class="hint">Everything set up on this machine. Pick one and type.</p>
+      <ul id="talkWho" class="talk-who"></ul>
+      <button id="talkRefresh" type="button">Look again</button>
+    </aside>
+
+    <section class="talk-main" aria-labelledby="talkTitle">
+      <div class="talk-bar">
+        <div>
+          <h2 id="talkTitle">Talk to them</h2>
+          <p class="talk-strapline">Type below and press Send. The conversation is kept, so you
+            can carry it on tomorrow.</p>
+        </div>
+        <div class="talk-bar-buttons">
+          <button id="talkStartAgain" type="button">Start again</button>
+        </div>
+      </div>
+
+      <p id="talkSaid" class="callout" role="status">Pick somebody on the left.</p>
+      <ol id="talkThread" class="talk-thread" aria-label="What has been said" aria-live="polite"></ol>
+
+      <form id="talkForm" class="talk-form">
+        <label class="sr-only" for="talkBox">What to say</label>
+        <textarea id="talkBox" rows="3" maxlength="6000"
+          placeholder="Is the old parser still used anywhere?"></textarea>
+        <div class="button-row">
+          <button id="talkSend" class="primary" type="submit">Send</button>
+          <button id="talkAskEveryone" type="button"
+            title="Put the same thing to every assistant that is ready, all at once">Ask all of them</button>
+          <span id="talkCount" class="hint" aria-live="polite"></span>
+        </div>
+        <p class="field-help">Enter sends it. Shift and Enter starts a new line.
+          It cannot read your files or run anything - paste what you want it to see.</p>
+      </form>
+
+      <section id="talkEveryone" class="talk-everyone" aria-labelledby="talkEveryoneTitle" hidden>
+        <h3 id="talkEveryoneTitle">What each of them said</h3>
+        <ul id="talkEveryoneList" class="talk-everyone-list"></ul>
+      </section>
+    </section>
+  </div>
+
+  <main id="lookupView" data-view-panel="lookup" class="data-view" hidden>
+    <section class="glass data-panel" aria-labelledby="lookupTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="lookupTitle">Look it up</h2>
+          <p>Three questions about your code. Give it a name, or a file and a line, and ask.</p>
+        </div>
+        <button id="lookupRefresh" type="button">Look for the tools again</button>
+      </div>
+
+      <div class="lookup-ask">
+        <div>
+          <label for="lookupName">A name</label>
+          <input id="lookupName" type="text" maxlength="120" placeholder="ask_for_help">
+        </div>
+        <div>
+          <label for="lookupPath">Or a file</label>
+          <input id="lookupPath" type="text" maxlength="300" placeholder="src/our_harness/helper.py">
+        </div>
+        <div>
+          <label for="lookupLine">and line</label>
+          <input id="lookupLine" type="number" min="1" max="1000000" placeholder="130">
+        </div>
+        <div>
+          <label for="lookupColumn">and column</label>
+          <input id="lookupColumn" type="number" min="1" max="10000" placeholder="5">
+        </div>
+      </div>
+      <p class="field-help">A file and a line give an exact answer, because the tool for that
+        language is asked directly. A name on its own is a search through your files, which is
+        a good guess and says so.</p>
+      <div class="button-row">
+        <button id="lookupWhere" class="primary" type="button">Where is it?</button>
+        <button id="lookupUses" type="button">What uses it?</button>
+        <button id="lookupWhat" type="button">What is it?</button>
+      </div>
+
+      <p id="lookupSaid" class="callout" role="status">Type a name and press one of the three.</p>
+      <ol id="lookupPlaces" class="lookup-places" aria-label="What was found"></ol>
+    </section>
+
+    <section class="glass data-panel" aria-labelledby="lookupToolsTitle">
+      <div class="section-heading">
+        <div>
+          <h2 id="lookupToolsTitle">Tools that give exact answers</h2>
+          <p>One of these per language. Each is free, needs no account, and is the same tool
+            your editor uses. Without one, answers are a search through your files.</p>
+        </div>
+      </div>
+      <ul id="lookupTools" class="lookup-tools"></ul>
+    </section>
+  </main>
 
   <div id="teamView" data-view-panel="team" class="team-shell" hidden>
     <aside class="team-side" aria-labelledby="teamSideTitle">

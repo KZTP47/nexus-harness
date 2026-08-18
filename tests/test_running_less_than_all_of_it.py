@@ -1,4 +1,4 @@
-"""The ideas taken from Kestra, and the promises each one has to keep.
+"""Running less than all of a pipeline, and the promises each way has to keep.
 
 Four things somebody asks for the first afternoon they draw a pipeline:
 
@@ -41,13 +41,13 @@ class PipelineTestCase(unittest.TestCase):
     def stand_in(self, answers: dict[str, tuple[bool, str, str]]):
         """Every kind stood in, so no real suite or model is started."""
 
-        def one(config, node, before, results, order, check_kinds, depth=0):
+        def one(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
             if node["kind"] == "start":
                 return True, "Started", ""
             if node["kind"] in pipelines.GATES:
                 return pipelines._decide_a_gate(node, before)
             if node["kind"] == "another_pipeline":
-                return pipelines._run_another_pipeline(config, node, check_kinds, depth)
+                return pipelines._run_another_pipeline(config, node, check_kinds, depth, stopping, waiting_on)
             return answers.get(node["id"], (True, "done", ""))
 
         return mock.patch.object(pipelines, "_do_one", one)
@@ -209,6 +209,55 @@ class RunningAnotherPipelineTests(PipelineTestCase):
         self.assertIn("The inner one", inner.said)
         self.assertIn("Read the repo", inner.detail)
 
+    def test_somebody_answering_reaches_a_step_inside_the_other_one(self) -> None:
+        """A "wait for a person" step inside a nested pipeline must be askable.
+
+        Without this it was never asked at all: it came back as nobody
+        answering, however loudly somebody answered, so every nested pipeline
+        holding one failed for good.
+        """
+
+        pipelines.save(self.config, {
+            "name": "It asks first",
+            "nodes": [
+                {"id": "start", "kind": "start", "label": "Start"},
+                {"id": "ask", "kind": "wait_for_a_person", "label": "Are you sure?",
+                 "settings": {"question": "Shall I carry on?"}},
+            ],
+            "edges": [{"from": "start", "to": "ask"}],
+        })
+        asked = []
+
+        def somebody(step_id):
+            asked.append(step_id)
+            return True  # carry on
+
+        with self.stand_in({}):
+            run = pipelines.run_it(
+                self.config, self.calling("It asks first"), waiting_on=somebody
+            )
+        inner = next(one for one in run.nodes if one.id == "inner")
+        self.assertEqual(asked, ["ask"], "the step inside was never asked")
+        self.assertEqual(inner.state, pipelines.PASSED, inner.said)
+        self.assertTrue(run.passed, run.said)
+
+    def test_stop_reaches_a_step_inside_the_other_one(self) -> None:
+        pipelines.save(self.config, {
+            "name": "Three of them",
+            "nodes": [
+                {"id": "start", "kind": "start", "label": "Start"},
+                {"id": "one", "kind": "git_repo", "label": "One"},
+                {"id": "two", "kind": "git_repo", "label": "Two"},
+            ],
+            "edges": [{"from": "start", "to": "one"}, {"from": "one", "to": "two"}],
+        })
+        with self.stand_in({}):
+            run = pipelines.run_it(
+                self.config, self.calling("Three of them"), stopping=lambda: True
+            )
+        inner = next(one for one in run.nodes if one.id == "inner")
+        self.assertIn("stopped", inner.detail.lower() + " " + inner.said.lower())
+
     def test_a_name_nobody_saved_is_said_plainly(self) -> None:
         with self.stand_in({}):
             run = pipelines.run_it(self.config, self.calling("Never saved"))
@@ -250,7 +299,7 @@ class AskingBeforeARunTests(PipelineTestCase):
     def test_an_answer_is_used_for_that_run(self) -> None:
         seen: dict[str, str] = {}
 
-        def one(config, node, before, results, order, check_kinds, depth=0):
+        def one(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
             if node["kind"] == "suite":
                 seen["tag"] = node["settings"].get("tag", "")
             return True, "done", ""
@@ -264,7 +313,7 @@ class AskingBeforeARunTests(PipelineTestCase):
     def test_with_no_answer_what_was_saved_is_used(self) -> None:
         seen: dict[str, str] = {}
 
-        def one(config, node, before, results, order, check_kinds, depth=0):
+        def one(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
             if node["kind"] == "suite":
                 seen["tag"] = node["settings"].get("tag", "")
             return True, "done", ""
@@ -312,7 +361,7 @@ class TheGalleryTests(unittest.TestCase):
         # A gallery of things that do not work is worse than an empty page, so
         # every one of them is really run - with each kind stood in, so no real
         # suite or model is started, but through the same runner a person uses.
-        def one_step(config, node, before, results, order, check_kinds, depth=0):
+        def one_step(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
             if node["kind"] == "start":
                 return True, "Started", ""
             if node["kind"] in pipelines.GATES:
@@ -378,6 +427,47 @@ class TheTimelineHasWhatItNeedsTests(PipelineTestCase):
             run = pipelines.run_it(self.config, self.three_steps())
         when = [one.started_after for one in run.nodes]
         self.assertEqual(when, sorted(when))
+
+    def test_a_step_that_was_skipped_still_says_when_it_was_reached(self) -> None:
+        """The timeline draws a skipped step too, and drew it at the far left.
+
+        Left at nought, a step skipped after two minutes of work was drawn
+        alongside the very first step, as if the two had happened together.
+        """
+
+        held = pipelines.read_it({
+            "name": "One slow one then trouble",
+            "nodes": [
+                {"id": "start", "kind": "start", "label": "Start"},
+                {"id": "aa_slow", "kind": "git_repo", "label": "The slow one"},
+                {"id": "bb_work", "kind": "git_repo", "label": "The one that breaks"},
+                {"id": "cc_after", "kind": "git_repo", "label": "The one after it"},
+            ],
+            "edges": [
+                {"from": "start", "to": "aa_slow"},
+                {"from": "aa_slow", "to": "bb_work"},
+                {"from": "bb_work", "to": "cc_after"},
+            ],
+        })
+
+        def one(config, node, before, results, order, check_kinds, depth=0,
+                stopping=None, waiting_on=None):
+            if node["kind"] == "start":
+                return True, "Started", ""
+            if node["id"] == "aa_slow":
+                time.sleep(0.15)
+                return True, "slow", ""
+            if node["id"] == "bb_work":
+                return False, "broke", ""
+            return True, "done", ""
+
+        with mock.patch.object(pipelines, "_do_one", one):
+            run = pipelines.run_it(self.config, held)
+        by_id = {item.id: item for item in run.nodes}
+        self.assertEqual(by_id["cc_after"].state, pipelines.SKIPPED)
+        self.assertGreaterEqual(by_id["cc_after"].started_after, 100)
+        when = [item.started_after for item in run.nodes]
+        self.assertEqual(when, sorted(when), when)
 
 
 if __name__ == "__main__":

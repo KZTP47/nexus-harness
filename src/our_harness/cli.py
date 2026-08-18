@@ -603,6 +603,50 @@ def command_carry(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_look_up(args: argparse.Namespace) -> int:
+    """Where is it, what uses it, what is it - from a terminal.
+
+    The same three questions the panel asks, for anybody who lives in a shell.
+    It prints whether the answer is exact or a guess before it prints the
+    answer, because that is the part that decides what you do next.
+    """
+
+    from . import navigate
+
+    config = _config(args)
+    if getattr(args, "tools", False):
+        for one in navigate.what_is_on_this_machine():
+            mark = "ready" if one["ready"] else "not installed"
+            print(f"{one['label']} ({mark})")
+            print(f"    for {', '.join(one['for_files'])}")
+            if not one["ready"]:
+                print(f"    to get it: {one['how_to_get_it']}")
+        return 0
+    answer = navigate.look_it_up(
+        config,
+        asking=args.asking,
+        path=getattr(args, "path", "") or "",
+        line=int(getattr(args, "line", 0) or 0),
+        column=int(getattr(args, "column", 0) or 0),
+        name=getattr(args, "name", "") or "",
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(answer.to_dict(), indent=2))
+        return 0 if answer.places else 1
+    print("Exact: " + answer.how if answer.exact else "A guess: " + answer.how)
+    if answer.note:
+        print(answer.note)
+    for place in answer.places:
+        if place.what:
+            print(place.what)
+        else:
+            print(f"{place.path}:{place.line}  {place.text}")
+    if not answer.places:
+        print("Nothing found.")
+        return 1
+    return 0
+
+
 def command_trust(args: argparse.Namespace) -> int:
     """Say that the local config file in this project is yours and may be used."""
 
@@ -1516,6 +1560,24 @@ def parser() -> argparse.ArgumentParser:
     )
     seats_setup.add_argument("--json", action="store_true")
     seats_setup.set_defaults(handler=command_seats)
+    look_up = sub.add_parser(
+        "look-up", help="Where is it, what uses it, what is it - in your own code"
+    )
+    look_up.add_argument(
+        "--asking", default="where-is-it",
+        choices=["where-is-it", "what-uses-it", "what-is-it"],
+        help="Which of the three questions to ask",
+    )
+    look_up.add_argument("--name", default="", help="A name to look for")
+    look_up.add_argument("--path", default="", help="A file, for an exact answer")
+    look_up.add_argument("--line", type=int, default=0, help="The line in that file")
+    look_up.add_argument("--column", type=int, default=0, help="The column on that line")
+    look_up.add_argument(
+        "--tools", action="store_true",
+        help="Only list the language servers, and say how to get the missing ones",
+    )
+    look_up.add_argument("--json", action="store_true")
+    look_up.set_defaults(handler=command_look_up)
     trust = sub.add_parser("trust", help="Say the local config file in this project is yours")
     trust.add_argument("--yes", action="store_true", help="Do not ask first")
     trust.add_argument("--show", action="store_true", help="Only say whether it is trusted")

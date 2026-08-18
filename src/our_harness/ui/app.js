@@ -615,7 +615,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); if (name === "lookup") refreshLookup(); if (name === "talk") refreshTalk(); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -2204,6 +2204,11 @@ let pipeline = {name: "First pipeline", nodes: [], edges: []};
 let pipelineKinds = [];
 let pipelineSaved = [];
 let pipelineStarters = [];
+let pipelineWhens = [];   // when a step runs: always, only on failure, either way
+let pipelineWaits = [];   // how long it waits before trying again
+// Which saved pipeline is on the board, if it came from one. Older versions
+// belong to a saved name, so without this there is nothing to look back at.
+let pipelineSavedName = "";
 let pipelineJoining = "";      // the node an arrow is being drawn from
 let pipelineDragging = null;
 let pipelineEditing = "";
@@ -2215,8 +2220,12 @@ async function refreshPipelines(name) {
     pipelineKinds = said.kinds || [];
     pipelineSaved = said.saved || [];
     pipelineStarters = said.starters || [];
+    pipelineWhens = said.when_it_runs || [];
+    pipelineWaits = said.waits || [];
     pipeline = said.pipeline;
     pipelineStates = new Map();
+    pipelineSavedName = name || "";
+    pipelineOlderOnes = said.older_ones || [];
     $("pipelineName").value = pipeline.name || "";
     $("pipelineStop").disabled = !said.running;
     renderPipelinePalette();
@@ -2354,6 +2363,16 @@ function renderPipeline() {
     if ((node.label || "") !== kind.label) card.append(make("p", "pipeline-node-kind", kind.label));
     if (state) {
       card.append(make("p", "pipeline-node-state", state.said || state.state));
+    }
+    if (node.settings?.when === "when-something-failed") {
+      card.append(make("p", "pipeline-node-when", "Only if something failed"));
+    } else if (node.settings?.when === "whatever-happens") {
+      card.append(make("p", "pipeline-node-when", "Runs either way"));
+    }
+    if ((node.settings?.wait || "no-wait") !== "no-wait") {
+      card.append(make("p", "pipeline-node-wait",
+        node.settings.wait === "growing-wait"
+          ? "Waits longer after each try" : "Waits a few seconds between tries"));
     }
     if ((node.settings?.asks || []).length) {
       card.append(make("p", "pipeline-node-asks",
@@ -2547,6 +2566,10 @@ const PIPELINE_FIELDS = {
   instructions: {label: "What the model should write", long: true,
                  placeholder: "Write a test for the basket total, covering an empty basket."},
   write_to: {label: "Save the draft as", placeholder: "basket-total.test.js"},
+  question: {label: "What to ask", long: true,
+             placeholder: "Is anything else in this project still using the old parser?"},
+  who: {label: "Which assistant, if not the usual one", placeholder: "Leave empty for the usual one"},
+  pipeline: {label: "Which saved pipeline to run", placeholder: "Before a commit"},
 };
 
 function openPipelineNode(nodeId) {
@@ -2601,7 +2624,39 @@ function openPipelineNode(nodeId) {
     asking.append(row);
   }
   $("pipelineNodeAsks").hidden = !(kind.settings || []).length;
+  fillOneChoice("pipelineNodeWhen", pipelineWhens, "when",
+                node.settings?.when || "when-all-is-well");
+  fillOneChoice("pipelineNodeWait", pipelineWaits, "wait",
+                node.settings?.wait || "no-wait");
+  sayWhatTheStepChoicesMean();
   $("pipelineNodeDialog").showModal();
+}
+
+// The two choices every step has, filled from what the harness said they are.
+// A list the page made up itself could offer something the harness cannot run.
+function fillOneChoice(id, from, key, chosen) {
+  const box = $(id);
+  box.replaceChildren();
+  for (const one of from) {
+    const option = make("option", "", one.label);
+    option.value = one[key];
+    box.append(option);
+  }
+  box.value = chosen;
+}
+
+function sayWhatTheStepChoicesMean() {
+  $("pipelineNodeWhenMeans").textContent =
+    pipelineWhens.find((one) => one.when === $("pipelineNodeWhen").value)?.means || "";
+  $("pipelineNodeWaitMeans").textContent =
+    pipelineWaits.find((one) => one.wait === $("pipelineNodeWait").value)?.means || "";
+  // Waiting only means anything when there is a second try to wait for.
+  const tries = Number($("pipelineNodeTries").value) || 1;
+  $("pipelineNodeWait").disabled = tries < 2;
+  if (tries < 2) {
+    $("pipelineNodeWaitMeans").textContent =
+      "Nothing to wait for: this step is only tried once. Raise the number above first.";
+  }
 }
 
 function savePipelineNode() {
@@ -2619,6 +2674,10 @@ function savePipelineNode() {
     .filter((tick) => tick.checked)
     .map((tick) => tick.dataset.asks);
   if (asks.length) settings.asks = asks;
+  const when = $("pipelineNodeWhen").value;
+  if (when && when !== "when-all-is-well") settings.when = when;
+  const wait = $("pipelineNodeWait").value;
+  if (wait && wait !== "no-wait" && (settings.tries || 1) > 1) settings.wait = wait;
   node.settings = settings;
   $("pipelineNodeDialog").close();
   renderPipeline();
@@ -2646,10 +2705,13 @@ async function savePipeline() {
       method: "POST", body: JSON.stringify({pipeline: pipelineOnScreen()}),
     });
     pipeline = said.pipeline;
+    pipelineSavedName = pipeline.name;
     say(`Saved ${pipeline.name}.`);
-    const list = await request("/api/pipelines");
+    const list = await request(`/api/pipelines?name=${encodeURIComponent(pipeline.name)}`);
     pipelineSaved = list.saved || [];
+    pipelineOlderOnes = list.older_ones || [];
     renderPipelineSaved();
+    if (pipelineLooking === "before") listHowItLookedBefore();
   } catch (error) { say(error.message); showError(error.message); }
 }
 
@@ -3306,6 +3368,9 @@ function bindEvents() {
   document.querySelectorAll("[data-pipeline-tab]").forEach((tab) => {
     tab.addEventListener("click", () => showPipelinePane(tab.dataset.pipelineTab));
   });
+  $("pipelineNodeWhen").addEventListener("change", sayWhatTheStepChoicesMean);
+  $("pipelineNodeWait").addEventListener("change", sayWhatTheStepChoicesMean);
+  $("pipelineNodeTries").addEventListener("input", sayWhatTheStepChoicesMean);
   $("pipelineCodeApply").addEventListener("click", useTheTypedPipeline);
   $("pipelineCodeCopy").addEventListener("click", copyThePipelineText);
   $("pipelineStarterSearch").addEventListener("input", (event) => {
@@ -3314,6 +3379,20 @@ function bindEvents() {
   });
   $("pipelineAskRun").addEventListener("click", runWithTheAnswers);
   $("pipelineAskCancel").addEventListener("click", () => $("pipelineAskDialog").close());
+  $("talkRefresh").addEventListener("click", () => refreshTalk(talkOpen));
+  $("talkStartAgain").addEventListener("click", startTalkingAgain);
+  $("talkAskEveryone").addEventListener("click", askEveryone);
+  $("talkForm").addEventListener("submit", (event) => { event.preventDefault(); sendWhatIsTyped(); });
+  $("talkBox").addEventListener("input", countWhatIsTyped);
+  $("talkBox").addEventListener("keydown", (event) => {
+    // Enter sends it, which is what everybody expects of a box like this.
+    // Shift and Enter is how you write a second line.
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendWhatIsTyped(); }
+  });
+  $("lookupRefresh").addEventListener("click", refreshLookup);
+  $("lookupWhere").addEventListener("click", () => lookSomethingUp("where-is-it"));
+  $("lookupUses").addEventListener("click", () => lookSomethingUp("what-uses-it"));
+  $("lookupWhat").addEventListener("click", () => lookSomethingUp("what-is-it"));
   $("teamAddCustom").addEventListener("click", openTheCustomWindow);
   $("teamAddModel").addEventListener("click", openTheModelWindow);
   $("teamCustomSave").addEventListener("click", saveTheCustomOne);
@@ -4016,6 +4095,7 @@ function showPipelinePane(which) {
   if (which === "code") writeThePipelineOut();
   if (which === "timeline") drawThePipelineTimeline();
   if (which === "help") listWhatEachStepIsFor();
+  if (which === "before") listHowItLookedBefore();
 }
 
 /* ---- the same thing as text ---- */
@@ -4131,6 +4211,59 @@ function listWhatEachStepIsFor() {
   }
 }
 
+/* ---- how it looked before ----
+   Saving over a pipeline used to lose the old one. Now each save keeps it, and
+   this is where they are: what changed, when, and a button to bring it back. */
+
+let pipelineOlderOnes = [];
+
+function listHowItLookedBefore() {
+  const list = $("pipelineOlderOnes");
+  list.replaceChildren();
+  if (!pipelineSavedName) {
+    list.append(make("li", "hint",
+      "This pipeline has not been saved yet, so there is nothing before it."));
+    return;
+  }
+  if (!pipelineOlderOnes.length) {
+    list.append(make("li", "hint",
+      `${pipelineSavedName} has only been saved once. The next time you save, what is `
+      + "here now is kept."));
+    return;
+  }
+  for (const [where, one] of pipelineOlderOnes.entries()) {
+    const row = make("li", "pipeline-older-one");
+    row.append(make("strong", "", where === 0 ? "The one before this" : `${where + 1} saves ago`));
+    row.append(make("p", "", one.what_changed || "nothing that shows here"));
+    row.append(make("p", "hint",
+      `${one.steps} steps, ${one.arrows} arrows. Saved ${one.saved_at}.`));
+    const back = make("button", "", "Put this one back");
+    back.type = "button";
+    back.dataset.older = String(where);
+    back.addEventListener("click", () => putAnOldOneBack(where));
+    row.append(back);
+    list.append(row);
+  }
+}
+
+async function putAnOldOneBack(which) {
+  if (!window.confirm(
+    "Put this older version back? What is on the board now is kept too, so you can "
+    + "swap back again.")) return;
+  try {
+    const said = await request("/api/pipelines/put-one-back", {
+      method: "POST",
+      body: JSON.stringify({name: pipelineSavedName, which}),
+    });
+    pipeline = said.pipeline;
+    pipelineOlderOnes = said.older_ones || [];
+    $("pipelineName").value = pipeline.name;
+    renderPipeline();
+    listHowItLookedBefore();
+    say(said.note || "Put it back.");
+  } catch (error) { showError(error.message); say(error.message); }
+}
+
 /* ---- the gallery, and searching it ---- */
 
 function pipelineStartersShown() {
@@ -4223,6 +4356,348 @@ async function answerTheStep(step, carryOn) {
     showWhatIsBeingAsked("");
     say(said.note || "Answered.");
   } catch (error) { showError(error.message); }
+}
+
+/* ==========================================================================
+   Talking to the assistants you have hooked up.
+
+   One box, one assistant, and the conversation kept. Nothing here can read a
+   file or run anything - it is a conversation, and anything that changes the
+   project goes through a run, where there is a record of it.
+   ========================================================================== */
+
+let talkWho = [];        // everyone on this machine, ready or not
+let talkOpen = "";       // whose conversation is on screen
+let talkBusy = false;    // waiting for an answer
+// Which refresh is the newest. Looking over the machine runs each assistant's
+// own tool, which takes about a second, so an old one can land long after
+// somebody has moved on - and used to write its words over theirs.
+let talkNewestRefresh = 0;
+
+async function refreshTalk(who, quietly) {
+  const mine = ++talkNewestRefresh;
+  try {
+    const asked = who === undefined ? talkOpen : who;
+    const said = await request(`/api/chat?who=${encodeURIComponent(asked || "")}`);
+    if (mine !== talkNewestRefresh) return;  // a newer look started while this one ran
+    talkWho = said.who || [];
+    talkOpen = said.open || "";
+    renderTalkWho();
+    renderTalkThread(said.said || []);
+    // Quietly, when this is a tidy-up after something the person just did.
+    // Otherwise the line saying what happened is replaced, a moment later, by
+    // a line saying nothing happened.
+    if (!quietly && !talkBusy) {
+      sayInTalk(talkTheOpenOne()
+        ? `Talking to ${talkTheOpenOne().label}. Type below and press Send.`
+        : "Nobody is set up to talk to yet. Open Your team and press Set them up.");
+    }
+    setWhatCanBePressed();
+    countWhatIsTyped();
+  } catch (error) {
+    if (mine !== talkNewestRefresh) return;
+    showError(error.message);
+    sayInTalk(error.message);
+  }
+}
+
+function talkTheOpenOne() {
+  return talkWho.find((one) => one.ready && one.route === talkOpen)
+    || talkWho.find((one) => one.ready)
+    || null;
+}
+
+function sayInTalk(words) { $("talkSaid").textContent = words; }
+
+// One place decides what can be pressed, so no path can leave a button off.
+// Leaving "Ask all of them" disabled after a send that failed is exactly the
+// kind of thing two places setting the same buttons produces.
+function setWhatCanBePressed() {
+  const somebody = talkTheOpenOne();
+  $("talkBox").disabled = !somebody;
+  $("talkSend").disabled = talkBusy || !somebody;
+  $("talkAskEveryone").disabled = talkBusy || !talkWho.some((one) => one.ready);
+  $("talkStartAgain").disabled = talkBusy || !somebody;
+  // The names on the left too, and now rather than the next time the list is
+  // drawn: switching while an answer is on its way leaves "Asking them..." on
+  // screen over somebody else's conversation.
+  for (const pick of $("talkWho").querySelectorAll(".talk-pick")) {
+    pick.disabled = talkBusy || pick.dataset.ready !== "yes";
+  }
+}
+
+function renderTalkWho() {
+  const list = $("talkWho");
+  list.replaceChildren();
+  if (!talkWho.length) {
+    list.append(make("li", "hint", "Nobody found on this machine yet."));
+    return;
+  }
+  for (const one of talkWho) {
+    const row = make("li", `talk-one ${one.ready ? "ready" : "not-ready"}`
+      + (one.ready && one.route === talkOpen ? " open" : ""));
+    const pick = make("button", "talk-pick", one.label || one.route || "The usual one");
+    pick.type = "button";
+    pick.dataset.ready = one.ready ? "yes" : "no";
+    pick.disabled = !one.ready;
+    pick.setAttribute("aria-pressed", String(one.ready && one.route === talkOpen));
+    // Not while an answer is on its way. Switching then left the answer
+    // arriving under the new one's name, as if they had said it.
+    pick.disabled = pick.disabled || talkBusy;
+    pick.addEventListener("click", () => {
+      if (talkBusy) return;
+      talkOpen = one.route;
+      refreshTalk(one.route);
+    });
+    row.append(pick);
+    if (one.model) row.append(make("p", "hint", one.model));
+    if (!one.ready) {
+      row.append(make("p", "talk-why-not", one.why_not));
+      if (one.how_to_fix_it) row.append(make("p", "hint", one.how_to_fix_it));
+    }
+    list.append(row);
+  }
+}
+
+function renderTalkThread(said) {
+  const list = $("talkThread");
+  list.replaceChildren();
+  if (!said.length) {
+    list.append(make("li", "hint",
+      "Nothing said yet. Whatever you type stays on this machine, and goes only to "
+      + "the assistant you picked."));
+    return;
+  }
+  for (const one of said) {
+    const row = make("li", `talk-turn ${one.who}`);
+    row.append(make("strong", "talk-turn-who",
+      one.who === "you" ? "You" : (talkTheOpenOne()?.label || "Them")));
+    row.append(make("p", "talk-turn-text", one.text));
+    const under = [];
+    if (one.at) under.push(one.at);
+    if (one.milliseconds) under.push(prettyTime(one.milliseconds));
+    if (one.model) under.push(one.model);
+    if (under.length) row.append(make("p", "hint", under.join(" | ")));
+    list.append(row);
+  }
+  list.lastElementChild.scrollIntoView({block: "nearest"});
+}
+
+function countWhatIsTyped() {
+  const box = $("talkBox");
+  const left = Number(box.maxLength || 6000) - box.value.length;
+  $("talkCount").textContent = left < 400 ? `${left} letters left` : "";
+}
+
+async function sendWhatIsTyped() {
+  const box = $("talkBox");
+  const words = box.value.trim();
+  const one = talkTheOpenOne();
+  if (!words) { sayInTalk("Type something first."); return; }
+  if (!one) { sayInTalk("Nobody is set up to talk to yet."); return; }
+  if (talkBusy) { sayInTalk("Still waiting for the last answer."); return; }
+  talkBusy = true;
+  setWhatCanBePressed();
+  sayInTalk(`Asking ${one.label}...`);
+  // Shown straight away, so the words are on screen while the answer is coming.
+  renderTalkThread([
+    ...[...$("talkThread").querySelectorAll(".talk-turn")].map(readOneTurnBack),
+    {who: "you", text: words, at: ""},
+  ]);
+  try {
+    const said = await request("/api/chat/say", {
+      method: "POST", body: JSON.stringify({who: one.route, text: words}),
+    });
+    if (talkOpen !== one.route) {
+      // Somebody switched while this was on its way. It is kept and will be
+      // there when they switch back; what it must not do is appear under
+      // whoever is on screen now.
+      sayInTalk(`${one.label} answered. Pick them again to read it.`);
+      return;
+    }
+    box.value = "";
+    countWhatIsTyped();
+    renderTalkThread(said.said || []);
+    sayInTalk(`${one.label} answered.`);
+  } catch (error) {
+    // Read back from what was really kept, so the message that did not go
+    // through stops looking like one that did. The words stay in the box.
+    // Quietly: the reason it failed is the last word, not "type below".
+    await refreshTalk(one.route, true);
+    sayInTalk(error.message);
+    showError(error.message);
+  } finally {
+    talkBusy = false;
+    setWhatCanBePressed();
+    renderTalkWho();
+  }
+}
+
+// Reading a turn back off the screen, so what is already there survives having
+// the one being typed added under it.
+function readOneTurnBack(row) {
+  return {
+    who: row.classList.contains("you") ? "you" : "them",
+    text: row.querySelector(".talk-turn-text")?.textContent || "",
+    at: "",
+  };
+}
+
+async function askEveryone() {
+  const box = $("talkBox");
+  const words = box.value.trim();
+  if (!words) { sayInTalk("Type something first."); return; }
+  if (talkBusy) { sayInTalk("Still waiting for the last answer."); return; }
+  talkBusy = true;
+  setWhatCanBePressed();
+  sayInTalk("Asking every one of them at once...");
+  try {
+    const said = await request("/api/chat/ask-everyone", {
+      method: "POST", body: JSON.stringify({text: words}),
+    });
+    renderWhatEveryoneSaid(said.answers || []);
+    box.value = "";
+    countWhatIsTyped();
+    await refreshTalk(talkOpen, true);
+    sayInTalk(`${(said.answers || []).length} of them were asked.`);
+  } catch (error) {
+    sayInTalk(error.message);
+    showError(error.message);
+  } finally {
+    talkBusy = false;
+    setWhatCanBePressed();
+    renderTalkWho();
+  }
+}
+
+function renderWhatEveryoneSaid(answers) {
+  const box = $("talkEveryone");
+  const list = $("talkEveryoneList");
+  list.replaceChildren();
+  box.hidden = !answers.length;
+  for (const one of answers) {
+    const row = make("li", `talk-everyone-one ${one.went_wrong ? "went-wrong" : ""}`);
+    row.append(make("strong", "", one.label || one.route));
+    row.append(make("p", "talk-turn-text", one.went_wrong || one.answer));
+    if (one.milliseconds) row.append(make("p", "hint", prettyTime(one.milliseconds)));
+    list.append(row);
+  }
+}
+
+async function startTalkingAgain() {
+  const one = talkTheOpenOne();
+  if (!one) return;
+  if (!window.confirm(
+    `Throw away the conversation with ${one.label}? What was said is gone for good.`)) return;
+  try {
+    const said = await request("/api/chat/start-again", {
+      method: "POST", body: JSON.stringify({who: one.route}),
+    });
+    renderTalkThread([]);
+    $("talkEveryone").hidden = true;
+    sayInTalk(said.note || "That conversation is gone.");
+  } catch (error) { showError(error.message); sayInTalk(error.message); }
+}
+
+/* ==========================================================================
+   Looking things up in the code.
+
+   Where is it, what uses it, what is it. The answer says whether it is exact -
+   a tool built for that language was asked - or a guess from reading the files.
+   Those are different things, and only one is worth acting on without checking.
+   ========================================================================== */
+
+let lookupTools = [];
+
+async function refreshLookup() {
+  try {
+    const said = await request("/api/look-up");
+    lookupTools = said.servers || [];
+    renderLookupTools();
+  } catch (error) { showError(error.message); }
+}
+
+function renderLookupTools() {
+  const list = $("lookupTools");
+  list.replaceChildren();
+  const ready = lookupTools.filter((one) => one.ready);
+  for (const one of lookupTools) {
+    const row = make("li", `lookup-tool ${one.ready ? "ready" : "not-ready"}`);
+    row.append(make("strong", "", one.label));
+    row.append(make("p", "", one.ready
+      ? `Ready. Exact answers for ${one.for_files.join(", ")}.`
+      : `Not installed. To get it: ${one.how_to_get_it}`));
+    if (one.ready && one.found_at) row.append(make("p", "hint", one.found_at));
+    list.append(row);
+  }
+  $("lookupSaid").textContent = ready.length
+    ? `${ready.length} of these are installed, so answers about those files are exact.`
+    : "None of these are installed yet, so answers will be a search through your files. "
+      + "That is often enough, and it says so every time.";
+}
+
+async function lookSomethingUp(asking) {
+  const name = $("lookupName").value.trim();
+  const path = $("lookupPath").value.trim();
+  if (!name && !path) {
+    $("lookupSaid").textContent = "Type a name, or a file and a line, first.";
+    return;
+  }
+  $("lookupSaid").textContent = "Looking...";
+  $("lookupPlaces").replaceChildren();
+  try {
+    const said = await request("/api/look-up", {
+      method: "POST",
+      body: JSON.stringify({
+        asking,
+        name,
+        path,
+        line: Number($("lookupLine").value) || 0,
+        column: Number($("lookupColumn").value) || 0,
+      }),
+    });
+    renderLookupAnswer(said);
+  } catch (error) {
+    $("lookupSaid").textContent = error.message;
+    showError(error.message);
+  }
+}
+
+function renderLookupAnswer(said) {
+  const list = $("lookupPlaces");
+  list.replaceChildren();
+  const places = said.places || [];
+  const mark = make("p", said.exact ? "lookup-exact" : "lookup-guess",
+    said.exact
+      ? `Exact: ${said.how}.`
+      : `A guess: ${said.how}. ${said.note || ""}`);
+  $("lookupSaid").textContent = places.length
+    ? `${places.length} place${places.length === 1 ? "" : "s"} found.`
+    : (said.note || "Nothing found.");
+  const first = make("li", "lookup-mark");
+  first.append(mark);
+  list.append(first);
+  for (const place of places) {
+    const row = make("li", "lookup-place");
+    if (place.what) {
+      row.append(make("strong", "", place.path ? `${place.path}:${place.line}` : "What it is"));
+      row.append(make("pre", "lookup-what", place.what));
+    } else {
+      const open = make("button", "link", `${place.path}:${place.line}`);
+      open.type = "button";
+      open.title = "Put this file and line in the boxes above, to ask about it exactly";
+      open.addEventListener("click", () => {
+        $("lookupPath").value = place.path;
+        $("lookupLine").value = String(place.line);
+        $("lookupColumn").value = String(place.column || 1);
+        $("lookupSaid").textContent =
+          `Asking about ${place.path}:${place.line} now. Press one of the three again.`;
+      });
+      row.append(open);
+      if (place.text) row.append(make("code", "lookup-line", place.text));
+    }
+    list.append(row);
+  }
 }
 
 async function boot() {

@@ -123,6 +123,56 @@ everything that already runs a workflow runs a team.
 
 See [YOUR_TEAM.md](docs/YOUR_TEAM.md).
 
+## Talk to them
+
+A box to type in, and whichever assistant you have hooked up answers.
+
+![Talk to them](docs/images/talk-to-them.png)
+
+Everything set up on this machine is in the list on the left. Pick one and
+type. It is a conversation, not a row of unrelated questions - what was said
+before goes with the next thing you say - and it is kept, so you can close the
+panel and carry on tomorrow.
+
+**Ask all of them** puts the same question to every assistant that is ready, at
+the same time, and lays the answers side by side. That is what two
+subscriptions are actually for: one model's blind spot is not usually the
+other's.
+
+It cannot read your files, run anything, or change anything - paste what you
+want it to see. Everything typed and everything said back has credentials taken
+out before it is written down, and the conversations live in `.harness/chats`,
+which is never committed.
+
+See [TALK_TO_THEM.md](docs/TALK_TO_THEM.md).
+
+## Look it up
+
+Three questions about your own code, on their own tab: **where is it**, **what
+uses it**, **what is it**.
+
+![Look it up](docs/images/look-it-up.png)
+
+Every answer says whether it is exact or a guess. Exact means the tool built for
+that language was asked — the same one your editor asks. A guess means the files
+were read and the text matched, which is often right and cannot tell two things
+with the same name apart. A guess called a guess is useful; a guess called an
+answer sends you to the wrong place.
+
+Give it a name and it searches. Give it a file and a line and the answer is
+exact. Click any place it found and the file and line fill in for you, so the
+next question is the exact one.
+
+The panel lists the language servers it knows about, says which are installed,
+and gives the one command that installs each missing one. All of them are free
+and need no account. From a terminal:
+
+```bash
+harness look-up --asking what-uses-it --path src/basket.py --line 42
+```
+
+See [LOOK_IT_UP.md](docs/LOOK_IT_UP.md).
+
 ---
 
 ## What it knows about you
@@ -163,6 +213,16 @@ parts worth keeping as notes. It never writes over a note you have edited.
 
 ## Pipelines: many jobs, wired together
 
+**Pipelines is the tab for automating work.** Draw each job as a box, join the
+boxes with arrows, and press Run. It is the one to open when you want something
+to happen without you: the checks and tests you already run, chained up, with
+gates between them, tries that wait before trying again, a step that only runs
+when something breaks, a stop to ask a person, and a record of every version you
+have saved.
+
+(The **Workflow** tab is a different thing: it is about how the assistants work
+on one change. Pipelines is about jobs on this machine.)
+
 A check suite answers "does this project work?". A pipeline answers a bigger
 question: run these suites side by side, scan the code for credentials, only go
 on if that passed, then run the unit tests, and try the flaky one again.
@@ -185,13 +245,27 @@ when it did not, and dim when a gate stopped the work before it got there.
 | Git repo | Reads which branch you are on and what is uncommitted. It never writes. |
 | AI drafts a test | Asks the model you set up to write a test, and saves it as a draft for you to read. Nothing runs a draft where it is kept. |
 | Keep the evidence | Writes what happened into one file you can send to somebody. |
+| Ask an assistant | Puts one question to a model you already pay for and keeps the answer. It cannot read files or change anything. |
+| Run another pipeline | Runs one of your saved pipelines as a single step. |
 
 Any step can be told to try again up to five times before it gives up, which is
-usually enough for the one test that fails on a slow morning.
+usually enough for the one test that fails on a slow morning. It can wait
+between tries — the same few seconds each time, or longer each time — because
+something that failed because another thing was busy will fail again straight
+away.
 
-Four tabs over the board show the same pipeline four ways: the picture, the same
-thing written out as text you can edit, a timeline of the last run, and what
-every kind of step is for.
+Every step also says **when** it runs: when everything before it passed (the
+usual one), only when something before it failed, or whatever happened. The
+second is for telling somebody, or putting things right. The third is for the
+step that writes down what happened, which is needed most when the run went
+badly. A step that was only ever there for trouble does not make a good run look
+bad when it is skipped.
+
+Five tabs over the board show the same pipeline five ways: the picture, the same
+thing written out as text you can edit, a timeline of the last run, what every
+kind of step is for, and how it looked before. Saving over a pipeline keeps the
+one that was there — twenty of them — and any can be put back with one button,
+which keeps what is on the board too.
 
 ![How long each step took](docs/images/pipeline-timeline.png)
 
@@ -549,7 +623,9 @@ Cloning a repository never gives that repository the right to run code.
 | Guide | About |
 | --- | --- |
 | [QA.md](docs/QA.md) | Checks, in full: every kind, every option, every command |
-| [PIPELINES.md](docs/PIPELINES.md) | Wiring many jobs together, with gates between them |
+| [PIPELINES.md](docs/PIPELINES.md) | Automating work: jobs as boxes, arrows between them, and it runs itself |
+| [TALK_TO_THEM.md](docs/TALK_TO_THEM.md) | Typing to the assistants you have hooked up, one or all at once |
+| [LOOK_IT_UP.md](docs/LOOK_IT_UP.md) | Where is it, what uses it, what is it - in your own code |
 | [WHAT_IT_KNOWS.md](docs/WHAT_IT_KNOWS.md) | The notes the harness keeps about you and your project |
 | [YOUR_TEAM.md](docs/YOUR_TEAM.md) | The assistants on your machine, and how to make them work together |
 | [WHAT_WE_COULD_ADD.md](docs/WHAT_WE_COULD_ADD.md) | What two other harnesses have that this one does not, and what each is worth |

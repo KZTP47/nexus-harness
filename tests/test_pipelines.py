@@ -167,7 +167,7 @@ class RunningThemTests(PipelineTestCase):
     def stand_in(self, answers: dict[str, tuple[bool, str, str]]):
         """Every node kind stood in, so no real suite or model is started."""
 
-        def one(config, node, before, results, order, check_kinds, depth=0):
+        def one(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
             if node["kind"] == "start":
                 return True, "Started", ""
             if node["kind"] in pipelines.GATES:
@@ -206,7 +206,7 @@ class RunningThemTests(PipelineTestCase):
     def test_a_step_told_to_try_again_really_tries_again(self) -> None:
         tries: list[int] = []
 
-        def flaky(config, node, before, results, order, check_kinds, depth=0):
+        def flaky(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
             if node["id"] != "tests":
                 return True, "done", ""
             tries.append(1)
@@ -220,7 +220,7 @@ class RunningThemTests(PipelineTestCase):
         self.assertEqual(by_id["tests"].tries, 2)
 
     def test_a_step_that_throws_does_not_end_the_run(self) -> None:
-        def explodes(config, node, before, results, order, check_kinds, depth=0):
+        def explodes(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
             if node["id"] == "scan":
                 raise ValueError("something nobody expected")
             return True, "done", ""
@@ -260,7 +260,7 @@ class RunningThemTests(PipelineTestCase):
         # person can drag out and never use.
         # Waiting for a person is not run here: it is handled by the runner
         # itself, because it has to be able to wait, and _do_one cannot. Its
-        # own tests are in test_the_kestra_ideas.py.
+        # own tests are in test_running_less_than_all_of_it.py.
         for kind in set(pipelines.KINDS) - {"wait_for_a_person"}:
             with self.subTest(kind=kind):
                 node = {"id": "only", "kind": kind, "label": kind, "settings": {}}

@@ -197,6 +197,11 @@ def _plain_text(raw: str) -> str:
     return (fenced[0].strip() if fenced else text)
 
 
+# How much of a tool's own reason for refusing is worth reading. Far above a
+# real sentence, far below a page.
+LONGEST_REASON = 4000
+
+
 class SubscriptionCLIProvider(Provider):
     """Drive a signed-in assistant's command line as an ordinary program."""
 
@@ -313,9 +318,11 @@ class SubscriptionCLIProvider(Provider):
             raise HarnessError(f"{recipe.label} did not answer with JSON: {exc.msg}") from exc
         if recipe.error_field and _dotted(body, recipe.error_field) is True:
             said = _dotted(body, recipe.error_message_field) if recipe.error_message_field else ""
-            raise HarnessError(
-                f"{recipe.label} refused the request: {self._redactor.text(str(said or 'no reason given'))}"
-            )
+            # Cut to a length a person reads. Every other way of building one of
+            # these caps what it holds; this one did not, so a tool that answers
+            # with a page of detail put a page of detail in a sentence.
+            why = self._redactor.text(str(said or "no reason given"))[:LONGEST_REASON]
+            raise HarnessError(f"{recipe.label} refused the request: {why}")
         text = _dotted(body, recipe.text_field)
         if not isinstance(text, str) or not text.strip():
             raise HarnessError(

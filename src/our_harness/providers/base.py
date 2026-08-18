@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import copy
+import http.client
 import json
 import os
 import queue
@@ -147,7 +148,17 @@ class Provider(ABC):
                 exc.close()
             raise HarnessError(f"Provider HTTP {exc.code}: {self._redactor.text(body)}") from exc
         except (urllib.error.URLError, TimeoutError) as exc:
-            raise HarnessError(f"Provider request failed: {exc}") from exc
+            raise HarnessError(
+                f"Provider request failed: {self._redactor.text(str(exc))}"
+            ) from exc
+        except (ValueError, http.client.HTTPException) as exc:
+            # An address the machine cannot even take apart - a name and
+            # password written into it, a port that is not a number. Left to
+            # itself this is not the kind of failure anything above catches, so
+            # it went all the way out with whatever was in the address.
+            raise HarnessError(
+                f"Provider request failed: {self._redactor.text(str(exc))}"
+            ) from exc
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as exc:
