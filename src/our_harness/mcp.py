@@ -20,6 +20,16 @@ from .config import LoadedConfig
 from .models import HarnessError
 
 
+# What a program we start is told about this machine. Every one of these is a
+# path or a language, and none of them is a secret; the list is the one the
+# runner already uses, so a program started here and a job run there find the
+# same things.
+STARTS_A_PROGRAM = (
+    "PATH", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "WINDIR", "TMP", "TEMP",
+    "LANG", "LC_ALL", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE",
+    "HOMEPATH", "HOME",
+)
+
 MODERN_PROTOCOL_VERSION = "2026-07-28"
 LATEST_LEGACY_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_LEGACY_PROTOCOL_VERSIONS = frozenset(
@@ -213,7 +223,11 @@ class MCPClient:
             encoding="utf-8",
             errors="replace",
             shell=False,
-            env={name: os.environ[name] for name in ("PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "LANG", "LC_ALL") if name in os.environ},
+            # The same names a job we run gets, and for the same reason: these
+            # are paths, not secrets, and a program that cannot find the home
+            # folder cannot start at all. Without them our own server fell over
+            # before it said a word, and all our client saw was a closed pipe.
+            env={name: os.environ[name] for name in STARTS_A_PROGRAM if name in os.environ},
             **popen_options,
         )
         if os.name == "nt":

@@ -634,6 +634,7 @@ Cloning a repository never gives that repository the right to run code.
 | [TALK_TO_THEM.md](docs/TALK_TO_THEM.md) | Typing to the assistants you have hooked up, one or all at once |
 | [ON_A_TIMER.md](docs/ON_A_TIMER.md) | Having an automation run itself, with nobody watching |
 | [WHEN_IT_IS_STUCK.md](docs/WHEN_IT_IS_STUCK.md) | Noticing a run going round in circles, and seeing what it is doing |
+| [INSIDE_YOUR_EDITOR.md](docs/INSIDE_YOUR_EDITOR.md) | Working inside an editor you already have open |
 | [LOOK_IT_UP.md](docs/LOOK_IT_UP.md) | Where is it, what uses it, what is it - in your own code |
 | [WHAT_IT_KNOWS.md](docs/WHAT_IT_KNOWS.md) | The notes the harness keeps about you and your project |
 | [YOUR_TEAM.md](docs/YOUR_TEAM.md) | The assistants on your machine, and how to make them work together |

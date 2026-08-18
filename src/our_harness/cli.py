@@ -733,6 +733,50 @@ def command_timer(args: argparse.Namespace) -> int:
     raise HarnessError(f"Unknown timer command: {what}")
 
 
+def command_editor(args: argparse.Namespace) -> int:
+    """Work inside an editor you already have open.
+
+    Two things: the one that the editor starts and talks to, and the one that
+    prints what to paste so it can. Nothing here changes your editor's settings.
+    """
+
+    from . import editor as editor_lab
+
+    config = _config(args)
+    what = args.editor_command
+    if what == "serve":
+        # Not a word on this pipe that is not an answer. Anything else is read
+        # by the editor as a message, and one stray line ends the conversation.
+        return editor_lab.talk(
+            config, may_run_things=getattr(args, "let_it_run_things", False)
+        )
+    if what == "setup":
+        how = editor_lab.how_to_tell_your_editor(
+            config, may_run_things=getattr(args, "let_it_run_things", False)
+        )
+        print(f"To let an editor use this project ({how['project']}), paste this:")
+        print()
+        print(how["settings"])
+        print()
+        print("Where it goes:")
+        for one in how["where_it_goes"]:
+            print(f"    {one}")
+        print()
+        print("For anything that asks for the command and its parts separately:")
+        print(f"    command: {how['command']}")
+        for one in how["arguments"]:
+            print(f"    argument: {one}")
+        print()
+        if how["may_run_things"]:
+            print("This one may run commands on your machine: automations and")
+            print("checks. Leave --let-it-run-things off for reading only.")
+        else:
+            print("This one only reads. Add --let-it-run-things to let it run")
+            print("your automations and your checks as well.")
+        return 0
+    raise HarnessError(f"Unknown editor command: {what}")
+
+
 def command_look_up(args: argparse.Namespace) -> int:
     """Where is it, what uses it, what is it - from a terminal.
 
@@ -1753,6 +1797,27 @@ def parser() -> argparse.ArgumentParser:
         help="How often the machine looks. Ten is plenty",
     )
     timer_install.set_defaults(handler=command_timer)
+
+    editor = sub.add_parser(
+        "editor", help="Work inside an editor you already have open"
+    )
+    editor_sub = editor.add_subparsers(dest="editor_command", required=True)
+    editor_serve = editor_sub.add_parser(
+        "serve", help="Answer an editor. Your editor starts this; you do not"
+    )
+    editor_serve.add_argument(
+        "--let-it-run-things", action="store_true",
+        help="Also let it run your automations and your checks",
+    )
+    editor_serve.set_defaults(handler=command_editor)
+    editor_setup = editor_sub.add_parser(
+        "setup", help="Print what to paste into your editor, and where"
+    )
+    editor_setup.add_argument(
+        "--let-it-run-things", action="store_true",
+        help="Write the line that also lets it run your automations and checks",
+    )
+    editor_setup.set_defaults(handler=command_editor)
 
     look_up = sub.add_parser(
         "look-up", help="Where is it, what uses it, what is it - in your own code"

@@ -37,21 +37,14 @@ whether it is exact or a guess, which is the part that decides what you do
 next. There is a **Look it up** tab and a `harness look-up` command. See
 [LOOK_IT_UP.md](LOOK_IT_UP.md).
 
-### 4. Being an agent inside somebody else's editor
+### 4. Being an agent inside somebody else's editor — **built**
 
-**What it is.** A standard way for editors to talk to an agent, so the harness
-could run inside a tool somebody already has open rather than only in its own
-panel.
-
-**Where they do it.** DeepSeek exposes the whole harness this way; Hermes has
-the other half of the same conversation.
-
-**What it would take.** A new module beside `mcp.py`. We already speak the
-client half of a very similar protocol, so this is the mirror image of code we
-have.
-
-**Worth it: medium.** Real reach, but new surface to keep working, and our own
-panel already does the job for most people.
+Done. `editor.py` answers an editor down the pipe between them. It offers three
+things that only read - where is it, what this project already knows, which
+automations are saved - and two that run commands, which are not offered at all
+unless you started it with `--let-it-run-things`. `harness editor setup` prints
+what to paste and where; it never edits your editor's settings. See
+[INSIDE_YOUR_EDITOR.md](INSIDE_YOUR_EDITOR.md).
 
 ### 5. A nudge before the hard stop — **built**
 

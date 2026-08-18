@@ -4,7 +4,10 @@
     {
       "name": "harness-ui",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "our_harness", "ui"],
+      "runtimeArgs": [
+        "scripts/run_ui.py",
+        "ui"
+      ],
       "port": 8765
     }
   ]
