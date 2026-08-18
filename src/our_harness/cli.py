@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import sys
@@ -601,6 +602,135 @@ def command_carry(args: argparse.Namespace) -> int:
     print("")
     print(done.note)
     return 0
+
+
+def command_automation(args: argparse.Namespace) -> int:
+    """Run one saved automation, without the panel.
+
+    The panel could always run one; nothing else could. A timer, a build
+    server, and anybody who lives in a terminal all need this one command.
+    """
+
+    from . import pipelines as pipeline_lab
+
+    config = _config(args)
+    if args.automation_command == "list":
+        for name in pipeline_lab.saved_ones(config):
+            print(name)
+        return 0
+    held = pipeline_lab.load(config, args.name)
+    if args.automation_command == "check":
+        pipeline_lab.read_it(held)
+        print(f"{held['name']} can run.")
+        return 0
+    said_so_far: list[str] = []
+
+    def tell(event: dict[str, Any]) -> None:
+        payload = event.get("payload") or {}
+        if payload.get("state") in ("passed", "failed", "skipped"):
+            line = f"{payload.get('label')}: {payload.get('state')} - {payload.get('said')}"
+            said_so_far.append(line)
+            if not args.quiet:
+                print(line)
+
+    run = pipeline_lab.run_it(config, held, tell=tell, from_here=args.from_here or "",
+                              only=args.only or "")
+    print(run.said)
+    if args.json:
+        print(json.dumps(run.to_dict(), indent=2))
+    return 0 if run.passed else 1
+
+
+def command_timer(args: argparse.Namespace) -> int:
+    """Set up, look at, and set off the timers."""
+
+    from . import timer as timer_lab
+
+    config = _config(args)
+    what = args.timer_command
+    if what == "run":
+        put_aside = timer_lab.what_could_not_be_read(config)
+        if put_aside:
+            print(put_aside)
+        said = timer_lab.run_what_is_due(config)
+        for one in said["ran"]:
+            said_missed = timer_lab.how_many_missed_in_words(one["missed"])
+            missed = f" ({said_missed})" if said_missed else ""
+            print(f"{one['timer']}: {'passed' if one['passed'] else 'did not pass'}{missed} - {one['said']}")
+        if not said["ran"]:
+            print(said["note"])
+        return 0 if all(one["passed"] for one in said["ran"]) else 1
+    if what == "list":
+        found = timer_lab.every_one(config)
+        if not found:
+            print("Nothing is on a timer yet. Add one with: harness timer add")
+            return 0
+        now = datetime.datetime.now()
+        for one in found:
+            when = timer_lab.when_it_runs_next(one, now)
+            mark = "" if one.turned_on else "  (turned off)"
+            print(f"{one.name}: {one.automation}, {timer_lab.in_plain_words(one).lower()}{mark}")
+            print(f"    next: {when:%A %d %B at %H:%M}")
+            if one.runs:
+                last = one.runs[-1]
+                print(f"    last: {last['at']} {'passed' if last['passed'] else 'did not pass'} - {last['said'][:90]}")
+        return 0
+    if what == "add":
+        why_not = timer_lab.what_stops_it_running_alone(config, args.automation)
+        if why_not and not args.anyway:
+            print(why_not)
+            print("Add --anyway to put it on a timer regardless.")
+            return 1
+        saved = timer_lab.save(config, {
+            "name": args.name,
+            "automation": args.automation,
+            "how_often": args.how_often,
+            "at": args.at,
+            "on": args.on,
+            "turned_on": True,
+        }, they_meant_it=True)
+        # Looked at once now, so a timer added at noon does not set the
+        # night's job off the moment it is saved.
+        timer_lab.looked_just_now(config)
+        when = timer_lab.when_it_runs_next(saved, datetime.datetime.now())
+        print(f"{saved.name} runs {timer_lab.in_plain_words(saved).lower()}.")
+        print(f"Next: {when:%A %d %B at %H:%M}")
+        print("For it to run with nobody watching, see: harness timer install")
+        return 0
+    if what == "remove":
+        print(timer_lab.remove(config, args.name))
+        return 0
+    if what in ("on", "off"):
+        # Read here and saved straight away, so nothing in between can be
+        # written over by a copy read some time ago.
+        one = timer_lab.load(config, args.name)
+        if what == "on":
+            # Asked again. Turning one back on is putting it on a timer just as
+            # much as adding it was, and the reason it should not run alone has
+            # not gone away in the meantime.
+            why_not = timer_lab.what_stops_it_running_alone(config, one.automation)
+            if why_not and not getattr(args, "anyway", False):
+                print(why_not)
+                print("Add --anyway to turn it on regardless.")
+                return 1
+        one.turned_on = what == "on"
+        timer_lab.save(config, one.to_dict(), they_meant_it=True)
+        print(f"{one.name} is turned {what}.")
+        return 0
+    if what == "install":
+        how = timer_lab.how_to_ask_this_machine(config, args.every_minutes)
+        print(f"To have {how['machine']} run the timers every {args.every_minutes} minutes,")
+        print("run this line yourself. It is not run for you: asking a machine to")
+        print("start something on its own is your decision to make.")
+        print()
+        print(f"    {how['what']}")
+        print()
+        print("To see it afterwards:")
+        print(f"    {how['to_see_it']}")
+        print("To take it off again:")
+        print(f"    {how['to_take_it_off']}")
+        return 0
+    raise HarnessError(f"Unknown timer command: {what}")
 
 
 def command_look_up(args: argparse.Namespace) -> int:
@@ -1560,6 +1690,70 @@ def parser() -> argparse.ArgumentParser:
     )
     seats_setup.add_argument("--json", action="store_true")
     seats_setup.set_defaults(handler=command_seats)
+    automation = sub.add_parser(
+        "automation", help="Run a saved automation without opening the panel"
+    )
+    automation_sub = automation.add_subparsers(dest="automation_command", required=True)
+    automation_list = automation_sub.add_parser("list", help="Every automation this project has")
+    automation_list.set_defaults(handler=command_automation, name="", from_here="", only="",
+                                 quiet=False, json=False)
+    for which, helping in (("run", "Run it"), ("check", "Say whether it would run, without running it")):
+        one = automation_sub.add_parser(which, help=helping)
+        one.add_argument("name")
+        one.add_argument("--from-here", default="", help="Start at this step, not the first")
+        one.add_argument("--only", default="", help="Run only this step")
+        one.add_argument("--quiet", action="store_true", help="Say only the ending")
+        one.add_argument("--json", action="store_true")
+        one.set_defaults(handler=command_automation)
+
+    timer = sub.add_parser(
+        "timer", help="Run your automations on a timer, with nobody watching"
+    )
+    timer_sub = timer.add_subparsers(dest="timer_command", required=True)
+    timer_run = timer_sub.add_parser(
+        "run", help="Run whatever is due now and stop. This is what your machine calls"
+    )
+    timer_run.set_defaults(handler=command_timer)
+    timer_list = timer_sub.add_parser("list", help="What is on a timer, and when it runs next")
+    timer_list.set_defaults(handler=command_timer)
+    timer_add = timer_sub.add_parser("add", help="Put an automation on a timer")
+    timer_add.add_argument("name", help="What to call this timer")
+    timer_add.add_argument("automation", help="Which saved automation it runs")
+    timer_add.add_argument(
+        "--how-often", default="every-day",
+        choices=["every-hour", "every-day", "every-weekday", "every-week"],
+    )
+    timer_add.add_argument("--at", default="02:00", help="Time of day, like 02:00 or 17:30")
+    timer_add.add_argument(
+        "--on", default="monday", help="Which day, for a weekly one",
+        choices=["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+    )
+    timer_add.add_argument(
+        "--anyway", action="store_true",
+        help="Put it on a timer even if it stops to ask a person",
+    )
+    timer_add.set_defaults(handler=command_timer)
+    timer_remove = timer_sub.add_parser("remove", help="Take an automation off the timer")
+    timer_remove.add_argument("name")
+    timer_remove.set_defaults(handler=command_timer)
+    for which in ("on", "off"):
+        one = timer_sub.add_parser(which, help=f"Turn a timer {which}")
+        one.add_argument("name")
+        if which == "on":
+            one.add_argument(
+                "--anyway", action="store_true",
+                help="Turn it on even if it stops to ask a person",
+            )
+        one.set_defaults(handler=command_timer)
+    timer_install = timer_sub.add_parser(
+        "install", help="The line to give this machine, so the timers really run"
+    )
+    timer_install.add_argument(
+        "--every-minutes", type=int, default=10,
+        help="How often the machine looks. Ten is plenty",
+    )
+    timer_install.set_defaults(handler=command_timer)
+
     look_up = sub.add_parser(
         "look-up", help="Where is it, what uses it, what is it - in your own code"
     )

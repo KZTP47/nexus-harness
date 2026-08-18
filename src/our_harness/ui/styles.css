@@ -794,3 +794,24 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .talk-everyone-list { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 9px; }
 .talk-everyone-one { border-left: 5px solid #2563eb; border-radius: 9px; padding: 8px 10px; }
 .talk-everyone-one.went-wrong { border-left-color: #dc2626; }
+
+/* ---- when an automation runs on its own -------------------------------- */
+.timer-new { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin: 8px 0; }
+.timer-new label { display: block; font-size: .8rem; margin-bottom: 3px; color: #1f2933; }
+.timer-new input, .timer-new select { border-radius: 8px; padding: 6px 8px; font-size: .85rem; }
+#timerName { min-width: 180px; }
+.timer-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 9px; }
+.timer-one { border-left: 5px solid #16a34a; border-radius: 9px; padding: 8px 10px;
+  background: #fff; color: #1f2933; }
+.timer-one.off { border-left-color: #b6bfcc; }
+.timer-one p { margin: 3px 0 0; font-size: .84rem; }
+.timer-one .hint { color: #64748b; }
+.timer-last.passed { color: #15803d; }
+.timer-last.failed { color: #b91c1c; }
+.timer-one .button-row { margin-top: 7px; }
+.timer-machine { margin-top: 12px; color: #334155; }
+.timer-machine > summary { cursor: pointer; font-weight: 700; font-size: .88rem; color: #1f2933; }
+.timer-machine .hint { color: #64748b; }
+.timer-machine-line { background: #0f172a; color: #e2e8f0; border-radius: 8px;
+  padding: 9px 11px; font-size: .78rem; overflow-x: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; margin: 6px 0; }

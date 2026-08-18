@@ -257,6 +257,68 @@ def take_the_file_away(path: Path, *, missing_ok: bool = False) -> None:
         ) from exc
 
 
+def put_this_file_in_place(path: Path, written: str) -> None:
+    """Write beside, then move into place, so no reader ever sees half of one.
+
+    The moving is what needs the patience. Windows will not move a file over
+    one that anything has open, even only to read it, and on a busy panel
+    something usually does for a moment. Without the waiting, a settings file
+    written while two checks were reading it handed back a page of machine
+    detail for a write that would have worked a tenth of a second later.
+
+    The file beside it carries this process and this thread in its name, so two
+    writes at once cannot land on the same one and take each other's half.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    beside = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.part")
+    beside.write_text(written, encoding="utf-8")
+    # Six and a bit seconds all told. A reader really does hold the move off on
+    # Windows, and four checks running side by side hold it longer than one
+    # does, so the waiting is longer than it looks like it needs to be.
+    for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2):
+        try:
+            os.replace(beside, path)
+            return
+        except PermissionError:
+            time.sleep(wait)
+    try:
+        os.replace(beside, path)
+    except PermissionError as exc:
+        beside.unlink(missing_ok=True)
+        raise HarnessError(
+            f"{path.name} is held open by something else, so it could not be "
+            "written. Close whatever has it open and try again."
+        ) from exc
+
+
+def read_this_file_patiently(path: Path) -> str:
+    """Read a file something else may be moving into place this moment.
+
+    The other half of put_this_file_in_place. Windows will not let a file be
+    opened while it is being moved over, so a reader can lose the race just as
+    a writer can - and the settings file is read by nearly everything while the
+    panel writes it. Waiting a moment beats handing somebody a page of machine
+    detail for a read that works on the next try.
+    """
+
+    last: OSError | None = None
+    for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8):
+        try:
+            return path.read_text(encoding="utf-8")
+        except PermissionError as exc:
+            last = exc
+            time.sleep(wait)
+    try:
+        return path.read_text(encoding="utf-8")
+    except PermissionError as exc:
+        raise HarnessError(
+            f"{path.name} could not be read: something else is writing it this "
+            "moment, or this account is not allowed to read it. Try again in a "
+            "moment, and if it says the same thing, it is the permissions."
+        ) from (last or exc)
+
+
 def redact(value: str, secrets: list[str]) -> str:
     output = value
     for secret in sorted({item for item in secrets if len(item) >= 6}, key=len, reverse=True):

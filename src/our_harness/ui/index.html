@@ -436,6 +436,7 @@
         <button type="button" role="tab" data-pipeline-tab="timeline" aria-selected="false">How long each step took</button>
         <button type="button" role="tab" data-pipeline-tab="help" aria-selected="false">What each step is for</button>
         <button type="button" role="tab" data-pipeline-tab="before" aria-selected="false">How it looked before</button>
+        <button type="button" role="tab" data-pipeline-tab="timer" aria-selected="false">When it runs on its own</button>
       </div>
       <div id="pipelinePaneCode" class="pipeline-pane" data-pipeline-pane="code" hidden>
         <p class="hint">The same pipeline, written out. Change it here and the picture changes with it.</p>
@@ -451,6 +452,53 @@
         <p class="hint">One bar per step of the last run, laid out in time. The long one is the slow one.</p>
         <ol id="pipelineTimeline" class="pipeline-timeline"></ol>
       </div>
+      <div id="pipelinePaneTimer" class="pipeline-pane" data-pipeline-pane="timer" hidden>
+        <p class="hint">Have an automation run itself - every night, every weekday morning,
+          every hour - with nobody watching and the report waiting for you afterwards.</p>
+
+        <div class="timer-new" role="group" aria-label="Put an automation on a timer">
+          <div>
+            <label for="timerName">Call it</label>
+            <input id="timerName" type="text" maxlength="64" placeholder="Every night">
+          </div>
+          <div>
+            <label for="timerAutomation">Run</label>
+            <select id="timerAutomation"></select>
+          </div>
+          <div>
+            <label for="timerHowOften">How often</label>
+            <select id="timerHowOften"></select>
+          </div>
+          <div>
+            <label for="timerAt">At</label>
+            <input id="timerAt" type="time" value="02:00">
+          </div>
+          <div id="timerOnDayHolder" hidden>
+            <label for="timerOnDay">On</label>
+            <select id="timerOnDay"></select>
+          </div>
+          <button id="timerAdd" class="primary" type="button">Put it on a timer</button>
+        </div>
+        <p id="timerHowOftenMeans" class="hint"></p>
+        <p id="timerSaid" class="callout" role="status">Nothing runs on its own yet.</p>
+
+        <ul id="timerList" class="timer-list" aria-label="What runs on its own"></ul>
+
+        <details id="timerMachine" class="timer-machine">
+          <summary>One more step: tell your machine to look</summary>
+          <p class="hint">The harness does not sit in the background waiting. A program that
+            has to stay running is a program that is not running when you need it. Instead
+            your machine is asked to run one short command every so often, and it handles
+            being asleep and being restarted, because that is what it is for.</p>
+          <p class="hint">Run this line yourself. It is not run for you: asking a machine to
+            start something on its own is your decision to make.</p>
+          <pre id="timerMachineLine" class="timer-machine-line"></pre>
+          <button id="timerCopyLine" type="button">Copy that line</button>
+          <p class="hint">To take it off again later:</p>
+          <pre id="timerMachineOff" class="timer-machine-line"></pre>
+        </details>
+      </div>
+
       <div id="pipelinePaneBefore" class="pipeline-pane" data-pipeline-pane="before" hidden>
         <p class="hint">Every time you save over a pipeline, the one that was there is kept.
           Put any of them back and the current one is kept too, so nothing is ever lost.</p>

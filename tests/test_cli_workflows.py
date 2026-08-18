@@ -366,3 +366,72 @@ class OtherCommandTests(unittest.TestCase):
         self.assertEqual(finished.returncode, 0, finished.stderr)
         self.assertIn("it did not work", finished.stdout)
         self.assertIn("plain English", finished.stdout)
+
+
+class TimerCommandTests(unittest.TestCase):
+    """Putting an automation on a timer from a terminal.
+
+    A timer runs with nobody watching, so every refusal has to come now, while
+    somebody is still there to read it - not at two in the morning.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        (self.root / ".harness").mkdir()
+        (self.root / ".harness" / "pipelines").mkdir()
+        for name, kind in (("nightly-check", "git_repo"), ("asks-first", "wait_for_a_person")):
+            (self.root / ".harness" / "pipelines" / f"{name}.json").write_text(
+                json.dumps({
+                    "name": "Nightly check" if kind == "git_repo" else "Asks first",
+                    "nodes": [
+                        {"id": "start", "kind": "start", "label": "Start", "settings": {}},
+                        {"id": "work", "kind": kind, "label": "The work",
+                         "settings": {"question": "Shall I?"} if kind == "wait_for_a_person" else {}},
+                    ],
+                    "edges": [{"from": "start", "to": "work"}],
+                }),
+                encoding="utf-8",
+            )
+
+    def test_one_that_stops_to_ask_a_person_is_refused_until_you_say_anyway(self) -> None:
+        refused = run(["timer", "add", "Every night", "Asks first"], self.root)
+        self.assertEqual(refused.returncode, 1, refused.stdout)
+        self.assertIn("--anyway", refused.stdout)
+        went_on = run(
+            ["timer", "add", "Every night", "Asks first", "--anyway"], self.root
+        )
+        self.assertEqual(went_on.returncode, 0, went_on.stderr)
+        self.assertIn("every day at 02:00", went_on.stdout)
+
+    def test_turning_one_back_on_asks_again(self) -> None:
+        """The reason it should not run alone has not gone away in the
+        meantime, so being asked once is not enough."""
+
+        run(["timer", "add", "Every night", "Asks first", "--anyway"], self.root)
+        run(["timer", "off", "Every night"], self.root)
+        refused = run(["timer", "on", "Every night"], self.root)
+        self.assertEqual(refused.returncode, 1, refused.stdout)
+        self.assertIn("--anyway", refused.stdout)
+        went_on = run(["timer", "on", "Every night", "--anyway"], self.root)
+        self.assertEqual(went_on.returncode, 0, went_on.stderr)
+        self.assertIn("turned on", went_on.stdout)
+
+    def test_one_with_nothing_wrong_with_it_needs_no_anyway(self) -> None:
+        added = run(["timer", "add", "Every night", "Nightly check"], self.root)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        run(["timer", "off", "Every night"], self.root)
+        back_on = run(["timer", "on", "Every night"], self.root)
+        self.assertEqual(back_on.returncode, 0, back_on.stdout)
+
+    def test_the_line_for_this_machine_is_printed_and_never_run(self) -> None:
+        told = run(["timer", "install"], self.root)
+        self.assertEqual(told.returncode, 0, told.stderr)
+        self.assertIn("timer run", told.stdout)
+        self.assertIn("your decision", told.stdout)
+
+    def test_nothing_on_a_timer_says_so_rather_than_nothing(self) -> None:
+        listed = run(["timer", "list"], self.root)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("Nothing is on a timer yet", listed.stdout)

@@ -24,6 +24,7 @@ from . import explain as explainer
 from . import pipeline_starters
 from . import pipelines as pipeline_lab
 from . import chat as chat_lab
+from . import timer as timer_lab
 from . import navigate as navigate_lab
 from . import plain_graph
 from . import qa as qalab
@@ -794,6 +795,45 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 )
                 answer["pipeline"] = on_screen
                 self._json(answer)
+            elif parsed.path == "/api/pipelines/why-not-alone":
+                # Why this automation should not be left to run itself, if it
+                # should not. Asked before it goes on a timer, not after.
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                self._json({
+                    "why_not": timer_lab.what_stops_it_running_alone(
+                        self.server.config, query.get("name", [""])[0]
+                    )
+                })
+            elif parsed.path == "/api/timers":
+                self._require_token()
+                import datetime as when_lab
+
+                config = self.server.config
+                now = when_lab.datetime.now()
+                with self.server.pipelines_lock:
+                    found = timer_lab.every_one(config)
+                    saved = pipeline_lab.saved_ones(config)
+                self._json({
+                    "timers": [
+                        dict(
+                            one.to_dict(),
+                            in_plain_words=timer_lab.in_plain_words(one),
+                            next_run=timer_lab.when_it_runs_next(one, now).strftime(
+                                "%A %d %B at %H:%M"
+                            ),
+                        )
+                        for one in found
+                    ],
+                    "automations": saved,
+                    "how_often": [
+                        {"how_often": key, "label": label, "means": means}
+                        for key, label, means in timer_lab.HOW_OFTEN
+                    ],
+                    "days": list(timer_lab.DAYS),
+                    "how_to_ask_this_machine": timer_lab.how_to_ask_this_machine(config),
+                    "could_not_be_read": timer_lab.what_could_not_be_read(config),
+                })
             elif parsed.path == "/api/chat":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -1215,6 +1255,75 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json(explainer.what_it_means(
                     str(body.get("said") or "")[:20000], kind=str(body.get("kind") or "")
                 ).to_dict())
+            elif self.path == "/api/timers/save":
+                with self.server.pipelines_lock:
+                    # Saving does the refusing. Held in the panel's own code
+                    # alone, anything talking to the harness directly got none
+                    # of it.
+                    saved = timer_lab.save(
+                        self.server.config,
+                        body.get("timer"),
+                        they_meant_it=bool(body.get("anyway")),
+                    )
+                    # Looked at once now, so a timer added at noon does not set
+                    # the night's job off the moment it is saved.
+                    timer_lab.looked_just_now(self.server.config)
+                self._json({
+                    "timer": saved.to_dict(),
+                    "in_plain_words": timer_lab.in_plain_words(saved),
+                    "why_not": timer_lab.what_stops_it_running_alone(
+                        self.server.config, saved.automation
+                    ),
+                })
+            elif self.path == "/api/timers/remove":
+                with self.server.pipelines_lock:
+                    self._json({
+                        "note": timer_lab.remove(
+                            self.server.config, str(body.get("name") or "")
+                        )
+                    })
+            elif self.path == "/api/timers/turn":
+                # Only the on-off switch, flipped where the timer is kept.
+                # Sending the whole timer back from a panel that had been open
+                # a while put back the old time and the old automation with it.
+                with self.server.pipelines_lock:
+                    one = timer_lab.load(
+                        self.server.config, str(body.get("name") or "")
+                    )
+                    one.turned_on = bool(body.get("turned_on"))
+                    saved = timer_lab.save(
+                        self.server.config,
+                        one.to_dict(),
+                        they_meant_it=bool(body.get("anyway")),
+                    )
+                self._json({
+                    "timer": saved.to_dict(),
+                    "note": f"{saved.name} is turned {'on' if saved.turned_on else 'off'}.",
+                })
+            elif self.path == "/api/timers/run-now":
+                # What the machine's scheduler would do, done here so somebody
+                # can see it work rather than wait until two in the morning.
+                name = str(body.get("name") or "")
+                with self.server.pipelines_lock:
+                    one = timer_lab.load(self.server.config, name)
+                    held = pipeline_lab.load(self.server.config, one.automation)
+                # The run itself is outside the lock: it can take the best part
+                # of an hour, and the panel must not be dead for all of it.
+                run = pipeline_lab.run_it(
+                    self.server.config, held, check_kinds=self.server.check_kinds,
+                )
+                # Written down like any other run. Without this the line saying
+                # what it last did never changed, however many times somebody
+                # pressed the button.
+                # Cleaned before it goes anywhere. Cleaned only on its way to
+                # the file, the same words still came back to the browser and
+                # onto the screen.
+                said = timer_lab.in_safe_words(self.server.config, run.said)
+                with self.server.pipelines_lock:
+                    timer_lab.write_down_a_run(
+                        self.server.config, one, said, run.passed, by_hand=True
+                    )
+                self._json({"passed": run.passed, "said": said})
             elif self.path == "/api/chat/say":
                 # No lock here: the conversation has one of its own, taken by
                 # every way of reaching it, including asking everyone at once.

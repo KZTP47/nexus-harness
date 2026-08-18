@@ -3379,6 +3379,9 @@ function bindEvents() {
   });
   $("pipelineAskRun").addEventListener("click", runWithTheAnswers);
   $("pipelineAskCancel").addEventListener("click", () => $("pipelineAskDialog").close());
+  $("timerAdd").addEventListener("click", addATimer);
+  $("timerHowOften").addEventListener("change", sayWhatTheTimerMeans);
+  $("timerCopyLine").addEventListener("click", copyTheMachineLine);
   $("talkRefresh").addEventListener("click", () => refreshTalk(talkOpen));
   $("talkStartAgain").addEventListener("click", startTalkingAgain);
   $("talkAskEveryone").addEventListener("click", askEveryone);
@@ -4096,6 +4099,7 @@ function showPipelinePane(which) {
   if (which === "timeline") drawThePipelineTimeline();
   if (which === "help") listWhatEachStepIsFor();
   if (which === "before") listHowItLookedBefore();
+  if (which === "timer") refreshTimers();
 }
 
 /* ---- the same thing as text ---- */
@@ -4356,6 +4360,223 @@ async function answerTheStep(step, carryOn) {
     showWhatIsBeingAsked("");
     say(said.note || "Answered.");
   } catch (error) { showError(error.message); }
+}
+
+/* ==========================================================================
+   When an automation runs on its own.
+
+   The harness does not sit in the background waiting for two in the morning.
+   The machine is asked to look every so often, and it handles being asleep and
+   being restarted. This panel says what is on a timer, when each one is next
+   due, what it did last time, and gives you the one line to hand your machine.
+   ========================================================================== */
+
+let timers = [];
+let timerHowOften = [];
+let timerMachine = {};
+
+async function refreshTimers() {
+  try {
+    const said = await request("/api/timers");
+    timers = said.timers || [];
+    timerHowOften = said.how_often || [];
+    timerMachine = said.how_to_ask_this_machine || {};
+    fillOneChoice("timerAutomation", (said.automations || []).map((one) => ({name: one, label: one})), "name",
+                  $("timerAutomation").value || (said.automations || [])[0] || "");
+    fillOneChoice("timerHowOften", timerHowOften, "how_often",
+                  $("timerHowOften").value || "every-day");
+    fillOneChoice("timerOnDay", (said.days || []).map((one) => ({day: one, label: one[0].toUpperCase() + one.slice(1)})),
+                  "day", $("timerOnDay").value || "monday");
+    sayWhatTheTimerMeans();
+    renderTimers();
+    $("timerMachineLine").textContent = timerMachine.what || "";
+    $("timerMachineOff").textContent = timerMachine.to_take_it_off || "";
+    if (said.could_not_be_read) sayAboutTimers(said.could_not_be_read);
+    if (!(said.automations || []).length) {
+      sayAboutTimers("Save an automation first, then it can be put on a timer.");
+    }
+  } catch (error) { showError(error.message); sayAboutTimers(error.message); }
+}
+
+function sayAboutTimers(words) { $("timerSaid").textContent = words; }
+
+function sayWhatTheTimerMeans() {
+  const picked = $("timerHowOften").value;
+  const one = timerHowOften.find((held) => held.how_often === picked);
+  $("timerHowOftenMeans").textContent = one ? one.means : "";
+  // A day of the week only means anything for a weekly one, and a time of day
+  // means nothing at all for an hourly one.
+  $("timerOnDayHolder").hidden = picked !== "every-week";
+  $("timerAt").disabled = picked === "every-hour";
+}
+
+function renderTimers() {
+  const list = $("timerList");
+  list.replaceChildren();
+  if (!timers.length) {
+    list.append(make("li", "hint",
+      "Nothing runs on its own yet. Fill in the boxes above and press Put it on a timer."));
+    return;
+  }
+  for (const one of timers) {
+    const row = make("li", `timer-one ${one.turned_on ? "on" : "off"}`);
+    row.append(make("strong", "", one.name));
+    row.append(make("p", "", `${one.automation} — ${one.in_plain_words.toLowerCase()}`));
+    row.append(make("p", "hint", one.turned_on ? `Next: ${one.next_run}` : "Turned off."));
+    const last = (one.runs || [])[one.runs.length - 1];
+    if (last) {
+      const missed = last.missed
+        ? ` (${last.missed >= 1000 ? "more than 1000" : last.missed} missed while the machine was off)`
+        : "";
+      row.append(make("p", `timer-last ${last.passed ? "passed" : "failed"}`,
+        `Last ran ${last.at}: ${last.passed ? "passed" : "did not pass"}${missed}. ${last.said}`));
+    }
+    const buttons = make("div", "button-row");
+    const turn = make("button", "", one.turned_on ? "Turn it off" : "Turn it on");
+    turn.type = "button";
+    turn.addEventListener("click", () => turnTheTimer(one, !one.turned_on));
+    const now = make("button", "", "Run it now");
+    now.type = "button";
+    now.title = "Do what the timer would do, without waiting for it";
+    now.addEventListener("click", () => runTheTimerNow(one, now));
+    const off = make("button", "", "Take it off");
+    off.type = "button";
+    off.addEventListener("click", () => takeTheTimerOff(one));
+    buttons.append(turn, now, off);
+    row.append(buttons);
+    list.append(row);
+  }
+}
+
+async function addATimer() {
+  const name = $("timerName").value.trim();
+  const automation = $("timerAutomation").value;
+  if (!name) { sayAboutTimers("Give the timer a name first."); return; }
+  if (!automation) { sayAboutTimers("Save an automation first, then it can be put on a timer."); return; }
+  // Asked before it is put on, not told after. From a terminal this is a
+  // refusal you have to say --anyway to; the panel used to save it regardless
+  // and mention it afterwards, which is not the same thing.
+  if (!await saySoBeforeItRunsAlone(automation, "Put it on a timer anyway?")) {
+    sayAboutTimers("Not put on a timer.");
+    return;
+  }
+  // The server refuses this too, so it is told they said yes.
+  await saveATimer({
+    name,
+    automation,
+    how_often: $("timerHowOften").value,
+    at: $("timerAt").value || "02:00",
+    on: $("timerOnDay").value || "monday",
+    turned_on: true,
+  }, `${name} is on a timer.`);
+  $("timerName").value = "";
+}
+
+async function saveATimer(timer, wordsWhenDone, anyway = true) {
+  try {
+    const said = await request("/api/timers/save", {
+      method: "POST", body: JSON.stringify({timer, anyway}),
+    });
+    await refreshTimers();
+    // Said after the refresh, so the tidy-up cannot write over it.
+    // The warning belongs to a timer that is going to run. Saying it while
+    // somebody turns one off is telling them about a problem they have just
+    // taken away.
+    if (said.why_not && timer.turned_on) {
+      sayAboutTimers(`${wordsWhenDone} But: ${said.why_not}`);
+    } else if (timer.turned_on) {
+      sayAboutTimers(
+        `${wordsWhenDone} ${said.in_plain_words}. One more step below: tell your machine to look.`);
+    } else {
+      sayAboutTimers(wordsWhenDone);
+    }
+  } catch (error) { showError(error.message); sayAboutTimers(error.message); }
+}
+
+async function whyItShouldNotRunAlone(automation) {
+  try {
+    const said = await request(
+      `/api/pipelines/why-not-alone?name=${encodeURIComponent(automation)}`);
+    return {why_not: said.why_not || "", asked: true};
+  } catch (error) {
+    // Could not ask is not the same as nothing wrong. Read as nothing wrong,
+    // one hiccup on the way to the question turned "ask before" into "tell
+    // afterwards", which is the whole point of asking.
+    return {why_not: "", asked: false};
+  }
+}
+
+async function saySoBeforeItRunsAlone(automation, what) {
+  const {why_not, asked} = await whyItShouldNotRunAlone(automation);
+  if (!asked) {
+    return window.confirm(
+      `The harness could not check whether ${automation} stops to ask a `
+      + `person. One that does will sit there all night with nobody to `
+      + `answer.\n\n${what}`);
+  }
+  if (!why_not) return true;
+  return window.confirm(`${why_not}\n\n${what}`);
+}
+
+async function turnTheTimer(one, on) {
+  // Asked again. Turning one back on is putting it on a timer just as much as
+  // adding it was, and the reason it should not run alone has not gone away.
+  if (on && !await saySoBeforeItRunsAlone(one.automation, "Turn it on anyway?")) {
+    sayAboutTimers("Left turned off.");
+    return;
+  }
+  // Only the switch is sent. Sending the whole timer back from a panel left
+  // open put back the old time and the old automation along with it, over
+  // whatever somebody else had changed in the meantime.
+  try {
+    const said = await request("/api/timers/turn", {
+      method: "POST",
+      body: JSON.stringify({name: one.name, turned_on: on, anyway: true}),
+    });
+    await refreshTimers();
+    sayAboutTimers(said.note || "");
+  } catch (error) { showError(error.message); sayAboutTimers(error.message); }
+}
+
+async function takeTheTimerOff(one) {
+  if (!window.confirm(`Take ${one.name} off the timer? The automation itself stays.`)) return;
+  try {
+    const said = await request("/api/timers/remove", {
+      method: "POST", body: JSON.stringify({name: one.name}),
+    });
+    await refreshTimers();
+    sayAboutTimers(said.note || "Taken off.");
+  } catch (error) { showError(error.message); sayAboutTimers(error.message); }
+}
+
+async function runTheTimerNow(one, button) {
+  button.disabled = true;
+  sayAboutTimers(`Running ${one.automation} now...`);
+  try {
+    const said = await request("/api/timers/run-now", {
+      method: "POST", body: JSON.stringify({name: one.name}),
+    });
+    sayAboutTimers(`${said.passed ? "Passed" : "Did not pass"}: ${said.said}`);
+  } catch (error) {
+    showError(error.message);
+    sayAboutTimers(error.message);
+  } finally { button.disabled = false; }
+}
+
+async function copyTheMachineLine() {
+  const line = $("timerMachineLine").textContent;
+  try {
+    await navigator.clipboard.writeText(line);
+    sayAboutTimers("Copied. Paste it into a terminal and run it yourself.");
+  } catch (error) {
+    // Some browsers will not copy without a gesture they recognise. Select it
+    // instead, so it can still be copied by hand.
+    const range = document.createRange();
+    range.selectNodeContents($("timerMachineLine"));
+    window.getSelection().removeAllRanges();
+    window.getSelection().addRange(range);
+    sayAboutTimers("Selected it for you - copy it with your keyboard.");
+  }
 }
 
 /* ==========================================================================

@@ -12,21 +12,14 @@ we have seats and no keys.
 
 ## Worth having
 
-### 1. Run things on a timer, with nobody watching
+### 1. Run things on a timer, with nobody watching — **built**
 
-**What it is.** Tell the harness "run the whole suite every night at two, and
-leave the report where I can find it in the morning." It does, without anybody
-starting it.
-
-**Where they do it.** Hermes has a real scheduler built in. DeepSeek has a
-smaller version — a reminder that only fires while a session is open — which is
-not the same thing.
-
-**What it would take.** A small module beside `resident.py`. The background job
-runner and its job store already exist; this is mostly wiring a clock to them.
-
-**Worth it: high.** Our own notes already list this as missing, and it needs
-nothing but this machine's clock.
+Done. `timer.py` runs your automations every hour, every day, every weekday or
+once a week. The harness does not stay running: your machine's own scheduler is
+asked to run `harness timer run` every so often, which is what makes this
+survive closing the window and restarting. It will not run two at once, it comes
+back from a week off with one run rather than a hundred, and it says so when an
+automation stops to ask a person. See [ON_A_TIMER.md](ON_A_TIMER.md).
 
 ### 2. Let an agent call for help part way through — **built**
 

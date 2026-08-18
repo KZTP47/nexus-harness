@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import HarnessError
+from .safety import put_this_file_in_place, read_this_file_patiently
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -323,7 +324,10 @@ def _merge(base: dict[str, Any], incoming: dict[str, Any], provenance: dict[str,
 
 def _read_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        # Patiently: the panel writes this file while everything else is
+        # reading it, and on Windows a reader loses that race as easily as a
+        # writer does.
+        value = json.loads(read_this_file_patiently(path))
     except (OSError, json.JSONDecodeError) as exc:
         raise HarnessError(f"Cannot read config {path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -1207,21 +1211,19 @@ def write_default_project_config(
         if updated_ignore and not updated_ignore.endswith("\n"):
             updated_ignore += "\n"
         updated_ignore += "\n".join(missing_entries) + "\n"
-        ignore_temporary = folder / ".gitignore.tmp"
-        ignore_temporary.write_text(updated_ignore, encoding="utf-8")
-        os.replace(ignore_temporary, local_ignore)
+        put_this_file_in_place(local_ignore, updated_ignore)
     selected = copy.deepcopy(DEFAULT_CONFIG)
     provider_requires_trust = provider in CREDENTIAL_PROVIDER_NAMES or provider == "local" or not _is_loopback_endpoint(endpoint)
     if not provider_requires_trust:
         selected["provider"].update({"name": provider, "model": model})
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(selected, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
-    local_temporary = folder / "config.local.json.tmp"
+    put_this_file_in_place(
+        path, json.dumps(selected, indent=2, sort_keys=True) + "\n"
+    )
     local_provider: dict[str, Any] = {"endpoint": endpoint, "api_key_env": api_key_env}
     if provider_requires_trust:
         local_provider.update({"name": provider, "model": model})
-    local_temporary.write_text(
+    put_this_file_in_place(
+        local_path,
         json.dumps(
             {
                 "provider": local_provider,
@@ -1234,8 +1236,6 @@ def write_default_project_config(
             indent=2,
             sort_keys=True,
         ) + "\n",
-        encoding="utf-8",
     )
-    os.replace(local_temporary, local_path)
     trust_project_local_config(root, local_path)
     return path

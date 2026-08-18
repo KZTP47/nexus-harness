@@ -282,6 +282,13 @@ And a step can **wait for a person**: the run stops, shows the question you
 wrote, and waits for *Carry on* or *Stop here*. Ten ready-made pipelines, in
 groups, with a search box over them — nobody should start from a blank board.
 
+**And it can run itself.** Put an automation on a timer - every night, every
+weekday morning, every hour - and it runs with nobody watching, with the report
+waiting for you afterwards. The harness does not sit in the background: your
+machine is asked to look every so often, which is why this survives closing the
+window and restarting. It writes out the line for your machine and leaves the
+running of it to you. See [ON_A_TIMER.md](docs/ON_A_TIMER.md).
+
 A pipeline is ordinary JSON in `.harness/pipelines`, so it can go into your
 repository and everyone gets the same one. There is deliberately no "run this
 shell line" step: a saved pipeline is a file people pass around, and a file
@@ -625,6 +632,7 @@ Cloning a repository never gives that repository the right to run code.
 | [QA.md](docs/QA.md) | Checks, in full: every kind, every option, every command |
 | [PIPELINES.md](docs/PIPELINES.md) | Automating work: jobs as boxes, arrows between them, and it runs itself |
 | [TALK_TO_THEM.md](docs/TALK_TO_THEM.md) | Typing to the assistants you have hooked up, one or all at once |
+| [ON_A_TIMER.md](docs/ON_A_TIMER.md) | Having an automation run itself, with nobody watching |
 | [LOOK_IT_UP.md](docs/LOOK_IT_UP.md) | Where is it, what uses it, what is it - in your own code |
 | [WHAT_IT_KNOWS.md](docs/WHAT_IT_KNOWS.md) | The notes the harness keeps about you and your project |
 | [YOUR_TEAM.md](docs/YOUR_TEAM.md) | The assistants on your machine, and how to make them work together |

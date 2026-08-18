@@ -19,6 +19,7 @@ with arrows, and press Run.
 | Keep what you had | Every save keeps the version before it, and any can be put back |
 | Show you what happened | Every box lights up as the work reaches it, and a timeline names the slow step |
 | Start from a ready-made one | Ten of them, with a search box |
+| Run itself on a timer | Every night, every weekday morning, every hour, with nobody watching |
 
 Not to be confused with the **Workflow** tab, which is about how the assistants
 work on one change - who plans, who writes, who reviews. This tab is about jobs
@@ -288,3 +289,17 @@ underneath it.
 It goes through the same model routes as everything else, so a route nobody set
 up is a route it cannot use. Leave **Which assistant** empty for the one this
 project already uses.
+
+---
+
+## Running itself
+
+An automation you have to press Run on is half an automation. Open **When it
+runs on its own**, pick how often, and it runs itself.
+
+The harness does not sit in the background waiting. Your machine's own
+scheduler is asked to run one short command every so often, which is what makes
+this survive closing the window and restarting the machine. The harness writes
+out the exact line and leaves the running of it to you.
+
+See [ON_A_TIMER.md](ON_A_TIMER.md).

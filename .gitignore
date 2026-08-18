@@ -36,3 +36,11 @@ __pycache__/
 benchmark-logs/
 benchmark-archive/
 reports/
+
+# When this machine last looked at its timers, and the lock a run holds while
+# it goes. About this machine at this moment, not about the project - the
+# timers themselves are meant to be shared, and they are kept beside these.
+.harness/timers/what-happened.json
+.harness/timers/.what-happened.json
+.harness/timers/.what-happened.json.could-not-be-read
+.harness/timers/running.lock

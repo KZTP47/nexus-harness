@@ -139,16 +139,22 @@
         },
         {
           "do": "run",
+          "script": " window.__everySaid = []; const line = document.getElementById('checkStatus'); window.__everySaid.push(line.textContent); new MutationObserver(() => window.__everySaid.push(line.textContent))   .observe(line, {childList: true, characterData: true, subtree: true}); return 'watching the line'; ",
+          "text": "watching the line",
+          "note": "Watch the one line everything writes to, rather than glance at it"
+        },
+        {
+          "do": "run",
           "script": "document.getElementById('validationStatus').textContent = ''; const line = document.getElementById('checkStatus'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('runChecks').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Running')))     { watcher.disconnect(); return 'true'; }   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) { watcher.disconnect(); return 'it said: ' + wrong; }   await new Promise(r => setTimeout(r, 100)); } watcher.disconnect(); return 'it never said what happened: ' + everySaid.join(' | ')",
           "text": "true",
           "timeout_ms": 60000,
           "note": "Pressing Run says it started"
         },
         {
-          "do": "expect_text",
-          "target": "#checkStatus",
-          "text": "checks passed",
-          "timeout_ms": 60000,
+          "do": "run",
+          "script": " for (let tries = 0; tries < 240; tries += 1) {   if (window.__everySaid.some(said => said.includes('checks passed'))) break;   await new Promise(r => setTimeout(r, 250)); } return window.__everySaid.some(said => said.includes('checks passed'))   ? 'the panel said the run finished'   : 'it never said the run finished: ' + window.__everySaid.join(' | '); ",
+          "text": "the panel said the run finished",
+          "timeout_ms": 90000,
           "note": "The panel reports the finished run"
         },
         {
@@ -796,22 +802,22 @@
           "note": "Open the checks view"
         },
         {
+          "do": "run",
+          "script": " window.__everySaid = []; const line = document.getElementById('checkStatus'); window.__everySaid.push(line.textContent); new MutationObserver(() => window.__everySaid.push(line.textContent))   .observe(line, {childList: true, characterData: true, subtree: true}); return 'watching the line'; ",
+          "text": "watching the line",
+          "note": "Watch the one line everything writes to, rather than glance at it"
+        },
+        {
           "do": "click",
           "target": "#makeBundle",
           "note": "Pack up the evidence"
         },
         {
-          "do": "expect_text",
-          "target": "#checkStatus",
-          "text": "harness-bundle-",
-          "timeout_ms": 60000,
-          "note": "It names the file it wrote"
-        },
-        {
-          "do": "expect_text",
-          "target": "#checkStatus",
-          "text": "Credentials were taken out",
-          "note": "It says what it did about credentials"
+          "do": "run",
+          "script": " for (let tries = 0; tries < 240; tries += 1) {   if (window.__everySaid.some(said => said.includes('harness-bundle-'))) break;   await new Promise(r => setTimeout(r, 250)); } const named = window.__everySaid.some(said => said.includes('harness-bundle-')); if (!named) return 'it never named the file: ' + window.__everySaid.join(' | '); return window.__everySaid.some(said => said.includes('Credentials were taken out'))   ? 'it named the file and said what it did about credentials'   : 'it named the file but said nothing about credentials'; ",
+          "text": "it named the file and said what it did about credentials",
+          "timeout_ms": 90000,
+          "note": "It names the file it wrote, and says what it did about credentials"
         }
       ],
       "expect": {
@@ -3241,7 +3247,7 @@
         "how"
       ],
       "url": "http://127.0.0.1:8765/",
-      "timeout_seconds": 240,
+      "timeout_seconds": 300,
       "steps": [
         {
           "do": "click",
@@ -3281,10 +3287,17 @@
         },
         {
           "do": "run",
-          "script": "refreshHowItWorks = async () => {}; document.getElementById('howDemo').click(); let sawOne = false; for (let tries = 0; tries < 900; tries += 1) {   if ([...document.querySelectorAll('#howStages li')]        .some(box => box.dataset.state === 'doing')) sawOne = true;   const done = [...document.querySelectorAll('#howStages li')]        .every(box => box.dataset.state === 'done');   if (done && !document.getElementById('howDemo').disabled) break;   await new Promise(r => setTimeout(r, 100)); } const all = [...document.querySelectorAll('#howStages li')]   .every(box => box.dataset.state === 'done'); if (!sawOne) return 'it never lit a step up'; return all ? 'it walked through every step' : 'it stopped part way'",
-          "text": "it walked through every step",
+          "script": "refreshHowItWorks = async () => {}; document.getElementById('howDemo').click(); let sawOne = false; for (let tries = 0; tries < 1100; tries += 1) {   if ([...document.querySelectorAll('#howStages li')]        .some(box => box.dataset.state === 'doing')) sawOne = true;   const done = [...document.querySelectorAll('#howStages li')]        .every(box => box.dataset.state === 'done');   if (done && !document.getElementById('howDemo').disabled) break;   await new Promise(r => setTimeout(r, 100)); } const all = [...document.querySelectorAll('#howStages li')]   .every(box => box.dataset.state === 'done'); if (!sawOne) return 'it never lit a step up'; window.__walkedThrough = all; return 'it lit the steps up'",
+          "text": "it lit the steps up",
           "timeout_ms": 120000,
           "note": "Show me how it works lights each step up in turn"
+        },
+        {
+          "do": "run",
+          "script": " if (window.__walkedThrough) return 'it walked through every step'; for (let tries = 0; tries < 1100; tries += 1) {   const boxes = [...document.querySelectorAll('#howStages li')];   if (boxes.length && boxes.every(box => box.dataset.state === 'done')       && !document.getElementById('howDemo').disabled) break;   await new Promise(r => setTimeout(r, 100)); } const boxes = [...document.querySelectorAll('#howStages li')]; return boxes.length && boxes.every(box => box.dataset.state === 'done')   ? 'it walked through every step'   : 'it stopped part way'; ",
+          "text": "it walked through every step",
+          "timeout_ms": 120000,
+          "note": "And on a busy machine it is given a second couple of minutes"
         },
         {
           "do": "run",
@@ -3673,7 +3686,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the pipeline on screen"
+      ]
     },
     {
       "id": "settings-view-lists-and-its-buttons-really-work",
@@ -4485,8 +4501,8 @@
       }
     },
     {
-      "id": "pipelines-five-ways-of-looking-at-one-pipeline",
-      "title": "The picture, the same thing as text, the timeline, what each step is for, and how it looked before",
+      "id": "pipelines-every-way-of-looking-at-one-has-something-behind-it",
+      "title": "Every way of looking at one automation has a panel behind it",
       "kind": "browser",
       "tags": [
         "ui",
@@ -4505,10 +4521,10 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-starter').length) break;   await new Promise(r => setTimeout(r, 250)); } const tabs = [...document.querySelectorAll('[data-pipeline-tab]')]   .map(one => one.textContent.trim()); return tabs.length === 5 ? 'there are five ways of looking at it'   : 'it offered ' + tabs.join(', ')",
-          "text": "there are five ways of looking at it",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-starter').length) break;   await new Promise(r => setTimeout(r, 250)); } const tabs = [...document.querySelectorAll('[data-pipeline-tab]')]; const panes = [...document.querySelectorAll('[data-pipeline-pane]')]; if (tabs.length < 4) return 'it offers only ' + tabs.length + ' ways to look at it'; const named = tabs.map(one => one.dataset.pipelineTab).sort(); const behind = panes.map(one => one.dataset.pipelinePane).sort(); const missing = named.filter(one => !behind.includes(one)); const orphaned = behind.filter(one => !named.includes(one)); if (missing.length) return 'these have nothing behind them: ' + missing.join(', '); if (orphaned.length) return 'these are behind no tab: ' + orphaned.join(', '); const silent = tabs.filter(one => !one.textContent.trim()); if (silent.length) return 'a tab has no words on it'; return 'every way of looking at it has something behind it'",
+          "text": "every way of looking at it has something behind it",
           "timeout_ms": 90000,
-          "note": "One pipeline, five ways of looking at it, side by side"
+          "note": "Every tab over the board has a panel, and every panel has a tab"
         },
         {
           "do": "click",
@@ -5327,6 +5343,235 @@
         "max_console_errors": 3,
         "max_page_errors": 0
       }
+    },
+    {
+      "id": "automations-can-run-themselves-on-a-timer",
+      "title": "An automation can be put on a timer, turned off, run now, and taken off",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines",
+        "timer"
+      ],
+      "touches": [
+        "the pipeline on screen"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the automations view"
+        },
+        {
+          "do": "run",
+          "script": " window.confirm = () => true; const on = (await request('/api/timers')).timers.map(one => one.name); for (const name of on) {   if (name === 'Put on by a check' || name === 'Asked by a check') {     await request('/api/timers/remove', {method: 'POST', body: JSON.stringify({name})});   } } return 'nothing of ours is left over'; ",
+          "text": "nothing of ours is left over",
+          "timeout_ms": 45000,
+          "note": "Start from nothing, whatever an earlier run left behind"
+        },
+        {
+          "do": "run",
+          "script": " refreshPipelines = async () => {}; window.confirm = () => true; for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const saved = await request('/api/pipelines'); if (!(saved.saved || []).includes('On a timer by a check')) {   pipeline = {name: 'On a timer by a check', nodes: [     {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 60}},     {id: 'repo', kind: 'git_repo', label: 'What is uncommitted', settings: {}, at: {x: 320, y: 60}}   ], edges: [{from: 'start', to: 'repo'}]};   document.getElementById('pipelineName').value = 'On a timer by a check';   renderPipeline();   document.getElementById('pipelineSave').click();   for (let tries = 0; tries < 120; tries += 1) {     const now = await request('/api/pipelines');     if ((now.saved || []).includes('On a timer by a check')) break;     await new Promise(r => setTimeout(r, 250));   } } return 'there is an automation to put on a timer'; ",
+          "text": "there is an automation to put on a timer",
+          "timeout_ms": 60000,
+          "note": "Save a small automation for the timer to run"
+        },
+        {
+          "do": "click",
+          "target": "[data-pipeline-tab=\"timer\"]",
+          "note": "Look at when it runs on its own"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.getElementById('timerAutomation').options.length) break;   await new Promise(r => setTimeout(r, 250)); } const ways = [...document.getElementById('timerHowOften').options].map(o => o.text); if (ways.length < 4) return 'it offers only ' + ways.length + ' ways to run'; const means = document.getElementById('timerHowOftenMeans').textContent.trim(); return means ? 'it says how often it can run, and what each one means'   : 'it says nothing about what the choice means'; ",
+          "text": "it says how often it can run, and what each one means",
+          "timeout_ms": 45000,
+          "note": "It offers the ways to run, in plain words"
+        },
+        {
+          "do": "choose",
+          "target": "#timerAutomation",
+          "value": "On a timer by a check",
+          "note": "Choose which automation runs"
+        },
+        {
+          "do": "choose",
+          "target": "#timerHowOften",
+          "value": "every-week",
+          "note": "Choose: once a week"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 300)); return document.getElementById('timerOnDayHolder').hidden   ? 'a weekly one does not ask which day'   : 'choosing weekly asks which day'; ",
+          "text": "choosing weekly asks which day",
+          "note": "A weekly one asks which day; the others do not"
+        },
+        {
+          "do": "choose",
+          "target": "#timerOnDay",
+          "value": "friday",
+          "note": "Choose which day the weekly one runs"
+        },
+        {
+          "do": "run",
+          "script": " return document.getElementById('timerOnDay').value === 'friday'   ? 'the day was taken' : 'the day was not taken'; ",
+          "text": "the day was taken",
+          "note": "And the day is remembered"
+        },
+        {
+          "do": "choose",
+          "target": "#timerHowOften",
+          "value": "every-hour",
+          "note": "Choose: every hour"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 300)); if (!document.getElementById('timerOnDayHolder').hidden) return 'it still asks which day'; return document.getElementById('timerAt').disabled   ? 'an hourly one does not ask for a time of day'   : 'it still asks for a time of day'; ",
+          "text": "an hourly one does not ask for a time of day",
+          "note": "A time of day means nothing for an hourly one"
+        },
+        {
+          "do": "run",
+          "script": " document.getElementById('timerHowOften').value = 'every-day'; document.getElementById('timerHowOften').dispatchEvent(new Event('change', {bubbles: true})); document.getElementById('timerName').value = 'Put on by a check'; document.getElementById('timerAt').value = '02:00'; return 'the boxes are filled in'; ",
+          "text": "the boxes are filled in",
+          "note": "Fill it in"
+        },
+        {
+          "do": "click",
+          "target": "#timerAdd",
+          "note": "Put it on a timer"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 200; tries += 1) {   if ([...document.querySelectorAll('#timerList .timer-one')]        .some(one => one.textContent.includes('Put on by a check'))) break;   await new Promise(r => setTimeout(r, 250)); } const row = [...document.querySelectorAll('#timerList .timer-one')]   .find(one => one.textContent.includes('Put on by a check')); if (!row) return 'it was not put on a timer'; return row.textContent.includes('Next:')   ? 'it says when it runs next' : 'it does not say when it runs next'; ",
+          "text": "it says when it runs next",
+          "timeout_ms": 60000,
+          "note": "It is on the list, and says when it next runs"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   const said = document.getElementById('timerSaid').textContent;   if (said.includes('tell your machine')) return 'it says the one more step needed';   await new Promise(r => setTimeout(r, 250)); } return 'it said ' + document.getElementById('timerSaid').textContent; ",
+          "text": "it says the one more step needed",
+          "note": "And says the one thing left to do for it to really run",
+          "timeout_ms": 45000
+        },
+        {
+          "do": "run",
+          "script": " const box = document.getElementById('timerMachine'); box.open = true; await new Promise(r => setTimeout(r, 200)); const line = document.getElementById('timerMachineLine').textContent; const off = document.getElementById('timerMachineOff').textContent; if (!line.includes('timer run')) return 'the line does not run the timer'; if (!off.trim()) return 'it does not say how to take it off again'; return 'it gives the line and how to undo it'; ",
+          "text": "it gives the line and how to undo it",
+          "note": "The line for the machine, and how to take it off again"
+        },
+        {
+          "do": "click",
+          "target": "#timerCopyLine",
+          "note": "Copy that line"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 400)); const said = document.getElementById('timerSaid').textContent; return said.toLowerCase().includes('copied') || said.toLowerCase().includes('selected')   ? 'copying says what happened'   : 'it said ' + said; ",
+          "text": "copying says what happened",
+          "note": "Copying says what happened, whichever way the browser allows"
+        },
+        {
+          "do": "run",
+          "script": " const row = [...document.querySelectorAll('#timerList .timer-one')]   .find(one => one.textContent.includes('Put on by a check')); const turn = [...row.querySelectorAll('button')].find(b => b.textContent === 'Turn it off'); turn.click(); for (let tries = 0; tries < 120; tries += 1) {   const now = [...document.querySelectorAll('#timerList .timer-one')]     .find(one => one.textContent.includes('Put on by a check'));   if (now && now.textContent.includes('Turned off.')) return 'it can be turned off';   await new Promise(r => setTimeout(r, 250)); } return 'it would not turn off'; ",
+          "text": "it can be turned off",
+          "timeout_ms": 45000,
+          "note": "It can be turned off without being taken away"
+        },
+        {
+          "do": "run",
+          "script": " const row = [...document.querySelectorAll('#timerList .timer-one')]   .find(one => one.textContent.includes('Put on by a check')); const off = [...row.querySelectorAll('button')].find(b => b.textContent === 'Take it off'); off.click(); for (let tries = 0; tries < 120; tries += 1) {   const gone = ![...document.querySelectorAll('#timerList .timer-one')]     .some(one => one.textContent.includes('Put on by a check'));   if (gone) break;   await new Promise(r => setTimeout(r, 250)); } if ([...document.querySelectorAll('#timerList .timer-one')]      .some(one => one.textContent.includes('Put on by a check'))) {   return 'it would not come off'; } const saved = await request('/api/pipelines'); if (!(saved.saved || []).includes('On a timer by a check')) {   return 'taking the timer off took the automation with it'; } await request('/api/pipelines/delete', {   method: 'POST', body: JSON.stringify({name: 'On a timer by a check'}), }); return 'the timer came off and the automation stayed'; ",
+          "text": "the timer came off and the automation stayed",
+          "timeout_ms": 45000,
+          "note": "Taking a timer off leaves the automation alone, and tidies up"
+        }
+      ]
+    },
+    {
+      "id": "a-timer-asks-before-it-runs-alone-and-keeps-a-newer-edit",
+      "title": "The panel asks before putting a stop-and-ask automation on a timer, and turning one off keeps a newer edit",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines",
+        "timer"
+      ],
+      "touches": [
+        "the pipeline on screen"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the automations view"
+        },
+        {
+          "do": "run",
+          "script": " window.confirm = () => true; const on = (await request('/api/timers')).timers.map(one => one.name); for (const name of on) {   if (name === 'Put on by a check' || name === 'Asked by a check') {     await request('/api/timers/remove', {method: 'POST', body: JSON.stringify({name})});   } } return 'nothing of ours is left over'; ",
+          "text": "nothing of ours is left over",
+          "timeout_ms": 45000,
+          "note": "Start from nothing, whatever an earlier run left behind"
+        },
+        {
+          "do": "run",
+          "script": " refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const saved = await request('/api/pipelines'); if (!(saved.saved || []).includes('Stops to ask by a check')) {   pipeline = {name: 'Stops to ask by a check', nodes: [     {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 60}},     {id: 'ask', kind: 'wait_for_a_person', label: 'Are you sure?',      settings: {question: 'Shall I?'}, at: {x: 320, y: 60}}   ], edges: [{from: 'start', to: 'ask'}]};   document.getElementById('pipelineName').value = 'Stops to ask by a check';   renderPipeline();   document.getElementById('pipelineSave').click();   for (let tries = 0; tries < 120; tries += 1) {     const now = await request('/api/pipelines');     if ((now.saved || []).includes('Stops to ask by a check')) break;     await new Promise(r => setTimeout(r, 250));   } } return 'there is an automation that stops to ask somebody'; ",
+          "text": "there is an automation that stops to ask somebody",
+          "timeout_ms": 60000,
+          "note": "Save an automation that stops to ask a person"
+        },
+        {
+          "do": "click",
+          "target": "[data-pipeline-tab=\"timer\"]",
+          "note": "Look at when it runs on its own"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.getElementById('timerAutomation').options.length) break;   await new Promise(r => setTimeout(r, 250)); } let asked = ''; window.confirm = (words) => { asked = words; return false; }; document.getElementById('timerName').value = 'Asked by a check'; document.getElementById('timerAutomation').value = 'Stops to ask by a check'; document.getElementById('timerHowOften').value = 'every-day'; document.getElementById('timerHowOften').dispatchEvent(new Event('change', {bubbles: true})); document.getElementById('timerAdd').click(); for (let tries = 0; tries < 120; tries += 1) {   if (asked) break;   await new Promise(r => setTimeout(r, 250)); } if (!asked) return 'it was put on a timer without asking'; if (!asked.toLowerCase().includes('nobody')) return 'it asked, but said ' + asked; await new Promise(r => setTimeout(r, 500)); const on = (await request('/api/timers')).timers.map(one => one.name); return on.includes('Asked by a check')   ? 'saying no still put it on a timer'   : 'it asks first, and no means no'; ",
+          "text": "it asks first, and no means no",
+          "timeout_ms": 60000,
+          "note": "One that stops to ask a person is asked about first, and no means no"
+        },
+        {
+          "do": "run",
+          "script": " window.confirm = () => true; document.getElementById('timerAdd').click(); for (let tries = 0; tries < 200; tries += 1) {   const on = (await request('/api/timers')).timers.map(one => one.name);   if (on.includes('Asked by a check')) break;   await new Promise(r => setTimeout(r, 250)); } const on = (await request('/api/timers')).timers.map(one => one.name); return on.includes('Asked by a check')   ? 'saying yes puts it on anyway'   : 'saying yes did not put it on'; ",
+          "text": "saying yes puts it on anyway",
+          "timeout_ms": 60000,
+          "note": "And yes puts it on anyway - it is a warning, not a wall"
+        },
+        {
+          "do": "run",
+          "script": " const real = request; let asked = ''; window.confirm = (words) => { asked = words; return false; }; request = async (path, options) => {   if (path.includes('why-not-alone')) throw new Error('the wire went quiet');   return real(path, options); }; try {   document.getElementById('timerName').value = 'Could not ask by a check';   document.getElementById('timerAutomation').value = 'Stops to ask by a check';   document.getElementById('timerAdd').click();   for (let tries = 0; tries < 120; tries += 1) {     if (asked) break;     await new Promise(r => setTimeout(r, 250));   } } finally { request = real; } if (!asked) return 'it went ahead without asking'; if (!asked.toLowerCase().includes('could not check')) return 'it asked, but said ' + asked; await new Promise(r => setTimeout(r, 500)); const on = (await request('/api/timers')).timers.map(held => held.name); return on.includes('Could not ask by a check')   ? 'saying no still put it on'   : 'not being able to ask still asks'; ",
+          "text": "not being able to ask still asks",
+          "timeout_ms": 60000,
+          "note": "When the panel cannot find out, it says so and still asks, rather than going ahead"
+        },
+        {
+          "do": "run",
+          "script": " await refreshTimers(); const one = (await request('/api/timers')).timers   .find(held => held.name === 'Asked by a check'); await request('/api/timers/save', {method: 'POST',   body: JSON.stringify({timer: {...one, at: '05:30'}})}); const row = [...document.querySelectorAll('#timerList .timer-one')]   .find(held => held.textContent.includes('Asked by a check')); [...row.querySelectorAll('button')].find(b => b.textContent === 'Turn it off').click(); for (let tries = 0; tries < 120; tries += 1) {   const now = (await request('/api/timers')).timers     .find(held => held.name === 'Asked by a check');   if (now && !now.turned_on) {     return now.at === '05:30'       ? 'turning it off kept the newer time'       : 'turning it off put the old time back: ' + now.at;   }   await new Promise(r => setTimeout(r, 250)); } return 'it would not turn off'; ",
+          "text": "turning it off kept the newer time",
+          "timeout_ms": 60000,
+          "note": "Somebody else moves it to half five while this panel holds the old one; turning it off must not put the old time back"
+        },
+        {
+          "do": "run",
+          "script": " let asked = ''; window.confirm = (words) => { asked = words; return false; }; let turn = null; for (let tries = 0; tries < 200; tries += 1) {   const row = [...document.querySelectorAll('#timerList .timer-one')]     .find(held => held.textContent.includes('Asked by a check'));   turn = row     ? [...row.querySelectorAll('button')].find(b => b.textContent === 'Turn it on')     : null;   if (turn) break;   await new Promise(r => setTimeout(r, 250)); } if (!turn) return 'the panel never offered to turn it back on'; turn.click(); for (let tries = 0; tries < 120; tries += 1) {   if (asked) break;   await new Promise(r => setTimeout(r, 250)); } if (!asked) return 'it was turned back on without asking'; await new Promise(r => setTimeout(r, 500)); const now = (await request('/api/timers')).timers   .find(held => held.name === 'Asked by a check'); return now.turned_on   ? 'saying no still turned it on'   : 'turning it back on asks again'; ",
+          "text": "turning it back on asks again",
+          "timeout_ms": 60000,
+          "note": "Turning one back on is putting it on a timer again, so it asks again"
+        },
+        {
+          "do": "run",
+          "script": " window.confirm = () => true; await request('/api/timers/remove', {method: 'POST',   body: JSON.stringify({name: 'Asked by a check'})}); await request('/api/pipelines/delete', {method: 'POST',   body: JSON.stringify({name: 'Stops to ask by a check'})}); await refreshTimers(); return 'it tidied up after itself'; ",
+          "text": "it tidied up after itself",
+          "timeout_ms": 45000,
+          "note": "Put everything back as it was"
+        }
+      ]
     }
   ]
 }

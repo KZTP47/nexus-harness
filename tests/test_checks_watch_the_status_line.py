@@ -34,6 +34,24 @@ WATCHING = "MutationObserver"
 KEPT_ON_THE_PAGE = "__everySaid"
 
 
+def steps_that_wait_on_the_line():
+    """Steps that ask the line itself to say something, and only glance at it.
+
+    An expect_text on that line is a glance every tenth of a second, which is
+    the very thing this file is about - and it was not looked at here until a
+    check about packing up evidence failed because somebody else's "All 1 checks
+    passed." landed on the line first.
+    """
+
+    cases = json.loads(FLOWS.read_text(encoding="utf-8"))["cases"]
+    for case in cases:
+        for spot, step in enumerate(case.get("steps", []), 1):
+            if step.get("do", "").startswith("expect") and THE_LINE in str(
+                step.get("target", "")
+            ):
+                yield case["id"], spot, step.get("note", "")
+
+
 def scripts_that_read_the_line():
     cases = json.loads(FLOWS.read_text(encoding="utf-8"))["cases"]
     for case in cases:
@@ -81,4 +99,24 @@ class WatchTheLineTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    unittest.main()
+
+
+class NoCheckWaitsOnTheLineWithoutWatchingIt(unittest.TestCase):
+    def test_nothing_expects_text_on_the_one_line_everything_writes_to(self) -> None:
+        glancing = [
+            f"{case} step {spot}: {note}"
+            for case, spot, note in steps_that_wait_on_the_line()
+        ]
+        self.assertEqual(
+            glancing,
+            [],
+            "These steps wait for words on the one line everything writes to, "
+            "which is a glance every tenth of a second and loses to anything "
+            "else that finishes first. Watch the line in a run step instead, "
+            "keeping everything it says:\n" + "\n".join(glancing),
+        )
+
+
+if __name__ == "__main__":  # pragma: no cover
     unittest.main()
