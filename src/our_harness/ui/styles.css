@@ -815,3 +815,19 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .timer-machine-line { background: #0f172a; color: #e2e8f0; border-radius: 8px;
   padding: 9px 11px; font-size: .78rem; overflow-x: auto; white-space: pre-wrap;
   overflow-wrap: anywhere; margin: 6px 0; }
+
+/* What the agent says it is doing, and what the harness had to say to it. */
+.doing-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; }
+.doing-one { background: rgba(99, 230, 255, 0.06); display: grid; grid-template-columns: auto 1fr; gap: .6rem; align-items: baseline;
+  padding: .45rem .6rem; border-radius: .5rem; border-left: 3px solid transparent; }
+.doing-one p { margin: 0; }
+.doing-state { font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; opacity: .8; }
+.doing-one.going { border-left-color: var(--cyan); }
+.doing-one.done { opacity: .65; }
+.doing-one.done p { text-decoration: line-through; }
+.doing-one.dropped { opacity: .5; }
+.doing-one.dropped p { text-decoration: line-through; }
+.doing-one.empty-state { grid-template-columns: 1fr; }
+.warning-list { list-style: none; margin: .6rem 0 0; padding: 0; display: grid; gap: .35rem; }
+.warning-one { background: rgba(255, 216, 106, 0.1); padding: .45rem .6rem; border-radius: .5rem; border-left: 3px solid var(--yellow);
+  font-size: .9rem; }

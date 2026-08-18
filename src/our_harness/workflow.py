@@ -15,7 +15,15 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .agent_tools import AgentToolSession, action_envelope_schema, parse_native_tool_calls, tool_loop_instructions
+from .agent_tools import (
+    KEEP_A_LIST_EARLY,
+    MY_LIST_TOOL_NAMES,
+    WHAT_A_NOTICE_IS,
+    AgentToolSession,
+    action_envelope_schema,
+    parse_native_tool_calls,
+    tool_loop_instructions,
+)
 from .changes import FileTransaction, file_sha256
 from .cooperation import CooperativeDispatch, CooperativeScheduler
 from .config import LoadedConfig
@@ -3076,6 +3084,9 @@ class HarnessApplication:
             return session.execute(node, call["call_id"], call["name"], call["arguments"])
 
         instructions = tool_loop_instructions(definitions, session.waiting_messages(node))
+        offers_a_list = any(
+            str(item.get("name")) in MY_LIST_TOOL_NAMES for item in definitions
+        )
         transcript: list[dict[str, Any]] = []
         envelope_format = ResponseFormat(
             f"{response_format.name}_action_v1",
@@ -3110,6 +3121,13 @@ class HarnessApplication:
                     + "\n\nUse the supplied function tools when more repository evidence is needed. "
                     "When finished, return the direct final object required by the configured response format. "
                     "Do not wrap the final object in an action envelope."
+                    # The word from the harness reaches this route as well, so
+                    # what it is has to be said on this route as well. Said
+                    # only on the other one, the warning arrived here looking
+                    # like something the project had said. The same words as
+                    # the other way round, from the one place they are written.
+                    + "\n" + WHAT_A_NOTICE_IS
+                    + ("\n" + KEEP_A_LIST_EARLY if offers_a_list else "")
                 )
             else:
                 round_prompt = (

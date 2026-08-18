@@ -53,32 +53,22 @@ have.
 **Worth it: medium.** Real reach, but new surface to keep working, and our own
 panel already does the job for most people.
 
-### 5. A nudge before the hard stop
+### 5. A nudge before the hard stop — **built**
 
-**What it is.** Today the loop stops after a fixed number of tries. This adds a
-friendly warning earlier — "you have called the same tool with the same input
-three times" — so a stuck agent gets a chance to notice before its whole budget
-is gone.
+Done. A tool result comes back with a `notice` on it when the same question has
+come back with the same answer three times, or when three calls are left. Both
+are said to the agent and shown to the person watching. The hard stop still
+stops; a warning buys nobody an extra call. See
+[WHEN_IT_IS_STUCK.md](WHEN_IT_IS_STUCK.md).
 
-**Where they do it.** DeepSeek has a guard that watches for exactly this.
+### 6. A running to-do list you can watch — **built**
 
-**What it would take.** A few lines inside the loop in `agent_tools.py`.
-
-**Worth it: medium.** Cheap, and it saves wasted turns.
-
-### 6. A running to-do list you can watch
-
-**What it is.** A plain list — read the file, write the fix, run the tests —
-kept up to date as the work goes, shown to the person watching.
-
-**Where they do it.** DeepSeek keeps one list per session, shown to both the
-model and the person.
-
-**What it would take.** A small addition to `agent_tools.py` and a panel in the
-control panel.
-
-**Worth it: low to medium.** Our workflow board already lights each step as it
-runs, so most of this is there.
+Done. `keep_a_list` lets an agent say what it is doing - read the file, write
+the fix, run the tests - and whether each one is waiting, going, done or
+dropped. It shows under **What it is doing** in the Workflow view and stays
+there after the run. The board lights the steps *we* gave the run; this is the
+steps the agent gave itself, which is the half nobody could see. See
+[WHEN_IT_IS_STUCK.md](WHEN_IT_IS_STUCK.md).
 
 ---
 

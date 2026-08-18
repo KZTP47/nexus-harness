@@ -300,6 +300,15 @@
         <div class="table-scroll"><table><caption class="sr-only">Provider usage by request</caption><thead><tr><th scope="col">Agent</th><th scope="col">Provider</th><th scope="col">Model</th><th scope="col">Tokens</th><th scope="col">Latency</th><th scope="col">Cost</th></tr></thead><tbody id="usageBody"></tbody></table></div>
       </section>
 
+      <section class="glass event-panel" aria-labelledby="doingTitle">
+        <div class="section-heading">
+          <div><h2 id="doingTitle">What it is doing</h2><p>The steps the agent says it is working through, as it works through them.</p></div>
+          <output id="doingCount">Nothing yet.</output>
+        </div>
+        <ol id="doingList" class="doing-list"></ol>
+        <ul id="warningList" class="warning-list" aria-label="Words of warning"></ul>
+      </section>
+
       <section class="glass event-panel" aria-labelledby="teamTitle">
         <div class="section-heading">
           <div><h2 id="teamTitle">Team notes</h2><p>What the agents told each other during this run.</p></div>

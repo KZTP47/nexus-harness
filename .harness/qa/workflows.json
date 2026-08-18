@@ -5552,7 +5552,7 @@
         },
         {
           "do": "run",
-          "script": " await refreshTimers(); const one = (await request('/api/timers')).timers   .find(held => held.name === 'Asked by a check'); await request('/api/timers/save', {method: 'POST',   body: JSON.stringify({timer: {...one, at: '05:30'}})}); const row = [...document.querySelectorAll('#timerList .timer-one')]   .find(held => held.textContent.includes('Asked by a check')); [...row.querySelectorAll('button')].find(b => b.textContent === 'Turn it off').click(); for (let tries = 0; tries < 120; tries += 1) {   const now = (await request('/api/timers')).timers     .find(held => held.name === 'Asked by a check');   if (now && !now.turned_on) {     return now.at === '05:30'       ? 'turning it off kept the newer time'       : 'turning it off put the old time back: ' + now.at;   }   await new Promise(r => setTimeout(r, 250)); } return 'it would not turn off'; ",
+          "script": " await refreshTimers(); const one = (await request('/api/timers')).timers   .find(held => held.name === 'Asked by a check'); await request('/api/timers/save', {method: 'POST',   body: JSON.stringify({timer: {...one, at: '05:30'}, anyway: true})}); const row = [...document.querySelectorAll('#timerList .timer-one')]   .find(held => held.textContent.includes('Asked by a check')); [...row.querySelectorAll('button')].find(b => b.textContent === 'Turn it off').click(); for (let tries = 0; tries < 120; tries += 1) {   const now = (await request('/api/timers')).timers     .find(held => held.name === 'Asked by a check');   if (now && !now.turned_on) {     return now.at === '05:30'       ? 'turning it off kept the newer time'       : 'turning it off put the old time back: ' + now.at;   }   await new Promise(r => setTimeout(r, 250)); } return 'it would not turn off'; ",
           "text": "turning it off kept the newer time",
           "timeout_ms": 60000,
           "note": "Somebody else moves it to half five while this panel holds the old one; turning it off must not put the old time back"
@@ -5572,6 +5572,70 @@
           "note": "Put everything back as it was"
         }
       ]
+    },
+    {
+      "id": "what-it-is-doing-is-shown-while-it-works",
+      "title": "The panel shows the steps the agent says it is on, and what the harness told it",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "workflow"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "check_accessibility": true,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"workflow\"]",
+          "note": "Open the workflow view"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#doingList",
+          "note": "There is a place for it"
+        },
+        {
+          "do": "expect_text",
+          "target": "#doingTitle",
+          "text": "What it is doing"
+        },
+        {
+          "do": "run",
+          "script": " whatItIsDoing = []; wordsOfWarning = []; renderWhatItIsDoing(); const said = document.getElementById('doingList').textContent; return said.includes('has not said what it is doing yet')   ? 'with nothing yet, it says so in plain words'   : 'it said ' + said; ",
+          "text": "with nothing yet, it says so in plain words",
+          "note": "With nothing yet it says so, rather than showing an empty box"
+        },
+        {
+          "do": "run",
+          "script": " applyDoingEvent({kind: 'the_list', node: 'planner', payload: {steps: [   {what: 'Read the file', how_it_is_going: 'done'},   {what: 'Write the fix', how_it_is_going: 'going'},   {what: 'Run the tests', how_it_is_going: 'waiting'} ]}}); const rows = [...document.querySelectorAll('#doingList .doing-one')]; if (rows.length !== 3) return 'it drew ' + rows.length + ' steps'; if (!rows[1].classList.contains('going')) return 'it does not mark the one it is on'; const counted = document.getElementById('doingCount').textContent; return counted.includes('1 of 3 done')   ? 'it shows each step, marks the one it is on, and counts them'   : 'it counted ' + counted; ",
+          "text": "it shows each step, marks the one it is on, and counts them",
+          "note": "Every step is drawn, the one it is on is marked, and the count is right"
+        },
+        {
+          "do": "run",
+          "script": " applyDoingEvent({kind: 'the_list', node: 'planner', payload: {steps: [   {what: 'A different plan', how_it_is_going: 'going'} ]}}); const rows = [...document.querySelectorAll('#doingList .doing-one')]; return rows.length === 1 && rows[0].textContent.includes('A different plan')   ? 'changing its mind replaces the list rather than adding to it'   : 'it left ' + rows.length + ' steps'; ",
+          "text": "changing its mind replaces the list rather than adding to it",
+          "note": "The whole list is sent each time, so a new one replaces the old"
+        },
+        {
+          "do": "run",
+          "script": " applyDoingEvent({kind: 'a_word_of_warning', node: 'planner', payload: {   said: 'You have now asked read_file the same thing 3 times.' }}); const rows = [...document.querySelectorAll('#warningList .warning-one')]; return rows.length === 1 && rows[0].textContent.includes('same thing 3 times')   ? 'a word of warning is put in front of the person watching'   : 'it drew ' + rows.length + ' warnings'; ",
+          "text": "a word of warning is put in front of the person watching",
+          "note": "What the harness told the agent is shown to the person too"
+        },
+        {
+          "do": "run",
+          "script": " for (let number = 0; number < 20; number += 1) {   applyDoingEvent({kind: 'a_word_of_warning', node: 'planner',     payload: {said: 'warning number ' + number}}); } const rows = [...document.querySelectorAll('#warningList .warning-one')]; if (rows.length > MOST_WARNINGS) return 'it kept ' + rows.length + ' of them'; whatItIsDoing = []; wordsOfWarning = []; renderWhatItIsDoing(); return 'a run warned over and over does not fill the page'; ",
+          "text": "a run warned over and over does not fill the page",
+          "note": "One problem said forty times is still one problem, not forty lines"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0,
+        "max_accessibility_problems": 0
+      }
     }
   ]
 }

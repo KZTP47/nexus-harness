@@ -569,6 +569,7 @@ async function pollEvents() {
         // arrives, and the page quietly never shows it.
         if (["qa_", "pick_", "record_", "coverage_"].some((start) => kind.startsWith(start))) applyCheckEvent(event);
         if (kind === "agent_message") applyTeamEvent(event);
+        if (kind === "the_list" || kind === "a_word_of_warning") applyDoingEvent(event);
         if (kind.startsWith("pipeline_")) applyPipelineEvent(event);
       } catch (error) {
         appendEvent("update", `One update could not be read: ${error.message}`);
@@ -615,7 +616,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); if (name === "lookup") refreshLookup(); if (name === "talk") refreshTalk(); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); renderWhatItIsDoing(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); if (name === "lookup") refreshLookup(); if (name === "talk") refreshTalk(); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -1196,6 +1197,77 @@ function renderHistory() {
 }
 
 /* ---- Team notes: what the agents told each other ---- */
+
+/* ==========================================================================
+   What the agent says it is doing, and anything the harness had to say to it.
+
+   A run used to be a wall of tool calls with no plan behind it, and the only
+   sign of one going nowhere was it stopping when the budget ran out. These two
+   put both in front of the person watching: the steps the agent means to take,
+   and the moment the harness told it that it was going round in circles.
+   ========================================================================== */
+
+let whatItIsDoing = [];
+let wordsOfWarning = [];
+
+// The most kept on screen. A run that keeps being warned has one problem, not
+// forty, and forty lines of it push everything else off the page.
+const MOST_WARNINGS = 8;
+
+const HOW_IT_IS_GOING = {
+  waiting: "Waiting",
+  going: "Going",
+  done: "Done",
+  dropped: "Dropped",
+};
+
+function applyDoingEvent(event) {
+  const said = event.payload || {};
+  if (event.kind === "the_list") {
+    whatItIsDoing = (said.steps || []).map((one) => ({
+      what: String(one.what || ""),
+      howItIsGoing: String(one.how_it_is_going || "waiting"),
+    }));
+    renderWhatItIsDoing();
+    const going = whatItIsDoing.find((one) => one.howItIsGoing === "going");
+    announce(going ? `Now: ${going.what}` : `${whatItIsDoing.length} steps planned.`);
+    return;
+  }
+  wordsOfWarning.push({
+    node: String(event.node || "an agent"),
+    said: String(said.said || ""),
+  });
+  wordsOfWarning = wordsOfWarning.slice(-MOST_WARNINGS);
+  renderWhatItIsDoing();
+  announce(`A word of warning to ${event.node || "an agent"}: ${said.said || ""}`, true);
+}
+
+function renderWhatItIsDoing() {
+  const list = $("doingList");
+  list.replaceChildren();
+  const done = whatItIsDoing.filter((one) => one.howItIsGoing === "done").length;
+  $("doingCount").textContent = whatItIsDoing.length
+    ? `${done} of ${whatItIsDoing.length} done`
+    : "Nothing yet.";
+  if (!whatItIsDoing.length) {
+    const empty = make("li", "doing-one empty-state");
+    empty.append(make("p", "", "The agent has not said what it is doing yet. Its steps appear here while a run is going, and stay after it ends."));
+    list.append(empty);
+  }
+  for (const one of whatItIsDoing) {
+    const item = make("li", `doing-one ${one.howItIsGoing}`);
+    item.append(make("span", "doing-state", HOW_IT_IS_GOING[one.howItIsGoing] || one.howItIsGoing));
+    item.append(make("p", "", one.what));
+    list.append(item);
+  }
+  const warnings = $("warningList");
+  warnings.replaceChildren();
+  for (const one of wordsOfWarning) {
+    const item = make("li", "warning-one");
+    item.append(make("strong", "", `${one.node}: `), make("span", "", one.said));
+    warnings.append(item);
+  }
+}
 
 let teamNotes = [];
 
@@ -4923,7 +4995,7 @@ function renderLookupAnswer(said) {
 
 async function boot() {
   bindEvents();
-  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
+  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); renderWhatItIsDoing(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
 }
 
 boot();
