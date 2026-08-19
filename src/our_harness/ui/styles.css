@@ -831,3 +831,13 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .warning-list { list-style: none; margin: .6rem 0 0; padding: 0; display: grid; gap: .35rem; }
 .warning-one { background: rgba(255, 216, 106, 0.1); padding: .45rem .6rem; border-radius: .5rem; border-left: 3px solid var(--yellow);
   font-size: .9rem; }
+
+/* Being told when a run finishes. */
+.telling-new { display: flex; flex-wrap: wrap; gap: .6rem; align-items: flex-end; }
+.telling-list { list-style: none; margin: .6rem 0 0; padding: 0; display: grid; gap: .5rem; }
+.telling-one { padding: .6rem .7rem; border-radius: .5rem; border-left: 3px solid var(--line);
+  background: rgba(99, 230, 255, 0.06); }
+.telling-one p { margin: .2rem 0; }
+.telling-one.ready { border-left-color: var(--green); }
+.telling-one.waiting { border-left-color: var(--yellow); }
+.telling-waiting { color: var(--yellow); font-size: .9rem; }

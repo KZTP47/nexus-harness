@@ -173,7 +173,10 @@
         "max_console_errors": 0,
         "max_page_errors": 0,
         "max_accessibility_problems": 0
-      }
+      },
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "nav-reaches-every-view",
@@ -696,7 +699,10 @@
         "max_console_errors": 0,
         "max_page_errors": 0
       },
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "checks-tag-filter-narrows-the-list",
@@ -873,7 +879,10 @@
         "max_console_errors": 0,
         "max_page_errors": 0
       },
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "checks-names-box-shows-what-was-picked",
@@ -963,7 +972,10 @@
         "max_console_errors": 0,
         "max_page_errors": 0
       },
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "workflow-simulate-runs-and-logs",
@@ -1077,7 +1089,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-import-accepts-what-export-gave",
@@ -1109,7 +1124,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-undo-puts-back-what-was-removed",
@@ -1147,7 +1165,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-new-agent-can-be-added-and-named",
@@ -1217,7 +1238,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-every-agent-kind-can-be-added",
@@ -1295,7 +1319,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-fit-and-zoom-keep-the-canvas-usable",
@@ -1663,7 +1690,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-can-be-joined-with-the-keyboard",
@@ -1696,7 +1726,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-keyboard-really-moves-an-agent",
@@ -1735,7 +1768,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-inspector-edits-the-agent",
@@ -1785,7 +1821,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "workflow-tabs-really-save-and-remove",
@@ -2006,7 +2045,10 @@
         "max_console_errors": 0,
         "max_page_errors": 0
       },
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "checks-explain-button-answers",
@@ -2186,7 +2228,8 @@
         "max_page_errors": 0
       },
       "touches": [
-        "a run of the checks"
+        "a run of the checks",
+        "the check runner"
       ]
     },
     {
@@ -2295,7 +2338,8 @@
         "max_page_errors": 0
       },
       "touches": [
-        "a run of the checks"
+        "a run of the checks",
+        "the check runner"
       ]
     },
     {
@@ -2576,7 +2620,10 @@
         "max_console_errors": 1,
         "max_page_errors": 0
       },
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "checks-the-save-screenshots-button-is-really-pressed",
@@ -2641,7 +2688,10 @@
         "max_console_errors": 1,
         "max_page_errors": 0
       },
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "checks-copy-step-button-is-really-pressed",
@@ -2683,7 +2733,10 @@
         "max_console_errors": 1,
         "max_page_errors": 0
       },
-      "timeout_seconds": 300
+      "timeout_seconds": 300,
+      "touches": [
+        "the check runner"
+      ]
     },
     {
       "id": "start-view-plan-only-box-really-changes-what-is-asked",
@@ -3084,7 +3137,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "start-view-finding-the-assistants-on-this-machine",
@@ -3235,7 +3291,10 @@
       "expect": {
         "max_console_errors": 1,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "start-view-the-picture-of-the-workflow-is-real",
@@ -3309,7 +3368,10 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
-      }
+      },
+      "touches": [
+        "the workflow on screen"
+      ]
     },
     {
       "id": "start-view-just-do-it-for-me-does-the-work",
@@ -5151,21 +5213,17 @@
         },
         {
           "do": "run",
-          "script": " pipeline.nodes[1].label = 'The second name'; renderPipeline(); return 'the name was changed'; ",
-          "text": "the name was changed",
-          "note": "Change it"
-        },
-        {
-          "do": "click",
-          "target": "#pipelineSave",
-          "note": "Save over it"
+          "script": " pipeline.nodes[1].label = 'The second name'; renderPipeline(); if (pipeline.nodes[1].label !== 'The second name') return 'the change did not stick'; document.getElementById('pipelineSave').click(); for (let tries = 0; tries < 240; tries += 1) {   const said = await request('/api/pipelines?name=' + encodeURIComponent('Kept by a check'));   if ((said.older_ones || []).length) return 'it was changed and saved over';   await new Promise(r => setTimeout(r, 250)); } return 'nothing older was kept, so the two saves were the same'; ",
+          "text": "it was changed and saved over",
+          "timeout_ms": 90000,
+          "note": "Change it and save over it, without letting anything in between"
         },
         {
           "do": "run",
-          "script": " for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelector('#pipelineOlderOnes .pipeline-older-one')) break;   await new Promise(r => setTimeout(r, 250)); } const row = document.querySelector('#pipelineOlderOnes .pipeline-older-one'); if (!row) return 'the one before this was not kept'; return row.textContent.includes('The one before this')   ? 'the one before this is kept' : 'it is kept but not named'; ",
+          "script": " let older = []; for (let tries = 0; tries < 240; tries += 1) {   const said = await request('/api/pipelines?name=' + encodeURIComponent(pipeline.name));   older = said.older_ones || [];   if (older.length) break;   await new Promise(r => setTimeout(r, 250)); } if (!older.length) return 'the one before this was not kept'; pipelineOlderOnes = older; listHowItLookedBefore(); await new Promise(r => setTimeout(r, 200)); const row = document.querySelector('#pipelineOlderOnes .pipeline-older-one'); if (!row) return 'it was kept but the panel did not draw it'; return row.textContent.includes('The one before this')   ? 'the one before this is kept' : 'it is kept but not named'; ",
           "text": "the one before this is kept",
-          "timeout_ms": 60000,
-          "note": "Saving over it kept the one that was there"
+          "timeout_ms": 90000,
+          "note": "Saving over it kept the one that was there, whether or not the panel had redrawn the list yet"
         },
         {
           "do": "run",
@@ -5635,6 +5693,136 @@
         "max_page_errors": 0,
         "max_failed_requests": 0,
         "max_accessibility_problems": 0
+      }
+    },
+    {
+      "id": "being-told-when-a-run-finishes-says-it-needs-a-key",
+      "title": "Setting up a way to be told says plainly that it needs a key, and never asks for the key itself",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines",
+        "telling"
+      ],
+      "touches": [
+        "the pipeline on screen"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open the automations view"
+        },
+        {
+          "do": "click",
+          "target": "[data-pipeline-tab=\"telling\"]",
+          "note": "Look at being told when a run finishes"
+        },
+        {
+          "do": "run",
+          "script": " window.confirm = () => true; for (let tries = 0; tries < 200; tries += 1) {   if (document.getElementById('tellingKind').options.length) break;   await new Promise(r => setTimeout(r, 250)); } const on = (await request('/api/telling')).ways.map(one => one.name); for (const name of on) {   if (name.startsWith('By a check')) {     await request('/api/telling/remove', {method: 'POST', body: JSON.stringify({name})});   } } return 'nothing of ours is left over'; ",
+          "text": "nothing of ours is left over",
+          "timeout_ms": 45000,
+          "note": "Start from nothing, whatever an earlier run left behind"
+        },
+        {
+          "do": "expect_text",
+          "target": "#tellingNeedsAKey",
+          "text": "needs a key",
+          "note": "It says up front that every way of this needs a key"
+        },
+        {
+          "do": "run",
+          "script": " const said = document.getElementById('tellingNeedsAKey').textContent; return said.includes('never writes one down') && said.includes('environment variable')   ? 'it says the secret is never written down here'   : 'it said ' + said; ",
+          "text": "it says the secret is never written down here",
+          "note": "And that the harness keeps the name of a variable, not the secret"
+        },
+        {
+          "do": "choose",
+          "target": "#tellingKind",
+          "value": "slack",
+          "note": "Choose Slack"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 300)); const needs = document.getElementById('tellingWhatItNeeds').textContent; if (!needs.includes('webhook')) return 'it did not say what Slack needs: ' + needs; if (!needs.toLowerCase().includes('manage apps')) return 'it did not say where to get one'; return document.getElementById('tellingSecretIn').value === 'SLACK_WEBHOOK'   ? 'it says what Slack needs and where to get it'   : 'it did not fill in the usual variable name'; ",
+          "text": "it says what Slack needs and where to get it",
+          "note": "Choosing one says what it needs, where to get it, and names the variable"
+        },
+        {
+          "do": "choose",
+          "target": "#tellingKind",
+          "value": "email",
+          "note": "Choose email, which asks for more"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 300)); const asks = ['tellingWhereHolder', 'tellingToHolder', 'tellingSentFromHolder']   .filter(id => !document.getElementById(id).hidden); return asks.length === 3   ? 'email asks for the server, who gets it, and who it is from'   : 'it asked for only ' + asks.length + ' of the three'; ",
+          "text": "email asks for the server, who gets it, and who it is from",
+          "note": "A kind that needs more asks for more"
+        },
+        {
+          "do": "choose",
+          "target": "#tellingKind",
+          "value": "webhook",
+          "note": "Back to a plain webhook"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 300)); document.getElementById('tellingName').value = 'By a check'; document.getElementById('tellingSecretIn').value = 'https://example.invalid/hook'; return 'the secret itself was typed into the box for the name'; ",
+          "text": "the secret itself was typed into the box for the name",
+          "note": "Somebody pastes the address into the box next to the word webhook"
+        },
+        {
+          "do": "click",
+          "target": "#tellingAdd",
+          "note": "Try to set it up with the secret itself in the box"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   const said = document.getElementById('tellingSaid').textContent;   if (said.includes('looks like the secret itself')) return 'it refuses the secret itself';   await new Promise(r => setTimeout(r, 250)); } return 'it said ' + document.getElementById('tellingSaid').textContent; ",
+          "text": "it refuses the secret itself",
+          "timeout_ms": 45000,
+          "note": "It refuses, and says the file it saves is meant to be safe to commit"
+        },
+        {
+          "do": "run",
+          "script": " document.getElementById('tellingName').value = 'By a check'; document.getElementById('tellingSecretIn').value = 'A_KEY_NOBODY_HAS_SET'; return 'the name of a variable was typed instead'; ",
+          "text": "the name of a variable was typed instead",
+          "note": "Type the name of a variable instead"
+        },
+        {
+          "do": "click",
+          "target": "#tellingAdd",
+          "note": "Set it up"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 200; tries += 1) {   const rows = [...document.querySelectorAll('#tellingList .telling-one')];   const mine = rows.find(one => one.textContent.includes('By a check'));   if (mine) {     if (!mine.classList.contains('waiting')) return 'it says it is ready with no key set';     return mine.textContent.includes('A_KEY_NOBODY_HAS_SET')       ? 'it is set up, and says it is waiting on a key nobody has set'       : 'it does not name the variable';   }   await new Promise(r => setTimeout(r, 250)); } return 'it was never set up'; ",
+          "text": "it is set up, and says it is waiting on a key nobody has set",
+          "timeout_ms": 60000,
+          "note": "It is set up, marked as waiting, and names the variable to set"
+        },
+        {
+          "do": "run",
+          "script": " const row = [...document.querySelectorAll('#tellingList .telling-one')]   .find(one => one.textContent.includes('By a check')); const send = [...row.querySelectorAll('button')].find(b => b.textContent === 'Send one now'); if (!send.disabled) return 'it offers to send with no key'; send.disabled = false; send.click(); for (let tries = 0; tries < 120; tries += 1) {   const said = document.getElementById('tellingSaid').textContent;   if (said.includes('A_KEY_NOBODY_HAS_SET')) return 'saying hello says which key is missing';   await new Promise(r => setTimeout(r, 250)); } return 'it said ' + document.getElementById('tellingSaid').textContent; ",
+          "text": "saying hello says which key is missing",
+          "timeout_ms": 60000,
+          "note": "Send one now is not offered without a key, and says which key when asked anyway"
+        },
+        {
+          "do": "run",
+          "script": " const row = [...document.querySelectorAll('#tellingList .telling-one')]   .find(one => one.textContent.includes('By a check')); [...row.querySelectorAll('button')].find(b => b.textContent === 'Take it off').click(); for (let tries = 0; tries < 120; tries += 1) {   const on = (await request('/api/telling')).ways.map(one => one.name);   if (!on.includes('By a check')) return 'it can be taken off again';   await new Promise(r => setTimeout(r, 250)); } return 'it would not come off'; ",
+          "text": "it can be taken off again",
+          "timeout_ms": 45000,
+          "note": "And it can be taken off again"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
       }
     }
   ]

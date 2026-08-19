@@ -24,6 +24,7 @@ from . import explain as explainer
 from . import pipeline_starters
 from . import pipelines as pipeline_lab
 from . import chat as chat_lab
+from . import tell_somebody as telling_lab
 from . import timer as timer_lab
 from . import navigate as navigate_lab
 from . import plain_graph
@@ -805,6 +806,26 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         self.server.config, query.get("name", [""])[0]
                     )
                 })
+            elif parsed.path == "/api/telling":
+                self._require_token()
+                config = self.server.config
+                self._json({
+                    "ways": telling_lab.how_it_stands(config),
+                    "kinds": [
+                        {
+                            "kind": one.kind,
+                            "label": one.label,
+                            "secret_is": one.secret_is,
+                            "usually_called": one.usually_called,
+                            "where_to_get_one": one.where_to_get_one,
+                            "needs_a_server": one.needs_a_server,
+                            "server_usually_called": one.server_usually_called,
+                            "needs_to": one.needs_to,
+                            "needs_sent_from": one.needs_sent_from,
+                        }
+                        for one in telling_lab.THE_KINDS
+                    ],
+                })
             elif parsed.path == "/api/timers":
                 self._require_token()
                 import datetime as when_lab
@@ -1255,6 +1276,38 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json(explainer.what_it_means(
                     str(body.get("said") or "")[:20000], kind=str(body.get("kind") or "")
                 ).to_dict())
+            elif self.path == "/api/telling/save":
+                # The same lock its neighbour takes. Looking to see whether a
+                # name is taken and then writing it is two steps, and two people
+                # pressing the button at the same instant both got past the
+                # first one.
+                with self.server.pipelines_lock:
+                    saved = telling_lab.save(self.server.config, body.get("way"))
+                self._json({
+                    "way": saved.to_dict(),
+                    "why_not": telling_lab.why_it_cannot_be_used(saved),
+                })
+            elif self.path == "/api/telling/remove":
+                with self.server.pipelines_lock:
+                    note = telling_lab.remove(
+                        self.server.config, str(body.get("name") or "")
+                    )
+                self._json({"note": note})
+            elif self.path == "/api/telling/try":
+                name = str(body.get("name") or "")
+                found = [
+                    one for one in telling_lab.every_one(self.server.config)
+                    if one.name == name
+                ]
+                if not found:
+                    raise HarnessError(f"There is nothing set up called {name}.")
+                said = telling_lab.tell_them(
+                    self.server.config, found[0],
+                    "A message from the harness",
+                    "This is what a message from your harness looks like. "
+                    "Nothing has gone wrong; somebody pressed a button.",
+                )
+                self._json(said.to_dict())
             elif self.path == "/api/timers/save":
                 with self.server.pipelines_lock:
                     # Saving does the refusing. Held in the panel's own code

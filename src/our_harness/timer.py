@@ -775,6 +775,7 @@ def run_what_is_due(
                 "passed": passed,
                 "said": said,
                 "missed": missed,
+                "told": _tell_somebody_about_it(config, timer, passed, said),
             })
     finally:
         still_going.set()
@@ -926,6 +927,39 @@ def _is_it_still_going(process: int) -> bool:
         # there, which is what we wanted to know.
         return True
     return True
+
+
+def _tell_somebody_about_it(
+    config: LoadedConfig, timer: Timer, passed: bool, said: str
+) -> list[dict[str, Any]]:
+    """Say what happened, wherever somebody asked to be told.
+
+    Only when it did not pass. A run at two in the morning that went fine is
+    not news, and something that tells you every night is something you stop
+    reading by the end of the week.
+
+    Nothing here is allowed to stop the run. Whoever set this up wanted to hear
+    about a failing suite; being unable to reach Slack is not a reason to lose
+    the record of what the suite did.
+    """
+
+    from . import tell_somebody as telling
+
+    if passed:
+        return []
+    try:
+        return [
+            one.to_dict()
+            for one in telling.tell_everybody(
+                config,
+                f"{timer.name} did not pass",
+                f"{timer.automation}, run by the timer.\n\n{said}",
+                passed=passed,
+                only_when_it_fails=True,
+            )
+        ]
+    except HarnessError as exc:
+        return [{"name": "", "sent": False, "note": str(exc)}]
 
 
 def _keep_saying_it_is_alive(where: Path, stop: threading.Event) -> None:

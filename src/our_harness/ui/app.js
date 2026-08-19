@@ -3451,6 +3451,8 @@ function bindEvents() {
   });
   $("pipelineAskRun").addEventListener("click", runWithTheAnswers);
   $("pipelineAskCancel").addEventListener("click", () => $("pipelineAskDialog").close());
+  $("tellingAdd").addEventListener("click", addTelling);
+  $("tellingKind").addEventListener("change", sayWhatItNeeds);
   $("timerAdd").addEventListener("click", addATimer);
   $("timerHowOften").addEventListener("change", sayWhatTheTimerMeans);
   $("timerCopyLine").addEventListener("click", copyTheMachineLine);
@@ -4172,6 +4174,7 @@ function showPipelinePane(which) {
   if (which === "help") listWhatEachStepIsFor();
   if (which === "before") listHowItLookedBefore();
   if (which === "timer") refreshTimers();
+  if (which === "telling") refreshTelling();
 }
 
 /* ---- the same thing as text ---- */
@@ -4432,6 +4435,135 @@ async function answerTheStep(step, carryOn) {
     showWhatIsBeingAsked("");
     say(said.note || "Answered.");
   } catch (error) { showError(error.message); }
+}
+
+/* ==========================================================================
+   Being told when a run finishes.
+
+   The one part of the harness that cannot work on its own: every way of this
+   needs a key, a token or an address somebody has to go and get. So the panel
+   says that before anything else, says which ones are ready and which are
+   waiting, and never asks anybody to type a secret into it - only the name of
+   the variable holding one.
+   ========================================================================== */
+
+let tellingKinds = [];
+
+async function refreshTelling() {
+  try {
+    const said = await request("/api/telling");
+    tellingKinds = said.kinds || [];
+    fillOneChoice("tellingKind", tellingKinds, "kind",
+                  $("tellingKind").value || (tellingKinds[0] || {}).kind || "");
+    sayWhatItNeeds();
+    renderTelling(said.ways || []);
+  } catch (error) { showError(error.message); sayAboutTelling(error.message); }
+}
+
+function sayAboutTelling(words) { $("tellingSaid").textContent = words; }
+
+function theKindPicked() {
+  return tellingKinds.find((one) => one.kind === $("tellingKind").value) || {};
+}
+
+function sayWhatItNeeds() {
+  const one = theKindPicked();
+  $("tellingWhatItNeeds").textContent = one.kind
+    ? `${one.label} needs ${one.secret_is}. ${one.where_to_get_one}`
+    : "";
+  if (one.usually_called && !$("tellingSecretIn").value) {
+    $("tellingSecretIn").value = one.usually_called;
+  }
+  // Emptied when it is not asked for, so a value typed for one kind does not
+  // travel with the next one.
+  $("tellingWhereHolder").hidden = !one.needs_a_server;
+  if (!one.needs_a_server) $("tellingWhere").value = "";
+  else if (one.server_usually_called && !$("tellingWhere").value) {
+    $("tellingWhere").value = one.server_usually_called;
+  }
+  $("tellingToHolder").hidden = !one.needs_to;
+  $("tellingSentFromHolder").hidden = !one.needs_sent_from;
+}
+
+function renderTelling(ways) {
+  const list = $("tellingList");
+  list.replaceChildren();
+  if (!ways.length) {
+    const empty = make("li", "telling-one empty-state");
+    empty.append(make("p", "", "Nobody is told yet. Fill in the boxes above."));
+    list.append(empty);
+    return;
+  }
+  for (const one of ways) {
+    const row = make("li", `telling-one ${one.ready ? "ready" : "waiting"}`);
+    row.append(make("strong", "", one.name));
+    row.append(make("p", "", `${one.label}, key kept in ${one.secret_in}`));
+    row.append(make("p", one.ready ? "hint" : "telling-waiting",
+      one.ready ? "Ready." : one.why_not));
+    const buttons = make("div", "button-row");
+    const tryIt = make("button", "", "Send one now");
+    tryIt.type = "button";
+    tryIt.disabled = !one.ready;
+    tryIt.title = one.ready
+      ? "Say hello, so you can see it arrive"
+      : "There is no key for this one yet";
+    tryIt.addEventListener("click", () => tryTelling(one, tryIt));
+    const off = make("button", "", "Take it off");
+    off.type = "button";
+    off.addEventListener("click", () => removeTelling(one));
+    buttons.append(tryIt, off);
+    row.append(buttons);
+    list.append(row);
+  }
+}
+
+async function addTelling() {
+  const name = $("tellingName").value.trim();
+  if (!name) { sayAboutTelling("Give it a name first."); return; }
+  try {
+    const said = await request("/api/telling/save", {
+      method: "POST",
+      body: JSON.stringify({way: {
+        name,
+        kind: $("tellingKind").value,
+        secret_in: $("tellingSecretIn").value.trim(),
+        server_in: $("tellingWhereHolder").hidden ? "" : $("tellingWhere").value.trim(),
+        to: $("tellingTo").value.trim(),
+        sent_from: $("tellingSentFrom").value.trim(),
+        turned_on: true,
+      }}),
+    });
+    $("tellingName").value = "";
+    await refreshTelling();
+    sayAboutTelling(said.why_not
+      ? `${name} is set up. ${said.why_not}`
+      : `${name} is set up and ready.`);
+  } catch (error) { showError(error.message); sayAboutTelling(error.message); }
+}
+
+async function tryTelling(one, button) {
+  button.disabled = true;
+  sayAboutTelling(`Saying hello to ${one.name}...`);
+  try {
+    const said = await request("/api/telling/try", {
+      method: "POST", body: JSON.stringify({name: one.name}),
+    });
+    sayAboutTelling(said.note);
+  } catch (error) {
+    showError(error.message);
+    sayAboutTelling(error.message);
+  } finally { button.disabled = false; }
+}
+
+async function removeTelling(one) {
+  if (!window.confirm(`Stop telling ${one.name}?`)) return;
+  try {
+    const said = await request("/api/telling/remove", {
+      method: "POST", body: JSON.stringify({name: one.name}),
+    });
+    await refreshTelling();
+    sayAboutTelling(said.note || "Taken off.");
+  } catch (error) { showError(error.message); sayAboutTelling(error.message); }
 }
 
 /* ==========================================================================

@@ -733,6 +733,96 @@ def command_timer(args: argparse.Namespace) -> int:
     raise HarnessError(f"Unknown timer command: {what}")
 
 
+# Known when the parser is built, not when the command runs: the choices a
+# person can type have to be on the help page.
+from .tell_somebody import THE_KINDS as TELLING_KINDS
+
+
+def command_tell(args: argparse.Namespace) -> int:
+    """Set up, look at, and try the ways of telling somebody.
+
+    Every one of these needs something you have to go and get, so the listing
+    says which are ready and which are waiting, and the refusal when one is not
+    ready says what to get and where.
+    """
+
+    from . import tell_somebody as telling
+
+    config = _config(args)
+    what = args.tell_command
+    if what == "kinds":
+        print("Every one of these needs a key, a token or an address you have")
+        print("to go and get. The harness cannot make one for you.")
+        print()
+        for one in telling.THE_KINDS:
+            print(f"{one.label} ({one.kind})")
+            print(f"    needs: {one.secret_is}")
+            print(f"    usually kept in: {one.usually_called}")
+            print(f"    to get one: {one.where_to_get_one}")
+            wants = [
+                name for name, needed in (
+                    ("the variable holding the mail server", one.needs_a_server),
+                    ("to", one.needs_to),
+                    ("sent_from", one.needs_sent_from),
+                ) if needed
+            ]
+            if wants:
+                print(f"    also asks for: {', '.join(wants)}")
+            print()
+        return 0
+    if what == "list":
+        found = telling.how_it_stands(config)
+        if not found:
+            print("Nothing is set up to be told yet. Add one with: harness tell add")
+            print("To see what each kind needs first: harness tell kinds")
+            return 0
+        for one in found:
+            mark = "ready" if one["ready"] else "waiting on a key"
+            off = "" if one["turned_on"] else ", turned off"
+            print(f"{one['name']} ({one['label']}) - {mark}{off}")
+            if one["why_not"]:
+                print(f"    {one['why_not']}")
+        return 0
+    if what == "add":
+        saved = telling.save(config, {
+            "name": args.name,
+            "kind": args.kind,
+            "secret_in": args.secret_in,
+            "server_in": args.server_in,
+            "to": args.to,
+            "sent_from": args.sent_from,
+            "turned_on": True,
+        })
+        kind = telling.BY_KIND[saved.kind]
+        print(f"{saved.name} will be told, through {kind.label}.")
+        why_not = telling.why_it_cannot_be_used(saved)
+        if why_not:
+            print()
+            print(why_not)
+        else:
+            print(f"{saved.secret_in} is set on this machine, so it is ready.")
+        print()
+        print("Nothing secret was written down. What is saved is the name of the")
+        print(f"variable ({saved.secret_in}), never what is in it.")
+        return 0
+    if what == "remove":
+        print(telling.remove(config, args.name))
+        return 0
+    if what == "try":
+        found = [one for one in telling.every_one(config) if one.name == args.name]
+        if not found:
+            raise HarnessError(f"There is nothing set up called {args.name}.")
+        said = telling.tell_them(
+            config, found[0],
+            "A message from the harness",
+            "This is what a message from your harness looks like. Nothing has "
+            "gone wrong; somebody asked it to say hello.",
+        )
+        print(said.note)
+        return 0 if said.sent else 1
+    raise HarnessError(f"Unknown tell command: {what}")
+
+
 def command_editor(args: argparse.Namespace) -> int:
     """Work inside an editor you already have open.
 
@@ -1797,6 +1887,43 @@ def parser() -> argparse.ArgumentParser:
         help="How often the machine looks. Ten is plenty",
     )
     timer_install.set_defaults(handler=command_timer)
+
+    tell = sub.add_parser(
+        "tell", help="Be told when a run finishes. Every way of this needs a key"
+    )
+    tell_sub = tell.add_subparsers(dest="tell_command", required=True)
+    tell_kinds = tell_sub.add_parser(
+        "kinds", help="Every place you can be told, and what each one needs"
+    )
+    tell_kinds.set_defaults(handler=command_tell)
+    tell_list = tell_sub.add_parser(
+        "list", help="What is set up here, and whether it can be used"
+    )
+    tell_list.set_defaults(handler=command_tell)
+    tell_add = tell_sub.add_parser("add", help="Set up a way of being told")
+    tell_add.add_argument("name", help="What to call it")
+    tell_add.add_argument(
+        "kind", choices=[one.kind for one in TELLING_KINDS], help="Where to tell you"
+    )
+    tell_add.add_argument(
+        "--secret-in", default="",
+        help="The environment variable holding the key. Never the key itself",
+    )
+    tell_add.add_argument(
+        "--server-in", default="",
+        help="For email: the variable holding the mail server. Never the server",
+    )
+    tell_add.add_argument("--to", default="", help="Who or which room gets it")
+    tell_add.add_argument(
+        "--sent-from", default="", help="For email: the account it is sent from"
+    )
+    tell_add.set_defaults(handler=command_tell)
+    tell_remove = tell_sub.add_parser("remove", help="Take one off")
+    tell_remove.add_argument("name")
+    tell_remove.set_defaults(handler=command_tell)
+    tell_try = tell_sub.add_parser("try", help="Send one message, to see it work")
+    tell_try.add_argument("name")
+    tell_try.set_defaults(handler=command_tell)
 
     editor = sub.add_parser(
         "editor", help="Work inside an editor you already have open"

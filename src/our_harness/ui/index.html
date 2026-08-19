@@ -446,6 +446,7 @@
         <button type="button" role="tab" data-pipeline-tab="help" aria-selected="false">What each step is for</button>
         <button type="button" role="tab" data-pipeline-tab="before" aria-selected="false">How it looked before</button>
         <button type="button" role="tab" data-pipeline-tab="timer" aria-selected="false">When it runs on its own</button>
+        <button type="button" role="tab" data-pipeline-tab="telling" aria-selected="false">Tell me when it finishes</button>
       </div>
       <div id="pipelinePaneCode" class="pipeline-pane" data-pipeline-pane="code" hidden>
         <p class="hint">The same pipeline, written out. Change it here and the picture changes with it.</p>
@@ -461,6 +462,50 @@
         <p class="hint">One bar per step of the last run, laid out in time. The long one is the slow one.</p>
         <ol id="pipelineTimeline" class="pipeline-timeline"></ol>
       </div>
+      <div id="pipelinePaneTelling" class="pipeline-pane" data-pipeline-pane="telling" hidden>
+        <p class="hint">A run at two in the morning leaves its report where you can find
+          it. This is the step after: a line in the place you already watch, the moment
+          something needs you. Only when it does not pass - a run that went fine is not
+          news, and something that tells you every night is something you stop reading.</p>
+
+        <p class="callout" id="tellingNeedsAKey">Every one of these needs a key, a token
+          or an address that you have to go and get. The harness cannot make one for you,
+          and it never writes one down: you save the name of an environment variable, and
+          put the secret in that variable yourself.</p>
+
+        <div class="telling-new" role="group" aria-label="Be told when a run finishes">
+          <div>
+            <label for="tellingName">Call it</label>
+            <input id="tellingName" type="text" maxlength="64" placeholder="Our room">
+          </div>
+          <div>
+            <label for="tellingKind">Where</label>
+            <select id="tellingKind"></select>
+          </div>
+          <div>
+            <label for="tellingSecretIn">Key kept in</label>
+            <input id="tellingSecretIn" type="text" maxlength="128" placeholder="SLACK_WEBHOOK">
+          </div>
+          <div id="tellingWhereHolder" hidden>
+            <label for="tellingWhere">Mail server kept in</label>
+            <input id="tellingWhere" type="text" maxlength="300" placeholder="MAIL_SERVER">
+          </div>
+          <div id="tellingToHolder" hidden>
+            <label for="tellingTo">To</label>
+            <input id="tellingTo" type="text" maxlength="300">
+          </div>
+          <div id="tellingSentFromHolder" hidden>
+            <label for="tellingSentFrom">Sent from</label>
+            <input id="tellingSentFrom" type="text" maxlength="300">
+          </div>
+          <button id="tellingAdd" class="primary" type="button">Set it up</button>
+        </div>
+        <p id="tellingWhatItNeeds" class="hint"></p>
+        <p id="tellingSaid" class="callout" role="status">Nothing is set up to be told yet.</p>
+
+        <ul id="tellingList" class="telling-list" aria-label="Who gets told"></ul>
+      </div>
+
       <div id="pipelinePaneTimer" class="pipeline-pane" data-pipeline-pane="timer" hidden>
         <p class="hint">Have an automation run itself - every night, every weekday morning,
           every hour - with nobody watching and the report waiting for you afterwards.</p>

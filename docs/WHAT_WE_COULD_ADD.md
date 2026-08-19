@@ -12,6 +12,15 @@ we have seats and no keys.
 
 ## Worth having
 
+### 0. Being told when a run finishes - **built**
+
+Done, and it is the one part of the harness that needs a key. `tell_somebody.py`
+sends word to Slack, Discord, Teams, Telegram, email or any webhook when a
+timer's run does not pass. Every one of them needs a token or an address you go
+and get, so it says that everywhere it comes up, says which are ready and which
+are waiting, and never writes the secret down - what is saved is the name of an
+environment variable. See [BEING_TOLD.md](BEING_TOLD.md).
+
 ### 1. Run things on a timer, with nobody watching — **built**
 
 Done. `timer.py` runs your automations every hour, every day, every weekday or
@@ -67,12 +76,17 @@ steps the agent gave itself, which is the half nobody could see. See
 
 ## Left out on purpose
 
-- **Chat platform bots** (Telegram, Discord, Slack, WhatsApp, Signal), voice,
-  and image or video generation. Every one needs an outside account or bot
-  token that our seats do not cover.
+- **Voice, and image or video generation.** Every one needs an outside account
+  and a key our seats do not cover, and none of them helps anybody write code.
+  A harness that reads a stack trace aloud is a harness nobody uses twice.
 - **Squeezing finished runs into training data.** Hermes does this to train
   future models. We do not train models.
-- **Cloud sandboxes** that need their own account and key.
+- **Cloud sandboxes** that need their own account and key. This one is worth
+  having and is not built: running somebody else's code on somebody else's
+  machine is the honest answer to "is this safe to run", and our own runner only
+  bounds what a command may do on this machine. It is a large piece of work and
+  it cannot be checked here without an account, so it is written down rather
+  than half-built.
 - **Their goal tracker and their context shrinker.** We already have the
   requirement list the reviewer checks against, and a bounded context builder.
   Two ways of doing one thing is worse than one.

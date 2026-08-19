@@ -137,6 +137,15 @@ committed key is a key you cannot take back.
 
 ---
 
+## Being told, rather than going to look
+
+A timer leaves the report where you can find it. If you would rather be told,
+`harness tell` sends word to Slack, Discord, Teams, Telegram, email or any
+webhook when a run does not pass. That part needs a key you go and get, and it
+says so plainly. See [BEING_TOLD.md](BEING_TOLD.md).
+
+---
+
 ## What it cannot promise
 
 **A step that has already started is not cut short.** An hour is the longest a

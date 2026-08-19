@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
+import pathlib
 import re
+import threading
+import time
 from typing import Any
+
+from collections.abc import Iterable
 
 from .config import LoadedConfig
 
@@ -178,11 +184,90 @@ def hide_private_keys(value: str) -> str:
     return "".join(pieces)
 
 
+# The most files looked at when gathering those names, and how long an answer
+# is held before looking again. Read fresh every single time, with three
+# thousand of them in the folder, this put a second onto every cleaning
+# anywhere in the harness - and cleaning happens on paths that have nothing to
+# do with telling anybody anything.
+MOST_TELLING_FILES = 200
+HOW_LONG_THE_NAMES_KEEP = 5.0
+_names_last_looked: dict[str, tuple[float, frozenset[str]]] = {}
+_names_lock = threading.Lock()
+
+
+def _names_of_keys_for_telling_somebody(config: LoadedConfig) -> set[str]:
+    """The variables holding the keys for telling somebody about a run.
+
+    Guessed from the name alone, a webhook address was not recognised as a
+    secret: "webhook" is not one of the words this looks for, and an address
+    does not look like a token. So a failing check that printed its own Slack
+    address had it sent out, in plain text, to Slack. These are not guessed -
+    they are the ones somebody set up here, read from where they are written
+    down.
+    """
+
+    from .safety import confined_path
+
+    try:
+        where = confined_path(
+            config.project_root, ".harness/telling",
+            allow_missing=True, allow_control=True,
+        )
+    except Exception:  # noqa: BLE001 - never stop a redaction from happening
+        return set()
+    key = str(where)
+    now = time.monotonic()
+    with _names_lock:
+        held = _names_last_looked.get(key)
+        if held is not None and now - held[0] < HOW_LONG_THE_NAMES_KEEP:
+            return set(held[1])
+    found: set[str] = set()
+    try:
+        # Walked and stopped, rather than listed and sorted. Sorting first
+        # means reading the whole folder however few are wanted, which is a
+        # folder somebody else decides the size of.
+        with os.scandir(where) as walking:
+            for one in walking:
+                if len(found) >= MOST_TELLING_FILES:
+                    break
+                if not one.name.endswith(".json"):
+                    continue
+                try:
+                    said = json.loads(
+                        pathlib.Path(one.path).read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    continue
+                for name_of in ("secret_in", "server_in"):
+                    name = said.get(name_of) if isinstance(said, dict) else None
+                    if isinstance(name, str) and name.strip():
+                        found.add(name.strip())
+    except OSError:
+        # Not a folder, or unreadable. Nothing is found, and nothing here can
+        # do anything about it - which is why whoever is about to use a key
+        # hands its name over rather than relying on this.
+        found = set()
+    with _names_lock:
+        _names_last_looked[key] = (now, frozenset(found))
+    return set(found)
+
+
 class CredentialRedactor:
     """Remove credential material before network transmission or persistence."""
 
-    def __init__(self, config: LoadedConfig | None = None):
-        configured_names = {"HARNESS_API_KEY"}
+    def __init__(
+        self,
+        config: LoadedConfig | None = None,
+        also_hide: "Iterable[str] | None" = None,
+    ):
+        # `also_hide` is the names of variables the caller already knows hold a
+        # secret. Handed over rather than looked for, because looking can fail:
+        # the folder they are written in was once briefly a file rather than a
+        # folder, the looking quietly found none, and the very key this exists
+        # to hide went out in plain text with nothing to say it had.
+        configured_names = {"HARNESS_API_KEY"} | {
+            one.strip() for one in (also_hide or ()) if isinstance(one, str) and one.strip()
+        }
         if config is not None:
             configured = str(config.get("provider.api_key_env") or "")
             if configured:
@@ -195,6 +280,7 @@ class CredentialRedactor:
                     profile_name = profile.get("api_key_env")
                     if isinstance(profile_name, str) and profile_name:
                         configured_names.add(profile_name)
+            configured_names |= _names_of_keys_for_telling_somebody(config)
         configured_secrets = {
             os.environ[name] for name in configured_names if os.environ.get(name, "")
         }
