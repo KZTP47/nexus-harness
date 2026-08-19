@@ -868,6 +868,7 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .project-one p { margin: 0; }
 .project-one-path { font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
 .project-sidebar-add { display: grid; gap: .35rem; }
+.project-sidebar-add h3 { margin: .4rem 0 0; font-size: 1rem; }
 .project-sidebar-how { display: grid; gap: .35rem; }
 
 /* Always down the side: the page moves over rather than the list sitting on it. */

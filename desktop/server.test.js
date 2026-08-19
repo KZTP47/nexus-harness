@@ -362,3 +362,32 @@ test("what the app carries comes before anything in the project", () => {
   assert.strictEqual(found.length, 2, "the project's own is still a fallback");
   fs.rmSync(folder, { recursive: true, force: true });
 });
+
+test("the bridge offers a picker that only picks", () => {
+  // The Project menu's picker opens what it finds, which is right there and
+  // wrong for a list somebody adds to while working on something else. So
+  // there are two, and this is the one that answers with the folder and does
+  // nothing with it.
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  assert.ok(preload.includes("pickAFolder"), "the bridge offers it");
+  assert.ok(preload.includes("harness:pickAFolder"), "and asks the app for it");
+
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  const handler = main.slice(main.indexOf('ipcMain.handle("harness:pickAFolder"'));
+  const upto = handler.slice(0, handler.indexOf("});"));
+  assert.ok(upto.includes("chooseProject"), "it opens a folder picker");
+  assert.ok(!upto.includes("openProject"), "and does not open what it picked");
+});
+
+test("the bridge exposes named actions and nothing else", () => {
+  // What it really does, not what it says about itself. Read whole, this
+  // failed on the comment at the top saying there is no shell in it.
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8")
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().startsWith("//"))
+    .join("\n");
+  for (const forbidden of ["node:fs", "shell", "child_process", "node:path"]) {
+    assert.ok(!preload.includes(forbidden), `the bridge must not reach ${forbidden}`);
+  }
+  assert.ok(preload.includes("contextIsolation") === false, "it sets nothing itself");
+});

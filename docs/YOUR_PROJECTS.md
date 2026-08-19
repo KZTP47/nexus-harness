@@ -27,6 +27,20 @@ three assistants here and one there, and neither knows about the other.
 
 ---
 
+## Adding one
+
+**Browse for the folder** opens a folder picker and fills the box in. It does not
+add it behind your back: you see what was picked, then press **Add it**.
+
+That button is only there in the Nexus Harness app. Opened in an ordinary
+browser, the panel says so and takes a typed path instead — a web page is not
+allowed to learn where a folder really is on your machine, which is the whole
+point of that rule.
+
+Adding a folder does not switch to it. Press **Work on this** when you want to.
+
+---
+
 ## Naming one
 
 **Rename** in the list. The name is written inside the project, so it travels

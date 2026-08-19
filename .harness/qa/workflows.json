@@ -5902,6 +5902,30 @@
         },
         {
           "do": "run",
+          "script": " if (canWeBrowseForAFolder()) return 'this is the app, so the button is offered'; if (!$('projectBrowse').hidden) return 'a browser is offered a button that cannot work'; return $('projectBrowseWhyNot').hidden   ? 'it hides the button and says nothing about why'   : 'in a browser there is no picker, and it says so'; ",
+          "text": "in a browser there is no picker, and it says so",
+          "note": "A page is not allowed to learn where a folder really is, so the reason is said"
+        },
+        {
+          "do": "run",
+          "script": " window.harnessDesktop = {pickAFolder: async () => 'C:' + String.fromCharCode(92) + 'picked-by-a-check'}; sayWhetherWeCanBrowse(); if ($('projectBrowse').hidden) return 'the button is still hidden in the app'; if (!$('projectBrowseWhyNot').hidden) return 'it still says there is no picker'; return 'in the app the button is offered instead'; ",
+          "text": "in the app the button is offered instead",
+          "note": "And in the app the button is there instead of the reason"
+        },
+        {
+          "do": "click",
+          "target": "#projectBrowse",
+          "note": "Browse for a folder"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if ($('projectAddPath').value.includes('picked-by-a-check')) break;   await new Promise(r => setTimeout(r, 250)); } if (!$('projectAddPath').value.includes('picked-by-a-check')) {   return 'browsing did not fill the box in'; } const said = $('projectSaid').textContent; delete window.harnessDesktop; sayWhetherWeCanBrowse(); $('projectAddPath').value = ''; return said.includes('Add it')   ? 'browsing fills the box in and says what to press next'   : 'it filled the box but said ' + said; ",
+          "text": "browsing fills the box in and says what to press next",
+          "timeout_ms": 45000,
+          "note": "Browsing fills the box in rather than adding it behind your back"
+        },
+        {
+          "do": "run",
           "script": " const here = (await request('/api/projects')).here.path; $('projectAddPath').value = here; $('projectAdd').click(); for (let tries = 0; tries < 120; tries += 1) {   if ($('projectSaid').textContent.includes('on the list')) break;   await new Promise(r => setTimeout(r, 250)); } return $('projectSaid').textContent.includes('on the list')   ? 'a real folder goes on the list'   : 'it said ' + $('projectSaid').textContent; ",
           "text": "a real folder goes on the list",
           "timeout_ms": 45000,

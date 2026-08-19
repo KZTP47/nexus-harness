@@ -19,9 +19,14 @@
       <ul id="projectList" class="project-list" aria-labelledby="projectSidebarTitle"></ul>
 
       <div class="project-sidebar-add">
-        <label for="projectAddPath">Add a project folder</label>
+        <h3>Add a project</h3>
+        <button id="projectBrowse" type="button" hidden>Browse for the folder</button>
+        <label for="projectAddPath">Or type where it is</label>
         <input id="projectAddPath" type="text" placeholder="The folder your project is in">
         <button id="projectAdd" class="primary" type="button">Add it</button>
+        <p id="projectBrowseWhyNot" class="hint" hidden>A browser is not allowed to
+          open a folder picker that says where the folder really is, so this only
+          takes a typed path. In the Nexus Harness app there is a button for it.</p>
       </div>
       <p id="projectSaid" class="callout" role="status">Pick one to work on it.</p>
 

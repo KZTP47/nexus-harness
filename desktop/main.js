@@ -169,6 +169,12 @@ ipcMain.handle("harness:chooseProject", () => {
   if (chosen) openProject(chosen);
   return chosen;
 });
+ipcMain.handle("harness:pickAFolder", () => {
+  // The folder, and nothing else. The one above opens what it picks, which is
+  // right for the Project menu and wrong for a list somebody is adding to
+  // while working on something else.
+  return chooseProject(projectPath);
+});
 ipcMain.handle("harness:retry", () => {
   if (projectPath) openProject(projectPath);
   else showPage("welcome.html");

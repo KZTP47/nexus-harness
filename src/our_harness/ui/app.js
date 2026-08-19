@@ -1297,6 +1297,7 @@ async function refreshProjects() {
       ? `${projectsHere.name} - ${projectsHere.path}. Press it to see the others.`
       : "Which project this is.";
     $("projectSidebarHow").value = projectsSidebar;
+    sayWhetherWeCanBrowse();
     showTheSidebarTheWayTheyLikeIt();
     renderProjects();
   } catch (error) { showError(error.message); }
@@ -1419,6 +1420,29 @@ async function forgetThisProject(one) {
     });
     await refreshProjects();
     sayAboutProjects(said.note || "");
+  } catch (error) { showError(error.message); sayAboutProjects(error.message); }
+}
+
+function canWeBrowseForAFolder() {
+  return Boolean(window.harnessDesktop && window.harnessDesktop.pickAFolder);
+}
+
+function sayWhetherWeCanBrowse() {
+  // In the app there is a real folder picker. In a browser there is not: a page
+  // is not allowed to learn where a folder really is on the machine, which is
+  // the whole point of that rule. So the button is only offered where it works,
+  // and where it does not, the reason is said rather than left to be guessed.
+  const can = canWeBrowseForAFolder();
+  $("projectBrowse").hidden = !can;
+  $("projectBrowseWhyNot").hidden = can;
+}
+
+async function browseForAProject() {
+  try {
+    const chosen = await window.harnessDesktop.pickAFolder();
+    if (!chosen) { sayAboutProjects("Nothing was picked."); return; }
+    $("projectAddPath").value = chosen;
+    sayAboutProjects(`Picked ${chosen}. Press Add it to put it on the list.`);
   } catch (error) { showError(error.message); sayAboutProjects(error.message); }
 }
 
@@ -3633,6 +3657,7 @@ function bindEvents() {
   $("projectBar").addEventListener("click", () => openTheProjects($("projectSidebar").hidden));
   $("projectSidebarClose").addEventListener("click", () => openTheProjects(false));
   $("projectAdd").addEventListener("click", addAProject);
+  $("projectBrowse").addEventListener("click", browseForAProject);
   $("projectSidebarHow").addEventListener("change", chooseHowTheSidebarLooks);
   // Escape closes it, the way it closes everything else that sits over a page.
   // Not when it is meant to stay: closing it then is undoing somebody's own
