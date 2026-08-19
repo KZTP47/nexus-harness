@@ -5,7 +5,7 @@
       "name": "harness-ui",
       "runtimeExecutable": "python",
       "runtimeArgs": [
-        "scripts/run_ui.py",
+        "scripts/harness.py",
         "ui"
       ],
       "port": 8765

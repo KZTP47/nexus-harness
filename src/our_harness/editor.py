@@ -553,15 +553,12 @@ def how_to_tell_your_editor(
 
 
 def _how_this_harness_is_started() -> list[str]:
-    """The command that starts this very harness, however it was installed.
+    """The command that starts this very harness, however it got here.
 
-    A zipapp, an installed package and a checkout are all started differently,
-    and the line handed to an editor has to be the one that works here.
+    Asked in one place, because the timer and the desktop app need the same
+    answer and all three used to get it wrong the same way.
     """
 
-    from_a_zipapp = Path(sys.argv[0]).resolve()
-    if from_a_zipapp.suffix == ".pyz" and from_a_zipapp.is_file():
-        return [sys.executable, str(from_a_zipapp)]
-    if from_a_zipapp.name.lower() in {"harness", "harness.exe"} and from_a_zipapp.is_file():
-        return [str(from_a_zipapp)]
-    return [sys.executable, "-m", "our_harness"]
+    from .starting import how_to_start_the_harness
+
+    return how_to_start_the_harness()

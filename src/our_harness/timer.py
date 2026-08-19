@@ -986,12 +986,22 @@ def how_to_ask_this_machine(config: LoadedConfig, every_minutes: int = 10) -> di
 
     where = config.project_root
     name = f"harness-timer-{project_short_name(where)}"
+    from .starting import how_to_start_the_harness
+
     found = shutil.which("harness")
+    # Asked in one place. Written out here as "python -m our_harness", the line
+    # handed to the scheduler was right for anybody who had installed the
+    # harness and wrong for everybody who had only downloaded it - and it went
+    # wrong at two in the morning, months later, with nobody watching.
+    starting = how_to_start_the_harness()
     if os.name == "nt":
         # Every path gets quotes. This project's own folder has a space in its
         # name, and so does the usual place Python is installed for everybody:
         # left bare, the line looks right, is accepted, and never runs.
-        start = f'"{found}"' if found else f'"{sys.executable}" -m our_harness'
+        start = (
+            f'"{found}"' if found
+            else " ".join(f'"{one}"' if " " in one else one for one in starting)
+        )
         inside = f'cmd /c cd /d "{where}" && {start} timer run'
         return {
             "name": name,
@@ -1003,7 +1013,10 @@ def how_to_ask_this_machine(config: LoadedConfig, every_minutes: int = 10) -> di
             "to_see_it": f'schtasks /query /tn "{name}"',
             "machine": "this machine's Task Scheduler",
         }
-    start = shlex.quote(found) if found else f"{shlex.quote(sys.executable)} -m our_harness"
+    start = (
+        shlex.quote(found) if found
+        else " ".join(shlex.quote(one) for one in starting)
+    )
     line = f"*/{every_minutes} * * * * cd {shlex.quote(str(where))} && {start} timer run"
     return {
         "name": name,

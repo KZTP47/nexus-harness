@@ -42,7 +42,21 @@ async function main() {
     page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
     page.on("pageerror", (error) => pageErrors.push(String(error && error.message)));
 
-    await page.waitForFunction(() => location.protocol === "http:", null, { timeout: TIMEOUT_MS });
+    // If the panel never opens, the reason is on the failure page the app is
+    // showing right now. Without this the only thing said was "Timeout 90000ms
+    // exceeded", which names nothing and points nowhere - and the reason it
+    // was hiding was "No module named our_harness", which anybody could have
+    // acted on.
+    try {
+      await page.waitForFunction(() => location.protocol === "http:", null, { timeout: TIMEOUT_MS });
+    } catch (error) {
+      const shown = await page.textContent("body").catch(() => "");
+      const said = String(shown || "").replace(/\s+/g, " ").trim().slice(0, 800);
+      throw new Error(
+        `The panel never opened. What the app is showing instead:
+${said || "(nothing)"}`
+      );
+    }
     const address = new URL(page.url());
     check(address.protocol === "http:", "the window loads over http");
     check(["127.0.0.1", "localhost"].includes(address.hostname), "the window stays on this machine");

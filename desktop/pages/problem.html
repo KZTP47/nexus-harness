@@ -11,12 +11,13 @@
   <main>
     <h1 id="title">Something went wrong</h1>
     <p class="lead" id="detail"></p>
-    <p>Most of the time this means one of two things:</p>
+    <p>Most of the time this means one of these:</p>
     <ul>
-      <li>Python 3.11 or newer is not installed, or the app cannot find it. Install it, then start the app again.</li>
-      <li>The harness package is not installed for that Python. Open a terminal in the project folder and run <code>python -m pip install .</code></li>
+      <li><strong>Python 3.11 or newer is not installed</strong>, or the app cannot find it. Install it, then start the app again.</li>
+      <li><strong>The folder you chose is not the harness.</strong> Pick the folder that has <code>src</code> and <code>scripts</code> in it. The app takes the harness's own code from beside itself, so a plain download works with nothing installed - but it has to be pointed at the right place.</li>
+      <li><strong>Something is missing from the download.</strong> If <code>src/our_harness</code> is not there, the copy is incomplete. Download it again.</li>
     </ul>
-    <p>If Python lives somewhere unusual, set the <code>HARNESS_PYTHON</code> environment variable to its full path before starting this app.</p>
+    <p>If Python lives somewhere unusual, set the <code>HARNESS_PYTHON</code> environment variable to its full path before starting this app. If you would rather install the harness into Python, open a terminal in the project folder and run <code>python -m pip install .</code> - it is not needed, and it works too.</p>
     <div class="row">
       <button id="retry" class="primary" type="button">Try again</button>
       <button id="choose" type="button">Choose a different folder</button>

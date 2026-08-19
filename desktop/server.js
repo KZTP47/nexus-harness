@@ -4,7 +4,9 @@
 // It is kept apart from the window code so it can be tested on its own.
 
 const { spawn } = require("node:child_process");
+const fs = require("node:fs");
 const os = require("node:os");
+const path = require("node:path");
 
 const READY_MARKER = "harness-ui-ready ";
 const START_TIMEOUT_MS = 45000;
@@ -24,6 +26,38 @@ function pythonCandidates(environment = process.env) {
     found.push(["python3", []], ["python", []]);
   }
   return found;
+}
+
+// Where the harness's own code lives, when it has not been installed into
+// Python.
+//
+// The code sits in a src folder beside this app, which is the ordinary shape of
+// a Python project and is not somewhere Python looks by itself. Started without
+// this, every Python on the machine answered "No module named our_harness", and
+// the app showed three of those and nothing anybody could act on. Everybody who
+// has only downloaded the project - which is everybody, the first time - hit it.
+function whereTheHarnessLives(appFolder = __dirname, projectPath = "") {
+  const looking = [path.resolve(appFolder, "..", "src")];
+  if (projectPath) looking.push(path.resolve(projectPath, "src"));
+  return looking.filter((one) => {
+    try {
+      return fs.existsSync(path.join(one, "our_harness", "__init__.py"));
+    } catch (error) {
+      return false;
+    }
+  });
+}
+
+// What the harness is started with. Its own code goes on the path in front of
+// whatever is already there, so a plain download works with nothing installed.
+// Python is told about it only when the files are really there, so nobody who
+// has installed it properly is sent somewhere else.
+function environmentForStarting(environment = process.env, folders = []) {
+  const started = { ...environment };
+  if (!folders.length) return started;
+  const already = String(environment.PYTHONPATH || "").trim();
+  started.PYTHONPATH = [...folders, ...(already ? [already] : [])].join(path.delimiter);
+  return started;
 }
 
 // The server prints one line that names the address it really bound to. Reading
@@ -97,7 +131,9 @@ function isWebAddress(candidate) {
 class HarnessServer {
   constructor(options = {}) {
     this.spawnProcess = options.spawn || spawn;
-    this.candidates = options.candidates || pythonCandidates();
+    this.environment = options.environment || process.env;
+    this.appFolder = options.appFolder || __dirname;
+    this.candidates = options.candidates || pythonCandidates(this.environment);
     this.timeoutMs = options.timeoutMs || START_TIMEOUT_MS;
     this.child = null;
     this.url = "";
@@ -159,7 +195,13 @@ class HarnessServer {
       };
       let child;
       try {
-        child = this.spawnProcess(command, argv, { cwd: projectPath, windowsHide: true });
+        child = this.spawnProcess(command, argv, {
+          cwd: projectPath,
+          env: environmentForStarting(
+            this.environment, whereTheHarnessLives(this.appFolder, projectPath)
+          ),
+          windowsHide: true,
+        });
       } catch (error) {
         reject(notHere(error));
         return;
@@ -227,4 +269,4 @@ class HarnessServer {
   }
 }
 
-module.exports = { HarnessServer, pythonCandidates, readReadyLine, isLoopbackUrl, isWebAddress, isOwnPage, READY_MARKER };
+module.exports = { HarnessServer, whereTheHarnessLives, environmentForStarting, pythonCandidates, readReadyLine, isLoopbackUrl, isWebAddress, isOwnPage, READY_MARKER };

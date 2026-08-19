@@ -3,8 +3,14 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const { EventEmitter } = require("node:events");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
-const { HarnessServer, readReadyLine, isLoopbackUrl, isOwnPage, pythonCandidates } = require("./server");
+const {
+  HarnessServer, readReadyLine, isLoopbackUrl, isOwnPage, pythonCandidates,
+  whereTheHarnessLives, environmentForStarting,
+} = require("./server");
 
 function fakeChild(behaviour) {
   const child = new EventEmitter();
@@ -258,4 +264,67 @@ test("no Python at all is said plainly, naming what was tried", async () => {
       return true;
     }
   );
+});
+
+test("the harness's own code goes with it, so a plain download starts", async () => {
+  // Every Python on the machine answered "No module named our_harness", and
+  // the app showed three of those and nothing anybody could act on. The code
+  // sits in a src folder beside the app, which is not somewhere Python looks
+  // by itself.
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-start-"));
+  fs.mkdirSync(path.join(folder, "app"), { recursive: true });
+  fs.mkdirSync(path.join(folder, "src", "our_harness"), { recursive: true });
+  fs.writeFileSync(path.join(folder, "src", "our_harness", "__init__.py"), "");
+
+  const found = whereTheHarnessLives(path.join(folder, "app"), "");
+  assert.deepStrictEqual(found, [path.join(folder, "src")]);
+
+  const child = fakeChild();
+  let startedWith = null;
+  const server = new HarnessServer({
+    candidates: [["python", []]],
+    appFolder: path.join(folder, "app"),
+    environment: { PATH: "somewhere" },
+    spawn: (command, argv, options) => { startedWith = options; return child; },
+  });
+  const started = server.start("demo-project");
+  child.stdout.emit("data", 'harness-ui-ready {"url": "http://127.0.0.1:4/", "port": 4}\n');
+  await started;
+  assert.strictEqual(startedWith.env.PYTHONPATH, path.join(folder, "src"));
+  assert.strictEqual(startedWith.env.PATH, "somewhere", "the rest is left alone");
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("an installed harness is not sent somewhere else", () => {
+  // Told about a folder that is not really there, an installed copy would be
+  // looked for in the wrong place first.
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-none-"));
+  assert.deepStrictEqual(whereTheHarnessLives(path.join(folder, "app"), folder), []);
+  assert.strictEqual(
+    environmentForStarting({ PATH: "x" }, []).PYTHONPATH, undefined
+  );
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("what somebody already put on the path is kept, and comes second", () => {
+  // Built rather than written out: a path with a drive letter in it looks like
+  // somebody's own machine, and the check that looks for those is right to say
+  // so.
+  const mine = path.join(os.tmpdir(), "mine");
+  const ours = path.join(os.tmpdir(), "ours");
+  const said = environmentForStarting({ PYTHONPATH: mine }, [ours]);
+  assert.strictEqual(said.PYTHONPATH, [ours, mine].join(path.delimiter));
+});
+
+test("the project's own src is looked at too, after the app's", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-both-"));
+  fs.mkdirSync(path.join(folder, "project", "src", "our_harness"), { recursive: true });
+  fs.writeFileSync(
+    path.join(folder, "project", "src", "our_harness", "__init__.py"), ""
+  );
+  assert.deepStrictEqual(
+    whereTheHarnessLives(path.join(folder, "app"), path.join(folder, "project")),
+    [path.join(folder, "project", "src")]
+  );
+  fs.rmSync(folder, { recursive: true, force: true });
 });
