@@ -841,3 +841,37 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .telling-one.ready { border-left-color: var(--green); }
 .telling-one.waiting { border-left-color: var(--yellow); }
 .telling-waiting { color: var(--yellow); font-size: .9rem; }
+
+/* Which project this is, and the list of the others. */
+.project-bar { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap;
+  margin: .35rem 0 0; padding: .35rem .7rem; border-radius: .5rem; cursor: pointer;
+  background: rgba(99, 230, 255, 0.08); border: 1px solid var(--line);
+  color: inherit; font: inherit; text-align: left; }
+.project-bar:hover { background: rgba(99, 230, 255, 0.16); }
+.project-bar-name { font-weight: 600; }
+.project-bar-path { font-size: .85rem; color: var(--muted); overflow-wrap: anywhere; }
+.project-bar-more { margin-left: auto; display: inline-flex; align-items: center;
+  color: var(--muted); }
+
+.project-sidebar { position: fixed; inset: 0 auto 0 0; width: min(24rem, 88vw);
+  z-index: 40; overflow-y: auto; padding: 1rem; display: grid; gap: .7rem;
+  align-content: start; background: var(--panel-strong);
+  border-right: 1px solid var(--line); box-shadow: 0 0 2rem rgba(0, 0, 0, .5); }
+.project-sidebar-top { display: flex; align-items: center; justify-content: space-between;
+  gap: .6rem; }
+.project-sidebar h2 { margin: 0; }
+.project-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; }
+.project-one { padding: .5rem .6rem; border-radius: .5rem; border-left: 3px solid transparent;
+  background: rgba(99, 230, 255, 0.06); display: grid; gap: .25rem; }
+.project-one.here { border-left-color: var(--cyan); }
+.project-one.missing { border-left-color: var(--red); opacity: .85; }
+.project-one p { margin: 0; }
+.project-one-path { font-size: .8rem; color: var(--muted); overflow-wrap: anywhere; }
+.project-sidebar-add { display: grid; gap: .35rem; }
+.project-sidebar-how { display: grid; gap: .35rem; }
+
+/* Always down the side: the page moves over rather than the list sitting on it. */
+body.projects-always .project-sidebar { box-shadow: none; }
+@media (min-width: 60rem) {
+  body.projects-always > *:not(.project-sidebar):not(.skip-link) { margin-left: min(24rem, 30vw); }
+}

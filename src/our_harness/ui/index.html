@@ -8,8 +8,47 @@
 </head>
 <body>
   <a class="skip-link" href="#workspace">Skip to workflow</a>
+    <aside id="projectSidebar" class="project-sidebar" aria-label="Your projects" hidden>
+      <div class="project-sidebar-top">
+        <h2 id="projectSidebarTitle">Your projects</h2>
+        <button id="projectSidebarClose" type="button" title="Close this list">Close</button>
+      </div>
+      <p class="hint">Each project keeps its own automations, timers, checks and team,
+        inside its own folder. Switching here changes all of them at once.</p>
+
+      <ul id="projectList" class="project-list" aria-labelledby="projectSidebarTitle"></ul>
+
+      <div class="project-sidebar-add">
+        <label for="projectAddPath">Add a project folder</label>
+        <input id="projectAddPath" type="text" placeholder="The folder your project is in">
+        <button id="projectAdd" class="primary" type="button">Add it</button>
+      </div>
+      <p id="projectSaid" class="callout" role="status">Pick one to work on it.</p>
+
+      <div class="project-sidebar-how">
+        <label for="projectSidebarHow">Show this list</label>
+        <select id="projectSidebarHow">
+          <option value="slide-out">Only when I ask for it</option>
+          <option value="always">Always, down the side</option>
+        </select>
+      </div>
+    </aside>
   <header class="topbar">
-    <div><p class="eyebrow">LOCAL CONTROL</p><h1>Nexus Harness</h1></div>
+    <div>
+      <p class="eyebrow">LOCAL CONTROL</p><h1>Nexus Harness</h1>
+      <button id="projectBar" class="project-bar" type="button"
+              aria-expanded="false" aria-controls="projectSidebar"
+              title="Which project this is. Press it to see the others.">
+        <span class="project-bar-name" id="projectBarName">This project</span>
+        <span class="project-bar-path" id="projectBarPath"></span>
+        <span class="project-bar-more" aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="14" height="14" focusable="false">
+            <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="2"
+                  stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </span>
+      </button>
+    </div>
     <div id="workflowActions" class="top-actions" aria-label="Workflow actions" hidden>
       <button id="addAgentButton" class="primary" type="button">Add agent</button>
       <button id="validateButton" type="button">Validate</button>

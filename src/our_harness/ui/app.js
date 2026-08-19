@@ -1269,6 +1269,185 @@ function renderWhatItIsDoing() {
   }
 }
 
+/* ==========================================================================
+   Which project this is, and getting to another one.
+
+   The harness has always worked on one project at a time, and everything it
+   keeps belongs to the folder of that project. What was missing was anywhere
+   saying which one you were looking at, and any way to another without
+   stopping the harness and starting it again.
+
+   The list itself is about this machine. What a project is called lives in the
+   project, so it travels with it.
+   ========================================================================== */
+
+let projectsHere = {};
+let projectsList = [];
+let projectsSidebar = "slide-out";
+
+async function refreshProjects() {
+  try {
+    const said = await request("/api/projects");
+    projectsHere = said.here || {};
+    projectsList = said.projects || [];
+    projectsSidebar = said.sidebar || "slide-out";
+    $("projectBarName").textContent = projectsHere.name || "This project";
+    $("projectBarPath").textContent = projectsHere.shortened || projectsHere.path || "";
+    $("projectBar").title = projectsHere.path
+      ? `${projectsHere.name} - ${projectsHere.path}. Press it to see the others.`
+      : "Which project this is.";
+    $("projectSidebarHow").value = projectsSidebar;
+    showTheSidebarTheWayTheyLikeIt();
+    renderProjects();
+  } catch (error) { showError(error.message); }
+}
+
+function showTheSidebarTheWayTheyLikeIt() {
+  // Always means it stays there. Slide-out means it is only there while it is
+  // wanted, and the page keeps its whole width the rest of the time.
+  const always = projectsSidebar === "always";
+  document.body.classList.toggle("projects-always", always);
+  // The close button is no use when the list is meant to stay, and leaving it
+  // there offers somebody a button that undoes their own setting. Decided here
+  // rather than only when the list is opened: going back to slide-out never
+  // opens anything, and the button stayed gone.
+  $("projectSidebarClose").hidden = always;
+  if (always) openTheProjects(true);
+}
+
+function sayAboutProjects(words) { $("projectSaid").textContent = words; }
+
+function openTheProjects(open) {
+  const sidebar = $("projectSidebar");
+  sidebar.hidden = !open;
+  $("projectBar").setAttribute("aria-expanded", String(Boolean(open)));
+  $("projectSidebarClose").hidden = projectsSidebar === "always";
+  if (open && !$("projectSidebarClose").hidden) {
+    $("projectSidebarClose").focus({preventScroll: true});
+  }
+}
+
+function renderProjects() {
+  const list = $("projectList");
+  list.replaceChildren();
+  if (!projectsList.length) {
+    const empty = make("li", "project-one empty-state");
+    empty.append(make("p", "", "Only this one so far. Add a folder below."));
+    list.append(empty);
+    return;
+  }
+  for (const one of projectsList) {
+    const here = one.path === projectsHere.path;
+    const row = make("li", `project-one${here ? " here" : ""}${one.is_there ? "" : " missing"}`);
+    row.append(make("strong", "", one.name));
+    row.append(make("p", "project-one-path", one.path));
+    if (!one.is_there) {
+      row.append(make("p", "project-one-path", "That folder is not there any more."));
+    }
+    const buttons = make("div", "button-row");
+    if (here) {
+      buttons.append(make("span", "hint", "You are working on this one."));
+    } else {
+      const open = make("button", "", "Work on this");
+      open.type = "button";
+      open.disabled = !one.is_there;
+      open.addEventListener("click", () => workOnThisProject(one, open));
+      buttons.append(open);
+    }
+    const rename = make("button", "", "Rename");
+    rename.type = "button";
+    rename.disabled = !one.is_there;
+    rename.addEventListener("click", () => renameThisProject(one));
+    const forget = make("button", "", "Take off the list");
+    forget.type = "button";
+    forget.title = "Nothing is deleted. The folder stays where it is.";
+    forget.addEventListener("click", () => forgetThisProject(one));
+    buttons.append(rename, forget);
+    row.append(buttons);
+    list.append(row);
+  }
+}
+
+async function workOnThisProject(one, button) {
+  button.disabled = true;
+  sayAboutProjects(`Moving to ${one.name}...`);
+  try {
+    const said = await request("/api/projects/open", {
+      method: "POST", body: JSON.stringify({path: one.path}),
+    });
+    sayAboutProjects(said.note || "");
+    // Everything on this page belongs to the project it came from - the
+    // workflow, the checks, the automations, what it knows. Reading it fresh
+    // is the honest thing, and it is what somebody expects to see.
+    window.location.reload();
+  } catch (error) {
+    showError(error.message);
+    sayAboutProjects(error.message);
+    button.disabled = false;
+  }
+}
+
+async function renameThisProject(one) {
+  const wanted = window.prompt(
+    `What should this project be called?\n\nThe name is kept inside the project, `
+    + `so anybody who copies it gets the same name. Leave it empty to go back to `
+    + `the folder's own name.`,
+    one.name
+  );
+  if (wanted === null) return;
+  try {
+    const said = await request("/api/projects/rename", {
+      method: "POST", body: JSON.stringify({path: one.path, name: wanted}),
+    });
+    await refreshProjects();
+    sayAboutProjects(`Now called ${said.name}.`);
+  } catch (error) { showError(error.message); sayAboutProjects(error.message); }
+}
+
+async function forgetThisProject(one) {
+  if (one.path === projectsHere.path) {
+    sayAboutProjects("This is the one you are working on. Move to another one first.");
+    return;
+  }
+  if (!window.confirm(
+    `Take ${one.name} off this list?\n\nNothing is deleted. The folder and `
+    + `everything in it stays exactly where it is.`
+  )) return;
+  try {
+    const said = await request("/api/projects/forget", {
+      method: "POST", body: JSON.stringify({path: one.path}),
+    });
+    await refreshProjects();
+    sayAboutProjects(said.note || "");
+  } catch (error) { showError(error.message); sayAboutProjects(error.message); }
+}
+
+async function addAProject() {
+  const path = $("projectAddPath").value.trim();
+  if (!path) { sayAboutProjects("Type the folder your project is in."); return; }
+  try {
+    const said = await request("/api/projects/add", {
+      method: "POST", body: JSON.stringify({path}),
+    });
+    $("projectAddPath").value = "";
+    await refreshProjects();
+    sayAboutProjects(`${said.project.name} is on the list. Press Work on this to open it.`);
+  } catch (error) { showError(error.message); sayAboutProjects(error.message); }
+}
+
+async function chooseHowTheSidebarLooks() {
+  try {
+    const said = await request("/api/projects/sidebar", {
+      method: "POST", body: JSON.stringify({how: $("projectSidebarHow").value}),
+    });
+    projectsSidebar = said.sidebar;
+    showTheSidebarTheWayTheyLikeIt();
+    sayAboutProjects(projectsSidebar === "always"
+      ? "This list will stay where it is."
+      : "This list will only come out when you ask for it.");
+  } catch (error) { showError(error.message); sayAboutProjects(error.message); }
+}
+
 let teamNotes = [];
 
 async function refreshTeamNotes() {
@@ -3451,6 +3630,17 @@ function bindEvents() {
   });
   $("pipelineAskRun").addEventListener("click", runWithTheAnswers);
   $("pipelineAskCancel").addEventListener("click", () => $("pipelineAskDialog").close());
+  $("projectBar").addEventListener("click", () => openTheProjects($("projectSidebar").hidden));
+  $("projectSidebarClose").addEventListener("click", () => openTheProjects(false));
+  $("projectAdd").addEventListener("click", addAProject);
+  $("projectSidebarHow").addEventListener("change", chooseHowTheSidebarLooks);
+  // Escape closes it, the way it closes everything else that sits over a page.
+  // Not when it is meant to stay: closing it then is undoing somebody's own
+  // setting with a key they pressed for something else.
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || projectsSidebar === "always") return;
+    if (!$("projectSidebar").hidden) { openTheProjects(false); $("projectBar").focus(); }
+  });
   $("tellingAdd").addEventListener("click", addTelling);
   $("tellingKind").addEventListener("change", sayWhatItNeeds);
   $("timerAdd").addEventListener("click", addATimer);
@@ -5127,7 +5317,7 @@ function renderLookupAnswer(said) {
 
 async function boot() {
   bindEvents();
-  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); renderWhatItIsDoing(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
+  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); renderWhatItIsDoing(); await refreshProjects(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
 }
 
 boot();

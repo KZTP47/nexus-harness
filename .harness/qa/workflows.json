@@ -5824,6 +5824,131 @@
         "max_console_errors": 1,
         "max_page_errors": 0
       }
+    },
+    {
+      "id": "the-panel-says-which-project-and-can-list-the-others",
+      "title": "The panel says which project it is on, and the list can be added to, renamed, tidied and pinned open",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "projects"
+      ],
+      "touches": [
+        "the project list"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "expect_visible",
+          "target": "#projectBar",
+          "note": "The bar under the title is always there"
+        },
+        {
+          "do": "run",
+          "script": " window.confirm = () => true; for (let tries = 0; tries < 200; tries += 1) {   if ($('projectBarPath').textContent.trim()) break;   await new Promise(r => setTimeout(r, 250)); } const name = $('projectBarName').textContent.trim(); const path = $('projectBarPath').textContent.trim(); if (!name) return 'it does not say which project this is'; return path ? 'it says the name and the path' : 'it names it but does not say where it is'; ",
+          "text": "it says the name and the path",
+          "timeout_ms": 60000,
+          "note": "It says which project this is, and where it is"
+        },
+        {
+          "do": "run",
+          "script": " const said = await request('/api/projects'); for (const one of said.projects) {   if (one.name === 'Made by a check' || one.path.includes('made-by-a-check')) {     await request('/api/projects/forget', {method: 'POST', body: JSON.stringify({path: one.path})});   } } if (said.sidebar !== 'slide-out') {   await request('/api/projects/sidebar', {method: 'POST', body: JSON.stringify({how: 'slide-out'})}); } await refreshProjects(); return 'nothing of ours is left over'; ",
+          "text": "nothing of ours is left over",
+          "timeout_ms": 45000,
+          "note": "Start from nothing, whatever an earlier run left behind"
+        },
+        {
+          "do": "run",
+          "script": " return $('projectSidebar').hidden   ? 'the list stays out of the way until it is asked for'   : 'the list was already open'; ",
+          "text": "the list stays out of the way until it is asked for",
+          "note": "It starts closed, so the panel keeps its whole width"
+        },
+        {
+          "do": "click",
+          "target": "#projectBar",
+          "note": "Ask for the list"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 300)); if ($('projectSidebar').hidden) return 'pressing the bar did not open it'; if ($('projectBar').getAttribute('aria-expanded') !== 'true') {   return 'it opened but does not say so to anybody listening'; } const rows = [...document.querySelectorAll('#projectList .project-one')]; const here = rows.find(one => one.classList.contains('here')); return here ? 'the list opens and marks the one you are on'             : 'it opens but does not mark the one you are on'; ",
+          "text": "the list opens and marks the one you are on",
+          "timeout_ms": 45000,
+          "note": "Pressing the bar opens the list, and it marks where you are"
+        },
+        {
+          "do": "run",
+          "script": " const here = [...document.querySelectorAll('#projectList .project-one.here')][0]; const buttons = [...here.querySelectorAll('button')].map(one => one.textContent); if (buttons.includes('Work on this')) return 'it offers to move to the one you are on'; const off = [...here.querySelectorAll('button')].find(one => one.textContent === 'Take off the list'); return off && off.title.toLowerCase().includes('nothing is deleted')   ? 'the one you are on cannot be moved to, and taking one off says nothing is deleted'   : 'taking one off does not say that nothing is deleted'; ",
+          "text": "the one you are on cannot be moved to, and taking one off says nothing is deleted",
+          "note": "No button to move to where you already are, and the risky-looking one says it is not"
+        },
+        {
+          "do": "type",
+          "target": "#projectAddPath",
+          "text": "C:\\this\\folder\\is\\not\\there",
+          "note": "Type a folder that is not there"
+        },
+        {
+          "do": "click",
+          "target": "#projectAdd",
+          "note": "Try to add it"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   const said = $('projectSaid').textContent;   if (said.includes('no folder at')) return 'a folder that is not there is refused, and it says why';   await new Promise(r => setTimeout(r, 250)); } return 'it said ' + $('projectSaid').textContent; ",
+          "text": "a folder that is not there is refused, and it says why",
+          "timeout_ms": 45000,
+          "note": "A path with nothing at it is almost always a typo"
+        },
+        {
+          "do": "run",
+          "script": " const here = (await request('/api/projects')).here.path; $('projectAddPath').value = here; $('projectAdd').click(); for (let tries = 0; tries < 120; tries += 1) {   if ($('projectSaid').textContent.includes('on the list')) break;   await new Promise(r => setTimeout(r, 250)); } return $('projectSaid').textContent.includes('on the list')   ? 'a real folder goes on the list'   : 'it said ' + $('projectSaid').textContent; ",
+          "text": "a real folder goes on the list",
+          "timeout_ms": 45000,
+          "note": "A folder that is really there goes on"
+        },
+        {
+          "do": "choose",
+          "target": "#projectSidebarHow",
+          "value": "always",
+          "note": "Ask for the list to stay"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.body.classList.contains('projects-always')) break;   await new Promise(r => setTimeout(r, 250)); } if (!document.body.classList.contains('projects-always')) return 'it did not stay'; if ($('projectSidebar').hidden) return 'it says it stays but it is not there'; if (!$('projectSidebarClose').hidden) return 'it still offers a Close that undoes the setting'; const kept = (await request('/api/projects')).sidebar; return kept === 'always'   ? 'it stays, and that is remembered'   : 'it stays now but was not remembered'; ",
+          "text": "it stays, and that is remembered",
+          "timeout_ms": 45000,
+          "note": "It stays down the side, the Close button goes, and it is remembered"
+        },
+        {
+          "do": "choose",
+          "target": "#projectSidebarHow",
+          "value": "slide-out",
+          "note": "Back to only when asked for"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (!document.body.classList.contains('projects-always')) break;   await new Promise(r => setTimeout(r, 250)); } if (document.body.classList.contains('projects-always')) return 'it would not go back'; return $('projectSidebarClose').hidden   ? 'the Close button did not come back'   : 'it can be put back the way it was'; ",
+          "text": "it can be put back the way it was",
+          "timeout_ms": 45000,
+          "note": "And back again, with Close offered once more"
+        },
+        {
+          "do": "click",
+          "target": "#projectSidebarClose",
+          "note": "Close the list the way a person does"
+        },
+        {
+          "do": "run",
+          "script": " await new Promise(r => setTimeout(r, 300)); return $('projectSidebar').hidden   ? 'Close really closes it'   : 'Close did not close it'; ",
+          "text": "Close really closes it",
+          "note": "And it closes"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 1,
+        "max_page_errors": 0
+      }
     }
   ]
 }

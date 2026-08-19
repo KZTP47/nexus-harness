@@ -24,6 +24,7 @@ from . import explain as explainer
 from . import pipeline_starters
 from . import pipelines as pipeline_lab
 from . import chat as chat_lab
+from . import projects as projects_lab
 from . import tell_somebody as telling_lab
 from . import timer as timer_lab
 from . import navigate as navigate_lab
@@ -189,6 +190,68 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.workflow_policy = resolve_workflow_policy(config, registry.workflow_nodes)
         self.check_kinds = dict(registry.check_kinds)
         self.template = migrate_graph(json.loads(files("our_harness.templates").joinpath("gauntlet.json").read_text(encoding="utf-8")))
+
+    def move_to(self, where: str) -> dict[str, Any]:
+        """Show a different project, without stopping and starting again.
+
+        Everything the panel reads comes from `self.config` at the moment it is
+        asked, so most of this is one assignment. The rest is what was worked
+        out from the old project when this started: which plugins it has, what
+        its workflow is allowed to do, and which secrets to keep out of the
+        news. All three belong to a project and all three have to move with it.
+
+        A run in flight stops this. Halfway through, the run would be reading
+        one project's settings and writing into another's.
+        """
+
+        from .config import load_config
+
+        wanted = Path(where).expanduser()
+        try:
+            wanted = wanted.resolve()
+        except OSError as exc:
+            raise HarnessError(f"That path cannot be read: {exc}") from exc
+        if not wanted.is_dir():
+            raise HarnessError(
+                f"There is no folder at {wanted}. Pick the folder your project is in."
+            )
+        if self.pipeline_running:
+            raise HarnessError(
+                "An automation is running. Wait for it to finish, or stop it, "
+                "before moving to another project."
+            )
+        if not self.run_lock.acquire(blocking=False):
+            raise HarnessError(
+                "A run is going. Wait for it to finish before moving to "
+                "another project."
+            )
+        try:
+            if not self.qa_lock.acquire(blocking=False):
+                raise HarnessError(
+                    "The checks are running. Wait for them to finish before "
+                    "moving to another project."
+                )
+            try:
+                config = load_config(wanted)
+                registry = load_plugins(config)
+                self.config = config
+                self.workflow_policy = resolve_workflow_policy(
+                    config, registry.workflow_nodes
+                )
+                self.check_kinds = dict(registry.check_kinds)
+                # What to keep out of the news is worked out from the project's
+                # own settings, so it moves with the project too.
+                self.events.redactor = CredentialRedactor(config)
+                self.qa_result = None
+                self.pipeline_run = None
+                self.seats_before = None
+                self.seats_were_set_up = False
+            finally:
+                self.qa_lock.release()
+        finally:
+            self.run_lock.release()
+        projects_lab.opened(wanted)
+        return projects_lab.where_we_are(self.config)
 
     def reserve_run(self) -> bool:
         return self.run_lock.acquire(blocking=False)
@@ -806,6 +869,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         self.server.config, query.get("name", [""])[0]
                     )
                 })
+            elif parsed.path == "/api/projects":
+                self._require_token()
+                config = self.server.config
+                self._json({
+                    "here": projects_lab.where_we_are(config),
+                    "projects": [
+                        one.to_dict()
+                        for one in projects_lab.every_one(config.project_root)
+                    ],
+                    "sidebar": projects_lab.how_it_looks(),
+                    "how_it_can_look": list(projects_lab.HOW_IT_CAN_LOOK),
+                })
             elif parsed.path == "/api/telling":
                 self._require_token()
                 config = self.server.config
@@ -1276,6 +1351,32 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json(explainer.what_it_means(
                     str(body.get("said") or "")[:20000], kind=str(body.get("kind") or "")
                 ).to_dict())
+            elif self.path == "/api/projects/add":
+                one = projects_lab.add(str(body.get("path") or ""))
+                self._json({"project": one.to_dict()})
+            elif self.path == "/api/projects/rename":
+                # A name is about the project, so it is written inside it and
+                # travels with it. Somebody else who clones this gets the name.
+                name = projects_lab.rename(
+                    str(body.get("path") or self.server.config.project_root),
+                    str(body.get("name") or ""),
+                )
+                self._json({"name": name})
+            elif self.path == "/api/projects/forget":
+                self._json({"note": projects_lab.forget(str(body.get("path") or ""))})
+            elif self.path == "/api/projects/open":
+                here = self.server.move_to(str(body.get("path") or ""))
+                self._json({
+                    "here": here,
+                    "note": (
+                        f"Now showing {here['name']}. The page reloads, because "
+                        "everything on it belongs to the project it came from."
+                    ),
+                })
+            elif self.path == "/api/projects/sidebar":
+                self._json({
+                    "sidebar": projects_lab.make_it_look(str(body.get("how") or ""))
+                })
             elif self.path == "/api/telling/save":
                 # The same lock its neighbour takes. Looking to see whether a
                 # name is taken and then writing it is two steps, and two people
