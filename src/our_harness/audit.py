@@ -28,6 +28,10 @@ EXCLUDED_PARTS = {
     ".git", ".venv", "dist", "build", "tests", "__pycache__",
     # Third-party trees are not ours to rewrite, and the harness never ships them.
     "node_modules", ".harness", "benchmark-archive", "benchmark-logs",
+    # What a build put there, including the copy of this very code that the
+    # desktop app carries. Read as source, the audit was reading its own output
+    # and telling us off for it.
+    "build-output", "win-unpacked",
 }
 RECORDED_AUDIT_NOTES = {"docs/AUDIT.md", "src/our_harness/audit.py", "our_harness/audit.py"}
 

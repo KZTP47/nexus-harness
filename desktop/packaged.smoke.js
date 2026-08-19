@@ -78,11 +78,22 @@ function main() {
   const installers = fs.readdirSync(OUTPUT).filter((name) => /\.(exe|dmg|AppImage)$/.test(name));
   check(installers.length > 0, `an installer was built (${installers.join(", ") || "none"})`);
 
+  // The harness itself. An installed program has no src folder beside it, so
+  // the app carries one - and without it the app is a window that opens onto
+  // "No module named our_harness" and nothing anybody can act on. This check
+  // used to say "carries everything it needs" while that was missing.
+  const carried = path.join(folder, "resources", "harness", "src", "our_harness");
+  check(fs.existsSync(carried), "the harness itself is in the installer");
+  const launcher = path.join(folder, "resources", "harness", "scripts", "harness.py");
+  check(fs.existsSync(launcher), "and the launcher that starts it");
+
   if (problems.length) {
     console.error(`\n${problems.length} check(s) failed.`);
     process.exit(1);
   }
   console.log("\nThe built app carries everything it needs.");
+  console.log("This says what is inside it. Whether it starts is a different");
+  console.log("question, and the answer is: npm run smoke:built");
 }
 
 try {

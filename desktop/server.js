@@ -36,8 +36,15 @@ function pythonCandidates(environment = process.env) {
 // this, every Python on the machine answered "No module named our_harness", and
 // the app showed three of those and nothing anybody could act on. Everybody who
 // has only downloaded the project - which is everybody, the first time - hit it.
-function whereTheHarnessLives(appFolder = __dirname, projectPath = "") {
-  const looking = [path.resolve(appFolder, "..", "src")];
+function whereTheHarnessLives(appFolder = __dirname, projectPath = "", resources = "") {
+  const looking = [];
+  // An installed app has no src folder beside it - it has a resources folder,
+  // and the harness is put in there when the app is built. Without this the
+  // installed app was an empty window: it could only ever work if the project
+  // somebody picked happened to be a copy of the harness itself.
+  const carried = resources || process.resourcesPath || "";
+  if (carried) looking.push(path.resolve(carried, "harness", "src"));
+  looking.push(path.resolve(appFolder, "..", "src"));
   if (projectPath) looking.push(path.resolve(projectPath, "src"));
   return looking.filter((one) => {
     try {
@@ -133,6 +140,7 @@ class HarnessServer {
     this.spawnProcess = options.spawn || spawn;
     this.environment = options.environment || process.env;
     this.appFolder = options.appFolder || __dirname;
+    this.resources = options.resources || process.resourcesPath || "";
     this.candidates = options.candidates || pythonCandidates(this.environment);
     this.timeoutMs = options.timeoutMs || START_TIMEOUT_MS;
     this.child = null;
@@ -198,7 +206,8 @@ class HarnessServer {
         child = this.spawnProcess(command, argv, {
           cwd: projectPath,
           env: environmentForStarting(
-            this.environment, whereTheHarnessLives(this.appFolder, projectPath)
+            this.environment,
+            whereTheHarnessLives(this.appFolder, projectPath, this.resources)
           ),
           windowsHide: true,
         });

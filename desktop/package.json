@@ -9,7 +9,8 @@
     "test": "node --test",
     "build": "electron-builder",
     "smoke": "node smoke.js",
-    "smoke:packaged": "node packaged.smoke.js"
+    "smoke:packaged": "node packaged.smoke.js",
+    "smoke:built": "node built.smoke.js"
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -27,7 +28,8 @@
       "package.json",
       "!**/*.test.js",
       "!smoke.js",
-      "!packaged.smoke.js"
+      "!packaged.smoke.js",
+      "!built.smoke.js"
     ],
     "win": {
       "target": "nsis"
@@ -40,7 +42,17 @@
     },
     "directories": {
       "output": "build-output"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "../src",
+        "to": "harness/src"
+      },
+      {
+        "from": "../scripts/harness.py",
+        "to": "harness/scripts/harness.py"
+      }
+    ]
   },
   "author": "Nexus Harness"
 }

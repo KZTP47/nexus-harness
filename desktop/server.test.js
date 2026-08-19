@@ -328,3 +328,37 @@ test("the project's own src is looked at too, after the app's", () => {
   );
   fs.rmSync(folder, { recursive: true, force: true });
 });
+
+test("an installed app finds the harness it was built with", () => {
+  // An installed program has no src folder beside it. It has a resources
+  // folder, and the harness is put there when the app is built. Without this
+  // the installed app was an empty window, whatever anybody did.
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-packed-"));
+  const carried = path.join(folder, "resources");
+  fs.mkdirSync(path.join(carried, "harness", "src", "our_harness"), { recursive: true });
+  fs.writeFileSync(
+    path.join(carried, "harness", "src", "our_harness", "__init__.py"), ""
+  );
+
+  const found = whereTheHarnessLives(path.join(folder, "app"), "", carried);
+  assert.deepStrictEqual(found, [path.join(carried, "harness", "src")]);
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("what the app carries comes before anything in the project", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-order-"));
+  const carried = path.join(folder, "resources");
+  for (const where of [
+    path.join(carried, "harness", "src", "our_harness"),
+    path.join(folder, "project", "src", "our_harness"),
+  ]) {
+    fs.mkdirSync(where, { recursive: true });
+    fs.writeFileSync(path.join(where, "__init__.py"), "");
+  }
+  const found = whereTheHarnessLives(
+    path.join(folder, "app"), path.join(folder, "project"), carried
+  );
+  assert.strictEqual(found[0], path.join(carried, "harness", "src"));
+  assert.strictEqual(found.length, 2, "the project's own is still a fallback");
+  fs.rmSync(folder, { recursive: true, force: true });
+});
