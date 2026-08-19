@@ -6026,10 +6026,10 @@
         },
         {
           "do": "run",
-          "script": " const press = async (button, id) => {   let threw = '';   const before = window.__sweep.errors.length;   try { button.click(); } catch (error) { threw = String((error && error.message) || error); }   await new Promise(r => setTimeout(r, 50));   window.__sweep.results.push({id, threw, newErrors: window.__sweep.errors.length - before});   for (const box of [...document.querySelectorAll('dialog')]) {     if (box.open) { box.returnValue = 'cancel'; box.close(); }   } }; const nameOf = (button) => button.id || ('the one saying \"' + button.textContent.trim().slice(0, 40) + '\"'); const views = [...document.querySelectorAll('[data-view]')].map(one => one.dataset.view); for (const view of views) {   switchView(view);   await new Promise(r => setTimeout(r, 250));   for (const button of [...document.querySelectorAll('button')]) {     if (!button.isConnected) continue;     await press(button, nameOf(button));   } } openTheProjects(true); await new Promise(r => setTimeout(r, 250)); for (const button of [...document.querySelectorAll('#projectSidebar button')]) {   if (button.isConnected) await press(button, nameOf(button)); } for (const tab of [...document.querySelectorAll('[data-pipeline-tab]')]) {   tab.click();   await new Promise(r => setTimeout(r, 200));   for (const button of [...document.querySelectorAll('.pipeline-pane button')]) {     if (button.isConnected) await press(button, nameOf(button));   } } return 'every one of them was pressed'; ",
+          "script": " const goesAway = (button) => button.textContent.trim() === 'Work on this'; const press = async (button, id) => { if (goesAway(button)) return;   let threw = '';   const before = window.__sweep.errors.length;   try { button.click(); } catch (error) { threw = String((error && error.message) || error); }   await new Promise(r => setTimeout(r, 50));   window.__sweep.results.push({id, threw, newErrors: window.__sweep.errors.length - before});   for (const box of [...document.querySelectorAll('dialog')]) {     if (box.open) { box.returnValue = 'cancel'; box.close(); }   } }; const nameOf = (button) => button.id || ('the one saying \"' + button.textContent.trim().slice(0, 40) + '\"'); const views = [...document.querySelectorAll('[data-view]')].map(one => one.dataset.view); for (const view of views) {   switchView(view);   await new Promise(r => setTimeout(r, 250));   for (const button of [...document.querySelectorAll('button')]) {     if (!button.isConnected) continue;     await press(button, nameOf(button));   } } openTheProjects(true); await new Promise(r => setTimeout(r, 250)); for (const button of [...document.querySelectorAll('#projectSidebar button')]) {   if (button.isConnected) await press(button, nameOf(button)); } for (const tab of [...document.querySelectorAll('[data-pipeline-tab]')]) {   tab.click();   await new Promise(r => setTimeout(r, 200));   for (const button of [...document.querySelectorAll('.pipeline-pane button')]) {     if (button.isConnected) await press(button, nameOf(button));   } } return 'every one of them was pressed'; ",
           "text": "every one of them was pressed",
           "timeout_ms": 120000,
-          "note": "Press every button in every view, the ones with names and the ones the page builds with words on them"
+          "note": "Press every button in every view, but not the one that moves to another project - that reloads the page, which would end the sweep rather than tell anybody anything"
         },
         {
           "do": "run",
@@ -6041,6 +6041,71 @@
       ],
       "expect": {
         "max_console_errors": 60,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "renaming-a-project-really-changes-its-name",
+      "title": "Pressing Rename opens a box, and what is typed really becomes the name",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "projects"
+      ],
+      "touches": [
+        "the project list"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"start\"]",
+          "note": "Somewhere to start from"
+        },
+        {
+          "do": "click",
+          "target": "#projectBar",
+          "note": "Open the list of projects"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelector('#projectList .project-one.here')) break;   await new Promise(r => setTimeout(r, 250)); } const here = document.querySelector('#projectList .project-one.here'); if (!here) return 'the list never showed the one we are on'; window.__wasCalled = (await request('/api/projects')).here.name; return 'the list is open and knows where we are'; ",
+          "text": "the list is open and knows where we are",
+          "timeout_ms": 60000,
+          "note": "Wait for the list, and remember what this project is called"
+        },
+        {
+          "do": "run",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); } else { document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); } await new Promise(r => setTimeout(r, 200)); return true; }; const here = document.querySelector('#projectList .project-one.here'); const rename = [...here.querySelectorAll('button')].find(one => one.textContent.trim() === 'Rename'); if (!rename) return 'there is no Rename button'; rename.click(); if (!await answerTheBox('Renamed by a check')) return 'pressing Rename opened no box'; return 'pressing Rename opens a box to type in'; ",
+          "text": "pressing Rename opens a box to type in",
+          "timeout_ms": 45000,
+          "note": "Press Rename by the word on it, and type in the box that opens"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 200; tries += 1) {   const now = (await request('/api/projects')).here.name;   if (now === 'Renamed by a check') break;   await new Promise(r => setTimeout(r, 250)); } const now = (await request('/api/projects')).here.name; if (now !== 'Renamed by a check') return 'the name never changed, it is still ' + now; const onTheBar = document.getElementById('projectBarName').textContent.trim(); return onTheBar === 'Renamed by a check'   ? 'what was typed really became the name, on disk and on the bar'   : 'the name changed but the bar still says ' + onTheBar; ",
+          "text": "what was typed really became the name, on disk and on the bar",
+          "timeout_ms": 60000,
+          "note": "It changed where it is kept, and on the bar under the title"
+        },
+        {
+          "do": "run",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); } else { document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); } await new Promise(r => setTimeout(r, 200)); return true; }; const here = document.querySelector('#projectList .project-one.here'); const rename = [...here.querySelectorAll('button')].find(one => one.textContent.trim() === 'Rename'); rename.click(); if (!await answerTheBox(null)) return 'the box did not open the second time'; await new Promise(r => setTimeout(r, 300)); const now = (await request('/api/projects')).here.name; return now === 'Renamed by a check'   ? 'pressing Cancel changes nothing'   : 'Cancel changed the name to ' + now; ",
+          "text": "pressing Cancel changes nothing",
+          "timeout_ms": 45000,
+          "note": "And Cancel leaves it alone, which is what prompt did"
+        },
+        {
+          "do": "run",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); } else { document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); } await new Promise(r => setTimeout(r, 200)); return true; }; const here = document.querySelector('#projectList .project-one.here'); const rename = [...here.querySelectorAll('button')].find(one => one.textContent.trim() === 'Rename'); rename.click(); if (!await answerTheBox(window.__wasCalled)) return 'the box did not open'; for (let tries = 0; tries < 200; tries += 1) {   if ((await request('/api/projects')).here.name === window.__wasCalled) break;   await new Promise(r => setTimeout(r, 250)); } const now = (await request('/api/projects')).here.name; return now === window.__wasCalled   ? 'and the name was put back'   : 'it was left called ' + now; ",
+          "text": "and the name was put back",
+          "timeout_ms": 60000,
+          "note": "Leave this project called what it was called"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
         "max_page_errors": 0
       }
     }

@@ -148,6 +148,35 @@ class TheListIsAboutThisMachine(ProjectTestCase):
             [one.name for one in projects.every_one()], ["second", "first"]
         )
 
+    def test_the_one_you_are_on_comes_first(self) -> None:
+        """Sorted only by when each was last opened, the row saying "you are
+        working on this one" turned up in the middle of the list. Somebody
+        pressing the first Rename they saw then renamed a different project."""
+
+        first, second = self.a_project("first"), self.a_project("second")
+        projects.add(first)
+        projects.add(second)
+        projects.opened(second, datetime(2026, 1, 2, 9, 0))
+
+        found = projects.every_one(first)
+        self.assertEqual(found[0].path, str(first))
+        self.assertEqual(
+            [one.name for one in found], ["first", "second"],
+            "and the rest are still newest first",
+        )
+
+    def test_the_rest_are_still_newest_first_under_it(self) -> None:
+        here = self.a_project("here")
+        older, newer = self.a_project("older"), self.a_project("newer")
+        for one in (here, older, newer):
+            projects.add(one)
+        projects.opened(older, datetime(2026, 1, 1, 9, 0))
+        projects.opened(newer, datetime(2026, 1, 3, 9, 0))
+        self.assertEqual(
+            [one.name for one in projects.every_one(here)],
+            ["here", "newer", "older"],
+        )
+
     def test_a_list_nobody_could_read_does_not_grow_for_ever(self) -> None:
         for number in range(projects.MOST_KEPT + 5):
             projects.add(self.a_project(f"one-{number}"))

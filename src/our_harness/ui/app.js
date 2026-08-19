@@ -3665,10 +3665,9 @@ function bindEvents() {
   window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
   $("teamSetUp").addEventListener("click", setUpTheTeam);
-  // Both of these say what went wrong. Without it, a request that failed threw
+  // This one says what went wrong. Without it, a request that failed threw
   // where nobody was listening: the button was pressed, nothing happened, and
-  // there was nothing on the screen to say why. Every other button here already
-  // did this; these two were the ones that did not.
+  // there was nothing on the screen to say why.
   $("teamStarting").addEventListener("click", async () => {
     try {
       const said = await request("/api/who-is-on-it");
@@ -3676,11 +3675,11 @@ function bindEvents() {
       teamSay("This is the ready-made team. Change anything you like, then save it.");
     } catch (error) { showError(error.message); teamSay(error.message); }
   });
+  // Not this one: checkTheTeam catches its own failures and answers false, so
+  // wrapping it again would be a catch that can never run.
   $("teamCheck").addEventListener("click", async () => {
-    try {
-      const fine = await checkTheTeam();
-      teamSay(fine ? "Nothing is in the way. This team would run." : "Have a look at what is in the way, below.");
-    } catch (error) { showError(error.message); teamSay(error.message); }
+    const fine = await checkTheTeam();
+    teamSay(fine ? "Nothing is in the way. This team would run." : "Have a look at what is in the way, below.");
   });
   $("teamSave").addEventListener("click", saveTheTeam);
   $("teamRemove").addEventListener("click", removeTheTeam);

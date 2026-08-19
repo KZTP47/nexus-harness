@@ -54,8 +54,14 @@ async function main() {
 
     wasCalled = (await page.textContent("#projectBarName")).trim();
 
-    // Pressed by the word on it, which is how a person finds it.
-    await page.locator("#projectList button", { hasText: "Rename" }).first().click();
+    // The row for the project this window is showing, and no other. Taking the
+    // first row instead renamed whichever project happened to sort first, said
+    // "Now called ..." about it, and left this one untouched - which reads
+    // exactly like the bug this check is here to catch.
+    await page
+      .locator("#projectList .project-one.here button", { hasText: "Rename" })
+      .first()
+      .click();
     await page.waitForSelector("#askDialog[open]", { timeout: 15000 });
     console.log("pass  pressing Rename opens a box to type in");
 
@@ -71,7 +77,10 @@ async function main() {
     // Whatever happened, this project is left called what it was called.
     if (wasCalled) {
       try {
-        await page.locator("#projectList button", { hasText: "Rename" }).first().click();
+        await page
+          .locator("#projectList .project-one.here button", { hasText: "Rename" })
+          .first()
+          .click();
         await page.waitForSelector("#askDialog[open]", { timeout: 15000 });
         await page.fill("#askDialogInput", wasCalled);
         await page.click("#askDialogOk");

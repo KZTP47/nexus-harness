@@ -173,11 +173,16 @@ def _the_paths(said: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def every_one(also: Path | str | None = None) -> list[Project]:
-    """Every project this machine knows about, newest first.
+    """Every project this machine knows about, the one you are on first.
 
     The one the panel is showing is always in the list, whether or not anybody
     added it - opening a folder is how it gets on the list, and it would be odd
     for the one in front of you to be missing from it.
+
+    And it is first. Sorted only by when each was last opened, the one you were
+    looking at could sit anywhere in the list, which is a strange thing to hand
+    somebody: the row that says "you are working on this one" was somewhere in
+    the middle. Everything after it is newest first, as before.
     """
 
     said = _the_paths(_read_the_list())
@@ -194,7 +199,22 @@ def every_one(also: Path | str | None = None) -> list[Project]:
             is_there=where.is_dir(),
             last_opened=one["last_opened"],
         ))
-    return sorted(found, key=lambda one: one.last_opened, reverse=True)
+    here = str(Path(also).resolve()) if also is not None else ""
+    return sorted(
+        found,
+        key=lambda one: (one.path != here, _the_other_way_round(one.last_opened)),
+    )
+
+
+def _the_other_way_round(said: str) -> str:
+    """Newest first, out of a sort that goes smallest first.
+
+    Every time is written the same way, so turning each letter around orders
+    them backwards. Simpler than sorting twice, and it keeps the one you are on
+    pinned to the top whatever its time says.
+    """
+
+    return "".join(chr(0x10FFFF - ord(one)) if ord(one) < 0x10FFFF else one for one in said)
 
 
 def add(where: Path | str) -> Project:

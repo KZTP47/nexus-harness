@@ -22,9 +22,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PANEL = ROOT / "src" / "our_harness" / "ui" / "app.js"
 
-# What the app does not have. Written as it is really called, so the comment
-# saying "not window.prompt" is not itself a finding.
-NOT_IN_THE_APP = re.compile(r"(?<![\w.])(?:window\.)?prompt\s*\(")
+# What the app does not have.
+#
+# Every way of writing the same call, not just the two obvious ones: window,
+# globalThis, top, self and parent all reach it, and so does taking a reference
+# to it first. Written as one pattern rather than a list of spellings, because
+# a list of spellings is a list somebody adds to after it has already gone
+# wrong.
+NOT_IN_THE_APP = re.compile(
+    # The global itself, reached by any of its names, however it is used -
+    # including taking a reference to it and calling that later.
+    r"(?:window|globalThis|self|top|parent)\.prompt(?![\w$])"
+    # Or a bare call. Not the word on its own: a step of an automation has
+    # a setting called prompt, and telling somebody off for that is how a
+    # guard gets turned off.
+    r"|(?<![\w.$\-])prompt\s*\("
+)
 
 # The box the panel uses instead.
 THE_WAY_TO_ASK = "askForOneLine"
@@ -81,8 +94,16 @@ class ThePanelOnlyAsksInWaysTheAppHas(unittest.TestCase):
 
         self.assertIsNotNone(NOT_IN_THE_APP.search("const x = prompt('hello');"))
         self.assertIsNotNone(NOT_IN_THE_APP.search("const x = window.prompt('hi');"))
+        self.assertIsNotNone(NOT_IN_THE_APP.search("globalThis.prompt('hi');"))
+        self.assertIsNotNone(NOT_IN_THE_APP.search("const p = window.prompt;"))
+        self.assertIsNotNone(NOT_IN_THE_APP.search("top.prompt('hi');"))
         self.assertIsNone(NOT_IN_THE_APP.search("askForOneLine('hello');"))
         self.assertIsNone(NOT_IN_THE_APP.search("this.promptCache = 1;"))
+        self.assertIsNone(NOT_IN_THE_APP.search("said.prompt_history = [];"))
+        # A step of an automation really has a setting called this.
+        self.assertIsNone(NOT_IN_THE_APP.search("prompt: $('teamCustomPrompt').value,"))
+        self.assertIsNone(NOT_IN_THE_APP.search("if (!one.prompt.trim()) {"))
+        self.assertIsNone(NOT_IN_THE_APP.search('make("p", "team-node-prompt",'))
 
 
 class TheCheckThatRunsInTheRealApp(unittest.TestCase):

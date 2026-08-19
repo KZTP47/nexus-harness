@@ -2665,6 +2665,28 @@ async function runStep(page, step) {
           wentWrong = true;
         }
       }
+      // A check runs whatever script it likes, so one of them could put an
+      // answering prompt back and quietly get the forgiving browser again -
+      // for itself, without anybody noticing. Asked here, after the steps, that
+      // cannot pass unremarked.
+      try {
+        const putBack = await page.evaluate(() => {
+          try { window.prompt('x'); return true; } catch (error) { return false; }
+        });
+        if (putBack) {
+          report.steps.push({
+            route: current,
+            label: 'this check put prompt back, which the app does not have',
+            ok: false,
+            tidyUp: false,
+            text: 'A check may make the rules stricter, never softer. The app has '
+              + 'no prompt, so a check that gives it an answer is checking a '
+              + 'browser nobody uses.',
+            picture: '',
+          });
+          wentWrong = true;
+        }
+      } catch (error) { /* the page went away; the steps already said so */ }
       if (plan.screenshot) {
         // Wait for the letters to settle and stop anything that moves, so the
         // same page gives the same picture twice.
