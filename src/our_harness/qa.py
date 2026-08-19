@@ -2530,6 +2530,17 @@ async function runStep(page, step) {
   try {
     browser = await chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: plan.viewport });
+    // The panel is used in the desktop app, and the app does not have prompt:
+    // it is the one browser thing Electron takes out on purpose. A check that
+    // runs somewhere more forgiving than where people use it is worse than no
+    // check at all - seven buttons asked with prompt and did nothing whatsoever
+    // in the app, while every check here passed. So the browser is made to
+    // behave the same way, for every check, before any page loads.
+    await page.addInitScript(() => {
+      window.prompt = () => {
+        throw new Error('prompt() is and will not be supported.');
+      };
+    });
     page.on('console', (message) => {
       if (message.type() === 'error') {
         report.consoleErrors.push({ route: current, text: message.text().slice(0, 500) });

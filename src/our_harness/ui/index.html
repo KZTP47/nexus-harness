@@ -619,6 +619,19 @@
     </section>
   </div>
 
+  <dialog id="askDialog" aria-labelledby="askDialogTitle">
+    <form method="dialog" class="dialog-form">
+      <h2 id="askDialogTitle">Type something</h2>
+      <p id="askDialogWhy" class="hint"></p>
+      <label for="askDialogInput" id="askDialogLabel">Your answer</label>
+      <input id="askDialogInput" type="text" maxlength="300">
+      <div class="button-row">
+        <button id="askDialogOk" class="primary" type="submit" value="ok">OK</button>
+        <button id="askDialogCancel" type="submit" value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="pipelineAskDialog" aria-labelledby="pipelineAskDialogTitle">
     <form id="pipelineAskForm" method="dialog">
       <h2 id="pipelineAskDialogTitle">Before this runs</h2>

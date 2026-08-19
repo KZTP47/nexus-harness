@@ -1,0 +1,96 @@
+{
+  "name": "Checked by a check two",
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "label": "Start",
+      "settings": {},
+      "at": {
+        "x": 40.0,
+        "y": 160.0
+      }
+    },
+    {
+      "id": "scan",
+      "kind": "security_scan",
+      "label": "Security scan",
+      "settings": {},
+      "at": {
+        "x": 260.0,
+        "y": 60.0
+      }
+    },
+    {
+      "id": "checks",
+      "kind": "suite",
+      "label": "Your checks",
+      "settings": {},
+      "at": {
+        "x": 260.0,
+        "y": 250.0
+      }
+    },
+    {
+      "id": "gate",
+      "kind": "security_gate",
+      "label": "Security gate",
+      "settings": {
+        "needs": "all"
+      },
+      "at": {
+        "x": 520.0,
+        "y": 60.0
+      }
+    },
+    {
+      "id": "tests",
+      "kind": "unit_test",
+      "label": "Unit tests",
+      "settings": {
+        "command_kind": "test",
+        "tries": 2
+      },
+      "at": {
+        "x": 780.0,
+        "y": 160.0
+      }
+    },
+    {
+      "id": "evidence",
+      "kind": "artifact",
+      "label": "Keep the evidence",
+      "settings": {},
+      "at": {
+        "x": 1020.0,
+        "y": 160.0
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "start",
+      "to": "scan"
+    },
+    {
+      "from": "start",
+      "to": "checks"
+    },
+    {
+      "from": "scan",
+      "to": "gate"
+    },
+    {
+      "from": "gate",
+      "to": "tests"
+    },
+    {
+      "from": "checks",
+      "to": "tests"
+    },
+    {
+      "from": "tests",
+      "to": "evidence"
+    }
+  ]
+}

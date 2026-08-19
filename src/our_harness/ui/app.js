@@ -45,6 +45,33 @@ async function request(path, options = {}) {
   return value;
 }
 
+// Asking somebody for one line of text.
+//
+// Not window.prompt. Electron does not have it - it is the one browser thing
+// they took out on purpose - so every button that used it did nothing at all
+// in the app: no box, no error, no sign anything had happened. In a browser
+// they all worked, which is exactly why nothing caught it for so long.
+//
+// Answers with the text, or null when somebody said no, which is what prompt
+// did and what every caller was already written for.
+function askForOneLine(title, question, value = "") {
+  return new Promise((finish) => {
+    const box = $("askDialog");
+    $("askDialogTitle").textContent = title;
+    $("askDialogWhy").textContent = question || "";
+    $("askDialogWhy").hidden = !question;
+    $("askDialogInput").value = value == null ? "" : String(value);
+    const done = () => {
+      box.removeEventListener("close", done);
+      finish(box.returnValue === "ok" ? $("askDialogInput").value : null);
+    };
+    box.addEventListener("close", done);
+    box.showModal();
+    $("askDialogInput").focus();
+    $("askDialogInput").select();
+  });
+}
+
 function make(tag, className, text) {
   const element = document.createElement(tag);
   if (className) element.className = className;
@@ -1082,7 +1109,8 @@ async function openWorkflow(name) {
 
 async function saveWorkflow() {
   const suggested = currentWorkflow || "My workflow";
-  const name = prompt("Save this workflow as:", suggested);
+  const name = await askForOneLine(
+       "Save this workflow", "What should it be called?", suggested);
   if (name === null) return;
   const checked = await validate();
   if (!checked.valid) {
@@ -1102,7 +1130,9 @@ async function saveWorkflow() {
 
 async function renameWorkflow() {
   if (!currentWorkflow) { showError("Save this workflow first, then you can rename it."); return; }
-  const name = prompt(`Rename ${currentWorkflow} to:`, currentWorkflow);
+  const name = await askForOneLine(
+       "Rename this workflow", `What should ${currentWorkflow} be called now?`,
+       currentWorkflow);
   if (name === null || name === currentWorkflow) return;
   try {
     const answer = await request("/api/workflows/rename", {
@@ -1389,10 +1419,10 @@ async function workOnThisProject(one, button) {
 }
 
 async function renameThisProject(one) {
-  const wanted = window.prompt(
-    `What should this project be called?\n\nThe name is kept inside the project, `
-    + `so anybody who copies it gets the same name. Leave it empty to go back to `
-    + `the folder's own name.`,
+  const wanted = await askForOneLine(
+    "Rename this project",
+    "The name is kept inside the project, so anybody who copies it gets the "
+    + "same name. Leave it empty to go back to the name of the folder.",
     one.name
   );
   if (wanted === null) return;
@@ -1619,9 +1649,10 @@ async function makeBundle() {
 }
 
 async function recordSteps() {
-  const address = window.prompt(
-    "Which page should open?\n\nDo the thing you want to check in the window that opens, "
-      + "then press Done in the bar at the top.",
+  const address = await askForOneLine(
+    "Which page should open?",
+    "Do the thing you want to check in the window that opens, then press Done "
+    + "in the bar at the top.",
     window.location.origin + "/"
   );
   if (!address) return;
@@ -1633,8 +1664,10 @@ async function recordSteps() {
 }
 
 async function pickElement() {
-  const address = window.prompt(
-    "Which page should open?\n\nClick the thing you want to check in the window that opens. Press Escape there to give up.",
+  const address = await askForOneLine(
+    "Which page should open?",
+    "Click the thing you want to check in the window that opens. Press Escape "
+    + "there to give up.",
     window.location.origin + "/"
   );
   if (!address) return;
@@ -2991,7 +3024,9 @@ async function savePipeline() {
 }
 
 async function savePipelineAs() {
-  const name = window.prompt("Save it as", `${$("pipelineName").value} copy`);
+  const name = await askForOneLine(
+       "Save a copy", "What should the copy be called?",
+       `${$("pipelineName").value} copy`);
   if (!name) return;
   $("pipelineName").value = name;
   await savePipeline();
@@ -3457,9 +3492,10 @@ async function shareTheWork() {
 let coverageFound = null;
 
 async function findGaps() {
-  const address = window.prompt(
-    "Which address should the walk start from?\n\nIt opens your site, follows the links, and "
-      + "tells you which pages have no check at all.",
+  const address = await askForOneLine(
+    "Which address should the walk start from?",
+    "It opens your site, follows the links, and tells you which pages have "
+    + "no check at all.",
     window.location.origin + "/"
   );
   if (!address) return;
@@ -3629,14 +3665,22 @@ function bindEvents() {
   window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
   $("teamSetUp").addEventListener("click", setUpTheTeam);
+  // Both of these say what went wrong. Without it, a request that failed threw
+  // where nobody was listening: the button was pressed, nothing happened, and
+  // there was nothing on the screen to say why. Every other button here already
+  // did this; these two were the ones that did not.
   $("teamStarting").addEventListener("click", async () => {
-    const said = await request("/api/who-is-on-it");
-    useTheStartingTeam(said.starting_team);
-    teamSay("This is the ready-made team. Change anything you like, then save it.");
+    try {
+      const said = await request("/api/who-is-on-it");
+      useTheStartingTeam(said.starting_team);
+      teamSay("This is the ready-made team. Change anything you like, then save it.");
+    } catch (error) { showError(error.message); teamSay(error.message); }
   });
   $("teamCheck").addEventListener("click", async () => {
-    const fine = await checkTheTeam();
-    teamSay(fine ? "Nothing is in the way. This team would run." : "Have a look at what is in the way, below.");
+    try {
+      const fine = await checkTheTeam();
+      teamSay(fine ? "Nothing is in the way. This team would run." : "Have a look at what is in the way, below.");
+    } catch (error) { showError(error.message); teamSay(error.message); }
   });
   $("teamSave").addEventListener("click", saveTheTeam);
   $("teamRemove").addEventListener("click", removeTheTeam);

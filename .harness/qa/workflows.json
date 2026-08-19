@@ -855,14 +855,22 @@
         },
         {
           "do": "run",
-          "script": "window.prompt = () => null; return 'ready'",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; window.__answerTheBoxWith = null; window.__answerTheBox = answerTheBox; return 'ready'; ",
           "text": "ready",
-          "note": "Answer the address question with nothing, as a person pressing cancel would"
+          "note": "Answer the address question with nothing, as a person pressing cancel would",
+          "timeout_ms": 45000
         },
         {
           "do": "click",
           "target": "#pickElement",
           "note": "Point at something"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.getElementById('askDialog').open) break;   await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return 'the box never opened'; const words = null; if (words === null) { document.getElementById('askDialogCancel').click(); } else {   document.getElementById('askDialogInput').value = words === '@here' ? window.location.origin + '/' : words;   document.getElementById('askDialogOk').click(); } await new Promise(r => setTimeout(r, 150)); return document.getElementById('askDialog').open ? 'the box would not close' : 'the box was answered'; ",
+          "text": "the box was answered",
+          "timeout_ms": 30000,
+          "note": "Press Cancel in the box, the way somebody who changed their mind does"
         },
         {
           "do": "expect_hidden",
@@ -1843,9 +1851,10 @@
         },
         {
           "do": "run",
-          "script": "window.prompt = () => 'Check made this'; window.confirm = () => true; await saveWorkflow(); const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check made this'))",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; window.confirm = () => true; const going = saveWorkflow(); if (!await answerTheBox('Check made this')) return 'the box never opened'; await going; const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check made this')); ",
           "text": "true",
-          "note": "It was really kept on disk"
+          "note": "It was really kept on disk",
+          "timeout_ms": 45000
         },
         {
           "do": "expect_text",
@@ -1855,9 +1864,10 @@
         },
         {
           "do": "run",
-          "script": "window.prompt = () => 'Check renamed this'; await renameWorkflow(); const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check renamed this')   && !kept.workflows.some(item => item.name === 'Check made this'))",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; const going = renameWorkflow(); if (!await answerTheBox('Check renamed this')) return 'the box never opened'; await going; const kept = await request('/api/workflows'); return String(kept.workflows.some(item => item.name === 'Check renamed this')   && !kept.workflows.some(item => item.name === 'Check made this')); ",
           "text": "true",
-          "note": "The new name replaced the old one, with no copy left behind"
+          "note": "The new name replaced the old one, with no copy left behind",
+          "timeout_ms": 45000
         },
         {
           "do": "run",
@@ -2020,14 +2030,22 @@
         },
         {
           "do": "run",
-          "script": "window.prompt = () => null; return 'ready'",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; window.__answerTheBoxWith = null; window.__answerTheBox = answerTheBox; return 'ready'; ",
           "text": "ready",
-          "note": "Answer the address question with nothing"
+          "note": "Answer the address question with nothing",
+          "timeout_ms": 45000
         },
         {
           "do": "click",
           "target": "#recordSteps",
           "note": "Record what I do"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.getElementById('askDialog').open) break;   await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return 'the box never opened'; const words = null; if (words === null) { document.getElementById('askDialogCancel').click(); } else {   document.getElementById('askDialogInput').value = words === '@here' ? window.location.origin + '/' : words;   document.getElementById('askDialogOk').click(); } await new Promise(r => setTimeout(r, 150)); return document.getElementById('askDialog').open ? 'the box would not close' : 'the box was answered'; ",
+          "text": "the box was answered",
+          "timeout_ms": 30000,
+          "note": "Press Cancel in the box"
         },
         {
           "do": "expect_visible",
@@ -2373,14 +2391,22 @@
         },
         {
           "do": "run",
-          "script": "window.prompt = () => window.location.origin + '/'; return 'the address is ready'",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; window.__answerTheBox = answerTheBox; return 'the address is ready'; ",
           "text": "the address is ready",
-          "note": "Answer the box the button opens"
+          "note": "Answer the box the button opens",
+          "timeout_ms": 45000
         },
         {
           "do": "click",
           "target": "#findGaps",
           "note": "Press the button itself"
+        },
+        {
+          "do": "run",
+          "script": " for (let tries = 0; tries < 120; tries += 1) {   if (document.getElementById('askDialog').open) break;   await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return 'the box never opened'; const words = \"@here\"; if (words === null) { document.getElementById('askDialogCancel').click(); } else {   document.getElementById('askDialogInput').value = words === '@here' ? window.location.origin + '/' : words;   document.getElementById('askDialogOk').click(); } await new Promise(r => setTimeout(r, 150)); return document.getElementById('askDialog').open ? 'the box would not close' : 'the box was answered'; ",
+          "text": "the box was answered",
+          "timeout_ms": 30000,
+          "note": "Type the address into the box and press OK"
         },
         {
           "do": "run",
@@ -2553,16 +2579,16 @@
         },
         {
           "do": "run",
-          "script": "window.prompt = () => 'a-workflow-a-check-made'; window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; document.getElementById('saveWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   if ((list.workflows || []).some(w => w.name === 'a-workflow-a-check-made')) return 'saved';   await new Promise(r => setTimeout(r, 100)); } return 'it was never saved'",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; window.confirm = () => true; document.getElementById('validationStatus').textContent = ''; document.getElementById('saveWorkflow').click(); if (!await answerTheBox('a-workflow-a-check-made')) return 'the box never opened'; for (let tries = 0; tries < 150; tries += 1) {   const list = await request('/api/workflows');   if ((list.workflows || []).some(w => w.name === 'a-workflow-a-check-made')) return 'saved';   await new Promise(r => setTimeout(r, 100)); } return 'it was never saved'; ",
           "text": "saved",
-          "timeout_ms": 20000,
+          "timeout_ms": 45000,
           "note": "Pressing save really saves the workflow under that name"
         },
         {
           "do": "run",
-          "script": "window.prompt = () => 'a-workflow-a-check-renamed'; document.getElementById('renameWorkflow').click(); for (let tries = 0; tries < 100; tries += 1) {   const list = await request('/api/workflows');   const names = (list.workflows || []).map(w => w.name);   if (names.includes('a-workflow-a-check-renamed') && !names.includes('a-workflow-a-check-made')) return 'renamed';   await new Promise(r => setTimeout(r, 100)); } return 'it was never renamed'",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; document.getElementById('renameWorkflow').click(); if (!await answerTheBox('a-workflow-a-check-renamed')) return 'the box never opened'; for (let tries = 0; tries < 150; tries += 1) {   const list = await request('/api/workflows');   const names = (list.workflows || []).map(w => w.name);   if (names.includes('a-workflow-a-check-renamed') && !names.includes('a-workflow-a-check-made')) return 'renamed';   await new Promise(r => setTimeout(r, 100)); } return 'it was never renamed'; ",
           "text": "renamed",
-          "timeout_ms": 20000,
+          "timeout_ms": 45000,
           "note": "Pressing rename really changes its name"
         },
         {
@@ -3723,9 +3749,9 @@
         },
         {
           "do": "run",
-          "script": "window.prompt = () => 'Checked by a check two'; const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineSaveAs').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Checked by a check two')))     { watcher.disconnect(); break; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); const listed = [...document.querySelectorAll('.pipeline-saved-one')]   .map(item => item.textContent); if (!listed.includes('Checked by a check two'))   return 'Save as did not save a second one: ' + listed.join(', '); await request('/api/pipelines/delete',   {method: 'POST', body: JSON.stringify({name: 'Checked by a check two'})}); document.getElementById('pipelineName').value = 'Checked by a check'; return 'Save as really saves it under the new name'",
+          "script": " const answerTheBox = async (words) => { for (let tries = 0; tries < 120; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; if (words === null) { document.getElementById('askDialogCancel').click(); return true; } document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 80)); return true; }; const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineSaveAs').click(); if (!await answerTheBox('Checked by a check two')) { watcher.disconnect(); return 'the box never opened'; } for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('Checked by a check two'))) break;   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); const saved = (await request('/api/pipelines')).saved || []; return saved.includes('Checked by a check two')   ? 'Save as really saves it under the new name'   : 'it was never saved under the new name'; ",
           "text": "Save as really saves it under the new name",
-          "timeout_ms": 60000,
+          "timeout_ms": 90000,
           "always": true,
           "note": "Save as saves a second copy under the name you give it"
         },
@@ -5971,6 +5997,50 @@
       ],
       "expect": {
         "max_console_errors": 1,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "no-button-throws-with-the-app-s-own-rules",
+      "title": "Every button in the panel is pressed with the browser behaving like the desktop app, and none of them throws",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "sweep"
+      ],
+      "touches": [
+        "the pipeline on screen",
+        "the workflow on screen",
+        "the check runner",
+        "the project list"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "run",
+          "script": " window.__sweep = {errors: [], results: []}; window.addEventListener('error', (e) => window.__sweep.errors.push(String(e.message))); window.addEventListener('unhandledrejection', (e) => window.__sweep.errors.push(String((e.reason && e.reason.message) || e.reason))); window.prompt = () => { throw new Error('prompt() is and will not be supported.'); }; window.confirm = () => true; window.alert = () => {}; const anything = new Proxy(function () {}, {   get(target, key) {     if (key === 'then') return undefined;     if (key === Symbol.iterator) return function* () {};     if (key === Symbol.toPrimitive) return () => '';     if (key === 'length') return 0;     if (key === 'toString') return () => '';     if (key === 'toJSON') return () => null;     return anything;   },   apply() { return anything; },   has() { return true; }, }); window.__asked = []; request = async (path) => { window.__asked.push(path); return anything; }; return 'the page now behaves like the app, and nothing it does can escape'; ",
+          "text": "the page now behaves like the app, and nothing it does can escape",
+          "timeout_ms": 45000,
+          "note": "Take prompt away the way the app does, and catch every request"
+        },
+        {
+          "do": "run",
+          "script": " const press = async (button, id) => {   let threw = '';   const before = window.__sweep.errors.length;   try { button.click(); } catch (error) { threw = String((error && error.message) || error); }   await new Promise(r => setTimeout(r, 50));   window.__sweep.results.push({id, threw, newErrors: window.__sweep.errors.length - before});   for (const box of [...document.querySelectorAll('dialog')]) {     if (box.open) { box.returnValue = 'cancel'; box.close(); }   } }; const nameOf = (button) => button.id || ('the one saying \"' + button.textContent.trim().slice(0, 40) + '\"'); const views = [...document.querySelectorAll('[data-view]')].map(one => one.dataset.view); for (const view of views) {   switchView(view);   await new Promise(r => setTimeout(r, 250));   for (const button of [...document.querySelectorAll('button')]) {     if (!button.isConnected) continue;     await press(button, nameOf(button));   } } openTheProjects(true); await new Promise(r => setTimeout(r, 250)); for (const button of [...document.querySelectorAll('#projectSidebar button')]) {   if (button.isConnected) await press(button, nameOf(button)); } for (const tab of [...document.querySelectorAll('[data-pipeline-tab]')]) {   tab.click();   await new Promise(r => setTimeout(r, 200));   for (const button of [...document.querySelectorAll('.pipeline-pane button')]) {     if (button.isConnected) await press(button, nameOf(button));   } } return 'every one of them was pressed'; ",
+          "text": "every one of them was pressed",
+          "timeout_ms": 120000,
+          "note": "Press every button in every view, the ones with names and the ones the page builds with words on them"
+        },
+        {
+          "do": "run",
+          "script": " const done = window.__sweep.results; if (done.length < 150) return 'only ' + done.length + ' were pressed, which is too few'; const broke = done.filter(one => one.threw || one.newErrors > 0); return broke.length   ? 'these broke: ' + broke.map(one => one.id + ' (' + (one.threw || 'an error nobody caught') + ')').join('; ')   : 'not one of them threw, and not one left an error nobody caught'; ",
+          "text": "not one of them threw, and not one left an error nobody caught",
+          "timeout_ms": 45000,
+          "note": "A button that throws, or leaves an error nobody catches, is a button that does nothing and says nothing"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 60,
         "max_page_errors": 0
       }
     }

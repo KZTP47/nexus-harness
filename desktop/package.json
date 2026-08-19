@@ -10,7 +10,8 @@
     "build": "electron-builder",
     "smoke": "node smoke.js",
     "smoke:packaged": "node packaged.smoke.js",
-    "smoke:built": "node built.smoke.js"
+    "smoke:built": "node built.smoke.js",
+    "smoke:asking": "node asking.smoke.js"
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -29,7 +30,8 @@
       "!**/*.test.js",
       "!smoke.js",
       "!packaged.smoke.js",
-      "!built.smoke.js"
+      "!built.smoke.js",
+      "!asking.smoke.js"
     ],
     "win": {
       "target": "nsis"
