@@ -26,7 +26,14 @@ _SECRET_WORDS = (
     r"api[_-]?keys?|access[_-]?token|auth(?:orization)?|bearer|client[_-]?secrets?|"
     r"credentials?|cookie|passwd|passwords?|private[_-]?keys?|secrets?|token"
 )
-_SENSITIVE_NAME = re.compile(r"(?:" + _SECRET_WORDS + r")(?![a-z])", re.IGNORECASE)
+# The look forward is deliberately case sensitive, inside a pattern that is not.
+# It is there so "author" is not read as "auth", which needs it to reject a
+# lowercase letter only. Under the outer ignore-case flag it rejected every
+# letter, upper and lower - so "authMethod", "apiKeyName", "accessTokenValue"
+# and every other name written that way were invisible to this, and their values
+# went out whole.
+_SENSITIVE_NAME = re.compile(
+    r"(?:" + _SECRET_WORDS + r")(?-i:(?![a-z]))", re.IGNORECASE)
 # What may follow the word before the value starts: the rest of the name, an
 # optional closing quote for a JSON key, then a colon, an equals sign, or a fat
 # arrow. Every piece is bounded, so this is only ever a short look forward.

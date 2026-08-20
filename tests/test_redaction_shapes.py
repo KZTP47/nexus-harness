@@ -191,6 +191,43 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class NamesWrittenInCamelCaseTests(unittest.TestCase):
+    """A name with a capital in the middle of it is still that name.
+
+    The look forward that stops "author" being read as "auth" was written to
+    reject a lowercase letter. Under the ignore-case flag around it, it rejected
+    every letter - so every name written this way was invisible, and its value
+    went out whole. These are the shapes every tool that answers in JSON uses.
+    """
+
+    def setUp(self) -> None:
+        self.remover = CredentialRedactor(None)
+
+    def test_a_name_with_a_capital_in_the_middle_is_still_a_secret(self) -> None:
+        for line, secret in (
+            ('{"authMethod": "session-9f8e7d6c5b4a3210"}', "session-9f8e7d6c5b4a3210"),
+            ('{"apiKeyName": "sk-live-abcdefghij"}', "sk-live-abcdefghij"),
+            ('{"accessTokenValue": "abcdefghijklmnop"}', "abcdefghijklmnop"),
+            ('{"clientSecretId": "cs-0123456789abc"}', "cs-0123456789abc"),
+            ('{"privateKeyBody": "aaaabbbbccccdddd"}', "aaaabbbbccccdddd"),
+            ('{"cookieJar": "sid=abcdefghijklmnop"}', "sid=abcdefghijklmnop"),
+        ):
+            with self.subTest(line=line):
+                self.assertNotIn(secret, self.remover.text(line))
+
+    def test_an_ordinary_word_that_starts_the_same_way_is_left_alone(self) -> None:
+        """Which is what the look forward was for in the first place."""
+
+        for line in (
+            "the author of this file is somebody",
+            "authored by somebody in 2026",
+            "tokenised text is not a token",
+            "secretary: somebody",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.remover.text(line), line)
+
+
 class PluralAndAwkwardValueTests(unittest.TestCase):
     """Names in the plural, and values holding the characters that broke it."""
 

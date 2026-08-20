@@ -958,6 +958,20 @@ class WhatTheySaidToEachOther(BoardTestCase):
         self.assertEqual(len(said["notes"]), 2)
 
 
+# The colour, whichever way it is written. The variable is the usual way; a rule
+# that wants it faded has to spell the numbers out, because a colour with a
+# variable in it cannot be given an amount of see-through. Checking for the name
+# alone would fail on the faded one and teach nobody anything.
+THE_YELLOW = (255, 216, 106)
+
+
+def _is_yellow(rule: str) -> bool:
+    if "--yellow" in rule:
+        return True
+    numbers = ", ".join(str(one) for one in THE_YELLOW)
+    return numbers in rule.replace(" ", "").replace(",", ", ")
+
+
 class TheTabItself(unittest.TestCase):
     """Where the tab sits in the row, what it is called, and its colour.
 
@@ -986,14 +1000,44 @@ class TheTabItself(unittest.TestCase):
         tabs = self.the_tabs()
         self.assertEqual(tabs[:3], ["start", "swarm", "checks"], tabs)
 
+    def the_rules_for_the_tab(self) -> list[str]:
+        """Every rule written for this tab, and what each one sets.
+
+        Read as "from the first mention to the next blank line" this swallowed
+        three hundred rules that have nothing to do with it, several of which
+        mention yellow on their own - so it passed with the tab painted any
+        colour at all. Each rule is taken on its own now.
+        """
+
+        import re
+
+        return [
+            found.group(2)
+            for found in re.finditer(r"([^{}\n]*\.the-swarm[^{}]*)\{([^}]*)\}", self.styles)
+        ]
+
     def test_it_is_the_yellow_one(self) -> None:
         self.assertIn('class="the-swarm"', self.markup)
-        self.assertIn(".view-nav button.the-swarm", self.styles)
-        # Yellow whether or not it is the tab you are on. Only while it was the
-        # open one, it would be grey every time somebody looked away from it.
-        held = self.styles[self.styles.index(".view-nav button.the-swarm"):]
-        end = held.find(chr(10) + chr(10))
-        self.assertIn("var(--yellow)", held if end < 0 else held[:end])
+        rules = self.the_rules_for_the_tab()
+        self.assertGreaterEqual(len(rules), 2, rules)
+        # Yellow whether or not it is the tab you are on. Painted only while it
+        # was the open one, it would be grey every time somebody looked at
+        # another tab, which is every time they would want to find it.
+        for rule in rules:
+            self.assertTrue(_is_yellow(rule), rule)
+
+    def test_it_is_yellow_when_it_is_the_open_one_too(self) -> None:
+        import re
+
+        pressed = [
+            found.group(2)
+            for found in re.finditer(
+                r"([^{}\n]*\.the-swarm\[aria-pressed=\"true\"\][^{}]*)\{([^}]*)\}",
+                self.styles,
+            )
+        ]
+        self.assertEqual(len(pressed), 1, pressed)
+        self.assertTrue(_is_yellow(pressed[0]), pressed[0])
 
 
 class WhatThePanelIsTold(BoardTestCase):

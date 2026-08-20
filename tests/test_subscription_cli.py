@@ -6,6 +6,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -97,6 +98,75 @@ print(json.dumps({
     "result": "Your organization does not have access to Claude.",
     "usage": {"input_tokens": 0, "output_tokens": 0},
 }))
+raise SystemExit(1)
+'''
+
+# Prints a line before the answer, the way a tool with a banner or a word of
+# progress does. Read as one whole object and nothing else, the reason in here
+# was never found.
+REFUSES_AFTER_A_BANNER = '''
+import json, sys
+arguments = sys.argv[1:]
+if arguments[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "orgName": "A Company"}))
+    raise SystemExit(0)
+if "--version" in arguments:
+    print("9.9.9 (Fake Claude)")
+    raise SystemExit(0)
+sys.stdin.read()
+print("Welcome to the fake tool")
+print(json.dumps({"is_error": True, "result": "The banner reason"}))
+print("Goodbye from the fake tool")
+raise SystemExit(1)
+'''
+
+# One object per line, which is how these tools stream. The last word on it is
+# the one that counts.
+REFUSES_ONE_LINE_AT_A_TIME = '''
+import json, sys
+arguments = sys.argv[1:]
+if arguments[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "orgName": "A Company"}))
+    raise SystemExit(0)
+if "--version" in arguments:
+    print("9.9.9 (Fake Claude)")
+    raise SystemExit(0)
+sys.stdin.read()
+print(json.dumps({"type": "progress", "is_error": False}))
+print(json.dumps({"is_error": True, "result": "The first thing it said"}))
+print(json.dumps({"is_error": True, "result": "The last word on it"}))
+raise SystemExit(1)
+'''
+
+# Stops with a code and says nothing anybody can read, which is the one case
+# where the code is all there is to say.
+STOPS_AND_SAYS_NOTHING_READABLE = '''
+import json, sys
+arguments = sys.argv[1:]
+if arguments[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "orgName": "A Company"}))
+    raise SystemExit(0)
+if "--version" in arguments:
+    print("9.9.9 (Fake Claude)")
+    raise SystemExit(0)
+sys.stdin.read()
+sys.stdout.write("x" * 9000)
+raise SystemExit(4)
+'''
+
+# Takes its time answering about its own sign-in, so a caller with little time
+# left is not made to wait for an explanation.
+SLOW_ABOUT_ITSELF = '''
+import json, sys, time
+arguments = sys.argv[1:]
+if arguments[:2] == ["auth", "status"]:
+    time.sleep(30)
+    raise SystemExit(0)
+if "--version" in arguments:
+    print("9.9.9 (Fake Claude)")
+    raise SystemExit(0)
+sys.stdin.read()
+print(json.dumps({"is_error": True, "result": "No thank you"}))
 raise SystemExit(1)
 '''
 
@@ -233,6 +303,60 @@ class RunningTests(unittest.TestCase):
         tool = fake_tool(self.folder, "plaintool", PLAIN_TEXT_TOOL)
         answer = self.provider("copilot-cli", tool).complete(self.request())
         self.assertEqual(answer.text, '{"ok": true}', "a fenced block should be unwrapped")
+
+    def test_a_reason_is_found_after_a_banner(self) -> None:
+        """A line of progress or a word of welcome, and reading it as one whole
+        object found nothing - which dropped somebody into the message that says
+        only what code it stopped with."""
+
+        tool = fake_tool(self.folder, "faketool", REFUSES_AFTER_A_BANNER)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("The banner reason", message)
+        self.assertNotIn("stopped with code", message)
+        self.assertNotIn("Welcome to the fake tool", message)
+
+    def test_a_reason_is_found_when_it_prints_one_object_a_line(self) -> None:
+        """Which is how these tools stream, and the last word on it is the one
+        that counts."""
+
+        tool = fake_tool(self.folder, "faketool", REFUSES_ONE_LINE_AT_A_TIME)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("The last word on it", message)
+        self.assertNotIn("The first thing it said", message)
+
+    def test_what_it_printed_never_comes_before_the_words(self) -> None:
+        """Machine output in front of the sentence is what this was written to
+        stop. Put there, whatever reads the message afterwards looking for a
+        sentence at the end finds the page instead."""
+
+        tool = fake_tool(self.folder, "faketool", STOPS_AND_SAYS_NOTHING_READABLE)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("stopped with code 4", message)
+        self.assertLess(
+            message.index("stopped with code 4"), message.index("It printed:"),
+            "the words come first and what it printed comes last",
+        )
+        # A glimpse, not the page. Nine thousand letters went in.
+        self.assertLess(len(message), 1200, message[:200])
+
+    def test_asking_it_about_itself_stays_inside_the_time_allowed(self) -> None:
+        """Given time of its own, a call told to take no more than a few seconds
+        took twenty - and the extra was spent explaining a failure that had
+        already happened."""
+
+        tool = fake_tool(self.folder, "slowtool", SLOW_ABOUT_ITSELF)
+        started = time.monotonic()
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool, timeout_seconds=6).complete(self.request())
+        took = time.monotonic() - started
+        self.assertIn("No thank you", str(caught.exception))
+        self.assertLess(took, 20, f"it took {took:.1f} seconds")
 
     def test_a_tool_that_says_why_and_stops_anyway_is_read_for_the_reason(self) -> None:
         """Both real tools do this: the sentence is in the answer and the exit

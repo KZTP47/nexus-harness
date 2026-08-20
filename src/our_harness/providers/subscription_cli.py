@@ -223,6 +223,12 @@ class SubscriptionCLIProvider(Provider):
         chosen = kind or str(self.settings.get("kind") or self.settings.get("name") or "")
         self.recipe = recipe_for(chosen)
         self._checked = False
+        # What the last call ran, and by when it had to be done. Kept so the
+        # error path can ask the very tool that was run, inside the time the
+        # caller allowed, rather than looking it up again and helping itself to
+        # more.
+        self._asked_with: list[str] = []
+        self._deadline: float | None = None
 
     def _command(self) -> list[str]:
         configured = self.settings.get("command") or list(self.recipe.command)
@@ -290,8 +296,12 @@ class SubscriptionCLIProvider(Provider):
         self._reject_native_contract(request)
         recipe = self._arguments()
         command = self._command()
+        # Kept so the error path does not look the tool up on the disk a second
+        # time, and so it asks the very tool that was run.
+        self._asked_with = command
         timeout = self._timeout(request.timeout_seconds)
         deadline_at = time.monotonic() + timeout
+        self._deadline = deadline_at
         self._preflight(command, deadline_at)
         output_limit = min(2_000_000, int(self.config.get("execution.max_output_bytes")))
         argv = recipe.argv(command, str(request.model or ""))
@@ -313,42 +323,64 @@ class SubscriptionCLIProvider(Provider):
             # so it is used instead of the exit code and the page of JSON that
             # came with it - which is what was being shown, and told nobody
             # anything.
-            said = self._why_it_would_not(recipe, result.stdout)
+            said = self._why_it_would_not(recipe, result.stdout, result.stderr)
             if said:
                 # The label is left off the front on purpose: whoever asked puts
                 # the name of the route in front of this, and "claude was asked
                 # and did not answer: the Claude command line would not answer"
                 # is the same thing said twice.
                 raise HarnessError(
-                    f"{said}{self._and_what_it_says_about_itself(recipe)}"
+                    f"{said}{self._and_what_it_says_about_itself(recipe, deadline_at)}"
                 )
-            # No reason anywhere in what it printed, so the code it stopped with
-            # is the most anybody can be told.
-            detail = self._redactor.text(
-                (result.stderr or result.stdout).strip()[:LONGEST_REASON])
+            # Nothing in what it printed reads as a reason, so the code it
+            # stopped with is the most anybody can be told - and the last few
+            # words of what it printed, at the end and kept short. In front of
+            # the sentence and at full length, it was a page of machine output
+            # where the reason should be, which is what this was written to stop.
             raise HarnessError(
-                f"{recipe.label} stopped with code {result.exit_code}. {detail}"
-                f"{self._and_what_it_says_about_itself(recipe)}"
+                f"{recipe.label} stopped with code {result.exit_code}, and nothing "
+                f"it printed says why."
+                f"{self._and_what_it_says_about_itself(recipe, deadline_at)}"
+                f" It printed: {self._just_a_glimpse(result.stderr or result.stdout)}"
             )
         return self._read_answer(recipe, result.stdout, result.stderr, started)
 
-    def _why_it_would_not(self, recipe: CliRecipe, stdout: str) -> str:
-        """The reason the tool gave, if it gave one where the recipe says to look."""
+    def _why_it_would_not(self, recipe: CliRecipe, stdout: str, stderr: str = "") -> str:
+        """The reason the tool gave, if it gave one anywhere in what it printed.
+
+        Looked for in every object it printed, not only in a whole answer that is
+        one object and nothing else. These tools print a line of progress, or a
+        banner, or one object per line, and any of those left this finding
+        nothing - which dropped the reader into the message that says only what
+        code it stopped with.
+
+        The last object wins: a tool that says one thing and then a better one
+        is telling you the second.
+        """
 
         if not (recipe.error_field and recipe.error_message_field):
             return ""
-        try:
-            body = json.loads(stdout.strip() or "{}")
-        except json.JSONDecodeError:
-            return ""
-        if not isinstance(body, dict) or _dotted(body, recipe.error_field) is not True:
-            return ""
-        said = _dotted(body, recipe.error_message_field)
-        if not isinstance(said, str) or not said.strip():
-            return ""
-        return self._redactor.text(" ".join(said.split()))[:LONGEST_REASON]
+        for body in reversed(list(_every_object_in(f"{stdout}\n{stderr}"))):
+            if _dotted(body, recipe.error_field) is not True:
+                continue
+            said = _dotted(body, recipe.error_message_field)
+            if isinstance(said, str) and said.strip():
+                return self._redactor.text(" ".join(said.split()))[:LONGEST_REASON]
+        return ""
 
-    def _and_what_it_says_about_itself(self, recipe: CliRecipe) -> str:
+    def _just_a_glimpse(self, said: str) -> str:
+        """The first few words of what a tool printed, and no more.
+
+        Enough to recognise, short enough to stay a sentence. The whole of it
+        belongs in a log, not in the one line somebody reads.
+        """
+
+        held = self._redactor.text(" ".join(said.split()))
+        return held[:200] + ("..." if len(held) > 200 else "") if held else "nothing at all"
+
+    def _and_what_it_says_about_itself(
+        self, recipe: CliRecipe, deadline_at: float | None = None
+    ) -> str:
         """What else the harness knows, tacked onto a refusal.
 
         The tool's own sentence, read on its own, can say the wrong thing:
@@ -368,22 +400,31 @@ class SubscriptionCLIProvider(Provider):
             f"The {recipe.label} is on this machine and did answer, so nothing "
             "failed to reach it - what turned this down was the service behind it."
         )]
-        about = self._how_it_describes_its_sign_in(recipe)
+        about = self._how_it_describes_its_sign_in(recipe, deadline_at)
         if about:
             said.append(f"It says of itself: {about}.")
         if recipe.when_it_is_refused:
             said.append(recipe.when_it_is_refused)
         return " ".join(said)
 
-    def _how_it_describes_its_sign_in(self, recipe: CliRecipe) -> str:
+    def _how_it_describes_its_sign_in(
+        self, recipe: CliRecipe, deadline_at: float | None = None
+    ) -> str:
         if not recipe.signed_in_arguments:
+            return ""
+        # Inside the time the caller allowed for the whole thing, not on top of
+        # it. Given its own fifteen seconds, a call told to take no more than
+        # five could take twenty - and the extra was spent on an explanation,
+        # after the work had already failed.
+        left = 10.0 if deadline_at is None else min(10.0, _remaining(deadline_at))
+        if left <= 0.5:
             return ""
         try:
             result = _run_bounded(
-                [*self._command(), *recipe.signed_in_arguments],
+                [*(self._asked_with or self._command()), *recipe.signed_in_arguments],
                 cwd=Path.cwd(),
                 stdin_text=None,
-                timeout_seconds=15.0,
+                timeout_seconds=left,
                 max_output_bytes=32_000,
             )
         except HarnessError:
@@ -417,7 +458,7 @@ class SubscriptionCLIProvider(Provider):
             why = self._redactor.text(str(said or "no reason given"))[:LONGEST_REASON]
             raise HarnessError(
                 f"{recipe.label} refused the request: {why}"
-                f"{self._and_what_it_says_about_itself(recipe)}"
+                f"{self._and_what_it_says_about_itself(recipe, self._deadline)}"
             )
         text = _dotted(body, recipe.text_field)
         if not isinstance(text, str) or not text.strip():
@@ -431,6 +472,39 @@ class SubscriptionCLIProvider(Provider):
             output_tokens=_whole(_dotted(body, recipe.output_tokens_field)),
             raw={"tool": recipe.id, "price_status": UNPRICED, "latency_ms": latency},
         )
+
+
+def _every_object_in(said: str):
+    """Every JSON object in what a tool printed, in the order they appear.
+
+    A whole line at a time first, which is how a tool that prints one object per
+    line reads. Then the whole of it, for a tool that prints one object across
+    several lines. A banner, a line of progress or a word at the end is stepped
+    over rather than throwing the reason away with it.
+    """
+
+    seen = []
+    for line in said.splitlines():
+        line = line.strip()
+        if not (line.startswith("{") and line.endswith("}")):
+            continue
+        try:
+            held = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(held, dict):
+            seen.append(held)
+    if seen:
+        return seen
+    start = said.find("{")
+    end = said.rfind("}")
+    if start < 0 or end <= start:
+        return []
+    try:
+        held = json.loads(said[start:end + 1])
+    except json.JSONDecodeError:
+        return []
+    return [held] if isinstance(held, dict) else []
 
 
 def _in_a_few_words(said: str) -> str:
@@ -448,7 +522,10 @@ def _in_a_few_words(said: str) -> str:
     if not isinstance(held, dict):
         return " ".join(said.split())[:300]
     words = []
-    for name in ("loggedIn", "email", "orgName", "subscriptionType", "authMethod",
+    # Named one at a time on purpose, and nothing here holds a secret. A field
+    # called authMethod was read at first: it said "claude.ai", which told
+    # nobody anything, and the same name on another tool holds a session.
+    for name in ("loggedIn", "email", "orgName", "subscriptionType",
                  "account", "user", "plan", "status"):
         found = held.get(name)
         if isinstance(found, bool):
