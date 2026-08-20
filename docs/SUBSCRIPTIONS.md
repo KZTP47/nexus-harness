@@ -140,3 +140,33 @@ for you.
 On Windows these tools are usually installed as a small `.CMD` wrapper. The
 harness looks up the real path before running it, so the bare name working in
 your terminal is enough.
+
+## When a tool says you have no access and you plainly do
+
+Two things worth knowing, both found the hard way on a machine where Claude was
+working in one window and refused in another.
+
+**More than one copy of the tool.** Claude Code can be on a machine twice: one
+put there by npm, first on the path and never updated, and one the Claude
+desktop app keeps up to date for itself. They do not answer the same way. The
+old one refused without asking anybody - no request left the machine - and said
+"your organization does not have access to Claude, please login again", which
+sent somebody to their administrator about the wrong thing. The newer one asked,
+and came back with the real answer: the organisation has Claude Code turned off
+for subscription use. So the harness looks for the newest build it can find
+rather than taking the first one on the path.
+
+**Whether it asked anybody at all.** A refusal decided on your own machine and a
+refusal from the service need two different things done about them, and the
+harness says which it was. It reads the status the tool reports, because the
+timing these tools print says nothing: this machine reports no time at the
+service even for a refusal that really did come back from it.
+
+## Which Copilot this is
+
+The `copilot-cli` route drives **GitHub Copilot's** command line tool, which you
+install with `npm install -g @github/copilot`.
+
+**Microsoft 365 Copilot is a different product** and has no command line, so
+there is nothing on the machine for the harness to drive. A seat for it does not
+make this route work, and no amount of setting up will find it.

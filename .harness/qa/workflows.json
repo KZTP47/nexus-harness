@@ -6399,10 +6399,10 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => document.getElementById('swarmExchangeSaid').textContent.length > 0)) return 'it never said anything about the exchange'; const said = await request('/api/swarm/what-they-said'); if (!Array.isArray(said.notes)) return 'the exchange is not a list'; return document.getElementById('swarmExchangeSaid').textContent.includes('nothing passed yet') ? 'with nothing passed it says so rather than showing an empty box' : 'this machine has an exchange from an earlier run, which is fine too';",
-          "text": "with nothing passed it says so rather than showing an empty box",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => document.getElementById('swarmExchangeSaid').textContent.length > 0)) return 'it never said anything about the exchange'; const said = await request('/api/swarm/what-they-said'); if (!Array.isArray(said.notes)) return 'the exchange is not a list'; const words = document.getElementById('swarmExchangeSaid').textContent; return words.includes('nothing passed yet') || words.includes('passed') ? 'it says how much has been passed, whatever that is' : 'it says nothing at all about the exchange';",
+          "text": "it says how much has been passed, whatever that is",
           "timeout_ms": 45000,
-          "note": "Nothing passed is a thing to say, not an empty list to stare at"
+          "note": "Nothing passed is a thing to say, not an empty list to stare at - and a machine that has run the board before says how much, which is the same rule. Read for one of those only, this failed on whichever machine it was not"
         },
         {
           "do": "run",
@@ -6654,6 +6654,81 @@
           "text": "the board this machine had is back",
           "timeout_ms": 45000,
           "always": true,
+          "note": "Leave this machine's board exactly as it was found"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "every-conversation-on-the-board-is-listed-down-the-side",
+      "title": "The list of chats: yours with each agent, and what the agents passed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "swarm",
+        "chat"
+      ],
+      "touches": [
+        "the board of agents"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"swarm\"]",
+          "note": "Open the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); const who = ((await request('/api/swarm')).who_can_be_used.find(one => one.ready) || {}).route || ''; if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check agent one', who}, {id: 'agent-2', name: 'Check agent two', who}], projects: [{id: 'project-1', path: here, tasks: ['Do it']}], works_on: [{agent: 'agent-1', project: 'project-1'}, {agent: 'agent-2', project: 'project-1'}], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; return 'two agents to have chats with';",
+          "text": "two agents to have chats with",
+          "timeout_ms": 45000,
+          "note": "Two agents, so there is more than one conversation to tell apart"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => document.querySelectorAll('.swarm-chat-pick.yours').length === 2)) return 'the chats down the side were not drawn'; const named = [...document.querySelectorAll('.swarm-chat-pick.yours .swarm-chat-who')].map(one => one.textContent); if (!named.includes('You and Check agent one')) return 'the names are wrong: ' + named.join(', '); const first = document.querySelector('.swarm-chat-pick.yours'); if (!(first.getAttribute('aria-label') || '').includes('Check agent one')) return 'a row does not say what it is when it is read out'; return 'every agent has a chat listed down the side';",
+          "text": "every agent has a chat listed down the side",
+          "timeout_ms": 45000,
+          "note": "One row per agent, named, and it says what it is when it is read out"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.querySelector('.swarm-chat-pick.yours').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 1)) return 'pressing a chat opened nothing'; const card = document.querySelector('.swarm-chat-card'); if (!card.querySelector('.swarm-chat-grip').textContent.includes('Check agent one')) return 'it opened the chat of a different agent'; if (!document.querySelector('.swarm-chat-pick.open')) return 'the row does not show that its chat is open'; return 'pressing one opens that chat on the board';",
+          "text": "pressing one opens that chat on the board",
+          "timeout_ms": 45000,
+          "note": "The whole point of the list: getting back to a conversation"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; swarmWhatTheySaid = {notes: [{said_by: 'agent-1', said_by_name: 'Check agent one', shown_to: 'agent-2', shown_to_name: 'Check agent two', where: 'Somewhere', at: '2026-01-01T00:00:00', text: 'The first note'}, {said_by: 'agent-2', said_by_name: 'Check agent two', shown_to: 'agent-1', shown_to_name: 'Check agent one', where: 'Somewhere', at: '2026-01-01T00:00:01', text: 'The answer back'}]}; renderTheChatsOnThisBoard(); const between = [...document.querySelectorAll('.swarm-chat-pick.between')]; if (between.length !== 1) return 'a pair that passed answers got ' + between.length + ' rows'; const words = between[0].querySelector('.swarm-chat-who').textContent; return words.includes('Check agent one and Check agent two') && words.includes('(2)') ? 'what the agents passed each other is listed too' : 'the pair row says ' + words;",
+          "text": "what the agents passed each other is listed too",
+          "timeout_ms": 45000,
+          "note": "Both kinds of conversation, told apart: yours, and theirs with each other"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.querySelector('.swarm-chat-pick.between').click(); if (!await waitFor(() => document.getElementById('swarmExchange').open)) return 'it did not open what they said to each other'; renderWhatTheySaidToEachOther(swarmWhatTheySaid); const rows = [...document.querySelectorAll('#swarmExchangeList li')].map(one => one.textContent); if (!rows.some(one => one.includes('The first note'))) return 'it opened but showed nothing that was passed'; if (!rows.some(one => one.includes('only'))) return 'it does not say it is showing one pair only'; return 'pressing a pair shows what those two passed';",
+          "text": "pressing a pair shows what those two passed",
+          "timeout_ms": 45000,
+          "note": "Down to one pair, and it says that is what you are looking at"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const back = [...document.querySelectorAll('#swarmExchangeList button')].find(one => one.textContent.trim() === 'Show every pair again'); if (!back) return 'there is no way back to all of them'; back.click(); renderWhatTheySaidToEachOther(swarmWhatTheySaid); const rows = document.querySelectorAll('#swarmExchangeList .swarm-exchange-one'); return rows.length === 2 ? 'and there is a way back to all of them' : 'going back showed ' + rows.length + ' of them';",
+          "text": "and there is a way back to all of them",
+          "timeout_ms": 45000,
+          "note": "A filter somebody cannot take off is a filter that traps them"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; return 'the board this machine had is back';",
+          "text": "the board this machine had is back",
+          "timeout_ms": 45000,
           "note": "Leave this machine's board exactly as it was found"
         }
       ],

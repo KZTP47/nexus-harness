@@ -5558,6 +5558,12 @@ async function refreshSwarm(quietly) {
     renderSwarmBoard();
     renderSwarmNotReady();
     renderSwarmPanel();
+    renderTheChatsOnThisBoard();
+    // What the agents passed to each other, so the list down the side holds
+    // those conversations too rather than only the ones you have had. It is
+    // small, and without it the list is half a list until somebody opens the
+    // fold at the bottom of the board.
+    await refreshWhatTheySaidToEachOther();
     const doing = (await request("/api/swarm/how-it-is-going")).doing;
     renderWhatTheyAreDoing(doing);
     if (doing && doing.going) watchWhatTheyAreDoing();
@@ -5638,6 +5644,9 @@ function oneSwarmBox(kind, one) {
   pick.dataset.kind = kind;
   pick.dataset.id = one.id;
   pick.setAttribute("aria-pressed", String(Boolean(picked)));
+  pick.setAttribute("aria-label", kind === "agent"
+    ? `${one.name}, an agent on the board. Pick it, or move it with the arrow keys`
+    : `${one.name}, a project on the board. Pick it, or move it with the arrow keys`);
   pick.append(aSwarmDrawing(kind === "agent" ? "robot" : "folder", 26));
   const words = make("span", "swarm-box-words");
   words.append(make("span", "swarm-box-name", one.name));
@@ -6196,6 +6205,7 @@ async function applyOneChangeToTheBoard(change, note) {
     renderSwarmBoard();
     renderSwarmNotReady();
     renderSwarmPanel();
+    renderTheChatsOnThisBoard();
     if (note) sayInSwarm(typeof note === "function" ? note() : note);
     return true;
   } catch (error) {
@@ -6364,6 +6374,7 @@ function openTheChatFor(agentId) {
     });
   }
   renderSwarmBoard();
+  renderTheChatsOnThisBoard();
   refreshTheChatFor(agentId);
   const card = theChatCardFor(agentId);
   if (card) {
@@ -6375,6 +6386,7 @@ function openTheChatFor(agentId) {
 function closeTheChatFor(agentId) {
   swarmChats = swarmChats.filter((one) => one.agent !== agentId);
   renderSwarmBoard();
+  renderTheChatsOnThisBoard();
 }
 
 function theChatCardFor(agentId) {
@@ -6577,6 +6589,9 @@ async function sendWhatIsTypedTo(agentId) {
     countWhatIsTypedTo(agentId);
     renderTheChatThreadFor(agentId, said.said || []);
     sayInTheChatFor(agentId, `${agent.name} answered.`);
+    // The list down the side carries the last thing said under each name, and
+    // something was just said.
+    refreshSwarm(true);
   } catch (error) {
     // Read back what was really kept, so a message that did not get through
     // stops looking like one that did. The words stay in the box.
@@ -6614,7 +6629,9 @@ async function startTheChatAgainFor(agentId) {
 async function refreshWhatTheySaidToEachOther() {
   try {
     const said = await request("/api/swarm/what-they-said");
+    swarmWhatTheySaid = said;
     renderWhatTheySaidToEachOther(said);
+    renderTheChatsOnThisBoard();
   } catch (error) {
     $("swarmExchangeSaid").textContent = error.message;
   }
@@ -6623,7 +6640,24 @@ async function refreshWhatTheySaidToEachOther() {
 function renderWhatTheySaidToEachOther(said) {
   const list = $("swarmExchangeList");
   list.replaceChildren();
-  const notes = said.notes || [];
+  const every = said.notes || [];
+  // Showing one pair only, when somebody picked that pair down the side. The
+  // whole exchange is still there; this is which part of it is on screen.
+  const notes = swarmOnlyThisPair
+    ? every.filter((one) => (
+      (one.said_by === swarmOnlyThisPair.one && one.shown_to === swarmOnlyThisPair.other)
+      || (one.said_by === swarmOnlyThisPair.other && one.shown_to === swarmOnlyThisPair.one)
+    ))
+    : every;
+  if (swarmOnlyThisPair) {
+    const back = make("button", "", "Show every pair again");
+    back.type = "button";
+    back.addEventListener("click", showEveryPairAgain);
+    list.append(make("li", "hint", `Showing ${swarmOnlyThisPair.names.join(" and ")} only.`));
+    const row = make("li");
+    row.append(back);
+    list.append(row);
+  }
   const dropped = said.dropped || 0;
   $("swarmExchangeSaid").textContent = notes.length
     ? `${notes.length} answer${notes.length === 1 ? "" : "s"} passed`
@@ -6746,6 +6780,103 @@ function renderWhatTheyAreDoing(doing) {
     if (turn.why_not) row.append(make("p", "hint", turn.why_not));
     list.append(row);
   }
+}
+
+// ---- every conversation, down the side ------------------------------------
+//
+// Two kinds, and they are different enough to be told apart at a glance: yours
+// with one agent, which you can carry on, and what one agent passed to another
+// during a run, which you can only read. A chat you can reach only by finding
+// the box it belongs to is a chat nobody goes back to.
+
+// What the agents passed to each other, kept here so the list down the side can
+// be drawn without asking for the whole exchange every time the board is drawn.
+let swarmWhatTheySaid = {notes: []};
+// When the list is showing one pair only, and which.
+let swarmOnlyThisPair = null;
+
+function theChatsOnThisBoard() {
+  const held = [];
+  for (const agent of theSwarmBoard().agents) {
+    held.push({
+      kind: "yours",
+      key: `you:${agent.id}`,
+      who: `You and ${agent.name}`,
+      last: agent.last_said || "nothing said yet",
+      at: agent.last_said_at || "",
+      howMany: agent.said || 0,
+      open: () => openTheChatFor(agent.id),
+    });
+  }
+  // One row per pair that really passed something, newest last, so a run that
+  // has just happened reads down the page in the order it happened.
+  const pairs = new Map();
+  for (const note of swarmWhatTheySaid.notes || []) {
+    const key = [note.said_by, note.shown_to].sort().join("|");
+    const held = pairs.get(key) || {
+      one: note.said_by, other: note.shown_to,
+      names: [note.said_by_name, note.shown_to_name].sort(), howMany: 0,
+      last: "", at: "",
+    };
+    held.howMany += 1;
+    held.last = `${note.said_by_name}: ${note.text}`;
+    held.at = note.at || held.at;
+    pairs.set(key, held);
+  }
+  for (const [key, one] of pairs) {
+    held.push({
+      kind: "between",
+      key: `between:${key}`,
+      who: `${one.names[0]} and ${one.names[1]}`,
+      last: one.last,
+      at: one.at,
+      howMany: one.howMany,
+      open: () => showOnlyThisPair(one),
+    });
+  }
+  return held;
+}
+
+function renderTheChatsOnThisBoard() {
+  const list = $("swarmChats");
+  list.replaceChildren();
+  const held = theChatsOnThisBoard();
+  if (!held.length) {
+    list.append(make("li", "hint", "No agents on the board yet."));
+    return;
+  }
+  for (const one of held) {
+    const row = make("li");
+    const pick = make("button", `swarm-chat-pick ${one.kind}`);
+    pick.type = "button";
+    pick.dataset.chat = one.key;
+    if (one.kind === "yours" && theChatCardFor(one.key.slice(4))) {
+      pick.classList.add("open");
+    }
+    pick.append(make("span", "swarm-chat-who",
+      one.howMany ? `${one.who} (${one.howMany})` : one.who));
+    pick.append(make("span", "swarm-chat-last", one.last));
+    // Said out loud as one sentence. Going through the page by its buttons,
+    // what is read out of a row of boxes is not something to leave to chance.
+    pick.setAttribute("aria-label", one.kind === "yours"
+      ? `Open your chat with ${one.who.replace("You and ", "")}, ${one.howMany} said`
+      : `Read what ${one.who} passed to each other, ${one.howMany} answers`);
+    pick.addEventListener("click", one.open);
+    row.append(pick);
+    list.append(row);
+  }
+}
+
+function showOnlyThisPair(pair) {
+  swarmOnlyThisPair = pair;
+  $("swarmExchange").open = true;
+  renderWhatTheySaidToEachOther(swarmWhatTheySaid);
+  $("swarmExchange").scrollIntoView({block: "nearest"});
+}
+
+function showEveryPairAgain() {
+  swarmOnlyThisPair = null;
+  renderWhatTheySaidToEachOther(swarmWhatTheySaid);
 }
 
 function wireUpTheSwarmBoard() {

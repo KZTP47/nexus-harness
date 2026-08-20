@@ -821,6 +821,157 @@ class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
         self.assertEqual(subscription_cli._every_object_in(""), [])
 
 
+class TheNewestBuildWinsTests(unittest.TestCase):
+    """Which copy of a tool gets run, when the machine has more than one.
+
+    Found the hard way. Two builds of Claude Code were on one machine: 2.1.101
+    put there by npm months ago and first on the path, and 2.1.234 kept up to
+    date by the Claude desktop app. The old one refused without asking anybody
+    and said "your organization does not have access to Claude, please login
+    again" - which was not true, and sends somebody to their administrator about
+    the wrong thing. The new one asked, and came back with a plain four hundred
+    and three: the organisation has Claude Code turned off. Same account, same
+    minute; only the copy of the program was different.
+    """
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.folder = Path(self.temporary.name).resolve()
+
+    def a_build(self, version: str, name: str = "claude.exe") -> Path:
+        where = self.folder / "kept" / "claude-code" / version
+        where.mkdir(parents=True, exist_ok=True)
+        made = where / name
+        made.write_text("", encoding="utf-8")
+        return made
+
+    def patterns(self) -> tuple[str, ...]:
+        return ("HARNESS_TEST_HOME/kept/claude-code/*/claude.exe",)
+
+    def test_every_build_it_can_find_is_listed_with_its_version(self) -> None:
+        self.a_build("2.1.229")
+        self.a_build("2.1.234")
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}):
+            found = subscription_cli._every_build_of(self.patterns())
+        self.assertEqual(
+            sorted(version for _where, version in found),
+            [(2, 1, 229), (2, 1, 234)],
+        )
+
+    def test_a_folder_that_is_not_a_version_is_passed_over(self) -> None:
+        self.a_build("nightly")
+        self.a_build("2.1.234")
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}):
+            found = subscription_cli._every_build_of(self.patterns())
+        self.assertEqual([version for _where, version in found], [(2, 1, 234)])
+
+    def test_versions_are_compared_as_numbers_not_as_words(self) -> None:
+        """Written down, 2.1.9 comes after 2.1.101 and the old one wins."""
+
+        self.assertGreater(
+            subscription_cli._as_numbers("2.1.101"), subscription_cli._as_numbers("2.1.9"))
+        self.assertEqual(subscription_cli._as_numbers("not a version"), ())
+
+    def test_a_newer_build_is_taken_over_the_one_on_the_path(self) -> None:
+        newer = self.a_build("2.1.234")
+        holder = self.provider_reading(self.patterns())
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}), \
+             mock.patch.object(subscription_cli, "_the_version_of", lambda where: (2, 1, 101)):
+            self.assertEqual(holder._a_newer_build_than("C:/npm/claude.CMD"), newer)
+
+    def test_an_older_build_elsewhere_is_left_alone(self) -> None:
+        self.a_build("2.0.1")
+        holder = self.provider_reading(self.patterns())
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}), \
+             mock.patch.object(subscription_cli, "_the_version_of", lambda where: (2, 1, 101)):
+            self.assertIsNone(holder._a_newer_build_than("C:/npm/claude.CMD"))
+
+    def test_a_command_somebody_wrote_down_is_the_one_that_runs(self) -> None:
+        """Somebody who said which program to run meant that one."""
+
+        self.a_build("9.9.9")
+        holder = self.provider_reading(self.patterns(), command=["C:/mine/claude.exe"])
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}), \
+             mock.patch.object(subscription_cli, "_the_version_of", lambda where: (1, 0, 0)):
+            self.assertIsNone(holder._a_newer_build_than("C:/mine/claude.exe"))
+
+    def test_a_tool_that_keeps_no_other_builds_is_left_alone(self) -> None:
+        holder = self.provider_reading(())
+        self.assertIsNone(holder._a_newer_build_than("C:/npm/copilot.CMD"))
+
+    def provider_reading(self, patterns, command=None):
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["provider"].update({
+            "name": "claude-cli", "model": "m", "endpoint": "", "api_key_env": "",
+        })
+        if command:
+            data["provider"]["command"] = command
+        holder = SubscriptionCLIProvider(
+            LoadedConfig(data, self.folder, [], {}), "claude-cli")
+        holder.recipe = CliRecipe(**{**CLAUDE_RECIPE.__dict__, "kept_under": patterns})
+        return holder
+
+    def test_the_command_that_really_runs_is_the_newer_one(self) -> None:
+        """The one that matters. Finding a newer build and then running the old
+        one anyway is the whole bug, kept."""
+
+        newer = self.a_build("2.1.234")
+        onpath = self.folder / "npm" / "claude.CMD"
+        onpath.parent.mkdir(parents=True, exist_ok=True)
+        onpath.write_text("", encoding="utf-8")
+        holder = self.provider_reading(self.patterns())
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}),              mock.patch.object(subscription_cli.shutil, "which", lambda name: str(onpath)),              mock.patch.object(subscription_cli, "_the_version_of", lambda where: (2, 1, 101)):
+            self.assertEqual(holder._command()[0], str(newer))
+
+    def test_with_nothing_newer_the_one_on_the_path_runs(self) -> None:
+        onpath = self.folder / "npm" / "claude.CMD"
+        onpath.parent.mkdir(parents=True, exist_ok=True)
+        onpath.write_text("", encoding="utf-8")
+        holder = self.provider_reading(self.patterns())
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}),              mock.patch.object(subscription_cli.shutil, "which", lambda name: str(onpath)),              mock.patch.object(subscription_cli, "_the_version_of", lambda where: (9, 9, 9)):
+            self.assertEqual(holder._command()[0], str(onpath))
+
+    def test_the_shipped_recipe_looks_where_the_desktop_app_keeps_them(self) -> None:
+        where = " ".join(CLAUDE_RECIPE.kept_under)
+        self.assertIn("claude-code", where)
+        self.assertIn("LOCALAPPDATA", where)
+
+
+class WhetherItReallyAskedTests(unittest.TestCase):
+    """Two very different sentences hang on this, so it has to be read right."""
+
+    def holder(self):
+        return SubscriptionCLIProvider(
+            LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path.cwd(), [], {}), "claude-cli")
+
+    def test_a_status_from_the_service_is_proof_it_asked(self) -> None:
+        """Even when the tool says it spent no time there, which is what this
+        machine really reports for a refusal that did come back from the
+        service. Read from the timing alone, somebody was told the request never
+        left their machine and to sign in again, while the answer was four
+        hundred and three and the thing to do was turn Claude Code on for the
+        organisation."""
+
+        said = json.dumps({
+            "is_error": True, "api_error_status": 403, "duration_api_ms": 0,
+            "result": "Your organization has disabled Claude subscription access",
+        })
+        self.assertIs(self.holder()._did_it_ask_anybody(CLAUDE_RECIPE, said, ""), True)
+
+    def test_no_status_and_no_time_at_the_service_means_it_never_asked(self) -> None:
+        said = json.dumps({"is_error": True, "duration_api_ms": 0, "result": "no"})
+        self.assertIs(self.holder()._did_it_ask_anybody(CLAUDE_RECIPE, said, ""), False)
+
+    def test_time_at_the_service_still_counts_when_there_is_no_status(self) -> None:
+        said = json.dumps({"is_error": True, "duration_api_ms": 812, "result": "no"})
+        self.assertIs(self.holder()._did_it_ask_anybody(CLAUDE_RECIPE, said, ""), True)
+
+    def test_a_tool_that_says_neither_gets_neither_claim(self) -> None:
+        said = json.dumps({"is_error": True, "result": "no"})
+        self.assertIsNone(self.holder()._did_it_ask_anybody(CLAUDE_RECIPE, said, ""))
+
+
 class ConfigTests(unittest.TestCase):
     def config(self, **provider: object) -> dict:
         data = copy.deepcopy(DEFAULT_CONFIG)

@@ -14,6 +14,7 @@ someone describe a tool the harness has never heard of without changing code.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import time
@@ -47,6 +48,11 @@ class CliRecipe:
     input_tokens_field: str = ""
     output_tokens_field: str = ""
     version_arguments: tuple[str, ...] = ("--version",)
+    # Where else this tool keeps builds of itself, as patterns to look under.
+    # A tool that updates itself often has a newer copy somewhere its installer
+    # never put on the path, and the older one on the path can behave quite
+    # differently - see _the_newest_build_of below.
+    kept_under: tuple[str, ...] = ()
     # How to ask the tool about its own sign-in, and what to try when it is
     # signed in and the request is still turned down. Only ever run on the way
     # to an error message, so it costs nothing on a working machine.
@@ -57,6 +63,11 @@ class CliRecipe:
     # request down here, out of what it has written down about the account, and
     # the two cases send somebody to completely different places.
     time_at_the_service_field: str = ""
+    # Where the tool puts the status the service answered with. A number here is
+    # proof something answered, whatever the timing says, and the timing on this
+    # machine says nothing at all - it reads zero for an answer that really did
+    # come back from the service.
+    service_status_field: str = ""
     when_it_never_asked: str = ""
     # What to say when the tool does not say whether it asked anybody. Neither
     # of the other two can be claimed then, and claiming one is how somebody
@@ -136,7 +147,17 @@ CLAUDE_RECIPE = CliRecipe(
     input_tokens_field="usage.input_tokens",
     output_tokens_field="usage.output_tokens",
     signed_in_arguments=("auth", "status"),
+    # The desktop app keeps its own copy of Claude Code and updates it, while an
+    # npm install months ago sits on the path never changing. Both are here on
+    # this machine, and they do not answer the same way.
+    kept_under=(
+        "LOCALAPPDATA/Packages/Claude_*/LocalCache/Roaming/Claude/claude-code/*/claude.exe",
+        "APPDATA/Claude/claude-code/*/claude.exe",
+        "LOCALAPPDATA/Claude/claude-code/*/claude.exe",
+        "HOME/.claude/claude-code/*/claude",
+    ),
     time_at_the_service_field="duration_api_ms",
+    service_status_field="api_error_status",
     when_it_never_asked=(
         "It says the same thing itself: please login again. Run: claude auth "
         "login. What it has written down about your account here is what it "
@@ -174,8 +195,13 @@ COPILOT_RECIPE = CliRecipe(
     arguments=("-p", "--allow-all-tools", "--model", "{model}"),
     text_field="",
     install_hint=(
-        "Install the GitHub Copilot command line tool and sign in, then run: copilot --version. "
-        "If your version takes different arguments, set them in providers.<name>.arguments."
+        "Install the GitHub Copilot command line tool and sign in, then run: "
+        "copilot --version. It comes from npm: npm install -g @github/copilot. "
+        "This is GitHub Copilot, which has a command line. Microsoft 365 Copilot "
+        "is a different product with none, so there is nothing here for the "
+        "harness to drive - a seat for it does not make this route work. "
+        "If your version takes different arguments, set them in "
+        "providers.<name>.arguments."
     ),
 )
 
@@ -275,7 +301,25 @@ class SubscriptionCLIProvider(Provider):
                 f"{parts[0]} is not on this machine. {self.recipe.install_hint}"
             )
         parts[0] = found
+        newer = self._a_newer_build_than(found)
+        if newer is not None:
+            parts[0] = str(newer)
         return parts
+
+    def _a_newer_build_than(self, found: str) -> Path | None:
+        """A newer copy of this tool than the one on the path, if there is one.
+
+        Only when nobody named a command themselves: somebody who wrote down
+        which program to run meant that one.
+        """
+
+        if self.settings.get("command") or not self.recipe.kept_under:
+            return None
+        best_where, best_version = Path(found), _the_version_of(found)
+        for where, version in _every_build_of(self.recipe.kept_under):
+            if version > best_version:
+                best_where, best_version = where, version
+        return None if best_where == Path(found) else best_where
 
     def _arguments(self) -> CliRecipe:
         configured = self.settings.get("arguments")
@@ -417,13 +461,19 @@ class SubscriptionCLIProvider(Provider):
         an afternoon.
         """
 
-        if not recipe.time_at_the_service_field:
-            return None
         for body in reversed(list(_every_object_in(f"{stdout}\n{stderr}"))):
-            took = _dotted(body, recipe.time_at_the_service_field)
-            if isinstance(took, bool) or not isinstance(took, (int, float)):
-                continue
-            return took > 0
+            # A status from the service first. It is only ever there because
+            # something answered, and it is right where the timing is wrong:
+            # this machine reports no time at the service for a refusal that
+            # really did come back from it.
+            if recipe.service_status_field:
+                status = _dotted(body, recipe.service_status_field)
+                if not isinstance(status, bool) and isinstance(status, (int, float)):
+                    return True
+            if recipe.time_at_the_service_field:
+                took = _dotted(body, recipe.time_at_the_service_field)
+                if not isinstance(took, bool) and isinstance(took, (int, float)):
+                    return took > 0
         return None
 
     def _and_what_it_says_about_itself(
@@ -735,6 +785,63 @@ def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
     if holding is not None:
         seen.extend(aside)
     return seen
+
+
+def _every_build_of(patterns: tuple[str, ...]) -> list[tuple[Path, tuple[int, ...]]]:
+    """Every copy of a tool kept under those patterns, with its version.
+
+    The version is read out of the folder name, which is how these tools lay
+    themselves out, so nothing has to be run to find out how old a copy is.
+    """
+
+    found: list[tuple[Path, tuple[int, ...]]] = []
+    for pattern in patterns:
+        name, _, rest = pattern.partition("/")
+        base = os.environ.get(name) if name.isupper() else None
+        if name == "HOME":
+            base = str(Path.home())
+        if not base:
+            continue
+        try:
+            for where in Path(base).glob(rest):
+                if not where.is_file():
+                    continue
+                version = _as_numbers(where.parent.name)
+                if version:
+                    found.append((where, version))
+        except OSError:
+            continue
+    return found
+
+
+def _as_numbers(said: str) -> tuple[int, ...]:
+    """A version written as numbers, so two of them can be compared."""
+
+    parts = said.split(".")
+    if not all(one.isdigit() for one in parts) or not parts:
+        return ()
+    return tuple(int(one) for one in parts)
+
+
+def _the_version_of(program: str) -> tuple[int, ...]:
+    """What version the copy on the path says it is.
+
+    Asked of the program itself, because nothing about where it sits says so.
+    A copy that will not answer is treated as the oldest there is, which is the
+    safe way round: anything found elsewhere will be preferred to it.
+    """
+
+    try:
+        done = _run_bounded(
+            [program, "--version"], cwd=Path.cwd(), stdin_text=None,
+            timeout_seconds=20.0, max_output_bytes=8_000,
+        )
+    except HarnessError:
+        return ()
+    if done.timed_out or done.exit_code != 0:
+        return ()
+    found = re.search(r"(\d+(?:\.\d+)+)", done.stdout or "")
+    return _as_numbers(found.group(1)) if found else ()
 
 
 def _in_a_few_words(said: str) -> str:

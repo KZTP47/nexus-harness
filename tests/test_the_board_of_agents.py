@@ -972,6 +972,64 @@ def _is_yellow(rule: str) -> bool:
     return numbers in rule.replace(" ", "").replace(",", ", ")
 
 
+class WhatEachChatHoldsTests(BoardTestCase):
+    """What the list of chats down the side is drawn from.
+
+    Asked for one conversation at a time it would be one request per agent every
+    time the board is drawn, so the board says it: how much has been said to
+    each one, and the last line of it.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.where = self.a_project()
+        self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.where, [], {})
+        ready = mock.patch.object(chat, "who_can_talk", lambda config: [
+            {"route": "claude", "label": "Claude", "ready": True,
+             "why_not": "", "how_to_fix_it": ""},
+        ])
+        ready.start()
+        self.addCleanup(ready.stop)
+
+    def test_an_agent_nobody_has_spoken_to_says_nothing_was_said(self) -> None:
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual(agent["said"], 0)
+        self.assertEqual(agent["last_said"], "")
+
+    def test_it_counts_what_was_said_and_carries_the_last_line(self) -> None:
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        kept.write_text(json.dumps([
+            {"who": "you", "text": "What did you change?", "at": "2026-01-01T00:00:00"},
+            {"who": "them", "text": "The parser, and the test around it.",
+             "at": "2026-01-01T00:00:09"},
+        ]), encoding="utf-8")
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual(agent["said"], 2)
+        self.assertEqual(agent["last_said"], "The parser, and the test around it.")
+        self.assertEqual(agent["last_said_at"], "2026-01-01T00:00:09")
+
+    def test_a_long_last_line_is_cut_to_something_a_row_can_hold(self) -> None:
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        kept.write_text(json.dumps([
+            {"who": "them", "text": "x" * 900, "at": ""},
+        ]), encoding="utf-8")
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertLessEqual(len(agent["last_said"]), 120)
+
+    def test_an_agent_with_no_assistant_is_not_asked_for_a_conversation(self) -> None:
+        """It cannot have one, and reading a file for it says a name that is not
+        filed anywhere."""
+
+        self.a_board(agents=[{"name": "Nobody home"}])
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual((agent["said"], agent["last_said"]), (0, ""))
+
+
 class TheTabItself(unittest.TestCase):
     """Where the tab sits in the row, what it is called, and its colour.
 

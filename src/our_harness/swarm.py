@@ -484,6 +484,14 @@ def how_it_stands(config) -> dict[str, Any]:
             )
         )
         held["how_to_fix_it"] = (known or {}).get("how_to_fix_it", "")
+        # How much has been said to this one, so the list of chats can be drawn
+        # without asking after every conversation one at a time. It is read
+        # rather than counted from anything kept in memory: a chat that was had
+        # yesterday is still a chat.
+        said = chat_lab.read_it(config, one.who, filed_as(one.name)) if one.who else []
+        held["said"] = len(said)
+        held["last_said"] = said[-1].text[:120] if said else ""
+        held["last_said_at"] = said[-1].at if said else ""
         agents.append(held)
     return {
         "board": dict(board.to_dict(), agents=agents),

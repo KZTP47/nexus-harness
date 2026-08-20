@@ -109,6 +109,18 @@ lost, and opening it again reads it back.
 Every one of these is that agent's own conversation, filed under its own name.
 Two agents both using Claude never read each other's words.
 
+## Every conversation, down the side
+
+The left of the board lists all of them: **You and The planner**, one row per
+agent, and **The planner and The writer**, one row per pair that really passed
+something. Under each name is the last thing said in it.
+
+Press one of yours and that agent's chat opens on the board. Press a pair and
+what those two passed is shown on its own, with a way back to all of them.
+
+A chat you can only reach by finding the box it belongs to is a chat you stop
+going back to, which is the whole reason this is here.
+
 ## What they said to each other
 
 Under the board, folded away until you ask for it.
