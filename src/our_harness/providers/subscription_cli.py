@@ -474,6 +474,15 @@ class SubscriptionCLIProvider(Provider):
         )
 
 
+# How far one object may be spread, how much of what a tool printed is worth
+# reading at all, and how long one run may be. An object these tools print is a
+# handful of lines; anything spread across thousands of them is not an answer
+# somebody is waiting to read, and walking it costs more than it is worth.
+MOST_LINES_FOR_ONE_OBJECT = 60
+MOST_LINES_READ = 2_000
+LONGEST_RUN = 200_000
+
+
 def _objects_across(said: str) -> list[dict[str, Any]] | None:
     """Every object in this run of text, or nothing if it is not all objects.
 
@@ -484,6 +493,8 @@ def _objects_across(said: str) -> list[dict[str, Any]] | None:
     tool's own answer.
     """
 
+    if len(said) > LONGEST_RUN:
+        return None
     reader = json.JSONDecoder()
     seen: list[dict[str, Any]] = []
     at = 0
@@ -494,7 +505,12 @@ def _objects_across(said: str) -> list[dict[str, Any]] | None:
             break
         try:
             held, at = reader.raw_decode(said, at)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError, ValueError):
+            # RecursionError as well as the one about the shape. An object
+            # nested a thousand deep is seven thousand letters long, and the
+            # error it raises is not a JSONDecodeError - so it came out of here,
+            # past the one place that catches a route which will not answer, and
+            # took every other assistant's answer down with it.
             return None
         if not isinstance(held, dict):
             return None
@@ -519,18 +535,22 @@ def _every_object_in(said: str) -> list[dict[str, Any]]:
     """
 
     seen: list[dict[str, Any]] = []
-    lines = said.splitlines()
+    lines = said.splitlines()[:MOST_LINES_READ]
     at = 0
     while at < len(lines):
         if not lines[at].strip().startswith("{"):
             at += 1
             continue
         # This line, then this line and the next, and so on: a tool that writes
-        # one object across several lines is still one object.
+        # one object across several lines is still one object. Only so far,
+        # though - given the whole of what was printed to grow into, a few
+        # thousand lines that each open a brace and never close it had this walk
+        # to the end from every one of them in turn, and sixteen hundred lines
+        # took nine seconds.
         run = ""
         reached = at
         found = None
-        while reached < len(lines):
+        while reached < len(lines) and reached - at < MOST_LINES_FOR_ONE_OBJECT:
             run = f"{run}\n{lines[reached]}" if run else lines[reached]
             found = _objects_across(run)
             if found is not None:

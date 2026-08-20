@@ -521,6 +521,45 @@ class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
         found = subscription_cli._every_object_in(said)
         self.assertEqual([one.get("result") for one in found], [None, "joined up"])
 
+    def test_something_nested_too_deep_to_read_is_not_an_answer(self) -> None:
+        """A validly nested object a few thousand deep is what Python cannot
+        read, and the error it raises is not the one about shapes. Let out of
+        here it went past the one place that catches a route which will not
+        answer, and took every other assistant's answer with it."""
+
+        deep = '{"a":' * 28000 + "1" + "}" * 28000
+        self.assertLessEqual(len(deep), subscription_cli.LONGEST_RUN)
+        with self.assertRaises(RecursionError):
+            json.loads(deep)
+        self.assertEqual(subscription_cli._every_object_in(deep), [])
+
+    def test_a_run_longer_than_worth_reading_is_left_alone(self) -> None:
+        said = "{" + ('"a": 1, ' * 40_000) + '"b": 2}'
+        self.assertGreater(len(said), subscription_cli.LONGEST_RUN)
+        self.assertEqual(subscription_cli._every_object_in(said), [])
+
+    def test_a_pile_of_broken_lines_is_read_quickly(self) -> None:
+        """Given the whole of what was printed to grow into, this walked to the
+        end from every line that opened a brace: sixteen hundred lines took nine
+        seconds, with no clock on it at all."""
+
+        said = "\n".join(['{"a": 1' for _ in range(3_000)])
+        started = time.monotonic()
+        found = subscription_cli._every_object_in(said)
+        took = time.monotonic() - started
+        self.assertEqual(found, [])
+        self.assertLess(took, 4, f"it took {took:.1f} seconds")
+
+    def test_one_object_may_only_be_spread_so_far(self) -> None:
+        """An object these tools print is a handful of lines. One spread across
+        thousands is not an answer somebody is waiting to read."""
+
+        lines = ["{"] + [f'  "n{n}": {n},' for n in range(400)] + ['  "last": 1', "}"]
+        self.assertEqual(subscription_cli._every_object_in("\n".join(lines)), [])
+        near = ["{"] + [f'  "n{n}": {n},' for n in range(20)] + ['  "last": 1', "}"]
+        found = subscription_cli._every_object_in("\n".join(near))
+        self.assertEqual([one.get("last") for one in found], [1])
+
     def test_nothing_that_looks_like_an_object_is_nothing(self) -> None:
         self.assertEqual(subscription_cli._every_object_in("no braces here"), [])
         self.assertEqual(subscription_cli._every_object_in(""), [])

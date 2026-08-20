@@ -441,14 +441,21 @@ def ask_everyone(config: LoadedConfig, text: str) -> list[dict[str, Any]]:
                 "milliseconds": got["answer"]["milliseconds"],
                 "went_wrong": "",
             }
-        except HarnessError as exc:
-            # One that will not answer must not stop the others being read.
+        except Exception as exc:  # noqa: BLE001 - one route may not fell the rest
+            # One that will not answer must not stop the others being read, and
+            # that has to hold for every way of not answering - not only the one
+            # the harness has a name for. Anything else coming out of here ended
+            # the whole round: every other assistant had already answered, or
+            # was about to, and nobody saw any of it.
             return {
                 "route": who["route"],
                 "label": who["label"],
                 "answer": "",
                 "milliseconds": 0,
-                "went_wrong": str(exc),
+                "went_wrong": _in_plain_words(exc) if isinstance(exc, HarnessError) else (
+                    f"{who['label']} stopped in a way nobody expected: "
+                    f"{type(exc).__name__}"
+                ),
             }
 
     with ThreadPoolExecutor(max_workers=min(len(ready), MOST_AT_ONCE)) as pool:
