@@ -474,13 +474,46 @@ class SubscriptionCLIProvider(Provider):
         )
 
 
-# How far one object may be spread, how much of what a tool printed is worth
-# reading at all, and how long one run may be. An object these tools print is a
-# handful of lines; anything spread across thousands of them is not an answer
-# somebody is waiting to read, and walking it costs more than it is worth.
-MOST_LINES_FOR_ONE_OBJECT = 60
+# How much of what a tool printed is worth reading at all, and how long one run
+# may be. There was a third limit here, on how far one object could be spread,
+# and it was needed while a run was read again after every line: a tool that
+# printed a few thousand lines each opening a brace had that reading walk to the
+# end from every one of them. Counting the braces first means a run is read once,
+# when it could be whole, so the limit stopped doing anything - a block is never
+# longer than the two below allow. A limit that cannot be reached is worse than
+# none: it reads like a guard and guards nothing.
 MOST_LINES_READ = 2_000
 LONGEST_RUN = 200_000
+
+
+def _where_the_braces_are(line: str, depth: int, inside: bool) -> tuple[int, bool]:
+    """How deep the braces go by the end of this line, and whether a string is
+    still open.
+
+    Braces inside a string are letters, not braces, and a backslash inside one
+    means the next character is a letter whatever it is. Getting that wrong the
+    other way - counting them - would have a run look closed while it is not,
+    which only costs one reading that comes to nothing.
+    """
+
+    skip = False
+    for letter in line:
+        if skip:
+            skip = False
+            continue
+        if inside:
+            if letter == "\\":
+                skip = True
+            elif letter == '"':
+                inside = False
+            continue
+        if letter == '"':
+            inside = True
+        elif letter == "{":
+            depth += 1
+        elif letter == "}":
+            depth = max(0, depth - 1)
+    return depth, inside
 
 
 def _objects_across(said: str) -> list[dict[str, Any]] | None:
@@ -564,19 +597,23 @@ def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
             at += 1
             continue
         # This line, then this line and the next, and so on: a tool that writes
-        # one object across several lines is still one object. Only so far,
-        # though - given the whole of what was printed to grow into, a few
-        # thousand lines that each open a brace and never close it had this walk
-        # to the end from every one of them in turn, and sixteen hundred lines
-        # took nine seconds.
+        # one object across several lines is still one object. As far as the
+        # block goes, which is what MOST_LINES_READ allows and no further.
         run = ""
         reached = at
         found = None
-        while reached < len(lines) and reached - at < MOST_LINES_FOR_ONE_OBJECT:
+        depth, inside = 0, False
+        while reached < len(lines):
             run = f"{run}\n{lines[reached]}" if run else lines[reached]
-            found = _objects_across(run)
-            if found is not None:
-                break
+            depth, inside = _where_the_braces_are(lines[reached], depth, inside)
+            # Only worth reading when every brace it opened has closed. Read
+            # after every line instead, a run of two hundred lines was read two
+            # hundred times, which is why how far an object could be spread had
+            # to be kept to a length no real answer would fit in.
+            if depth == 0 and not inside:
+                found = _objects_across(run)
+                if found is not None:
+                    break
             reached += 1
         if found is None:
             at += 1

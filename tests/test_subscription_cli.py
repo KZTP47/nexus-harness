@@ -565,15 +565,55 @@ class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
                 found = subscription_cli._every_object_in(joined)
                 self.assertEqual([one.get("result") for one in found], [what])
 
-    def test_one_object_may_only_be_spread_so_far(self) -> None:
-        """An object these tools print is a handful of lines. One spread across
-        thousands is not an answer somebody is waiting to read."""
+    def test_an_object_with_real_detail_in_it_is_still_read(self) -> None:
+        """A refusal can carry a breakdown - so many tokens against each of
+        eighty files - and written out one line at a time that is three hundred
+        lines. Read after every line, a run that long cost enough that how far
+        an object could be spread had to be kept shorter than a real answer."""
 
-        lines = ["{"] + [f'  "n{n}": {n},' for n in range(400)] + ['  "last": 1', "}"]
-        self.assertEqual(subscription_cli._every_object_in("\n".join(lines)), [])
-        near = ["{"] + [f'  "n{n}": {n},' for n in range(20)] + ['  "last": 1', "}"]
-        found = subscription_cli._every_object_in("\n".join(near))
-        self.assertEqual([one.get("last") for one in found], [1])
+        body = {
+            "is_error": True,
+            "result": "Your organization does not have access.",
+            "usage": {
+                f"file-{n}.py": {"input_tokens": n, "output_tokens": n}
+                for n in range(80)
+            },
+        }
+        said = "Welcome" + chr(10) + json.dumps(body, indent=2) + chr(10) + "Goodbye"
+        self.assertGreater(len(said.splitlines()), 300)
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual(
+            [one.get("result") for one in found],
+            ["Your organization does not have access."],
+        )
+
+    def test_an_object_spread_past_what_is_read_is_not_read(self) -> None:
+        """Only so much of what a tool printed is looked at, so an object spread
+        past that is not there to find. Held down because it is the bound that
+        stops any of this taking as long as somebody has patience for."""
+
+        lines = ["{"] + [f'  "n{n}": {n},' for n in range(3_000)] + ['  "last": 1', "}"]
+        self.assertGreater(len(lines), subscription_cli.MOST_LINES_READ)
+        self.assertEqual(subscription_cli._every_object_in(chr(10).join(lines)), [])
+
+    def test_a_brace_inside_a_string_is_a_letter(self) -> None:
+        """Counted as a brace, a run looks closed while it is not, or never
+        looks closed at all - and the reason inside it is lost either way."""
+
+        said = chr(10).join([
+            "{",
+            '  "a": "} not a brace {",',
+            '  "is_error": true, "result": "tricky"',
+            "}",
+        ])
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual([one.get("result") for one in found], ["tricky"])
+
+    def test_a_backslash_before_a_quote_does_not_end_the_string(self) -> None:
+        body = {"a": 'a quote " and a brace }', "is_error": True, "result": "escaped"}
+        said = json.dumps(body, indent=2)
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual([one.get("result") for one in found], ["escaped"])
 
     def test_nothing_that_looks_like_an_object_is_nothing(self) -> None:
         self.assertEqual(subscription_cli._every_object_in("no braces here"), [])

@@ -357,6 +357,47 @@ class AskingEveryone(TalkingTestCase):
         self.assertEqual(by_route["one"]["answer"], "")
         self.assertTrue(by_route["two"]["answer"])
 
+    def test_one_that_falls_over_in_a_way_nobody_named_stops_nothing(self) -> None:
+        """The harness has a name for a tool that will not answer, and catching
+        only that let anything else out: a tool answering with an object nested
+        thousands deep raises the error Python raises when it cannot read it,
+        which is not that name. Out it went, past this, and it ended the whole
+        round - every other assistant had already answered and nobody saw any of
+        it."""
+
+        class Falls:
+            def complete(self, request):
+                raise RecursionError("too deep to read")
+
+        def which(config):
+            return Falls() if config.get("provider.model") == "a" else Answering()
+
+        with mock.patch.object(chat, "create_provider", which):
+            answers = chat.ask_everyone(self.config, "What do you think?")
+        by_route = {one["route"]: one for one in answers}
+        self.assertEqual(by_route["one"]["answer"], "")
+        self.assertIn("nobody expected", by_route["one"]["went_wrong"])
+        self.assertIn("RecursionError", by_route["one"]["went_wrong"])
+        # And the whole point: the other one still answered.
+        self.assertTrue(by_route["two"]["answer"])
+        self.assertEqual(by_route["two"]["went_wrong"], "")
+
+    def test_what_goes_wrong_in_a_way_nobody_named_is_not_repeated_word_for_word(self) -> None:
+        """Only what kind of thing it was. Anything the harness has no name for
+        has not been through the part that takes credentials out, and this
+        sentence goes on a screen."""
+
+        class Falls:
+            def complete(self, request):
+                raise RuntimeError("sk-do-not-put-me-on-the-screen-0000")
+
+        with mock.patch.object(chat, "create_provider", lambda config: Falls()):
+            answers = chat.ask_everyone(self.config, "What do you think?")
+        for one in answers:
+            with self.subTest(who=one["route"]):
+                self.assertIn("RuntimeError", one["went_wrong"])
+                self.assertNotIn("sk-do-not-put-me-on-the-screen", one["went_wrong"])
+
     def test_they_are_asked_at_the_same_time(self) -> None:
         """Six one after another is six waits, which nobody sits through."""
 
