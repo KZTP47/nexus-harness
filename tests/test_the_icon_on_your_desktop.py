@@ -396,9 +396,21 @@ class NothingIsLeftInTheProjectTests(unittest.TestCase):
         ]
         self.assertEqual(left, [], f"these belong on a desktop: {left}")
 
-    def test_the_name_is_ignored_so_one_cannot_be_committed_by_accident(self) -> None:
+    def test_every_name_it_can_write_is_ignored(self) -> None:
+        """Every name, not the one this machine happens to use. Ignoring only
+        the Windows one, the same accident on Linux writes a file nothing stops
+        going in - and only the check above would find it, after the fact."""
+
         said = (ROOT / ".gitignore").read_text(encoding="utf-8")
-        self.assertIn(f"{installer.WHAT_IT_IS_CALLED}.lnk", said)
+        for ending in (".lnk", ".command", ".desktop"):
+            with self.subTest(ending=ending):
+                self.assertIn(f"{installer.WHAT_IT_IS_CALLED}{ending}", said)
+
+    def test_the_name_this_machine_writes_is_one_of_them(self) -> None:
+        """So the list above cannot drift away from what the code really does."""
+
+        said = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(installer.what_the_launcher_is_called(), said)
 
 
 class WhenAskingWindowsGoesWrongTests(unittest.TestCase):
