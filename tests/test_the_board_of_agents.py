@@ -250,15 +250,23 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
     """
 
     def test_a_fresh_board_counts_from_one(self) -> None:
-        """A board written down by hand still gets agent-1 and project-1, so
-        anybody writing one can say who works on what."""
+        """The base case: nothing has ever been on this board, and nobody said
+        which name they wanted.
 
-        board = self.a_board(
-            agents=[{"name": "One"}, {"name": "Two"}],
-            projects=[{"path": str(self.a_project())}],
-        )
+        Saved through the helper above this proved nothing at all - the helper
+        writes an id on every box, so the counting was never reached and a
+        wrong count would have sailed through. Saved bare, as somebody writing a
+        board down by hand does, it is the only test that holds the first name
+        the board ever hands out.
+        """
+
+        board = swarm.save({
+            "agents": [{"name": "One"}, {"name": "Two"}],
+            "projects": [{"path": str(self.a_project())}],
+        })
         self.assertEqual([one.id for one in board.agents], ["agent-1", "agent-2"])
         self.assertEqual([one.id for one in board.projects], ["project-1"])
+        self.assertEqual((board.made_agents, board.made_projects), (2, 1))
 
     def test_a_new_agent_never_takes_a_removed_one_s_name(self) -> None:
         board = self.a_board(agents=[{"name": "One"}, {"name": "Two"}])

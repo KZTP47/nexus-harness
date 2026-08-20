@@ -62,10 +62,22 @@ class TheLauncherIsReallyThere(unittest.TestCase):
         self.assertIn("harness", finished.stdout)
 
     def test_it_passes_what_it_is_given_through(self) -> None:
-        finished = subprocess.run(
-            [sys.executable, str(a_launcher()), "tell", "kinds"],
-            capture_output=True, text=True, env=with_nothing_set_up(), timeout=120,
-        )
+        """Run against a folder with nothing in it, on purpose.
+
+        Run against this project, it failed for anybody who had only just
+        downloaded it: a settings file nobody on that machine has said is theirs
+        can start programs, so the harness will not read it until they do, and
+        the command stopped with the sentence that says so. Right of the harness,
+        and nothing to do with what this test is about - which is whether the
+        launcher hands the words it was given to the harness.
+        """
+
+        with tempfile.TemporaryDirectory() as nowhere:
+            finished = subprocess.run(
+                [sys.executable, str(a_launcher()), "--project", nowhere,
+                 "tell", "kinds"],
+                capture_output=True, text=True, env=with_nothing_set_up(), timeout=120,
+            )
         self.assertEqual(finished.returncode, 0, finished.stderr)
         self.assertIn("needs a key", finished.stdout)
 
