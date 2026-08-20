@@ -474,37 +474,74 @@ class SubscriptionCLIProvider(Provider):
         )
 
 
-def _every_object_in(said: str):
-    """Every JSON object in what a tool printed, in the order they appear.
+def _objects_across(said: str) -> list[dict[str, Any]] | None:
+    """Every object in this run of text, or nothing if it is not all objects.
 
-    A whole line at a time first, which is how a tool that prints one object per
-    line reads. Then the whole of it, for a tool that prints one object across
-    several lines. A banner, a line of progress or a word at the end is stepped
-    over rather than throwing the reason away with it.
+    All of it or none of it, on purpose. A tool can print two objects one after
+    another with nothing between them, and that is still a tool talking; text
+    with an object somewhere inside it is not, and reading one out of the middle
+    of a sentence is how a line saying "this was rejected" came back as the
+    tool's own answer.
     """
 
-    seen = []
-    for line in said.splitlines():
-        line = line.strip()
-        if not (line.startswith("{") and line.endswith("}")):
-            continue
+    reader = json.JSONDecoder()
+    seen: list[dict[str, Any]] = []
+    at = 0
+    while at < len(said):
+        while at < len(said) and said[at] in " \t\r\n":
+            at += 1
+        if at >= len(said):
+            break
         try:
-            held = json.loads(line)
+            held, at = reader.raw_decode(said, at)
         except json.JSONDecodeError:
+            return None
+        if not isinstance(held, dict):
+            return None
+        seen.append(held)
+    return seen or None
+
+
+def _every_object_in(said: str) -> list[dict[str, Any]]:
+    """Every JSON object a tool printed, in the order it printed them.
+
+    A run is only read when a line starts with a brace and everything from there
+    is objects and nothing else. That covers the three ways these tools really
+    answer - one object, several one after another, and one written across
+    several lines - and steps over a banner, a line of progress, or a word at
+    the end.
+
+    What it will not do is reach into the middle of a line of ordinary text.
+    Reading from the first brace to the last one over everything printed, a line
+    like `debug: candidate {"is_error": true, ...} rejected` was read as the
+    tool refusing, in those words. What goes into these tools is not always
+    something anybody chose, so that was a way to put words in the tool's mouth.
+    """
+
+    seen: list[dict[str, Any]] = []
+    lines = said.splitlines()
+    at = 0
+    while at < len(lines):
+        if not lines[at].strip().startswith("{"):
+            at += 1
             continue
-        if isinstance(held, dict):
-            seen.append(held)
-    if seen:
-        return seen
-    start = said.find("{")
-    end = said.rfind("}")
-    if start < 0 or end <= start:
-        return []
-    try:
-        held = json.loads(said[start:end + 1])
-    except json.JSONDecodeError:
-        return []
-    return [held] if isinstance(held, dict) else []
+        # This line, then this line and the next, and so on: a tool that writes
+        # one object across several lines is still one object.
+        run = ""
+        reached = at
+        found = None
+        while reached < len(lines):
+            run = f"{run}\n{lines[reached]}" if run else lines[reached]
+            found = _objects_across(run)
+            if found is not None:
+                break
+            reached += 1
+        if found is None:
+            at += 1
+            continue
+        seen.extend(found)
+        at = reached + 1
+    return seen
 
 
 def _in_a_few_words(said: str) -> str:

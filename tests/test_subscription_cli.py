@@ -475,6 +475,57 @@ class RunningTests(unittest.TestCase):
         self.assertIn("Fix the parser", prompt)
 
 
+class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
+    """Which of the things a tool printed are the tool's own answer.
+
+    Read as "everything from the first brace to the last one", a line of
+    ordinary text with a brace in it was read as the tool's answer - so a line
+    saying a thing had been rejected came back as the tool refusing, in those
+    words. What goes into these tools is not always something anybody chose, so
+    that was a way to put words in the tool's mouth.
+    """
+
+    def test_an_object_in_the_middle_of_a_line_of_words_is_not_an_answer(self) -> None:
+        said = ('debug: raw candidate was {"is_error": true, '
+                '"result": "SHOULD NOT LEAK"} but rejected')
+        self.assertEqual(subscription_cli._every_object_in(said), [])
+
+    def test_words_after_an_object_on_one_line_are_not_an_answer_either(self) -> None:
+        said = '{"is_error": true, "result": "SHOULD NOT LEAK"} and then some words'
+        self.assertEqual(subscription_cli._every_object_in(said), [])
+
+    def test_one_object_a_line_is_read(self) -> None:
+        said = "\n".join([
+            "Welcome",
+            '{"is_error": false}',
+            '{"is_error": true, "result": "the real one"}',
+            "Bye",
+        ])
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual([one.get("result") for one in found], [None, "the real one"])
+
+    def test_one_object_written_across_several_lines_is_read(self) -> None:
+        said = "\n".join([
+            "Welcome",
+            "{",
+            '  "is_error": true,',
+            '  "result": "across lines"',
+            "}",
+            "Bye",
+        ])
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual([one.get("result") for one in found], ["across lines"])
+
+    def test_two_objects_with_nothing_between_them_are_both_read(self) -> None:
+        said = '{"a": 1}{"is_error": true, "result": "joined up"}'
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual([one.get("result") for one in found], [None, "joined up"])
+
+    def test_nothing_that_looks_like_an_object_is_nothing(self) -> None:
+        self.assertEqual(subscription_cli._every_object_in("no braces here"), [])
+        self.assertEqual(subscription_cli._every_object_in(""), [])
+
+
 class ConfigTests(unittest.TestCase):
     def config(self, **provider: object) -> dict:
         data = copy.deepcopy(DEFAULT_CONFIG)
