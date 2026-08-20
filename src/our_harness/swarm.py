@@ -577,6 +577,11 @@ class OneTurn:
     milliseconds: int = 0
 
     def to_dict(self) -> dict[str, Any]:
+        # What the agent said is not in here. It is kept where somebody would
+        # go looking for it - that agent's own conversation - and sending a
+        # copy of every answer to the panel as well, every second and a half
+        # while a run is going, would be a lot of words nothing on screen ever
+        # shows. How long it is said instead, which is the part the list uses.
         return {
             "agent": self.agent,
             "name": self.name,
@@ -584,7 +589,7 @@ class OneTurn:
             "where": self.where,
             "round": self.round,
             "state": self.state,
-            "said": self.said,
+            "letters": len(self.said),
             "why_not": self.why_not,
             "milliseconds": self.milliseconds,
         }

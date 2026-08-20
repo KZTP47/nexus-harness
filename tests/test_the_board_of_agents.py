@@ -527,6 +527,15 @@ class SettingThemGoing(BoardTestCase):
         self.assertIn(str(self.where), first)
         self.assertIn("Reads it", first)
 
+    def test_what_an_agent_said_is_not_copied_into_the_run_list(self) -> None:
+        """It is kept where somebody would look for it, which is that agent's
+        own conversation. The list only says how long it was."""
+
+        self.a_working_board(talks=False)
+        doing = self.a_run()
+        self.assertNotIn("said", doing["turns"][0])
+        self.assertGreater(doing["turns"][0]["letters"], 0)
+
     def test_the_second_round_shows_what_the_other_said(self) -> None:
         self.a_working_board()
         self.a_run()
@@ -694,7 +703,12 @@ class WhatThePanelIsTold(BoardTestCase):
             with urllib.request.urlopen(asked, timeout=15) as answer:
                 return answer.status, json.loads(answer.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            return exc.code, json.loads(exc.read().decode("utf-8"))
+            # Closed, not merely read. A turned-down answer holds a temporary
+            # file open, and left to be tidied up whenever, it comes back as a
+            # warning in the middle of a run - which is exactly the sort of
+            # noise that hides a real one.
+            with exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
 
     def test_an_empty_board_is_still_an_answer(self) -> None:
         status, said = self.ask("/api/swarm")
@@ -841,7 +855,8 @@ class WhatThePanelIsTold(BoardTestCase):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(asked, timeout=15)
         self.assertEqual(caught.exception.code, 400)
-        self.assertIn("token", json.loads(caught.exception.read())["error"])
+        with caught.exception as answer:
+            self.assertIn("token", json.loads(answer.read())["error"])
 
 
 if __name__ == "__main__":

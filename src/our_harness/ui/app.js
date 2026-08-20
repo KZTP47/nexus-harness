@@ -6193,7 +6193,12 @@ function renderWhatTheyAreDoing(doing) {
   for (const turn of doing.turns) {
     const row = make("li", turn.state.replace(/ /g, "-"));
     row.append(make("strong", "", `${turn.name} on ${turn.where}`));
-    row.append(make("p", "hint", `${turn.round} - ${turn.state}`));
+    const under = [turn.round, turn.state];
+    // How long the answer was, which is the one thing about it worth showing
+    // here. The answer itself is in that agent's own conversation.
+    if (turn.letters) under.push(`${turn.letters} letters`);
+    if (turn.milliseconds) under.push(prettyTime(turn.milliseconds));
+    row.append(make("p", "hint", under.join(" - ")));
     if (turn.why_not) row.append(make("p", "hint", turn.why_not));
     list.append(row);
   }
