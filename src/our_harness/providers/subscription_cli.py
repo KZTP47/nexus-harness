@@ -535,7 +535,29 @@ def _every_object_in(said: str) -> list[dict[str, Any]]:
     """
 
     seen: list[dict[str, Any]] = []
-    lines = said.splitlines()[:MOST_LINES_READ]
+    for block in _the_ends_of(said.splitlines()):
+        seen.extend(_objects_in_these_lines(block))
+    return seen
+
+
+def _the_ends_of(lines: list[str]) -> list[list[str]]:
+    """The beginning and the end of a great many lines, and both of them.
+
+    Only the first so many, and a tool that says three thousand lines of
+    something before it says why loses the reason - which is the shape a tool
+    with a lot to say has. Only the last so many, and a tool that answers first
+    and then talks loses it the other way round. So both ends, read apart from
+    each other, and the middle of a torrent is what goes unread.
+    """
+
+    if len(lines) <= MOST_LINES_READ:
+        return [lines]
+    half = MOST_LINES_READ // 2
+    return [lines[:half], lines[-half:]]
+
+
+def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
+    seen: list[dict[str, Any]] = []
     at = 0
     while at < len(lines):
         if not lines[at].strip().startswith("{"):

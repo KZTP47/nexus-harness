@@ -550,6 +550,21 @@ class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertLess(took, 4, f"it took {took:.1f} seconds")
 
+    def test_the_reason_is_found_at_either_end_of_a_torrent(self) -> None:
+        """Reading only the first so many lines, a tool with a great deal to say
+        before it says why lost the reason. Reading only the last so many loses
+        it the other way round, from a tool that answers and then talks."""
+
+        noise = [f"chatter {n}" for n in range(4_000)]
+        for what, lines in (
+            ("at the end", noise + ['{"is_error": true, "result": "at the end"}']),
+            ("at the front", ['{"is_error": true, "result": "at the front"}'] + noise),
+        ):
+            with self.subTest(what=what):
+                joined = chr(10).join(lines)
+                found = subscription_cli._every_object_in(joined)
+                self.assertEqual([one.get("result") for one in found], [what])
+
     def test_one_object_may_only_be_spread_so_far(self) -> None:
         """An object these tools print is a handful of lines. One spread across
         thousands is not an answer somebody is waiting to read."""
