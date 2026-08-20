@@ -27,6 +27,7 @@
       "guards.js",
       "preload.js",
       "pages/**",
+      "nexus-harness.ico",
       "package.json",
       "!**/*.test.js",
       "!smoke.js",
@@ -35,13 +36,16 @@
       "!asking.smoke.js"
     ],
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "nexus-harness.ico"
     },
     "mac": {
-      "target": "dmg"
+      "target": "dmg",
+      "icon": "nexus-harness.ico"
     },
     "linux": {
-      "target": "AppImage"
+      "target": "AppImage",
+      "icon": "nexus-harness.ico"
     },
     "directories": {
       "output": "build-output"
@@ -55,7 +59,15 @@
         "from": "../scripts/harness.py",
         "to": "harness/scripts/harness.py"
       }
-    ]
+    ],
+    "nsis": {
+      "installerIcon": "nexus-harness.ico",
+      "uninstallerIcon": "nexus-harness.ico",
+      "installerHeaderIcon": "nexus-harness.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Nexus Harness"
+    }
   },
   "author": "Nexus Harness"
 }

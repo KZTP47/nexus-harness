@@ -170,6 +170,46 @@ print(json.dumps({"is_error": True, "result": "No thank you"}))
 raise SystemExit(1)
 '''
 
+# Turns the request down and says, in the same answer, that the service took no
+# time at all. Nothing was asked: it decided here, out of what it has written
+# down about the account. Claude does exactly this, and reading it as the
+# service saying no sent somebody to their administrator for nothing.
+REFUSES_WITHOUT_ASKING = '''
+import json, sys
+arguments = sys.argv[1:]
+if arguments[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "orgName": "A Company"}))
+    raise SystemExit(0)
+if "--version" in arguments:
+    print("9.9.9 (Fake Claude)")
+    raise SystemExit(0)
+sys.stdin.read()
+print(json.dumps({
+    "is_error": True, "duration_api_ms": 0,
+    "result": "Your organization does not have access. Please login again.",
+}))
+raise SystemExit(1)
+'''
+
+# Asks, waits, and is turned down by the service - which is somebody else's
+# answer and a different thing to do about it.
+REFUSED_BY_THE_SERVICE = '''
+import json, sys
+arguments = sys.argv[1:]
+if arguments[:2] == ["auth", "status"]:
+    print(json.dumps({"loggedIn": True, "orgName": "A Company"}))
+    raise SystemExit(0)
+if "--version" in arguments:
+    print("9.9.9 (Fake Claude)")
+    raise SystemExit(0)
+sys.stdin.read()
+print(json.dumps({
+    "is_error": True, "duration_api_ms": 412,
+    "result": "That model is not available to you.",
+}))
+raise SystemExit(1)
+'''
+
 BROKEN_TOOL = '''
 import sys
 if "--version" in sys.argv[1:]:
@@ -303,6 +343,41 @@ class RunningTests(unittest.TestCase):
         tool = fake_tool(self.folder, "plaintool", PLAIN_TEXT_TOOL)
         answer = self.provider("copilot-cli", tool).complete(self.request())
         self.assertEqual(answer.text, '{"ok": true}', "a fenced block should be unwrapped")
+
+    def test_a_tool_that_never_asked_anybody_is_not_the_service_saying_no(self) -> None:
+        """The one the person in front of it was right about. Claude answers with
+        the service having taken no time at all, which means it never asked: it
+        turned the job down here, out of what it has written down about the
+        account. Read as the service saying no, the harness pointed at an
+        administrator who has nothing to do with it, while the tool's own words
+        said the useful thing - please login again."""
+
+        tool = fake_tool(self.folder, "faketool", REFUSES_WITHOUT_ASKING)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("never asked anybody", message)
+        self.assertIn("claude auth login", message)
+        self.assertNotIn("what turned this down was the service", message)
+        self.assertNotIn("setup-token", message)
+
+    def test_a_tool_the_service_turned_down_says_that_instead(self) -> None:
+        tool = fake_tool(self.folder, "faketool", REFUSED_BY_THE_SERVICE)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("what turned this down was the service", message)
+        self.assertNotIn("never asked anybody", message)
+        self.assertNotIn("claude auth login", message)
+
+    def test_a_tool_that_does_not_say_either_way_gets_no_guess(self) -> None:
+        """Nothing is a real answer. A tool that says nothing about how long the
+        service took is not told what it meant."""
+
+        tool = fake_tool(self.folder, "brokentool", BROKEN_TOOL)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("copilot-cli", tool).complete(self.request())
+        self.assertNotIn("never asked anybody", str(caught.exception))
 
     def test_a_reason_is_found_after_a_banner(self) -> None:
         """A line of progress or a word of welcome, and reading it as one whole

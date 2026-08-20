@@ -12,6 +12,30 @@ yourself.
 
 ---
 
+## Start here, on Windows
+
+**Double-click `Install Nexus Harness.cmd`** in this folder.
+
+That is the whole thing. It puts a **Nexus Harness** on your desktop with an
+icon of its own, and from then on you double-click that. You never need this
+file, or a terminal, again.
+
+It only touches your own desktop, so nothing here needs an administrator. If
+Python is not on the machine yet it says so, and where to get it, rather than
+failing at you.
+
+The icon opens the desktop app if somebody has installed it, and otherwise the
+panel in your browser - and it says which of those you got. Prefer to type it?
+The same thing, and it works on macOS and Linux as well:
+
+```bash
+python scripts/put_it_on_your_desktop.py
+```
+
+See [THE_THING_ON_YOUR_DESKTOP.md](docs/THE_THING_ON_YOUR_DESKTOP.md).
+
+---
+
 ## What it does
 
 **Writes your tests for you.** Point it at a page and click the thing you want
@@ -41,6 +65,33 @@ Python 3.11+ must already be on the machine. Nothing else is needed.
 ```bash
 git clone https://github.com/KZTP47/nexus-harness.git
 cd nexus-harness
+```
+
+### Put an icon on your desktop
+
+**Double-click `Install Nexus Harness.cmd`** in the folder you just cloned.
+
+That is the whole thing. It puts a Nexus Harness icon on your desktop, with its
+own picture, and that icon opens the panel. Nothing is installed anywhere else
+and nothing outside your desktop is changed; to undo it, delete the icon.
+
+It is at the top of the project with a name that says what it does, because the
+one thing somebody who has just downloaded this cannot be expected to know is
+which command to type first.
+
+Not on Windows, or would rather type it:
+
+```bash
+python scripts/put_it_on_your_desktop.py
+```
+
+The icon opens the best thing on your machine: the desktop app if you have it,
+and otherwise the panel in your browser, started by Python straight out of this
+folder. It says which one you got.
+
+### The other ways
+
+```bash
 python -m pip install .
 ```
 

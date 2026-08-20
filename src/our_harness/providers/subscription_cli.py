@@ -52,6 +52,12 @@ class CliRecipe:
     # to an error message, so it costs nothing on a working machine.
     signed_in_arguments: tuple[str, ...] = ()
     when_it_is_refused: str = ""
+    # Where the tool says how long the service took, and what to say when that
+    # is nothing at all. Nothing at all means it never asked: it turned the
+    # request down here, out of what it has written down about the account, and
+    # the two cases send somebody to completely different places.
+    time_at_the_service_field: str = ""
+    when_it_never_asked: str = ""
     install_hint: str = ""
     verified: bool = False
 
@@ -125,6 +131,15 @@ CLAUDE_RECIPE = CliRecipe(
     input_tokens_field="usage.input_tokens",
     output_tokens_field="usage.output_tokens",
     signed_in_arguments=("auth", "status"),
+    time_at_the_service_field="duration_api_ms",
+    when_it_never_asked=(
+        "It says the same thing itself: please login again. Run: claude auth "
+        "login. What it has written down about your account here is what it "
+        "read, and signing in again is what rewrites it. If it still says no "
+        "afterwards, then it really is your organisation's answer and whoever "
+        "administers it has to turn Claude Code on - and only then is there "
+        "anybody else to ask."
+    ),
     when_it_is_refused=(
         "A tool that is signed in and still turned down usually has no token of "
         "its own for work nobody is watching. Run: claude setup-token. If that "
@@ -324,13 +339,15 @@ class SubscriptionCLIProvider(Provider):
             # came with it - which is what was being shown, and told nobody
             # anything.
             said = self._why_it_would_not(recipe, result.stdout, result.stderr)
+            asked = self._did_it_ask_anybody(recipe, result.stdout, result.stderr)
             if said:
                 # The label is left off the front on purpose: whoever asked puts
                 # the name of the route in front of this, and "claude was asked
                 # and did not answer: the Claude command line would not answer"
                 # is the same thing said twice.
                 raise HarnessError(
-                    f"{said}{self._and_what_it_says_about_itself(recipe, deadline_at)}"
+                    f"{said}"
+                    f"{self._and_what_it_says_about_itself(recipe, deadline_at, asked)}"
                 )
             # Nothing in what it printed reads as a reason, so the code it
             # stopped with is the most anybody can be told - and the last few
@@ -340,7 +357,7 @@ class SubscriptionCLIProvider(Provider):
             raise HarnessError(
                 f"{recipe.label} stopped with code {result.exit_code}, and nothing "
                 f"it printed says why."
-                f"{self._and_what_it_says_about_itself(recipe, deadline_at)}"
+                f"{self._and_what_it_says_about_itself(recipe, deadline_at, asked)}"
                 f" It printed: {self._just_a_glimpse(result.stderr or result.stdout)}"
             )
         return self._read_answer(recipe, result.stdout, result.stderr, started)
@@ -378,8 +395,30 @@ class SubscriptionCLIProvider(Provider):
         held = self._redactor.text(" ".join(said.split()))
         return held[:200] + ("..." if len(held) > 200 else "") if held else "nothing at all"
 
+    def _did_it_ask_anybody(self, recipe: CliRecipe, stdout: str, stderr: str) -> bool | None:
+        """Did the tool put the request to the service, or answer by itself?
+
+        Nothing is a real answer here: a tool that does not say gets a shrug,
+        not a guess. The ones that do say are the ones worth reading, because
+        "the service said no" and "the tool said no without asking" send
+        somebody to two different places, and being sent to the wrong one costs
+        an afternoon.
+        """
+
+        if not recipe.time_at_the_service_field:
+            return None
+        for body in reversed(list(_every_object_in(f"{stdout}\n{stderr}"))):
+            took = _dotted(body, recipe.time_at_the_service_field)
+            if isinstance(took, bool) or not isinstance(took, (int, float)):
+                continue
+            return took > 0
+        return None
+
     def _and_what_it_says_about_itself(
-        self, recipe: CliRecipe, deadline_at: float | None = None
+        self,
+        recipe: CliRecipe,
+        deadline_at: float | None = None,
+        asked_anybody: bool | None = None,
     ) -> str:
         """What else the harness knows, tacked onto a refusal.
 
@@ -391,20 +430,36 @@ class SubscriptionCLIProvider(Provider):
         the question from "have I got this at all" to "this one thing is not
         allowed", and those take you to different places.
 
+        And whether it asked anybody, which is the part that decides where to
+        go next. A tool that says the request took no time at all never left
+        this machine: it turned the job down out of what it has written down
+        about the account. Saying "the service turned this down" there was
+        simply wrong, and it pointed at an administrator who has nothing to do
+        with it.
+
         Anything that goes wrong while asking is left out rather than piled on
         top: this is already an error message, and a second failure inside it
         helps nobody.
         """
 
-        said = ["", (
-            f"The {recipe.label} is on this machine and did answer, so nothing "
-            "failed to reach it - what turned this down was the service behind it."
-        )]
+        here = f"The {recipe.label} is on this machine and did answer, so nothing failed to reach it"
+        if asked_anybody is False:
+            said = ["", (
+                f"{here} - and it says the request took no time at all, which "
+                "means it never asked anybody. It turned this down here, out of "
+                "what it has written down about your account."
+            )]
+        else:
+            said = ["", f"{here} - what turned this down was the service behind it."]
         about = self._how_it_describes_its_sign_in(recipe, deadline_at)
         if about:
             said.append(f"It says of itself: {about}.")
-        if recipe.when_it_is_refused:
-            said.append(recipe.when_it_is_refused)
+        advice = (
+            recipe.when_it_never_asked if asked_anybody is False
+            else recipe.when_it_is_refused
+        )
+        if advice:
+            said.append(advice)
         return " ".join(said)
 
     def _how_it_describes_its_sign_in(
@@ -458,7 +513,7 @@ class SubscriptionCLIProvider(Provider):
             why = self._redactor.text(str(said or "no reason given"))[:LONGEST_REASON]
             raise HarnessError(
                 f"{recipe.label} refused the request: {why}"
-                f"{self._and_what_it_says_about_itself(recipe, self._deadline)}"
+                f"{self._and_what_it_says_about_itself(recipe, self._deadline, self._did_it_ask_anybody(recipe, stdout, stderr))}"
             )
         text = _dotted(body, recipe.text_field)
         if not isinstance(text, str) or not text.strip():
