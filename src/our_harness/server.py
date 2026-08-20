@@ -24,6 +24,7 @@ from . import explain as explainer
 from . import pipeline_starters
 from . import pipelines as pipeline_lab
 from . import chat as chat_lab
+from . import swarm as swarm_lab
 from . import projects as projects_lab
 from . import tell_somebody as telling_lab
 from . import timer as timer_lab
@@ -166,6 +167,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # panel refreshing in the middle of that read a pipeline whose history
         # did not match it - or, on Windows, a file being moved into place.
         self.pipelines_lock = threading.Lock()
+        # The board of agents has its own lock. Saving it is read, change,
+        # write, and two windows open on the same board would otherwise each
+        # write a whole board built from what it read before the other wrote.
+        self.swarm_lock = threading.Lock()
+        # Setting the board going is one run at a time, in the background,
+        # because every turn is a real assistant being asked a real question and
+        # a page that says nothing for two minutes is a page nobody trusts.
+        self.swarm_runner = swarm_lab.Running()
         # "I don't care, just do it for me" runs one job at a time, in the
         # background, because fetching a model can take a long while and the
         # page has to keep saying what is happening.
@@ -881,6 +890,37 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "sidebar": projects_lab.how_it_looks(),
                     "how_it_can_look": list(projects_lab.HOW_IT_CAN_LOOK),
                 })
+            elif parsed.path == "/api/swarm":
+                self._require_token()
+                config = self.server.config
+                with self.server.swarm_lock:
+                    said = swarm_lab.how_it_stands(config)
+                    said["what_is_not_ready"] = swarm_lab.what_is_not_ready(config, said)
+                said["cannot_be_changed"] = (
+                    self.server.swarm_runner.why_it_cannot_be_changed()
+                )
+                self._json(said)
+            elif parsed.path == "/api/swarm/said":
+                # One agent's own conversation. Its name decides which file is
+                # read, so two agents both using Claude do not read each
+                # other's half of it.
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                with self.server.swarm_lock:
+                    board = swarm_lab.load()
+                one = swarm_lab.the_agent(board, query.get("agent", [""])[0])
+                self._json({
+                    "agent": one.to_dict(),
+                    "said": [
+                        held.to_dict() for held in chat_lab.read_it(
+                            self.server.config, one.who, swarm_lab.filed_as(one.name)
+                        )
+                    ],
+                    "most_letters": chat_lab.MOST_LETTERS,
+                })
+            elif parsed.path == "/api/swarm/how-it-is-going":
+                self._require_token()
+                self._json({"doing": self.server.swarm_runner.how_it_is_going()})
             elif parsed.path == "/api/telling":
                 self._require_token()
                 config = self.server.config
@@ -1376,6 +1416,67 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/projects/sidebar":
                 self._json({
                     "sidebar": projects_lab.make_it_look(str(body.get("how") or ""))
+                })
+            elif self.path == "/api/swarm/save":
+                # The whole board at once. It is one small picture, and saving
+                # it whole means the panel can never leave a line pointing at a
+                # box that half of a save had already taken away.
+                # Both under the one lock. Asked outside it, a run could start
+                # in the gap between "is anything going?" and the write, and
+                # then be working from a board that had changed underneath it.
+                with self.server.swarm_lock:
+                    stopping = self.server.swarm_runner.why_it_cannot_be_changed()
+                    if stopping:
+                        raise swarm_lab.SwarmError(stopping)
+                    swarm_lab.save(body.get("board"))
+                    said = swarm_lab.how_it_stands(self.server.config)
+                    said["what_is_not_ready"] = swarm_lab.what_is_not_ready(
+                        self.server.config, said
+                    )
+                self._json(said)
+            elif self.path == "/api/swarm/say":
+                # No board lock while it waits for an answer: an assistant can
+                # take a minute, and holding the lock that long would freeze
+                # every other window looking at the same board. The
+                # conversation has its own lock, which is the one that matters.
+                with self.server.swarm_lock:
+                    board = swarm_lab.load()
+                one = swarm_lab.the_agent(board, str(body.get("agent") or ""))
+                if not one.who:
+                    raise swarm_lab.SwarmError(
+                        f"{one.name} has no assistant chosen yet. Open its "
+                        "settings and pick which one it uses."
+                    )
+                self._json(dict(chat_lab.say(
+                    self.server.config,
+                    one.who,
+                    str(body.get("text") or ""),
+                    filed_as=swarm_lab.filed_as(one.name),
+                ), agent=one.to_dict()))
+            elif self.path == "/api/swarm/start-again":
+                with self.server.swarm_lock:
+                    board = swarm_lab.load()
+                one = swarm_lab.the_agent(board, str(body.get("agent") or ""))
+                self._json({
+                    "note": chat_lab.start_again(
+                        self.server.config, one.who, swarm_lab.filed_as(one.name)
+                    ),
+                    "said": [],
+                })
+            elif self.path == "/api/swarm/start":
+                # The lock is held only while the board is read and the run is
+                # marked as going, which is all start does - the asking happens
+                # on a thread of its own afterwards. Held for that much, no save
+                # can slip in between the board being read and the run owning
+                # it; held for the whole run, every window looking at the board
+                # would freeze for as long as the assistants took.
+                with self.server.swarm_lock:
+                    doing = self.server.swarm_runner.start(self.server.config)
+                self._json({"doing": doing})
+            elif self.path == "/api/swarm/stop":
+                self._json({
+                    "note": self.server.swarm_runner.stop(),
+                    "doing": self.server.swarm_runner.how_it_is_going(),
                 })
             elif self.path == "/api/telling/save":
                 # The same lock its neighbour takes. Looking to see whether a

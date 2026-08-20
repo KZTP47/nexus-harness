@@ -72,6 +72,7 @@
     <button type="button" data-view="pipelines" aria-pressed="false" title="Work that runs itself: draw the jobs as boxes, join them with arrows, press Run">Automations</button>
     <button type="button" data-view="team" aria-pressed="false" title="The assistants you already pay for, and how they work together">Your team</button>
     <button type="button" data-view="talk" aria-pressed="false" title="Type something to any assistant you have hooked up, and keep the conversation">Talk to them</button>
+    <button type="button" data-view="swarm" aria-pressed="false" title="A board of your agents, the projects they are on, and which of them may talk to each other">Agent board</button>
     <button type="button" data-view="lookup" aria-pressed="false" title="Where is this, what uses it, what is it">Look it up</button>
     <button type="button" data-view="vault" aria-pressed="false" title="What the harness has learned about you and this project">What it knows</button>
     <button type="button" data-view="settings" aria-pressed="false" title="Change any setting, without opening a file">Settings</button>
@@ -193,6 +194,7 @@
       <dl class="tab-guide">
         <dt>Checks</dt><dd>Your tests. Each one says what to do and what a good result looks like. Run them any time. That tab can also point at a thing on a page to name it for you, keep a picture of a page to compare later, and pack up the evidence when you need somebody's help.</dd>
         <dt>Workflow</dt><dd>For later. It draws the agents as boxes so you can change who does what, and in which order.</dd>
+        <dt>Agent board</dt><dd>One picture of every agent you have, the projects you want worked on, and the lines between them. Say which agents work on which projects, and which pairs may talk to each other. Each agent has its own conversation, so you can put something to one of them without the rest reading it.</dd>
         <dt>Memory</dt><dd>What the harness has read and remembered about this project, and which agent wrote each note.</dd>
         <dt>Prompt history</dt><dd>The instructions the harness gives its agents, and how they changed. Nothing changes without your review.</dd>
       </dl>
@@ -714,6 +716,130 @@
         <ul id="talkEveryoneList" class="talk-everyone-list"></ul>
       </section>
     </section>
+  </div>
+
+  <div id="swarmView" data-view-panel="swarm" class="swarm-shell" hidden>
+    <aside class="swarm-side" aria-labelledby="swarmSideTitle">
+      <h2 id="swarmSideTitle">The board</h2>
+      <p class="hint">Your agents, the projects they work on, and which of them may talk
+        to each other. Drag a box to move it. Nothing reaches an assistant until you
+        press Set them going, below.</p>
+      <div class="button-row">
+        <button id="swarmAddAgent" type="button">Add an agent</button>
+        <button id="swarmAddProject" type="button">Add a project</button>
+      </div>
+      <div class="button-row">
+        <button id="swarmTidy" type="button" title="Lay every box out in rows again">Tidy the board</button>
+        <button id="swarmRefresh" type="button">Look again</button>
+      </div>
+      <h3 id="swarmSetGoingTitle">Set them going</h3>
+      <p class="hint">Every agent is asked about the projects it is on, one at a
+        time. Those allowed to talk are then shown what the others said and asked
+        again. What each one says lands in its own conversation.</p>
+      <div class="button-row">
+        <button id="swarmStart" class="primary" type="button">Set them going</button>
+        <button id="swarmStop" type="button">Stop</button>
+      </div>
+      <p id="swarmDoingSaid" class="hint" role="status"></p>
+      <ol id="swarmDoing" class="swarm-doing" aria-labelledby="swarmSetGoingTitle"></ol>
+
+      <h3 id="swarmNotReadyTitle">What is not ready</h3>
+      <ul id="swarmNotReady" class="swarm-not-ready" aria-labelledby="swarmNotReadyTitle"></ul>
+    </aside>
+
+    <section class="swarm-main" aria-labelledby="swarmTitle">
+      <div class="swarm-bar">
+        <div>
+          <h2 id="swarmTitle">Who works on what</h2>
+          <p class="swarm-strapline">Pick a box to change it or to talk to it. Blue lines are
+            agents working on a project. Green lines are agents allowed to talk to each other.
+            Drag a box to move it, or pick it and use the arrow keys.</p>
+        </div>
+      </div>
+      <p id="swarmSaid" class="callout" role="status">Add an agent to get started.</p>
+      <div id="swarmBoard" class="swarm-board" role="group" aria-label="The board">
+        <svg id="swarmLines" class="swarm-lines" aria-hidden="true"></svg>
+      </div>
+    </section>
+
+    <aside id="swarmPanel" class="swarm-panel" aria-labelledby="swarmPanelTitle">
+      <h2 id="swarmPanelTitle">Nothing picked</h2>
+      <p id="swarmPanelHint" class="hint">Pick a box on the board to change it.</p>
+
+      <div id="swarmAgentPanel" hidden>
+        <label for="swarmAgentName">Name</label>
+        <input id="swarmAgentName" type="text" maxlength="60" placeholder="The reviewer">
+        <p class="field-help">Its name is also where its conversation is kept, so two agents
+          cannot share one name.</p>
+
+        <label for="swarmAgentWho">Which assistant it uses</label>
+        <select id="swarmAgentWho">
+          <option value="">Not chosen yet</option>
+        </select>
+
+        <label for="swarmAgentJob">What it is for</label>
+        <input id="swarmAgentJob" type="text" maxlength="300"
+          placeholder="Reads the change and says what is wrong with it">
+
+        <fieldset class="swarm-set">
+          <legend>Projects it works on</legend>
+          <div id="swarmWorksOn" class="swarm-ticks"></div>
+        </fieldset>
+
+        <fieldset class="swarm-set">
+          <legend>Agents it may talk to</legend>
+          <p class="field-help">Off means they never hear from each other.</p>
+          <div id="swarmTalksTo" class="swarm-ticks"></div>
+        </fieldset>
+
+        <div class="button-row">
+          <button id="swarmAgentSave" class="primary" type="button">Save this agent</button>
+          <button id="swarmAgentRemove" type="button">Remove this agent</button>
+        </div>
+
+        <section class="swarm-chat" aria-labelledby="swarmChatTitle">
+          <div class="swarm-bar">
+            <h3 id="swarmChatTitle">Talk to this one</h3>
+            <button id="swarmStartAgain" type="button">Start again</button>
+          </div>
+          <p id="swarmChatSaid" class="callout" role="status"></p>
+          <ol id="swarmThread" class="talk-thread" aria-label="What has been said" aria-live="polite"></ol>
+          <form id="swarmChatForm" class="talk-form">
+            <label class="sr-only" for="swarmBox">What to say</label>
+            <textarea id="swarmBox" rows="3" maxlength="6000"
+              placeholder="What did you change and why?"></textarea>
+            <div class="button-row">
+              <button id="swarmSend" class="primary" type="submit">Send</button>
+              <span id="swarmCount" class="hint" aria-live="polite"></span>
+            </div>
+            <p class="field-help">Enter sends it. Shift and Enter starts a new line.
+              This conversation is this agent's own: no other agent reads it.</p>
+          </form>
+        </section>
+      </div>
+
+      <div id="swarmProjectPanel" hidden>
+        <label for="swarmProjectPath">Folder</label>
+        <input id="swarmProjectPath" type="text" readonly>
+        <p id="swarmProjectWho" class="hint"></p>
+
+        <fieldset class="swarm-set">
+          <legend>Jobs wanted here</legend>
+          <ul id="swarmTasks" class="swarm-tasks"></ul>
+          <label class="sr-only" for="swarmTaskText">A job to add</label>
+          <div class="button-row">
+            <input id="swarmTaskText" type="text" maxlength="300"
+              placeholder="Make every check pass">
+            <button id="swarmAddTask" type="button">Add this job</button>
+          </div>
+        </fieldset>
+
+        <div class="button-row">
+          <button id="swarmProjectRemove" type="button">Take off the board</button>
+        </div>
+        <p class="field-help">Taking a project off the board changes nothing in the folder.</p>
+      </div>
+    </aside>
   </div>
 
   <main id="lookupView" data-view-panel="lookup" class="data-view" hidden>

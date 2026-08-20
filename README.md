@@ -146,6 +146,27 @@ which is never committed.
 
 See [TALK_TO_THEM.md](docs/TALK_TO_THEM.md).
 
+## The agent board
+
+One picture of every agent you have, the projects you want worked on, and the
+lines between them.
+
+Your team finds the assistants on this machine. Talk to them puts a question to
+one. The board is all of it at once, and across more than one project: which
+agents you have, which projects each one is on, and which pairs are allowed to
+talk to each other. Drag a box to move it, tick a box to join two things up.
+
+Each agent keeps its own conversation, so two agents both using Claude never
+read each other's words - and a pair with no line between them never hears from
+each other at all.
+
+**Set them going** acts on it. Every agent is asked about the projects it is on,
+one at a time, on its own. Then the ones allowed to talk are shown what the
+others said and asked again, to say plainly where they disagree. That order is
+the point: an agent that read the others first is not a second opinion.
+
+See [AGENT_BOARD.md](docs/AGENT_BOARD.md).
+
 ## Look it up
 
 Three questions about your own code, on their own tab: **where is it**, **what

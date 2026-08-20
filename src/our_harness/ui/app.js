@@ -643,7 +643,7 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); renderWhatItIsDoing(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); if (name === "lookup") refreshLookup(); if (name === "talk") refreshTalk(); }
+function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); renderWhatItIsDoing(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); if (name === "lookup") refreshLookup(); if (name === "talk") refreshTalk(); if (name === "swarm") refreshSwarm(); }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -3715,6 +3715,7 @@ function bindEvents() {
   $("timerHowOften").addEventListener("change", sayWhatTheTimerMeans);
   $("timerCopyLine").addEventListener("click", copyTheMachineLine);
   $("talkRefresh").addEventListener("click", () => refreshTalk(talkOpen));
+  wireUpTheSwarmBoard();
   $("talkStartAgain").addEventListener("click", startTalkingAgain);
   $("talkAskEveryone").addEventListener("click", askEveryone);
   $("talkForm").addEventListener("submit", (event) => { event.preventDefault(); sendWhatIsTyped(); });
@@ -5386,6 +5387,849 @@ function renderLookupAnswer(said) {
 async function boot() {
   bindEvents();
   try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); renderWhatItIsDoing(); await refreshProjects(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
+}
+
+// ---- the board of agents -------------------------------------------------
+//
+// One picture of every agent you have, every project you want worked on, and
+// the lines between them. The other tabs each show one of those things; this
+// shows all of it at once, and lets you change any of it.
+//
+// Two ways to change the same board, on purpose. Dragging a box is how you
+// arrange it; the ticks on the right are how you say who works on what. Lines
+// are drawn from the ticks rather than dragged between boxes, because a line
+// you have to aim at is a line somebody with a trackpad cannot draw, and
+// because a tick says out loud what a line only implies.
+//
+// Nothing here starts anything by itself. Adding an agent, drawing a line and
+// writing a job down all change the board and nothing else. "Set them going",
+// at the bottom of this file, is the one part that reaches an assistant, and
+// only when somebody presses it.
+
+let swarmSaid = {
+  board: {agents: [], projects: [], works_on: [], talks_to: []},
+  who_can_be_used: [],
+  projects_on_this_machine: [],
+  most: {agents: 24, projects: 12, tasks: 40},
+  what_is_not_ready: [],
+};
+let swarmPicked = null;      // {kind: "agent" | "project", id: "agent-1"}
+let swarmBusy = false;       // an answer is on its way
+let swarmNewestRefresh = 0;  // so a slow look cannot overwrite a newer one
+
+function sayInSwarm(words) { $("swarmSaid").textContent = words; }
+function sayInSwarmChat(words) { $("swarmChatSaid").textContent = words; }
+
+function theSwarmBoard() { return swarmSaid.board; }
+
+function theSwarmAgent(id) {
+  return theSwarmBoard().agents.find((one) => one.id === id) || null;
+}
+
+function theSwarmProject(id) {
+  return theSwarmBoard().projects.find((one) => one.id === id) || null;
+}
+
+function thePickedAgent() {
+  return swarmPicked && swarmPicked.kind === "agent" ? theSwarmAgent(swarmPicked.id) : null;
+}
+
+function thePickedProject() {
+  return swarmPicked && swarmPicked.kind === "project" ? theSwarmProject(swarmPicked.id) : null;
+}
+
+async function refreshSwarm(quietly) {
+  const mine = ++swarmNewestRefresh;
+  try {
+    const said = await request("/api/swarm");
+    if (mine !== swarmNewestRefresh) return;
+    swarmSaid = said;
+    keepTheSwarmPick();
+    renderSwarmBoard();
+    renderSwarmNotReady();
+    renderSwarmPanel();
+    const doing = (await request("/api/swarm/how-it-is-going")).doing;
+    renderWhatTheyAreDoing(doing);
+    if (doing && doing.going) watchWhatTheyAreDoing();
+    if (!quietly) sayInSwarm(whatTheBoardSays());
+  } catch (error) {
+    if (mine !== swarmNewestRefresh) return;
+    showError(error.message);
+    sayInSwarm(error.message);
+  }
+}
+
+// What was picked may have been removed in another window. Rather than a panel
+// showing an agent that is not there, the pick quietly falls away.
+function keepTheSwarmPick() {
+  if (!swarmPicked) return;
+  const still = swarmPicked.kind === "agent"
+    ? theSwarmAgent(swarmPicked.id) : theSwarmProject(swarmPicked.id);
+  if (!still) swarmPicked = null;
+}
+
+function whatTheBoardSays() {
+  const board = theSwarmBoard();
+  if (!board.agents.length && !board.projects.length) {
+    return "Nothing on the board yet. Press Add an agent to get started.";
+  }
+  const agents = `${board.agents.length} agent${board.agents.length === 1 ? "" : "s"}`;
+  const projects = `${board.projects.length} project${board.projects.length === 1 ? "" : "s"}`;
+  return `${agents} and ${projects} on the board. Pick a box to change it.`;
+}
+
+// ---- drawing it ----------------------------------------------------------
+
+function renderSwarmBoard() {
+  const board = $("swarmBoard");
+  for (const old of [...board.querySelectorAll(".swarm-box, .swarm-empty")]) old.remove();
+  const said = theSwarmBoard();
+  if (!said.agents.length && !said.projects.length) {
+    board.append(make("div", "swarm-empty",
+      "Nothing on the board yet. Press Add an agent on the left, then Add a project, "
+      + "then tick which projects the agent works on."));
+  }
+  for (const one of said.agents) board.append(oneSwarmBox("agent", one));
+  for (const one of said.projects) board.append(oneSwarmBox("project", one));
+  drawSwarmLines();
+}
+
+function oneSwarmBox(kind, one) {
+  const picked = swarmPicked && swarmPicked.kind === kind && swarmPicked.id === one.id;
+  const wrong = kind === "agent" ? !one.ready : !one.is_there;
+  const box = make("button");
+  box.type = "button";
+  box.className = [
+    "swarm-box", kind,
+    wrong ? (kind === "agent" ? "not-ready" : "gone") : "",
+    picked ? "picked" : "",
+  ].filter(Boolean).join(" ");
+  box.dataset.kind = kind;
+  box.dataset.id = one.id;
+  box.style.left = `${one.at.x}px`;
+  box.style.top = `${one.at.y}px`;
+  box.append(make("span", "swarm-box-name", one.name));
+  if (kind === "agent") {
+    box.append(make("span", "swarm-box-who",
+      one.who ? (one.ready ? one.who : `${one.who} - not ready`) : "no assistant chosen"));
+    if (one.job) box.append(make("span", "swarm-box-job", one.job));
+  } else {
+    box.append(make("span", "swarm-box-who",
+      one.is_there ? one.path : `${one.path} - no such folder`));
+    box.append(make("span", "swarm-box-job",
+      one.tasks.length ? `${one.tasks.length} job${one.tasks.length === 1 ? "" : "s"}` : "no jobs yet"));
+  }
+  box.setAttribute("aria-pressed", String(Boolean(picked)));
+  makeSwarmBoxDraggable(box);
+  return box;
+}
+
+// Where the middle of one box is, in the board's own coordinates.
+function theMiddleOf(box) {
+  return {
+    x: box.offsetLeft + box.offsetWidth / 2,
+    y: box.offsetTop + box.offsetHeight / 2,
+  };
+}
+
+function drawSwarmLines() {
+  const sheet = $("swarmLines");
+  sheet.replaceChildren();
+  const board = $("swarmBoard");
+  const found = new Map();
+  for (const box of board.querySelectorAll(".swarm-box")) {
+    found.set(`${box.dataset.kind}:${box.dataset.id}`, box);
+  }
+  // The sheet is stretched to whatever the board scrolls to, so a line to a box
+  // that is off the bottom is still drawn instead of being cut off at the edge.
+  sheet.setAttribute("width", String(board.scrollWidth));
+  sheet.setAttribute("height", String(board.scrollHeight));
+  sheet.style.width = `${board.scrollWidth}px`;
+  sheet.style.height = `${board.scrollHeight}px`;
+  const said = theSwarmBoard();
+  for (const line of said.works_on) {
+    drawOneSwarmLine(sheet, found.get(`agent:${line.agent}`),
+      found.get(`project:${line.project}`), "works-on");
+  }
+  for (const line of said.talks_to) {
+    drawOneSwarmLine(sheet, found.get(`agent:${line.one}`),
+      found.get(`agent:${line.other}`), "talks-to");
+  }
+}
+
+function drawOneSwarmLine(sheet, from, to, kind) {
+  if (!from || !to) return;
+  const start = theMiddleOf(from);
+  const end = theMiddleOf(to);
+  const drawn = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  drawn.setAttribute("class", `swarm-line ${kind}`);
+  drawn.setAttribute("x1", String(start.x));
+  drawn.setAttribute("y1", String(start.y));
+  drawn.setAttribute("x2", String(end.x));
+  drawn.setAttribute("y2", String(end.y));
+  sheet.append(drawn);
+}
+
+function renderSwarmNotReady() {
+  const list = $("swarmNotReady");
+  list.replaceChildren();
+  const said = swarmSaid.what_is_not_ready || [];
+  if (!said.length) {
+    list.append(make("li", "all-well",
+      "Everything on the board is ready: every agent has an assistant, and every "
+      + "project has somebody on it and jobs to do."));
+    return;
+  }
+  for (const one of said) list.append(make("li", "", one));
+}
+
+// ---- dragging ------------------------------------------------------------
+//
+// Letting go of a box where it started means you meant to pick it, not move it,
+// so a press that never moved four pixels picks it instead of writing a new
+// position down. Moving one does both: it lands where you dropped it, and it is
+// the box the panel on the right is now showing, which is what you were about
+// to change anyway.
+
+function makeSwarmBoxDraggable(box) {
+  let dragging = null;
+  box.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    // Letting go writes a new place down, which is a change to the board, so
+    // while a run is going a box can be picked but not moved.
+    if (swarmGoing || swarmSaid.cannot_be_changed) return;
+    dragging = {
+      x: event.clientX, y: event.clientY,
+      left: box.offsetLeft, top: box.offsetTop, moved: false,
+    };
+    box.setPointerCapture(event.pointerId);
+  });
+  box.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const across = event.clientX - dragging.x;
+    const down = event.clientY - dragging.y;
+    if (!dragging.moved && Math.abs(across) + Math.abs(down) < 4) return;
+    dragging.moved = true;
+    box.style.left = `${Math.max(0, Math.min(4000, Math.round(dragging.left + across)))}px`;
+    box.style.top = `${Math.max(0, Math.min(4000, Math.round(dragging.top + down)))}px`;
+    drawSwarmLines();
+  });
+  const letGo = async (event) => {
+    if (!dragging) return;
+    const wasMoved = dragging.moved;
+    dragging = null;
+    if (box.hasPointerCapture(event.pointerId)) box.releasePointerCapture(event.pointerId);
+    if (!wasMoved) { pickSwarmBox(box.dataset.kind, box.dataset.id); return; }
+    const one = box.dataset.kind === "agent"
+      ? theSwarmAgent(box.dataset.id) : theSwarmProject(box.dataset.id);
+    if (!one) return;
+    one.at = {x: box.offsetLeft, y: box.offsetTop};
+    await saveTheSwarmBoard(`${one.name} was moved.`);
+  };
+  box.addEventListener("pointerup", letGo);
+  box.addEventListener("pointercancel", letGo);
+  // Moving one without a mouse. Dragging is a pointer at a target, which is
+  // no use to somebody on a keyboard, and "Tidy the board" only ever puts
+  // things back in rows - it is not a way to arrange them. The arrows move the
+  // box a step at a time, and holding shift moves it a small step for lining
+  // two of them up.
+  let moved = false;
+  box.addEventListener("keydown", (event) => {
+    const which = {
+      ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
+    }[event.key];
+    if (!which) return;
+    event.preventDefault();
+    if (swarmGoing || swarmSaid.cannot_be_changed) {
+      sayInSwarm(swarmSaid.cannot_be_changed
+        || "The board is going, so it cannot be changed until it finishes.");
+      return;
+    }
+    const step = event.shiftKey ? 4 : 20;
+    box.style.left = `${Math.max(0, Math.min(4000, box.offsetLeft + which[0] * step))}px`;
+    box.style.top = `${Math.max(0, Math.min(4000, box.offsetTop + which[1] * step))}px`;
+    drawSwarmLines();
+    moved = true;
+  });
+  // Written down when the key comes back up, not on every step of holding it,
+  // so moving a box across the board is one save and not forty.
+  box.addEventListener("keyup", async (event) => {
+    if (!moved || !event.key.startsWith("Arrow")) return;
+    moved = false;
+    const one = box.dataset.kind === "agent"
+      ? theSwarmAgent(box.dataset.id) : theSwarmProject(box.dataset.id);
+    if (!one) return;
+    one.at = {x: box.offsetLeft, y: box.offsetTop};
+    await saveTheSwarmBoard(`${one.name} was moved.`);
+  });
+  // Keyboard and anything that fires a plain click without a pointer. The
+  // pointer path has already picked it, so this only acts when it has not.
+  box.addEventListener("click", (event) => {
+    event.preventDefault();
+    const already = swarmPicked && swarmPicked.kind === box.dataset.kind
+      && swarmPicked.id === box.dataset.id;
+    if (!already) pickSwarmBox(box.dataset.kind, box.dataset.id);
+  });
+}
+
+function pickSwarmBox(kind, id) {
+  swarmPicked = {kind, id};
+  renderSwarmBoard();
+  renderSwarmPanel();
+  if (kind === "agent") refreshSwarmChat();
+}
+
+// ---- what you picked -----------------------------------------------------
+
+function renderSwarmPanel() {
+  const agent = thePickedAgent();
+  const project = thePickedProject();
+  $("swarmAgentPanel").hidden = !agent;
+  $("swarmProjectPanel").hidden = !project;
+  if (agent) {
+    $("swarmPanelTitle").textContent = agent.name;
+    $("swarmPanelHint").textContent = agent.ready
+      ? "Change what it is and who it works with, or talk to it below."
+      : (agent.why_not || "");
+    renderSwarmAgentPanel(agent);
+  } else if (project) {
+    $("swarmPanelTitle").textContent = project.name;
+    $("swarmPanelHint").textContent = project.is_there
+      ? project.path : `There is no folder at ${project.path} any more.`;
+    renderSwarmProjectPanel(project);
+  } else {
+    $("swarmPanelTitle").textContent = "Nothing picked";
+    $("swarmPanelHint").textContent = "Pick a box on the board to change it.";
+  }
+  setWhatCanBePressedInSwarm();
+}
+
+function renderSwarmAgentPanel(agent) {
+  $("swarmAgentName").value = agent.name;
+  $("swarmAgentJob").value = agent.job || "";
+  const who = $("swarmAgentWho");
+  who.replaceChildren();
+  const none = make("option", "", "Not chosen yet");
+  none.value = "";
+  who.append(none);
+  for (const one of swarmSaid.who_can_be_used || []) {
+    const choice = make("option", "", one.ready ? one.label : `${one.label} - not set up`);
+    choice.value = one.route;
+    who.append(choice);
+  }
+  // One that is written down but no longer on this machine still has to be
+  // shown, or opening its settings would quietly change it to something else.
+  if (agent.who && !(swarmSaid.who_can_be_used || []).some((one) => one.route === agent.who)) {
+    const gone = make("option", "", `${agent.who} - not on this machine`);
+    gone.value = agent.who;
+    who.append(gone);
+  }
+  who.value = agent.who || "";
+
+  const worksOn = $("swarmWorksOn");
+  worksOn.replaceChildren();
+  if (!theSwarmBoard().projects.length) {
+    worksOn.append(make("p", "hint", "No projects on the board yet."));
+  }
+  for (const one of theSwarmBoard().projects) {
+    worksOn.append(oneSwarmTick(
+      `swarmWorks-${one.id}`, one.name,
+      theSwarmBoard().works_on.some(
+        (line) => line.agent === agent.id && line.project === one.id),
+      (on) => setWhoWorksOnWhat(agent.id, one.id, on),
+    ));
+  }
+
+  const talksTo = $("swarmTalksTo");
+  talksTo.replaceChildren();
+  const others = theSwarmBoard().agents.filter((one) => one.id !== agent.id);
+  if (!others.length) {
+    talksTo.append(make("p", "hint", "There is nobody else on the board to talk to."));
+  }
+  for (const one of others) {
+    talksTo.append(oneSwarmTick(
+      `swarmTalks-${one.id}`, one.name,
+      mayTheyTalk(agent.id, one.id),
+      (on) => setWhetherTheyTalk(agent.id, one.id, on),
+    ));
+  }
+}
+
+function oneSwarmTick(id, words, ticked, whenChanged) {
+  const row = make("label", "swarm-tick");
+  const tick = make("input");
+  tick.type = "checkbox";
+  tick.id = id;
+  tick.checked = ticked;
+  tick.addEventListener("change", () => whenChanged(tick.checked));
+  row.append(tick, make("span", "", words));
+  row.htmlFor = id;
+  return row;
+}
+
+function mayTheyTalk(one, other) {
+  const first = one < other ? one : other;
+  const second = one < other ? other : one;
+  return theSwarmBoard().talks_to.some(
+    (line) => line.one === first && line.other === second);
+}
+
+async function setWhoWorksOnWhat(agentId, projectId, on) {
+  const board = theSwarmBoard();
+  board.works_on = board.works_on.filter(
+    (line) => !(line.agent === agentId && line.project === projectId));
+  if (on) board.works_on.push({agent: agentId, project: projectId});
+  const agent = theSwarmAgent(agentId);
+  const project = theSwarmProject(projectId);
+  await saveTheSwarmBoard(on
+    ? `${agent.name} works on ${project.name}.`
+    : `${agent.name} is off ${project.name}.`);
+}
+
+async function setWhetherTheyTalk(one, other, on) {
+  const board = theSwarmBoard();
+  const first = one < other ? one : other;
+  const second = one < other ? other : one;
+  board.talks_to = board.talks_to.filter(
+    (line) => !(line.one === first && line.other === second));
+  if (on) board.talks_to.push({one: first, other: second});
+  const them = `${theSwarmAgent(one).name} and ${theSwarmAgent(other).name}`;
+  await saveTheSwarmBoard(on
+    ? `${them} may talk to each other.`
+    : `${them} will not hear from each other.`);
+}
+
+function renderSwarmProjectPanel(project) {
+  $("swarmProjectPath").value = project.path;
+  const on_it = theSwarmBoard().works_on
+    .filter((line) => line.project === project.id)
+    .map((line) => (theSwarmAgent(line.agent) || {}).name)
+    .filter(Boolean);
+  $("swarmProjectWho").textContent = on_it.length
+    ? `Worked on by ${on_it.join(", ")}.`
+    : "Nobody works on this yet. Pick an agent and tick this project.";
+  const list = $("swarmTasks");
+  list.replaceChildren();
+  if (!project.tasks.length) {
+    list.append(make("li", "hint", "No jobs written down yet."));
+  }
+  project.tasks.forEach((task, at) => {
+    const row = make("li", "swarm-task");
+    row.append(make("span", "", task));
+    const drop = make("button", "", "Remove");
+    drop.type = "button";
+    drop.addEventListener("click", () => removeOneSwarmTask(project.id, at));
+    row.append(drop);
+    list.append(row);
+  });
+}
+
+// One place decides what can be pressed, so no path can leave a button dead.
+function setWhatCanBePressedInSwarm() {
+  const agent = thePickedAgent();
+  const board = theSwarmBoard();
+  const most = swarmSaid.most || {};
+  // While a run is going the board cannot be changed at all. A turn already
+  // asked for writes what it says under the name that agent had when it was
+  // asked, so an agent renamed halfway through would have its answer land in a
+  // conversation nothing points at any more. The server turns those saves down
+  // as well; this is so nobody is offered a button that will be refused.
+  const held = Boolean(swarmSaid.cannot_be_changed) || swarmGoing;
+  $("swarmAddAgent").disabled = held || board.agents.length >= (most.agents || 24);
+  $("swarmAddProject").disabled = held || board.projects.length >= (most.projects || 12);
+  $("swarmTidy").disabled = held || (!board.agents.length && !board.projects.length);
+  $("swarmBox").disabled = !agent || !agent.ready;
+  $("swarmSend").disabled = swarmBusy || !agent || !agent.ready;
+  $("swarmStartAgain").disabled = swarmBusy || !agent;
+  $("swarmAgentSave").disabled = held || swarmBusy || !agent;
+  $("swarmAgentRemove").disabled = held || swarmBusy || !agent;
+  const project = thePickedProject();
+  $("swarmAddTask").disabled = held
+    || !project || project.tasks.length >= (most.tasks || 40);
+  $("swarmProjectRemove").disabled = held || !project;
+  for (const tick of $("swarmWorksOn").querySelectorAll("input")) tick.disabled = held;
+  for (const tick of $("swarmTalksTo").querySelectorAll("input")) tick.disabled = held;
+  $("swarmStart").disabled = swarmGoing;
+  $("swarmStop").disabled = !swarmGoing;
+}
+
+// ---- changing it ---------------------------------------------------------
+
+// Every change goes through here, so the board on screen and the board on disk
+// cannot drift apart. What comes back is what was really written, which is why
+// it is read back into the panel rather than trusted from here.
+async function saveTheSwarmBoard(note) {
+  try {
+    const said = await request("/api/swarm/save", {
+      method: "POST", body: JSON.stringify({board: theSwarmBoard()}),
+    });
+    swarmSaid = said;
+    keepTheSwarmPick();
+    renderSwarmBoard();
+    renderSwarmNotReady();
+    renderSwarmPanel();
+    if (note) sayInSwarm(note);
+    return true;
+  } catch (error) {
+    // Whatever was half changed here is thrown away and the written-down board
+    // is read again, so the screen never shows a change that was refused. The
+    // reason comes after that reading, or the reading would wipe it.
+    await refreshSwarm(true);
+    showError(error.message);
+    sayInSwarm(error.message);
+    return false;
+  }
+}
+
+// Somewhere free to put a new box: down the rows, then across.
+function aFreeSpotOnTheBoard(kind) {
+  const held = kind === "agent" ? theSwarmBoard().agents : theSwarmBoard().projects;
+  const down = kind === "agent" ? 40 : 320;
+  return {x: 40 + (held.length % 4) * 210, y: down + Math.floor(held.length / 4) * 110};
+}
+
+async function addAnAgentToTheBoard() {
+  const taken = new Set(theSwarmBoard().agents.map((one) => one.name.toLowerCase()));
+  let name = "New agent";
+  for (let number = 2; taken.has(name.toLowerCase()); number += 1) name = `New agent ${number}`;
+  const said = await askForOneLine(
+    "Add an agent", "What do you want to call it?", name);
+  if (said === null) { sayInSwarm("Nothing was added."); return; }
+  // Tidied the way the server tidies it. It collapses runs of spaces, so a
+  // name typed with two of them came back different from what was sent and the
+  // agent just added was never the one that got picked.
+  const wanted = said.trim().replace(/\s+/g, " ");
+  if (!wanted) { sayInSwarm("An agent needs a name."); return; }
+  const ready = (swarmSaid.who_can_be_used || []).find((one) => one.ready);
+  theSwarmBoard().agents.push({
+    id: "", name: wanted, who: ready ? ready.route : "", job: "",
+    at: aFreeSpotOnTheBoard("agent"),
+  });
+  const worked = await saveTheSwarmBoard(`${wanted} is on the board.`);
+  if (!worked) return;
+  const added = theSwarmBoard().agents.find((one) => one.name === wanted);
+  if (added) pickSwarmBox("agent", added.id);
+}
+
+async function addAProjectToTheBoard() {
+  const already = new Set(theSwarmBoard().projects.map((one) => one.path));
+  const known = (swarmSaid.projects_on_this_machine || [])
+    .find((one) => !already.has(one.path));
+  const said = await askForOneLine(
+    "Add a project", "Which folder do you want worked on?",
+    known ? known.path : "");
+  if (said === null) { sayInSwarm("Nothing was added."); return; }
+  const path = said.trim();
+  if (!path) { sayInSwarm("A project needs a folder."); return; }
+  theSwarmBoard().projects.push({
+    id: "", path, tasks: [], at: aFreeSpotOnTheBoard("project"),
+  });
+  const worked = await saveTheSwarmBoard(`${path} is on the board.`);
+  if (!worked) return;
+  const added = theSwarmBoard().projects.find((one) => one.path === path);
+  if (added) pickSwarmBox("project", added.id);
+}
+
+async function saveTheSwarmAgent() {
+  const agent = thePickedAgent();
+  if (!agent) { sayInSwarm("Pick an agent first."); return; }
+  const name = $("swarmAgentName").value.trim();
+  if (!name) { sayInSwarm("An agent needs a name."); return; }
+  agent.name = name;
+  agent.who = $("swarmAgentWho").value;
+  agent.job = $("swarmAgentJob").value.trim();
+  const worked = await saveTheSwarmBoard(`${name} was saved.`);
+  // Its conversation is kept under its name, so a rename opens a different
+  // one. Read it again rather than leaving somebody else's words on screen.
+  if (worked) refreshSwarmChat();
+}
+
+async function removeTheSwarmAgent() {
+  const agent = thePickedAgent();
+  if (!agent) return;
+  const board = theSwarmBoard();
+  board.agents = board.agents.filter((one) => one.id !== agent.id);
+  board.works_on = board.works_on.filter((line) => line.agent !== agent.id);
+  board.talks_to = board.talks_to.filter(
+    (line) => line.one !== agent.id && line.other !== agent.id);
+  swarmPicked = null;
+  await saveTheSwarmBoard(`${agent.name} is off the board. What it said is kept.`);
+}
+
+async function removeTheSwarmProject() {
+  const project = thePickedProject();
+  if (!project) return;
+  const board = theSwarmBoard();
+  board.projects = board.projects.filter((one) => one.id !== project.id);
+  board.works_on = board.works_on.filter((line) => line.project !== project.id);
+  swarmPicked = null;
+  await saveTheSwarmBoard(
+    `${project.name} is off the board. Nothing in the folder was changed.`);
+}
+
+async function addOneSwarmTask() {
+  const project = thePickedProject();
+  if (!project) return;
+  const words = $("swarmTaskText").value.trim();
+  if (!words) { sayInSwarm("Type the job first."); return; }
+  project.tasks.push(words);
+  const worked = await saveTheSwarmBoard(`Added to ${project.name}: ${words}`);
+  if (worked) $("swarmTaskText").value = "";
+}
+
+async function removeOneSwarmTask(projectId, at) {
+  const project = theSwarmProject(projectId);
+  if (!project) return;
+  const [gone] = project.tasks.splice(at, 1);
+  await saveTheSwarmBoard(`Off ${project.name}: ${gone}`);
+}
+
+function tidyTheSwarmBoard() {
+  theSwarmBoard().agents.forEach((one, at) => {
+    one.at = {x: 40 + (at % 4) * 210, y: 40 + Math.floor(at / 4) * 110};
+  });
+  theSwarmBoard().projects.forEach((one, at) => {
+    one.at = {x: 40 + (at % 4) * 210, y: 320 + Math.floor(at / 4) * 110};
+  });
+  return saveTheSwarmBoard("The board was tidied. Agents on top, projects below.");
+}
+
+// ---- talking to one of them ----------------------------------------------
+
+// Quietly, when this is tidying up after something that went wrong. The reason
+// it went wrong is what somebody needs to read, and reading the conversation
+// back would otherwise replace it, a moment later, with "Talking to them" -
+// which reads exactly like nothing went wrong at all.
+async function refreshSwarmChat(quietly) {
+  const agent = thePickedAgent();
+  if (!agent) { $("swarmThread").replaceChildren(); sayInSwarmChat(""); return; }
+  const mine = swarmPicked.id;
+  try {
+    const said = await request(`/api/swarm/said?agent=${encodeURIComponent(agent.id)}`);
+    if (!swarmPicked || swarmPicked.id !== mine) return;
+    renderSwarmThread(said.said || []);
+    if (!quietly) {
+      sayInSwarmChat(agent.ready
+        ? `Talking to ${agent.name}. Nobody else reads this.`
+        : (agent.why_not || "This one is not set up yet."));
+    }
+    countWhatIsTypedInSwarm();
+  } catch (error) {
+    if (!swarmPicked || swarmPicked.id !== mine) return;
+    sayInSwarmChat(error.message);
+  }
+}
+
+function renderSwarmThread(said) {
+  const list = $("swarmThread");
+  list.replaceChildren();
+  const agent = thePickedAgent();
+  if (!said.length) {
+    list.append(make("li", "hint",
+      "Nothing said yet. Whatever you type stays on this machine, and goes only to "
+      + "this agent's assistant."));
+    return;
+  }
+  for (const one of said) {
+    const row = make("li", `talk-turn ${one.who}`);
+    row.append(make("strong", "talk-turn-who",
+      one.who === "you" ? "You" : ((agent && agent.name) || "Them")));
+    row.append(make("p", "talk-turn-text", one.text));
+    const under = [];
+    if (one.at) under.push(one.at);
+    if (one.milliseconds) under.push(prettyTime(one.milliseconds));
+    if (one.model) under.push(one.model);
+    if (under.length) row.append(make("p", "hint", under.join(" | ")));
+    list.append(row);
+  }
+  list.lastElementChild.scrollIntoView({block: "nearest"});
+}
+
+function countWhatIsTypedInSwarm() {
+  const typed = $("swarmBox").value.length;
+  $("swarmCount").textContent = typed ? `${typed} letters` : "";
+}
+
+async function sendWhatIsTypedInSwarm() {
+  const box = $("swarmBox");
+  const words = box.value.trim();
+  const agent = thePickedAgent();
+  if (!agent) { sayInSwarmChat("Pick an agent first."); return; }
+  if (!words) { sayInSwarmChat("Type something first."); return; }
+  if (!agent.ready) { sayInSwarmChat(agent.why_not || "This one is not set up yet."); return; }
+  if (swarmBusy) { sayInSwarmChat("Still waiting for the last answer."); return; }
+  swarmBusy = true;
+  setWhatCanBePressedInSwarm();
+  sayInSwarmChat(`Asking ${agent.name}...`);
+  const asked = agent.id;
+  try {
+    const said = await request("/api/swarm/say", {
+      method: "POST", body: JSON.stringify({agent: agent.id, text: words}),
+    });
+    if (!swarmPicked || swarmPicked.id !== asked) {
+      // Somebody picked another box while this was on its way. It is kept, and
+      // is there when they come back; what it must not do is appear under
+      // whoever is on screen now.
+      sayInSwarmChat(`${agent.name} answered. Pick it again to read what it said.`);
+      return;
+    }
+    box.value = "";
+    countWhatIsTypedInSwarm();
+    renderSwarmThread(said.said || []);
+    sayInSwarmChat(`${agent.name} answered.`);
+  } catch (error) {
+    // Read back what was really kept, so a message that did not get through
+    // stops looking like one that did. The words stay in the box, and the
+    // reason is said after the reading back rather than before it.
+    if (swarmPicked && swarmPicked.id === asked) await refreshSwarmChat(true);
+    showError(error.message);
+    sayInSwarmChat(error.message);
+  } finally {
+    swarmBusy = false;
+    setWhatCanBePressedInSwarm();
+  }
+}
+
+async function startSwarmChatAgain() {
+  const agent = thePickedAgent();
+  if (!agent) return;
+  try {
+    const said = await request("/api/swarm/start-again", {
+      method: "POST", body: JSON.stringify({agent: agent.id}),
+    });
+    renderSwarmThread([]);
+    sayInSwarmChat(said.note || `${agent.name} starts again.`);
+  } catch (error) {
+    showError(error.message);
+    sayInSwarmChat(error.message);
+  }
+}
+
+// ---- setting them going --------------------------------------------------
+//
+// The board says who works on what. This is the part that acts on it, and the
+// part that has to keep saying what it is doing: every turn is a real
+// assistant being asked a real question, which can take a minute, and a page
+// that says nothing for a minute is a page somebody presses again.
+
+let swarmGoing = false;      // a run is on
+let swarmWatching = 0;       // the timer that keeps asking how it is going
+
+async function setThemGoing() {
+  try {
+    const said = await request("/api/swarm/start", {
+      method: "POST", body: JSON.stringify({}),
+    });
+    renderWhatTheyAreDoing(said.doing);
+    watchWhatTheyAreDoing();
+    sayInSwarm("They are going. What each one says lands in its own conversation.");
+  } catch (error) {
+    showError(error.message);
+    sayInSwarm(error.message);
+    $("swarmDoingSaid").textContent = error.message;
+  }
+}
+
+async function stopThemGoing() {
+  try {
+    const said = await request("/api/swarm/stop", {
+      method: "POST", body: JSON.stringify({}),
+    });
+    renderWhatTheyAreDoing(said.doing);
+    $("swarmDoingSaid").textContent = said.note;
+  } catch (error) {
+    showError(error.message);
+    $("swarmDoingSaid").textContent = error.message;
+  }
+}
+
+// One timer, however many times this is called. Two would ask twice as often
+// and fight over the same list.
+function watchWhatTheyAreDoing() {
+  if (swarmWatching) return;
+  swarmWatching = window.setInterval(async () => {
+    try {
+      const said = await request("/api/swarm/how-it-is-going");
+      renderWhatTheyAreDoing(said.doing);
+      if (!said.doing || !said.doing.going) {
+        window.clearInterval(swarmWatching);
+        swarmWatching = 0;
+        // What they said is in their conversations now, and an agent that was
+        // asked while its box was open is showing a conversation from before.
+        refreshSwarmChat(true);
+      }
+    } catch (error) {
+      window.clearInterval(swarmWatching);
+      swarmWatching = 0;
+      $("swarmDoingSaid").textContent = error.message;
+    }
+  }, 1500);
+}
+
+function renderWhatTheyAreDoing(doing) {
+  const list = $("swarmDoing");
+  list.replaceChildren();
+  swarmGoing = Boolean(doing && doing.going);
+  setWhatCanBePressedInSwarm();
+  if (!doing) {
+    $("swarmDoingSaid").textContent = "";
+    return;
+  }
+  $("swarmDoingSaid").textContent = doing.going
+    ? `${doing.note} (${doing.done} of ${doing.of} done)`
+    : doing.note;
+  // Said out loud, not only shown as grey buttons. And taken back when it
+  // finishes: left there, the line still said the board could not be changed
+  // long after it could.
+  if (doing.going) {
+    // The server works out this sentence and sends it. Written out again here
+    // it would be two copies of the same thing, which is the pair that
+    // disagrees the day one of them is reworded.
+    sayInSwarm(swarmSaid.cannot_be_changed
+      || "The board is going, so it cannot be changed until it finishes.");
+  } else if ($("swarmSaid").textContent.startsWith("The board is going")) {
+    sayInSwarm(whatTheBoardSays());
+  }
+  for (const turn of doing.turns) {
+    const row = make("li", turn.state.replace(/ /g, "-"));
+    row.append(make("strong", "", `${turn.name} on ${turn.where}`));
+    row.append(make("p", "hint", `${turn.round} - ${turn.state}`));
+    if (turn.why_not) row.append(make("p", "hint", turn.why_not));
+    list.append(row);
+  }
+}
+
+function wireUpTheSwarmBoard() {
+  $("swarmAddAgent").addEventListener("click", addAnAgentToTheBoard);
+  $("swarmAddProject").addEventListener("click", addAProjectToTheBoard);
+  $("swarmTidy").addEventListener("click", tidyTheSwarmBoard);
+  $("swarmRefresh").addEventListener("click", () => refreshSwarm());
+  $("swarmStart").addEventListener("click", setThemGoing);
+  $("swarmStop").addEventListener("click", stopThemGoing);
+  $("swarmAgentSave").addEventListener("click", saveTheSwarmAgent);
+  $("swarmAgentRemove").addEventListener("click", removeTheSwarmAgent);
+  $("swarmProjectRemove").addEventListener("click", removeTheSwarmProject);
+  $("swarmAddTask").addEventListener("click", addOneSwarmTask);
+  $("swarmTaskText").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); addOneSwarmTask(); }
+  });
+  $("swarmStartAgain").addEventListener("click", startSwarmChatAgain);
+  $("swarmChatForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendWhatIsTypedInSwarm();
+  });
+  $("swarmBox").addEventListener("input", countWhatIsTypedInSwarm);
+  $("swarmBox").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendWhatIsTypedInSwarm();
+    }
+  });
+  // The lines are drawn where the boxes really are, so a board that changes
+  // shape has to draw them again.
+  window.addEventListener("resize", () => {
+    if (!$("swarmView").hidden) drawSwarmLines();
+  });
 }
 
 boot();

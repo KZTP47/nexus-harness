@@ -151,10 +151,17 @@ def _filed_under(route: str) -> str:
     return f"{tidy}-{marked}"
 
 
-def where_it_is_kept(config: LoadedConfig, route: str) -> Path:
+def where_it_is_kept(config: LoadedConfig, route: str, filed_as: str = "") -> Path:
+    """The file one conversation is kept in.
+
+    `filed_as` is for when one assistant holds more than one conversation - two
+    agents on a board both using Claude, say. Without it they would share one
+    file and each would read the other's half of it.
+    """
+
     return confined_path(
         config.project_root,
-        f"{WHERE_THEY_LIVE}/{_filed_under(route)}.json",
+        f"{WHERE_THEY_LIVE}/{_filed_under(filed_as or route)}.json",
         allow_missing=True,
         allow_control=True,
     )
@@ -239,10 +246,10 @@ def who_can_talk(config: LoadedConfig) -> list[dict[str, Any]]:
     return found
 
 
-def read_it(config: LoadedConfig, route: str) -> list[Said]:
+def read_it(config: LoadedConfig, route: str, filed_as: str = "") -> list[Said]:
     """The conversation with one of them, oldest first."""
 
-    where = where_it_is_kept(config, route)
+    where = where_it_is_kept(config, route, filed_as)
     if not where.is_file():
         return []
     try:
@@ -271,8 +278,10 @@ def read_it(config: LoadedConfig, route: str) -> list[Said]:
     return kept
 
 
-def _keep_it(config: LoadedConfig, route: str, turns: list[Said]) -> None:
-    where = where_it_is_kept(config, route)
+def _keep_it(
+    config: LoadedConfig, route: str, turns: list[Said], filed_as: str = ""
+) -> None:
+    where = where_it_is_kept(config, route, filed_as)
     where.parent.mkdir(parents=True, exist_ok=True)
     written = json.dumps([one.to_dict() for one in turns[-MOST_KEPT:]], indent=2) + "\n"
     # Written beside and moved into place, so a panel reading it never sees
@@ -288,13 +297,13 @@ def _keep_it(config: LoadedConfig, route: str, turns: list[Said]) -> None:
     os.replace(beside, where)
 
 
-def start_again(config: LoadedConfig, route: str) -> str:
+def start_again(config: LoadedConfig, route: str, filed_as: str = "") -> str:
     """Throw the conversation away and start a fresh one."""
 
     from .safety import take_the_file_away
 
-    with _the_lock_for(_filed_under(route)):
-        where = where_it_is_kept(config, route)
+    with _the_lock_for(_filed_under(filed_as or route)):
+        where = where_it_is_kept(config, route, filed_as)
         if where.is_file():
             take_the_file_away(where, missing_ok=True)
     return "That conversation is gone. Say something and a new one starts."
@@ -314,11 +323,16 @@ def _check_what_was_typed(text: str) -> str:
     return said
 
 
-def say(config: LoadedConfig, route: str, text: str) -> dict[str, Any]:
+def say(
+    config: LoadedConfig, route: str, text: str, filed_as: str = ""
+) -> dict[str, Any]:
     """Say one thing to one of them, and keep what comes back.
 
     The conversation so far goes with it, so this is a conversation and not a
     row of unrelated questions.
+
+    `filed_as` keeps this conversation apart from any other going through the
+    same assistant. The route still decides who is reached.
     """
 
     asked = _check_what_was_typed(text)
@@ -343,12 +357,16 @@ def say(config: LoadedConfig, route: str, text: str) -> dict[str, Any]:
     # From here to the write is one piece of work: read what was said, add to
     # it, write it back. Two of those at once each write what the other did not
     # know about, and a turn disappears with nobody told.
-    with _the_lock_for(_filed_under(route)):
-        return _ask_and_keep(config, route, asked, provider, model, redactor, named)
+    with _the_lock_for(_filed_under(filed_as or route)):
+        return _ask_and_keep(
+            config, route, asked, provider, model, redactor, named, filed_as
+        )
 
 
-def _ask_and_keep(config, route, asked, provider, model, redactor, named) -> dict[str, Any]:
-    so_far = read_it(config, route)
+def _ask_and_keep(
+    config, route, asked, provider, model, redactor, named, filed_as=""
+) -> dict[str, Any]:
+    so_far = read_it(config, route, filed_as)
     messages = [
         {"role": "user" if one.who == "you" else "assistant", "content": one.text}
         for one in so_far
@@ -388,7 +406,7 @@ def _ask_and_keep(config, route, asked, provider, model, redactor, named) -> dic
             model=model,
         ),
     ]
-    _keep_it(config, route, turns)
+    _keep_it(config, route, turns, filed_as)
     return {
         "route": named,
         "said": [one.to_dict() for one in turns[-MOST_KEPT:]],

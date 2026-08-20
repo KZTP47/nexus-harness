@@ -11,7 +11,8 @@
     "smoke": "node smoke.js",
     "smoke:packaged": "node packaged.smoke.js",
     "smoke:built": "node built.smoke.js",
-    "smoke:asking": "node asking.smoke.js"
+    "smoke:asking": "node asking.smoke.js",
+    "smoke:board": "node board.smoke.js"
   },
   "devDependencies": {
     "electron": "^33.0.0",

@@ -38,6 +38,23 @@ the answers out side by side.
 It cannot read files, run anything, or change anything. See
 [TALK_TO_THEM.md](TALK_TO_THEM.md).
 
+## The agent board
+
+One picture of every agent you have, the projects you want worked on, and the
+lines between them. Add an agent and give it a name and an assistant; add a
+project folder and write down the jobs wanted there; tick which projects each
+agent works on and which other agents it may talk to. Drag a box to move it.
+
+Each agent keeps its own conversation, filed under its own name, so two agents
+both using Claude never read each other's words. A pair with no line between
+them never hears from each other at all: off is the answer when nothing was
+said.
+
+**Set them going** acts on the board. Every agent is asked about the projects it
+is on, one at a time and on its own; then the ones allowed to talk are shown
+what the others said and asked again. While it is going the board cannot be
+changed, and the panel says why. See [AGENT_BOARD.md](AGENT_BOARD.md).
+
 ## Look it up
 
 Three questions about your own code, on their own tab: **Where is it?**, **What
