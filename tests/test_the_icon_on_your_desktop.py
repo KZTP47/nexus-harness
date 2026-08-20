@@ -379,6 +379,28 @@ class PathsWithAnApostropheInThemTests(unittest.TestCase):
             self.assertTrue(where.is_file(), str(where))
 
 
+class NothingIsLeftInTheProjectTests(unittest.TestCase):
+    """A launcher belongs on somebody's desktop, not in the repository.
+
+    One got as far as being committed: a check that took the desktop-finding out
+    to see whether anything noticed wrote the shortcut into the project instead,
+    and it went in with the next commit. Ignoring the name is the fix; this is
+    the check that says so out loud.
+    """
+
+    def test_no_launcher_is_sitting_in_the_project(self) -> None:
+        left = [
+            one.name for one in ROOT.iterdir()
+            if one.name.startswith(installer.WHAT_IT_IS_CALLED)
+            and one.suffix.lower() in (".lnk", ".command", ".desktop")
+        ]
+        self.assertEqual(left, [], f"these belong on a desktop: {left}")
+
+    def test_the_name_is_ignored_so_one_cannot_be_committed_by_accident(self) -> None:
+        said = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn(f"{installer.WHAT_IT_IS_CALLED}.lnk", said)
+
+
 class WhenAskingWindowsGoesWrongTests(unittest.TestCase):
     def test_a_desktop_that_cannot_be_found_is_said_plainly(self) -> None:
         """Finding the desktop asks Windows, and that can fail on a machine

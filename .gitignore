@@ -44,3 +44,9 @@ reports/
 .harness/timers/.what-happened.json
 .harness/timers/.what-happened.json.could-not-be-read
 .harness/timers/running.lock
+
+# A launcher somebody made for themselves. It holds the paths on their own
+# machine, so it is theirs and not the project's - and one of these got as far as
+# being committed, from a check that wrote it here rather than onto a desktop.
+Nexus Harness.lnk
+Nexus Harness.command
