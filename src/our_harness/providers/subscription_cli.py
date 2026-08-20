@@ -590,36 +590,60 @@ def _the_ends_of(lines: list[str]) -> list[list[str]]:
 
 
 def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
+    """Every object in this block, in one walk from the top.
+
+    Two shapes, both cheap. A line that is a whole answer on its own is read on
+    its own, which is how these tools usually print one. Otherwise a run opens
+    at a line that starts with a brace and is read when the braces it opened
+    have closed - and the lines are kept in a list, joined once, rather than a
+    string rebuilt from the beginning every time a line is added.
+
+    Starting again at every line that opened a brace and never closed it, and
+    rebuilding the run after each line, two thousand lines of sixty-six letters
+    took thirty-eight seconds. There is no clock on this: it happens after the
+    program has already finished, so nothing else would have stopped it.
+
+    A whole answer on one line is taken even while a run is open and stuck, and
+    the stuck run is let go of - a line that opened a brace and never closed it
+    was never going to close, and the answer after it is the thing somebody
+    wants. That test is only made for a line that both starts and ends with a
+    brace, so it costs nothing on the run of unclosed lines that made all this
+    slow in the first place.
+
+    What one pass gives up is an object written across several lines that begins
+    after an earlier brace was left open. That falls back to the message saying
+    what code the tool stopped with, which is the safer way round.
+    """
+
     seen: list[dict[str, Any]] = []
-    at = 0
-    while at < len(lines):
-        if not lines[at].strip().startswith("{"):
-            at += 1
-            continue
-        # This line, then this line and the next, and so on: a tool that writes
-        # one object across several lines is still one object. As far as the
-        # block goes, which is what MOST_LINES_READ allows and no further.
-        run = ""
-        reached = at
-        found = None
-        depth, inside = 0, False
-        while reached < len(lines):
-            run = f"{run}\n{lines[reached]}" if run else lines[reached]
-            depth, inside = _where_the_braces_are(lines[reached], depth, inside)
-            # Only worth reading when every brace it opened has closed. Read
-            # after every line instead, a run of two hundred lines was read two
-            # hundred times, which is why how far an object could be spread had
-            # to be kept to a length no real answer would fit in.
-            if depth == 0 and not inside:
-                found = _objects_across(run)
-                if found is not None:
-                    break
-            reached += 1
-        if found is None:
-            at += 1
-            continue
-        seen.extend(found)
-        at = reached + 1
+    depth, inside = 0, False
+    holding: list[str] | None = None
+    for line in lines:
+        if holding is None:
+            if not line.strip().startswith("{"):
+                continue
+            # A whole answer on one line, read without opening a run at all.
+            alone = _objects_across(line)
+            if alone is not None:
+                seen.extend(alone)
+                continue
+            holding = []
+            depth, inside = 0, False
+        else:
+            held = line.strip()
+            if held.startswith("{") and held.endswith("}"):
+                alone = _objects_across(held)
+                if alone is not None:
+                    seen.extend(alone)
+                    holding = None
+                    continue
+        holding.append(line)
+        depth, inside = _where_the_braces_are(line, depth, inside)
+        if depth == 0 and not inside:
+            found = _objects_across("\n".join(holding))
+            if found is not None:
+                seen.extend(found)
+            holding = None
     return seen
 
 

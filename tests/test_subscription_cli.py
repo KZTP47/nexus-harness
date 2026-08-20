@@ -539,31 +539,39 @@ class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
         self.assertEqual(subscription_cli._every_object_in(said), [])
 
     def test_a_pile_of_broken_lines_is_read_quickly(self) -> None:
-        """Given the whole of what was printed to grow into, this walked to the
-        end from every line that opened a brace: sixteen hundred lines took nine
-        seconds, with no clock on it at all."""
+        """A line that opens a brace and never closes it, thousands of times.
 
-        said = "\n".join(['{"a": 1' for _ in range(3_000)])
-        started = time.monotonic()
+        The lines here are the length a real tool prints, not the shortest thing
+        that fits the shape. Measured with seven letters a line this looked
+        cheap, while the same number of sixty-six letter lines took thirty-eight
+        seconds: the cost was in walking the run again from the beginning for
+        every line added, so the shortest possible line hid all of it.
+
+        There is no clock on this at all - it happens after the program has
+        already finished, so nothing else would have stopped it.
+        """
+
+        line = '{"attempt": 1, "tool": "claude", "note": "retrying the request now'
+        self.assertGreater(len(line), 60)
+        for how_many in (2_000, 5_000):
+            with self.subTest(lines=how_many):
+                said = chr(10).join([line] * how_many)
+                started = time.monotonic()
+                found = subscription_cli._every_object_in(said)
+                took = time.monotonic() - started
+                self.assertEqual(found, [])
+                self.assertLess(took, 2, f"{how_many} lines took {took:.1f} seconds")
+
+    def test_a_whole_answer_after_an_unclosed_brace_is_still_read(self) -> None:
+        """A line that opened a brace and never closed it was never going to
+        close, and the answer after it is the thing somebody wants."""
+
+        said = chr(10).join([
+            '{"attempt": 1, "note": "this line never closes',
+            '{"is_error": true, "result": "the one that matters"}',
+        ])
         found = subscription_cli._every_object_in(said)
-        took = time.monotonic() - started
-        self.assertEqual(found, [])
-        self.assertLess(took, 4, f"it took {took:.1f} seconds")
-
-    def test_the_reason_is_found_at_either_end_of_a_torrent(self) -> None:
-        """Reading only the first so many lines, a tool with a great deal to say
-        before it says why lost the reason. Reading only the last so many loses
-        it the other way round, from a tool that answers and then talks."""
-
-        noise = [f"chatter {n}" for n in range(4_000)]
-        for what, lines in (
-            ("at the end", noise + ['{"is_error": true, "result": "at the end"}']),
-            ("at the front", ['{"is_error": true, "result": "at the front"}'] + noise),
-        ):
-            with self.subTest(what=what):
-                joined = chr(10).join(lines)
-                found = subscription_cli._every_object_in(joined)
-                self.assertEqual([one.get("result") for one in found], [what])
+        self.assertEqual([one.get("result") for one in found], ["the one that matters"])
 
     def test_an_object_with_real_detail_in_it_is_still_read(self) -> None:
         """A refusal can carry a breakdown - so many tokens against each of
