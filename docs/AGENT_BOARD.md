@@ -150,6 +150,17 @@ If there is nothing to do - no agent with an assistant, no project with jobs, or
 nobody on a project - the press is turned down with the reason, before any
 assistant is asked.
 
+## Coming to this from a fresh download
+
+The board needs nothing set up. Clone the project, say the settings file is
+yours (`python scripts/harness.py trust` - the harness asks for this the first
+time, because a settings file can name commands to run), start the panel with
+`python scripts/harness.py ui`, and the tab is there.
+
+It will say what is not ready, which on a machine with nothing set up is: no
+assistant is set up to be used by name. Open **Your team** and press **Set them
+up**, and come back.
+
 ## Where it is kept
 
 Beside your own settings, in `swarm.json`, next to the list of projects - not

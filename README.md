@@ -55,6 +55,23 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 sh ./scripts/install.sh
 ```
 
+Or run it straight out of the folder, with nothing installed at all. The code
+lives in `src`, which Python does not look in by itself, so there is a launcher
+that puts it on the path for you:
+
+```bash
+python scripts/harness.py ui
+```
+
+The first command you run in a freshly cloned project stops and says the
+settings file has not been trusted. That is on purpose: a settings file can name
+commands to run, and nothing reads one until the person at the keyboard says the
+file is theirs. Read it, then:
+
+```bash
+python scripts/harness.py trust
+```
+
 Browser and screenshot checks additionally need Node.js and Playwright. Every
 other kind works without them, and a browser check says so plainly instead of
 failing when they are missing:
