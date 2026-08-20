@@ -603,12 +603,14 @@ def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
     took thirty-eight seconds. There is no clock on this: it happens after the
     program has already finished, so nothing else would have stopped it.
 
-    A whole answer on one line is taken even while a run is open and stuck, and
-    the stuck run is let go of - a line that opened a brace and never closed it
-    was never going to close, and the answer after it is the thing somebody
-    wants. That test is only made for a line that both starts and ends with a
-    brace, so it costs nothing on the run of unclosed lines that made all this
-    slow in the first place.
+    A whole object found on a line inside an open run is kept to one side rather
+    than taken there and then, because a line inside an answer is not the
+    answer. An outer object written over several lines can hold a list whose
+    last item is written compactly on one line, and taking that line as the
+    answer said "transient network hiccup, retrying" while the real answer, two
+    lines further down, was thrown away with the run. What is kept to one side
+    is used only if the run never closes - which is the case it was there for: a
+    line that opened a brace and never closed it, and the answer after it.
 
     What one pass gives up is an object written across several lines that begins
     after an earlier brace was left open. That falls back to the message saying
@@ -616,6 +618,13 @@ def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
     """
 
     seen: list[dict[str, Any]] = []
+    # Whole objects found on a line inside a run that has not closed. Used only
+    # if it never does - inside one that closes they are its own parts, and one
+    # of them read as the answer is worse than no answer at all. Nothing needs
+    # to empty this when a run closes: it is only ever read where a run was left
+    # open, and a new run empties it. A line put here to do that as well looked
+    # like it was holding something up and was holding up nothing.
+    aside: list[dict[str, Any]] = []
     depth, inside = 0, False
     holding: list[str] | None = None
     for line in lines:
@@ -628,15 +637,14 @@ def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
                 seen.extend(alone)
                 continue
             holding = []
+            aside = []
             depth, inside = 0, False
         else:
             held = line.strip()
             if held.startswith("{") and held.endswith("}"):
                 alone = _objects_across(held)
                 if alone is not None:
-                    seen.extend(alone)
-                    holding = None
-                    continue
+                    aside.extend(alone)
         holding.append(line)
         depth, inside = _where_the_braces_are(line, depth, inside)
         if depth == 0 and not inside:
@@ -644,6 +652,10 @@ def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
             if found is not None:
                 seen.extend(found)
             holding = None
+    # A run left open at the end was never going to close, and a whole object
+    # found inside it is the best there is.
+    if holding is not None:
+        seen.extend(aside)
     return seen
 
 

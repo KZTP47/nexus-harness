@@ -562,6 +562,80 @@ class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
                 self.assertEqual(found, [])
                 self.assertLess(took, 2, f"{how_many} lines took {took:.1f} seconds")
 
+    def test_a_line_inside_an_answer_is_not_the_answer(self) -> None:
+        """The one that matters most, because it was wrong rather than missing.
+
+        An answer written out over several lines can hold a list whose last item
+        is written compactly on one line - an ordinary mixed style, not a strange
+        one. Taking that line as the answer said "transient network hiccup,
+        retrying" while the real answer, two lines below it, was thrown away with
+        the run it was in.
+        """
+
+        said = chr(10).join([
+            "{",
+            '  "type": "result",',
+            '  "attempts": [',
+            '    {"is_error": true, "result": "transient network hiccup, retrying"}',
+            "  ],",
+            '  "is_error": true,',
+            '  "result": "Your organization does not have access.",',
+            '  "session_id": "abc123"',
+            "}",
+        ])
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual(
+            [one.get("result") for one in found],
+            ["Your organization does not have access."],
+        )
+
+    def test_the_reason_read_from_that_shape_is_the_real_one(self) -> None:
+        """The same thing said through the part that reads a reason, because
+        that is where a wrong sentence would have reached somebody."""
+
+        said = chr(10).join([
+            "{",
+            '  "attempts": [',
+            '    {"is_error": true, "result": "transient network hiccup, retrying"}',
+            "  ],",
+            '  "is_error": true,',
+            '  "result": "Your organization does not have access."',
+            "}",
+        ])
+        holder = SubscriptionCLIProvider(
+            LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path.cwd(), [], {}), "claude-cli")
+        self.assertEqual(
+            holder._why_it_would_not(CLAUDE_RECIPE, said, ""),
+            "Your organization does not have access.",
+        )
+
+    def test_a_run_that_closed_leaves_nothing_behind_for_the_next_one(self) -> None:
+        """An answer holding a compact line of its own, and then a line that
+        opens a brace and never closes it.
+
+        The compact line was set aside while the first answer was being read, and
+        the first answer being read means it was one of that answer's own parts.
+        Left lying about, it came out as though it belonged to the second run -
+        which is the same wrong sentence as before, arriving by a longer road.
+        """
+
+        said = chr(10).join([
+            "{",
+            '  "attempts": [',
+            '    {"is_error": true, "result": "a part of the first"}',
+            "  ],",
+            '  "result": "the first answer"',
+            "}",
+            '{"b": 2, "note": "this line never closes',
+        ])
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual([one.get("result") for one in found], ["the first answer"])
+
+    def test_a_whole_object_on_one_line_inside_a_good_answer_is_left_where_it_is(self) -> None:
+        said = chr(10).join(["{", '  "a": {"b": 1},', '  "c": 2', "}"])
+        found = subscription_cli._every_object_in(said)
+        self.assertEqual(found, [{"a": {"b": 1}, "c": 2}])
+
     def test_a_whole_answer_after_an_unclosed_brace_is_still_read(self) -> None:
         """A line that opened a brace and never closed it was never going to
         close, and the answer after it is the thing somebody wants."""
