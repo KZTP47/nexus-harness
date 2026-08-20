@@ -332,12 +332,19 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(answer.text, "SAW_SCHEMA")
 
     def test_a_refusal_is_reported_even_when_the_tool_exits_cleanly(self) -> None:
-        """Claude answers with is_error true while still saying success."""
+        """Claude answers with is_error true while still saying success.
+
+        And what is said about who refused is checked, not only that the reason
+        came through. Checking the reason alone, this passed just the same while
+        a tool that prints no timing was being told the service turned it down.
+        """
 
         tool = fake_tool(self.folder, "faketool", CLAUDE_REFUSES)
         with self.assertRaises(HarnessError) as caught:
             self.provider("claude-cli", tool).complete(self.request())
-        self.assertIn("does not have access", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("does not have access", message)
+        self.assertNotIn("what turned this down was the service", message)
 
     def test_a_tool_that_prints_plain_text_is_read_too(self) -> None:
         tool = fake_tool(self.folder, "plaintool", PLAIN_TEXT_TOOL)
@@ -459,7 +466,44 @@ class RunningTests(unittest.TestCase):
         self.assertIn("is on this machine and did answer", message)
         self.assertIn("A Company", message, "it should say what the tool says of itself")
         self.assertIn("signed in", message)
-        self.assertIn("setup-token", message, "and the one thing to try")
+        # This one prints no timing, so it is not known whether it asked
+        # anybody, and neither answer is claimed. What it does get is the order
+        # to try things in, cheapest first.
+        self.assertIn("neither is claimed", message)
+        self.assertIn("claude auth login", message)
+
+    def test_a_tool_that_prints_no_timing_is_not_told_the_service_refused_it(self) -> None:
+        """The one that came back. Whether it asked anybody has three answers,
+        and folding "it did not say" in with "yes it asked" put the wrong
+        sentence in front of every tool that prints no timing - which is the
+        sentence this was all written to stop."""
+
+        tool = fake_tool(self.folder, "faketool", REFUSES_AND_STOPS)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertNotIn("what turned this down was the service", message)
+        self.assertNotIn("never asked anybody", message)
+        self.assertNotIn("setup-token", message, "which is only for a real refusal")
+
+    def test_the_three_answers_each_say_something_different(self) -> None:
+        """Said side by side, because the whole point of the three is that they
+        send somebody to three different places."""
+
+        seen = {}
+        for what, source in (
+            ("never asked", REFUSES_WITHOUT_ASKING),
+            ("the service refused", REFUSED_BY_THE_SERVICE),
+            ("it did not say", REFUSES_AND_STOPS),
+        ):
+            tool = fake_tool(self.folder, f"tool-{len(seen)}", source)
+            with self.assertRaises(HarnessError) as caught:
+                self.provider("claude-cli", tool).complete(self.request())
+            seen[what] = str(caught.exception)
+        self.assertEqual(len(set(seen.values())), 3, "two of them read the same")
+        self.assertIn("never asked anybody", seen["never asked"])
+        self.assertIn("was the service behind it", seen["the service refused"])
+        self.assertIn("neither is claimed", seen["it did not say"])
 
     def test_a_tool_that_cannot_be_asked_about_itself_still_says_the_rest(self) -> None:
         """Anything that goes wrong while asking is left out rather than piled

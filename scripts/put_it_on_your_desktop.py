@@ -121,6 +121,19 @@ def what_to_launch(root: Path = ROOT, is_there=None) -> Launcher:
 # ---- putting it where somebody will find it -------------------------------
 
 
+def as_powershell_text(said: object) -> str:
+    """One value, written so PowerShell reads it as the text it is.
+
+    Inside single quotes PowerShell takes everything literally, which is what is
+    wanted, and the one character that ends the quoting is a single quote itself.
+    Doubling it is how PowerShell says "one of these, not the end" - so a folder
+    called "Karo's Folder" stays a folder name instead of ending the string and
+    turning the rest of the line into nonsense.
+    """
+
+    return str(said).replace("'", "''")
+
+
 def _ask_windows(script: str) -> str:
     """Run one small piece of PowerShell and hand back what it printed."""
 
@@ -150,14 +163,15 @@ def where_the_desktop_is() -> Path:
 
 def _windows_shortcut(where: Path, launcher: Launcher, icon: Path) -> None:
     arguments = " ".join(f'"{one}"' for one in launcher.arguments)
+    quoted = as_powershell_text
     script = (
         "$made = (New-Object -ComObject WScript.Shell)"
-        f".CreateShortcut('{where}');"
-        f"$made.TargetPath = '{launcher.program}';"
-        f"$made.Arguments = '{arguments}';"
-        f"$made.WorkingDirectory = '{launcher.working_folder}';"
-        f"$made.IconLocation = '{icon},0';"
-        f"$made.Description = '{WHAT_IT_IS_FOR}';"
+        f".CreateShortcut('{quoted(where)}');"
+        f"$made.TargetPath = '{quoted(launcher.program)}';"
+        f"$made.Arguments = '{quoted(arguments)}';"
+        f"$made.WorkingDirectory = '{quoted(launcher.working_folder)}';"
+        f"$made.IconLocation = '{quoted(icon)},0';"
+        f"$made.Description = '{quoted(WHAT_IT_IS_FOR)}';"
         "$made.Save()"
     )
     _ask_windows(script)
@@ -218,6 +232,60 @@ def put_it_there(desktop: Path, launcher: Launcher, icon: Path | None = None) ->
     return where
 
 
+def is_the_settings_file_trusted(root: Path = ROOT) -> bool | None:
+    """Whether this machine has been told the project's settings are its own.
+
+    Nothing, when there is no answer to be had - no Python to ask with, or the
+    question itself went wrong. Nothing is not a no: saying "your settings are
+    not trusted" to somebody whose settings are fine would send them off to fix
+    what is not broken.
+
+    Asked by running the harness rather than by reading the file, because the
+    harness is what decides it and there is only one place that rule should
+    live.
+    """
+
+    try:
+        done = subprocess.run(
+            [sys.executable, str(root / "scripts" / "harness.py"),
+             "--project", str(root), "trust", "--show"],
+            capture_output=True, text=True, timeout=120, cwd=str(root),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    said = f"{done.stdout}\n{done.stderr}".lower()
+    if "not trusted" in said:
+        return False
+    if "is trusted" in said:
+        return True
+    return None
+
+
+def what_to_say_about_trust(root: Path = ROOT) -> list[str]:
+    """What to tell somebody about the settings file, if anything.
+
+    Said here rather than left for the icon to fail at, because the icon starts
+    the panel with the quiet Python and a panel that refuses there says it to
+    nobody: the icon is double-clicked and nothing happens at all.
+    """
+
+    if is_the_settings_file_trusted(root) is not False:
+        return []
+    return [
+        "",
+        "One thing first, or the icon will open nothing.",
+        "",
+        "This project has a settings file, and a settings file can name commands",
+        "to run - so nothing reads one until you say the file is yours. Read it,",
+        "then run this once:",
+        "",
+        f"    python scripts/harness.py --project \"{root}\" trust",
+        "",
+        "After that the icon works. Until then the panel stops before it starts,",
+        "and it stops quietly, because the icon opens it without a window.",
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -232,8 +300,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     launcher = what_to_launch()
-    desktop = Path(said.desktop) if said.desktop else where_the_desktop_is()
+    # Finding the desktop asks Windows, and asking Windows can go wrong on a
+    # machine locked down enough that PowerShell will not run. Outside this, the
+    # answer to that was a Python traceback rather than the plain sentence every
+    # other way of failing here is careful to give.
     try:
+        desktop = Path(said.desktop) if said.desktop else where_the_desktop_is()
         where = put_it_there(desktop, launcher)
     except (OSError, RuntimeError) as exc:
         print(f"The launcher could not be put on your desktop: {exc}")
@@ -250,6 +322,8 @@ def main(argv: list[str] | None = None) -> int:
         print("    npm install")
         print("    npm run build")
         print("then run this again and the icon will open that instead.")
+    for line in what_to_say_about_trust():
+        print(line)
     return 0
 
 

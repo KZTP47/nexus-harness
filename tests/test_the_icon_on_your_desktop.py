@@ -217,6 +217,181 @@ class WhereItLandsTests(unittest.TestCase):
             self.assertEqual(installer.main(["--desktop", str(self.desktop)]), 1)
 
 
+class TheOneThingThatStopsTheIconWorkingTests(unittest.TestCase):
+    """A freshly downloaded project has a settings file nobody has trusted, and
+    the panel will not read one until they do. The icon starts the panel with
+    the quiet Python - the one with no window - so it says that to nobody: the
+    icon is double-clicked and nothing happens at all. The installer is the
+    moment to say it, while somebody is looking.
+    """
+
+    def answering(self, said: str, code: int = 0):
+        def instead(argv, **rest):
+            return subprocess.CompletedProcess(argv, code, said, "")
+
+        return instead
+
+    def test_a_project_nobody_has_trusted_is_said_out_loud(self) -> None:
+        with mock.patch.object(
+            installer.subprocess, "run", self.answering("This file is not trusted yet.", 1)
+        ):
+            said = installer.what_to_say_about_trust(ROOT)
+        self.assertTrue(said)
+        together = " ".join(said)
+        self.assertIn("the icon will open nothing", together)
+        self.assertIn("trust", together)
+        self.assertIn("quietly", together, "and why nothing seems to happen")
+
+    def test_a_project_that_is_trusted_is_left_alone(self) -> None:
+        with mock.patch.object(
+            installer.subprocess, "run", self.answering("This file is trusted.", 0)
+        ):
+            self.assertEqual(installer.what_to_say_about_trust(ROOT), [])
+
+    def test_no_answer_is_not_taken_for_a_no(self) -> None:
+        """Saying "your settings are not trusted" to somebody whose settings are
+        fine sends them off to fix what is not broken."""
+
+        with mock.patch.object(
+            installer.subprocess, "run", self.answering("something else entirely", 3)
+        ):
+            self.assertIsNone(installer.is_the_settings_file_trusted(ROOT))
+            self.assertEqual(installer.what_to_say_about_trust(ROOT), [])
+
+    def test_a_question_that_cannot_be_asked_is_not_a_no_either(self) -> None:
+        def falls_over(argv, **rest):
+            raise OSError("no python here")
+
+        with mock.patch.object(installer.subprocess, "run", falls_over):
+            self.assertIsNone(installer.is_the_settings_file_trusted(ROOT))
+            self.assertEqual(installer.what_to_say_about_trust(ROOT), [])
+
+    def test_it_names_the_folder_so_the_command_can_be_pasted(self) -> None:
+        with mock.patch.object(
+            installer.subprocess, "run", self.answering("This file is not trusted yet.", 1)
+        ):
+            said = " ".join(installer.what_to_say_about_trust(ROOT))
+        self.assertIn(str(ROOT), said)
+        self.assertIn("harness.py", said)
+
+    def test_the_installer_really_prints_it(self) -> None:
+        """The tests above are about the words. This is about them reaching
+        somebody: worked out and never said is the same as never worked out."""
+
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            with mock.patch.object(
+                installer, "is_the_settings_file_trusted", lambda root=ROOT: False
+            ), mock.patch.object(
+                installer, "put_it_there",
+                lambda where, launcher, icon=None: where / "Nexus Harness.lnk",
+            ):
+                held = io.StringIO()
+                with contextlib.redirect_stdout(held):
+                    self.assertEqual(installer.main(["--desktop", str(desktop)]), 0)
+        said = held.getvalue()
+        self.assertIn("the icon will open nothing", said)
+        self.assertIn("trust", said)
+
+    def test_the_installer_says_nothing_about_it_when_there_is_nothing_to_say(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder)
+            with mock.patch.object(
+                installer, "is_the_settings_file_trusted", lambda root=ROOT: True
+            ), mock.patch.object(
+                installer, "put_it_there",
+                lambda where, launcher, icon=None: where / "Nexus Harness.lnk",
+            ):
+                held = io.StringIO()
+                with contextlib.redirect_stdout(held):
+                    installer.main(["--desktop", str(desktop)])
+        self.assertNotIn("open nothing", held.getvalue())
+
+    def test_the_harness_itself_is_what_decides_it(self) -> None:
+        """Asked by running the harness rather than by reading the file, so the
+        rule lives in one place."""
+
+        seen: list[list[str]] = []
+
+        def watching(argv, **rest):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "This file is trusted.", "")
+
+        with mock.patch.object(installer.subprocess, "run", watching):
+            installer.is_the_settings_file_trusted(ROOT)
+        self.assertTrue(seen)
+        self.assertIn("trust", seen[0])
+        self.assertIn("--show", seen[0])
+
+
+class PathsWithAnApostropheInThemTests(unittest.TestCase):
+    """Somebody's folder can have an apostrophe in it, and often does.
+
+    Every path went straight into a single-quoted piece of PowerShell, so a
+    folder called "Karo's Folder" - or a company OneDrive with an apostrophe in
+    its name, which is most of the ones that have one - ended the string early
+    and handed somebody a parser dump instead of an icon.
+    """
+
+    def test_a_quote_is_doubled_rather_than_left_to_end_the_string(self) -> None:
+        self.assertEqual(installer.as_powershell_text("Karo's Folder"), "Karo''s Folder")
+        self.assertEqual(installer.as_powershell_text("nothing to do"), "nothing to do")
+
+    def test_every_path_in_the_shortcut_goes_through_it(self) -> None:
+        seen: list[str] = []
+
+        def watching(script):
+            seen.append(script)
+            return ""
+
+        awkward = Path("C:/O'Brien/Karo's Folder/Nexus Harness.lnk")
+        launcher = installer.Launcher(
+            program=Path("C:/O'Brien/python.exe"),
+            arguments=[str(Path("C:/O'Brien/harness.py"))],
+            working_folder=Path("C:/O'Brien"),
+            what_it_is="the panel",
+            in_its_own_window=False,
+            icon=Path("C:/O'Brien/nexus-harness.ico"),
+        )
+        with mock.patch.object(installer, "_ask_windows", watching):
+            installer._windows_shortcut(awkward, launcher, launcher.icon)
+        self.assertTrue(seen)
+        script = seen[0]
+        self.assertNotIn("O'Brien", script, "a lone quote is what ends the string early")
+        self.assertIn("O''Brien", script)
+        self.assertIn("Karo''s Folder", script)
+
+    @unittest.skipUnless(os.name == "nt", "the Windows one")
+    def test_a_shortcut_really_lands_in_a_folder_with_one(self) -> None:
+        """Written for real, by Windows, into a folder named the awkward way."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            desktop = Path(folder) / "Karo's Folder"
+            desktop.mkdir()
+            launcher = installer.what_to_launch()
+            where = installer.put_it_there(desktop, launcher)
+            self.assertTrue(where.is_file(), str(where))
+
+
+class WhenAskingWindowsGoesWrongTests(unittest.TestCase):
+    def test_a_desktop_that_cannot_be_found_is_said_plainly(self) -> None:
+        """Finding the desktop asks Windows, and that can fail on a machine
+        locked down enough. Outside the part that catches things going wrong,
+        the answer was a Python traceback."""
+
+        def falls_over():
+            raise RuntimeError("PowerShell would not run")
+
+        with mock.patch.object(installer, "where_the_desktop_is", falls_over):
+            self.assertEqual(installer.main([]), 1)
+
+
 class SomebodyCanFindItTests(unittest.TestCase):
     """The thing to run has to be findable by somebody who knows nothing."""
 

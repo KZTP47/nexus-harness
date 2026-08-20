@@ -58,6 +58,11 @@ class CliRecipe:
     # the two cases send somebody to completely different places.
     time_at_the_service_field: str = ""
     when_it_never_asked: str = ""
+    # What to say when the tool does not say whether it asked anybody. Neither
+    # of the other two can be claimed then, and claiming one is how somebody
+    # ends up asking an administrator about something that never left their own
+    # machine.
+    when_it_is_not_clear: str = ""
     install_hint: str = ""
     verified: bool = False
 
@@ -144,6 +149,13 @@ CLAUDE_RECIPE = CliRecipe(
         "A tool that is signed in and still turned down usually has no token of "
         "its own for work nobody is watching. Run: claude setup-token. If that "
         "is not allowed either, whoever administers your organisation has to "
+        "turn Claude Code on for it - being able to use Claude in a window of "
+        "its own is not the same permission."
+    ),
+    when_it_is_not_clear=(
+        "Two things to try, in this order, because the first is free and the "
+        "second is somebody else's afternoon. Run: claude auth login. If it "
+        "still says no after that, whoever administers your organisation has to "
         "turn Claude Code on for it - being able to use Claude in a window of "
         "its own is not the same permission."
     ),
@@ -437,6 +449,10 @@ class SubscriptionCLIProvider(Provider):
         simply wrong, and it pointed at an administrator who has nothing to do
         with it.
 
+        Three answers, not two. A tool that does not say gets neither claim -
+        folded in with the ones that did ask, every tool that prints no timing
+        at all was back to being told the service refused it.
+
         Anything that goes wrong while asking is left out rather than piled on
         top: this is already an error message, and a second failure inside it
         helps nobody.
@@ -449,15 +465,22 @@ class SubscriptionCLIProvider(Provider):
                 "means it never asked anybody. It turned this down here, out of "
                 "what it has written down about your account."
             )]
-        else:
+            advice = recipe.when_it_never_asked
+        elif asked_anybody is True:
             said = ["", f"{here} - what turned this down was the service behind it."]
+            advice = recipe.when_it_is_refused
+        else:
+            # It did not say. Neither of the other two can be claimed, and
+            # claiming the service is how somebody ends up asking an
+            # administrator about something that never left their own machine.
+            said = ["", (
+                f"{here}. It does not say whether it asked anybody or turned "
+                "this down by itself, so neither is claimed here."
+            )]
+            advice = recipe.when_it_is_not_clear
         about = self._how_it_describes_its_sign_in(recipe, deadline_at)
         if about:
             said.append(f"It says of itself: {about}.")
-        advice = (
-            recipe.when_it_never_asked if asked_anybody is False
-            else recipe.when_it_is_refused
-        )
         if advice:
             said.append(advice)
         return " ".join(said)
