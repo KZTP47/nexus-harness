@@ -61,16 +61,28 @@ a board nobody would dare touch.
 
 ## Using it
 
-Press **Add an agent** and give it a name. Press **Add a project** and give it a
-folder. Pick a box to open its settings on the right.
+Under the board: **Add another agent**, **Remove an agent**, **Add another
+project folder**, **Remove a project folder**, **Tidy the board**, **Look
+again**. Remove works on whichever box is picked, so it is off until one is.
 
-For an agent you can change its name, which assistant it uses, and what it is
-for; tick the projects it works on and the agents it may talk to; and talk to it
-in the box underneath. **Save this agent** writes the top part down - the ticks
-save themselves as you make them.
+Every box carries two small buttons of its own:
 
-For a project you can write down the jobs you want done there, and take it off
-the board again. Taking a project off the board changes nothing in the folder.
+  - the **gear**, which opens that box's settings on the right;
+  - the **chat** button, on agents, which opens a chat for that agent on the
+    board.
+
+Every line carries a **gear** too, halfway along it, with what the line means
+beside it: **works on** between an agent and a project, and **communicates?
+YES** or **communicates? NO** between two agents. A pair who may not talk still
+gets a line, crossed out and grey, so there is always a gear to press. Pressing
+it opens the line on the right, where one tick turns it on or off.
+
+An agent's settings hold its name, which assistant it uses, what it is for, the
+projects it works on, and the agents it may talk to. **Save this agent** writes
+the top part down; the ticks save themselves as you make them.
+
+A project's settings hold the jobs you want done there. Taking a project off the
+board changes nothing in the folder.
 
 Drag a box to move it, or pick it and use the arrow keys - holding shift moves
 it a small step, for lining two of them up. **Tidy the board** puts every box
@@ -80,6 +92,35 @@ back in rows: agents on top, projects below.
 and it being any use - an agent with no assistant, a project nobody is on, a
 project with no jobs written down, a folder that is no longer there. It is in
 the order somebody would fix them.
+
+## Talking to one of them
+
+The chat button on an agent opens a chat box on the board, joined to that agent
+by a thin line. It is a big box on purpose: a chat squeezed into a strip at the
+edge of a page is a chat nobody uses, and the answer is the part you came to
+read.
+
+Several can be open at once, one per agent, and each can be dragged where you
+want it. Two of them can be waiting for an answer at the same time, because they
+are two different assistants being asked two different things. **Start again**
+empties that one chat and no other. **Close** puts it away; nothing said is
+lost, and opening it again reads it back.
+
+Every one of these is that agent's own conversation, filed under its own name.
+Two agents both using Claude never read each other's words.
+
+## What they said to each other
+
+Under the board, folded away until you ask for it.
+
+The second round of a run shows each agent what the others said - but only to
+the agent. This is the same thing where you can read it: every answer that was
+passed, who said it, who was shown it, and which project it was about. A pair
+with no line passes nothing, and nothing appears here for them.
+
+It is kept after the run finishes, so it is still there when you come back to
+the panel tomorrow. Only the last run is kept: it is there to be read, not as a
+history of everything that ever ran.
 
 ## Setting them going
 

@@ -56,9 +56,24 @@ class BoardTestCase(unittest.TestCase):
         return where
 
     def a_board(self, **kept) -> swarm.Board:
+        """A board written down here, with an id on every box.
+
+        Said out loud rather than left to be worked out, because a name is never
+        handed out twice: on a board that has already seen three agents the next
+        one is agent-4, and a test that wrote two agents and then said agent-1
+        works on something was drawing a line to nothing. Saying which one you
+        mean is what makes a board possible to write down by hand at all.
+        """
+
+        def named(kind, held):
+            return [
+                dict(one, id=one.get("id") or f"{kind}-{at + 1}")
+                for at, one in enumerate(held)
+            ]
+
         return swarm.save({
-            "agents": kept.get("agents", []),
-            "projects": kept.get("projects", []),
+            "agents": named("agent", kept.get("agents", [])),
+            "projects": named("project", kept.get("projects", [])),
             "works_on": kept.get("works_on", []),
             "talks_to": kept.get("talks_to", []),
         })
@@ -222,6 +237,95 @@ class NamesAreWhereConversationsAreKept(BoardTestCase):
 
         board = self.a_board(agents=[{"name": " The  reviewer "}])
         self.assertEqual(board.agents[0].to_dict()["filed_as"], "The reviewer")
+
+
+class ANameIsNeverHandedOutTwice(BoardTestCase):
+    """The name of a box is its name forever, and never anybody else's.
+
+    Handed out by taking the lowest number nothing was using, removing an agent
+    and adding another gave the new one the name the old one had. The panel holds
+    which agent it is waiting on by that name, so an answer already on its way
+    back landed in the new agent's chat - one agent's words showing up in another
+    agent's box.
+    """
+
+    def test_a_fresh_board_counts_from_one(self) -> None:
+        """A board written down by hand still gets agent-1 and project-1, so
+        anybody writing one can say who works on what."""
+
+        board = self.a_board(
+            agents=[{"name": "One"}, {"name": "Two"}],
+            projects=[{"path": str(self.a_project())}],
+        )
+        self.assertEqual([one.id for one in board.agents], ["agent-1", "agent-2"])
+        self.assertEqual([one.id for one in board.projects], ["project-1"])
+
+    def test_a_new_agent_never_takes_a_removed_one_s_name(self) -> None:
+        board = self.a_board(agents=[{"name": "One"}, {"name": "Two"}])
+        said = board.to_dict()
+        said["agents"] = [one for one in said["agents"] if one["name"] != "One"]
+        said["agents"].append({"name": "Replacement"})
+        again = swarm.save(said)
+        self.assertEqual(
+            [(one.id, one.name) for one in again.agents],
+            [("agent-2", "Two"), ("agent-3", "Replacement")],
+        )
+
+    def test_the_same_for_projects(self) -> None:
+        first = self.a_project("alpha")
+        board = self.a_board(projects=[{"path": str(first)}])
+        said = board.to_dict()
+        said["projects"] = [{"path": str(self.a_project("beta"))}]
+        again = swarm.save(said)
+        self.assertEqual([one.id for one in again.projects], ["project-2"])
+
+    def test_the_count_only_ever_goes_up(self) -> None:
+        board = self.a_board(agents=[{"name": f"Agent {n}"} for n in range(4)])
+        self.assertEqual(board.made_agents, 4)
+        said = board.to_dict()
+        said["agents"] = []
+        self.assertEqual(swarm.save(said).made_agents, 4)
+
+    def test_a_caller_that_says_nothing_about_the_count_cannot_turn_it_back(self) -> None:
+        """The one that matters. Somebody replacing the whole roster with fresh
+        names - a check resetting the board, a script writing one down - sends no
+        count at all, and working it out from what was sent alone handed the next
+        box a name a removed one used to have."""
+
+        self.a_board(agents=[{"name": f"Agent {n}"} for n in range(5)])
+        board = swarm.save({"agents": [{"name": "Replacement"}]})
+        self.assertEqual(board.made_agents, 6)
+        self.assertEqual([one.id for one in board.agents], ["agent-6"])
+
+    def test_the_same_for_projects_when_the_count_is_left_out(self) -> None:
+        self.a_board(projects=[
+            {"path": str(self.a_project(f"one-{n}"))} for n in range(3)
+        ])
+        board = swarm.save({"projects": [{"path": str(self.a_project("later"))}]})
+        self.assertEqual([one.id for one in board.projects], ["project-4"])
+
+    def test_an_id_asked_for_on_purpose_is_still_honoured(self) -> None:
+        """Saying which one you mean is a deliberate act, unlike leaving it out.
+        It is how a check, or this test, can write a board down and then say who
+        works on what."""
+
+        self.a_board(agents=[{"name": f"Agent {n}"} for n in range(5)])
+        board = swarm.save({"agents": [{"id": "agent-1", "name": "Pinned"}]})
+        self.assertEqual([one.id for one in board.agents], ["agent-1"])
+
+    def test_an_older_board_keeps_the_names_its_boxes_have(self) -> None:
+        """One written before there was a count says nothing about it, and its
+        boxes still have to answer to the names they were given."""
+
+        board = swarm.read_it({"agents": [{"name": "One", "id": "agent-7"}]})
+        self.assertEqual(board.agents[0].id, "agent-7")
+        self.assertEqual(board.made_agents, 7)
+
+    def test_two_boxes_sent_with_one_name_do_not_share_it(self) -> None:
+        board = swarm.read_it({"agents": [
+            {"name": "One", "id": "agent-1"}, {"name": "Two", "id": "agent-1"},
+        ]})
+        self.assertEqual(len({one.id for one in board.agents}), 2)
 
 
 class NobodyTalksUnlessSomebodyDrewTheLine(BoardTestCase):
@@ -677,6 +781,175 @@ class SettingThemGoing(BoardTestCase):
         self.assertIsNone(swarm.Running().how_it_is_going())
 
 
+class WhatTheySaidToEachOther(BoardTestCase):
+    """The exchange, kept where somebody watching can read it.
+
+    The run always showed one agent what another said - that is what the second
+    round is - but it was shown only to the agent. The one thing you want to
+    look at when two assistants disagree is what each of them was given.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.where = self.a_project()
+        self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.where, [], {})
+
+        def instead(config, route, text, filed_as=""):
+            return {"answer": {"who": "them", "text": f"{filed_as} says so", "at": ""}}
+
+        patched = mock.patch.object(chat, "say", instead)
+        patched.start()
+        self.addCleanup(patched.stop)
+        ready = mock.patch.object(chat, "who_can_talk", lambda config: [
+            {"route": "claude", "label": "Claude", "ready": True,
+             "why_not": "", "how_to_fix_it": ""},
+        ])
+        ready.start()
+        self.addCleanup(ready.stop)
+
+    def a_working_board(self, talks: bool = True) -> None:
+        self.a_board(
+            agents=[
+                {"name": "The reviewer", "who": "claude"},
+                {"name": "The writer", "who": "claude"},
+            ],
+            projects=[{"path": str(self.where), "tasks": ["Make it pass"]}],
+            works_on=[
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            talks_to=[{"one": "agent-1", "other": "agent-2"}] if talks else [],
+        )
+
+    def a_run(self) -> swarm.Running:
+        running = swarm.Running()
+        running.start(self.config)
+        running.wait(20)
+        return running
+
+    def test_every_answer_that_was_passed_is_written_down(self) -> None:
+        self.a_working_board()
+        said = self.a_run().what_they_said()
+        passed = {
+            (one["said_by_name"], one["shown_to_name"]) for one in said["notes"]
+        }
+        self.assertEqual(passed, {
+            ("The writer", "The reviewer"),
+            ("The reviewer", "The writer"),
+        })
+
+    def test_what_was_passed_is_the_words_themselves(self) -> None:
+        """Not a count of them. Reading what was passed is the whole point."""
+
+        self.a_working_board()
+        said = self.a_run().what_they_said()
+        self.assertIn("says so", said["notes"][0]["text"])
+        self.assertEqual(said["notes"][0]["where"], "alpha")
+
+    def test_nothing_is_passed_where_no_line_was_drawn(self) -> None:
+        self.a_working_board(talks=False)
+        self.assertEqual(self.a_run().what_they_said()["notes"], [])
+
+    def test_a_turn_says_whose_answers_it_was_shown(self) -> None:
+        self.a_working_board()
+        doing = self.a_run().how_it_is_going()
+        first = [one for one in doing["turns"] if one["round"] == swarm.ON_ITS_OWN]
+        later = [one for one in doing["turns"] if one["round"] == swarm.AFTER_THE_OTHERS]
+        # The first round is each of them on their own, which is the point of it.
+        self.assertEqual([one["shown"] for one in first], [[], []])
+        self.assertEqual([one["shown"] for one in later], [["The writer"], ["The reviewer"]])
+
+    def test_it_is_still_there_after_the_panel_is_started_again(self) -> None:
+        """Written down beside the board, so closing the window does not lose
+        the one thing somebody opened it to read."""
+
+        self.a_working_board()
+        self.a_run()
+        self.assertTrue(swarm.where_what_they_said_lives().is_file())
+        # A brand new runner, the way a panel that has just started has one.
+        said = swarm.Running().what_they_said()
+        self.assertEqual(len(said["notes"]), 2)
+        self.assertFalse(said["going"])
+
+    def test_the_exchange_does_not_grow_without_end(self) -> None:
+        """Each agent on the second round is shown one answer per agent it may
+        hear from, so everybody talking to everybody about one project writes
+        down a great many copies of the same words."""
+
+        self.assertLessEqual(swarm.MOST_NOTES, 400)
+        many = [{"name": f"Agent {n}", "who": "claude"} for n in range(8)]
+        self.a_board(
+            agents=many,
+            projects=[{"path": str(self.where), "tasks": ["Do it"]}],
+            works_on=[
+                {"agent": f"agent-{n + 1}", "project": "project-1"}
+                for n in range(len(many))
+            ],
+            talks_to=[
+                {"one": f"agent-{a + 1}", "other": f"agent-{b + 1}"}
+                for a in range(len(many)) for b in range(a + 1, len(many))
+            ],
+        )
+        # The limit is turned down for this. Eight agents talking to everybody
+        # make fifty-six answers and the real limit is two hundred, so a test
+        # that never reaches the limit would pass with the trimming taken out
+        # altogether - which is no test at all.
+        with mock.patch.object(swarm, "MOST_NOTES", 10):
+            said = self.a_run().what_they_said()
+        self.assertEqual(len(said["notes"]), 10)
+        # And the ones that fell off the end are counted, not quietly lost.
+        self.assertEqual(said["dropped"], 8 * 7 - 10)
+        # The newest are the ones kept: what somebody reads this for is what
+        # just happened.
+        self.assertEqual(said["notes"][-1]["shown_to_name"], "Agent 7")
+
+    def test_one_answer_kept_in_the_exchange_is_not_endless_either(self) -> None:
+        """The whole answer is in that agent's own chat. This is the copy for
+        reading who was shown what."""
+
+        long_one = "x" * (swarm.LONGEST_NOTE + 500)
+
+        def instead(config, route, text, filed_as=""):
+            return {"answer": {"who": "them", "text": long_one, "at": ""}}
+
+        self.a_working_board()
+        with mock.patch.object(chat, "say", instead):
+            said = self.a_run().what_they_said()
+        self.assertEqual(len(said["notes"][0]["text"]), swarm.LONGEST_NOTE)
+
+    def test_a_list_cut_short_says_so_where_it_is_written_down(self) -> None:
+        """A list that has been cut short and does not say so reads like the
+        whole of it - including after the panel has been started again."""
+
+        self.a_working_board()
+        with mock.patch.object(swarm, "MOST_NOTES", 1):
+            self.a_run()
+        # A brand new runner, the way a panel that has just started has one.
+        said = swarm.Running().what_they_said()
+        self.assertEqual(len(said["notes"]), 1)
+        self.assertEqual(said["dropped"], 1)
+
+    def test_nothing_written_down_yet_is_an_answer_too(self) -> None:
+        said = swarm.Running().what_they_said()
+        self.assertEqual(said["notes"], [])
+        self.assertFalse(said["going"])
+
+    def test_a_file_nobody_can_read_says_nothing_was_passed(self) -> None:
+        where = swarm.where_what_they_said_lives()
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text("{ not json", encoding="utf-8")
+        self.assertEqual(swarm.read_what_they_said()["notes"], [])
+
+    def test_the_run_that_is_going_is_the_one_you_read(self) -> None:
+        """So it can be read as it happens, not only once it has finished."""
+
+        self.a_working_board()
+        running = self.a_run()
+        said = running.what_they_said()
+        self.assertFalse(said["going"])
+        self.assertEqual(len(said["notes"]), 2)
+
+
 class WhatThePanelIsTold(BoardTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -798,6 +1071,15 @@ class WhatThePanelIsTold(BoardTestCase):
             [one.text for one in chat.read_it(config, "claude", "The writer")],
             ["The writer"],
         )
+
+    def test_the_exchange_can_be_asked_for_on_its_own(self) -> None:
+        """Not sent with every "how is it going": these are whole answers, and
+        a page watching a run asks that every second and a half."""
+
+        status, said = self.ask("/api/swarm/what-they-said")
+        self.assertEqual(status, 200)
+        self.assertEqual(said["notes"], [])
+        self.assertFalse(said["going"])
 
     def test_nothing_has_been_set_going_yet(self) -> None:
         status, said = self.ask("/api/swarm/how-it-is-going")

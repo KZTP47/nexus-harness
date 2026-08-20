@@ -84,6 +84,59 @@ async function main() {
     );
     console.log("pass  the agent just added is the one whose settings are open");
 
+    // The gear on the box, which is how the drawing asks for it to be reached.
+    // Nothing is picked first, so the gear really is what opened it - and it is
+    // this agent's own gear, not whichever box happens to sort first. Taking the
+    // first one renamed and read back the wrong agent everywhere else this went
+    // wrong, and it reads exactly like the bug a check is here to catch.
+    const which = await page.evaluate(
+      (wanted) => [...document.querySelectorAll(".swarm-box.agent")]
+        .find((one) => one.querySelector(".swarm-box-name").textContent === wanted)
+        .dataset.id,
+      CALLED
+    );
+    await page.evaluate(() => { swarmPicked = null; renderSwarmPanel(); });
+    await page.click(
+      `.swarm-box[data-id="${which}"] .swarm-icon-button[data-does="settings"]`,
+      { timeout: 20000 });
+    await page.waitForFunction(
+      (wanted) => document.getElementById("swarmPanelTitle").textContent === wanted,
+      CALLED, { timeout: 20000 }
+    );
+    console.log("pass  the gear on the box opens its settings");
+
+    // The chat button, and the big box it opens on the board.
+    await page.click(
+      `.swarm-box[data-id="${which}"] .swarm-icon-button[data-does="chat"]`,
+      { timeout: 20000 });
+    await page.waitForSelector(
+      `.swarm-chat-card[data-agent="${which}"] .swarm-chat-box`, { timeout: 20000 });
+    const tall = await page.evaluate(
+      (agent) => document.querySelector(
+        `.swarm-chat-card[data-agent="${agent}"] .swarm-chat-box`).clientHeight,
+      which);
+    if (tall < 90) throw new Error(`the box to type in is only ${tall} tall`);
+    console.log(`pass  the chat button opens a big box to type in (${tall} tall)`);
+
+    await page.fill(`.swarm-chat-card[data-agent="${which}"] .swarm-chat-box`,
+      "Typed by a smoke check");
+    await page.waitForFunction(
+      (agent) => document.querySelector(
+        `.swarm-chat-card[data-agent="${agent}"] .swarm-chat-count`)
+        .textContent === "22 letters",
+      which, { timeout: 20000 }
+    );
+    console.log("pass  what is typed into it really goes in");
+
+    await page.click(
+      `.swarm-chat-card[data-agent="${which}"] .swarm-icon-button[data-does="close"]`,
+      { timeout: 20000 });
+    await page.waitForFunction(
+      (agent) => !document.querySelector(`.swarm-chat-card[data-agent="${agent}"]`),
+      which, { timeout: 20000 }
+    );
+    console.log("pass  and the chat closes again");
+
     await page.click("#swarmAgentRemove", { timeout: 20000 });
     await page.waitForFunction(
       (count) => document.querySelectorAll(".swarm-box.agent").length === count,

@@ -6110,8 +6110,8 @@
       }
     },
     {
-      "id": "the-board-holds-agents-projects-and-the-lines-between-them",
-      "title": "Adding agents and a project, joining them, and tidying the board",
+      "id": "every-box-on-the-board-carries-its-own-gear-and-chat-button",
+      "title": "The gear and the chat button on a box, and adding and removing from under the board",
       "kind": "browser",
       "tags": [
         "ui",
@@ -6130,170 +6130,91 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden && document.getElementById('swarmSaid').textContent)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; await saveBoard({agents: [], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 0)) return 'Look again did not empty the board'; return 'the board is ready to work on';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; await saveBoard({agents: [], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 0)) return 'Look again did not empty the board'; return 'the board is ready to work on';",
           "text": "the board is ready to work on",
-          "timeout_ms": 60000,
-          "note": "Remember what was on this machine's board, and start from a known one"
+          "timeout_ms": 45000,
+          "note": "Remember what was on this machine's board, and start from an empty one"
         },
         {
           "do": "run",
-          "script": "const answerTheBox = async (words) => { for (let tries = 0; tries < 200; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 200)); return true; }; const namesOn = (what) => [...document.querySelectorAll('.swarm-box.' + what + ' .swarm-box-name')].map(one => one.textContent); const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmAddAgent').click(); if (!await answerTheBox('Check agent one')) return 'pressing Add an agent opened no box'; if (!await waitFor(() => namesOn('agent').includes('Check agent one'))) return 'nothing was put on the board'; return 'pressing Add an agent puts one on the board';",
-          "text": "pressing Add an agent puts one on the board",
-          "timeout_ms": 60000,
-          "note": "Add an agent asks for a name, and what is typed goes on the board"
+          "script": "const answerTheBox = async (words) => { for (let tries = 0; tries < 200; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 200)); return true; }; const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmAddAgent').click(); if (!await answerTheBox('Check agent one')) return 'pressing Add another agent opened no box'; if (!await waitFor(() => [...document.querySelectorAll('.swarm-box-name')].some(one => one.textContent === 'Check agent one'))) return 'nothing was put on the board'; return 'Add another agent puts one on the board';",
+          "text": "Add another agent puts one on the board",
+          "timeout_ms": 45000,
+          "note": "The add button under the board asks for a name and puts an agent on it"
         },
         {
           "do": "run",
-          "script": "const answerTheBox = async (words) => { for (let tries = 0; tries < 200; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 200)); return true; }; const namesOn = (what) => [...document.querySelectorAll('.swarm-box.' + what + ' .swarm-box-name')].map(one => one.textContent); const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmAddAgent').click(); if (!await answerTheBox('Check agent two')) return 'no box opened'; if (!await waitFor(() => namesOn('agent').length === 2)) return 'the second agent was not added'; return 'a second agent goes on beside the first';",
-          "text": "a second agent goes on beside the first",
-          "timeout_ms": 60000,
-          "note": "Two agents, because one cannot be told who it may talk to"
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const box = document.querySelector('.swarm-box.agent'); if (!theButton(box, 'settings')) return 'the box has no gear on it'; if (!theButton(box, 'chat')) return 'the box has no chat button on it'; if (theButton(box, 'settings').getAttribute('aria-label') !== 'settings for Check agent one') return 'the gear does not say which box it is on'; theButton(box, 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden && document.getElementById('swarmPanelTitle').textContent === 'Check agent one')) return 'the gear opened nothing'; return 'the gear on a box opens that box';",
+          "text": "the gear on a box opens that box",
+          "timeout_ms": 45000,
+          "note": "A gear on every box, and it opens the settings for that box and no other"
         },
         {
           "do": "run",
-          "script": "const answerTheBox = async (words) => { for (let tries = 0; tries < 200; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 200)); return true; }; const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const here = (await request('/api/projects')).here.path; document.getElementById('swarmAddProject').click(); if (!await answerTheBox(here)) return 'pressing Add a project opened no box'; if (!await waitFor(() => document.querySelectorAll('.swarm-box.project').length === 1)) return 'the project was not added'; return 'pressing Add a project puts a folder on the board';",
-          "text": "pressing Add a project puts a folder on the board",
-          "timeout_ms": 60000,
-          "note": "Add a project asks for a folder, and puts that folder on the board"
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const box = document.querySelector('.swarm-box.agent'); theButton(box, 'chat').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 1)) return 'the chat button opened no chat'; const card = document.querySelector('.swarm-chat-card'); if (!card.querySelector('.swarm-chat-box')) return 'the chat has nothing to type in'; if (card.querySelector('.swarm-chat-box').clientHeight < 90) return 'the box to type in is not a big one'; if (!document.querySelectorAll('#swarmLines line.to-its-chat').length) return 'the chat is not joined to its agent'; return 'the chat button opens a big chat box joined to its agent';",
+          "text": "the chat button opens a big chat box joined to its agent",
+          "timeout_ms": 45000,
+          "note": "The chat is a box on the board, big, with a line back to whose chat it is"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.querySelector('.swarm-box.agent[data-id=\"agent-1\"]').click(); if (!await waitFor(() => document.querySelector('#swarmWorksOn input'))) return 'picking an agent showed no projects to tick'; const tick = document.querySelector('#swarmWorksOn input'); tick.checked = true; tick.dispatchEvent(new Event('change', {bubbles: true})); if (!await waitFor(() => document.querySelectorAll('#swarmLines line.works-on').length === 1)) return 'ticking it drew no line'; const kept = (await request('/api/swarm')).board.works_on; return kept.length === 1 ? 'ticking a project draws a line and is written down' : 'the line was drawn but not written down';",
-          "text": "ticking a project draws a line and is written down",
-          "timeout_ms": 60000,
-          "note": "Ticking a project joins the agent to it, on screen and on disk"
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const card = document.querySelector('.swarm-chat-card'); theButton(card, 'close').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 0)) return 'the chat would not close'; return 'a chat closes again';",
+          "text": "a chat closes again",
+          "timeout_ms": 45000,
+          "note": "And it closes, because a board full of chats is a board nobody can read"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const tick = document.querySelector('#swarmTalksTo input'); if (!tick) return 'there was nobody else to talk to'; tick.checked = true; tick.dispatchEvent(new Event('change', {bubbles: true})); if (!await waitFor(() => document.querySelectorAll('#swarmLines line.talks-to').length === 1)) return 'ticking it drew no line'; const kept = (await request('/api/swarm')).board.talks_to; return kept.length === 1 ? 'letting two agents talk draws a line and is kept' : 'the line was drawn but not written down';",
-          "text": "letting two agents talk draws a line and is kept",
-          "timeout_ms": 60000,
-          "note": "Two agents only hear from each other when somebody says they may"
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmOpenChat').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 1)) return 'the button in the settings opened no chat'; return 'the settings panel opens the same chat as the button on the box';",
+          "text": "the settings panel opens the same chat as the button on the box",
+          "timeout_ms": 45000,
+          "note": "Two ways to the same chat, because somebody looking at the settings is already looking at that agent"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const tick = document.querySelector('#swarmTalksTo input'); tick.checked = false; tick.dispatchEvent(new Event('change', {bubbles: true})); if (!await waitFor(() => document.querySelectorAll('#swarmLines line.talks-to').length === 0)) return 'the line stayed after it was turned off'; const kept = (await request('/api/swarm')).board.talks_to; return kept.length === 0 ? 'turning it off means they will not hear from each other' : 'it was turned off on screen only';",
-          "text": "turning it off means they will not hear from each other",
-          "timeout_ms": 60000,
-          "note": "Off really is off: the line goes, and so does what was written down"
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (document.getElementById('swarmRemoveProject').disabled !== true) return 'Remove a project folder was offered with no project picked'; if (document.getElementById('swarmRemoveAgent').disabled !== false) return 'Remove an agent was not offered with an agent picked'; return 'the remove buttons follow what is picked';",
+          "text": "the remove buttons follow what is picked",
+          "timeout_ms": 45000,
+          "note": "Nothing is offered that would do nothing, or the wrong thing"
         },
         {
           "do": "click",
-          "target": "#swarmTidy",
-          "note": "Lay every box out in rows again"
+          "target": "#swarmRemoveAgent",
+          "note": "Remove an agent, from under the board"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => [...document.querySelectorAll('.swarm-box.agent')].every(one => one.style.top === '40px'))) return 'tidying moved nothing'; const project = document.querySelector('.swarm-box.project'); return project.style.top === '320px' ? 'tidying puts the agents on top and the projects below' : 'the projects were not moved';",
-          "text": "tidying puts the agents on top and the projects below",
-          "timeout_ms": 60000,
-          "note": "Tidy the board is the way back from a board somebody has dragged about"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(Object.assign({}, window.__boardWas, {version: (await request('/api/swarm')).board.version})); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
-          "text": "the board this machine had is back",
-          "timeout_ms": 60000,
-          "note": "Leave this machine's board exactly as it was found",
-          "always": true
-        }
-      ],
-      "expect": {
-        "max_console_errors": 0,
-        "max_page_errors": 0
-      }
-    },
-    {
-      "id": "the-board-keeps-what-you-change-about-an-agent-and-a-project",
-      "title": "Changing an agent, writing jobs down, and taking things off the board",
-      "kind": "browser",
-      "tags": [
-        "ui",
-        "swarm"
-      ],
-      "touches": [
-        "the board of agents"
-      ],
-      "url": "http://127.0.0.1:8765/",
-      "timeout_seconds": 300,
-      "steps": [
-        {
-          "do": "click",
-          "target": "[data-view=\"swarm\"]",
-          "note": "Open the board"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden && document.getElementById('swarmSaid').textContent)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{name: 'Check settings agent'}], projects: [{path: here}], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 2)) return 'the board was not drawn'; document.querySelector('.swarm-box.agent').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'picking the agent opened nothing'; return 'one agent and one project to work on';",
-          "text": "one agent and one project to work on",
-          "timeout_ms": 60000,
-          "note": "Remember this machine's board, then start from one known agent and project"
-        },
-        {
-          "do": "choose",
-          "target": "#swarmAgentWho",
-          "value": "",
-          "note": "Choose nobody, which every machine can do and which really means something"
-        },
-        {
-          "do": "click",
-          "target": "#swarmAgentSave",
-          "note": "Save the agent"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.agents[0].who === ''))) return 'choosing nobody was not written down'; if (!await waitFor(() => [...document.querySelectorAll('#swarmNotReady li')].some(one => one.textContent.includes('Check settings agent')))) return 'an agent pointed at nobody was not called out'; return 'an agent with nobody chosen is written down and called out';",
-          "text": "an agent with nobody chosen is written down and called out",
-          "timeout_ms": 60000,
-          "note": "Choosing nobody is a real choice, and the board says so rather than guessing"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const list = document.getElementById('swarmAgentWho'); const real = [...list.options].map(one => one.value).filter(Boolean)[0]; if (!real) return 'nothing on this machine can be chosen by name'; list.value = real; document.getElementById('swarmAgentName').value = 'Check renamed agent'; document.getElementById('swarmAgentJob').value = 'Reads what changed'; document.getElementById('swarmAgentSave').click(); if (!await waitFor(async () => { const one = (await request('/api/swarm')).board.agents[0]; return one.name === 'Check renamed agent' && one.who === real && one.job === 'Reads what changed'; })) return 'saving the agent kept none of it'; return 'the name, the assistant and the job are all kept';",
-          "text": "the name, the assistant and the job are all kept",
-          "timeout_ms": 60000,
-          "note": "Save this agent keeps every part of it, not only the part on screen"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.querySelector('.swarm-box.project').click(); if (!await waitFor(() => !document.getElementById('swarmProjectPanel').hidden)) return 'picking the project opened nothing'; document.getElementById('swarmTaskText').value = 'Make every check pass'; document.getElementById('swarmAddTask').click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.projects[0].tasks.length === 1))) return 'the job was not written down'; if (!await waitFor(() => document.getElementById('swarmTaskText').value === '')) return 'the job was kept but the box still holds it'; return 'a job is written down and the box is emptied for the next one';",
-          "text": "a job is written down and the box is emptied for the next one",
-          "timeout_ms": 60000,
-          "note": "Add this job writes it down, and leaves the box ready for another"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const drop = [...document.querySelectorAll('#swarmTasks button')].find(one => one.textContent.trim() === 'Remove'); if (!drop) return 'the job had no Remove button'; drop.click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.projects[0].tasks.length === 0))) return 'the job stayed'; return 'Remove takes one job off and leaves the rest alone';",
-          "text": "Remove takes one job off and leaves the rest alone",
-          "timeout_ms": 60000,
-          "note": "Every job has its own Remove, found by the word on it"
-        },
-        {
-          "do": "click",
-          "target": "#swarmProjectRemove",
-          "note": "Take the project off the board"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.projects.length === 0))) return 'the project stayed on the board'; const here = (await request('/api/projects')).here.name; return here ? 'the project is off the board and the folder is untouched' : 'the project itself went missing';",
-          "text": "the project is off the board and the folder is untouched",
-          "timeout_ms": 60000,
-          "note": "Taking a project off the board changes nothing in the folder"
-        },
-        {
-          "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.querySelector('.swarm-box.agent').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'picking the agent opened nothing'; document.getElementById('swarmAgentRemove').click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.agents.length === 0))) return 'the agent stayed on the board'; return document.getElementById('swarmAgentPanel').hidden ? 'removing an agent takes it off the board and closes its settings' : 'the agent went but its settings are still open';",
-          "text": "removing an agent takes it off the board and closes its settings",
-          "timeout_ms": 60000,
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.agents.length === 0))) return 'the agent stayed on the board'; return document.getElementById('swarmAgentPanel').hidden ? 'Remove an agent takes it off and closes its settings' : 'the agent went but its settings are still open';",
+          "text": "Remove an agent takes it off and closes its settings",
+          "timeout_ms": 45000,
           "note": "Nothing is left pointing at an agent that is not there any more"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(Object.assign({}, window.__boardWas, {version: (await request('/api/swarm')).board.version})); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "script": "const answerTheBox = async (words) => { for (let tries = 0; tries < 200; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 200)); return true; }; const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const here = (await request('/api/projects')).here.path; document.getElementById('swarmAddProject').click(); if (!await answerTheBox(here)) return 'pressing Add another project folder opened no box'; if (!await waitFor(() => document.querySelectorAll('.swarm-box.project').length === 1)) return 'the project was not added'; return 'Add another project folder puts a folder on the board';",
+          "text": "Add another project folder puts a folder on the board",
+          "timeout_ms": 45000,
+          "note": "The same for project folders, from the same row of buttons"
+        },
+        {
+          "do": "click",
+          "target": "#swarmRemoveProject",
+          "note": "Remove a project folder, from under the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.projects.length === 0))) return 'the project stayed on the board'; const here = (await request('/api/projects')).here.name; return here ? 'the project is off the board and the folder is untouched' : 'the project itself went missing';",
+          "text": "the project is off the board and the folder is untouched",
+          "timeout_ms": 45000,
+          "note": "Taking a project off the board changes nothing in the folder"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
           "text": "the board this machine had is back",
-          "timeout_ms": 60000,
-          "note": "Leave this machine's board exactly as it was found",
-          "always": true
+          "timeout_ms": 45000,
+          "always": true,
+          "note": "Leave this machine's board exactly as it was found"
         }
       ],
       "expect": {
@@ -6302,8 +6223,109 @@
       }
     },
     {
-      "id": "each-agent-on-the-board-has-a-conversation-of-its-own",
-      "title": "Talking to one agent on the board, and starting it again",
+      "id": "every-line-on-the-board-carries-a-gear-that-turns-it-on-and-off",
+      "title": "The gear on a line, and what it says about whether two agents talk",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "swarm"
+      ],
+      "touches": [
+        "the board of agents"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"swarm\"]",
+          "note": "Open the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const who = ((await request('/api/swarm')).who_can_be_used.find(one => one.ready) || {}).route || ''; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check agent one', who, at: {x: 40, y: 40}}, {id: 'agent-2', name: 'Check agent two', who, at: {x: 300, y: 40}}], projects: [{id: 'project-1', path: here, tasks: ['Make every check pass'], at: {x: 40, y: 420}}], works_on: [{agent: 'agent-1', project: 'project-1'}, {agent: 'agent-2', project: 'project-1'}], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 3)) return 'the board was not drawn'; return 'the board is ready to work on';",
+          "text": "the board is ready to work on",
+          "timeout_ms": 45000,
+          "note": "Two agents on one project, which is when whether they talk means anything"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const said = [...document.querySelectorAll('.swarm-line-words')].map(one => one.textContent); if (said.filter(one => one === 'works on').length !== 2) return 'the works on lines are not both there: ' + said.join(', '); if (!said.includes('communicates? NO')) return 'a pair who may not talk is not said out loud: ' + said.join(', '); if (!document.querySelectorAll('#swarmLines line.crossed-out').length) return 'the line they may not talk over is not crossed out'; return 'every line says what it is, and a pair who may not talk is crossed out';",
+          "text": "every line says what it is, and a pair who may not talk is crossed out",
+          "timeout_ms": 45000,
+          "note": "A pair with no line still gets one, crossed out, so there is a gear to press"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const held = [...document.querySelectorAll('.swarm-line-tools')].find(one => one.querySelector('.swarm-line-words').textContent.startsWith('communicates')); if (!held) return 'the line between the two agents has no gear'; held.querySelector('.swarm-icon-button').click(); if (!await waitFor(() => !document.getElementById('swarmLinePanel').hidden)) return 'the gear on the line opened nothing'; return document.getElementById('swarmPanelTitle').textContent === 'Communicates?' ? 'the gear on a line opens that line' : 'it opened something else: ' + document.getElementById('swarmPanelTitle').textContent;",
+          "text": "the gear on a line opens that line",
+          "timeout_ms": 45000,
+          "note": "The gear on a line is how you change what the line means"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const tick = document.getElementById('swarmLineOn'); if (tick.checked) return 'the pair was already talking'; tick.checked = true; tick.dispatchEvent(new Event('change', {bubbles: true})); if (!await waitFor(async () => ((await request('/api/swarm')).board.talks_to.length === 1))) return 'turning the line on was not written down'; if (!await waitFor(() => [...document.querySelectorAll('.swarm-line-words')].some(one => one.textContent === 'communicates? YES'))) return 'it was written down but the line still says no'; return 'the tick on the line panel turns the line on';",
+          "text": "the tick on the line panel turns the line on",
+          "timeout_ms": 45000,
+          "note": "Ticking it is the same as drawing the line, and the line says so"
+        },
+        {
+          "do": "click",
+          "target": "#swarmLineRemove",
+          "note": "Turn the line off again from the same panel"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.talks_to.length === 0))) return 'turning it off was not written down'; if (!await waitFor(() => [...document.querySelectorAll('.swarm-line-words')].some(one => one.textContent === 'communicates? NO'))) return 'it was turned off but the line still says yes'; return 'off really is off, and the line says so';",
+          "text": "off really is off, and the line says so",
+          "timeout_ms": 45000,
+          "note": "Two agents that should not know about each other will not hear from each other"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); const who = ((await request('/api/swarm')).who_can_be_used.find(one => one.ready) || {}).route || ''; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check agent one', who}, {id: 'agent-2', name: 'Check agent two', who}], projects: [{id: 'project-1', path: here, tasks: ['Make every check pass']}], works_on: [{agent: 'agent-1', project: 'project-1'}], talks_to: [{one: 'agent-1', other: 'agent-2'}]}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; const said = [...document.querySelectorAll('.swarm-line-words')].map(one => one.textContent); if (!said.includes('communicates? YES')) return 'a pair who talk but share no project got no line: ' + said.join(', '); return 'a line that exists is drawn even with no project in common';",
+          "text": "a line that exists is drawn even with no project in common",
+          "timeout_ms": 45000,
+          "note": "A line drawn nowhere is a line nobody can turn off, which is worse than none"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const held = [...document.querySelectorAll('.swarm-line-tools')].find(one => one.querySelector('.swarm-line-words').textContent.startsWith('communicates')); held.querySelector('.swarm-icon-button').click(); if (!await waitFor(() => !document.getElementById('swarmLinePanel').hidden)) return 'the gear on that line opened nothing'; document.getElementById('swarmLineRemove').click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.talks_to.length === 0))) return 'it could not be turned off'; return 'and it can be turned off from that gear';",
+          "text": "and it can be turned off from that gear",
+          "timeout_ms": 45000,
+          "note": "The whole reason for drawing it: there is a gear to press"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); const who = ((await request('/api/swarm')).who_can_be_used.find(one => one.ready) || {}).route || ''; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check agent one', who, at: {x: 40, y: 40}}, {id: 'agent-2', name: 'Check agent two', who, at: {x: 300, y: 40}}], projects: [{id: 'project-1', path: here, tasks: ['Make every check pass'], at: {x: 40, y: 420}}], works_on: [{agent: 'agent-1', project: 'project-1'}, {agent: 'agent-2', project: 'project-1'}], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; return 'back to two agents on one project';",
+          "text": "back to two agents on one project",
+          "timeout_ms": 45000,
+          "note": "Put the board back the way the next step expects it"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const held = [...document.querySelectorAll('.swarm-line-tools')].find(one => one.querySelector('.swarm-line-words').textContent === 'works on'); held.querySelector('.swarm-icon-button').click(); if (!await waitFor(() => document.getElementById('swarmPanelTitle').textContent === 'Works on')) return 'the gear on a works on line opened nothing'; document.getElementById('swarmLineRemove').click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.works_on.length === 1))) return 'the works on line stayed'; return 'the gear on a works on line takes the agent off that project';",
+          "text": "the gear on a works on line takes the agent off that project",
+          "timeout_ms": 45000,
+          "note": "The same gear on the other kind of line, which means something else"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "text": "the board this machine had is back",
+          "timeout_ms": 45000,
+          "always": true,
+          "note": "Leave this machine's board exactly as it was found"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "each-agent-has-its-own-big-chat-box-on-the-board",
+      "title": "Two chats open at once, each its own conversation, and what they said to each other",
       "kind": "browser",
       "tags": [
         "ui",
@@ -6314,7 +6336,7 @@
         "the board of agents"
       ],
       "url": "http://127.0.0.1:8765/",
-      "timeout_seconds": 240,
+      "timeout_seconds": 300,
       "steps": [
         {
           "do": "click",
@@ -6323,44 +6345,140 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden && document.getElementById('swarmSaid').textContent)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const who = ((await request('/api/swarm')).who_can_be_used .find(one => one.ready) || {}).route || ''; await saveBoard({agents: [{name: 'Check talking agent', who}, {name: 'Check quiet agent', who}], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box.agent').length === 2)) return 'the agents were not drawn'; document.querySelector('.swarm-box.agent').click(); if (!await waitFor(() => document.getElementById('swarmChatSaid').textContent)) return 'picking one said nothing about talking to it'; return 'two agents to talk to, and one of them picked';",
-          "text": "two agents to talk to, and one of them picked",
-          "timeout_ms": 60000,
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const who = ((await request('/api/swarm')).who_can_be_used.find(one => one.ready) || {}).route || ''; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check agent one', who, at: {x: 40, y: 40}}, {id: 'agent-2', name: 'Check agent two', who, at: {x: 300, y: 40}}], projects: [{id: 'project-1', path: here, tasks: ['Make every check pass'], at: {x: 40, y: 420}}], works_on: [{agent: 'agent-1', project: 'project-1'}, {agent: 'agent-2', project: 'project-1'}], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 3)) return 'the board was not drawn'; return 'the board is ready to work on';",
+          "text": "the board is ready to work on",
+          "timeout_ms": 45000,
           "note": "Two agents, so it can be shown that one does not read the other's words"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const box = document.getElementById('swarmBox'); const send = document.getElementById('swarmSend'); if (send.disabled) return 'Send waits until there is somebody to send to'; box.value = '   '; document.getElementById('swarmSend').click(); if (!await waitFor(() => document.getElementById('swarmChatSaid').textContent.includes('Type something first'))) return 'pressing Send with nothing typed did something else'; return 'Send waits until there is somebody to send to';",
-          "text": "Send waits until there is somebody to send to",
-          "timeout_ms": 60000,
-          "note": "Send never goes off with nothing to say, whether or not this machine has one"
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; for (const box of document.querySelectorAll('.swarm-box.agent')) { theButton(box, 'chat').click(); } if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 2)) return 'two chats could not be open at once'; const named = [...document.querySelectorAll('.swarm-chat-grip')].map(one => one.textContent); return named.includes('Chat with Check agent one') && named.includes('Chat with Check agent two') ? 'two agents can have their chats open at the same time' : 'the chats are not the ones asked for: ' + named.join(', ');",
+          "text": "two agents can have their chats open at the same time",
+          "timeout_ms": 45000,
+          "note": "One chat per agent, open together, which is the point of a board"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const kept = await request('/api/swarm/said?agent=' + encodeURIComponent((await request('/api/swarm')).board.agents[1].id)); if (kept.agent.name !== 'Check quiet agent') return 'the wrong one was read'; return kept.agent.filed_as === 'Check quiet agent' ? 'each agent keeps its conversation under its own name' : 'two agents would share one conversation';",
-          "text": "each agent keeps its conversation under its own name",
-          "timeout_ms": 60000,
-          "note": "The whole reason an agent has a name: two on one assistant do not share"
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const card = document.querySelector('.swarm-chat-card[data-agent=\"agent-1\"]'); const box = card.querySelector('.swarm-chat-box'); if (box.disabled) return 'there is nobody set up to talk to on this machine'; box.value = '   '; card.querySelector('.swarm-chat-send').click(); if (!await waitFor(() => card.querySelector('.swarm-chat-said').textContent.includes('Type something first'))) return 'pressing Send with nothing typed did something else'; return 'Send never goes off with nothing to say';",
+          "text": "Send never goes off with nothing to say",
+          "timeout_ms": 45000,
+          "note": "Send is wired up, and it does not reach an assistant with an empty box"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const card = document.querySelector('.swarm-chat-card[data-agent=\"agent-1\"]'); const box = card.querySelector('.swarm-chat-box'); box.value = 'x'; box.dispatchEvent(new Event('input', {bubbles: true})); if (card.querySelector('.swarm-chat-count').textContent !== '1 letters') return 'it does not say how much was typed'; box.value = ''; box.dispatchEvent(new Event('input', {bubbles: true})); return 'the chat says how much has been typed';",
+          "text": "the chat says how much has been typed",
+          "timeout_ms": 45000,
+          "note": "How long what you typed is, which matters when there is a limit on it"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const card = document.querySelector('.swarm-chat-card[data-agent=\"agent-2\"]'); card.querySelector('.swarm-chat-again').click(); if (!await waitFor(() => card.querySelector('.swarm-chat-said').textContent.includes('gone'))) return 'Start again said nothing'; const other = document.querySelector('.swarm-chat-card[data-agent=\"agent-1\"]'); return other.querySelector('.swarm-chat-said').textContent.includes('gone') ? 'Start again on one emptied the other one too' : 'Start again empties one chat and leaves the other alone';",
+          "text": "Start again empties one chat and leaves the other alone",
+          "timeout_ms": 45000,
+          "note": "Each agent's chat is its own, which is the whole reason each has a name"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const kept = await request('/api/swarm/said?agent=agent-2'); return kept.agent.filed_as === 'Check agent two' ? 'each agent keeps its chat under its own name' : 'two agents would share one chat';",
+          "text": "each agent keeps its chat under its own name",
+          "timeout_ms": 45000,
+          "note": "Two agents on one assistant do not read each other's half of it"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmExchange').open = true; if (!await waitFor(() => !document.getElementById('swarmExchangeRefresh').hidden)) return 'the fold would not open'; return 'what they said to each other unfolds';",
+          "text": "what they said to each other unfolds",
+          "timeout_ms": 45000,
+          "note": "It is folded away until somebody asks for it, because most days nobody does"
         },
         {
           "do": "click",
-          "target": "#swarmStartAgain",
-          "note": "Start this one's conversation again"
+          "target": "#swarmExchangeRefresh",
+          "note": "Look again at what they said to each other"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => document.getElementById('swarmChatSaid').textContent.includes('gone'))) return 'Start again said nothing'; return document.querySelectorAll('#swarmThread .talk-turn').length === 0 ? 'Start again empties this one conversation and says so' : 'it said so but the words are still there';",
-          "text": "Start again empties this one conversation and says so",
-          "timeout_ms": 60000,
-          "note": "Start again is about the one agent picked, and it says what it did"
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => document.getElementById('swarmExchangeSaid').textContent.length > 0)) return 'it never said anything about the exchange'; const said = await request('/api/swarm/what-they-said'); if (!Array.isArray(said.notes)) return 'the exchange is not a list'; return document.getElementById('swarmExchangeSaid').textContent.includes('nothing passed yet') ? 'with nothing passed it says so rather than showing an empty box' : 'this machine has an exchange from an earlier run, which is fine too';",
+          "text": "with nothing passed it says so rather than showing an empty box",
+          "timeout_ms": 45000,
+          "note": "Nothing passed is a thing to say, not an empty list to stare at"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(Object.assign({}, window.__boardWas, {version: (await request('/api/swarm')).board.version})); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; renderWhatTheySaidToEachOther({dropped: 3, notes: [{said_by_name: 'Check agent one', shown_to_name: 'Check agent two', where: 'Somewhere', at: '2026-01-01T00:00:00', text: 'The first thing that was passed'}, {said_by_name: 'Check agent two', shown_to_name: 'Check agent one', where: 'Somewhere', at: '2026-01-01T00:00:01', text: 'The second thing that was passed'}]}); const rows = [...document.querySelectorAll('#swarmExchangeList li')].map(one => one.textContent); if (rows.length !== 2) return 'it drew ' + rows.length + ' rows, not two'; if (!rows[0].includes('Check agent one to Check agent two')) return 'it does not say who said it and who was shown it'; if (!rows[0].includes('The first thing that was passed')) return 'it does not show what was actually said'; if (!rows[1].includes('The second thing that was passed')) return 'it shows only the first one'; if (!document.getElementById('swarmExchangeSaid').textContent.includes('3 older ones dropped')) return 'a list cut short does not say that it was'; await refreshWhatTheySaidToEachOther(); if (document.getElementById('swarmExchangeSaid').textContent.includes('3 older ones dropped')) return 'the made-up answers were left on screen'; return 'the exchange shows who said what to whom, in their own words';",
+          "text": "the exchange shows who said what to whom, in their own words",
+          "timeout_ms": 45000,
+          "note": "Given two answers it draws both, names both ends, and says when it has been cut short. That the answers are really recorded during a run is held down in tests/test_the_board_of_agents.py, where no assistant is reached either"
+        },
+        {
+          "do": "run",
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; for (const card of [...document.querySelectorAll('.swarm-chat-card')]) { theButton(card, 'close').click(); } if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 0)) return 'the chats would not close'; return 'the chats close again';",
+          "text": "the chats close again",
+          "timeout_ms": 45000,
+          "note": "Tidy up after itself, so the next check starts from a board it knows"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
           "text": "the board this machine had is back",
-          "timeout_ms": 60000,
-          "note": "Leave this machine's board exactly as it was found",
-          "always": true
+          "timeout_ms": 45000,
+          "always": true,
+          "note": "Leave this machine's board exactly as it was found"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "a-box-on-the-board-can-be-moved-without-a-mouse",
+      "title": "A box can be reached and moved with the keyboard alone",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "swarm"
+      ],
+      "touches": [
+        "the board of agents"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"swarm\"]",
+          "note": "Open the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; await saveBoard({agents: [{id: 'agent-1', name: 'Check keyboard agent', at: {x: 200, y: 200}}], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 1)) return 'the board was not drawn'; document.querySelector('.swarm-box-pick').focus(); return document.activeElement === document.querySelector('.swarm-box-pick') ? 'a box on the board can be reached from the keyboard' : 'the box could not be focused';",
+          "text": "a box on the board can be reached from the keyboard",
+          "timeout_ms": 45000,
+          "note": "One box, in a known place, with the keyboard on it"
+        },
+        {
+          "do": "press",
+          "target": ".swarm-box-pick",
+          "key": "ArrowRight",
+          "timeout_ms": 20000,
+          "note": "Move it without a mouse, which dragging cannot do"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.agents[0].at.x === 220))) return 'the arrow key moved nothing'; return document.querySelector('.swarm-box').style.left === '220px' ? 'an arrow key moves a box and the new place is kept' : 'it was written down but the board still draws it where it was';",
+          "text": "an arrow key moves a box and the new place is kept",
+          "timeout_ms": 45000,
+          "note": "A box moved from the keyboard is written down like one that was dragged"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "text": "the board this machine had is back",
+          "timeout_ms": 45000,
+          "always": true,
+          "note": "Leave this machine's board exactly as it was found"
         }
       ],
       "expect": {
@@ -6389,16 +6507,16 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden && document.getElementById('swarmSaid').textContent)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; window.__doingWas = JSON.stringify((await request('/api/swarm/how-it-is-going')).doing); await saveBoard({agents: [{name: 'Check going agent'}], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 1)) return 'the board was not drawn'; return 'a board with nothing anybody could do on it';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; window.__doingWas = JSON.stringify((await request('/api/swarm/how-it-is-going')).doing); await saveBoard({agents: [{id: 'agent-1', name: 'Check going agent'}], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 1)) return 'the board was not drawn'; return 'a board with nothing anybody could do on it';",
           "text": "a board with nothing anybody could do on it",
-          "timeout_ms": 60000,
+          "timeout_ms": 45000,
           "note": "One agent, no project: nothing here can reach an assistant"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (document.getElementById('swarmStop').disabled !== true) return 'Stop was offered when nothing was going'; return 'Stop waits until there is something to stop';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (document.getElementById('swarmStop').disabled !== true) return 'Stop was offered when nothing was going'; return 'Stop waits until there is something to stop';",
           "text": "Stop waits until there is something to stop",
-          "timeout_ms": 60000,
+          "timeout_ms": 45000,
           "note": "Stop is off until a run is really going"
         },
         {
@@ -6408,25 +6526,25 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => document.getElementById('swarmDoingSaid').textContent.includes('nothing to set going'))) return 'pressing it said nothing about why it would not go'; const doing = JSON.stringify((await request('/api/swarm/how-it-is-going')).doing); return doing === window.__doingWas ? 'it says why it will not go, and nothing was set going' : 'it said why and set something going anyway';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => document.getElementById('swarmDoingSaid').textContent.includes('nothing to set going'))) return 'pressing it said nothing about why it would not go'; const doing = JSON.stringify((await request('/api/swarm/how-it-is-going')).doing); return doing === window.__doingWas ? 'it says why it will not go, and nothing was set going' : 'it said why and set something going anyway';",
           "text": "it says why it will not go, and nothing was set going",
-          "timeout_ms": 60000,
+          "timeout_ms": 45000,
           "note": "A board nobody could work on is turned down at the press, with the reason"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmStop').disabled = false; document.getElementById('swarmStop').click(); if (!await waitFor(() => document.getElementById('swarmDoingSaid').textContent.includes('Nothing is going'))) return 'Stop said nothing'; return 'Stop with nothing going says so rather than falling over';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmStop').disabled = false; document.getElementById('swarmStop').click(); if (!await waitFor(() => document.getElementById('swarmDoingSaid').textContent.includes('Nothing is going'))) return 'Stop said nothing'; return 'Stop with nothing going says so rather than falling over';",
           "text": "Stop with nothing going says so rather than falling over",
-          "timeout_ms": 60000,
+          "timeout_ms": 45000,
           "note": "Stop is pressed for real, with the guard taken off, to prove it is wired up"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 240; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(Object.assign({}, window.__boardWas, {version: (await request('/api/swarm')).board.version})); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
           "text": "the board this machine had is back",
-          "timeout_ms": 60000,
-          "note": "Leave this machine's board exactly as it was found",
-          "always": true
+          "timeout_ms": 45000,
+          "always": true,
+          "note": "Leave this machine's board exactly as it was found"
         }
       ],
       "expect": {
@@ -6435,8 +6553,8 @@
       }
     },
     {
-      "id": "a-box-on-the-board-can-be-moved-without-a-mouse",
-      "title": "A box can be reached and moved with the keyboard alone",
+      "id": "the-board-keeps-what-you-change-about-an-agent-and-a-project",
+      "title": "Changing an agent from its gear, and writing jobs down against a project",
       "kind": "browser",
       "tags": [
         "ui",
@@ -6446,7 +6564,7 @@
         "the board of agents"
       ],
       "url": "http://127.0.0.1:8765/",
-      "timeout_seconds": 180,
+      "timeout_seconds": 300,
       "steps": [
         {
           "do": "click",
@@ -6455,28 +6573,84 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 80; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden && document.getElementById('swarmSaid').textContent)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; await saveBoard({agents: [{name: 'Check keyboard agent', at: {x: 200, y: 200}}], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 1)) return 'the board was not drawn'; document.querySelector('.swarm-box').focus(); return document.activeElement === document.querySelector('.swarm-box') ? 'a box on the board can be reached from the keyboard' : 'the box could not be focused';",
-          "text": "a box on the board can be reached from the keyboard",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check settings agent'}], projects: [{id: 'project-1', path: here}], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 2)) return 'the board was not drawn'; theButton(document.querySelector('.swarm-box.agent'), 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'the gear opened nothing'; return 'one agent and one project to work on';",
+          "text": "one agent and one project to work on",
           "timeout_ms": 45000,
-          "note": "One box, in a known place, with the keyboard on it"
+          "note": "Remember this machine's board, then start from one known agent and project"
         },
         {
-          "do": "press",
-          "target": ".swarm-box",
-          "key": "ArrowRight",
-          "timeout_ms": 20000,
-          "note": "Move it without a mouse, which dragging cannot do"
+          "do": "choose",
+          "target": "#swarmAgentWho",
+          "value": "",
+          "note": "Choose nobody, which every machine can do and which really means something"
+        },
+        {
+          "do": "click",
+          "target": "#swarmAgentSave",
+          "note": "Save the agent as it stands"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 80; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.agents[0].at.x === 220))) return 'the arrow key moved nothing'; return document.querySelector('.swarm-box').style.left === '220px' ? 'an arrow key moves a box and the new place is kept' : 'it was written down but the board still draws it where it was';",
-          "text": "an arrow key moves a box and the new place is kept",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.agents[0].who === ''))) return 'choosing nobody was not written down'; if (!await waitFor(() => [...document.querySelectorAll('#swarmNotReady li')].some(one => one.textContent.includes('Check settings agent')))) return 'an agent pointed at nobody was not called out'; return 'an agent with nobody chosen is written down and called out';",
+          "text": "an agent with nobody chosen is written down and called out",
           "timeout_ms": 45000,
-          "note": "A box moved from the keyboard is written down like one that was dragged"
+          "note": "Choosing nobody is a real choice, and the board says so rather than guessing"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 80; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const list = document.getElementById('swarmAgentWho'); const real = [...list.options].map(one => one.value).filter(Boolean)[0]; if (!real) return 'nothing on this machine can be chosen by name'; list.value = real; document.getElementById('swarmAgentName').value = 'Check renamed agent'; document.getElementById('swarmAgentJob').value = 'Reads what changed'; document.getElementById('swarmAgentSave').click(); if (!await waitFor(async () => { const one = (await request('/api/swarm')).board.agents[0]; return one.name === 'Check renamed agent' && one.who === real && one.job === 'Reads what changed'; })) return 'saving the agent kept none of it'; return 'the name, the assistant and the job are all kept';",
+          "text": "the name, the assistant and the job are all kept",
+          "timeout_ms": 45000,
+          "note": "Save this agent keeps every part of it, not only the part on screen"
+        },
+        {
+          "do": "run",
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; theButton(document.querySelector('.swarm-box.project'), 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmProjectPanel').hidden)) return 'the gear on the project opened nothing'; document.getElementById('swarmTaskText').value = 'Make every check pass'; document.getElementById('swarmAddTask').click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.projects[0].tasks.length === 1))) return 'the job was not written down'; if (!await waitFor(() => document.getElementById('swarmTaskText').value === '')) return 'the job was kept but the box still holds it'; return 'a job is written down and the box is emptied for the next one';",
+          "text": "a job is written down and the box is emptied for the next one",
+          "timeout_ms": 45000,
+          "note": "Add this job writes it down, and leaves the box ready for another"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const drop = [...document.querySelectorAll('#swarmTasks button')].find(one => one.textContent.trim() === 'Remove'); if (!drop) return 'the job had no Remove button'; drop.click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.projects[0].tasks.length === 0))) return 'the job stayed'; return 'Remove takes one job off and leaves the rest alone';",
+          "text": "Remove takes one job off and leaves the rest alone",
+          "timeout_ms": 45000,
+          "note": "Every job has its own Remove, found by the word on it"
+        },
+        {
+          "do": "click",
+          "target": "#swarmProjectRemove",
+          "note": "Take the project off the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.projects.length === 0))) return 'the project stayed on the board'; return 'the project is off the board';",
+          "text": "the project is off the board",
+          "timeout_ms": 45000,
+          "note": "The same thing from the settings panel as from the row under the board"
+        },
+        {
+          "do": "click",
+          "target": "#swarmTidy",
+          "note": "Lay every box out in rows again"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => [...document.querySelectorAll('.swarm-box.agent')].every(one => one.style.top === '40px'))) return 'tidying moved nothing'; return 'tidying puts the agents back in a row';",
+          "text": "tidying puts the agents back in a row",
+          "timeout_ms": 45000,
+          "note": "Tidy the board is the way back from a board somebody has dragged about"
+        },
+        {
+          "do": "run",
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; theButton(document.querySelector('.swarm-box.agent'), 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'the gear opened nothing'; document.getElementById('swarmAgentRemove').click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.agents.length === 0))) return 'the agent stayed on the board'; return 'Remove this agent takes it off the board';",
+          "text": "Remove this agent takes it off the board",
+          "timeout_ms": 45000,
+          "note": "And the same for an agent, from its own settings"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
           "text": "the board this machine had is back",
           "timeout_ms": 45000,
           "always": true,

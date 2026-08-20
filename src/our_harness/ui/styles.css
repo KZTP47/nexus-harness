@@ -878,14 +878,14 @@ body.projects-always .project-sidebar { box-shadow: none; }
 }
 
 /* ---- the board of agents ----------------------------------------------- */
-/* Three columns: what you can add, the board itself, and what you picked.
+/* Three columns: setting them going, the board itself, and what you picked.
    The middle one is the only part that has to be wide, so the two sides are
    given a size and the board takes whatever is left. */
 .swarm-shell { display: grid; grid-template-columns: minmax(190px, 230px) 1fr minmax(280px, 340px);
   gap: 14px; align-items: start; }
-/* On a narrow window the panel for what you picked drops below the board rather than
-   squeezing it. Full width there, or it would sit in a thin column under the
-   buttons with the whole board beside it empty. */
+/* On a narrow window the panel for what you picked drops below the board rather
+   than squeezing it. Full width there, or it would sit in a thin column under
+   the buttons with the whole board beside it empty. */
 @media (max-width: 1200px) {
   .swarm-shell { grid-template-columns: minmax(190px, 230px) 1fr; }
   .swarm-panel { grid-column: 1 / -1; }
@@ -903,44 +903,101 @@ body.projects-always .project-sidebar { box-shadow: none; }
 
 /* The board. Boxes sit where they were dragged, so it is positioned and the
    lines are drawn on a sheet behind them at the same size. */
-.swarm-board { position: relative; min-height: 420px; height: 58vh; overflow: auto;
+.swarm-board { position: relative; min-height: 520px; height: 62vh; overflow: auto;
   border: 1px solid var(--line); border-radius: 10px; background:
     radial-gradient(circle at 1px 1px, rgba(167, 224, 239, .18) 1px, transparent 0) 0 0 / 26px 26px,
     rgba(7, 25, 34, .55); }
 .swarm-lines { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .swarm-line { stroke-width: 2.5; fill: none; }
-.swarm-line.works-on { stroke: var(--cyan); }
-.swarm-line.talks-to { stroke: var(--green); stroke-dasharray: 7 5; }
+/* Red for works on, green for a pair who may talk, grey and crossed out for a
+   pair who may not - the same colours the drawing used. */
+.swarm-line.works-on { stroke: #ff8e9c; }
+.swarm-line.talks-to { stroke: var(--green); }
+.swarm-line.talks-not { stroke: rgba(184, 208, 220, .5); stroke-dasharray: 7 6; }
+.swarm-line.crossed-out { stroke: #ff8e9c; stroke-width: 3.5; }
+.swarm-line.to-its-chat { stroke: rgba(99, 230, 255, .45); stroke-width: 1.6; stroke-dasharray: 3 4; }
 
-.swarm-box { position: absolute; width: 190px; min-height: 74px; padding: 9px 10px;
-  display: grid; gap: 3px; text-align: left; cursor: grab; touch-action: none;
+/* One box. The gear and the chat button sit on its corner, the way the drawing
+   has them, and the box itself is the thing you press to pick it. */
+.swarm-box { position: absolute; width: 200px; }
+.swarm-box-pick { width: 100%; min-height: 86px; padding: 9px 10px 9px 40px;
+  display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: start;
+  text-align: left; cursor: grab; touch-action: none;
   border: 1px solid var(--line); border-radius: 12px; background: var(--panel-strong);
   color: var(--ink); font: inherit; }
-.swarm-box:active { cursor: grabbing; }
-.swarm-box.picked { outline: 2px solid var(--focus); }
-.swarm-box.agent { border-left: 5px solid var(--cyan); }
-.swarm-box.agent.not-ready { border-left-color: var(--yellow); }
-.swarm-box.project { border-left: 5px solid var(--green); }
-.swarm-box.project.gone { border-left-color: var(--red); }
+.swarm-box-pick:active { cursor: grabbing; }
+.swarm-box.picked .swarm-box-pick { outline: 2px solid var(--focus); }
+.swarm-box.agent .swarm-box-pick { border-left: 5px solid var(--cyan); }
+.swarm-box.agent.not-ready .swarm-box-pick { border-left-color: var(--yellow); }
+.swarm-box.project .swarm-box-pick { border-left: 5px solid var(--green); }
+.swarm-box.project.gone .swarm-box-pick { border-left-color: var(--red); }
+.swarm-box-words { display: grid; gap: 2px; min-width: 0; }
 .swarm-box-name { font-weight: 800; font-size: .88rem; overflow-wrap: anywhere; }
-.swarm-box-who, .swarm-box-job { font-size: .76rem; color: var(--muted); overflow-wrap: anywhere; }
+.swarm-box-who, .swarm-box-job { font-size: .75rem; color: var(--muted); overflow-wrap: anywhere; }
+.swarm-box-tools { position: absolute; left: -6px; top: 6px; display: grid; gap: 5px; }
 .swarm-empty { position: absolute; inset: 0; display: grid; place-content: center;
   text-align: center; padding: 20px; color: var(--muted); font-size: .88rem; }
+
+/* A small button with a picture on it. The words are there for a screen reader
+   and for anybody who cannot tell what the picture means, shown under it. */
+.swarm-icon-button { display: grid; justify-items: center; gap: 1px; padding: 4px 5px;
+  min-width: 34px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel-strong); color: var(--ink); line-height: 1; cursor: pointer; }
+.swarm-icon-button:hover { background: rgba(99, 230, 255, .18); }
+.swarm-button-words { font-size: .52rem; text-transform: uppercase; letter-spacing: .02em;
+  max-width: 4.4em; text-align: center; color: var(--muted); }
+
+/* The gear that sits halfway along a line, with what the line means beside it. */
+.swarm-line-tools { position: absolute; transform: translate(-50%, -50%);
+  display: flex; align-items: center; gap: 5px; }
+.swarm-line-words { font-size: .68rem; font-weight: 700; white-space: nowrap;
+  padding: 1px 5px; border-radius: 6px; background: var(--panel-strong);
+  border: 1px solid var(--line); }
+.swarm-line-tools.on .swarm-line-words { color: var(--green); }
+.swarm-line-tools.off .swarm-line-words { color: var(--red); }
+
+/* A chat box on the board: big, because a chat squeezed into the edge of a page
+   is a chat nobody uses, and the answer is the part you came to read. */
+.swarm-chat-card { position: absolute; width: 380px; display: grid; gap: 7px;
+  padding: 10px; border: 1px solid var(--cyan); border-radius: 12px;
+  background: var(--panel-strong); box-shadow: 0 18px 40px rgba(0, 0, 0, .45); }
+.swarm-chat-bar { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+.swarm-chat-grip { flex: 1; text-align: left; padding: 3px 5px; font-size: .86rem;
+  border: 0; background: none; color: var(--ink); cursor: grab; touch-action: none; }
+.swarm-chat-grip:active { cursor: grabbing; }
+.swarm-chat-said { margin: 0; font-size: .76rem; }
+.swarm-chat-thread { max-height: 22vh; }
+.swarm-chat-form { display: grid; gap: 7px; }
+.swarm-chat-box { width: 100%; border-radius: 10px; padding: 9px 11px; font-size: .9rem;
+  resize: vertical; min-height: 7.5em; }
+.swarm-chat-count { font-size: .72rem; }
+
+/* Under the board: adding and removing, where the drawing puts them. */
+.swarm-tools { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* What they said to each other. */
+.swarm-exchange { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+.swarm-exchange > summary { cursor: pointer; font-weight: 700; font-size: .9rem; }
+.swarm-exchange-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px;
+  max-height: 34vh; overflow-y: auto; }
+.swarm-exchange-one { border-left: 4px solid var(--green); border-radius: 8px;
+  padding: 6px 9px; background: rgba(137, 247, 161, .07); }
+.swarm-exchange-one .hint { margin: 2px 0 0; font-size: .72rem; }
+.swarm-exchange-text { margin: 5px 0 0; font-size: .82rem; line-height: 1.45;
+  white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .swarm-panel label { display: block; font-size: .8rem; margin-top: 4px; }
 .swarm-panel input, .swarm-panel select, .swarm-panel textarea { width: 100%; border-radius: 8px;
   padding: 6px 8px; font-size: .85rem; }
+.swarm-panel .swarm-tick input { width: auto; }
 .swarm-set { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; margin: 4px 0 0; }
 .swarm-set legend { font-size: .8rem; font-weight: 700; padding: 0 4px; }
 .swarm-ticks { display: grid; gap: 5px; max-height: 22vh; overflow-y: auto; }
 .swarm-tick { display: flex; gap: 7px; align-items: baseline; font-size: .82rem; }
-.swarm-tick input { width: auto; }
 .swarm-tasks { list-style: none; margin: 0 0 7px; padding: 0; display: grid; gap: 5px; }
 .swarm-task { display: flex; gap: 7px; align-items: baseline; justify-content: space-between;
   font-size: .82rem; border-radius: 8px; padding: 4px 7px; background: rgba(255, 255, 255, .05); }
-.swarm-chat { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 9px; display: grid; gap: 8px; }
-.swarm-chat h3 { margin: 0; font-size: .9rem; }
-.swarm-chat .talk-thread { max-height: 26vh; }
+
 .swarm-doing { list-style: none; margin: 0; padding: 0; display: grid; gap: 5px;
   max-height: 24vh; overflow-y: auto; }
 .swarm-doing li { border-left: 4px solid var(--line); border-radius: 8px;

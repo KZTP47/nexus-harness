@@ -194,7 +194,7 @@
       <dl class="tab-guide">
         <dt>Checks</dt><dd>Your tests. Each one says what to do and what a good result looks like. Run them any time. That tab can also point at a thing on a page to name it for you, keep a picture of a page to compare later, and pack up the evidence when you need somebody's help.</dd>
         <dt>Workflow</dt><dd>For later. It draws the agents as boxes so you can change who does what, and in which order.</dd>
-        <dt>Agent board</dt><dd>One picture of every agent you have, the projects you want worked on, and the lines between them. Say which agents work on which projects, and which pairs may talk to each other. Each agent has its own conversation, so you can put something to one of them without the rest reading it.</dd>
+        <dt>Agent board</dt><dd>One picture of every agent you have, the projects you want worked on, and the lines between them. Every box has a gear for its settings and a button that opens its own chat on the board; every line has a gear that says whether those two may talk. Press Set them going and each agent is asked about the projects it is on, then shown what the others said.</dd>
         <dt>Memory</dt><dd>What the harness has read and remembered about this project, and which agent wrote each note.</dd>
         <dt>Prompt history</dt><dd>The instructions the harness gives its agents, and how they changed. Nothing changes without your review.</dd>
       </dl>
@@ -722,20 +722,13 @@
     <aside class="swarm-side" aria-labelledby="swarmSideTitle">
       <h2 id="swarmSideTitle">The board</h2>
       <p class="hint">Your agents, the projects they work on, and which of them may talk
-        to each other. Drag a box to move it. Nothing reaches an assistant until you
-        press Set them going, below.</p>
-      <div class="button-row">
-        <button id="swarmAddAgent" type="button">Add an agent</button>
-        <button id="swarmAddProject" type="button">Add a project</button>
-      </div>
-      <div class="button-row">
-        <button id="swarmTidy" type="button" title="Lay every box out in rows again">Tidy the board</button>
-        <button id="swarmRefresh" type="button">Look again</button>
-      </div>
+        to each other. Every box has its own settings and its own chat. Every line has a
+        gear. Nothing reaches an assistant until you press Set them going.</p>
+
       <h3 id="swarmSetGoingTitle">Set them going</h3>
       <p class="hint">Every agent is asked about the projects it is on, one at a
         time. Those allowed to talk are then shown what the others said and asked
-        again. What each one says lands in its own conversation.</p>
+        again. What each one says lands in its own chat.</p>
       <div class="button-row">
         <button id="swarmStart" class="primary" type="button">Set them going</button>
         <button id="swarmStop" type="button">Stop</button>
@@ -751,25 +744,48 @@
       <div class="swarm-bar">
         <div>
           <h2 id="swarmTitle">Who works on what</h2>
-          <p class="swarm-strapline">Pick a box to change it or to talk to it. Blue lines are
-            agents working on a project. Green lines are agents allowed to talk to each other.
-            Drag a box to move it, or pick it and use the arrow keys.</p>
+          <p class="swarm-strapline">Red lines are agents working on a project. Green lines are
+            agents who may talk to each other; a crossed grey line is a pair who may not.
+            Press the gear on a line to change it. Drag a box to move it, or pick it and use
+            the arrow keys.</p>
         </div>
       </div>
       <p id="swarmSaid" class="callout" role="status">Add an agent to get started.</p>
+
       <div id="swarmBoard" class="swarm-board" role="group" aria-label="The board">
         <svg id="swarmLines" class="swarm-lines" aria-hidden="true"></svg>
       </div>
+
+      <div class="swarm-tools">
+        <button id="swarmAddAgent" type="button">Add another agent</button>
+        <button id="swarmRemoveAgent" type="button">Remove an agent</button>
+        <button id="swarmAddProject" type="button">Add another project folder</button>
+        <button id="swarmRemoveProject" type="button">Remove a project folder</button>
+        <button id="swarmTidy" type="button" title="Lay every box out in rows again">Tidy the board</button>
+        <button id="swarmRefresh" type="button">Look again</button>
+      </div>
+
+      <details id="swarmExchange" class="swarm-exchange">
+        <summary id="swarmExchangeTitle">What they said to each other</summary>
+        <p class="hint">Every answer that was passed from one agent to another, because a
+          green line said they may talk. A pair with no line passes nothing.</p>
+        <div class="button-row">
+          <button id="swarmExchangeRefresh" type="button">Look again</button>
+          <span id="swarmExchangeSaid" class="hint" role="status"></span>
+        </div>
+        <ol id="swarmExchangeList" class="swarm-exchange-list"
+          aria-labelledby="swarmExchangeTitle"></ol>
+      </details>
     </section>
 
     <aside id="swarmPanel" class="swarm-panel" aria-labelledby="swarmPanelTitle">
       <h2 id="swarmPanelTitle">Nothing picked</h2>
-      <p id="swarmPanelHint" class="hint">Pick a box on the board to change it.</p>
+      <p id="swarmPanelHint" class="hint">Press the gear on a box or a line to change it.</p>
 
       <div id="swarmAgentPanel" hidden>
         <label for="swarmAgentName">Name</label>
         <input id="swarmAgentName" type="text" maxlength="60" placeholder="The reviewer">
-        <p class="field-help">Its name is also where its conversation is kept, so two agents
+        <p class="field-help">Its name is also where its chat is kept, so two agents
           cannot share one name.</p>
 
         <label for="swarmAgentWho">Which assistant it uses</label>
@@ -788,7 +804,8 @@
 
         <fieldset class="swarm-set">
           <legend>Agents it may talk to</legend>
-          <p class="field-help">Off means they never hear from each other.</p>
+          <p class="field-help">Off means they never hear from each other. The same
+            switch is on the gear of the line between them.</p>
           <div id="swarmTalksTo" class="swarm-ticks"></div>
         </fieldset>
 
@@ -796,26 +813,9 @@
           <button id="swarmAgentSave" class="primary" type="button">Save this agent</button>
           <button id="swarmAgentRemove" type="button">Remove this agent</button>
         </div>
-
-        <section class="swarm-chat" aria-labelledby="swarmChatTitle">
-          <div class="swarm-bar">
-            <h3 id="swarmChatTitle">Talk to this one</h3>
-            <button id="swarmStartAgain" type="button">Start again</button>
-          </div>
-          <p id="swarmChatSaid" class="callout" role="status"></p>
-          <ol id="swarmThread" class="talk-thread" aria-label="What has been said" aria-live="polite"></ol>
-          <form id="swarmChatForm" class="talk-form">
-            <label class="sr-only" for="swarmBox">What to say</label>
-            <textarea id="swarmBox" rows="3" maxlength="6000"
-              placeholder="What did you change and why?"></textarea>
-            <div class="button-row">
-              <button id="swarmSend" class="primary" type="submit">Send</button>
-              <span id="swarmCount" class="hint" aria-live="polite"></span>
-            </div>
-            <p class="field-help">Enter sends it. Shift and Enter starts a new line.
-              This conversation is this agent's own: no other agent reads it.</p>
-          </form>
-        </section>
+        <div class="button-row">
+          <button id="swarmOpenChat" type="button">Open its chat on the board</button>
+        </div>
       </div>
 
       <div id="swarmProjectPanel" hidden>
@@ -838,6 +838,18 @@
           <button id="swarmProjectRemove" type="button">Take off the board</button>
         </div>
         <p class="field-help">Taking a project off the board changes nothing in the folder.</p>
+      </div>
+
+      <div id="swarmLinePanel" hidden>
+        <p id="swarmLineWhat" class="callout"></p>
+        <label class="swarm-tick" for="swarmLineOn">
+          <input id="swarmLineOn" type="checkbox">
+          <span id="swarmLineOnWords">This line is on</span>
+        </label>
+        <p id="swarmLineWhy" class="field-help"></p>
+        <div class="button-row">
+          <button id="swarmLineRemove" type="button">Turn this line off</button>
+        </div>
       </div>
     </aside>
   </div>

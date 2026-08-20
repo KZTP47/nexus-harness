@@ -154,11 +154,18 @@ lines between them.
 Your team finds the assistants on this machine. Talk to them puts a question to
 one. The board is all of it at once, and across more than one project: which
 agents you have, which projects each one is on, and which pairs are allowed to
-talk to each other. Drag a box to move it, tick a box to join two things up.
+talk to each other.
+
+Everything is changed where it is. Every box has a gear for its settings and a
+button that opens that agent's own chat, as a big box on the board beside it.
+Every line has a gear too, saying **works on**, or **communicates? YES** or
+**NO** - and a pair who may not talk still gets a crossed-out line, so there is
+always a gear to press.
 
 Each agent keeps its own conversation, so two agents both using Claude never
 read each other's words - and a pair with no line between them never hears from
-each other at all.
+each other at all. **What they said to each other** lists every answer that was
+passed, so you can read what each of them was actually given.
 
 **Set them going** acts on it. Every agent is asked about the projects it is on,
 one at a time, on its own. Then the ones allowed to talk are shown what the

@@ -50,6 +50,15 @@ from .models import HarnessError
 MOST_AGENTS = 24
 MOST_PROJECTS = 12
 MOST_TASKS = 40
+# The most answers kept from one run of the board. Each agent on the second
+# round is shown one answer per agent it may hear from, so a project with
+# everybody talking to everybody writes down a great many copies of the same
+# words. Past this the oldest fall off the end, and it says so.
+MOST_NOTES = 200
+# The most letters of one answer kept in the exchange. The whole answer is in
+# that agent's own chat either way; this is the copy for reading who was shown
+# what.
+LONGEST_NOTE = 4000
 
 LONGEST_NAME = 60
 LONGEST_JOB = 300
@@ -118,6 +127,13 @@ class Board:
     # back with a save, so a window that has been looking at an old board is
     # told rather than quietly writing over somebody else's change.
     version: int = 0
+    # How many agents, and how many projects, have ever been put on this board.
+    # Each only ever goes up, and the next box is named from it, so a name is
+    # never handed out twice. One count per kind rather than one for the board,
+    # so a board written down by hand still gets agent-1 and project-1 and not
+    # agent-1 and project-3.
+    made_agents: int = 0
+    made_projects: int = 0
     agents: list[Agent] = field(default_factory=list)
     projects: list[OneProject] = field(default_factory=list)
     # Which agent works on which project.
@@ -131,6 +147,8 @@ class Board:
         return {
             "schema_version": 1,
             "version": self.version,
+            "made_agents": self.made_agents,
+            "made_projects": self.made_projects,
             "agents": [one.to_dict() for one in self.agents],
             "projects": [one.to_dict() for one in self.projects],
             "works_on": [dict(one) for one in self.works_on],
@@ -161,13 +179,36 @@ def where_it_lives() -> Path:
     return user_config_path().parent / "swarm.json"
 
 
-def _an_id(kind: str, taken: set[str]) -> str:
-    """A short name for one box, that nothing else on the board is using."""
+def _how_many_ever(kind: str, said: Any, held: Any, least: int = 0) -> int:
+    """How many boxes of one kind have ever been on this board.
 
-    number = 1
-    while f"{kind}-{number}" in taken:
-        number += 1
-    return f"{kind}-{number}"
+    Taken from what the board says, never less than the highest number already
+    in use - an older board says nothing about it, and its boxes still have to
+    keep the names they have - and never less than what the board on disk says,
+    which is what `least` is for.
+    """
+
+    most = max(_how_many_times(said), least)
+    for one in held if isinstance(held, list) else []:
+        if not isinstance(one, dict):
+            continue
+        found = re.fullmatch(rf"{kind}-(\d{{1,9}})", str(one.get("id") or ""))
+        if found:
+            most = max(most, int(found.group(1)))
+    return most
+
+
+def _the_next_name(kind: str, made: int) -> str:
+    """The name for one new box. Never one that has been used before.
+
+    Handed out by taking the lowest number nothing was using, removing an agent
+    and adding another gave the new one the name the old one had. The panel
+    holds which agent it is waiting on by that name, so an answer already on its
+    way back landed in the new agent's chat - one agent's words in another
+    agent's box.
+    """
+
+    return f"{kind}-{made}"
 
 
 def _somewhere_free(which: int, down: int) -> tuple[int, int]:
@@ -224,13 +265,25 @@ def _some_words(said: Any, longest: int) -> str:
     return " ".join(str(said or "").split())[:longest]
 
 
-def read_it(said: Any) -> Board:
-    """A board, from whatever was written down or sent."""
+def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
+    """A board, from whatever was written down or sent.
+
+    `made_agents` and `made_projects` are the counts the board on disk holds.
+    They are a floor, never a ceiling: a caller that replaces the whole roster
+    with fresh names sends no counts at all, and working them out from what was
+    sent alone would hand the next box a name a removed one used to have. An id
+    written down on purpose is still honoured - saying which one you mean is a
+    deliberate act, unlike leaving it out.
+    """
 
     if not isinstance(said, dict):
         raise SwarmError("A board is written as an object")
     agents: list[Agent] = []
     seen: set[str] = set()
+    made_agents = _how_many_ever(
+        "agent", said.get("made_agents"), said.get("agents"), made_agents)
+    made_projects = _how_many_ever(
+        "project", said.get("made_projects"), said.get("projects"), made_projects)
     for one in _a_list(said.get("agents"))[:MOST_AGENTS]:
         name = _some_words(one.get("name"), LONGEST_NAME)
         if not name:
@@ -246,7 +299,10 @@ def read_it(said: Any) -> Board:
                 "would share one conversation and each would read the other's "
                 "half of it."
             )
-        held_id = str(one.get("id") or "").strip() or _an_id("agent", seen)
+        held_id = str(one.get("id") or "").strip()
+        if not held_id or held_id in seen:
+            made_agents += 1
+            held_id = _the_next_name("agent", made_agents)
         seen.add(held_id)
         across, down = _somewhere_free(len(agents), 40)
         agents.append(Agent(
@@ -264,7 +320,10 @@ def read_it(said: Any) -> Board:
         where = Path(path)
         if str(where) in {held.path for held in projects}:
             raise SwarmError(f"{path} is on the board twice")
-        held_id = str(one.get("id") or "").strip() or _an_id("project", seen)
+        held_id = str(one.get("id") or "").strip()
+        if not held_id or held_id in seen:
+            made_projects += 1
+            held_id = _the_next_name("project", made_projects)
         seen.add(held_id)
         # Jobs are lines of text, not objects. Read with the helper for lists of
         # objects, every one of them was quietly dropped and the board said the
@@ -309,6 +368,8 @@ def read_it(said: Any) -> Board:
             talks_to.append(pair)
     return Board(
         version=_how_many_times(said.get("version")),
+        made_agents=made_agents,
+        made_projects=made_projects,
         agents=agents,
         projects=projects,
         works_on=works_on,
@@ -361,11 +422,11 @@ def save(said: Any) -> Board:
 
     from .safety import put_this_file_in_place
 
-    board = read_it(said)
     # Anybody adding a second caller: read the paragraph above about the lock.
     # Reading the version and writing the board are two steps, and without
     # something held around both of them the check below proves nothing.
     now = load()
+    board = read_it(said, now.made_agents, now.made_projects)
     asked = said.get("version") if isinstance(said, dict) else None
     if asked is not None and not _is_a_count(asked):
         # Refused rather than waved through. Taken as "said nothing", a version
@@ -563,6 +624,37 @@ AFTER_THE_OTHERS = "after reading the others"
 
 
 @dataclass
+class OneNote:
+    """One agent's answer, shown to another because a line said they may talk.
+
+    Kept so somebody watching can read what was passed. The second round showed
+    it to the agent and nothing else; the one thing you want to look at when two
+    assistants disagree is what each of them was actually given.
+    """
+
+    said_by: str
+    said_by_name: str
+    shown_to: str
+    shown_to_name: str
+    project: str
+    where: str
+    text: str
+    at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "said_by": self.said_by,
+            "said_by_name": self.said_by_name,
+            "shown_to": self.shown_to,
+            "shown_to_name": self.shown_to_name,
+            "project": self.project,
+            "where": self.where,
+            "text": self.text,
+            "at": self.at,
+        }
+
+
+@dataclass
 class OneTurn:
     """One agent, one project, one round of it."""
 
@@ -575,6 +667,9 @@ class OneTurn:
     said: str = ""
     why_not: str = ""
     milliseconds: int = 0
+    # The agents whose answers this one was shown before it was asked. Empty on
+    # the first round, because that is the point of the first round.
+    shown: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         # What the agent said is not in here. It is kept where somebody would
@@ -592,6 +687,7 @@ class OneTurn:
             "letters": len(self.said),
             "why_not": self.why_not,
             "milliseconds": self.milliseconds,
+            "shown": list(self.shown),
         }
 
 
@@ -603,12 +699,22 @@ class Doing:
     stopped: bool = False
     note: str = ""
     turns: list[OneTurn] = field(default_factory=list)
+    # Every answer that was passed from one agent to another, in the order it
+    # was passed. Asked for on its own, because these are whole answers and
+    # sending them with every "how is it going" would be a lot of words.
+    notes: list[OneNote] = field(default_factory=list)
+    # How many answers fell off the end of that list. Said rather than quietly
+    # dropped: a list that has been cut short and does not say so reads like the
+    # whole of it.
+    dropped: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "going": self.going,
             "stopped": self.stopped,
             "note": self.note,
+            "notes": len(self.notes),
+            "dropped": self.dropped,
             "turns": [one.to_dict() for one in self.turns],
             "done": len([one for one in self.turns if one.state == "done"]),
             "of": len(self.turns),
@@ -686,6 +792,26 @@ class Running:
     def how_it_is_going(self) -> dict[str, Any] | None:
         with self._lock:
             return self._doing.to_dict() if self._doing else None
+
+    def what_they_said(self) -> dict[str, Any]:
+        """What was passed from one agent to another, whole.
+
+        The run that is going, if one is, so it can be read as it happens; and
+        otherwise the last one, read back off the disk so it is still there
+        after the panel has been closed and opened again.
+        """
+
+        with self._lock:
+            doing = self._doing
+        if doing is not None:
+            return {
+                "note": doing.note,
+                "going": doing.going,
+                "dropped": doing.dropped,
+                "most": MOST_NOTES,
+                "notes": [one.to_dict() for one in doing.notes],
+            }
+        return dict(read_what_they_said(), going=False, most=MOST_NOTES)
 
     def stop(self) -> str:
         with self._lock:
@@ -818,6 +944,30 @@ class Running:
                     turn.why_not = "Nobody it may talk to had anything to show it."
                     continue
                 asking = what_the_others_said(agent, project, notes)
+                # Written down as it is passed, so somebody watching can read
+                # what each agent was actually given rather than take it on
+                # trust that the right thing was shown to the right one.
+                turn.shown = [name for name, _text in notes]
+                for (held, where), text in heard.items():
+                    if (where != turn.project or held == turn.agent
+                            or not may_they_talk(board, turn.agent, held)):
+                        continue
+                    doing.notes.append(OneNote(
+                        said_by=held,
+                        said_by_name=agents[held]["name"],
+                        shown_to=turn.agent,
+                        shown_to_name=agent["name"],
+                        project=turn.project,
+                        where=project["name"],
+                        text=text[:LONGEST_NOTE],
+                        at=_the_time_now(),
+                    ))
+                    # The oldest fall off the end rather than the newest never
+                    # being written: what somebody reads this for is what just
+                    # happened. How many were dropped is said out loud below.
+                    if len(doing.notes) > MOST_NOTES:
+                        doing.dropped += len(doing.notes) - MOST_NOTES
+                        del doing.notes[:len(doing.notes) - MOST_NOTES]
             turn.state = "asking"
             doing.note = f"Asking {turn.name} about {turn.where}, {turn.round}."
             started = time.monotonic()
@@ -833,6 +983,59 @@ class Running:
                 heard[(turn.agent, turn.project)] = turn.said
             turn.milliseconds = int((time.monotonic() - started) * 1000)
         doing.note = _how_it_went(doing)
+        _keep_what_they_said(doing)
+
+
+def _the_time_now() -> str:
+    from datetime import datetime
+
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def where_what_they_said_lives() -> Path:
+    """Where the last run's exchange is kept.
+
+    Beside the board, for the same reason: a run spans projects. Only the last
+    one is kept - it is there so somebody can read what happened after the
+    panel has been closed and opened again, not as a history of everything.
+    """
+
+    return where_it_lives().with_name("swarm-last-run.json")
+
+
+def _keep_what_they_said(doing: Doing) -> None:
+    from .safety import put_this_file_in_place
+
+    try:
+        where = where_what_they_said_lives()
+        where.parent.mkdir(parents=True, exist_ok=True)
+        put_this_file_in_place(where, json.dumps({
+            "schema_version": 1,
+            "note": doing.note,
+            "dropped": doing.dropped,
+            "notes": [one.to_dict() for one in doing.notes],
+        }, indent=2) + "\n")
+    except OSError:
+        # Not being able to write down what was said is not worth failing a run
+        # that has already happened for. It is still on screen either way.
+        pass
+
+
+def read_what_they_said() -> dict[str, Any]:
+    """The last run's exchange, read back off the disk."""
+
+    try:
+        said = json.loads(where_what_they_said_lives().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"note": "", "notes": [], "dropped": 0}
+    if not isinstance(said, dict):
+        return {"note": "", "notes": [], "dropped": 0}
+    held = said.get("notes")
+    return {
+        "note": str(said.get("note") or ""),
+        "dropped": _how_many_times(said.get("dropped")),
+        "notes": [one for one in held if isinstance(one, dict)] if isinstance(held, list) else [],
+    }
 
 
 def _how_it_went(doing: Doing) -> str:

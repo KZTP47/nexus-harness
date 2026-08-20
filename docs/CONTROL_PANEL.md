@@ -41,9 +41,10 @@ It cannot read files, run anything, or change anything. See
 ## The agent board
 
 One picture of every agent you have, the projects you want worked on, and the
-lines between them. Add an agent and give it a name and an assistant; add a
-project folder and write down the jobs wanted there; tick which projects each
-agent works on and which other agents it may talk to. Drag a box to move it.
+lines between them. Every box carries a gear for its settings and, on an agent, a
+button that opens that agent's own chat as a big box on the board. Every line
+carries a gear as well, saying what it means: **works on**, or **communicates?
+YES** or **NO**. Drag a box to move it, or pick it and use the arrow keys.
 
 Each agent keeps its own conversation, filed under its own name, so two agents
 both using Claude never read each other's words. A pair with no line between
@@ -53,7 +54,9 @@ said.
 **Set them going** acts on the board. Every agent is asked about the projects it
 is on, one at a time and on its own; then the ones allowed to talk are shown
 what the others said and asked again. While it is going the board cannot be
-changed, and the panel says why. See [AGENT_BOARD.md](AGENT_BOARD.md).
+changed, and the panel says why. **What they said to each other**, under the
+board, is every answer that was passed between agents.
+See [AGENT_BOARD.md](AGENT_BOARD.md).
 
 ## Look it up
 

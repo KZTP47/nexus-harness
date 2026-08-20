@@ -921,6 +921,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/swarm/how-it-is-going":
                 self._require_token()
                 self._json({"doing": self.server.swarm_runner.how_it_is_going()})
+            elif parsed.path == "/api/swarm/what-they-said":
+                # Asked for on its own rather than sent with every "how is it
+                # going": these are whole answers, and a page watching a run
+                # asks how it is going every second and a half.
+                self._require_token()
+                self._json(self.server.swarm_runner.what_they_said())
             elif parsed.path == "/api/telling":
                 self._require_token()
                 config = self.server.config
