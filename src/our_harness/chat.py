@@ -455,6 +455,13 @@ def ask_everyone(config: LoadedConfig, text: str) -> list[dict[str, Any]]:
         return list(pool.map(one_of_them, ready))
 
 
+# How much of a reason is worth reading. Four hundred letters was enough while a
+# reason was one line out of a screen of noise; it is not enough now that the
+# tools which will not answer are told to say what they know about themselves as
+# well, and cutting that off in the middle wastes the part that says what to do.
+LONGEST_REASON = 900
+
+
 def _in_plain_words(exc: Exception) -> str:
     """The sentence inside what a tool printed, rather than the whole of it.
 
@@ -475,8 +482,8 @@ def _in_plain_words(exc: Exception) -> str:
                 # upstream's own JSON one after the other, and this branch
                 # used to hand the page back with its tags on.
                 before = _without_markup(said[:start]).strip()
-                return f"{before} {inside.strip()}".strip()[:400]
-    return _without_markup(said)[:400]
+                return f"{before} {inside.strip()}".strip()[:LONGEST_REASON]
+    return _without_markup(said)[:LONGEST_REASON]
 
 
 # How many braces are tried before giving up looking for the JSON.

@@ -47,6 +47,11 @@ class CliRecipe:
     input_tokens_field: str = ""
     output_tokens_field: str = ""
     version_arguments: tuple[str, ...] = ("--version",)
+    # How to ask the tool about its own sign-in, and what to try when it is
+    # signed in and the request is still turned down. Only ever run on the way
+    # to an error message, so it costs nothing on a working machine.
+    signed_in_arguments: tuple[str, ...] = ()
+    when_it_is_refused: str = ""
     install_hint: str = ""
     verified: bool = False
 
@@ -119,6 +124,14 @@ CLAUDE_RECIPE = CliRecipe(
     error_message_field="result",
     input_tokens_field="usage.input_tokens",
     output_tokens_field="usage.output_tokens",
+    signed_in_arguments=("auth", "status"),
+    when_it_is_refused=(
+        "A tool that is signed in and still turned down usually has no token of "
+        "its own for work nobody is watching. Run: claude setup-token. If that "
+        "is not allowed either, whoever administers your organisation has to "
+        "turn Claude Code on for it - being able to use Claude in a window of "
+        "its own is not the same permission."
+    ),
     install_hint=(
         "Install Claude Code and sign in with your subscription, then run: claude --version"
     ),
@@ -295,9 +308,89 @@ class SubscriptionCLIProvider(Provider):
         if result.output_truncated:
             raise HarnessError(f"{recipe.label} printed more than the {output_limit} byte limit")
         if result.exit_code != 0:
-            detail = self._redactor.text((result.stderr or result.stdout).strip()[:4_000])
-            raise HarnessError(f"{recipe.label} stopped with code {result.exit_code}. {detail}")
+            # Some of these tools say plainly why they would not answer and then
+            # exit non-zero anyway. That sentence is the part somebody can read,
+            # so it is used instead of the exit code and the page of JSON that
+            # came with it - which is what was being shown, and told nobody
+            # anything.
+            said = self._why_it_would_not(recipe, result.stdout)
+            if said:
+                # The label is left off the front on purpose: whoever asked puts
+                # the name of the route in front of this, and "claude was asked
+                # and did not answer: the Claude command line would not answer"
+                # is the same thing said twice.
+                raise HarnessError(
+                    f"{said}{self._and_what_it_says_about_itself(recipe)}"
+                )
+            # No reason anywhere in what it printed, so the code it stopped with
+            # is the most anybody can be told.
+            detail = self._redactor.text(
+                (result.stderr or result.stdout).strip()[:LONGEST_REASON])
+            raise HarnessError(
+                f"{recipe.label} stopped with code {result.exit_code}. {detail}"
+                f"{self._and_what_it_says_about_itself(recipe)}"
+            )
         return self._read_answer(recipe, result.stdout, result.stderr, started)
+
+    def _why_it_would_not(self, recipe: CliRecipe, stdout: str) -> str:
+        """The reason the tool gave, if it gave one where the recipe says to look."""
+
+        if not (recipe.error_field and recipe.error_message_field):
+            return ""
+        try:
+            body = json.loads(stdout.strip() or "{}")
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(body, dict) or _dotted(body, recipe.error_field) is not True:
+            return ""
+        said = _dotted(body, recipe.error_message_field)
+        if not isinstance(said, str) or not said.strip():
+            return ""
+        return self._redactor.text(" ".join(said.split()))[:LONGEST_REASON]
+
+    def _and_what_it_says_about_itself(self, recipe: CliRecipe) -> str:
+        """What else the harness knows, tacked onto a refusal.
+
+        The tool's own sentence, read on its own, can say the wrong thing:
+        "your organization does not have access to Claude" is what somebody
+        sees while looking at a working Claude window. What the harness knows
+        and was not saying is that the tool is on this machine, that it
+        answered, and what it says about its own sign-in - which together move
+        the question from "have I got this at all" to "this one thing is not
+        allowed", and those take you to different places.
+
+        Anything that goes wrong while asking is left out rather than piled on
+        top: this is already an error message, and a second failure inside it
+        helps nobody.
+        """
+
+        said = ["", (
+            f"The {recipe.label} is on this machine and did answer, so nothing "
+            "failed to reach it - what turned this down was the service behind it."
+        )]
+        about = self._how_it_describes_its_sign_in(recipe)
+        if about:
+            said.append(f"It says of itself: {about}.")
+        if recipe.when_it_is_refused:
+            said.append(recipe.when_it_is_refused)
+        return " ".join(said)
+
+    def _how_it_describes_its_sign_in(self, recipe: CliRecipe) -> str:
+        if not recipe.signed_in_arguments:
+            return ""
+        try:
+            result = _run_bounded(
+                [*self._command(), *recipe.signed_in_arguments],
+                cwd=Path.cwd(),
+                stdin_text=None,
+                timeout_seconds=15.0,
+                max_output_bytes=32_000,
+            )
+        except HarnessError:
+            return ""
+        if result.timed_out or result.exit_code != 0:
+            return ""
+        return self._redactor.text(_in_a_few_words(result.stdout))[:300]
 
     def _read_answer(
         self, recipe: CliRecipe, stdout: str, stderr: str, started: float
@@ -322,7 +415,10 @@ class SubscriptionCLIProvider(Provider):
             # these caps what it holds; this one did not, so a tool that answers
             # with a page of detail put a page of detail in a sentence.
             why = self._redactor.text(str(said or "no reason given"))[:LONGEST_REASON]
-            raise HarnessError(f"{recipe.label} refused the request: {why}")
+            raise HarnessError(
+                f"{recipe.label} refused the request: {why}"
+                f"{self._and_what_it_says_about_itself(recipe)}"
+            )
         text = _dotted(body, recipe.text_field)
         if not isinstance(text, str) or not text.strip():
             raise HarnessError(
@@ -335,6 +431,31 @@ class SubscriptionCLIProvider(Provider):
             output_tokens=_whole(_dotted(body, recipe.output_tokens_field)),
             raw={"tool": recipe.id, "price_status": UNPRICED, "latency_ms": latency},
         )
+
+
+def _in_a_few_words(said: str) -> str:
+    """What a tool printed about itself, as one line somebody can read.
+
+    These tools answer with JSON, and the whole of it in the middle of a
+    sentence is worse than none of it. The few fields that say who is signed in
+    are picked out by name; anything else falls back to the first line.
+    """
+
+    try:
+        held = json.loads(said.strip() or "{}")
+    except json.JSONDecodeError:
+        held = None
+    if not isinstance(held, dict):
+        return " ".join(said.split())[:300]
+    words = []
+    for name in ("loggedIn", "email", "orgName", "subscriptionType", "authMethod",
+                 "account", "user", "plan", "status"):
+        found = held.get(name)
+        if isinstance(found, bool):
+            words.append("signed in" if found else "not signed in")
+        elif isinstance(found, (str, int)) and str(found).strip():
+            words.append(str(found).strip())
+    return ", ".join(words) or " ".join(said.split())[:300]
 
 
 def _whole(value: Any) -> int | None:

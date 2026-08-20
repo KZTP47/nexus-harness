@@ -958,6 +958,44 @@ class WhatTheySaidToEachOther(BoardTestCase):
         self.assertEqual(len(said["notes"]), 2)
 
 
+class TheTabItself(unittest.TestCase):
+    """Where the tab sits in the row, what it is called, and its colour.
+
+    All three were asked for out loud, so all three are held down. A tab that
+    quietly goes back to being the seventh grey one in a row of thirteen is a
+    tab nobody finds again.
+    """
+
+    def setUp(self) -> None:
+        here = Path(__file__).resolve().parents[1] / "src" / "our_harness" / "ui"
+        self.markup = (here / "index.html").read_text(encoding="utf-8")
+        self.styles = (here / "styles.css").read_text(encoding="utf-8")
+
+    def the_tabs(self) -> list[str]:
+        import re
+
+        row = self.markup[self.markup.index('<nav class="view-nav"'):]
+        row = row[:row.index("</nav>")]
+        return re.findall(r'data-view="([A-Za-z]+)"', row)
+
+    def test_it_is_called_what_it_was_asked_to_be_called(self) -> None:
+        self.assertIn("AI Agent Swarm orchestrator", self.markup)
+        self.assertNotIn(">Agent board<", self.markup)
+
+    def test_it_sits_between_start_here_and_checks(self) -> None:
+        tabs = self.the_tabs()
+        self.assertEqual(tabs[:3], ["start", "swarm", "checks"], tabs)
+
+    def test_it_is_the_yellow_one(self) -> None:
+        self.assertIn('class="the-swarm"', self.markup)
+        self.assertIn(".view-nav button.the-swarm", self.styles)
+        # Yellow whether or not it is the tab you are on. Only while it was the
+        # open one, it would be grey every time somebody looked away from it.
+        held = self.styles[self.styles.index(".view-nav button.the-swarm"):]
+        end = held.find(chr(10) + chr(10))
+        self.assertIn("var(--yellow)", held if end < 0 else held[:end])
+
+
 class WhatThePanelIsTold(BoardTestCase):
     def setUp(self) -> None:
         super().setUp()

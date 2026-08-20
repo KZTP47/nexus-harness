@@ -163,7 +163,7 @@ which is never committed.
 
 See [TALK_TO_THEM.md](docs/TALK_TO_THEM.md).
 
-## The agent board
+## The AI Agent Swarm orchestrator
 
 One picture of every agent you have, the projects you want worked on, and the
 lines between them.

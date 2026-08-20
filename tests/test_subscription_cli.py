@@ -76,6 +76,30 @@ sys.stdin.read()
 sys.stdout.write("```json\\n{\\"ok\\": true}\\n```\\n")
 '''
 
+# Says why it will not answer, in the place the recipe says to look, and then
+# stops with a code anyway. Both real tools do this, and reading the code
+# instead of the sentence is what put a page of JSON in front of somebody.
+REFUSES_AND_STOPS = '''
+import json, sys
+arguments = sys.argv[1:]
+if arguments[:2] == ["auth", "status"]:
+    print(json.dumps({
+        "loggedIn": True, "email": "somebody@example.test",
+        "orgName": "A Company", "subscriptionType": "pro",
+    }))
+    raise SystemExit(0)
+if "--version" in arguments:
+    print("9.9.9 (Fake Claude)")
+    raise SystemExit(0)
+sys.stdin.read()
+print(json.dumps({
+    "type": "result", "subtype": "success", "is_error": True,
+    "result": "Your organization does not have access to Claude.",
+    "usage": {"input_tokens": 0, "output_tokens": 0},
+}))
+raise SystemExit(1)
+'''
+
 BROKEN_TOOL = '''
 import sys
 if "--version" in sys.argv[1:]:
@@ -209,6 +233,45 @@ class RunningTests(unittest.TestCase):
         tool = fake_tool(self.folder, "plaintool", PLAIN_TEXT_TOOL)
         answer = self.provider("copilot-cli", tool).complete(self.request())
         self.assertEqual(answer.text, '{"ok": true}', "a fenced block should be unwrapped")
+
+    def test_a_tool_that_says_why_and_stops_anyway_is_read_for_the_reason(self) -> None:
+        """Both real tools do this: the sentence is in the answer and the exit
+        code is not zero. Read for the code instead, what somebody saw was
+        "stopped with code 1" and a page of JSON, which told them nothing."""
+
+        tool = fake_tool(self.folder, "faketool", REFUSES_AND_STOPS)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("does not have access", message)
+        self.assertNotIn("stopped with code", message)
+        self.assertNotIn("is_error", message, "the raw answer should not be in a sentence")
+
+    def test_a_refusal_says_what_the_harness_knows_as_well(self) -> None:
+        """The tool's own sentence, read on its own, says the wrong thing: it
+        tells somebody looking at a working Claude window that they have no
+        Claude. What the harness knows and was not saying is that the tool is
+        here, that it answered, and what it says about its own sign-in."""
+
+        tool = fake_tool(self.folder, "faketool", REFUSES_AND_STOPS)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("claude-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("is on this machine and did answer", message)
+        self.assertIn("A Company", message, "it should say what the tool says of itself")
+        self.assertIn("signed in", message)
+        self.assertIn("setup-token", message, "and the one thing to try")
+
+    def test_a_tool_that_cannot_be_asked_about_itself_still_says_the_rest(self) -> None:
+        """Anything that goes wrong while asking is left out rather than piled
+        on top. This is already an error message."""
+
+        tool = fake_tool(self.folder, "brokentool", BROKEN_TOOL)
+        with self.assertRaises(HarnessError) as caught:
+            self.provider("copilot-cli", tool).complete(self.request())
+        message = str(caught.exception)
+        self.assertIn("stopped with code 3", message)
+        self.assertIn("is on this machine and did answer", message)
 
     def test_a_tool_that_fails_reports_what_it_said(self) -> None:
         tool = fake_tool(self.folder, "brokentool", BROKEN_TOOL)

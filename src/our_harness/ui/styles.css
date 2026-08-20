@@ -65,6 +65,12 @@ button.danger { border-color: var(--red); color: #ffe9ed; }
 .view-nav { position: relative; z-index: 2; display: flex; gap: 6px; padding: 8px 12px 0; background: rgba(4,22,30,.72); }
 .view-nav button { min-height: 36px; padding: 6px 14px; }
 .view-nav button[aria-pressed="true"] { color: #03202b; background: var(--cyan); font-weight: 800; }
+/* The swarm board is yellow, so it can be found without reading the row. It
+   keeps that colour whether or not it is the tab you are on: the point of it is
+   being the one you can pick out. */
+.view-nav button.the-swarm { border-color: var(--yellow); color: var(--yellow); font-weight: 800; }
+.view-nav button.the-swarm:hover { background: rgba(255, 216, 106, .16); }
+.view-nav button.the-swarm[aria-pressed="true"] { color: #241c00; background: var(--yellow); }
 .app-shell { position: relative; z-index: 1; display: grid; grid-template-columns: 250px minmax(500px, 1fr) 290px; gap: 12px; padding: 12px; min-height: calc(100vh - 82px); }
 .glass { border: 1px solid var(--line); border-radius: 18px; background: linear-gradient(145deg, rgba(255,255,255,.09), rgba(255,255,255,.025)), var(--panel); box-shadow: inset 0 1px rgba(255,255,255,.2), 0 20px 40px rgba(0,0,0,.25); backdrop-filter: blur(18px); }
 .palette, .inspector { align-self: start; position: sticky; top: 12px; max-height: calc(100vh - 106px); overflow: auto; padding: 16px; }

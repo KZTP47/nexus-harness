@@ -1,4 +1,4 @@
-# The agent board
+# The AI Agent Swarm orchestrator
 
 One picture of every agent you have, the projects you want worked on, and the
 lines between them.
@@ -155,7 +155,8 @@ assistant is asked.
 The board needs nothing set up. Clone the project, say the settings file is
 yours (`python scripts/harness.py trust` - the harness asks for this the first
 time, because a settings file can name commands to run), start the panel with
-`python scripts/harness.py ui`, and the tab is there.
+`python scripts/harness.py ui`, and the tab is there - the yellow one, second
+from the left.
 
 It will say what is not ready, which on a machine with nothing set up is: no
 assistant is set up to be used by name. Open **Your team** and press **Set them
