@@ -924,6 +924,30 @@
         <button id="teamLookAgain" type="button">Look again</button>
         <button id="teamSetUp" class="primary" type="button">I don't care, just set them up for me</button>
       </div>
+      <h3>Microsoft 365 Copilot</h3>
+      <p class="hint">This one has no command line, so it signs in here instead.
+        You will get a short code to paste into a browser, once. It needs three
+        things nobody on this machine can give it: a Microsoft 365 Copilot
+        add-on seat, an app registered in your organisation, and an
+        administrator who has approved the seven read-only permissions it asks
+        for.</p>
+      <label for="microsoftApp">Application (client) ID of the registered app</label>
+      <input id="microsoftApp" type="text" autocomplete="off"
+        placeholder="00000000-0000-0000-0000-000000000000">
+      <label for="microsoftOrganisation">Directory (tenant) ID, if yours needs one</label>
+      <input id="microsoftOrganisation" type="text" autocomplete="off"
+        placeholder="leave empty for any work account">
+      <div class="button-row">
+        <button id="microsoftSignIn" type="button">Sign in to Microsoft</button>
+        <button id="microsoftSignOut" type="button">Forget this sign-in</button>
+      </div>
+      <div id="microsoftCodeBox" hidden>
+        <p>Your code: <strong id="microsoftCode" class="microsoft-code"></strong></p>
+        <p>Paste it at <a id="microsoftWhere" href="https://microsoft.com/devicelogin"
+          target="_blank" rel="noopener noreferrer">the Microsoft sign-in page</a></p>
+      </div>
+      <p id="microsoftSays" class="hint" role="status" aria-live="polite"></p>
+
       <h3 id="teamSavedTitle">Saved teams</h3>
       <ul id="teamSaved" class="team-saved" aria-labelledby="teamSavedTitle"></ul>
       <h3 id="teamAddTitle">Add somebody</h3>

@@ -6736,6 +6736,110 @@
         "max_console_errors": 0,
         "max_page_errors": 0
       }
+    },
+    {
+      "id": "signing-in-to-microsoft-says-what-is-happening",
+      "title": "Signing in to Microsoft: the code, and what to do when it will not",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "team",
+        "microsoft"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"team\"]",
+          "note": "Open Your team"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => !document.getElementById('teamView').hidden)) return 'Your team never opened'; const there = ['microsoftApp', 'microsoftOrganisation', 'microsoftSignIn', 'microsoftSignOut'].filter(one => !document.getElementById(one)); return there.length ? 'missing: ' + there.join(', ') : 'there is a way to sign in to Microsoft';",
+          "text": "there is a way to sign in to Microsoft",
+          "timeout_ms": 45000,
+          "note": "Microsoft 365 Copilot has no command line, so this is the only way in"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('microsoftApp').value = ''; document.getElementById('microsoftSignIn').click(); if (!await waitFor(() => (document.getElementById('microsoftSays').textContent || '').includes('Application'))) return 'pressing it with nothing filled in said nothing'; return 'with nothing filled in it says what is missing';",
+          "text": "with nothing filled in it says what is missing",
+          "timeout_ms": 45000,
+          "note": "A button that goes quiet reads as an app that is broken"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const real = window.request; window.request = async (where, how) => where.startsWith('/api/microsoft/sign-in') && !where.includes('how-it-is-going') ? {code: 'ABCD-EFGH', where: 'https://microsoft.com/devicelogin', ask_again_after: 2} : real(where, how); document.getElementById('microsoftApp').value = 'a-registered-app'; document.getElementById('microsoftSignIn').click(); const showed = await waitFor(() => !document.getElementById('microsoftCodeBox').hidden); window.request = real; if (!showed) return 'the code was never shown'; const code = document.getElementById('microsoftCode').textContent; const where = document.getElementById('microsoftWhere').textContent; return code === 'ABCD-EFGH' && where.includes('devicelogin') ? 'the code and where to paste it are both shown' : 'it showed ' + code + ' at ' + where;",
+          "text": "the code and where to paste it are both shown",
+          "timeout_ms": 45000,
+          "note": "A code with no address to paste it into is half an instruction"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const real = window.request; window.request = async (where, how) => where.includes('how-it-is-going') ? {done: false, waiting: false, why: 'Microsoft does not know an app numbered that one.'} : real(where, how); const said = await waitFor(() => (document.getElementById('microsoftSays').textContent || '').includes('does not know an app')); window.request = real; if (!said) return 'a refusal from Microsoft never reached the screen'; return document.getElementById('microsoftCodeBox').hidden ? 'a refusal from Microsoft is put in front of somebody' : 'it still shows a code that will never work now';",
+          "text": "a refusal from Microsoft is put in front of somebody",
+          "timeout_ms": 45000,
+          "note": "The whole point: being told why, rather than nothing happening"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('microsoftSignOut').click(); if (!await waitFor(() => (document.getElementById('microsoftSays').textContent || '').includes('forgotten'))) return 'forgetting the sign-in said nothing'; return 'a sign-in can be forgotten again';",
+          "text": "a sign-in can be forgotten again",
+          "timeout_ms": 45000,
+          "note": "A machine somebody hands on should not keep their sign-in"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "a-box-says-what-went-wrong-the-last-time-it-was-asked",
+      "title": "What went wrong last time is on the box, and does not stop it",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "swarm"
+      ],
+      "touches": [
+        "the board of agents"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"swarm\"]",
+          "note": "Open the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; swarmSaid = Object.assign({}, swarmSaid, {board: Object.assign({}, swarmSaid.board, {agents: [{id: 'agent-1', name: 'Check agent', who: 'claude', ready: true, why_not: '', at: {x: 40, y: 40}, trouble_last_time: 'The last time this was asked something, it would not answer: your organisation has Claude Code turned off.'}], projects: [], works_on: [], talks_to: []})}); renderSwarmBoard(); const said = document.querySelector('.swarm-box-trouble'); if (!said) return 'the box says nothing about last time'; return said.textContent.includes('turned off') ? 'the box says what went wrong the last time' : 'it says ' + said.textContent;",
+          "text": "the box says what went wrong the last time",
+          "timeout_ms": 45000,
+          "note": "Read before somebody types, which is the whole reason it is kept"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const box = document.querySelector('.swarm-box.agent'); return box && !box.classList.contains('not-ready') ? 'and it is still ready to be tried' : 'a warning about last time turned into a box nobody can use';",
+          "text": "and it is still ready to be tried",
+          "timeout_ms": 45000,
+          "note": "A warning is not a gate: hung on ready, one bad minute stopped runs for a day"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; return 'the board this machine had is back';",
+          "text": "the board this machine had is back",
+          "timeout_ms": 45000,
+          "note": "Leave this machine's board exactly as it was found"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
     }
   ]
 }

@@ -3716,6 +3716,7 @@ function bindEvents() {
   $("timerCopyLine").addEventListener("click", copyTheMachineLine);
   $("talkRefresh").addEventListener("click", () => refreshTalk(talkOpen));
   wireUpTheSwarmBoard();
+  wireUpMicrosoft();
   $("talkStartAgain").addEventListener("click", startTalkingAgain);
   $("talkAskEveryone").addEventListener("click", askEveryone);
   $("talkForm").addEventListener("submit", (event) => { event.preventDefault(); sendWhatIsTyped(); });
@@ -5654,6 +5655,12 @@ function oneSwarmBox(kind, one) {
     words.append(make("span", "swarm-box-who",
       one.who ? (one.ready ? one.who : `${one.who} - not ready`) : "no assistant chosen"));
     if (one.job) words.append(make("span", "swarm-box-job", one.job));
+    // What went wrong the last time this one's assistant was asked anything.
+    // It is still ready and it will still be tried; this is here so somebody
+    // reads it before typing a message rather than after sending one.
+    if (one.trouble_last_time) {
+      words.append(make("span", "swarm-box-trouble", one.trouble_last_time));
+    }
   } else {
     words.append(make("span", "swarm-box-who",
       one.is_there ? one.path : `${one.path} - no such folder`));
@@ -6878,6 +6885,100 @@ function showEveryPairAgain() {
   swarmOnlyThisPair = null;
   renderWhatTheySaidToEachOther(swarmWhatTheySaid);
 }
+
+// ---- signing in to Microsoft ----------------------------------------------
+//
+// Microsoft 365 Copilot has no command line, so there is nothing to hand the
+// signing in off to, and Microsoft allows no key. What is left is a short code
+// somebody pastes into a browser. The panel asks Microsoft for one, shows it,
+// and then asks every few seconds whether it has been used yet. Nothing secret
+// passes through this screen at any point.
+
+let microsoftWaiting = null;
+
+function sayAboutMicrosoft(words) {
+  const where = $("microsoftSays");
+  if (where) where.textContent = words;
+}
+
+async function signInToMicrosoft() {
+  const app = ($("microsoftApp").value || "").trim();
+  if (!app) {
+    sayAboutMicrosoft("Put in the Application (client) ID of the registered app first.");
+    $("microsoftApp").focus();
+    return;
+  }
+  stopWaitingOnMicrosoft();
+  sayAboutMicrosoft("Asking Microsoft for a code...");
+  try {
+    const said = await request("/api/microsoft/sign-in", {
+      method: "POST",
+      body: JSON.stringify({app, organisation: ($("microsoftOrganisation").value || "").trim()}),
+    });
+    showTheMicrosoftCode(said);
+  } catch (trouble) {
+    sayAboutMicrosoft(String(trouble.message || trouble));
+  }
+}
+
+function showTheMicrosoftCode(said) {
+  $("microsoftCode").textContent = said.code;
+  $("microsoftWhere").textContent = said.where;
+  $("microsoftWhere").href = said.where;
+  $("microsoftCodeBox").hidden = false;
+  sayAboutMicrosoft(
+    "Open the address below, paste the code, and sign in with your work account. "
+    + "This window will notice when you are done.");
+  // Asked no faster than Microsoft said to ask. Faster and they start refusing.
+  const every = Math.max(2, Number(said.ask_again_after) || 5) * 1000;
+  microsoftWaiting = setInterval(askIfMicrosoftIsDoneYet, every);
+}
+
+function stopWaitingOnMicrosoft() {
+  if (microsoftWaiting) clearInterval(microsoftWaiting);
+  microsoftWaiting = null;
+}
+
+async function askIfMicrosoftIsDoneYet() {
+  try {
+    // A body even though there is nothing to say in it: the panel will not
+    // read a request that has none.
+    const said = await request(
+      "/api/microsoft/sign-in/how-it-is-going", {method: "POST", body: "{}"});
+    if (said.waiting) return;
+    stopWaitingOnMicrosoft();
+    $("microsoftCodeBox").hidden = true;
+    if (said.done) {
+      sayAboutMicrosoft("Signed in to Microsoft. This machine will stay signed in.");
+      refreshTeam();
+    } else {
+      sayAboutMicrosoft(said.why);
+    }
+  } catch (trouble) {
+    stopWaitingOnMicrosoft();
+    $("microsoftCodeBox").hidden = true;
+    sayAboutMicrosoft(String(trouble.message || trouble));
+  }
+}
+
+async function signOutOfMicrosoft() {
+  stopWaitingOnMicrosoft();
+  $("microsoftCodeBox").hidden = true;
+  try {
+    await request("/api/microsoft/sign-out", {method: "POST", body: "{}"});
+    sayAboutMicrosoft("The Microsoft sign-in on this machine has been forgotten.");
+  } catch (trouble) {
+    sayAboutMicrosoft(String(trouble.message || trouble));
+  }
+}
+
+function wireUpMicrosoft() {
+  const inIt = $("microsoftSignIn");
+  if (!inIt) return;
+  inIt.addEventListener("click", signInToMicrosoft);
+  $("microsoftSignOut").addEventListener("click", signOutOfMicrosoft);
+}
+
 
 function wireUpTheSwarmBoard() {
   $("swarmAddAgent").addEventListener("click", addAnAgentToTheBoard);

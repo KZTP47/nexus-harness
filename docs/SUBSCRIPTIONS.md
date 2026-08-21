@@ -168,5 +168,9 @@ The `copilot-cli` route drives **GitHub Copilot's** command line tool, which you
 install with `npm install -g @github/copilot`.
 
 **Microsoft 365 Copilot is a different product** and has no command line, so
-there is nothing on the machine for the harness to drive. A seat for it does not
-make this route work, and no amount of setting up will find it.
+this route will never find it however long you wait.
+
+It can still be reached, though - over the web rather than by running anything,
+and with a sign-in rather than a key, because Microsoft allows nothing else.
+That is the `m365-copilot` route, and it needs three things your organisation
+has to give it. See [Microsoft 365 Copilot](MICROSOFT_365_COPILOT.md).

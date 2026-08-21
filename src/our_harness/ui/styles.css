@@ -1030,3 +1030,22 @@ body.projects-always .project-sidebar { box-shadow: none; }
 .swarm-chat-who { font-size: .78rem; font-weight: 700; }
 .swarm-chat-last { font-size: .7rem; color: var(--muted); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
+
+/* What went wrong the last time an assistant was asked anything. Beside the
+   name, not in place of it: the box is still ready and will still be tried. */
+.swarm-box-trouble {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--warn, #d08b1f);
+  max-width: 22rem;
+}
+
+/* The code somebody pastes into Microsoft. Big enough to read off a screen and
+   type into a phone, since that is where half of these get done. */
+.microsoft-code {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 1.4rem;
+  letter-spacing: 0.18em;
+}
