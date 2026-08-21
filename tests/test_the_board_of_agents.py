@@ -1021,6 +1021,92 @@ class WhatEachChatHoldsTests(BoardTestCase):
         agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
         self.assertLessEqual(len(agent["last_said"]), 120)
 
+    def test_a_chat_that_has_not_changed_is_not_read_again(self) -> None:
+        """The board is drawn on every look and every save - a box dragged a few
+        pixels saves the board - and each of those reads every agent's chat. A
+        chat only changes when somebody types in it, which almost never lines up
+        with any of that, so reading it again would nearly always come back with
+        what it came back with last time."""
+
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        kept.write_text(json.dumps([
+            {"who": "them", "text": "The first answer", "at": "2026-01-01T00:00:00"},
+        ]), encoding="utf-8")
+
+        swarm.how_it_stands(self.config)
+        reads = []
+        real = chat.read_it
+        with mock.patch.object(
+                chat, "read_it",
+                lambda *a, **k: reads.append(1) or real(*a, **k)):
+            agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual(reads, [])
+        self.assertEqual(agent["last_said"], "The first answer")
+
+    def test_what_is_kept_about_chats_cannot_grow_without_end(self) -> None:
+        """This is remembered between one board and the next, and the panel runs
+        for as long as somebody leaves it open. Every agent that has ever been on
+        a board leaves an entry, so without a lid on it the pile only grows."""
+
+        swarm._what_was_said.clear()
+        kept = chat.where_it_is_kept(self.config, "claude", "One of many")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        for number in range(swarm._MOST_KEPT_ABOUT_CHATS + 25):
+            named = kept.with_name(f"agent-{number}.json")
+            named.write_text(json.dumps(
+                [{"who": "them", "text": "hello", "at": ""}]), encoding="utf-8")
+            with mock.patch.object(
+                    chat, "where_it_is_kept", lambda *a, **k: named):
+                swarm._how_much_was_said_to(self.config, "claude", f"agent-{number}")
+        self.assertLessEqual(
+            len(swarm._what_was_said), swarm._MOST_KEPT_ABOUT_CHATS)
+
+    def test_a_chat_that_has_changed_is_read_again(self) -> None:
+        """Which is the whole point of keeping it: it has to still be right."""
+
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        kept.write_text(json.dumps([
+            {"who": "them", "text": "The first answer", "at": "2026-01-01T00:00:00"},
+        ]), encoding="utf-8")
+        swarm.how_it_stands(self.config)
+
+        kept.write_text(json.dumps([
+            {"who": "them", "text": "The first answer", "at": "2026-01-01T00:00:00"},
+            {"who": "them", "text": "And the next one", "at": "2026-01-01T00:00:20"},
+        ]), encoding="utf-8")
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual((agent["said"], agent["last_said"]), (2, "And the next one"))
+
+    def test_a_conversation_left_behind_is_not_read_back_out(self) -> None:
+        """An agent with nobody to ask is not read, even when something is there.
+
+        A chat is kept under the agent's name, and a name outlives what it was
+        given to: unset an assistant, or give a new agent the name an old one
+        had, and yesterday's conversation is still sitting at that name. Reading
+        it back out would put a line somebody said to a different agent under
+        this one, on the board, for anybody looking at the screen.
+        """
+
+        kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        kept.write_text(json.dumps([
+            {"who": "them", "text": "LEFT BEHIND", "at": "2026-01-01T00:00:00"},
+        ]), encoding="utf-8")
+
+        self.a_board(agents=[{"name": "The reviewer"}])
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual((agent["said"], agent["last_said"]), (0, ""))
+
+        # And with somebody to ask, that same conversation is read. So the part
+        # above is about the agent having nobody, and not about an empty folder.
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual((agent["said"], agent["last_said"]), (1, "LEFT BEHIND"))
+
     def test_an_agent_with_no_assistant_is_not_asked_for_a_conversation(self) -> None:
         """It cannot have one, and reading a file for it says a name that is not
         filed anywhere."""

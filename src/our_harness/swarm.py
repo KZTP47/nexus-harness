@@ -454,6 +454,54 @@ def save(said: Any) -> Board:
 # --------------------------------------------------------------------------
 
 
+# The three things the board wants out of a conversation, kept against when the
+# file was last written. Drawing the board reads every agent's chat, and the
+# board is drawn every time somebody looks at it and every time anything on it
+# moves - dragging a box a few pixels saves the board. Chats change when
+# somebody types, which almost never lines up with any of that, so nearly all
+# of those reads would come back with what they came back with last time.
+#
+# Only the three small values are kept, never the conversation itself, and the
+# oldest are dropped once there are more than a board could hold, so this cannot
+# grow into somewhere conversations quietly pile up in memory.
+_MOST_KEPT_ABOUT_CHATS = 200
+_what_was_said: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+
+def _how_much_was_said_to(config, who: str, filed: str) -> dict[str, Any]:
+    """How much has been said in one agent's chat, and the last line of it."""
+
+    from . import chat as chat_lab
+
+    nothing = {"said": 0, "last_said": "", "last_said_at": ""}
+    # An agent with nobody to ask has no conversation of its own. A name outlives
+    # what it was given to, so a chat filed under this name may well be there -
+    # from before somebody unset the assistant, or from an agent that had the
+    # name before - and it belongs to none of this one's business.
+    if not who:
+        return nothing
+    where = chat_lab.where_it_is_kept(config, who, filed)
+    try:
+        stamp = where.stat()
+        when = (stamp.st_mtime_ns, stamp.st_size)
+    except OSError:
+        return nothing
+    key = f"{who}\n{where}"
+    known = _what_was_said.get(key)
+    if known is not None and known[0] == when:
+        return dict(known[1])
+    said = chat_lab.read_it(config, who, filed)
+    held = {
+        "said": len(said),
+        "last_said": said[-1].text[:120] if said else "",
+        "last_said_at": said[-1].at if said else "",
+    }
+    if len(_what_was_said) >= _MOST_KEPT_ABOUT_CHATS:
+        _what_was_said.pop(next(iter(_what_was_said)), None)
+    _what_was_said[key] = (when, dict(held))
+    return held
+
+
 def how_it_stands(config) -> dict[str, Any]:
     """The board, and everything the panel needs to draw and judge it."""
 
@@ -488,10 +536,7 @@ def how_it_stands(config) -> dict[str, Any]:
         # without asking after every conversation one at a time. It is read
         # rather than counted from anything kept in memory: a chat that was had
         # yesterday is still a chat.
-        said = chat_lab.read_it(config, one.who, filed_as(one.name)) if one.who else []
-        held["said"] = len(said)
-        held["last_said"] = said[-1].text[:120] if said else ""
-        held["last_said_at"] = said[-1].at if said else ""
+        held.update(_how_much_was_said_to(config, one.who, filed_as(one.name)))
         agents.append(held)
     return {
         "board": dict(board.to_dict(), agents=agents),

@@ -315,8 +315,15 @@ class SubscriptionCLIProvider(Provider):
 
         if self.settings.get("command") or not self.recipe.kept_under:
             return None
+        # Look for the other builds first. On a machine that has only the one,
+        # which is most of them, this is where it stops - before asking the
+        # program its version, which means starting it. That question is asked
+        # on the way to every single message, so it has to be worth asking.
+        elsewhere = _every_build_of(self.recipe.kept_under)
+        if not elsewhere:
+            return None
         best_where, best_version = Path(found), _the_version_of(found)
-        for where, version in _every_build_of(self.recipe.kept_under):
+        for where, version in elsewhere:
             if version > best_version:
                 best_where, best_version = where, version
         return None if best_where == Path(found) else best_where
@@ -462,6 +469,16 @@ class SubscriptionCLIProvider(Provider):
         """
 
         for body in reversed(list(_every_object_in(f"{stdout}\n{stderr}"))):
+            # Only what the tool printed as its answer counts. These tools print
+            # lines of progress and counts alongside it, and any of those can
+            # carry a number under one of these names without being about this
+            # request at all - which would answer the question wrongly, in the
+            # one place where being wrong sends somebody to the wrong door.
+            # A tool that says whether it failed says so in its answer and
+            # nowhere else, so that is what marks the answer out.
+            if recipe.error_field and not isinstance(
+                    _dotted(body, recipe.error_field), bool):
+                continue
             # A status from the service first. It is only ever there because
             # something answered, and it is right where the timing is wrong:
             # this machine reports no time at the service for a refusal that

@@ -896,6 +896,23 @@ class TheNewestBuildWinsTests(unittest.TestCase):
              mock.patch.object(subscription_cli, "_the_version_of", lambda where: (1, 0, 0)):
             self.assertIsNone(holder._a_newer_build_than("C:/mine/claude.exe"))
 
+    def test_the_program_is_not_started_when_there_is_nothing_to_compare(self) -> None:
+        """Asking a program its version means starting it.
+
+        This is on the way to every single message, and on a machine with only
+        the one copy - which is most of them - the answer cannot change anything.
+        So the other builds are looked for first, and on a machine with none the
+        program is never started at all.
+        """
+
+        asked = []
+        holder = self.provider_reading(self.patterns())
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}), \
+             mock.patch.object(subscription_cli, "_the_version_of",
+                               lambda where: asked.append(where) or (2, 1, 101)):
+            self.assertIsNone(holder._a_newer_build_than("C:/npm/claude.CMD"))
+        self.assertEqual(asked, [])
+
     def test_a_tool_that_keeps_no_other_builds_is_left_alone(self) -> None:
         holder = self.provider_reading(())
         self.assertIsNone(holder._a_newer_build_than("C:/npm/copilot.CMD"))
@@ -965,6 +982,29 @@ class WhetherItReallyAskedTests(unittest.TestCase):
 
     def test_time_at_the_service_still_counts_when_there_is_no_status(self) -> None:
         said = json.dumps({"is_error": True, "duration_api_ms": 812, "result": "no"})
+        self.assertIs(self.holder()._did_it_ask_anybody(CLAUDE_RECIPE, said, ""), True)
+
+    def test_only_the_answer_counts_and_not_the_lines_around_it(self) -> None:
+        """These tools print progress and counts next to the answer.
+
+        Any of those can carry a number under one of these names without being
+        about this request. Read as the answer, a refusal the tool decided on its
+        own becomes "the service turned you down" and somebody goes to their
+        administrator about something that never happened - which is the whole of
+        what this was written to stop.
+        """
+
+        said = "\n".join([
+            json.dumps({"is_error": True, "duration_api_ms": 0, "result": "no"}),
+            json.dumps({"type": "how it went", "api_error_status": 200}),
+        ])
+        self.assertIs(self.holder()._did_it_ask_anybody(CLAUDE_RECIPE, said, ""), False)
+
+    def test_the_answer_is_read_even_when_it_came_first(self) -> None:
+        said = "\n".join([
+            json.dumps({"is_error": True, "api_error_status": 403, "result": "no"}),
+            json.dumps({"type": "how it went", "duration_api_ms": 0}),
+        ])
         self.assertIs(self.holder()._did_it_ask_anybody(CLAUDE_RECIPE, said, ""), True)
 
     def test_a_tool_that_says_neither_gets_neither_claim(self) -> None:
