@@ -290,6 +290,21 @@ class WhatATruncatedAnswerReadsAsTests(unittest.TestCase):
     def test_a_whole_answer_comes_back_exactly_as_it_was(self) -> None:
         self.assertEqual(codex_cli._as_words(self.WHOLE), "ready · done")
 
+    def test_a_four_byte_letter_cut_in_half_is_dropped_too(self) -> None:
+        """The one the countdown was one step short of.
+
+        Dropping "up to three bytes" dropped up to two, because the end of a
+        countdown is not one of its steps. A four-byte letter cut with three of
+        its bytes left over went all the way through to the black diamond this
+        is here to prevent.
+        """
+
+        whole = "All fine up to here \U0001F600".encode("utf-8")
+        for short_by in (1, 2, 3):
+            with self.subTest(short_by=short_by):
+                self.assertEqual(
+                    codex_cli._as_words(whole[:-short_by]), "All fine up to here ")
+
     def test_something_really_broken_is_still_shown_as_broken(self) -> None:
         """Damage further in than the last few bytes is damage, and is shown as
         damage rather than guessed at."""

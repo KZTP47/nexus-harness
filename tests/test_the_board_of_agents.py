@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
@@ -1093,14 +1094,59 @@ class WhatEachChatHoldsTests(BoardTestCase):
                 encoding="utf-8")
 
         put("the first line")
+        # The time of the first write, kept before the second one happens. Put
+        # back afterwards, this is the collision itself rather than a hope that
+        # one turns up: same length, same moment, different words.
+        first = kept.stat().st_mtime_ns
         swarm.how_it_stands(self.config)
-        # The same length and the same moment - the worst case, forced so it
-        # happens every time instead of one run in six.
         put("the second one")
-        when = kept.stat()
-        os.utime(kept, ns=(when.st_mtime_ns, when.st_mtime_ns))
+        self.assertEqual(len("the first line"), len("the second one"), "same length")
+        os.utime(kept, ns=(first, first))
+        self.assertEqual(kept.stat().st_mtime_ns, first, "the clock really went back")
         agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
         self.assertEqual(agent["last_said"], "the second one")
+
+    def test_reading_a_chat_takes_the_lock(self) -> None:
+        """Two threads have to be inside three lines at the same moment to break
+        this, which almost never happens however hard a test tries - and a race
+        that only shows up sometimes is a test that only fails sometimes. So
+        what is checked here is the thing that makes the race impossible: that
+        the lock is taken at all."""
+
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        kept.write_text(json.dumps(
+            [{"who": "them", "text": "hello", "at": ""}]), encoding="utf-8")
+
+        taken = []
+        real = swarm._while_reading_chats
+
+        class Counting:
+            def __enter__(self):
+                taken.append(1)
+                return real.__enter__()
+
+            def __exit__(self, *args):
+                return real.__exit__(*args)
+
+        with mock.patch.object(swarm, "_while_reading_chats", Counting()):
+            swarm._how_much_was_said_to(self.config, "claude", "The reviewer")
+        self.assertGreaterEqual(len(taken), 2, "read and write are both inside it")
+
+    def test_what_went_wrong_last_time_reaches_the_board(self) -> None:
+        """Written down in one place and read in another, and nothing in between
+        was making sure it arrived."""
+
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        with mock.patch.object(chat, "who_can_talk", lambda config: [{
+                "route": "claude", "label": "claude", "model": "m", "kind": "claude-cli",
+                "ready": True, "why_not": "", "how_to_fix_it": "",
+                "trouble_last_time": "it would not answer last time",
+                "when_that_was": "2026-08-21T00:00:00Z"}]):
+            agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual(agent["trouble_last_time"], "it would not answer last time")
+        self.assertTrue(agent["ready"], "a warning is not the same as not ready")
 
     def test_two_at_once_do_not_break_the_board(self) -> None:
         """Nothing today reaches this without a lock further up. That care is
@@ -1129,6 +1175,12 @@ class WhatEachChatHoldsTests(BoardTestCase):
             except Exception as trouble:  # noqa: BLE001 - the point is any of them
                 went_wrong.append(trouble)
 
+        # Threads hand over to each other far too rarely by default to land
+        # inside the three lines this is about, so this one passed happily with
+        # no lock at all. Turned right down, it fails every time without one.
+        was = sys.getswitchinterval()
+        sys.setswitchinterval(0.000001)
+        self.addCleanup(sys.setswitchinterval, was)
         crowd = [threading.Thread(target=hammer, args=(one,)) for one in range(16)]
         for one in crowd:
             one.start()

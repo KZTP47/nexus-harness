@@ -179,7 +179,11 @@ CLAUDE_RECIPE = CliRecipe(
         "turn Claude Code on for it - being able to use Claude in a window of "
         "its own is not the same permission."
     ),
-    the_answer_names_it=("ask your admin", "disabled claude subscription access"),
+    # Only what this refusal actually says, word for word. "ask your admin" on
+    # its own turns up in plenty of others - a rate limit says it - and
+    # answering one of those with "there is nothing to try again here" sends
+    # somebody away from a wait that would have fixed it in a minute.
+    the_answer_names_it=("disabled claude subscription access",),
     when_the_answer_names_it=(
         "There is nothing to try again here. Your organisation has Claude Code "
         "turned off, and only whoever administers it can turn it on. Being "

@@ -1440,6 +1440,10 @@ def create_provider(config: LoadedConfig) -> Provider:
         from .subscription_cli import SubscriptionCLIProvider
 
         return SubscriptionCLIProvider(config, name)
+    if name == "m365-copilot":
+        from .m365_copilot import M365CopilotProvider
+
+        return M365CopilotProvider(config)
     raise HarnessError(f"Unknown provider: {name}")
 
 

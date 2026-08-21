@@ -740,6 +740,9 @@ def validate_config(data: dict[str, Any]) -> None:
         "openai", "anthropic", "gemini", "ollama", "local", "openai-compatible",
         # Assistants you already pay for, driven through their own command line.
         "claude-cli", "copilot-cli", "assistant-cli",
+        # And one with no command line at all, reached over the web with a
+        # sign-in rather than a key, because Microsoft allows nothing else.
+        "m365-copilot",
     )
     profile_provider_names = (*provider_names, "codex-cli")
     if provider["name"] not in provider_names:
@@ -748,7 +751,7 @@ def validate_config(data: dict[str, Any]) -> None:
         raise HarnessError("provider.api_mode must be auto, responses, or chat-completions")
     if provider["prompt_cache_retention"] not in ("", "in_memory", "24h"):
         raise HarnessError("provider.prompt_cache_retention must be empty, in_memory, or 24h")
-    subscription_kinds = ("claude-cli", "copilot-cli", "assistant-cli")
+    subscription_kinds = ("claude-cli", "copilot-cli", "assistant-cli", "m365-copilot")
     _require_string(provider["model"], "provider.model", allow_empty=provider["name"] in subscription_kinds)
     if provider["name"] in subscription_kinds:
         if provider["endpoint"]:
@@ -800,7 +803,7 @@ def validate_config(data: dict[str, Any]) -> None:
             raise HarnessError(f"{dotted}.kind conflicts with name")
         _require_string(profile.get("model"), f"{dotted}.model", allow_empty=False)
         endpoint = _require_string(profile.get("endpoint", ""), f"{dotted}.endpoint")
-        if name in ("claude-cli", "copilot-cli", "assistant-cli"):
+        if name in ("claude-cli", "copilot-cli", "assistant-cli", "m365-copilot"):
             if endpoint:
                 raise HarnessError(f"{dotted}.endpoint must be empty for {name}")
         elif name != "codex-cli":

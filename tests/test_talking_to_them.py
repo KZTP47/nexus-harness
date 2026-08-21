@@ -325,10 +325,30 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
     def test_a_route_that_was_turned_down_says_so_before_anybody_types(self) -> None:
         chat._write_down_that_it_would_not(
             self.config, "claude", "your organisation has Claude Code turned off")
-        held = self.only_one()
-        self.assertFalse(held["ready"])
-        self.assertIn("turned off", held["why_not"])
-        self.assertTrue(held["how_to_fix_it"])
+        self.assertIn("turned off", self.only_one()["trouble_last_time"])
+
+    def test_what_happened_last_time_does_not_stop_it_being_tried(self) -> None:
+        """The whole point, and the thing this got wrong the first time.
+
+        Hung on the word ready, one bad minute on a Tuesday stopped runs from
+        starting, dropped a route out of asking everyone with nobody told it
+        had not been asked, and swapped the conversation somebody was looking
+        at for a different one. The note itself said "send something and it
+        will try again" while nothing would send anything.
+        """
+
+        chat._write_down_that_it_would_not(self.config, "claude", "it said no")
+        self.assertTrue(self.only_one()["ready"])
+        with self.standing_in(Answering("here you go")):
+            said = chat.say(self.config, "claude", "hello")
+        self.assertTrue(said["said"], "it was asked, and it answered")
+
+    def test_asking_everyone_still_asks_the_one_that_had_trouble(self) -> None:
+        self.config.data["providers"]["copilot"] = {"kind": "copilot-cli", "model": "m"}
+        chat._write_down_that_it_would_not(self.config, "claude", "it said no")
+        with self.standing_in(Answering("here you go")):
+            answers = chat.ask_everyone(self.config, "what do you think?")
+        self.assertEqual(sorted(one["route"] for one in answers), ["claude", "copilot"])
 
     def test_it_is_remembered_when_something_is_really_asked(self) -> None:
         class WouldNot:
@@ -337,13 +357,13 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
 
         with self.standing_in(WouldNot()), self.assertRaises(chat.ChatError):
             chat.say(self.config, "claude", "hello")
-        self.assertFalse(self.only_one()["ready"])
+        self.assertIn("turned this down", self.only_one()["trouble_last_time"])
 
     def test_anything_getting_through_clears_it(self) -> None:
         chat._write_down_that_it_would_not(self.config, "claude", "no")
         with self.standing_in(Answering("here you go")):
             chat.say(self.config, "claude", "hello")
-        self.assertTrue(self.only_one()["ready"])
+        self.assertEqual(self.only_one()["trouble_last_time"], "")
 
     def test_a_refusal_from_another_day_is_let_go(self) -> None:
         """A service that was down on Friday says nothing about Monday, and a
@@ -354,13 +374,93 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
         held = json.loads(where.read_text(encoding="utf-8"))
         held["claude"]["when"] -= chat.A_NO_IS_WORTH_MENTIONING_FOR + 60
         where.write_text(json.dumps(held), encoding="utf-8")
-        self.assertTrue(self.only_one()["ready"])
+        self.assertEqual(self.only_one()["trouble_last_time"], "")
 
     def test_one_route_being_turned_down_says_nothing_about_another(self) -> None:
         self.config.data["providers"]["copilot"] = {"kind": "copilot-cli", "model": "m"}
         chat._write_down_that_it_would_not(self.config, "claude", "no")
-        held = {one["route"]: one["ready"] for one in chat.already_set_up(self.config)}
-        self.assertEqual(held, {"claude": False, "copilot": True})
+        held = {
+            one["route"]: bool(one["trouble_last_time"])
+            for one in chat.already_set_up(self.config)
+        }
+        self.assertEqual(held, {"claude": True, "copilot": False})
+
+    def test_two_routes_failing_at_once_both_get_remembered(self) -> None:
+        """It reads the file, changes it and writes it back, which is three
+        things. Two at once each wrote back what the other had not seen, and one
+        of the notes simply never existed - the one nobody looks for."""
+
+        self.config.data["providers"]["copilot"] = {"kind": "copilot-cli", "model": "m"}
+        ready = threading.Barrier(2)
+
+        def blame(route: str) -> None:
+            ready.wait(timeout=10)
+            chat._write_down_that_it_would_not(self.config, route, route + " said no")
+
+        both = [threading.Thread(target=blame, args=(one,)) for one in ("claude", "copilot")]
+        for one in both:
+            one.start()
+        for one in both:
+            one.join(timeout=20)
+        self.assertEqual(
+            sorted(chat.what_would_not_answer(self.config)), ["claude", "copilot"])
+
+    def test_a_long_refusal_stops_where_a_sentence_stops(self) -> None:
+        """Cut by counting letters alone, this landed in the middle of the
+        sentence that says what to do about it - so the half somebody could act
+        on was the half thrown away."""
+
+        said = ("The service turned this down. " * 40) + "Ask your admin to turn it on."
+        self.assertGreater(len(said), chat.LONGEST_NO, "or nothing is being cut")
+        chat._write_down_that_it_would_not(self.config, "claude", said)
+        held = chat.what_would_not_answer(self.config)["claude"]["why"]
+        self.assertLessEqual(len(held), chat.LONGEST_NO)
+        self.assertTrue(held.endswith("."), held[-40:])
+        self.assertNotIn("The service turned this dow.", held)
+
+    def test_it_does_not_stop_at_an_abbreviation_and_call_that_a_sentence(self) -> None:
+        """Stopping after "Mr." leaves something that reads like a whole
+        sentence with the half somebody could act on thrown away."""
+
+        # Put together so that "Mr." is the last full stop before the cut and
+        # the real sentence before it is a good way back. Cut at the abbreviation
+        # this ends on a full stop, reads like a whole sentence, and the part
+        # saying what to do is gone with nothing to show it ever existed.
+        ending = ("Contact Mr. Smith about it, and then ask your administrator "
+                  "to turn Claude Code on for the organisation, which is the "
+                  "only thing that changes this.")
+        room = chat.LONGEST_NO - 3
+        lead = "This was turned down. " + ("padding " * 90)
+        said = lead + ending
+        self.assertGreater(len(said), chat.LONGEST_NO, "or nothing is being cut")
+        self.assertLess(
+            len(lead) + ending.index("Mr.") + 3, room,
+            "the abbreviation has to fall before the cut, or this proves nothing")
+
+        chat._write_down_that_it_would_not(self.config, "claude", said)
+        held = chat.what_would_not_answer(self.config)["claude"]["why"]
+        self.assertFalse(
+            held.rstrip(".").rstrip(".").endswith("Mr"),
+            f"it stopped at an abbreviation: {held[-60:]}")
+
+    def test_anything_shortened_says_that_it_was(self) -> None:
+        """A cut that ends on a full stop reads as all of it, and somebody acts
+        on half a reason believing they have the whole one."""
+
+        chat._write_down_that_it_would_not(self.config, "claude", "One sentence. " * 200)
+        held = chat.what_would_not_answer(self.config)["claude"]["why"]
+        self.assertTrue(held.endswith("..."), held[-30:])
+
+    def test_one_very_long_sentence_says_it_is_not_all_of_it(self) -> None:
+        chat._write_down_that_it_would_not(self.config, "claude", "x" * 2000)
+        held = chat.what_would_not_answer(self.config)["claude"]["why"]
+        self.assertLessEqual(len(held), chat.LONGEST_NO)
+        self.assertTrue(held.endswith("..."))
+
+    def test_a_refusal_that_already_fits_is_left_exactly_as_it_is(self) -> None:
+        chat._write_down_that_it_would_not(self.config, "claude", "It said no.")
+        self.assertEqual(
+            chat.what_would_not_answer(self.config)["claude"]["why"], "It said no.")
 
     def test_a_note_that_cannot_be_written_does_not_break_the_chat(self) -> None:
         """This is bookkeeping around somebody's message. If it cannot be

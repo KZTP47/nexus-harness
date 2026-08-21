@@ -140,7 +140,11 @@ def _as_words(raw: bytes) -> str:
     would turn a real answer with one bad byte in it into a page of nonsense.
     """
 
-    for end in range(len(raw), max(len(raw) - 3, -1), -1):
+    # Four back, not three. The end of a countdown is not one of its steps,
+    # so stopping at three tried dropping nothing, one byte and two - and a
+    # four-byte letter with three of its bytes left over came out as exactly
+    # the mark this is here to prevent.
+    for end in range(len(raw), max(len(raw) - 4, -1), -1):
         try:
             return raw[:end].decode("utf-8")
         except UnicodeDecodeError:

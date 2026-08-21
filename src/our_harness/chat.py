@@ -48,9 +48,10 @@ WHERE_THEY_LIVE = ".harness/chats"
 # What happened the last time a route was asked something and would not answer.
 # Kept so the board can say so before somebody types, rather than after.
 WHERE_THE_NOES_LIVE = ".harness/chats/_last-refusals.json"
-# How much of a refusal is kept. Enough to say what happened, short enough to
-# sit under a name on the board.
-LONGEST_NO = 400
+# How much of a refusal is kept. Enough to hold what the service said and what
+# to do about it - those are the two halves somebody needs and they arrive as
+# one sentence each - and short enough to sit under a name on the board.
+LONGEST_NO = 800
 # How long a refusal is worth mentioning. A service that was down on Friday
 # says nothing about Monday, and a note nobody can clear is a note that stops
 # being read. Anything getting through clears it long before this.
@@ -177,6 +178,49 @@ def where_it_is_kept(config: LoadedConfig, route: str, filed_as: str = "") -> Pa
     )
 
 
+def _cut_at_a_full_stop(said: str) -> str:
+    """As much of a refusal as fits, ending where a sentence ends.
+
+    Cut by counting letters alone, this landed in the middle of the sentence
+    that says what to do about it - so the half somebody could act on was the
+    half thrown away, and what was left stopped mid-thought like the app had
+    crashed writing it.
+    """
+
+    held = " ".join(str(said or "").split())
+    if len(held) <= LONGEST_NO:
+        return held
+    room = LONGEST_NO - 3
+    ended = -1
+    for mark in (". ", "? ", "! "):
+        at = room
+        while True:
+            at = held.rfind(mark, 0, at)
+            if at < 0:
+                break
+            # A full stop after one or two letters is "Mr." or somebody's
+            # initial, not the end of anything. Stopping there leaves a line
+            # that reads like a whole sentence with the useful half gone.
+            before = held[:at].rsplit(" ", 1)[-1].strip(".")
+            if len(before) > 2:
+                ended = max(ended, at)
+                break
+            at = max(at - 1, 0)
+            if at == 0:
+                break
+    if ended > room // 3:
+        return held[:ended + 1] + "..."
+    # No sentence ended anywhere in reach, so this is one long sentence.
+    return held[:room] + "..."
+
+
+# One at a time while the refusals file is changed. It is read, changed and
+# written back, which is three things, and two routes failing in the same moment
+# each wrote back what the other had not seen. One of the two notes then never
+# existed - and the one that goes missing is the one nobody knows to look for.
+_while_writing_the_noes = threading.Lock()
+
+
 def _where_the_noes_are(config: LoadedConfig) -> Path:
     return confined_path(
         config.project_root, WHERE_THE_NOES_LIVE, allow_missing=True, allow_control=True)
@@ -218,23 +262,26 @@ def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) ->
     """
 
     try:
-        # Inside the guard, all of it. Working out where the file goes can throw
-        # as easily as writing it, and neither is worth turning somebody's
-        # working chat into a broken one.
-        where = _where_the_noes_are(config)
-        held = what_would_not_answer(config)
-        if why:
-            held[route] = {"why": why[:LONGEST_NO], "when": time.time(), "at": _now()}
-        elif route not in held:
-            return
-        else:
-            held.pop(route, None)
-        where.parent.mkdir(parents=True, exist_ok=True)
-        # Written beside and moved into place, like the conversations
-        # themselves, so a panel reading this never catches it half written.
-        beside = where.with_name(f"{where.name}.{os.getpid()}-{threading.get_ident()}.part")
-        beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
-        os.replace(beside, where)
+        # One at a time, and inside the guard. Working out where the file goes
+        # can throw as easily as writing it, and neither is worth turning
+        # somebody's working chat into a broken one.
+        with _while_writing_the_noes:
+            where = _where_the_noes_are(config)
+            held = what_would_not_answer(config)
+            if why:
+                held[route] = {
+                    "why": _cut_at_a_full_stop(why), "when": time.time(), "at": _now()}
+            elif route not in held:
+                return
+            else:
+                held.pop(route, None)
+            where.parent.mkdir(parents=True, exist_ok=True)
+            # Written beside and moved into place, like the conversations
+            # themselves, so a panel reading this never catches it half written.
+            beside = where.with_name(
+                f"{where.name}.{os.getpid()}-{threading.get_ident()}.part")
+            beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+            os.replace(beside, where)
     except (OSError, ValueError):
         return
 
@@ -263,17 +310,22 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
             "label": str(name),
             "model": str(held.get("model") or ""),
             "kind": str(held.get("kind") or ""),
-            "ready": not no,
-            "why_not": (
+            # Ready still means what it always meant: there is a route here and
+            # something may be sent to it. Three other things read this word as
+            # "may this be used at all" - a run picking who to set going,
+            # asking everyone at once, and which conversation the panel opens -
+            # so hanging last Tuesday's bad minute on it stopped all three,
+            # quietly, for a day. The note itself said "send something and it
+            # will try again", and then nothing would send anything. A warning
+            # belongs beside the word and not inside it.
+            "ready": True,
+            "why_not": "",
+            "how_to_fix_it": "",
+            "trouble_last_time": (
                 f"The last time this was asked something, it would not answer: {no['why']}"
                 if no else ""
             ),
-            "how_to_fix_it": (
-                "This is what happened last time, not what will happen now - "
-                "send something and it will try again. It clears itself the "
-                "moment anything gets through."
-                if no else ""
-            ),
+            "when_that_was": no["at"] if no else "",
         })
     if not found:
         # No named routes: the one this project uses is still somebody, and on

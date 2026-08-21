@@ -988,7 +988,18 @@ class WhenTheAnswerAlreadySaysWhatToDoTests(unittest.TestCase):
     def test_it_reads_the_words_whatever_case_they_came_in(self) -> None:
         self.assertIn(
             "only whoever administers it can turn it on",
-            self.said_about("ASK YOUR ADMIN TO ENABLE ACCESS"))
+            self.said_about("DISABLED CLAUDE SUBSCRIPTION ACCESS for Claude Code"))
+
+    def test_a_wait_that_mentions_an_administrator_still_gets_something_to_try(self) -> None:
+        """Plenty of refusals say to ask an administrator without meaning that
+        anything is turned off. Told "there is nothing to try again here", the
+        one person who only had to wait a minute goes and asks for a meeting."""
+
+        said = self.said_about(
+            "Too many requests. If this keeps happening, ask your admin about "
+            "raising the limit for the team.")
+        self.assertNotIn("nothing to try again", said)
+        self.assertIn("setup-token", said)
 
 
 class WhetherItReallyAskedTests(unittest.TestCase):

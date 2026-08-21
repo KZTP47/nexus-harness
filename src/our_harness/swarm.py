@@ -552,6 +552,10 @@ def how_it_stands(config) -> dict[str, Any]:
             )
         )
         held["how_to_fix_it"] = (known or {}).get("how_to_fix_it", "")
+        # What happened the last time this route was asked anything. Not the
+        # same as not being ready - this one is still tried - so that somebody
+        # knows before they type instead of after.
+        held["trouble_last_time"] = (known or {}).get("trouble_last_time", "")
         # How much has been said to this one, so the list of chats can be drawn
         # without asking after every conversation one at a time. It is read
         # rather than counted from anything kept in memory: a chat that was had
