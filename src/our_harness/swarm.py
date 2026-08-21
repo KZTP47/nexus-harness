@@ -466,6 +466,20 @@ def save(said: Any) -> Board:
 # grow into somewhere conversations quietly pile up in memory.
 _MOST_KEPT_ABOUT_CHATS = 200
 _what_was_said: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+# One request at a time in here. Every way into the board today happens to take
+# a lock further up, so nothing needs this yet - which is exactly the problem
+# with leaving it out. That care is held somewhere else, by callers who have no
+# reason to know this depends on it, and the first one that arrives without it
+# throws while the oldest entry is being dropped and takes the whole board down
+# with it. It is one lock around three lines and it is nobody else's business.
+_while_reading_chats = threading.Lock()
+# How fresh is too fresh to trust. A file written twice inside the same tick of
+# the clock, to the same length, looks unchanged - and it is the same length
+# more often than sounds likely, because these are lines of chat. Typing at a
+# keyboard never comes close; a run driving several agents does, measured at
+# about one time in six when two writes land within a millisecond. So a file
+# written a moment ago is read rather than remembered.
+_TOO_FRESH_TO_TRUST = 2_000_000_000  # two seconds, in the same units as the clock
 
 
 def _how_much_was_said_to(config, who: str, filed: str) -> dict[str, Any]:
@@ -487,18 +501,24 @@ def _how_much_was_said_to(config, who: str, filed: str) -> dict[str, Any]:
     except OSError:
         return nothing
     key = f"{who}\n{where}"
-    known = _what_was_said.get(key)
-    if known is not None and known[0] == when:
-        return dict(known[1])
+    # Written a moment ago, so what is remembered about it cannot be trusted:
+    # two writes inside one tick of the clock, to the same length, are the same
+    # file as far as this can tell.
+    settled = time.time_ns() - stamp.st_mtime_ns > _TOO_FRESH_TO_TRUST
+    with _while_reading_chats:
+        known = _what_was_said.get(key)
+        if settled and known is not None and known[0] == when:
+            return dict(known[1])
     said = chat_lab.read_it(config, who, filed)
     held = {
         "said": len(said),
         "last_said": said[-1].text[:120] if said else "",
         "last_said_at": said[-1].at if said else "",
     }
-    if len(_what_was_said) >= _MOST_KEPT_ABOUT_CHATS:
-        _what_was_said.pop(next(iter(_what_was_said)), None)
-    _what_was_said[key] = (when, dict(held))
+    with _while_reading_chats:
+        if len(_what_was_said) >= _MOST_KEPT_ABOUT_CHATS:
+            _what_was_said.pop(next(iter(_what_was_said)), None)
+        _what_was_said[key] = (when, dict(held))
     return held
 
 

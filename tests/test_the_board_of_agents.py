@@ -972,6 +972,19 @@ def _is_yellow(rule: str) -> bool:
     return numbers in rule.replace(" ", "").replace(",", ", ")
 
 
+def _as_though_it_settled(where) -> None:
+    """Put a chat file's time back, so it is old enough to be trusted.
+
+    What is remembered about a chat is not trusted while the file is still
+    warm - two writes inside one tick of the clock, to the same length, look
+    like one file that never changed. A test that writes a file and reads it in
+    the same breath is inside that window every time.
+    """
+
+    when = where.stat().st_mtime_ns - swarm._TOO_FRESH_TO_TRUST * 2
+    os.utime(where, ns=(when, when))
+
+
 class WhatEachChatHoldsTests(BoardTestCase):
     """What the list of chats down the side is drawn from.
 
@@ -1035,6 +1048,7 @@ class WhatEachChatHoldsTests(BoardTestCase):
             {"who": "them", "text": "The first answer", "at": "2026-01-01T00:00:00"},
         ]), encoding="utf-8")
 
+        _as_though_it_settled(kept)
         swarm.how_it_stands(self.config)
         reads = []
         real = chat.read_it
@@ -1062,6 +1076,65 @@ class WhatEachChatHoldsTests(BoardTestCase):
                 swarm._how_much_was_said_to(self.config, "claude", f"agent-{number}")
         self.assertLessEqual(
             len(swarm._what_was_said), swarm._MOST_KEPT_ABOUT_CHATS)
+
+    def test_a_chat_written_a_moment_ago_is_read_and_not_remembered(self) -> None:
+        """Two writes inside one tick of the clock, to the same length, look
+        like one file that never changed. Typing never gets near that; a run
+        driving several agents in a loop does, and it was measured happening
+        about one time in six when two writes land within a millisecond."""
+
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
+        kept.parent.mkdir(parents=True, exist_ok=True)
+
+        def put(text: str) -> None:
+            kept.write_text(json.dumps(
+                [{"who": "them", "text": text, "at": "2026-01-01T00:00:00"}]),
+                encoding="utf-8")
+
+        put("the first line")
+        swarm.how_it_stands(self.config)
+        # The same length and the same moment - the worst case, forced so it
+        # happens every time instead of one run in six.
+        put("the second one")
+        when = kept.stat()
+        os.utime(kept, ns=(when.st_mtime_ns, when.st_mtime_ns))
+        agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
+        self.assertEqual(agent["last_said"], "the second one")
+
+    def test_two_at_once_do_not_break_the_board(self) -> None:
+        """Nothing today reaches this without a lock further up. That care is
+        held by callers who have no reason to know this depends on it, and the
+        first one to arrive without it throws while the oldest entry is being
+        dropped - and takes the whole board down."""
+
+        swarm._what_was_said.clear()
+        # Real files under real names, so nothing has to be patched. Patching a
+        # shared function from sixteen threads is its own bug: they overwrite
+        # each other and what gets put back at the end can be one of the mocks.
+        for number in range(swarm._MOST_KEPT_ABOUT_CHATS + 16):
+            named = chat.where_it_is_kept(self.config, "claude", f"at-once-{number}")
+            named.parent.mkdir(parents=True, exist_ok=True)
+            named.write_text(json.dumps(
+                [{"who": "them", "text": "hello", "at": ""}]), encoding="utf-8")
+
+        went_wrong = []
+
+        def hammer(number: int) -> None:
+            try:
+                for again in range(40):
+                    swarm._how_much_was_said_to(
+                        self.config, "claude",
+                        f"at-once-{(number * 13 + again) % (swarm._MOST_KEPT_ABOUT_CHATS + 16)}")
+            except Exception as trouble:  # noqa: BLE001 - the point is any of them
+                went_wrong.append(trouble)
+
+        crowd = [threading.Thread(target=hammer, args=(one,)) for one in range(16)]
+        for one in crowd:
+            one.start()
+        for one in crowd:
+            one.join()
+        self.assertEqual([str(one) for one in went_wrong], [])
 
     def test_a_chat_that_has_changed_is_read_again(self) -> None:
         """Which is the whole point of keeping it: it has to still be right."""

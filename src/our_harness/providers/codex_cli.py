@@ -117,12 +117,35 @@ def _run_bounded(
         argv=argv,
         cwd=str(cwd),
         exit_code=124 if timed_out else int(process.returncode),
-        stdout=stdout.decode("utf-8", errors="replace"),
-        stderr=stderr.decode("utf-8", errors="replace"),
+        stdout=_as_words(stdout),
+        stderr=_as_words(stderr),
         duration_ms=max(0, int((time.monotonic() - started) * 1000)),
         timed_out=timed_out,
         output_truncated=truncated,
     )
+
+
+def _as_words(raw: bytes) -> str:
+    """What a tool printed, turned back into letters.
+
+    The harness holds what a tool prints to a size, and that cut can land
+    between the two halves of one letter. Read straight through, the last letter
+    of a perfectly good answer becomes a black diamond - the app looking broken
+    where the tool was fine. So up to three bytes are dropped off the end to
+    find the last whole letter.
+
+    Anything still wrong after that is really wrong, and is shown as damage
+    rather than guessed at. Guessing means reading the whole thing as the
+    letters Windows uses instead, which reads almost any bytes as something and
+    would turn a real answer with one bad byte in it into a page of nonsense.
+    """
+
+    for end in range(len(raw), max(len(raw) - 3, -1), -1):
+        try:
+            return raw[:end].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def _remaining(deadline_at: float) -> float:

@@ -58,6 +58,12 @@ class CliRecipe:
     # to an error message, so it costs nothing on a working machine.
     signed_in_arguments: tuple[str, ...] = ()
     when_it_is_refused: str = ""
+    # When the service's own answer already names what would fix it. Words to
+    # look for in what it said, and what to say instead of guessing - because a
+    # guess offered next to an answer that spelt it out is a few more minutes
+    # somebody spends going the wrong way.
+    the_answer_names_it: tuple[str, ...] = ()
+    when_the_answer_names_it: str = ""
     # Where the tool says how long the service took, and what to say when that
     # is nothing at all. Nothing at all means it never asked: it turned the
     # request down here, out of what it has written down about the account, and
@@ -172,6 +178,15 @@ CLAUDE_RECIPE = CliRecipe(
         "is not allowed either, whoever administers your organisation has to "
         "turn Claude Code on for it - being able to use Claude in a window of "
         "its own is not the same permission."
+    ),
+    the_answer_names_it=("ask your admin", "disabled claude subscription access"),
+    when_the_answer_names_it=(
+        "There is nothing to try again here. Your organisation has Claude Code "
+        "turned off, and only whoever administers it can turn it on. Being "
+        "allowed to use Claude in a window of its own is a different permission "
+        "from letting a program drive it, and this is the second one - so it "
+        "working next door is not a sign that something here is broken. "
+        "Nothing on this machine changes it, and signing in again will not."
     ),
     when_it_is_not_clear=(
         "Two things to try, in this order, because the first is free and the "
@@ -410,7 +425,7 @@ class SubscriptionCLIProvider(Provider):
                 # is the same thing said twice.
                 raise HarnessError(
                     f"{said}"
-                    f"{self._and_what_it_says_about_itself(recipe, deadline_at, asked)}"
+                    f"{self._and_what_it_says_about_itself(recipe, deadline_at, asked, said)}"
                 )
             # Nothing in what it printed reads as a reason, so the code it
             # stopped with is the most anybody can be told - and the last few
@@ -498,6 +513,7 @@ class SubscriptionCLIProvider(Provider):
         recipe: CliRecipe,
         deadline_at: float | None = None,
         asked_anybody: bool | None = None,
+        reason: str = "",
     ) -> str:
         """What else the harness knows, tacked onto a refusal.
 
@@ -536,6 +552,12 @@ class SubscriptionCLIProvider(Provider):
         elif asked_anybody is True:
             said = ["", f"{here} - what turned this down was the service behind it."]
             advice = recipe.when_it_is_refused
+            # Unless the answer already said what would fix it. Then that is
+            # what somebody is told, and the harness stops guessing over the top
+            # of a service that spelt it out.
+            plainly = (reason or "").lower()
+            if any(one in plainly for one in recipe.the_answer_names_it):
+                advice = recipe.when_the_answer_names_it or advice
         else:
             # It did not say. Neither of the other two can be claimed, and
             # claiming the service is how somebody ends up asking an
@@ -603,7 +625,7 @@ class SubscriptionCLIProvider(Provider):
             why = self._redactor.text(str(said or "no reason given"))[:LONGEST_REASON]
             raise HarnessError(
                 f"{recipe.label} refused the request: {why}"
-                f"{self._and_what_it_says_about_itself(recipe, self._deadline, self._did_it_ask_anybody(recipe, stdout, stderr))}"
+                f"{self._and_what_it_says_about_itself(recipe, self._deadline, self._did_it_ask_anybody(recipe, stdout, stderr), why)}"
             )
         text = _dotted(body, recipe.text_field)
         if not isinstance(text, str) or not text.strip():

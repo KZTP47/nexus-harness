@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import pathlib
 import tempfile
 import threading
 import time
@@ -299,6 +300,78 @@ class WhenSomethingWillNotAnswer(TalkingTestCase):
         said = chat._without_markup(page)
         self.assertNotIn("<", said)
         self.assertIn("Error response", said)
+
+
+class WhatHappenedLastTimeTests(TalkingTestCase):
+    """Ready used to mean "there is a route written down for it".
+
+    Somebody opened the board, saw every agent marked ready and a green line
+    saying so, typed a message, and was told the service had refused it. The
+    board had never asked anything. It cannot ask for real before drawing -
+    that is a paid message per agent every time anybody looks at the tab - but
+    it does not have to forget what happened the last time somebody did.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.config.data["providers"] = {"claude": {"kind": "claude-cli", "model": "m"}}
+
+    def only_one(self):
+        return [one for one in chat.already_set_up(self.config) if one["route"] == "claude"][0]
+
+    def test_a_route_nobody_has_had_trouble_with_is_ready(self) -> None:
+        self.assertTrue(self.only_one()["ready"])
+
+    def test_a_route_that_was_turned_down_says_so_before_anybody_types(self) -> None:
+        chat._write_down_that_it_would_not(
+            self.config, "claude", "your organisation has Claude Code turned off")
+        held = self.only_one()
+        self.assertFalse(held["ready"])
+        self.assertIn("turned off", held["why_not"])
+        self.assertTrue(held["how_to_fix_it"])
+
+    def test_it_is_remembered_when_something_is_really_asked(self) -> None:
+        class WouldNot:
+            def complete(self, request):
+                raise HarnessError("the service turned this down")
+
+        with self.standing_in(WouldNot()), self.assertRaises(chat.ChatError):
+            chat.say(self.config, "claude", "hello")
+        self.assertFalse(self.only_one()["ready"])
+
+    def test_anything_getting_through_clears_it(self) -> None:
+        chat._write_down_that_it_would_not(self.config, "claude", "no")
+        with self.standing_in(Answering("here you go")):
+            chat.say(self.config, "claude", "hello")
+        self.assertTrue(self.only_one()["ready"])
+
+    def test_a_refusal_from_another_day_is_let_go(self) -> None:
+        """A service that was down on Friday says nothing about Monday, and a
+        note nobody can clear is a note that stops being read."""
+
+        chat._write_down_that_it_would_not(self.config, "claude", "no")
+        where = chat._where_the_noes_are(self.config)
+        held = json.loads(where.read_text(encoding="utf-8"))
+        held["claude"]["when"] -= chat.A_NO_IS_WORTH_MENTIONING_FOR + 60
+        where.write_text(json.dumps(held), encoding="utf-8")
+        self.assertTrue(self.only_one()["ready"])
+
+    def test_one_route_being_turned_down_says_nothing_about_another(self) -> None:
+        self.config.data["providers"]["copilot"] = {"kind": "copilot-cli", "model": "m"}
+        chat._write_down_that_it_would_not(self.config, "claude", "no")
+        held = {one["route"]: one["ready"] for one in chat.already_set_up(self.config)}
+        self.assertEqual(held, {"claude": False, "copilot": True})
+
+    def test_a_note_that_cannot_be_written_does_not_break_the_chat(self) -> None:
+        """This is bookkeeping around somebody's message. If it cannot be
+        written the message still went and the answer still came back."""
+
+        def no_such_place(config):
+            raise OSError("nowhere to put it")
+
+        with mock.patch.object(chat, "_where_the_noes_are", no_such_place),              self.standing_in(Answering("here you go")):
+            said = chat.say(self.config, "claude", "hello")
+        self.assertTrue(said["said"])
 
 
 class WhoIsHere(TalkingTestCase):

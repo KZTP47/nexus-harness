@@ -45,6 +45,16 @@ from .safety import confined_path
 
 # Where the conversations are kept, so one survives closing the panel.
 WHERE_THEY_LIVE = ".harness/chats"
+# What happened the last time a route was asked something and would not answer.
+# Kept so the board can say so before somebody types, rather than after.
+WHERE_THE_NOES_LIVE = ".harness/chats/_last-refusals.json"
+# How much of a refusal is kept. Enough to say what happened, short enough to
+# sit under a name on the board.
+LONGEST_NO = 400
+# How long a refusal is worth mentioning. A service that was down on Friday
+# says nothing about Monday, and a note nobody can clear is a note that stops
+# being read. Anything getting through clears it long before this.
+A_NO_IS_WORTH_MENTIONING_FOR = 24 * 60 * 60
 # One message is a message. Anything longer belongs in the project, with the
 # message pointing at it.
 MOST_LETTERS = 6000
@@ -167,6 +177,68 @@ def where_it_is_kept(config: LoadedConfig, route: str, filed_as: str = "") -> Pa
     )
 
 
+def _where_the_noes_are(config: LoadedConfig) -> Path:
+    return confined_path(
+        config.project_root, WHERE_THE_NOES_LIVE, allow_missing=True, allow_control=True)
+
+
+def what_would_not_answer(config: LoadedConfig) -> dict[str, dict[str, Any]]:
+    """What each route said the last time it would not answer, if it still counts.
+
+    A note that cannot be read is worth nothing and a note that cannot be got
+    rid of is worth less, so anything old enough to be about a different day is
+    dropped on the way out.
+    """
+
+    where = _where_the_noes_are(config)
+    try:
+        held = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(held, dict):
+        return {}
+    now = time.time()
+    kept: dict[str, dict[str, Any]] = {}
+    for route, one in held.items():
+        if not isinstance(one, dict) or not isinstance(one.get("why"), str):
+            continue
+        when = one.get("when")
+        if not isinstance(when, (int, float)) or now - when > A_NO_IS_WORTH_MENTIONING_FOR:
+            continue
+        kept[str(route)] = {"why": one["why"], "when": float(when), "at": str(one.get("at") or "")}
+    return kept
+
+
+def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) -> None:
+    """Remember a refusal, or forget one, without ever failing over it.
+
+    This is bookkeeping around somebody's message. If it cannot be written the
+    message still went and the answer still came back, and throwing here would
+    turn a working chat into a broken one over a note.
+    """
+
+    try:
+        # Inside the guard, all of it. Working out where the file goes can throw
+        # as easily as writing it, and neither is worth turning somebody's
+        # working chat into a broken one.
+        where = _where_the_noes_are(config)
+        held = what_would_not_answer(config)
+        if why:
+            held[route] = {"why": why[:LONGEST_NO], "when": time.time(), "at": _now()}
+        elif route not in held:
+            return
+        else:
+            held.pop(route, None)
+        where.parent.mkdir(parents=True, exist_ok=True)
+        # Written beside and moved into place, like the conversations
+        # themselves, so a panel reading this never catches it half written.
+        beside = where.with_name(f"{where.name}.{os.getpid()}-{threading.get_ident()}.part")
+        beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+        os.replace(beside, where)
+    except (OSError, ValueError):
+        return
+
+
 def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
     """Everyone that can be talked to right now, read from the settings.
 
@@ -178,17 +250,30 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
 
     found: list[dict[str, Any]] = []
     routes = config.get("providers", {}) or {}
+    # What was turned down last time somebody asked. Ready used to mean only
+    # "there is a route written down for it", which is not what the word says:
+    # somebody read every agent as ready, typed a message, and found out then.
+    turned_down = what_would_not_answer(config)
     for name, held in sorted(routes.items()):
         if not isinstance(held, dict):
             continue
+        no = turned_down.get(str(name))
         found.append({
             "route": str(name),
             "label": str(name),
             "model": str(held.get("model") or ""),
             "kind": str(held.get("kind") or ""),
-            "ready": True,
-            "why_not": "",
-            "how_to_fix_it": "",
+            "ready": not no,
+            "why_not": (
+                f"The last time this was asked something, it would not answer: {no['why']}"
+                if no else ""
+            ),
+            "how_to_fix_it": (
+                "This is what happened last time, not what will happen now - "
+                "send something and it will try again. It clears itself the "
+                "moment anything gets through."
+                if no else ""
+            ),
         })
     if not found:
         # No named routes: the one this project uses is still somebody, and on
@@ -387,12 +472,17 @@ def _ask_and_keep(
     try:
         answered = provider.complete(request)
     except HarnessError as exc:  # noqa: PERF203 - one shape of failure, one sentence
+        # Remembered against the route, so the board can say this before the
+        # next person types rather than after.
+        _write_down_that_it_would_not(config, route, redactor.text(_in_plain_words(exc)))
         raise ChatError(
             redactor.text(
                 f"{named or 'The assistant'} was asked and did not answer: "
                 f"{_in_plain_words(exc)}"
             )
         ) from exc
+    # It answered, so whatever it said last time is over.
+    _write_down_that_it_would_not(config, route, "")
     back = redactor.text(str(getattr(answered, "text", "") or "").strip())
     if not back:
         raise ChatError(f"{named or 'The assistant'} answered with nothing at all.")

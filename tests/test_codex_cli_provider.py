@@ -11,7 +11,7 @@ from unittest.mock import patch
 from our_harness.config import load_isolated_config
 from our_harness.doctor import run_doctor
 from our_harness.models import HarnessError, ProviderRequest, ResponseFormat
-from our_harness.providers import ProviderRegistry
+from our_harness.providers import ProviderRegistry, codex_cli
 from our_harness.usage import PriceCatalog
 
 
@@ -273,6 +273,28 @@ class CodexCLIProviderTests(unittest.TestCase):
             check = next(item for item in result["checks"] if item["name"] == "provider:subscription")
             self.assertEqual(check["level"], "ok")
             self.assertIn("signed in with ChatGPT", check["message"])
+
+
+class WhatATruncatedAnswerReadsAsTests(unittest.TestCase):
+    """The harness holds what a tool prints to a size, and that cut can land
+    between the two halves of one letter. Read straight through, the last letter
+    of a perfectly good answer becomes a black diamond - the app looking broken
+    where the tool was fine."""
+
+    WHOLE = "ready · done".encode("utf-8")
+
+    def test_a_letter_cut_in_half_by_the_limit_is_dropped_not_shown_as_damage(self) -> None:
+        # That letter is two bytes wide, and the cut lands between them.
+        self.assertEqual(codex_cli._as_words(self.WHOLE[:7]), "ready ")
+
+    def test_a_whole_answer_comes_back_exactly_as_it_was(self) -> None:
+        self.assertEqual(codex_cli._as_words(self.WHOLE), "ready · done")
+
+    def test_something_really_broken_is_still_shown_as_broken(self) -> None:
+        """Damage further in than the last few bytes is damage, and is shown as
+        damage rather than guessed at."""
+
+        self.assertIn("�", codex_cli._as_words(bytes([0xFF, 0xFE]) + b"x" * 40))
 
 
 if __name__ == "__main__":

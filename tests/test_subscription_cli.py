@@ -955,6 +955,42 @@ class TheNewestBuildWinsTests(unittest.TestCase):
         self.assertIn("LOCALAPPDATA", where)
 
 
+class WhenTheAnswerAlreadySaysWhatToDoTests(unittest.TestCase):
+    """A guess offered next to an answer that spelt it out is time wasted.
+
+    On this machine the service says, in words, "ask your admin to enable
+    access". The harness answered that with "run claude setup-token", which
+    cannot work here - so somebody spends another few minutes finding that out
+    for themselves before reading the part that was true.
+    """
+
+    def holder(self):
+        return SubscriptionCLIProvider(
+            LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path.cwd(), [], {}), "claude-cli")
+
+    def said_about(self, reason: str) -> str:
+        with mock.patch.object(
+                SubscriptionCLIProvider, "_how_it_describes_its_sign_in", lambda *a, **k: ""):
+            return self.holder()._and_what_it_says_about_itself(
+                CLAUDE_RECIPE, None, True, reason)
+
+    def test_the_service_naming_the_fix_is_the_fix_somebody_is_told(self) -> None:
+        said = self.said_about(
+            "Your organization has disabled Claude subscription access for Claude "
+            "Code - Use an Anthropic API key instead, or ask your admin to enable access")
+        self.assertIn("only whoever administers it can turn it on", said)
+        self.assertNotIn("setup-token", said)
+
+    def test_a_refusal_that_names_nothing_still_gets_something_to_try(self) -> None:
+        said = self.said_about("that model is not available on your plan")
+        self.assertIn("setup-token", said)
+
+    def test_it_reads_the_words_whatever_case_they_came_in(self) -> None:
+        self.assertIn(
+            "only whoever administers it can turn it on",
+            self.said_about("ASK YOUR ADMIN TO ENABLE ACCESS"))
+
+
 class WhetherItReallyAskedTests(unittest.TestCase):
     """Two very different sentences hang on this, so it has to be read right."""
 
