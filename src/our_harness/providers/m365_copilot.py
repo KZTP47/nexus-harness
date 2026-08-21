@@ -39,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -79,6 +80,10 @@ RENEW_IT_THIS_EARLY = 300
 LONGEST_WAIT = 180.0
 # How long to keep offering the code before giving up on somebody pasting it.
 LONGEST_SIGN_IN = 900
+# How much longer to wait between asks when Microsoft says to slow down. Five
+# seconds is what the rule for this kind of sign-in asks for, and asking again
+# at the old pace gets you stopped altogether.
+SLOW_DOWN_BY = 5
 
 # What to tell somebody, for each of the three things that can be missing.
 HOW_TO_REGISTER_AN_APP = (
@@ -143,12 +148,47 @@ def keep_the_sign_in(held: dict[str, Any]) -> None:
     where = _where_the_sign_in_is()
     where.parent.mkdir(parents=True, exist_ok=True)
     beside = where.with_name(f"{where.name}.{os.getpid()}.part")
-    beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+    # Made with nobody else allowed in, rather than written first and locked
+    # down after. Written first, the token sits there readable by anybody on the
+    # machine for as long as it takes to get to the next line - which is not
+    # long, and is long enough.
+    handle = os.open(beside, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        os.chmod(beside, 0o600)
-    except OSError:
-        pass
+        with os.fdopen(handle, "w", encoding="utf-8") as writing:
+            writing.write(json.dumps(held, indent=2) + "\n")
+    except BaseException:
+        beside.unlink(missing_ok=True)
+        raise
+    _keep_it_to_yourself(beside)
     os.replace(beside, where)
+
+
+def _keep_it_to_yourself(where: Path) -> None:
+    """Ask Windows to let nobody but this account near the file.
+
+    The mode a file is made with is the whole story on Linux and macOS and means
+    almost nothing on Windows, where a file takes whatever the folder it lands in
+    hands down - and that can be a good deal more than one person. This is the
+    only thing here worth stealing, so it is worth asking.
+
+    Asked, not insisted on. Whoever administers the machine can read it whatever
+    this does, and if the asking fails the sign-in still has to be written -
+    refusing to sign somebody in because their permissions could not be narrowed
+    would be worse than the risk, and the folder it sits in is already their own.
+    """
+
+    if os.name != "nt":
+        return
+    who = os.environ.get("USERNAME") or ""
+    if not who:
+        return
+    try:
+        subprocess.run(
+            ["icacls", str(where), "/inheritance:r", "/grant:r", f"{who}:F"],
+            capture_output=True, timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
 
 
 def forget_the_sign_in() -> None:
@@ -240,7 +280,13 @@ def how_the_sign_in_is_going(app: str, waiting_on: str, organisation: str = "") 
     )
     trouble = str(said.get("error") or "")
     if trouble in ("authorization_pending", "slow_down"):
-        return {"done": False, "waiting": True, "why": ""}
+        # Being asked to slow down and slowing down are two different things.
+        # Asked again at the same pace, Microsoft stops answering at all, and
+        # somebody watches a code they already pasted never be noticed.
+        return {
+            "done": False, "waiting": True, "why": "",
+            "wait_longer_by": SLOW_DOWN_BY if trouble == "slow_down" else 0,
+        }
     if trouble:
         return {"done": False, "waiting": False, "why": _what_microsoft_meant(said, app)}
     keep_the_sign_in(_a_sign_in_from(said, app, organisation))
@@ -310,7 +356,11 @@ def a_token_to_use(app: str, organisation: str = "") -> str:
             "Nobody is signed in to Microsoft 365 yet. Open Your team and press "
             "Sign in to Microsoft."
         )
-    if app and held.get("app") and held["app"] != app:
+    # An empty one counts as a different one. Read as "no app, nothing to
+    # check", a sign-in from before anybody wrote an app down gets used against
+    # whatever is written down now, and Microsoft refuses it in a way nothing
+    # here could explain.
+    if app and str(held.get("app") or "") != app:
         raise SignInNeeded(
             "The Microsoft sign-in on this machine is for a different registered app "
             "than the one in the settings. Sign in again."
@@ -375,7 +425,12 @@ class M365CopilotProvider(Provider):
         if not which:
             raise HarnessError("Microsoft 365 Copilot did not open a conversation")
         answered = self._say(
-            f"{WHERE_THE_QUESTIONS_GO}/conversations/{urllib.parse.quote(which)}/chat",
+            # Escaped whole, slashes and all. Left to itself this escapes
+            # everything except a slash, and a name with slashes in it walks
+            # straight out of the part of the address it was meant to fill -
+            # carrying the sign-in with it, to whatever it lands on instead.
+            f"{WHERE_THE_QUESTIONS_GO}/conversations"
+            f"/{urllib.parse.quote(which, safe='')}/chat",
             self._the_question(request),
             held,
             request.timeout_seconds,

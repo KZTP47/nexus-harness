@@ -14,6 +14,7 @@ have, and being sent to the wrong person costs an afternoon.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
@@ -128,6 +129,157 @@ class AgainstAStandInMicrosoft(unittest.TestCase):
         }
 
 
+class TheSettingsItNeedsAreRealSettingsTests(unittest.TestCase):
+    """The settings have to survive being read off a disk.
+
+    Everything else here builds them by hand, which is not how anybody gets
+    them, and that is how the three settings this whole thing needs came to be
+    undeclared: writing one of them down stopped the settings file loading at
+    all. Both the guide and the app's own error message told people to do
+    exactly that.
+    """
+
+    def a_project(self, providers: dict) -> Path:
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        here = Path(folder.name)
+        (here / ".harness").mkdir()
+        (here / ".harness" / "config.json").write_text(
+            json.dumps({"providers": providers}), encoding="utf-8")
+        return here
+
+    def test_the_settings_in_the_guide_are_settings_this_accepts(self) -> None:
+        """Word for word out of docs/MICROSOFT_365_COPILOT.md."""
+
+        import copy
+
+        from our_harness.config import validate_config
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {"microsoft": {
+            "kind": "m365-copilot",
+            "model": "",
+            "microsoft_app": "the Application (client) ID from step 2",
+            "time_zone": "Europe/Oslo",
+        }}
+        validate_config(data)
+
+    def test_the_tenant_can_be_named_too(self) -> None:
+        import copy
+
+        from our_harness.config import validate_config
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {"microsoft": {
+            "kind": "m365-copilot", "model": "",
+            "microsoft_app": "an-app", "microsoft_organisation": "a-tenant"}}
+        validate_config(data)
+
+    def test_it_is_read_back_out_the_way_it_was_written(self) -> None:
+        from our_harness.config import load_isolated_config
+
+        held = load_isolated_config(self.a_project({}), {"providers": {"microsoft": {
+            "kind": "m365-copilot", "model": "",
+            "microsoft_app": "an-app", "time_zone": "Europe/Oslo"}}})
+        settings = held.get("providers", {})["microsoft"]
+        self.assertEqual(settings["microsoft_app"], "an-app")
+        self.assertEqual(settings["time_zone"], "Europe/Oslo")
+
+    def test_a_route_of_this_kind_can_be_made(self) -> None:
+        """The last step of the guide, which nothing else here reaches."""
+
+        import copy
+
+        from our_harness.providers.base import create_provider
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["provider"].update({
+            "name": "m365-copilot", "model": "", "endpoint": "", "api_key_env": "",
+            "microsoft_app": "an-app", "time_zone": "Europe/Oslo"})
+        made = create_provider(LoadedConfig(data, Path.cwd(), [], {}))
+        self.assertEqual(made.app, "an-app")
+        self.assertEqual(made.where_they_are, "Europe/Oslo")
+
+
+class WhereTheSignInIsKeptTests(AgainstAStandInMicrosoft):
+    """This is the one thing here worth stealing."""
+
+    def test_the_file_is_made_with_nobody_else_allowed_in(self) -> None:
+        """Written first and locked down after, the token sits there readable by
+        anybody on the machine for as long as it takes to reach the next line.
+        Which is not long, and is long enough."""
+
+        made = []
+        real = os.open
+
+        def watch(path, flags, mode=0o777, **rest):
+            if str(path).endswith(".part"):
+                made.append((flags, mode))
+            return real(path, flags, mode, **rest)
+
+        with mock.patch.object(os, "open", watch):
+            m365.keep_the_sign_in({"token": "a-token", "renew_with": "a-renewal"})
+        self.assertTrue(made, "it did not make the file itself")
+        flags, mode = made[-1]
+        self.assertEqual(mode, 0o600, "made wide open and narrowed afterwards")
+        self.assertTrue(flags & os.O_EXCL, "it would write over whatever was there")
+
+    def test_on_windows_it_asks_for_the_file_to_be_kept_to_this_account(self) -> None:
+        """The mode a file is made with is the whole story on Linux and means
+        almost nothing on Windows, where a file takes what the folder hands
+        down - and that can be a good deal more than one person."""
+
+        asked = []
+        with mock.patch.object(os, "name", "nt"), \
+             mock.patch.dict("os.environ", {"USERNAME": "somebody"}), \
+             mock.patch.object(
+                 m365.subprocess, "run", lambda *a, **k: asked.append(a[0]) or None):
+            m365.keep_the_sign_in({"token": "a-token"})
+        self.assertTrue(asked, "nothing was asked of Windows at all")
+        self.assertIn("/inheritance:r", asked[0])
+
+    def test_windows_refusing_does_not_stop_somebody_signing_in(self) -> None:
+        """Whoever administers the machine can read it whatever this does.
+        Refusing to sign somebody in because their permissions could not be
+        narrowed would be worse than the risk."""
+
+        def refuse(*args, **rest):
+            raise OSError("no icacls on this machine")
+
+        with mock.patch.object(os, "name", "nt"), \
+             mock.patch.dict("os.environ", {"USERNAME": "somebody"}), \
+             mock.patch.object(m365.subprocess, "run", refuse):
+            m365.keep_the_sign_in({"token": "a-token"})
+        self.assertEqual(m365.read_the_sign_in()["token"], "a-token")
+
+    def test_the_token_is_never_handed_back_to_whoever_asked(self) -> None:
+        self.answers((200, {
+            "access_token": "a-token", "refresh_token": "a-renewal", "expires_in": 3600}))
+        said = m365.how_the_sign_in_is_going("the-app", "d")
+        self.assertNotIn("a-token", json.dumps(said))
+        self.assertNotIn("a-renewal", json.dumps(said))
+
+
+class ANameFromMicrosoftInAWebAddressTests(AgainstAStandInMicrosoft):
+    def test_a_conversation_name_cannot_walk_out_of_its_place(self) -> None:
+        """Whatever Microsoft sends back goes into a web address that carries
+        the sign-in. Escaped in the usual way, slashes are left alone, and a
+        name with slashes in it lands somewhere else entirely - taking the
+        sign-in with it."""
+
+        self.signed_in()
+        self.answers(
+            (201, {"id": "../../../users/somebody-else/sendMail"}),
+            (200, self.an_answer("ok")))
+        provider = self.a_provider(microsoft_app="the-app")
+        provider.complete(ProviderRequest(
+            system_prefix="", dynamic_context="",
+            messages=[{"role": "user", "content": "hello"}], model="", timeout_seconds=30))
+        where = StandingInForMicrosoft.asked[1][0]
+        self.assertNotIn("/users/", where)
+        self.assertIn("%2F", where, "the slashes have to be escaped, not honoured")
+
+
 class SigningInTests(AgainstAStandInMicrosoft):
     """A code pasted into a browser, because there is no key and no window."""
 
@@ -212,6 +364,22 @@ class SigningInTests(AgainstAStandInMicrosoft):
             str(Path.cwd()).lower(), str(m365._where_the_sign_in_is()).lower())
 
 
+class BeingAskedToSlowDownTests(AgainstAStandInMicrosoft):
+    def test_it_says_how_much_longer_to_wait(self) -> None:
+        """Being asked to slow down and slowing down are two different things.
+        Asked again at the old pace, Microsoft stops answering altogether, and
+        somebody watches a code they already pasted never be noticed."""
+
+        self.answers((400, {"error": "slow_down"}))
+        held = m365.how_the_sign_in_is_going("the-app", "d")
+        self.assertTrue(held["waiting"])
+        self.assertGreaterEqual(held["wait_longer_by"], 5)
+
+    def test_just_waiting_does_not_ask_for_any_extra_wait(self) -> None:
+        self.answers((400, {"error": "authorization_pending"}))
+        self.assertEqual(m365.how_the_sign_in_is_going("the-app", "d")["wait_longer_by"], 0)
+
+
 class StayingSignedInTests(AgainstAStandInMicrosoft):
     def test_a_sign_in_with_time_left_is_used_as_it_is(self) -> None:
         self.signed_in()
@@ -250,6 +418,15 @@ class StayingSignedInTests(AgainstAStandInMicrosoft):
         with self.assertRaises(m365.SignInNeeded) as caught:
             m365.a_token_to_use("the-app")
         self.assertIn("Your team", str(caught.exception))
+
+    def test_a_sign_in_from_before_anybody_named_an_app_is_not_used(self) -> None:
+        """Read as "no app written down, so nothing to check", a sign-in from
+        before somebody named one gets used against whatever is named now - and
+        Microsoft refuses it in a way nothing here could explain."""
+
+        self.signed_in(app="")
+        with self.assertRaises(m365.SignInNeeded):
+            m365.a_token_to_use("the-app")
 
     def test_a_sign_in_for_a_different_app_is_not_used(self) -> None:
         """Somebody changed which app is written down. The old sign-in is for
@@ -421,6 +598,140 @@ class WhatIsMissingTests(AgainstAStandInMicrosoft):
     def test_a_sign_in_that_ran_out_with_no_way_back_says_to_sign_in_again(self) -> None:
         self.signed_in(runs_out_at=time.time() - 10, renew_with="")
         self.assertIn("run out", m365.what_is_missing({"microsoft_app": "the-app"}))
+
+
+class TheThreeWaysInToTheSignInTests(unittest.TestCase):
+    """A real panel, real requests over a real socket, Microsoft standing in.
+
+    The browser check for this hands the screen its answers directly, so it
+    shows that the screen draws what it is given and nothing about what the
+    panel does with it. This is the part in between, and it had nothing.
+    """
+
+    def setUp(self) -> None:
+        from our_harness import server
+        from our_harness.config import load_config
+
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        here = Path(self.temporary.name)
+        (here / ".harness").mkdir()
+        (here / ".harness" / "config.json").write_text("{}", encoding="utf-8")
+        self.panel = server.HarnessHTTPServer(("127.0.0.1", 0), load_config(here))
+        self.addCleanup(self.panel.server_close)
+        self.port = self.panel.server_address[1]
+        thread = threading.Thread(target=self.panel.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.panel.shutdown)
+
+    def ask(self, path: str, body: dict) -> tuple[int, dict]:
+        import urllib.error
+        import urllib.request
+
+        asked = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Harness-Token": self.panel.token,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(asked, timeout=15) as answer:
+                return answer.status, json.loads(answer.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def microsoft_offers(self, **held):
+        return mock.patch.object(m365, "start_signing_in", lambda app, org="": {
+            "code": "ABCD-EFGH", "where": "https://microsoft.com/devicelogin",
+            "waiting_on": "a-handle", "ask_again_after": 5, "gives_up_at": 0, **held})
+
+    def test_it_gives_back_a_code_and_never_the_handle_behind_it(self) -> None:
+        """The handle is Microsoft's name for this attempt. Worth nothing to
+        anybody without the code, and still not something to put on a screen."""
+
+        with self.microsoft_offers():
+            status, said = self.ask("/api/microsoft/sign-in", {"app": "an-app"})
+        self.assertEqual(status, 200)
+        self.assertEqual(said["code"], "ABCD-EFGH")
+        self.assertNotIn("a-handle", json.dumps(said))
+
+    def test_asking_how_it_is_going_before_starting_says_so(self) -> None:
+        status, said = self.ask("/api/microsoft/sign-in/how-it-is-going", {})
+        self.assertEqual(status, 400)
+        self.assertIn("Press Sign in to Microsoft first", said["error"])
+
+    def test_a_second_window_does_not_quietly_take_the_first_ones_place(self) -> None:
+        """Two windows on the same panel both pressed Sign in. The first then
+        sat there asking about a code nothing was waiting on any more, showing
+        somebody a code that would never be noticed however carefully they
+        typed it."""
+
+        with self.microsoft_offers():
+            _status, first = self.ask("/api/microsoft/sign-in", {"app": "an-app"})
+            _status, second = self.ask("/api/microsoft/sign-in", {"app": "an-app"})
+        self.assertNotEqual(first["attempt"], second["attempt"])
+        status, said = self.ask(
+            "/api/microsoft/sign-in/how-it-is-going", {"attempt": first["attempt"]})
+        self.assertEqual(status, 400)
+        self.assertIn("replaced by a newer one", said["error"])
+
+    def test_the_newer_window_is_the_one_that_works(self) -> None:
+        with self.microsoft_offers():
+            self.ask("/api/microsoft/sign-in", {"app": "an-app"})
+            _status, second = self.ask("/api/microsoft/sign-in", {"app": "an-app"})
+        with mock.patch.object(
+                m365, "how_the_sign_in_is_going",
+                lambda app, waiting_on, org="": {
+                    "done": True, "waiting": False, "why": "", "handle": waiting_on}):
+            status, said = self.ask(
+                "/api/microsoft/sign-in/how-it-is-going", {"attempt": second["attempt"]})
+        self.assertEqual(status, 200)
+        self.assertTrue(said["done"])
+
+    def test_the_app_that_was_asked_for_is_the_app_that_is_used(self) -> None:
+        """Not whatever the window asking happens to send the second time."""
+
+        used = []
+        with self.microsoft_offers():
+            _status, held = self.ask("/api/microsoft/sign-in", {"app": "the-right-app"})
+        with mock.patch.object(
+                m365, "how_the_sign_in_is_going",
+                lambda app, waiting_on, org="": used.append(app) or {
+                    "done": True, "waiting": False, "why": ""}):
+            self.ask("/api/microsoft/sign-in/how-it-is-going", {
+                "attempt": held["attempt"], "app": "a-different-app"})
+        self.assertEqual(used, ["the-right-app"])
+
+    def test_nobody_without_the_panel_token_gets_in(self) -> None:
+        import urllib.error
+        import urllib.request
+
+        asked = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/microsoft/sign-in",
+            data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(asked, timeout=15)
+        with caught.exception as exc:
+            self.assertEqual(exc.code, 400)
+
+    def test_signing_out_forgets_the_attempt_as_well_as_the_sign_in(self) -> None:
+        """Left behind, the next window to ask gets an answer about a sign-in
+        somebody deliberately got rid of."""
+
+        with self.microsoft_offers():
+            self.ask("/api/microsoft/sign-in", {"app": "an-app"})
+        forgotten = []
+        with mock.patch.object(m365, "forget_the_sign_in", lambda: forgotten.append(1)):
+            status, said = self.ask("/api/microsoft/sign-out", {})
+        self.assertEqual((status, said["signed_out"]), (200, True))
+        self.assertEqual(forgotten, [1])
+        status, said = self.ask("/api/microsoft/sign-in/how-it-is-going", {})
+        self.assertEqual(status, 400)
+        self.assertIn("Press Sign in to Microsoft first", said["error"])
 
 
 if __name__ == "__main__":

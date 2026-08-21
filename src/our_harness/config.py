@@ -37,6 +37,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "timeout_seconds": 180,
         "command": [],
+        # Microsoft 365 Copilot signs in as a registered app rather than with a
+        # key, so it needs the app's number written down, and the time zone of
+        # whoever is asking - "what meeting do I have at nine tomorrow" means
+        # nothing without one. Empty for every other kind, which is all of them.
+        "microsoft_app": "",
+        "microsoft_organisation": "",
+        "time_zone": "",
     },
     "providers": {},
     "agents": {},
@@ -801,7 +808,11 @@ def validate_config(data: dict[str, Any]) -> None:
             raise HarnessError(f"{dotted}.kind must name a supported provider")
         if "kind" in profile and "name" in profile and profile["kind"] != profile["name"]:
             raise HarnessError(f"{dotted}.kind conflicts with name")
-        _require_string(profile.get("model"), f"{dotted}.model", allow_empty=False)
+        # Microsoft 365 Copilot has no model to pick: Microsoft chooses, and
+        # there is nothing to write here. Everything else names one.
+        _require_string(
+            profile.get("model"), f"{dotted}.model",
+            allow_empty=name == "m365-copilot")
         endpoint = _require_string(profile.get("endpoint", ""), f"{dotted}.endpoint")
         if name in ("claude-cli", "copilot-cli", "assistant-cli", "m365-copilot"):
             if endpoint:

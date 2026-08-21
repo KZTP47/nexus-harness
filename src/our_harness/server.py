@@ -171,6 +171,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # write, and two windows open on the same board would otherwise each
         # write a whole board built from what it read before the other wrote.
         self.swarm_lock = threading.Lock()
+        # The Microsoft sign-in somebody is part way through, if anybody is.
+        # One at a time, because there is one machine and one browser code.
+        self.microsoft_lock = threading.Lock()
+        self.microsoft_sign_in: dict[str, str] = {}
         # Setting the board going is one run at a time, in the background,
         # because every turn is a real assistant being asked a real question and
         # a page that says nothing for two minutes is a page nobody trusts.
@@ -1471,35 +1475,53 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     str(body.get("app") or "").strip(),
                     str(body.get("organisation") or "").strip(),
                 )
-                # The waiting_on is Microsoft's handle for this attempt and is
-                # worth nothing to anybody without the code, but it is still
-                # not something to put on a screen.
-                self.server.microsoft_waiting_on = held.pop("waiting_on")
-                self.server.microsoft_app = str(body.get("app") or "").strip()
-                self.server.microsoft_organisation = str(body.get("organisation") or "").strip()
+                # Each attempt carries a number of its own. Two windows open on
+                # the same panel both pressed this, and the second quietly took
+                # the first one's place - leaving the first showing a code that
+                # would never be noticed however carefully somebody typed it.
+                with self.server.microsoft_lock:
+                    self.server.microsoft_sign_in = {
+                        "attempt": secrets.token_urlsafe(12),
+                        # Microsoft's handle for this attempt. Worth nothing to
+                        # anybody without the code, and still not something to
+                        # put on a screen.
+                        "waiting_on": held.pop("waiting_on"),
+                        "app": str(body.get("app") or "").strip(),
+                        "organisation": str(body.get("organisation") or "").strip(),
+                    }
+                    held["attempt"] = self.server.microsoft_sign_in["attempt"]
                 self._json(held)
             elif self.path == "/api/microsoft/sign-in/how-it-is-going":
                 from .providers import m365_copilot as microsoft
 
-                waiting_on = getattr(self.server, "microsoft_waiting_on", "")
-                if not waiting_on:
+                with self.server.microsoft_lock:
+                    held = dict(getattr(self.server, "microsoft_sign_in", None) or {})
+                if not held.get("waiting_on"):
                     raise HarnessError(
                         "Nothing is waiting on a code. Press Sign in to Microsoft first.")
+                asked_about = str(body.get("attempt") or "")
+                if asked_about and asked_about != held["attempt"]:
+                    raise HarnessError(
+                        "That sign-in was replaced by a newer one, probably in another "
+                        "window. Press Sign in to Microsoft again to get a fresh code.")
                 said = microsoft.how_the_sign_in_is_going(
-                    getattr(self.server, "microsoft_app", ""),
-                    waiting_on,
-                    getattr(self.server, "microsoft_organisation", ""),
-                )
+                    held.get("app", ""), held["waiting_on"], held.get("organisation", ""))
                 if said["done"] or not said["waiting"]:
-                    # Over either way, so the handle goes. Left lying about, a
-                    # later press would ask again about an attempt that is
-                    # finished and be told something confusing.
-                    self.server.microsoft_waiting_on = ""
+                    # Over either way, so the handle goes - but only if it is
+                    # still this attempt's. A newer one may have started while
+                    # Microsoft was being asked, and throwing that away would
+                    # break the window that is now the live one.
+                    with self.server.microsoft_lock:
+                        now = getattr(self.server, "microsoft_sign_in", None) or {}
+                        if now.get("attempt") == held["attempt"]:
+                            self.server.microsoft_sign_in = {}
                 self._json(said)
             elif self.path == "/api/microsoft/sign-out":
                 from .providers import m365_copilot as microsoft
 
                 microsoft.forget_the_sign_in()
+                with self.server.microsoft_lock:
+                    self.server.microsoft_sign_in = {}
                 self._json({"signed_out": True})
             elif self.path == "/api/swarm/start-again":
                 with self.server.swarm_lock:

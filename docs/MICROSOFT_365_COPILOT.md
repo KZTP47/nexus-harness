@@ -88,6 +88,17 @@ A project folder is a thing people copy onto shared drives and push to GitHub,
 and this file is the one thing here worth stealing. **Forget this sign-in** in
 Your team removes it, which is what to press before handing a machine on.
 
+The file is made with nobody but you allowed in, rather than written first and
+locked down afterwards - written first, the token sits there readable by anybody
+on the machine for as long as it takes to reach the next line, which is not long
+and is long enough. On Windows the harness also asks for the file to be kept to
+your account alone, since a file there otherwise takes whatever permissions the
+folder hands down.
+
+That is asking, not insisting. **Whoever administers the machine can read it
+whatever the harness does.** Treat it the way you would treat being signed in to
+Outlook on that machine, because it is the same thing.
+
 ## What it will not do
 
 - **Text back, and nothing else.** No writing files, no sending mail, no

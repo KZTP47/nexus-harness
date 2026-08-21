@@ -6895,6 +6895,11 @@ function showEveryPairAgain() {
 // passes through this screen at any point.
 
 let microsoftWaiting = null;
+// Which attempt this window is watching, and how long it waits between asks.
+// Two windows on the same panel can both press Sign in, and only the newer one
+// is the one Microsoft is waiting on.
+let microsoftAttempt = "";
+let microsoftEvery = 5000;
 
 function sayAboutMicrosoft(words) {
   const where = $("microsoftSays");
@@ -6926,16 +6931,17 @@ function showTheMicrosoftCode(said) {
   $("microsoftWhere").textContent = said.where;
   $("microsoftWhere").href = said.where;
   $("microsoftCodeBox").hidden = false;
+  microsoftAttempt = said.attempt || "";
   sayAboutMicrosoft(
     "Open the address below, paste the code, and sign in with your work account. "
     + "This window will notice when you are done.");
   // Asked no faster than Microsoft said to ask. Faster and they start refusing.
-  const every = Math.max(2, Number(said.ask_again_after) || 5) * 1000;
-  microsoftWaiting = setInterval(askIfMicrosoftIsDoneYet, every);
+  microsoftEvery = Math.max(2, Number(said.ask_again_after) || 5) * 1000;
+  microsoftWaiting = setTimeout(askIfMicrosoftIsDoneYet, microsoftEvery);
 }
 
 function stopWaitingOnMicrosoft() {
-  if (microsoftWaiting) clearInterval(microsoftWaiting);
+  if (microsoftWaiting) clearTimeout(microsoftWaiting);
   microsoftWaiting = null;
 }
 
@@ -6943,9 +6949,17 @@ async function askIfMicrosoftIsDoneYet() {
   try {
     // A body even though there is nothing to say in it: the panel will not
     // read a request that has none.
-    const said = await request(
-      "/api/microsoft/sign-in/how-it-is-going", {method: "POST", body: "{}"});
-    if (said.waiting) return;
+    const said = await request("/api/microsoft/sign-in/how-it-is-going", {
+      method: "POST", body: JSON.stringify({attempt: microsoftAttempt}),
+    });
+    if (said.waiting) {
+      // Microsoft asking to slow down and this window slowing down are two
+      // different things. Kept at the old pace it gets stopped altogether, and
+      // then somebody watches a code they already pasted never be noticed.
+      if (said.wait_longer_by) microsoftEvery += Number(said.wait_longer_by) * 1000;
+      microsoftWaiting = setTimeout(askIfMicrosoftIsDoneYet, microsoftEvery);
+      return;
+    }
     stopWaitingOnMicrosoft();
     $("microsoftCodeBox").hidden = true;
     if (said.done) {
