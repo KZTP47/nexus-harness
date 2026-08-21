@@ -36,6 +36,8 @@ dare touch.
 from __future__ import annotations
 
 import json
+import os
+import hashlib
 import re
 import threading
 import time
@@ -564,6 +566,10 @@ def how_it_stands(config) -> dict[str, Any]:
         agents.append(held)
     return {
         "board": dict(board.to_dict(), agents=agents),
+        # The boards somebody saved under a name. Sent with the board itself, so
+        # opening the panel shows what is kept without pressing anything - and
+        # so anything that changes the list has the new one in its answer.
+        "kept": every_kept_board(),
         "who_can_be_used": can_talk,
         "projects_on_this_machine": [
             one.to_dict() for one in projects_lab.every_one(config.project_root)
@@ -1130,3 +1136,142 @@ def _how_it_went(doing: Doing) -> str:
         "conversation, on its box."
     )
 
+
+# ---------------------------------------------------------------------------
+# Boards kept under a name
+# ---------------------------------------------------------------------------
+#
+# The board you are working on is written down on its own and comes back on its
+# own. These are the ones somebody meant to keep: a shape worth having again,
+# saved under a name, opened when it is wanted.
+#
+# Kept beside the working board rather than inside it, so nothing about saving
+# can damage the one you are actually using.
+
+# How many a person can keep. Far more than anybody has, low enough that this
+# cannot quietly become somewhere a folder fills up.
+MOST_KEPT_BOARDS = 60
+# How long a name may be, so it fits on a row and in a file name.
+LONGEST_BOARD_NAME = 48
+
+
+def where_the_kept_ones_live() -> Path:
+    from .config import user_config_path
+
+    return user_config_path().parent / "swarms"
+
+
+def _filed_under(name: str) -> str:
+    """The file one saved board goes in.
+
+    A name is something somebody typed, so it is checked rather than trusted,
+    and it may not reach out of the folder it belongs in.
+    """
+
+    said = " ".join(str(name or "").split())
+    if not said:
+        raise SwarmError("Give the board a name first.")
+    if len(said) > LONGEST_BOARD_NAME:
+        raise SwarmError(
+            f"That name is too long. {LONGEST_BOARD_NAME} letters is the most.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.-]*", said):
+        raise SwarmError(
+            f"{said!r} is not a name a board can be kept under. Names hold "
+            "letters, numbers, spaces, dots, dashes and underscores."
+        )
+    tidy = said.replace(" ", "-").lower()
+    # A file name on Windows does not care about capitals, so "Friday" and
+    # "friday" - two names somebody meant to keep apart - would share one file
+    # and one of them would quietly become the other.
+    marked = hashlib.sha256(said.encode("utf-8")).hexdigest()[:8]
+    return f"{tidy}-{marked}.json"
+
+
+def every_kept_board() -> list[dict[str, Any]]:
+    """Every board somebody saved, newest first."""
+
+    where = where_the_kept_ones_live()
+    found: list[dict[str, Any]] = []
+    try:
+        files = sorted(where.glob("*.json"))
+    except OSError:
+        return []
+    for one in files:
+        try:
+            held = json.loads(one.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # A board that cannot be read is one that is not offered. It is not
+            # worth stopping the list of all the others over.
+            continue
+        if not isinstance(held, dict) or not isinstance(held.get("name"), str):
+            continue
+        board = held.get("board") if isinstance(held.get("board"), dict) else {}
+        found.append({
+            "name": held["name"],
+            "saved_at": str(held.get("saved_at") or ""),
+            "agents": len(board.get("agents") or []),
+            "projects": len(board.get("projects") or []),
+        })
+    return sorted(found, key=lambda one: one["saved_at"], reverse=True)
+
+
+def keep_this_board(name: str) -> dict[str, Any]:
+    """Save the board as it stands now, under a name.
+
+    What is saved is what is on the board this moment, not what was last set
+    going. Somebody pressing save has just finished arranging it.
+    """
+
+    filed = _filed_under(name)
+    where = where_the_kept_ones_live()
+    where.mkdir(parents=True, exist_ok=True)
+    already = every_kept_board()
+    if len(already) >= MOST_KEPT_BOARDS and not (where / filed).is_file():
+        raise SwarmError(
+            f"There are already {MOST_KEPT_BOARDS} saved boards, which is the most. "
+            "Delete one you no longer want first."
+        )
+    held = {
+        "name": " ".join(str(name).split()),
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "board": load().to_dict(),
+    }
+    # Written beside and moved into place, so a panel reading the list never
+    # catches a board half written.
+    beside = where / f"{filed}.{os.getpid()}.part"
+    beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+    os.replace(beside, where / filed)
+    return {"name": held["name"], "saved_at": held["saved_at"]}
+
+
+def open_this_board(name: str) -> Board:
+    """Put a saved board back on the screen, as the one being worked on.
+
+    The board it replaces is not lost by accident: it can be saved first, and
+    the panel asks. What this will not do is quietly merge the two, which is how
+    somebody ends up with a board holding both and belonging to neither.
+    """
+
+    where = where_the_kept_ones_live() / _filed_under(name)
+    try:
+        held = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SwarmError(f"There is no saved board called {name}.") from exc
+    board = held.get("board") if isinstance(held, dict) else None
+    if not isinstance(board, dict):
+        raise SwarmError(f"The board saved as {name} cannot be read.")
+    # Through the same door as any other save, so a board saved by an older
+    # version is checked and tidied the same way rather than trusted.
+    return save(dict(board, version=None))
+
+
+def forget_this_board(name: str) -> None:
+    """Throw away one saved board."""
+
+    where = where_the_kept_ones_live() / _filed_under(name)
+    try:
+        where.unlink()
+    except FileNotFoundError as exc:
+        raise SwarmError(f"There is no saved board called {name}.") from exc
+    except OSError as exc:
+        raise SwarmError(f"The board saved as {name} could not be deleted: {exc}") from exc

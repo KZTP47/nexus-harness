@@ -1070,12 +1070,34 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 validate_config(self.config(name=kind, model="m", endpoint="", api_key_env=""))
 
-    def test_a_signed_in_assistant_may_not_carry_an_endpoint_or_a_key(self) -> None:
-        for change in ({"endpoint": "https://api.example.com"}, {"api_key_env": "SOME_KEY"}):
-            with self.subTest(change=change), self.assertRaises(HarnessError):
-                validate_config(self.config(**{
-                    "name": "claude-cli", "model": "m", "endpoint": "", "api_key_env": "", **change,
-                }))
+    def test_a_signed_in_assistant_may_not_carry_an_endpoint(self) -> None:
+        """It has no address to call. It runs a program that knows where to go."""
+
+        with self.assertRaises(HarnessError):
+            validate_config(self.config(
+                name="claude-cli", model="m", endpoint="https://api.example.com",
+                api_key_env=""))
+
+    def test_a_signed_in_assistant_may_be_given_a_key_instead(self) -> None:
+        """It used to be refused outright, which was right when the only reason
+        to name a key was by mistake. Somebody who has a key and would rather
+        spend that than a seat is not making a mistake, and the tool's own
+        command line reads one out of an environment variable."""
+
+        for kind in ("claude-cli", "copilot-cli", "gemini-cli"):
+            with self.subTest(kind=kind):
+                validate_config(self.config(
+                    name=kind, model="m", endpoint="", api_key_env="A_KEY_OF_MINE"))
+
+    def test_the_ones_whose_service_allows_no_key_still_refuse_one(self) -> None:
+        """Microsoft 365 Copilot is the plain case: a person signing in is the
+        only way in that exists, so a key written down there is somebody
+        expecting something that cannot happen."""
+
+        with self.assertRaises(HarnessError) as caught:
+            validate_config(self.config(
+                name="m365-copilot", model="", endpoint="", api_key_env="A_KEY"))
+        self.assertIn("cannot be given a key", str(caught.exception))
 
     def test_a_signed_in_assistant_may_leave_the_model_empty(self) -> None:
         validate_config(self.config(name="claude-cli", model="", endpoint="", api_key_env=""))

@@ -6840,6 +6840,189 @@
         "max_console_errors": 0,
         "max_page_errors": 0
       }
+    },
+    {
+      "id": "the-automations-tab-can-be-picked-out-of-the-row",
+      "title": "Automations is purple, the way the board is yellow",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 120,
+      "steps": [
+        {
+          "do": "run",
+          "script": "const tab = document.querySelector('[data-view=\"pipelines\"]'); if (!tab) return 'there is no automations tab'; if (!tab.classList.contains('the-automations')) return 'the automations tab is not marked out at all'; const drawn = getComputedStyle(tab).color; const others = getComputedStyle(document.querySelector('[data-view=\"checks\"]')).color; return drawn !== others ? 'the automations tab is a colour of its own' : 'it is drawn the same as every other tab';",
+          "text": "the automations tab is a colour of its own",
+          "timeout_ms": 45000,
+          "note": "A row of identical tabs is a row nobody finds anything in"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open it"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => !document.getElementById('pipelinesView').hidden)) return 'automations never opened'; const tab = document.querySelector('[data-view=\"pipelines\"]'); return getComputedStyle(tab).backgroundColor !== getComputedStyle(document.querySelector('[data-view=\"checks\"]')).backgroundColor ? 'and it stays its own colour when it is the one you are on' : 'it looks like every other open tab';",
+          "text": "and it stays its own colour when it is the one you are on",
+          "timeout_ms": 45000,
+          "note": "Being findable is the point, and that does not stop when it is open"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "a-step-can-be-given-a-time-limit-and-allowed-to-fail",
+      "title": "The two things a step could not be told before",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open Automations"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => !document.getElementById('pipelinesView').hidden)) return 'automations never opened'; if (!await waitFor(() => pipeline && pipeline.nodes && pipeline.nodes.length)) return 'there are no steps to open'; openPipelineNode(pipeline.nodes[0].id); if (!await waitFor(() => document.getElementById('pipelineNodeDialog').open)) return 'the step settings never opened'; const missing = ['pipelineNodeLongest', 'pipelineNodeEvenIfItFails'].filter(one => !document.getElementById(one)); return missing.length ? 'missing: ' + missing.join(', ') : 'a step can be given a time limit and let off failing';",
+          "text": "a step can be given a time limit and let off failing",
+          "timeout_ms": 45000,
+          "note": "A step that can hang for ever is an automation nobody can leave alone"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; window.__stepWas = JSON.parse(JSON.stringify(pipeline.nodes[0].settings || {})); document.getElementById('pipelineNodeLongest').value = '90'; document.getElementById('pipelineNodeEvenIfItFails').checked = true; savePipelineNode(); const held = pipeline.nodes[0].settings || {}; return held.longest === 90 && held.even_if_it_fails === true ? 'what was typed in is what the step keeps' : 'the step kept ' + JSON.stringify(held);",
+          "text": "what was typed in is what the step keeps",
+          "timeout_ms": 45000,
+          "note": "A setting that is not kept is a setting that does nothing"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; renderPipeline(); const said = [...document.querySelectorAll('.pipeline-node-wait')].map(one => one.textContent).join(' '); return said.includes('90 seconds') && said.includes('carries on') ? 'and the step says so without being opened' : 'the step says ' + said;",
+          "text": "and the step says so without being opened",
+          "timeout_ms": 45000,
+          "note": "Something you can only see by opening it is something nobody checks"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openPipelineNode(pipeline.nodes[0].id); if (!await waitFor(() => document.getElementById('pipelineNodeDialog').open)) return 'it did not open again'; const back = document.getElementById('pipelineNodeLongest').value === '90' && document.getElementById('pipelineNodeEvenIfItFails').checked; document.getElementById('pipelineNodeLongest').value = String(window.__stepWas.longest || 0); document.getElementById('pipelineNodeEvenIfItFails').checked = Boolean(window.__stepWas.even_if_it_fails); savePipelineNode(); return back ? 'and it reads back the same when it is opened again' : 'it opened showing something else';",
+          "text": "and it reads back the same when it is opened again",
+          "timeout_ms": 45000,
+          "note": "Kept but not shown is the same as lost, to whoever opens it next"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "a-board-can-be-saved-under-a-name-and-opened-again",
+      "title": "More than one board, each kept under a name",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "swarm"
+      ],
+      "touches": [
+        "the board of agents"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 300,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"swarm\"]",
+          "note": "Open the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__keptWas = (await request('/api/swarm')).board; document.getElementById('swarmKeep').click(); if (!await waitFor(() => document.getElementById('askDialog').open)) return 'pressing Save this board asked nothing'; document.getElementById('askDialogInput').value = 'A check board'; document.getElementById('askDialogOk').click(); if (!await waitFor(() => [...document.querySelectorAll('.swarm-kept-pick')].some(one => one.textContent.includes('A check board')))) return 'nothing was saved'; const named = [...document.querySelectorAll('.swarm-kept-pick')].map(one => one.textContent); return named.some(one => one.includes('A check board')) ? 'a board can be saved under a name' : 'the saved boards are ' + named.join(', ');",
+          "text": "a board can be saved under a name",
+          "timeout_ms": 45000,
+          "note": "One board and only ever one means the second arrangement is built from memory"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const row = [...document.querySelectorAll('.swarm-kept-pick')].find(one => one.textContent.includes('A check board')); if (!row) return 'the saved board is not there to press'; if (!(row.getAttribute('aria-label') || '').includes('A check board')) return 'the row does not say what it is when it is read out'; const asked = window.confirm; window.confirm = () => true; row.click(); const back = await waitFor(() => (document.getElementById('swarmSaid').textContent || '').includes('A check board')); window.confirm = asked; return back ? 'and pressing it puts that board back' : 'pressing it said nothing';",
+          "text": "and pressing it puts that board back",
+          "timeout_ms": 45000,
+          "note": "Saved and not openable again is not saved"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; await request('/api/swarm/forget-kept', {method: 'POST', body: JSON.stringify({name: 'A check board'})}); await refreshSwarm(); const named = [...document.querySelectorAll('.swarm-kept-pick')].map(one => one.textContent); return named.some(one => one.includes('A check board')) ? 'it is still listed after being deleted' : 'and it can be deleted again';",
+          "text": "and it can be deleted again",
+          "timeout_ms": 45000,
+          "note": "Leave this machine's saved boards as they were found"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; await request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, window.__keptWas, {version: undefined})})}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; return 'the board this machine had is back';",
+          "text": "the board this machine had is back",
+          "timeout_ms": 45000,
+          "note": "Leave this machine's board exactly as it was found"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
+    },
+    {
+      "id": "models-running-on-this-machine-are-found-and-listed",
+      "title": "A model on your own machine, found rather than typed in",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "team",
+        "local"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"team\"]",
+          "note": "Open Your team"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; if (!await waitFor(() => !document.getElementById('teamView').hidden)) return 'Your team never opened'; if (!await waitFor(() => document.querySelectorAll('.local-model-one').length)) return 'nothing about models on this machine was drawn'; const named = [...document.querySelectorAll('.local-model-one strong')].map(one => one.textContent); return named.includes('Ollama') && named.includes('LM Studio') ? 'the places a model could be running are all listed' : 'it listed ' + named.join(', ');",
+          "text": "the places a model could be running are all listed",
+          "timeout_ms": 45000,
+          "note": "Nothing found is a worse answer than here is what you could have"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const stopped = [...document.querySelectorAll('.local-model-one.not-running')]; if (!stopped.length) return 'nothing is stopped, so this proves nothing today'; const said = stopped[0].textContent; return said.includes('Get it from') || said.includes('not running') ? 'and one that is not running says what to do about it' : 'it says ' + said.slice(0, 80);",
+          "text": "and one that is not running says what to do about it",
+          "timeout_ms": 45000,
+          "note": "The one route that needs nobody's permission should be the easiest to start"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const running = document.querySelector('.local-model-one.running'); if (!running) return 'nothing is running on this machine today'; const use = running.querySelector('.local-model-names button'); if (!use) return 'a running server offered no model to use'; if (!(use.getAttribute('aria-label') || '').startsWith('Use ')) return 'the model button does not say what it is when it is read out'; const real = window.request; let asked = null; window.request = async (where, how) => { if (where === '/api/local-models/use') { asked = JSON.parse(how.body); return {route: 'a-model', using: {}}; } return real(where, how); }; use.click(); await waitFor(() => asked !== null); window.request = real; return asked && asked.model && asked.server ? 'and one press is all it takes to use one' : 'pressing it asked for ' + JSON.stringify(asked);",
+          "text": "and one press is all it takes to use one",
+          "timeout_ms": 45000,
+          "note": "Knowing the port and the model name by heart is not setting something up"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0
+      }
     }
   ]
 }

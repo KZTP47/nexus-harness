@@ -36,6 +36,7 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
     "claude-cli": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
     "copilot-cli": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
     "assistant-cli": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
+    "gemini-cli": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
     "m365-copilot": ProviderCapabilities(False, False, False, False, False, False, False, False, False),
 }
 

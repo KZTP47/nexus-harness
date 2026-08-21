@@ -155,14 +155,73 @@ def where_the_desktop_is() -> Path:
     """
 
     if os.name == "nt":
-        said = _ask_windows("[Environment]::GetFolderPath('Desktop')")
+        # The registry first, because Python reads it on its own. Asking
+        # PowerShell needs PowerShell, and on a machine where somebody has
+        # turned scripts off there is none to ask.
+        said = _desktop_out_of_the_registry()
+        if said:
+            return said
+        try:
+            said = _ask_windows("[Environment]::GetFolderPath('Desktop')")
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            said = ""
         if said:
             return Path(said)
     return Path.home() / "Desktop"
 
 
+def _desktop_out_of_the_registry() -> Path | None:
+    """Where Windows itself says the desktop is.
+
+    Guessed at as the home folder with Desktop on the end, it is wrong for
+    everybody whose desktop is kept in OneDrive - which at work is most people -
+    and the icon lands somewhere they never look. Windows keeps the real answer
+    here, and Python reads it without asking anything else to help.
+    """
+
+    try:
+        import winreg
+    except ImportError:
+        return None
+    for root, where in (
+        (winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"),
+        (winreg.HKEY_CURRENT_USER,
+         r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"),
+    ):
+        try:
+            with winreg.OpenKey(root, where) as key:
+                said, _kind = winreg.QueryValueEx(key, "Desktop")
+        except OSError:
+            continue
+        # The first of the two holds things like %USERPROFILE%\Desktop, which is
+        # a path once it is filled in and nonsense before.
+        held = Path(os.path.expandvars(str(said)))
+        if held.is_dir():
+            return held
+    return None
+
+
 def _windows_shortcut(where: Path, launcher: Launcher, icon: Path) -> None:
-    arguments = " ".join(f'"{one}"' for one in launcher.arguments)
+    """The icon on the desktop, made whichever way this machine allows.
+
+    Windows' own shortcut maker first, asked directly. On plenty of company
+    machines PowerShell is gone - scripts turned off, or held in a mode where it
+    cannot make one of these at all - and none of that is anything the person
+    holding the installer can change. Asking the shortcut maker itself steps
+    over all of it: it is part of Windows, and the rule was about PowerShell.
+
+    PowerShell is still there as a second try, for the odd machine where it is
+    the other way round.
+    """
+
+    try:
+        _shortcut_the_direct_way(where, launcher, icon)
+        if where.is_file():
+            return
+    except OSError:
+        pass
+    arguments = arguments_for(launcher)
     quoted = as_powershell_text
     script = (
         "$made = (New-Object -ComObject WScript.Shell)"
@@ -174,7 +233,154 @@ def _windows_shortcut(where: Path, launcher: Launcher, icon: Path) -> None:
         f"$made.Description = '{quoted(WHAT_IT_IS_FOR)}';"
         "$made.Save()"
     )
-    _ask_windows(script)
+    try:
+        _ask_windows(script)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            "Windows would not make the shortcut, either directly or through "
+            f"PowerShell. What it said last: {exc}"
+        ) from exc
+    if not where.is_file():
+        # PowerShell can say nothing at all and do nothing at all, in a mode
+        # that quietly refuses. Believing it leaves somebody with no icon and a
+        # message saying it worked, which is the worst of both.
+        raise RuntimeError(
+            "Windows said nothing and made no shortcut. This machine may have "
+            "PowerShell locked down; the icon can be made by hand instead - "
+            "right-click the desktop, New, Shortcut."
+        )
+
+
+# What Windows calls its shortcut maker, and the two ways of talking to it.
+_THE_SHORTCUT_MAKER = "00021401-0000-0000-C000-000000000046"
+_SETTING_ONE_UP = "000214F9-0000-0000-C000-000000000046"   # IShellLinkW
+_WRITING_IT_OUT = "0000010B-0000-0000-C000-000000000046"   # IPersistFile
+
+
+def _a_windows_id(said: str):
+    """One of Windows' long numbers, laid out the way Windows lays them out."""
+
+    import ctypes
+
+    class TheNumber(ctypes.Structure):
+        _fields_ = [
+            ("first", ctypes.c_uint32),
+            ("second", ctypes.c_uint16),
+            ("third", ctypes.c_uint16),
+            ("rest", ctypes.c_ubyte * 8),
+        ]
+
+    parts = said.split("-")
+    held = TheNumber()
+    held.first = int(parts[0], 16)
+    held.second = int(parts[1], 16)
+    held.third = int(parts[2], 16)
+    tail = bytes.fromhex(parts[3] + parts[4])
+    held.rest = (ctypes.c_ubyte * 8)(*tail)
+    return held
+
+
+def _shortcut_the_direct_way(where: Path, launcher: Launcher, icon: Path) -> None:
+    """Ask Windows' shortcut maker for a shortcut, and nothing else for anything.
+
+    The maker is reached through a list of its own functions rather than by
+    name, which is how Windows has always offered it. The numbers below are
+    which one is where in that list, and they have not moved since the nineties.
+    """
+
+    import ctypes
+    from ctypes import POINTER, byref, c_void_p, c_wchar_p
+
+    ole32 = ctypes.oledll.ole32
+    ole32.CoInitialize(None)
+    try:
+        maker = c_void_p()
+        ole32.CoCreateInstance(
+            byref(_a_windows_id(_THE_SHORTCUT_MAKER)),
+            None,
+            1,  # in this program, rather than in one of its own
+            byref(_a_windows_id(_SETTING_ONE_UP)),
+            byref(maker),
+        )
+        if not maker:
+            raise OSError("Windows did not hand back a shortcut to fill in")
+        try:
+            _tell_it(maker, 20, str(launcher.program))            # where it points
+            _tell_it(maker, 11, arguments_for(launcher))          # what to say to it
+            _tell_it(maker, 9, str(launcher.working_folder))      # where to start
+            _tell_it(maker, 7, WHAT_IT_IS_FOR)                    # what it is
+            _set_the_picture(maker, str(icon))
+            # Asking the same thing for its other way of being talked to: the
+            # one that knows how to put itself in a file. Two things go in - who
+            # is being asked for, and where to put the answer.
+            writing = c_void_p()
+            wanted = _a_windows_id(_WRITING_IT_OUT)
+            _call(maker, 0, c_void_p, POINTER(c_void_p))(
+                maker, ctypes.cast(byref(wanted), c_void_p), byref(writing))
+            if not writing:
+                raise OSError("Windows would not write the shortcut out")
+            try:
+                where.parent.mkdir(parents=True, exist_ok=True)
+                # Read rather than thrown away. Windows saying no here and this
+                # carrying on is how somebody is told an icon was made and finds
+                # none on their desktop.
+                wrote = ctypes.WINFUNCTYPE(
+                    ctypes.c_long, c_void_p, c_wchar_p, ctypes.c_int)(
+                        _in_its_list(writing, 6))(writing, str(where), 1)
+                if wrote < 0:
+                    raise OSError(f"Windows would not write the shortcut ({wrote:#x})")
+            finally:
+                _let_go(writing)
+        finally:
+            _let_go(maker)
+    finally:
+        ole32.CoUninitialize()
+
+
+def _in_its_list(thing, which: int) -> int:
+    """Where one of a thing's functions sits in memory."""
+
+    import ctypes
+
+    table = ctypes.cast(thing, ctypes.POINTER(ctypes.c_void_p))[0]
+    return ctypes.cast(table, ctypes.POINTER(ctypes.c_void_p))[which]
+
+
+def _call(thing, which: int, *takes):
+    import ctypes
+
+    return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *takes)(
+        _in_its_list(thing, which))
+
+
+def _tell_it(thing, which: int, said: str) -> None:
+    """Set one piece of text on the shortcut being made."""
+
+    import ctypes
+
+    if _call(thing, which, ctypes.c_wchar_p)(thing, said) < 0:
+        raise OSError("Windows would not accept part of the shortcut")
+
+
+def _set_the_picture(thing, icon: str) -> None:
+    """Which picture the shortcut uses, and the first one inside that file."""
+
+    import ctypes
+
+    if _call(thing, 17, ctypes.c_wchar_p, ctypes.c_int)(thing, icon, 0) < 0:
+        raise OSError("Windows would not accept the picture for the shortcut")
+
+
+def _let_go(thing) -> None:
+    import ctypes
+
+    ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(_in_its_list(thing, 2))(thing)
+
+
+def arguments_for(launcher: Launcher) -> str:
+    """What to say to the program, as one line, the way a shortcut holds it."""
+
+    return " ".join(f'"{one}"' for one in launcher.arguments)
 
 
 def _linux_launcher(where: Path, launcher: Launcher, icon: Path) -> None:

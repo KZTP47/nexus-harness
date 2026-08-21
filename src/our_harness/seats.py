@@ -22,7 +22,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
+import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,9 +38,12 @@ from .safety import confined_path
 
 # The assistants this can set up on its own. Anything else is still possible by
 # hand, and the guide says how.
-KNOWN_SEATS = ("claude-cli", "copilot-cli")
+KNOWN_SEATS = ("claude-cli", "copilot-cli", "gemini-cli", "codex-cli")
 # A short name for the route, so the settings read as a person would write them.
-ROUTE_NAMES = {"claude-cli": "claude", "copilot-cli": "copilot"}
+ROUTE_NAMES = {
+    "claude-cli": "claude", "copilot-cli": "copilot",
+    "gemini-cli": "gemini", "codex-cli": "codex",
+}
 # What each assistant is asked to do by default, when a workflow is set up for
 # two of them. The reviewer is deliberately not the coder: two assistants that
 # share no training tend not to share the same blind spot.
@@ -44,6 +51,21 @@ DEFAULT_JOBS = {"planner": 0, "coder": 1, "review": 0}
 # Long enough for a program to start on a slow machine, short enough that a
 # hung tool does not hold up the page.
 VERSION_TIMEOUT_SECONDS = 20.0
+# How many programs' versions are kept. Far more than any machine has
+# tools, and a number rather than for ever.
+MOST_VERSIONS_REMEMBERED = 40
+
+
+# One at a time while the settings file is changed: it is read, added to and
+# written back, and two of those at once each write back what the other never
+# saw.
+_while_the_settings_are_written = threading.Lock()
+
+
+# One at a time while the remembered versions are changed: read, changed and
+# written back is three things, and two at once each write back what the
+# other never saw.
+_while_versions_are_written = threading.Lock()
 
 
 class SeatError(HarnessError):
@@ -322,6 +344,77 @@ def _default_model(config: LoadedConfig, kind: str) -> str:
     return {"claude-cli": "claude-sonnet-4-5", "copilot-cli": "gpt-5"}.get(kind, "")
 
 
+# What each tool said its version was, against the file it was asked of. Kept on
+# the disk: the panel is started and stopped all day, and one tool here takes
+# nine seconds to answer because it loads its extensions first. Nine seconds
+# once per install is fair. Nine seconds every time somebody opens a tab is not,
+# and the tab is drawn every time the board is.
+def _where_versions_are_remembered() -> Path:
+    from .config import user_config_path
+
+    return user_config_path().parent / "tool-versions.json"
+
+
+def _what_it_said_last_time(program: str) -> tuple[str, str] | None:
+    """The version this exact program answered with before, if it is the same one.
+
+    The same one means the same path, last written at the same moment, the same
+    size. A program that has been replaced is a different program and is asked
+    again.
+    """
+
+    try:
+        stamp = Path(program).stat()
+        held = json.loads(_where_versions_are_remembered().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    one = held.get(program) if isinstance(held, dict) else None
+    if not isinstance(one, dict):
+        return None
+    if one.get("when") != stamp.st_mtime_ns or one.get("size") != stamp.st_size:
+        return None
+    version, trouble = one.get("version"), one.get("trouble")
+    if not isinstance(version, str) or not isinstance(trouble, str):
+        return None
+    return version, trouble
+
+
+def _remember_what_it_said(program: str, version: str, trouble: str) -> None:
+    """Write down what a tool answered, without ever failing over it.
+
+    This is bookkeeping around looking at a machine. If it cannot be written the
+    looking still worked, and throwing here would turn a working tab into a
+    broken one over a note.
+    """
+
+    where = _where_versions_are_remembered()
+    try:
+        stamp = Path(program).stat()
+        with _while_versions_are_written:
+            try:
+                held = json.loads(where.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                held = {}
+            if not isinstance(held, dict):
+                held = {}
+            # A lid on it, because every program ever asked would otherwise stay
+            # in here for good. Far more than any machine has tools.
+            if len(held) >= MOST_VERSIONS_REMEMBERED and program not in held:
+                held.pop(next(iter(held)), None)
+            held[program] = {
+                "when": stamp.st_mtime_ns,
+                "size": stamp.st_size,
+                "version": version,
+                "trouble": trouble,
+            }
+            where.parent.mkdir(parents=True, exist_ok=True)
+            beside = where.with_name(f"{where.name}.{os.getpid()}.part")
+            beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+            os.replace(beside, where)
+    except (OSError, ValueError):
+        return
+
+
 def _ask_its_version(command: str, arguments: tuple[str, ...]) -> tuple[str, str]:
     """What the tool says when asked its version, and why it did not answer.
 
@@ -330,6 +423,23 @@ def _ask_its_version(command: str, arguments: tuple[str, ...]) -> tuple[str, str
     can change what runs. The full path matters on Windows, where these tools
     install as a small .CMD wrapper that the bare name cannot start.
     """
+
+    remembered = _what_it_said_last_time(command)
+    if remembered is not None:
+        return remembered
+    version, trouble = _really_ask_its_version(command, arguments)
+    _remember_what_it_said(command, version, trouble)
+    return version, trouble
+
+
+def _really_ask_its_version(command: str, arguments: tuple[str, ...]) -> tuple[str, str]:
+    """Start the tool and read what it says. The slow part.
+
+    One tool here takes nine seconds to answer this, because it loads its
+    extensions before it will say anything, so nothing should call this twice
+    for the same program.
+    """
+
 
     try:
         finished = subprocess.run(
@@ -372,6 +482,8 @@ def look(config: LoadedConfig) -> Look:
     )
     already = config.get("providers", {}) or {}
     found: list[Seat] = []
+    # The ones that are here and still have to be asked their version.
+    asking: list[tuple[Seat, str, tuple[str, ...]]] = []
     for kind in KNOWN_SEATS:
         recipe = recipe_for(kind)
         route = ROUTE_NAMES.get(kind, kind)
@@ -394,13 +506,22 @@ def look(config: LoadedConfig) -> Look:
             found.append(seat)
             continue
         seat.found_at = where
-        version, trouble = _ask_its_version(where, recipe.version_arguments)
-        if trouble:
-            seat.why_not = trouble
-        else:
-            seat.version = version
-            seat.ready = True
+        asking.append((seat, where, recipe.version_arguments))
         found.append(seat)
+    # All of them at once. Asking a tool its version means starting it, these
+    # tools are slow to start, and one at a time the wait is the sum of every
+    # one of them - which was ten seconds of somebody looking at a blank tab,
+    # and this is asked again every time the board is drawn.
+    if asking:
+        with ThreadPoolExecutor(max_workers=len(asking)) as crowd:
+            answers = list(crowd.map(
+                lambda held: _ask_its_version(held[1], held[2]), asking))
+        for (seat, _where, _arguments), (version, trouble) in zip(asking, answers):
+            if trouble:
+                seat.why_not = trouble
+            else:
+                seat.version = version
+                seat.ready = True
     return Look(
         seats=found,
         settings_file=local.as_posix(),
@@ -516,6 +637,28 @@ def set_up(config: LoadedConfig, kinds: list[str], trust: bool = True) -> Outcom
         return _write_the_routes(config, kinds, routes, local, trust)
 
 
+def write_one_route(config: LoadedConfig, name: str, route: dict[str, Any]) -> Outcome:
+    """Add one route to the settings without touching anything else.
+
+    Setting up a seat writes routes and picks a default, because somebody who
+    has just chosen their first assistant wants one. Adding a model that is
+    already running here is a smaller thing: it is one more assistant to hand a
+    job to, and whatever was already the default was somebody's decision.
+    """
+
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name):
+        raise SeatError(
+            f"{name!r} is not a name a route can have. Names start with a letter "
+            "and hold letters, numbers, dashes and underscores."
+        )
+    local = confined_path(
+        config.project_root, ".harness/config.local.json",
+        allow_missing=True, allow_control=True,
+    )
+    with _while_the_settings_are_written:
+        return _write_the_routes(config, [], {name: route}, local, True)
+
+
 def _write_the_routes(config, kinds, routes, local, trust) -> Outcome:
     settings: dict[str, Any] = {}
     kept: list[str] = []
@@ -546,13 +689,23 @@ def _write_the_routes(config, kinds, routes, local, trust) -> Outcome:
     settings["providers"] = {**existing, **routes}
     # The route used when nothing else is said. The first one chosen, so a
     # single seat needs no further setting up.
-    first = kinds[0]
-    settings["provider"] = {
-        "name": first,
-        "model": _default_model(config, first),
-        "endpoint": "",
-        "api_key_env": "",
-    }
+    #
+    # Unless no seat was chosen at all, which is what adding one more assistant
+    # on its own looks like. Whatever was already the default was somebody's
+    # decision and this is not the moment to overturn it.
+    if kinds:
+        first = kinds[0]
+        settings["provider"] = {
+            "name": first,
+            "model": _default_model(config, first),
+            "endpoint": "",
+            "api_key_env": "",
+        }
+        replaced_default = True
+    else:
+        replaced_default = False
+    if not replaced_default:
+        replaced = [one for one in replaced if not one.startswith("the assistant used by")]
     local.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps(settings, indent=2) + "\n"
     local.write_text(body, encoding="utf-8")

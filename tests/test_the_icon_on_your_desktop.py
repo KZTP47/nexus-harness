@@ -350,16 +350,29 @@ class PathsWithAnApostropheInThemTests(unittest.TestCase):
             seen.append(script)
             return ""
 
-        awkward = Path("C:/O'Brien/Karo's Folder/Nexus Harness.lnk")
+        # Inside a folder of this test's own. Pointed at a real place on the
+        # machine, a test that goes further than expected leaves something
+        # behind on somebody's C drive - which is exactly what happened.
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        here = Path(folder.name) / "O'Brien"
+        awkward = here / "Karo's Folder" / "Nexus Harness.lnk"
         launcher = installer.Launcher(
-            program=Path("C:/O'Brien/python.exe"),
-            arguments=[str(Path("C:/O'Brien/harness.py"))],
-            working_folder=Path("C:/O'Brien"),
+            program=here / "python.exe",
+            arguments=[str(here / "harness.py")],
+            working_folder=here,
             what_it_is="the panel",
             in_its_own_window=False,
-            icon=Path("C:/O'Brien/nexus-harness.ico"),
+            icon=here / "nexus-harness.ico",
         )
-        with mock.patch.object(installer, "_ask_windows", watching):
+        # With Windows' own shortcut maker out of reach, which is the whole
+        # reason there is a second way at all.
+        def no_maker(*args, **rest):
+            raise OSError("no shortcut maker here")
+
+        with mock.patch.object(installer, "_ask_windows", watching), \
+             mock.patch.object(installer, "_shortcut_the_direct_way", no_maker), \
+             self.assertRaises(RuntimeError):
             installer._windows_shortcut(awkward, launcher, launcher.icon)
         self.assertTrue(seen)
         script = seen[0]
@@ -459,6 +472,128 @@ class SomebodyCanFindItTests(unittest.TestCase):
     def test_the_readme_tells_somebody_to_run_it(self) -> None:
         said = (ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("Install Nexus Harness.cmd", said)
+
+
+class MakingTheShortcutWithoutPowerShellTests(unittest.TestCase):
+    """On plenty of company machines PowerShell is gone - scripts turned off, or
+    held in a mode where it cannot make one of these at all - and none of that
+    is anything the person holding the installer can change. Windows' own
+    shortcut maker is not PowerShell and is always there."""
+
+    def a_launcher(self, where: Path):
+        return installer.Launcher(
+            program=Path(r"C:\Windows\System32\notepad.exe"),
+            arguments=["--one", "a b"],
+            working_folder=where,
+            what_it_is="a test",
+            in_its_own_window=True,
+            icon=Path(r"C:\Windows\System32\notepad.exe"),
+        )
+
+    def test_powershell_is_not_asked_when_it_does_not_have_to_be(self) -> None:
+        asked = []
+        made = []
+        with tempfile.TemporaryDirectory() as folder:
+            where = Path(folder) / "one.lnk"
+
+            def pretend(target, launcher, icon):
+                made.append(target)
+                target.write_bytes(b"a shortcut")
+
+            with mock.patch.object(installer, "_shortcut_the_direct_way", pretend), \
+                 mock.patch.object(
+                     installer, "_ask_windows", lambda script: asked.append(script) or ""):
+                installer._windows_shortcut(where, self.a_launcher(Path(folder)), where)
+        self.assertEqual(asked, [], "PowerShell was asked when it did not need to be")
+        self.assertEqual(len(made), 1)
+
+    def test_it_falls_back_when_the_maker_will_not(self) -> None:
+        asked = []
+        with tempfile.TemporaryDirectory() as folder:
+            where = Path(folder) / "one.lnk"
+
+            def no_maker(*args, **rest):
+                raise OSError("no shortcut maker here")
+
+            def pretend_powershell(script):
+                asked.append(script)
+                where.write_bytes(b"a shortcut")
+                return ""
+
+            with mock.patch.object(installer, "_shortcut_the_direct_way", no_maker), \
+                 mock.patch.object(installer, "_ask_windows", pretend_powershell):
+                installer._windows_shortcut(where, self.a_launcher(Path(folder)), where)
+        self.assertEqual(len(asked), 1)
+
+    def test_neither_way_working_says_so_rather_than_saying_nothing(self) -> None:
+        """PowerShell can say nothing and do nothing, in a mode that quietly
+        refuses. Believed, somebody is left with no icon and a message saying it
+        worked, which is the worst of both."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            where = Path(folder) / "one.lnk"
+
+            def no_maker(*args, **rest):
+                raise OSError("no shortcut maker here")
+
+            with mock.patch.object(installer, "_shortcut_the_direct_way", no_maker), \
+                 mock.patch.object(installer, "_ask_windows", lambda script: ""), \
+                 self.assertRaises(RuntimeError) as caught:
+                installer._windows_shortcut(where, self.a_launcher(Path(folder)), where)
+        self.assertIn("no shortcut", str(caught.exception).lower())
+
+    @unittest.skipUnless(os.name == "nt", "the Windows one")
+    def test_it_really_makes_a_shortcut_windows_can_read(self) -> None:
+        """The only test here that proves anything: Windows reading back what
+        was written. Written by hand rather than made, everything but where it
+        points comes back right - and where it points is the whole file."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            where = Path(folder) / "made.lnk"
+            installer._shortcut_the_direct_way(
+                where, self.a_launcher(Path(folder)),
+                Path(r"C:\Windows\System32\notepad.exe"))
+            self.assertTrue(where.is_file())
+            held = where.read_bytes()
+        # What every shortcut starts with, and long enough to hold the part that
+        # says where it points rather than only the odds and ends.
+        self.assertEqual(held[:4], bytes([0x4C, 0, 0, 0]))
+        self.assertIn("notepad.exe".encode("utf-16-le"), held)
+        self.assertGreater(len(held), 600, "too short to be carrying a target")
+
+    @unittest.skipUnless(os.name == "nt", "the Windows one")
+    def test_windows_saying_no_about_the_picture_is_not_ignored(self) -> None:
+        """Windows does not refuse this in practice, which is exactly why the
+        answer got thrown away. Ignored, the day it does refuse somebody is told
+        an icon was made and finds one with the wrong picture on it - or none."""
+
+        def says_no(thing, which, *takes):
+            return lambda *args: -2147024809      # Windows for "no"
+
+        with mock.patch.object(installer, "_call", says_no),              self.assertRaises(OSError) as caught:
+            installer._set_the_picture(object(), "somewhere.ico")
+        self.assertIn("picture", str(caught.exception))
+
+    @unittest.skipUnless(os.name == "nt", "the Windows one")
+    def test_the_desktop_is_found_without_asking_powershell(self) -> None:
+        """Guessed at as the home folder with Desktop on the end, it is wrong for
+        everybody whose desktop is in OneDrive - which at work is most people."""
+
+        asked = []
+
+        def refuse(script):
+            asked.append(script)
+            raise RuntimeError("PowerShell is turned off on this machine")
+
+        with mock.patch.object(installer, "_ask_windows", refuse):
+            held = installer.where_the_desktop_is()
+        self.assertTrue(held.is_dir(), f"{held} is not a folder")
+        # Counted, not merely survived. Falling back to the home folder with
+        # Desktop on the end also survives, and is wrong for everybody whose
+        # desktop is in OneDrive - so what is checked is that PowerShell was
+        # never asked at all.
+        self.assertEqual(asked, [], "PowerShell was asked when it did not need to be")
+        self.assertEqual(installer._desktop_out_of_the_registry(), held)
 
 
 if __name__ == "__main__":

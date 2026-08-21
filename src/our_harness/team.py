@@ -175,6 +175,8 @@ def who_is_here(config: LoadedConfig) -> dict[str, Any]:
     and if not, what is in the way.
     """
 
+    from . import local_models as local_lab
+
     look = seats_lab.look(config)
     members: list[Member] = []
     for seat in look.seats:
@@ -222,6 +224,13 @@ def who_is_here(config: LoadedConfig) -> dict[str, Any]:
         "trusted": look.trusted,
         "how_many_ready": len(ready),
         "note": _how_it_looks(members),
+        # And the models running on this machine, which are nobody's to approve.
+        # Found rather than typed in: the harness has taken an Ollama address
+        # for as long as it has had settings, and somebody with Ollama running
+        # still had to know the port and the model name and write both into a
+        # file by hand - a strange thing to ask for the one route that needs no
+        # permission at all.
+        "on_this_machine": [one.to_dict() for one in local_lab.look()],
     }
 
 

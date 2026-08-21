@@ -133,6 +133,22 @@ class EventBus:
             }
 
 
+
+def _a_name_for_a_local_route(server: str, model: str) -> str:
+    """A short route name for a local model, from the model's own name.
+
+    Model names carry slashes, colons and version tags - "qwen2.5-coder:7b" and
+    worse - and a route name has to be something a person can type and a file
+    can hold. The tag goes, the punctuation goes, and what is left is the part
+    anybody would have called it anyway.
+    """
+
+    plain = model.split("/")[-1].split(":")[0]
+    plain = "".join(one if one.isalnum() else "-" for one in plain).strip("-")
+    while "--" in plain:
+        plain = plain.replace("--", "-")
+    return (plain or server)[:48].lower()
+
 class HarnessHTTPServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], config: LoadedConfig):
         if ":" in address[0]:
@@ -1463,6 +1479,47 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     str(body.get("text") or ""),
                     filed_as=swarm_lab.filed_as(one.name),
                 ), agent=one.to_dict()))
+            elif self.path == "/api/swarm/keep":
+                # Saving the board as it stands, under a name. One board came
+                # back on its own and only ever one, so a second arrangement
+                # meant taking the first apart and building it again from
+                # memory on Monday.
+                with self.server.swarm_lock:
+                    said = swarm_lab.keep_this_board(str(body.get("name") or ""))
+                    said["kept"] = swarm_lab.every_kept_board()
+                self._json(said)
+            elif self.path == "/api/swarm/open-kept":
+                with self.server.swarm_lock:
+                    swarm_lab.open_this_board(str(body.get("name") or ""))
+                    said = swarm_lab.how_it_stands(self.server.config)
+                    said["what_is_not_ready"] = swarm_lab.what_is_not_ready(
+                        self.server.config, said)
+                    said["kept"] = swarm_lab.every_kept_board()
+                self._json(said)
+            elif self.path == "/api/swarm/forget-kept":
+                with self.server.swarm_lock:
+                    swarm_lab.forget_this_board(str(body.get("name") or ""))
+                    self._json({"kept": swarm_lab.every_kept_board()})
+            elif self.path == "/api/local-models/use":
+                # One press to use a model already running here. No key, no
+                # seat, nobody to ask - which is the whole point of running one
+                # on your own machine, and it should not cost a trip into a
+                # settings file to find that out.
+                from . import local_models as local_lab
+
+                wanted = str(body.get("server") or "").strip()
+                model = str(body.get("model") or "").strip()
+                found = [one for one in local_lab.look() if one.id == wanted]
+                if not found:
+                    raise HarnessError(
+                        f"There is nothing called {wanted or 'that'} running on this machine.")
+                try:
+                    route = local_lab.a_route_for(found[0], model)
+                except ValueError as exc:
+                    raise HarnessError(str(exc)) from exc
+                name = _a_name_for_a_local_route(found[0].id, model)
+                seat_setup.write_one_route(self._settings_now(), name, route)
+                self._json({"route": name, "using": route})
             elif self.path == "/api/microsoft/sign-in":
                 # Microsoft 365 Copilot has no command line, so signing in
                 # cannot be handed off to one. It is a code somebody pastes

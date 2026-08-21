@@ -70,7 +70,7 @@
     <button type="button" data-view="swarm" class="the-swarm" aria-pressed="false" title="A board of your agents, the projects they are on, and which of them may talk to each other">AI Agent Swarm orchestrator</button>
     <button type="button" data-view="checks" aria-pressed="false" title="Your tests: what a working project looks like">Checks</button>
     <button type="button" data-view="workflow" aria-pressed="false" title="How the assistants work on one change: who plans, who writes, who reviews">Workflow</button>
-    <button type="button" data-view="pipelines" aria-pressed="false" title="Work that runs itself: draw the jobs as boxes, join them with arrows, press Run">Automations</button>
+    <button type="button" data-view="pipelines" class="the-automations" aria-pressed="false" title="Work that runs itself: draw the jobs as boxes, join them with arrows, press Run">Automations</button>
     <button type="button" data-view="team" aria-pressed="false" title="The assistants you already pay for, and how they work together">Your team</button>
     <button type="button" data-view="talk" aria-pressed="false" title="Type something to any assistant you have hooked up, and keep the conversation">Talk to them</button>
     <button type="button" data-view="lookup" aria-pressed="false" title="Where is this, what uses it, what is it">Look it up</button>
@@ -667,6 +667,18 @@
       <label for="pipelineNodeWait">How long to wait before trying again</label>
       <select id="pipelineNodeWait"></select>
       <p id="pipelineNodeWaitMeans" class="hint"></p>
+      <label for="pipelineNodeLongest">Give up on this step after (seconds)</label>
+      <input id="pipelineNodeLongest" type="number" min="0" max="14400" value="0">
+      <p class="hint">0 means no limit of its own. A step with nothing to say for
+        itself otherwise holds the whole run up until the run's own limit runs
+        out, and whoever set it going is not watching.</p>
+      <label class="tick">
+        <input id="pipelineNodeEvenIfItFails" type="checkbox">
+        Let the rest carry on even if this one fails
+      </label>
+      <p class="hint">For the steps that are a nice-to-have rather than the
+        point - posting a note, tidying up afterwards. One of those failing
+        should not throw away the work that already passed.</p>
       <div class="dialog-buttons">
         <button id="pipelineNodeCancel" type="button">Cancel</button>
         <button id="pipelineNodeSave" class="primary" type="button">Save</button>
@@ -725,7 +737,16 @@
         to each other. Every box has its own settings and its own chat. Every line has a
         gear. Nothing reaches an assistant until you press Set them going.</p>
 
-      <h3 id="swarmChatsTitle">Chats</h3>
+      <h3 id="swarmKeptTitle">Saved boards</h3>
+    <p class="hint">The board you are on comes back on its own. These are the
+      ones you meant to keep - a pair of agents for this week's work, another
+      for the project you go back to on Fridays.</p>
+    <div class="button-row">
+      <button id="swarmKeep" type="button">Save this board</button>
+    </div>
+    <ul id="swarmKept" class="swarm-kept" aria-labelledby="swarmKeptTitle"></ul>
+
+    <h3 id="swarmChatsTitle">Chats</h3>
       <p class="hint">Every conversation on this board: yours with each agent, and
         what the agents passed to each other. Press one to open it.</p>
       <ul id="swarmChats" class="swarm-chats" aria-labelledby="swarmChatsTitle"></ul>
@@ -924,6 +945,12 @@
         <button id="teamLookAgain" type="button">Look again</button>
         <button id="teamSetUp" class="primary" type="button">I don't care, just set them up for me</button>
       </div>
+      <h3 id="localModelsTitle">Running on this machine</h3>
+      <p class="hint">A model on your own machine needs no seat, no key and
+        nobody's permission, and nothing said to it leaves the building. On a
+        locked-down machine it is often the only one that will ever work.</p>
+      <ul id="localModels" class="local-models" aria-labelledby="localModelsTitle"></ul>
+
       <h3>Microsoft 365 Copilot</h3>
       <p class="hint">This one has no command line, so it signs in here instead.
         You will get a short code to paste into a browser, once. It needs three

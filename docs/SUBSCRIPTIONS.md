@@ -141,6 +141,12 @@ On Windows these tools are usually installed as a small `.CMD` wrapper. The
 harness looks up the real path before running it, so the bare name working in
 your terminal is enough.
 
+## Gemini and Codex
+
+Both are driven the same way, on a Google or ChatGPT sign-in you already have,
+and both can take an API key instead if you would rather. See
+[Gemini and Codex](GEMINI_AND_CODEX.md).
+
 ## When a tool says you have no access and you plainly do
 
 Two things worth knowing, both found the hard way on a machine where Claude was

@@ -57,6 +57,9 @@ DRAFTS = ".harness/pipelines/drafts"
 MOST_NODES = 200
 MOST_EDGES = 400
 MOST_TRIES = 5
+# The longest a single step may be given. Four hours is far past anything
+# sensible and still a number rather than for ever, which is the point.
+LONGEST_A_STEP_MAY_TAKE = 4 * 60 * 60
 # How long a step may go on being retried. A single try is bounded by
 # whatever it runs - a check has its own timeout, a model has its own - and
 # this stops a slow step being started again and again on top of that.
@@ -316,7 +319,8 @@ def read_it(pipeline: Any) -> dict[str, Any]:
         settings = node.get("settings") or {}
         if not isinstance(settings, dict):
             raise PipelineError(f"The settings on {node_id} are not settings")
-        allowed = set(KINDS[kind].settings) | {"tries", "asks", "when", "wait"}
+        allowed = set(KINDS[kind].settings) | {
+            "tries", "asks", "when", "wait", "longest", "even_if_it_fails"}
         extra = sorted(set(settings) - allowed)
         if extra:
             raise PipelineError(f"{node_id} has a setting it cannot use: {extra[0]}")
@@ -338,6 +342,23 @@ def read_it(pipeline: Any) -> dict[str, Any]:
             raise PipelineError(
                 f"When {node_id} runs has to be one of: " + ", ".join(sorted(WHEN_NAMES))
             )
+        # How long this step may take. A step with nothing to say for itself
+        # otherwise holds the whole run up until the run's own limit runs out,
+        # which on a long automation is the rest of the afternoon.
+        longest = settings.get("longest", 0)
+        if (not isinstance(longest, int) or isinstance(longest, bool)
+                or not 0 <= longest <= LONGEST_A_STEP_MAY_TAKE):
+            raise PipelineError(
+                f"How long {node_id} may take has to be a whole number of seconds "
+                f"from 0 to {LONGEST_A_STEP_MAY_TAKE}, where 0 means no limit of its own"
+            )
+        # Whether the rest may carry on without it. Some steps are the point of
+        # the whole run and some are a nice-to-have, and one nice-to-have
+        # failing should not throw away the work that already passed.
+        carry_on = settings.get("even_if_it_fails", False)
+        if not isinstance(carry_on, bool):
+            raise PipelineError(
+                f"Whether the rest carries on without {node_id} is yes or no")
         wait = settings.get("wait", "no-wait")
         if wait not in WAIT_NAMES:
             raise PipelineError(
@@ -345,7 +366,7 @@ def read_it(pipeline: Any) -> dict[str, Any]:
                 + ", ".join(sorted(WAIT_NAMES))
             )
         for key, value in settings.items():
-            if key in ("tries", "asks", "when", "wait"):
+            if key in ("tries", "asks", "when", "wait", "longest", "even_if_it_fails"):
                 continue
             if isinstance(value, list):
                 for item in value:
@@ -964,6 +985,34 @@ def _run_artifact(config: LoadedConfig, node: dict[str, Any], _kinds, so_far=Non
     return True, f"Wrote {where.name}", f"{len(so_far or [])} step(s) recorded"
 
 
+def _also_stopping_after(stopping, started: float, seconds: int):
+    """The run's own stop button, and this step's time limit, as one thing.
+
+    A step is handed something it can ask "should I stop yet". Handing it two
+    things to ask would mean every kind of step remembering to ask both, and the
+    one that forgot would be the one that hung.
+    """
+
+    if not seconds:
+        return stopping
+
+    def yes_it_should() -> bool:
+        if stopping and stopping():
+            return True
+        return time.monotonic() - started >= seconds
+
+    return yes_it_should
+
+
+def _was_allowed_to_fail(pipeline: dict[str, Any], item: NodeResult) -> bool:
+    """Whether this step was marked as one the rest may carry on without."""
+
+    for node in pipeline.get("nodes", []):
+        if node.get("id") == item.id:
+            return bool((node.get("settings") or {}).get("even_if_it_fails"))
+    return False
+
+
 def _was_not_needed(item: "NodeResult") -> bool:
     """True for a step that was only there for trouble, on a run with none.
 
@@ -1095,10 +1144,12 @@ def run_it(
         # pass" - one line under that step saying nothing went wrong.
         blocked = [
             item for item in before
-            if item.state in (FAILED, SKIPPED) and not _was_not_needed(item)
+            if item.state in (FAILED, SKIPPED)
+            and not _was_not_needed(item) and not _was_allowed_to_fail(pipeline, item)
         ]
         anything_wrong = any(
-            item.state in (FAILED, SKIPPED) and not _was_not_needed(item)
+            item.state in (FAILED, SKIPPED)
+            and not _was_not_needed(item) and not _was_allowed_to_fail(pipeline, item)
             for item in results.values()
         )
         # Somebody who pressed "run only this" on a step, or "carry on from
@@ -1146,13 +1197,25 @@ def run_it(
             continue
         tries = int(node["settings"].get("tries", 1))
         passed, said, detail = False, "", ""
+        # How long this step may take, when somebody said. A step with nothing
+        # to say for itself otherwise holds the whole run up until the run's own
+        # limit runs out, which on a long automation is the rest of the
+        # afternoon - and the person who set it going is not watching.
+        its_own_limit = int(node["settings"].get("longest", 0) or 0)
         for attempt in range(1, tries + 1):
             result.tries = attempt
             try:
                 passed, said, detail = _do_one(
                     config, node, before, results, order, check_kinds, depth,
-                    stopping, waiting_on,
+                    _also_stopping_after(stopping, started, its_own_limit), waiting_on,
                 )
+                if (not passed and its_own_limit
+                        and time.monotonic() - started >= its_own_limit):
+                    said = (
+                        f"This step was given {its_own_limit} second"
+                        f"{'' if its_own_limit == 1 else 's'} and took longer, "
+                        "so it was stopped."
+                    )
             except HarnessError as exc:
                 passed, said, detail = False, str(exc), ""
             except Exception as exc:  # noqa: BLE001 - one bad node must not end the run
@@ -1191,7 +1254,14 @@ def run_it(
         say(result)
 
     ordered = [results[node_id] for node_id in order]
-    failed = [item for item in ordered if item.state == FAILED]
+    # A step somebody marked as allowed to fail is not counted against the run.
+    # Some steps are the point of the whole thing and some are a nice-to-have -
+    # posting a note, tidying up afterwards - and one nice-to-have failing
+    # should not throw away work that already passed.
+    failed = [
+        item for item in ordered
+        if item.state == FAILED and not _was_allowed_to_fail(pipeline, item)
+    ]
     # A step that never ran is not a step that passed. Being stopped part way,
     # or nobody answering, leaves work undone, and a run with work left undone
     # must not read like one that finished. The only steps that do not count

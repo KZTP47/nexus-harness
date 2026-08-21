@@ -2677,6 +2677,14 @@ function renderPipeline() {
     } else if (node.settings?.when === "whatever-happens") {
       card.append(make("p", "pipeline-node-when", "Runs either way"));
     }
+    if (node.settings?.longest) {
+      card.append(make("p", "pipeline-node-wait",
+        `Given ${node.settings.longest} seconds, then stopped.`));
+    }
+    if (node.settings?.even_if_it_fails) {
+      card.append(make("p", "pipeline-node-wait",
+        "The rest carries on even if this one fails."));
+    }
     if ((node.settings?.wait || "no-wait") !== "no-wait") {
       card.append(make("p", "pipeline-node-wait",
         node.settings.wait === "growing-wait"
@@ -2889,6 +2897,8 @@ function openPipelineNode(nodeId) {
   $("pipelineNodeSummary").textContent = kind.summary || "";
   $("pipelineNodeLabel").value = node.label || kind.label;
   $("pipelineNodeTries").value = String(node.settings?.tries || 1);
+  $("pipelineNodeLongest").value = String(node.settings?.longest || 0);
+  $("pipelineNodeEvenIfItFails").checked = Boolean(node.settings?.even_if_it_fails);
   const box = $("pipelineNodeSettings");
   box.replaceChildren();
   for (const name of kind.settings || []) {
@@ -2986,6 +2996,12 @@ function savePipelineNode() {
   if (when && when !== "when-all-is-well") settings.when = when;
   const wait = $("pipelineNodeWait").value;
   if (wait && wait !== "no-wait" && (settings.tries || 1) > 1) settings.wait = wait;
+  // How long this one may take, and whether the rest carries on without it.
+  // Both are left out when they say nothing, so a pipeline written before these
+  // existed reads back exactly as it was written.
+  const longest = Math.round(Number($("pipelineNodeLongest").value) || 0);
+  if (longest > 0) settings.longest = Math.min(14400, longest);
+  if ($("pipelineNodeEvenIfItFails").checked) settings.even_if_it_fails = true;
   node.settings = settings;
   $("pipelineNodeDialog").close();
   renderPipeline();
@@ -3717,6 +3733,7 @@ function bindEvents() {
   $("talkRefresh").addEventListener("click", () => refreshTalk(talkOpen));
   wireUpTheSwarmBoard();
   wireUpMicrosoft();
+  $("swarmKeep").addEventListener("click", keepThisBoard);
   $("talkStartAgain").addEventListener("click", startTalkingAgain);
   $("talkAskEveryone").addEventListener("click", askEveryone);
   $("talkForm").addEventListener("submit", (event) => { event.preventDefault(); sendWhatIsTyped(); });
@@ -3780,12 +3797,14 @@ async function refreshTeam(name) {
     const asked = name ? `?name=${encodeURIComponent(name)}` : "";
     const said = await request(`/api/who-is-on-it${asked}`);
     teamWho = said.who?.members || [];
+    localModels = said.who?.on_this_machine || [];
     teamJobs = said.jobs || [];
     teamWaysOfAsking = said.ways_of_asking || [];
     teamWaysIn = said.ways_in || [];
     teamSavedNames = said.teams || [];
     $("teamWhoNote").textContent = said.who?.note || "";
     renderTeamWho();
+    renderLocalModels();
     renderTeamSaved();
     renderTeamJobs();
     if (said.gone) {
@@ -5555,11 +5574,13 @@ async function refreshSwarm(quietly) {
     if (mine !== swarmNewestRefresh) return;
     if (changesThen !== howManyChangesLanded) return;
     swarmSaid = said;
+    swarmKept = said.kept || swarmKept;
     keepTheSwarmPick();
     renderSwarmBoard();
     renderSwarmNotReady();
     renderSwarmPanel();
     renderTheChatsOnThisBoard();
+    renderTheKeptBoards();
     // What the agents passed to each other, so the list down the side holds
     // those conversations too rather than only the ones you have had. It is
     // small, and without it the list is half a list until somebody opens the
@@ -6208,6 +6229,7 @@ async function applyOneChangeToTheBoard(change, note) {
     // that was already in flight knows to throw its own answer away.
     howManyChangesLanded += 1;
     swarmSaid = said;
+    swarmKept = said.kept || swarmKept;
     keepTheSwarmPick();
     renderSwarmBoard();
     renderSwarmNotReady();
@@ -6991,6 +7013,157 @@ function wireUpMicrosoft() {
   if (!inIt) return;
   inIt.addEventListener("click", signInToMicrosoft);
   $("microsoftSignOut").addEventListener("click", signOutOfMicrosoft);
+}
+
+
+// ---- boards kept under a name ---------------------------------------------
+//
+// The board you are working on was always written down and always came back -
+// one board, the same one, whatever you were working on. That is fine until you
+// want two, and then the second one means taking the first apart and building
+// it again from memory on Monday.
+
+let swarmKept = [];
+
+function renderTheKeptBoards() {
+  const list = $("swarmKept");
+  if (!list) return;
+  list.replaceChildren();
+  if (!swarmKept.length) {
+    list.append(make("li", "hint", "None saved yet."));
+    return;
+  }
+  for (const one of swarmKept) {
+    const row = make("li");
+    const open = make("button", "swarm-kept-pick");
+    open.type = "button";
+    open.setAttribute("aria-label", `Open the saved board called ${one.name}`);
+    open.append(make("span", "", one.name));
+    open.append(make("span", "swarm-kept-when",
+      `${one.agents} agent${one.agents === 1 ? "" : "s"}, `
+      + `${one.projects} project${one.projects === 1 ? "" : "s"}`));
+    open.addEventListener("click", () => openTheKeptBoard(one.name));
+    row.append(open);
+    const drop = make("button", "swarm-icon-button", "Delete");
+    drop.type = "button";
+    drop.setAttribute("aria-label", `Delete the saved board called ${one.name}`);
+    drop.addEventListener("click", () => forgetTheKeptBoard(one.name));
+    row.append(drop);
+    list.append(row);
+  }
+}
+
+async function keepThisBoard() {
+  const name = await askForOneLine(
+    "Save this board", "What should this arrangement be called?", "");
+  if (name === null) return;
+  try {
+    const said = await request("/api/swarm/keep", {
+      method: "POST", body: JSON.stringify({name}),
+    });
+    swarmKept = said.kept || [];
+    renderTheKeptBoards();
+    sayInSwarm(`Saved this board as ${said.name}.`);
+  } catch (trouble) {
+    sayInSwarm(String(trouble.message || trouble));
+  }
+}
+
+async function openTheKeptBoard(name) {
+  // Asked first, because what is on the board now goes. Somebody who has spent
+  // ten minutes arranging it should not lose it to one press.
+  if (!window.confirm(
+      `Open the saved board "${name}"? What is on the board now is replaced. `
+      + "Save it first if you want it back.")) {
+    return;
+  }
+  try {
+    const said = await request("/api/swarm/open-kept", {
+      method: "POST", body: JSON.stringify({name}),
+    });
+    swarmSaid = said;
+    swarmKept = said.kept || [];
+    keepTheSwarmPick();
+    renderSwarmBoard();
+    renderSwarmNotReady();
+    renderSwarmPanel();
+    renderTheKeptBoards();
+    renderTheChatsOnThisBoard();
+    sayInSwarm(`Opened the board saved as ${name}.`);
+  } catch (trouble) {
+    sayInSwarm(String(trouble.message || trouble));
+  }
+}
+
+async function forgetTheKeptBoard(name) {
+  if (!window.confirm(`Delete the saved board "${name}"? This cannot be undone.`)) return;
+  try {
+    const said = await request("/api/swarm/forget-kept", {
+      method: "POST", body: JSON.stringify({name}),
+    });
+    swarmKept = said.kept || [];
+    renderTheKeptBoards();
+    sayInSwarm(`Deleted the saved board ${name}.`);
+  } catch (trouble) {
+    sayInSwarm(String(trouble.message || trouble));
+  }
+}
+
+// ---- models running on this machine ---------------------------------------
+//
+// The settings have taken an Ollama address for as long as there have been
+// settings. What was missing was finding one: somebody with Ollama running and
+// a model pulled still had to know the port and the model's name and write both
+// into a file by hand, which is a strange thing to ask for the one route that
+// needs nobody's permission.
+
+let localModels = [];
+
+function renderLocalModels() {
+  const list = $("localModels");
+  if (!list) return;
+  list.replaceChildren();
+  if (!localModels.length) {
+    list.append(make("li", "hint", "Nothing looked for yet. Press Look again."));
+    return;
+  }
+  for (const one of localModels) {
+    const row = make("li", `local-model-one ${one.running ? "running" : "not-running"}`);
+    row.append(make("strong", "", one.label));
+    row.append(make("p", "hint", one.running
+      ? `Running at ${one.endpoint}.`
+      : (one.why_not || "Not running.")));
+    if (!one.running || !one.models.length) {
+      row.append(make("p", "hint", one.how_to_get_it));
+    }
+    if (one.models.length) {
+      const names = make("div", "local-model-names");
+      for (const model of one.models) {
+        const use = make("button", "", model);
+        use.type = "button";
+        use.setAttribute("aria-label", `Use ${model} from ${one.label}`);
+        use.addEventListener("click", () => useThisLocalModel(one, model, use));
+        names.append(use);
+      }
+      row.append(names);
+    }
+    list.append(row);
+  }
+}
+
+async function useThisLocalModel(server, model, button) {
+  button.disabled = true;
+  try {
+    const said = await request("/api/local-models/use", {
+      method: "POST", body: JSON.stringify({server: server.id, model}),
+    });
+    say(`${model} is set up, as the route called ${said.route}.`);
+    await refreshTeam();
+  } catch (trouble) {
+    say(String(trouble.message || trouble));
+  } finally {
+    button.disabled = false;
+  }
 }
 
 

@@ -37,6 +37,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "timeout_seconds": 180,
         "command": [],
+        # Google will not answer a work account until it is told which Cloud
+        # project to bill the work to, and the message it sends for that is a
+        # link and a shrug. Empty for everything else.
+        "google_project": "",
         # Microsoft 365 Copilot signs in as a registered app rather than with a
         # key, so it needs the app's number written down, and the time zone of
         # whoever is asking - "what meeting do I have at nine tomorrow" means
@@ -738,6 +742,21 @@ def _require_commands(value: object, name: str, *, allow_empty: bool = True) -> 
     return value
 
 
+def _can_be_given_a_key(kind: str) -> bool:
+    """Whether a signed-in tool can be handed a key instead.
+
+    Most of them can: their own command line reads one out of an environment
+    variable. The ones that cannot are the ones whose service does not allow it
+    at all - Microsoft 365 Copilot is the plain case, where a person signing in
+    is the only way in that exists.
+    """
+
+    from .providers.subscription_cli import RECIPES
+
+    recipe = RECIPES.get(kind)
+    return bool(recipe and recipe.key_it_reads)
+
+
 def validate_config(data: dict[str, Any]) -> None:
     _check_known_keys(data, DEFAULT_CONFIG)
     if not _is_int(data.get("schema_version")) or data["schema_version"] != 1:
@@ -746,7 +765,7 @@ def validate_config(data: dict[str, Any]) -> None:
     provider_names = (
         "openai", "anthropic", "gemini", "ollama", "local", "openai-compatible",
         # Assistants you already pay for, driven through their own command line.
-        "claude-cli", "copilot-cli", "assistant-cli",
+        "claude-cli", "copilot-cli", "assistant-cli", "gemini-cli",
         # And one with no command line at all, reached over the web with a
         # sign-in rather than a key, because Microsoft allows nothing else.
         "m365-copilot",
@@ -758,13 +777,20 @@ def validate_config(data: dict[str, Any]) -> None:
         raise HarnessError("provider.api_mode must be auto, responses, or chat-completions")
     if provider["prompt_cache_retention"] not in ("", "in_memory", "24h"):
         raise HarnessError("provider.prompt_cache_retention must be empty, in_memory, or 24h")
-    subscription_kinds = ("claude-cli", "copilot-cli", "assistant-cli", "m365-copilot")
+    subscription_kinds = (
+        "claude-cli", "copilot-cli", "assistant-cli", "gemini-cli", "m365-copilot")
     _require_string(provider["model"], "provider.model", allow_empty=provider["name"] in subscription_kinds)
     if provider["name"] in subscription_kinds:
         if provider["endpoint"]:
             raise HarnessError(f"provider.endpoint must be empty for {provider['name']}")
-        if provider["api_key_env"]:
-            raise HarnessError(f"provider.api_key_env must be empty for {provider['name']}; it signs in on its own")
+        # A key is allowed on the ones whose tool can take one, for somebody who
+        # has a key and means to use it. It has to be asked for by name: a
+        # subscription tool handed a key because one happened to be lying about
+        # in the environment starts spending money nobody decided to spend.
+        if provider["api_key_env"] and not _can_be_given_a_key(provider["name"]):
+            raise HarnessError(
+                f"provider.api_key_env must be empty for {provider['name']}; "
+                "it signs in on its own and cannot be given a key")
     else:
         _require_string(provider["endpoint"], "provider.endpoint", allow_empty=False)
         _validate_endpoint(provider["endpoint"])
@@ -812,9 +838,10 @@ def validate_config(data: dict[str, Any]) -> None:
         # there is nothing to write here. Everything else names one.
         _require_string(
             profile.get("model"), f"{dotted}.model",
-            allow_empty=name == "m365-copilot")
+            allow_empty=name in subscription_kinds)
         endpoint = _require_string(profile.get("endpoint", ""), f"{dotted}.endpoint")
-        if name in ("claude-cli", "copilot-cli", "assistant-cli", "m365-copilot"):
+        if name in ("claude-cli", "copilot-cli", "assistant-cli", "gemini-cli",
+                    "m365-copilot"):
             if endpoint:
                 raise HarnessError(f"{dotted}.endpoint must be empty for {name}")
         elif name != "codex-cli":
@@ -833,6 +860,10 @@ def validate_config(data: dict[str, Any]) -> None:
         api_key_env = _require_string(profile.get("api_key_env", ""), f"{dotted}.api_key_env")
         if api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
             raise HarnessError(f"{dotted}.api_key_env must be an environment variable name")
+        if api_key_env and name in subscription_kinds and not _can_be_given_a_key(name):
+            raise HarnessError(
+                f"{dotted}.api_key_env must be empty for {name}; it signs in on "
+                "its own and cannot be given a key")
         if name in {"openai", "anthropic", "gemini"} and not api_key_env:
             raise HarnessError(f"{dotted}.api_key_env is required for the official {name} provider")
         api_mode = _require_string(profile.get("api_mode", "auto"), f"{dotted}.api_mode", allow_empty=False)

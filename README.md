@@ -552,6 +552,10 @@ machine; OpenAI, Anthropic or Gemini with your own key; or the Claude and
 GitHub Copilot command lines, which use a seat your organisation already pays
 for and need no key at all. See [docs/SUBSCRIPTIONS.md](docs/SUBSCRIPTIONS.md).
 
+A model on your own machine needs no seat and nobody's permission at all, and the
+app now finds them for you - see
+[docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md).
+
 ---
 
 ## Worked example: two subscriptions on one job

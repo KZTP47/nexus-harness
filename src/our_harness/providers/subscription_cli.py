@@ -44,10 +44,20 @@ class CliRecipe:
     # is the answer, as plain text.
     text_field: str = ""
     error_field: str = ""
+    # For a tool that says something went wrong by putting an object where the
+    # answer would be, rather than by setting a flag to true. Anything at all
+    # under this name is a refusal.
+    error_when_present: str = ""
     error_message_field: str = ""
     input_tokens_field: str = ""
     output_tokens_field: str = ""
     version_arguments: tuple[str, ...] = ("--version",)
+    # Where else this tool might be at all, as patterns to look under. Not the
+    # same as the next one: this is for a tool that is never on the path, where
+    # the question is whether it is on the machine, and any copy will do.
+    # Looked at only when the path has nothing, so a copy somebody put there on
+    # purpose still wins.
+    also_found_at: tuple[str, ...] = ()
     # Where else this tool keeps builds of itself, as patterns to look under.
     # A tool that updates itself often has a newer copy somewhere its installer
     # never put on the path, and the older one on the path can behave quite
@@ -80,6 +90,16 @@ class CliRecipe:
     # ends up asking an administrator about something that never left their own
     # machine.
     when_it_is_not_clear: str = ""
+    # Things this tool needs handed to it, as the name of the environment
+    # variable it reads and the setting it comes from. Handed over on purpose:
+    # everything else is stripped, so nothing arrives because it happened to be
+    # set on the machine.
+    needs_handing_over: tuple[tuple[str, str], ...] = ()
+    # The environment variable this tool reads a key from, for somebody who has
+    # a key and means to use it. Nothing is passed unless a route names the
+    # variable to take it from - a subscription tool handed a key quietly starts
+    # spending money nobody decided to spend.
+    key_it_reads: str = ""
     install_hint: str = ""
     verified: bool = False
 
@@ -153,6 +173,7 @@ CLAUDE_RECIPE = CliRecipe(
     input_tokens_field="usage.input_tokens",
     output_tokens_field="usage.output_tokens",
     signed_in_arguments=("auth", "status"),
+    key_it_reads="ANTHROPIC_API_KEY",
     # The desktop app keeps its own copy of Claude Code and updates it, while an
     # npm install months ago sits on the path never changing. Both are here on
     # this machine, and they do not answer the same way.
@@ -210,6 +231,7 @@ CLAUDE_RECIPE = CliRecipe(
 COPILOT_RECIPE = CliRecipe(
     id="copilot-cli",
     label="GitHub Copilot command line",
+    key_it_reads="GH_TOKEN",
     command=("copilot",),
     arguments=("-p", "--allow-all-tools", "--model", "{model}"),
     text_field="",
@@ -231,10 +253,95 @@ ASSISTANT_RECIPE = CliRecipe(
     install_hint="Set providers.<name>.command and providers.<name>.arguments for your tool.",
 )
 
+
+# Google's Gemini command line. Signs in with a Google account, which is what
+# somebody with Antigravity or a Code Assist seat already has - no key needed,
+# and none accepted unless one is asked for by name.
+GEMINI_RECIPE = CliRecipe(
+    id="gemini-cli",
+    label="Gemini command line",
+    command=("gemini",),
+    # The prompt goes in on standard input, which this reads when there is
+    # anything there. Nothing is auto-approved and no tools are allowed: this is
+    # a conversation, and a conversation that can change files is not one.
+    arguments=("--output-format", "json", "--approval-mode", "default", "--model", "{model}"),
+    text_field="response",
+    # It says so with an object rather than a flag.
+    error_when_present="error",
+    error_message_field="error.message",
+    input_tokens_field="stats.models.*.tokens.prompt",
+    output_tokens_field="stats.models.*.tokens.candidates",
+    # A Workspace account will not be answered at all until it names a Cloud
+    # project, and the message Google sends for that is a link and a shrug.
+    needs_handing_over=(
+        ("GOOGLE_CLOUD_PROJECT", "google_project"),
+    ),
+    key_it_reads="GEMINI_API_KEY",
+    when_it_is_refused=(
+        "Signed in and still turned down usually means the account has no "
+        "Gemini to give. A personal Google account gets some for free; a work "
+        "one needs a Gemini Code Assist seat, which somebody who administers "
+        "your organisation hands out."
+    ),
+    the_answer_names_it=("google_cloud_project", "goo.gle/gemini-cli-auth-docs"),
+    when_the_answer_names_it=(
+        "Google will not answer this account until it is told which Cloud "
+        "project to bill the work to. It is not a sign-in problem and signing "
+        "in again will not help. Put the project id in this route's settings as "
+        "google_project. Whoever set up your Google Workspace knows it, and it "
+        "is on the front page of the Google Cloud console."
+    ),
+    when_it_never_asked=(
+        "It turned this down here, without asking Google. Run: gemini, and see "
+        "what it says on the way in - it is usually waiting to be signed in."
+    ),
+    when_it_is_not_clear=(
+        "Run: gemini, on its own, and see what it says. It asks for whatever it "
+        "is missing on the way in, which is quicker than guessing from here."
+    ),
+    install_hint=(
+        "Install the Gemini command line and sign in with your Google account, "
+        "then run: gemini --version. It comes from npm: "
+        "npm install -g @google/gemini-cli. A Google account is all it needs - "
+        "no key. If yours is a work account, it will also want a Cloud project "
+        "id in this route's settings as google_project."
+    ),
+    verified=True,
+)
+
+
+# Codex, described here so it can be found and picked like the others.
+#
+# Only for finding it and saying what it is. Codex has its own way of being
+# talked to, in codex_cli.py, which came first and is far better tested than
+# this one - and that is still what does the talking. What was missing was
+# never the talking: it was that the app could not find Codex at all, because
+# its desktop app keeps it in a folder of its own and never puts it on the path.
+CODEX_RECIPE = CliRecipe(
+    id="codex-cli",
+    label="Codex command line",
+    key_it_reads="OPENAI_API_KEY",
+    command=("codex",),
+    also_found_at=(
+        "LOCALAPPDATA/Packages/OpenAI.Codex_*/LocalCache/Local/OpenAI/Codex/bin/codex.exe",
+        "LOCALAPPDATA/Programs/codex/codex.exe",
+        "HOME/.codex/bin/codex",
+    ),
+    signed_in_arguments=("login", "status"),
+    install_hint=(
+        "Install Codex and sign in with your ChatGPT account, then run: "
+        "codex --version. It comes with the Codex desktop app, or from npm: "
+        "npm install -g @openai/codex. A ChatGPT subscription is enough - no key."
+    ),
+    verified=True,
+)
+
 RECIPES: dict[str, CliRecipe] = {
     CLAUDE_RECIPE.id: CLAUDE_RECIPE,
     COPILOT_RECIPE.id: COPILOT_RECIPE,
     ASSISTANT_RECIPE.id: ASSISTANT_RECIPE,
+    GEMINI_RECIPE.id: GEMINI_RECIPE,
+    CODEX_RECIPE.id: CODEX_RECIPE,
 }
 
 
@@ -251,7 +358,37 @@ def available(kind: str, command: list[str] | None = None) -> str:
     parts = command or list(recipe.command)
     if not parts:
         return ""
-    return shutil.which(parts[0]) or ""
+    found = shutil.which(parts[0])
+    if found:
+        return found
+    # Not on the path is not the same as not here. Codex is installed by its own
+    # desktop app, into a folder of its own, and nothing ever puts it on the
+    # path - so this said it was not on the machine while it sat there signed
+    # in, which is a wrong answer that sends somebody off installing what they
+    # already have.
+    somewhere = _where_else_it_might_be(recipe.also_found_at)
+    return str(somewhere[0]) if somewhere else ""
+
+
+def _where_else_it_might_be(patterns: tuple[str, ...]) -> list[Path]:
+    """Every copy of a tool found under those patterns, newest first.
+
+    Newest by when it was last written, because these have no version in the
+    folder name to go by - unlike the builds a tool keeps of itself, which do.
+    """
+
+    found: list[Path] = []
+    for pattern in patterns:
+        name, _, rest = pattern.partition("/")
+        base = str(Path.home()) if name == "HOME" else (
+            os.environ.get(name) if name.isupper() else None)
+        if not base:
+            continue
+        try:
+            found.extend(one for one in Path(base).glob(rest) if one.is_file())
+        except OSError:
+            continue
+    return sorted(found, key=lambda one: one.stat().st_mtime, reverse=True)
 
 
 def _prompt(request: ProviderRequest) -> str:
@@ -316,6 +453,10 @@ class SubscriptionCLIProvider(Provider):
         # without a shell, so the real path is looked up here instead.
         found = shutil.which(parts[0])
         if not found:
+            # Not on the path is not the same as not here.
+            somewhere = _where_else_it_might_be(self.recipe.also_found_at)
+            found = str(somewhere[0]) if somewhere else ""
+        if not found:
             raise HarnessError(
                 f"{parts[0]} is not on this machine. {self.recipe.install_hint}"
             )
@@ -346,6 +487,41 @@ class SubscriptionCLIProvider(Provider):
             if version > best_version:
                 best_where, best_version = where, version
         return None if best_where == Path(found) else best_where
+
+    def _what_it_is_handed(self, recipe: CliRecipe) -> dict[str, str]:
+        """What this route means to give the tool, and nothing else.
+
+        Everything a subscription tool does not need is stripped before it runs,
+        keys included, because a key that arrives because it happened to be set
+        on the machine is a key nobody decided to spend. These are the ones
+        somebody wrote down.
+        """
+
+        handed: dict[str, str] = {}
+        for variable, setting in recipe.needs_handing_over:
+            value = str(self.settings.get(setting) or "").strip()
+            if value:
+                handed[variable] = value
+        # A key, only when a route names where to read it from. Named and empty
+        # is a mistake worth saying out loud: somebody meant to use a key, and
+        # letting it fall back to the subscription silently is how a route ends
+        # up doing something other than what it says.
+        from_where = str(self.settings.get("api_key_env") or "").strip()
+        if from_where:
+            if not recipe.key_it_reads:
+                raise HarnessError(
+                    f"{recipe.label} cannot be given a key: it signs in instead. "
+                    "Leave api_key_env empty for this one."
+                )
+            key = os.environ.get(from_where, "")
+            if not key:
+                raise HarnessError(
+                    f"{recipe.label} is set to use a key from {from_where}, and "
+                    f"{from_where} is not set on this machine. Set it, or clear "
+                    "api_key_env to go back to signing in."
+                )
+            handed[recipe.key_it_reads] = key
+        return handed
 
     def _arguments(self) -> CliRecipe:
         configured = self.settings.get("arguments")
@@ -409,6 +585,7 @@ class SubscriptionCLIProvider(Provider):
             stdin_text=self._redactor.text(_prompt(request)),
             timeout_seconds=_remaining(deadline_at),
             max_output_bytes=output_limit,
+            also_in_the_environment=self._what_it_is_handed(recipe),
         )
         if result.timed_out:
             raise HarnessError(f"{recipe.label} ran past its {timeout:g} second limit")
@@ -457,10 +634,12 @@ class SubscriptionCLIProvider(Provider):
         is telling you the second.
         """
 
-        if not (recipe.error_field and recipe.error_message_field):
+        if not recipe.error_message_field:
+            return ""
+        if not (recipe.error_field or recipe.error_when_present):
             return ""
         for body in reversed(list(_every_object_in(f"{stdout}\n{stderr}"))):
-            if _dotted(body, recipe.error_field) is not True:
+            if not _that_went_wrong(recipe, body):
                 continue
             said = _dotted(body, recipe.error_message_field)
             if isinstance(said, str) and said.strip():
@@ -495,8 +674,7 @@ class SubscriptionCLIProvider(Provider):
             # one place where being wrong sends somebody to the wrong door.
             # A tool that says whether it failed says so in its answer and
             # nowhere else, so that is what marks the answer out.
-            if recipe.error_field and not isinstance(
-                    _dotted(body, recipe.error_field), bool):
+            if not _this_is_its_answer(recipe, body):
                 continue
             # A status from the service first. It is only ever there because
             # something answered, and it is right where the timing is wrong:
@@ -556,12 +734,6 @@ class SubscriptionCLIProvider(Provider):
         elif asked_anybody is True:
             said = ["", f"{here} - what turned this down was the service behind it."]
             advice = recipe.when_it_is_refused
-            # Unless the answer already said what would fix it. Then that is
-            # what somebody is told, and the harness stops guessing over the top
-            # of a service that spelt it out.
-            plainly = (reason or "").lower()
-            if any(one in plainly for one in recipe.the_answer_names_it):
-                advice = recipe.when_the_answer_names_it or advice
         else:
             # It did not say. Neither of the other two can be claimed, and
             # claiming the service is how somebody ends up asking an
@@ -571,6 +743,15 @@ class SubscriptionCLIProvider(Provider):
                 "this down by itself, so neither is claimed here."
             )]
             advice = recipe.when_it_is_not_clear
+        # Unless the answer already said what would fix it, whichever of the
+        # three this was. A refusal that names its own cause beats anything
+        # worked out from timings here, and it was only being read in one of the
+        # three - so the one message that spelt out what to do got a guess
+        # written over the top of it whenever the tool was vague about the rest.
+        plainly = (reason or "").lower()
+        if recipe.the_answer_names_it and any(
+                one in plainly for one in recipe.the_answer_names_it):
+            advice = recipe.when_the_answer_names_it or advice
         about = self._how_it_describes_its_sign_in(recipe, deadline_at)
         if about:
             said.append(f"It says of itself: {about}.")
@@ -621,7 +802,7 @@ class SubscriptionCLIProvider(Provider):
             body = json.loads(stdout.strip() or "{}")
         except json.JSONDecodeError as exc:
             raise HarnessError(f"{recipe.label} did not answer with JSON: {exc.msg}") from exc
-        if recipe.error_field and _dotted(body, recipe.error_field) is True:
+        if _that_went_wrong(recipe, body):
             said = _dotted(body, recipe.error_message_field) if recipe.error_message_field else ""
             # Cut to a length a person reads. Every other way of building one of
             # these caps what it holds; this one did not, so a tool that answers
@@ -828,6 +1009,35 @@ def _objects_in_these_lines(lines: list[str]) -> list[dict[str, Any]]:
     if holding is not None:
         seen.extend(aside)
     return seen
+
+
+def _that_went_wrong(recipe: CliRecipe, body: dict[str, Any]) -> bool:
+    """Whether one thing a tool printed is it saying no.
+
+    Two ways of saying it. Most set a flag to true. Gemini puts an object where
+    the answer would be and says nothing else, and read for a flag that says
+    nothing at all - so a refusal came back as an empty answer.
+    """
+
+    if recipe.error_when_present and _dotted(body, recipe.error_when_present) is not None:
+        return True
+    return bool(recipe.error_field) and _dotted(body, recipe.error_field) is True
+
+
+def _this_is_its_answer(recipe: CliRecipe, body: dict[str, Any]) -> bool:
+    """Whether one thing a tool printed is its answer rather than a line beside it.
+
+    These tools print progress and counts alongside the answer, and any of those
+    can carry a number under one of the names being looked for without being
+    about this request at all. A tool says whether it failed in its answer and
+    nowhere else, so that is what marks the answer out - either the flag, or the
+    place an error object would go, or the answer itself.
+    """
+
+    for name in (recipe.error_field, recipe.error_when_present, recipe.text_field):
+        if name and _dotted(body, name) is not None:
+            return True
+    return not (recipe.error_field or recipe.error_when_present or recipe.text_field)
 
 
 def _every_build_of(patterns: tuple[str, ...]) -> list[tuple[Path, tuple[int, ...]]]:

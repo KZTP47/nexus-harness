@@ -49,6 +49,31 @@ tries is shown beside the step in the log.
 
 ---
 
+## Telling one step from another
+
+Every step can be told four things beyond what it does. The dialog on the step
+has all of them.
+
+**Try again this many times if it fails**, and **how long to wait** between
+tries. For anything that fails because something else was briefly busy.
+
+**When this step runs.** The usual answer is "when all is well" — anything before
+it failed and this is skipped. The other is "when something failed", which is how
+you get a step that only ever runs to tell somebody it broke.
+
+**Give up on this step after N seconds.** New. A step with nothing to say for
+itself otherwise holds the whole run up until the run's own limit runs out, which
+on a long automation is the rest of the afternoon — and whoever set it going is
+not watching. 0 means no limit of its own.
+
+**Let the rest carry on even if this one fails.** New. For the steps that are a
+nice-to-have rather than the point: posting a note, tidying up afterwards. One of
+those failing should not throw away work that already passed, and a step marked
+this way is not counted against the run either.
+
+Both new ones are shown on the step itself, so you can see them without opening
+it. Something you can only see by opening it is something nobody checks.
+
 ## The kinds of step
 
 | Kind | What it does | What it needs |

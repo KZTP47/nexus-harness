@@ -35,6 +35,7 @@ from .execution import CommandRunner
 from .models import HarnessError
 from .redaction import CredentialRedactor
 from .safety import confined_path
+from .safety import put_this_file_in_place
 
 SUITE_SCHEMA_VERSION = 1
 CASE_KINDS = ("command", "file", "http", "browser", "visual", "secrets", "crawl")
@@ -1477,6 +1478,167 @@ def visual_reasons(case: QaCase, difference: images.Difference, baseline: str) -
     return reasons
 
 
+
+# Where a copy of the board goes before checks run against it, and stays. Kept
+# rather than tidied away: a run that is killed outright never reaches any
+# putting-back, and the whole reason this exists is that one was.
+WHERE_THE_BOARD_IS_COPIED = "boards-before-checks"
+# How many copies to keep. One per run, and a run is a thing somebody starts, so
+# this is weeks of them and still a number.
+MOST_BOARD_COPIES = 30
+
+
+@contextlib.contextmanager
+def _the_board_put_back_afterwards(cases, run_id: str = "") -> "Iterator[None]":
+    """Keep the agent board safe while checks run against it.
+
+    A copy is written first and left there afterwards. Then the board is put
+    back the way it was - and if the putting-back cannot happen, because the run
+    was killed or because something has the file open, the copy is still on the
+    disk with the date on it and can be put back by hand.
+
+    Only when a check says it touches the board, so an ordinary run that never
+    goes near it is not slowed down or rewritten for no reason.
+    """
+
+    from . import swarm as swarm_lab
+
+    if not any("board" in str(thing).lower() for case in cases for thing in case.touches):
+        yield
+        return
+    live = swarm_lab.where_it_lives()
+    kept_ones = swarm_lab.where_the_kept_ones_live()
+    was = _read_or_nothing(live)
+    # The boards somebody saved under a name, which a check can delete as easily
+    # as it can change the live one.
+    saved_was = {}
+    try:
+        saved_was = {one.name: one.read_text(encoding="utf-8")
+                     for one in sorted(kept_ones.glob("*.json"))}
+    except OSError:
+        saved_was = {}
+    _keep_a_copy_of_the_board(live, was, saved_was, run_id)
+    try:
+        yield
+    finally:
+        _put_the_board_back(live, was)
+        _put_the_saved_boards_back(kept_ones, saved_was)
+
+
+def _read_or_nothing(where: "Path") -> str | None:
+    try:
+        return where.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _keep_a_copy_of_the_board(
+    live: "Path", was: str | None, saved_was: dict, run_id: str
+) -> None:
+    """Write the board aside before anything runs, and leave it there.
+
+    This is the part that holds when nothing else does. A run killed outright
+    never reaches the putting-back; a file something has open cannot be moved
+    over. Neither of those can touch a copy that was already written and is not
+    tidied away afterwards.
+    """
+
+    if was is None and not saved_was:
+        return
+    try:
+        where = live.parent / WHERE_THE_BOARD_IS_COPIED
+        where.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        name = f"{stamp}-{run_id or 'checks'}.json"
+        put_this_file_in_place(where / name, json.dumps({
+            "why": "Copied before checks ran, in case they leave it wrong.",
+            "when": stamp,
+            "run": run_id,
+            "board": was,
+            "saved_boards": saved_was,
+        }, indent=2) + "\n")
+        _throw_away_the_oldest_copies(where)
+    except (OSError, HarnessError, ValueError):
+        # Worth trying and not worth stopping a run of checks over. The putting
+        # back afterwards still happens either way.
+        return
+
+
+def _throw_away_the_oldest_copies(where: "Path") -> None:
+    try:
+        held = sorted(where.glob("*.json"))
+    except OSError:
+        return
+    for one in held[:max(0, len(held) - MOST_BOARD_COPIES)]:
+        try:
+            one.unlink()
+        except OSError:
+            continue
+
+
+def _put_the_board_back(live: "Path", was: str | None) -> None:
+    """Put the live board back the way it was found.
+
+    Through the patient writer, because Windows will not move a file over one
+    that anything has open - and a panel reading the board is exactly that. Left
+    to a plain move this threw, and the throw was swallowed, and the board was
+    left as the check left it.
+    """
+
+    now = _read_or_nothing(live)
+    if now == was:
+        return
+    if was is None:
+        try:
+            live.unlink(missing_ok=True)
+        except OSError:
+            return
+        return
+    try:
+        put_this_file_in_place(live, was)
+    except (OSError, HarnessError):
+        # The copy written before the run is still on the disk, so nothing is
+        # gone for good. Said out loud rather than swallowed: somebody has to
+        # know their board is not what they left it.
+        _say_it_could_not_be_put_back(live)
+
+
+def _put_the_saved_boards_back(where: "Path", saved_was: dict) -> None:
+    """Put back any board somebody had saved under a name.
+
+    A check can delete one of these as easily as it can change the live board,
+    and deleting somebody's saved arrangement is the worse of the two.
+    """
+
+    if not saved_was:
+        return
+    try:
+        where.mkdir(parents=True, exist_ok=True)
+        for name, held in saved_was.items():
+            one = where / name
+            if _read_or_nothing(one) != held:
+                put_this_file_in_place(one, held)
+    except (OSError, HarnessError):
+        _say_it_could_not_be_put_back(where)
+
+
+def _say_it_could_not_be_put_back(where: "Path") -> None:
+    """Say so, where the first version of this said nothing at all.
+
+    Swallowed, somebody is left with a board that is not the one they arranged
+    and no reason to think anything happened to it.
+    """
+
+    import sys
+
+    print(
+        f"The agent board at {where} could not be put back after the checks. "
+        f"A copy from before they ran is in "
+        f"{where.parent / WHERE_THE_BOARD_IS_COPIED}.",
+        file=sys.stderr,
+    )
+
+
 class QaRunner:
     """Runs a suite. Only the process runner and local file reads touch disk."""
 
@@ -1652,13 +1814,20 @@ class QaRunner:
         # several at a time; two that change the same thing simply wait for
         # each other rather than fighting over it.
         held = {thing: threading.Lock() for case in selected for thing in case.touches}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-            futures = {
-                pool.submit(self._run_case, case, artifacts_root, held): case for case in selected
-            }
-            for future in concurrent.futures.as_completed(futures):
-                case = futures[future]
-                results[case.id] = future.result()
+        # The board somebody actually uses, put aside before any of this runs.
+        # Checks that rearrange the board put it back themselves at the end, and
+        # that is no help at all when a check is killed part way through: the
+        # step that puts it back never runs, and somebody's agents are gone. It
+        # cost a real person their board once, which is once too often.
+        with _the_board_put_back_afterwards(selected, identifier):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+                futures = {
+                    pool.submit(self._run_case, case, artifacts_root, held): case
+                    for case in selected
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    case = futures[future]
+                    results[case.id] = future.result()
         duration = int((self.clock() - started) * 1000)
         ordered = tuple(results[case.id] for case in selected)
         result = QaRunResult(

@@ -1436,7 +1436,7 @@ def create_provider(config: LoadedConfig) -> Provider:
         from .codex_cli import CodexCLIProvider
 
         return CodexCLIProvider(config)
-    if name in ("claude-cli", "copilot-cli", "assistant-cli"):
+    if name in ("claude-cli", "copilot-cli", "assistant-cli", "gemini-cli"):
         from .subscription_cli import SubscriptionCLIProvider
 
         return SubscriptionCLIProvider(config, name)

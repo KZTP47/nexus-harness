@@ -32,8 +32,15 @@ def _load_json(value: str) -> Any:
     return json.loads(value, parse_constant=reject_constant)
 
 
-def _minimal_codex_environment() -> dict[str, str]:
-    """Pass platform/runtime discovery only; Codex owns and resolves its auth."""
+def _minimal_codex_environment(also: dict[str, str] | None = None) -> dict[str, str]:
+    """Pass platform/runtime discovery only; the tool owns and resolves its auth.
+
+    `also` is for the few things a caller means to hand over: a key somebody
+    wrote down on purpose, or the Cloud project Google insists on. Added here
+    rather than left in the environment to be picked up by luck - a key that
+    arrives because it happened to be set is a key nobody decided to spend.
+    """
+
     allowed = {
         "PATH", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "WINDIR", "COMSPEC",
         "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "XDG_CONFIG_HOME",
@@ -41,6 +48,9 @@ def _minimal_codex_environment() -> dict[str, str]:
     }
     environment = {name: value for name, value in os.environ.items() if name.upper() in allowed}
     environment["PYTHONIOENCODING"] = "utf-8"
+    for name, value in (also or {}).items():
+        if value:
+            environment[name] = value
     return environment
 
 
@@ -51,6 +61,7 @@ def _run_bounded(
     stdin_text: str | None,
     timeout_seconds: float,
     max_output_bytes: int,
+    also_in_the_environment: dict[str, str] | None = None,
 ) -> CommandResult:
     if timeout_seconds <= 0:
         raise HarnessError("Codex CLI wall-clock deadline expired")
@@ -60,7 +71,7 @@ def _run_bounded(
         process = subprocess.Popen(
             argv,
             cwd=cwd,
-            env=_minimal_codex_environment(),
+            env=_minimal_codex_environment(also_in_the_environment),
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
