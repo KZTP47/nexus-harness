@@ -707,8 +707,14 @@ function modelSetup() {
   for (const option of advice.options) {
     const item = make("li", `model-option ${option.state === "ready" ? "ready" : "todo"}`);
     const head = make("p", "model-head");
+    const stateLabel = {
+      ready: "Connected",
+      installed: "Installed",
+      "needs attention": "Needs attention",
+      "needs setup": "To do",
+    }[option.state] || option.state;
     head.append(
-      make("span", "step-mark", option.state === "ready" ? "Ready" : "To do"),
+      make("span", "step-mark", stateLabel),
       make("strong", "", option.label),
       make("span", "", option.in_use ? " (this project uses it)" : "")
     );
@@ -720,7 +726,10 @@ function modelSetup() {
     }
     if (canDoForYou.includes(option.id)) {
       // The whole list above, done for somebody who does not want to read it.
-      const button = make("button", "do-it-button", "I don't care, just do it for me");
+      const buttonLabel = option.state === "needs attention"
+        ? "Repair this connection"
+        : (option.state === "installed" ? "Connect to this project" : "Set this up for me");
+      const button = make("button", "do-it-button", buttonLabel);
       button.type = "button";
       button.dataset.option = option.id;
       button.addEventListener("click", () => doItForMe(option.id));
@@ -1705,11 +1714,11 @@ function renderSeats(found) {
   list.replaceChildren();
   for (const seat of found.seats || []) {
     const row = make("li", `seat ${seat.ready ? "ready" : "not-ready"}`);
-    row.append(make("span", "seat-state", seat.ready ? "Ready" : "Not here"));
+    row.append(make("span", "seat-state", seat.ready ? "Installed" : "Not here"));
     const detail = make("div", "");
     detail.append(make("strong", "", seat.label));
     detail.append(make("p", "", seat.ready
-      ? `${seat.version} — found at ${seat.found_at}`
+      ? `${seat.version}${seat.found_via ? ` — from ${seat.found_via}` : ""}`
       : seat.why_not));
     if (!seat.ready && seat.install_hint) detail.append(make("p", "field-help", seat.install_hint));
     if (seat.ready && seat.already_set_up) detail.append(make("p", "field-help", "A route for this is already in your settings."));
@@ -1718,7 +1727,7 @@ function renderSeats(found) {
   }
   const ready = (found.seats || []).filter((seat) => seat.ready);
   $("seatFindSaid").textContent = ready.length
-    ? `${ready.length} of ${(found.seats || []).length} are ready to use.`
+    ? `${ready.length} of ${(found.seats || []).length} are installed. Connect them below to verify their subscriptions.`
     : "None of them are on this machine yet. Install one, then press the button again.";
   markSeatStep("seatStepFind", "done");
   markSeatStep("seatStepWrite", ready.length ? "doing" : "waiting");
@@ -6521,8 +6530,11 @@ function oneSwarmChatCard(held) {
   card.append(bar);
 
   card.append(make("p", "swarm-chat-said hint", agent.ready
-    ? "Nobody else reads this."
+    ? (agent.trouble_last_time || "Nobody else reads this.")
     : (agent.why_not || "This one is not set up yet.")));
+  if (agent.how_to_fix_it) {
+    card.append(make("p", "swarm-chat-repair hint", agent.how_to_fix_it));
+  }
   card.append(make("ol", "swarm-chat-thread talk-thread"));
 
   const form = make("form", "swarm-chat-form");
@@ -7674,6 +7686,9 @@ function renderWhatItHasGoingOn(agent) {
   }
   if (agent && agent.trouble_last_time) {
     list.append(make("li", "the-big-chat-doing-one", agent.trouble_last_time));
+  }
+  if (agent && agent.how_to_fix_it) {
+    list.append(make("li", "the-big-chat-doing-one", agent.how_to_fix_it));
   }
 }
 

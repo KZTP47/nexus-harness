@@ -88,13 +88,37 @@ _ACCOUNT_EMAIL = re.compile(
 _AUTH_STATUS_DETAILS = re.compile(
     r"It says of itself:\s*(signed in|not signed in)[^.]*\.", re.IGNORECASE
 )
+_CLAUDE_SUBSCRIPTION_REFUSALS = (
+    "disabled claude subscription access",
+    "claude code turned off",
+    "subscription_access_disabled",
+    "anthropic rejected the command-line subscription request",
+)
+
+
+def _claude_subscription_repair() -> str:
+    return (
+        "Anthropic rejected the command-line subscription request. This does not "
+        "mean the installed Claude app is missing or signed out. Finish anything "
+        "open in Claude, then run: claude auth logout, claude update, and claude "
+        "auth login; choose Claude account with subscription. If claude -p still "
+        "gets a 403, contact Anthropic support. An API key is separately billed "
+        "and is never selected automatically."
+    )
 
 
 def _without_personal_account_details(said: str) -> str:
     held = _ACCOUNT_EMAIL.sub("[ACCOUNT EMAIL HIDDEN]", str(said or ""))
-    return _AUTH_STATUS_DETAILS.sub(
+    held = _AUTH_STATUS_DETAILS.sub(
         lambda found: f"It says of itself: {found.group(1).lower()}.", held
     )
+    # Older builds recorded a definitive and incorrect diagnosis for this 403,
+    # sometimes followed by an account identity. Rewrite it while reading as
+    # well as while writing so an already-saved refusal cannot keep exposing a
+    # person or keep telling them their administrator deliberately disabled it.
+    if any(mark in held.lower() for mark in _CLAUDE_SUBSCRIPTION_REFUSALS):
+        return _claude_subscription_repair()
+    return held
 
 
 # How many conversations get a lock of their own before they start sharing one.
@@ -361,13 +385,10 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
                 "google_cloud_project", "google cloud project", "google_project"
             ))
         )
-        blocked_by_account = bool(
+        claude_needs_attention = bool(
             kind == "claude-cli"
             and no
-            and any(mark in no["why"].lower() for mark in (
-                "disabled claude subscription access",
-                "claude code turned off",
-            ))
+            and any(mark in no["why"].lower() for mark in _CLAUDE_SUBSCRIPTION_REFUSALS)
         )
         found.append({
             "route": str(name),
@@ -384,25 +405,25 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
             # belongs beside the word and not inside it. The exception above is
             # not a past outage: it is a required route setting, so no retry can
             # start until the setting is supplied.
-            "ready": not (needs_setup or blocked_by_account),
+            # A provider refusal is a connection-health warning, not a permanent
+            # kill switch. Keeping this retryable lets a refreshed OAuth session
+            # recover without deleting and recreating the assistant.
+            "ready": not needs_setup,
             "why_not": (
                 "Gemini needs the Google Cloud project id for this Workspace account."
-                if needs_setup else (
-                    "This Claude account is not allowed to use Claude Code."
-                    if blocked_by_account else ""
-                )
+                if needs_setup else ""
             ),
             "how_to_fix_it": (
                 "Press Connect it and enter the project id. No API key is needed."
-                if needs_setup else (
-                    "An organisation administrator must enable Claude Code subscription access."
-                    if blocked_by_account else ""
+                if needs_setup else (_claude_subscription_repair() if claude_needs_attention else "")
+            ),
+            "connection_state": (
+                "needs setup" if needs_setup else (
+                    "needs attention" if no else "connected"
                 )
             ),
-            # Installed is not the same as repairable. Reconnecting cannot
-            # override an organisation policy, so it must not offer a button
-            # that will run the same command and fail in the same way.
-            "setup_blocked": blocked_by_account,
+            "retryable": not needs_setup,
+            "setup_blocked": False,
             "trouble_last_time": (
                 f"The last time this was asked something, it would not answer: {no['why']}"
                 if no else ""

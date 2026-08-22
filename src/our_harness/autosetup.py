@@ -39,6 +39,7 @@ from typing import Any, Callable
 
 from .config import LoadedConfig, is_project_local_config_trusted, trust_project_local_config
 from .models import HarnessError
+from .providers.subscription_cli import _in_a_few_words, available, recipe_for
 from .safety import confined_path
 
 DOING = "doing"
@@ -152,6 +153,15 @@ PLANS: dict[str, Plan] = {
         command="copilot",
         where_to_get_it="the GitHub Copilot command line install page",
     ),
+    "gemini-cli": Plan(
+        option="gemini-cli",
+        label="Gemini command line",
+        route_name="gemini",
+        kind="gemini-cli",
+        model="gemini-2.5-pro",
+        command="gemini",
+        where_to_get_it="the Gemini command line install page",
+    ),
     "codex-cli": Plan(
         option="codex-cli",
         label="Codex command line",
@@ -185,7 +195,7 @@ PLANS: dict[str, Plan] = {
     ),
     "gemini": Plan(
         option="gemini",
-        label="Google Gemini",
+        label="Google Gemini API",
         route_name="gemini",
         kind="gemini",
         model="gemini-2.5-pro",
@@ -363,11 +373,18 @@ def _finish(job: Job, config: LoadedConfig, plan: Plan) -> None:
         trust_step.detail = trouble
         job.left_for_you.append(trouble)
     job.worked = trusted
-    job.said = (
-        f"{plan.label} is set up and ready to use."
-        if trusted
-        else f"{plan.label} is written down. One thing is left for you."
-    )
+    if trusted and plan.kind.endswith("-cli"):
+        job.said = (
+            f"{plan.label} is connected. The first message will verify that its "
+            "subscription service is answering; installation and sign-in alone "
+            "are not treated as proof."
+        )
+    else:
+        job.said = (
+            f"{plan.label} is set up and ready to use."
+            if trusted
+            else f"{plan.label} is written down. One thing is left for you."
+        )
 
 
 def _do_ollama(job: Job, config: LoadedConfig, plan: Plan) -> None:
@@ -451,7 +468,7 @@ def _do_ollama(job: Job, config: LoadedConfig, plan: Plan) -> None:
 def _do_signed_in_tool(job: Job, config: LoadedConfig, plan: Plan) -> None:
     looking = Step(f"Look for the {plan.command} command")
     job.steps.append(looking)
-    where = shutil.which(plan.command)
+    where = available(plan.kind, [plan.command])
     if not where:
         looking.state = CANNOT
         looking.detail = f"The {plan.command} command is not on this machine."
@@ -464,7 +481,7 @@ def _do_signed_in_tool(job: Job, config: LoadedConfig, plan: Plan) -> None:
     looking.state = DONE
     looking.detail = "Found on this machine."
 
-    asking = Step("Check it answers")
+    asking = Step("Check the installed command")
     job.steps.append(asking)
     code, said = _run([where, "--version"], SHORT_COMMAND_SECONDS)
     if code != 0:
@@ -476,7 +493,33 @@ def _do_signed_in_tool(job: Job, config: LoadedConfig, plan: Plan) -> None:
         job.said = f"{plan.label} is installed but not signed in."
         return
     asking.state = DONE
-    asking.detail = said.splitlines()[0][:120] if said else "It answered."
+    asking.detail = "The installed command answered."
+
+    recipe = recipe_for(plan.kind)
+    if recipe.signed_in_arguments:
+        signing_in = Step("Check sign-in without reading account details")
+        job.steps.append(signing_in)
+        code, said = _run(
+            [where, *recipe.signed_in_arguments], SHORT_COMMAND_SECONDS
+        )
+        status = _in_a_few_words(said)
+        if code != 0 or status == "not signed in":
+            signing_in.state = CANNOT
+            signing_in.detail = (
+                "Not signed in. No account name, email address, token, or plan "
+                "details were kept."
+            )
+            job.left_for_you.append(
+                f"Run {plan.command} yourself and sign in, then press Connect again."
+            )
+            job.said = f"{plan.label} is installed but needs you to sign in."
+            return
+        signing_in.state = DONE
+        signing_in.detail = (
+            "Signed in. Account name, email address, token, and plan details were discarded."
+            if status == "signed in"
+            else "The sign-in check answered; personal account details were discarded."
+        )
     _finish(job, config, plan)
 
 
@@ -504,6 +547,7 @@ HOW: dict[str, Callable[[Job, LoadedConfig, Plan], None]] = {
     "ollama": _do_ollama,
     "claude-cli": _do_signed_in_tool,
     "copilot-cli": _do_signed_in_tool,
+    "gemini-cli": _do_signed_in_tool,
     "codex-cli": _do_signed_in_tool,
     "anthropic": _do_hosted,
     "openai": _do_hosted,

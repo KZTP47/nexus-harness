@@ -375,7 +375,8 @@ class RunningTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("what turned this down was the service", message)
         self.assertNotIn("never asked anybody", message)
-        self.assertNotIn("claude auth login", message)
+        self.assertIn("claude auth login", message)
+        self.assertIn("contact Anthropic support", message)
 
     def test_a_tool_that_does_not_say_either_way_gets_no_guess(self) -> None:
         """Nothing is a real answer. A tool that says nothing about how long the
@@ -545,7 +546,8 @@ class RunningTests(unittest.TestCase):
         data = copy.deepcopy(DEFAULT_CONFIG)
         data["provider"].update({"name": "claude-cli", "model": "m", "endpoint": "", "api_key_env": ""})
         provider = SubscriptionCLIProvider(LoadedConfig(data, self.folder, [], {}), "claude-cli")
-        with mock.patch.object(subscription_cli.shutil, "which", return_value=None):
+        with mock.patch.object(subscription_cli.shutil, "which", return_value=None), \
+                mock.patch.object(subscription_cli, "_every_build_of", return_value=[]):
             with self.assertRaises(HarnessError) as caught:
                 provider.complete(self.request())
         self.assertIn("Install Claude Code", str(caught.exception))
@@ -841,8 +843,9 @@ class TheNewestBuildWinsTests(unittest.TestCase):
     and said "your organization does not have access to Claude, please login
     again" - which was not true, and sends somebody to their administrator about
     the wrong thing. The new one asked, and came back with a plain four hundred
-    and three: the organisation has Claude Code turned off. Same account, same
-    minute; only the copy of the program was different.
+    and three about command-line subscription access while the interactive app
+    still worked. Same account, same minute; only the copy of the program was
+    different. The status identifies the rejected OAuth request, not its cause.
     """
 
     def setUp(self) -> None:
@@ -952,6 +955,22 @@ class TheNewestBuildWinsTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}),              mock.patch.object(subscription_cli.shutil, "which", lambda name: str(onpath)),              mock.patch.object(subscription_cli, "_the_version_of", lambda where: (2, 1, 101)):
             self.assertEqual(holder._command()[0], str(newer))
 
+    def test_the_desktop_build_runs_even_when_nothing_is_on_the_path(self) -> None:
+        desktop = self.a_build("2.1.234")
+        holder = self.provider_reading(self.patterns())
+        with mock.patch.dict(os.environ, {"HARNESS_TEST_HOME": str(self.folder)}), \
+             mock.patch.object(subscription_cli.shutil, "which", return_value=None):
+            self.assertEqual(holder._command()[0], str(desktop))
+
+    def test_discovery_finds_a_desktop_build_without_a_path_launcher(self) -> None:
+        desktop = self.folder / "claude.exe"
+        with mock.patch.object(subscription_cli.shutil, "which", return_value=None), \
+             mock.patch.object(
+                 subscription_cli, "_every_build_of",
+                 return_value=[(desktop, (2, 1, 234))],
+             ):
+            self.assertEqual(subscription_cli.available("claude-cli"), str(desktop))
+
     def test_with_nothing_newer_the_one_on_the_path_runs(self) -> None:
         onpath = self.folder / "npm" / "claude.CMD"
         onpath.parent.mkdir(parents=True, exist_ok=True)
@@ -967,12 +986,12 @@ class TheNewestBuildWinsTests(unittest.TestCase):
 
 
 class WhenTheAnswerAlreadySaysWhatToDoTests(unittest.TestCase):
-    """A guess offered next to an answer that spelt it out is time wasted.
+    """A provider error must not be promoted into a cause it did not prove.
 
-    On this machine the service says, in words, "ask your admin to enable
-    access". The harness answered that with "run claude setup-token", which
-    cannot work here - so somebody spends another few minutes finding that out
-    for themselves before reading the part that was true.
+    The subscription-access 403 can coexist with a working interactive app.
+    The harness therefore describes the rejected command-line OAuth request,
+    offers a clean sign-in and support path, and never silently selects a paid
+    API-key route.
     """
 
     def holder(self):
@@ -989,16 +1008,17 @@ class WhenTheAnswerAlreadySaysWhatToDoTests(unittest.TestCase):
         said = self.said_about(
             "Your organization has disabled Claude subscription access for Claude "
             "Code - Use an Anthropic API key instead, or ask your admin to enable access")
-        self.assertIn("only whoever administers it can turn it on", said)
+        self.assertIn("does not prove", said)
+        self.assertIn("claude auth logout", said)
         self.assertNotIn("setup-token", said)
 
     def test_a_refusal_that_names_nothing_still_gets_something_to_try(self) -> None:
         said = self.said_about("that model is not available on your plan")
-        self.assertIn("setup-token", said)
+        self.assertIn("claude auth login", said)
 
     def test_it_reads_the_words_whatever_case_they_came_in(self) -> None:
         self.assertIn(
-            "only whoever administers it can turn it on",
+            "does not prove",
             self.said_about("DISABLED CLAUDE SUBSCRIPTION ACCESS for Claude Code"))
 
     def test_a_wait_that_mentions_an_administrator_still_gets_something_to_try(self) -> None:
@@ -1010,7 +1030,7 @@ class WhenTheAnswerAlreadySaysWhatToDoTests(unittest.TestCase):
             "Too many requests. If this keeps happening, ask your admin about "
             "raising the limit for the team.")
         self.assertNotIn("nothing to try again", said)
-        self.assertIn("setup-token", said)
+        self.assertIn("claude auth login", said)
 
 
 class WhetherItReallyAskedTests(unittest.TestCase):

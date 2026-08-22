@@ -69,6 +69,15 @@ class WhoIsHereTests(TeamTestCase):
         self.assertIn("not on this machine", by_route["copilot"]["why_not"])
         self.assertEqual(who["how_many_ready"], 1)
 
+    def test_team_data_does_not_expose_install_paths(self) -> None:
+        private = a_seat("claude-cli", "claude", "Claude", ready=True)
+        private.found_at = "C:/Users/private-name/AppData/Local/Claude/claude.exe"
+        with self.pretend(private):
+            who = team.who_is_here(self.config)
+        shown = who["members"][0]
+        self.assertEqual(shown["found_at"], "")
+        self.assertNotIn("private-name", str(shown))
+
     def test_with_two_it_says_they_can_check_each_other(self) -> None:
         with self.both():
             who = team.who_is_here(self.config)

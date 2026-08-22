@@ -325,7 +325,9 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
     def test_a_route_that_was_turned_down_says_so_before_anybody_types(self) -> None:
         chat._write_down_that_it_would_not(
             self.config, "claude", "your organisation has Claude Code turned off")
-        self.assertIn("turned off", self.only_one()["trouble_last_time"])
+        route = self.only_one()
+        self.assertIn("Anthropic rejected", route["trouble_last_time"])
+        self.assertNotIn("organisation", route["trouble_last_time"])
 
     def test_a_gemini_route_missing_its_required_project_is_repairable(self) -> None:
         self.config.data["providers"] = {
@@ -341,16 +343,19 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
         self.assertIn("project id", route["why_not"])
         self.assertIn("Connect it", route["how_to_fix_it"])
 
-    def test_an_account_policy_that_forbids_claude_code_is_not_called_ready(self) -> None:
+    def test_a_claude_subscription_refusal_stays_retryable_and_private(self) -> None:
         chat._write_down_that_it_would_not(
             self.config,
             "claude",
             "Your organization has disabled Claude subscription access for Claude Code",
         )
         route = self.only_one()
-        self.assertFalse(route["ready"])
-        self.assertTrue(route["setup_blocked"])
-        self.assertIn("administrator", route["how_to_fix_it"])
+        self.assertTrue(route["ready"])
+        self.assertFalse(route["setup_blocked"])
+        self.assertTrue(route["retryable"])
+        self.assertEqual(route["connection_state"], "needs attention")
+        self.assertIn("claude auth logout", route["how_to_fix_it"])
+        self.assertNotIn("administrator deliberately disabled", route["trouble_last_time"])
 
     def test_account_identity_is_removed_from_new_and_old_refusals(self) -> None:
         private = (

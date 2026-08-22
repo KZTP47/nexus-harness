@@ -10,7 +10,8 @@ from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness import provider_help
-from our_harness.provider_help import NEEDS_SETUP, READY, provider_options, setup_advice
+from our_harness.provider_help import INSTALLED, NEEDS_SETUP, READY, provider_options, setup_advice
+from our_harness.providers import subscription_cli
 
 
 class ProviderHelpTests(unittest.TestCase):
@@ -33,9 +34,19 @@ class ProviderHelpTests(unittest.TestCase):
         )
         self.reachable.start()
         self.addCleanup(self.reachable.stop)
-        self.which = mock.patch.object(provider_help.shutil, "which", return_value=None)
+        self.which = mock.patch.object(subscription_cli.shutil, "which", return_value=None)
         self.which.start()
         self.addCleanup(self.which.stop)
+        self.desktop_builds = mock.patch.object(
+            subscription_cli, "_every_build_of", return_value=[]
+        )
+        self.desktop_builds.start()
+        self.addCleanup(self.desktop_builds.stop)
+        self.other_locations = mock.patch.object(
+            subscription_cli, "_where_else_it_might_be", return_value=[]
+        )
+        self.other_locations.start()
+        self.addCleanup(self.other_locations.stop)
         provider_help.clear_cache()
         self.addCleanup(provider_help.clear_cache)
 
@@ -50,7 +61,10 @@ class ProviderHelpTests(unittest.TestCase):
     def test_every_way_of_connecting_is_listed(self) -> None:
         self.assertEqual(
             set(self.by_id()),
-            {"ollama", "openai", "anthropic", "gemini", "codex-cli", "claude-cli", "copilot-cli"},
+            {
+                "ollama", "openai", "anthropic", "gemini", "gemini-cli",
+                "codex-cli", "claude-cli", "copilot-cli",
+            },
         )
 
     def test_a_bare_machine_has_nothing_ready_and_says_what_to_do(self) -> None:
@@ -83,11 +97,12 @@ class ProviderHelpTests(unittest.TestCase):
         advice = setup_advice(self.config("openai"))
         self.assertNotIn("sk-secret-value-do-not-show", json.dumps(advice))
 
-    def test_an_installed_codex_command_is_ready(self) -> None:
-        with mock.patch.object(provider_help.shutil, "which", return_value="/usr/bin/codex"):
+    def test_an_installed_codex_command_is_not_called_connected(self) -> None:
+        with mock.patch.object(subscription_cli.shutil, "which", return_value="/usr/bin/codex"):
             options = self.by_id()
-        self.assertEqual(options["codex-cli"].state, READY)
-        self.assertIn("/usr/bin/codex", options["codex-cli"].reason)
+        self.assertEqual(options["codex-cli"].state, INSTALLED)
+        self.assertIn("not connected", options["codex-cli"].reason)
+        self.assertNotIn("/usr/bin/codex", options["codex-cli"].reason)
 
     def test_ready_ways_are_listed_before_the_rest(self) -> None:
         os.environ["GEMINI_API_KEY"] = "test-value"

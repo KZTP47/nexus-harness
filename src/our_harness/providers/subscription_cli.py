@@ -186,19 +186,19 @@ CLAUDE_RECIPE = CliRecipe(
     time_at_the_service_field="duration_api_ms",
     service_status_field="api_error_status",
     when_it_never_asked=(
-        "It says the same thing itself: please login again. Run: claude auth "
-        "login. What it has written down about your account here is what it "
-        "read, and signing in again is what rewrites it. If it still says no "
-        "afterwards, then it really is your organisation's answer and whoever "
-        "administers it has to turn Claude Code on - and only then is there "
-        "anybody else to ask."
+        "Its saved sign-in needs attention. Finish anything open in Claude first, "
+        "then run: claude auth logout, claude update, and claude auth login. Pick "
+        "Claude account with subscription. If a direct claude -p request still "
+        "gets 403 afterwards, contact Anthropic support; the desktop app working "
+        "does not repair a stale command-line OAuth entitlement."
     ),
     when_it_is_refused=(
-        "A tool that is signed in and still turned down usually has no token of "
-        "its own for work nobody is watching. Run: claude setup-token. If that "
-        "is not allowed either, whoever administers your organisation has to "
-        "turn Claude Code on for it - being able to use Claude in a window of "
-        "its own is not the same permission."
+        "Claude is installed and signed in, but this non-interactive request was "
+        "rejected. Finish anything open in Claude first, then run: claude auth "
+        "logout, claude update, and claude auth login. Pick Claude account with "
+        "subscription. If a direct claude -p request still fails, contact "
+        "Anthropic support. An API key is a separate, paid route and is never "
+        "selected automatically."
     ),
     # Only what this refusal actually says, word for word. "ask your admin" on
     # its own turns up in plenty of others - a rate limit says it - and
@@ -206,19 +206,21 @@ CLAUDE_RECIPE = CliRecipe(
     # somebody away from a wait that would have fixed it in a minute.
     the_answer_names_it=("disabled claude subscription access",),
     when_the_answer_names_it=(
-        "There is nothing to try again here. Your organisation has Claude Code "
-        "turned off, and only whoever administers it can turn it on. Being "
-        "allowed to use Claude in a window of its own is a different permission "
-        "from letting a program drive it, and this is the second one - so it "
-        "working next door is not a sign that something here is broken. "
-        "Nothing on this machine changes it, and signing in again will not."
+        "This only says that Anthropic rejected the command line's subscription "
+        "OAuth request. It does not prove that Claude is missing, that the desktop "
+        "app is signed out, or that an administrator deliberately disabled it. "
+        "The same 403 is also reported for stale account-entitlement records while "
+        "interactive Claude still works. Finish anything open in Claude first, "
+        "then run: claude auth logout, claude update, and claude auth login, and "
+        "pick Claude account with subscription. If a direct claude -p request "
+        "still fails, contact Anthropic support. An API key would be separately "
+        "billed and is never selected automatically."
     ),
     when_it_is_not_clear=(
-        "Two things to try, in this order, because the first is free and the "
-        "second is somebody else's afternoon. Run: claude auth login. If it "
-        "still says no after that, whoever administers your organisation has to "
-        "turn Claude Code on for it - being able to use Claude in a window of "
-        "its own is not the same permission."
+        "Finish anything open in Claude first, then run: claude auth logout, "
+        "claude update, and claude auth login. Pick Claude account with "
+        "subscription. If a direct claude -p request still fails afterwards, "
+        "contact Anthropic support."
     ),
     install_hint=(
         "Install Claude Code and sign in with your subscription, then run: claude --version"
@@ -359,6 +361,15 @@ def available(kind: str, command: list[str] | None = None) -> str:
     if not parts:
         return ""
     found = shutil.which(parts[0])
+    # Desktop applications often keep the current build in their own data
+    # folder. It is still an installed command even when no launcher was put on
+    # PATH. Prefer the newest known build for discovery for the same reason the
+    # provider prefers it when a request is sent.
+    kept = _every_build_of(recipe.kept_under)
+    if kept:
+        newest, newest_version = max(kept, key=lambda one: one[1])
+        if not found or newest_version > _the_version_of(found):
+            return str(newest)
     if found:
         return found
     # Not on the path is not the same as not here. Codex is installed by its own
@@ -456,6 +467,9 @@ class SubscriptionCLIProvider(Provider):
             # Not on the path is not the same as not here.
             somewhere = _where_else_it_might_be(self.recipe.also_found_at)
             found = str(somewhere[0]) if somewhere else ""
+        if not found and self.recipe.kept_under:
+            kept = _every_build_of(self.recipe.kept_under)
+            found = str(max(kept, key=lambda one: one[1])[0]) if kept else ""
         if not found:
             raise HarnessError(
                 f"{parts[0]} is not on this machine. {self.recipe.install_hint}"

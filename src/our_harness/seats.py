@@ -72,6 +72,19 @@ class SeatError(HarnessError):
     """A problem setting up an assistant."""
 
 
+def safe_install_location(kind: str, found_at: str) -> str:
+    """Describe where a tool came from without exposing a Windows user path."""
+
+    held = str(found_at or "").replace("\\", "/").lower()
+    if not held:
+        return ""
+    if kind == "claude-cli" and ("/packages/claude_" in held or "/claude/" in held):
+        return "the Claude desktop app"
+    if kind == "codex-cli" and ("/packages/openai.codex_" in held or "/codex/" in held):
+        return "the Codex desktop app"
+    return "an installed command"
+
+
 @dataclass
 class Seat:
     """One assistant, and whether this machine can use it."""
@@ -94,7 +107,11 @@ class Seat:
             "label": self.label,
             "route": self.route,
             "command": self.command,
-            "found_at": self.found_at,
+            # The exact executable remains process-local. A full install path
+            # commonly contains the Windows account name and is neither needed
+            # by the browser nor safe to include in screenshots and reports.
+            "found_at": "",
+            "found_via": safe_install_location(self.kind, self.found_at),
             "version": self.version,
             "ready": self.ready,
             "already_set_up": self.already_set_up,

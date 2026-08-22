@@ -71,6 +71,17 @@ class LookingTests(SeatTestCase):
         self.assertEqual(claude.found_at, "/usr/bin/claude")
         self.assertEqual(claude.route, "claude")
 
+    def test_the_browser_never_receives_the_executable_or_windows_user_path(self) -> None:
+        seat = seats.Seat(
+            kind="claude-cli", label="Claude", route="claude", command="claude",
+            found_at="C:/Users/private-name/AppData/Local/Packages/Claude_x/claude.exe",
+            version="2.1.237", ready=True,
+        )
+        shown = seat.to_dict()
+        self.assertEqual(shown["found_at"], "")
+        self.assertEqual(shown["found_via"], "the Claude desktop app")
+        self.assertNotIn("private-name", json.dumps(shown))
+
     def test_a_tool_that_is_not_there_says_where_to_get_it(self) -> None:
         finds, asks = pretend({})
         with finds, asks:

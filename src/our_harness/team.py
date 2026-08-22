@@ -152,6 +152,8 @@ class Member:
     install_hint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        from .seats import safe_install_location
+
         return {
             "route": self.route,
             "label": self.label,
@@ -160,7 +162,12 @@ class Member:
             "signed_in": self.signed_in,
             "already_set_up": self.already_set_up,
             "version": self.version,
-            "found_at": self.found_at,
+            "found_at": "",
+            "found_via": (
+                safe_install_location(self.kind, self.found_at)
+                if self.kind.endswith("-cli")
+                else ("a configured service" if self.found_at else "")
+            ),
             "why_not": self.why_not,
             "install_hint": self.install_hint,
         }

@@ -8,7 +8,6 @@ to do about the ones that are not.
 from __future__ import annotations
 
 import os
-import shutil
 import ssl
 import threading
 import time
@@ -21,6 +20,8 @@ from typing import Any, Callable
 from .config import LoadedConfig
 
 READY = "ready"
+INSTALLED = "installed"
+ATTENTION = "needs attention"
 NEEDS_SETUP = "needs setup"
 
 # Looking for a listening server costs a round trip, and the first screen asks
@@ -157,27 +158,61 @@ def _hosted(
     )
 
 
-def _signed_in_tool(identifier: str, in_use: bool) -> ProviderOption:
+def _routes_of_kind(config: LoadedConfig, identifier: str) -> list[str]:
+    routes = config.get("providers", {}) or {}
+    if not isinstance(routes, dict):
+        return []
+    return [
+        str(name) for name, held in routes.items()
+        if isinstance(held, dict)
+        and str(held.get("kind") or held.get("name") or "") == identifier
+    ]
+
+
+def _signed_in_tool(
+    identifier: str, config: LoadedConfig, in_use: bool
+) -> ProviderOption:
     """An assistant you already pay for, driven through its own command line."""
 
     from .providers.subscription_cli import available, recipe_for
 
     recipe = recipe_for(identifier)
     summary = (
-        "Uses a seat your organisation already pays for. No key to get, "
-        "because the tool is already signed in."
+        "Uses the personal or work subscription already signed in on this computer. "
+        "No API key is copied into the harness."
     )
     found = available(identifier)
     if found:
+        routes = _routes_of_kind(config, identifier)
+        # A saved refusal is already scrubbed before it reaches this page. It
+        # means the route exists but its connection needs attention; it does not
+        # turn an installed program into "not here" or permanently disable it.
+        from .chat import what_would_not_answer
+
+        refusals = what_would_not_answer(config)
+        problem = next((refusals[name]["why"] for name in routes if name in refusals), "")
+        if problem:
+            state = ATTENTION
+            reason = f"Installed and connected in settings. Last request: {problem}"
+            steps = (
+                "Repair the sign-in shown above, then send the message again.",
+                "The harness keeps your unsent words and never switches to a separately billed API key.",
+            )
+        elif routes or str(config.get("provider.name") or "") == identifier:
+            state = READY
+            reason = "Installed and connected in this project's settings."
+            steps = ("The first message verifies that the subscription service is answering.",)
+        else:
+            state = INSTALLED
+            reason = "Installed on this machine, but not connected to this project yet."
+            steps = ("Press Connect to add a local provider route. No API key is needed.",)
         return ProviderOption(
             id=identifier,
             label=recipe.label,
             summary=summary,
-            state=READY,
-            reason=f"The {recipe.command[0]} command was found at {found}.",
-            steps=(
-                "Add it as a provider route in your own local config, then run: harness trust",
-            ),
+            state=state,
+            reason=reason,
+            steps=steps,
             cost="Covered by your subscription, with that plan's limits.",
             in_use=in_use,
         )
@@ -186,42 +221,12 @@ def _signed_in_tool(identifier: str, in_use: bool) -> ProviderOption:
         label=recipe.label,
         summary=summary,
         state=NEEDS_SETUP,
-        reason=f"The {recipe.command[0]} command is not on this machine.",
+        reason=f"The {recipe.command[0]} command was not found on this machine.",
         steps=(
             recipe.install_hint,
-            "Add it as a provider route in your own local config, then run: harness trust",
+            "Come back and press Connect. The harness will create the local route.",
         ),
         cost="Covered by your subscription, with that plan's limits.",
-        in_use=in_use,
-    )
-
-
-def _codex_cli(in_use: bool) -> ProviderOption:
-    found = shutil.which("codex")
-    summary = "Reuses a ChatGPT sign-in you already have, through the codex command."
-    if found:
-        return ProviderOption(
-            id="codex-cli",
-            label="Codex command line",
-            summary=summary,
-            state=READY,
-            reason=f"The codex command was found at {found}.",
-            steps=("If it asks you to sign in, run: codex login",),
-            cost="Covered by your ChatGPT plan, with that plan's limits.",
-            in_use=in_use,
-        )
-    return ProviderOption(
-        id="codex-cli",
-        label="Codex command line",
-        summary=summary,
-        state=NEEDS_SETUP,
-        reason="The codex command is not on this machine.",
-        steps=(
-            "Install the Codex command line tool.",
-            "Run: codex login",
-            "Add a provider route of kind codex-cli to your local config.",
-        ),
-        cost="Covered by your ChatGPT plan, with that plan's limits.",
         in_use=in_use,
     )
 
@@ -232,12 +237,13 @@ def provider_options(config: LoadedConfig) -> list[ProviderOption]:
     chosen = str(config.get("provider.name") or "")
     options = [
         _ollama(config, in_use=chosen == "ollama"),
-        _signed_in_tool("claude-cli", in_use=chosen == "claude-cli"),
-        _signed_in_tool("copilot-cli", in_use=chosen == "copilot-cli"),
+        _signed_in_tool("claude-cli", config, in_use=chosen == "claude-cli"),
+        _signed_in_tool("copilot-cli", config, in_use=chosen == "copilot-cli"),
+        _signed_in_tool("gemini-cli", config, in_use=chosen == "gemini-cli"),
+        _signed_in_tool("codex-cli", config, in_use=chosen == "codex-cli"),
         _hosted("anthropic", "Anthropic", "ANTHROPIC_API_KEY", "console.anthropic.com", chosen == "anthropic"),
         _hosted("openai", "OpenAI", "OPENAI_API_KEY", "platform.openai.com", chosen == "openai"),
-        _hosted("gemini", "Google Gemini", "GEMINI_API_KEY", "aistudio.google.com", chosen == "gemini"),
-        _codex_cli(in_use=False),
+        _hosted("gemini", "Google Gemini API", "GEMINI_API_KEY", "aistudio.google.com", chosen == "gemini"),
     ]
     options.sort(key=lambda item: (item.state != READY, not item.in_use, item.label))
     return options
@@ -265,6 +271,7 @@ def setup_advice(
             config.get("provider.endpoint"),
             config.get("provider.model"),
             config.get("provider.api_key_env"),
+            repr(config.get("providers", {})),
         )
     )
     now = clock()

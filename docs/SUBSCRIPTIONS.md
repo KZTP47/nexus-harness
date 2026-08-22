@@ -157,10 +157,13 @@ put there by npm, first on the path and never updated, and one the Claude
 desktop app keeps up to date for itself. They do not answer the same way. The
 old one refused without asking anybody - no request left the machine - and said
 "your organization does not have access to Claude, please login again", which
-sent somebody to their administrator about the wrong thing. The newer one asked,
-and came back with the real answer: the organisation has Claude Code turned off
-for subscription use. So the harness looks for the newest build it can find
-rather than taking the first one on the path.
+sent somebody to their administrator about the wrong thing. The newer one reached
+Anthropic and returned a 403 about command-line subscription access while the
+interactive desktop app still worked. That proves the OAuth request was rejected;
+it does not prove why or that an administrator deliberately disabled it. So the
+harness looks for the newest build, keeps the route retryable, recommends a clean
+command-line sign-in, and points to Anthropic support if a direct `claude -p`
+request still fails.
 
 **Whether it asked anybody at all.** A refusal decided on your own machine and a
 refusal from the service need two different things done about them, and the

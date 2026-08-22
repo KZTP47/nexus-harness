@@ -116,7 +116,8 @@ class WhatItWritesTests(SetupTestCase):
 
 class ASignedInToolTests(SetupTestCase):
     def test_a_tool_that_is_there_and_answers_is_set_up(self) -> None:
-        with mock.patch.object(autosetup.shutil, "which", lambda name: "/usr/bin/claude"), \
+        with mock.patch.object(
+                autosetup, "available", lambda kind, command=None: "/usr/bin/claude"), \
                 mock.patch.object(autosetup, "_run", lambda parts, seconds: (0, "2.1.101")):
             job = autosetup.do_it(self.config, "claude-cli")
         self.assertTrue(job.worked, job.said)
@@ -125,7 +126,7 @@ class ASignedInToolTests(SetupTestCase):
         self.assertTrue(is_project_local_config_trusted(self.root, self.local))
 
     def test_a_tool_that_is_not_there_says_so_and_writes_nothing(self) -> None:
-        with mock.patch.object(autosetup.shutil, "which", lambda name: ""):
+        with mock.patch.object(autosetup, "available", lambda kind, command=None: ""):
             job = autosetup.do_it(self.config, "copilot-cli")
         self.assertFalse(job.worked)
         self.assertTrue(job.left_for_you)
@@ -133,7 +134,8 @@ class ASignedInToolTests(SetupTestCase):
         self.assertFalse(self.local.exists(), "nothing was written")
 
     def test_a_tool_that_is_there_but_not_signed_in_writes_nothing(self) -> None:
-        with mock.patch.object(autosetup.shutil, "which", lambda name: "/usr/bin/claude"), \
+        with mock.patch.object(
+                autosetup, "available", lambda kind, command=None: "/usr/bin/claude"), \
                 mock.patch.object(autosetup, "_run", lambda parts, seconds: (1, "Please sign in")):
             job = autosetup.do_it(self.config, "claude-cli")
         self.assertFalse(job.worked)
