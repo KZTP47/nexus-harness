@@ -125,12 +125,33 @@ class WhichThingTheIconOpensTests(unittest.TestCase):
         self.assertEqual(found.program, built)
         self.assertTrue(found.in_its_own_window)
 
-    def test_with_neither_of_those_python_starts_the_panel(self) -> None:
-        """The one that always works. Nothing but Python is needed, which is
-        what most people will have."""
+    def test_with_no_desktop_app_it_still_opens_a_window(self) -> None:
+        """Somebody pressed this icon on a company computer expecting an app and
+        got a browser tab. A clone of this project has no desktop app in it,
+        only the instructions for building one - and building one needs npm, a
+        few minutes and a couple of hundred megabytes, any of which a company
+        machine can block.
+
+        Every Windows machine has a browser that will show one page as a window
+        with no tabs and no address bar, which is what an app window is.
+        """
 
         with mock.patch.object(installer, "_installed_app", lambda: None), \
-             mock.patch.object(installer, "_built_app", lambda root: None):
+             mock.patch.object(installer, "_built_app", lambda root: None), \
+             mock.patch.object(
+                 installer, "_a_browser_that_can_do_windows",
+                 lambda: Path("somewhere") / "msedge.exe"):
+            found = installer.what_to_launch(self.root, is_there=lambda where: False)
+        self.assertIn("open_the_app.py", " ".join(found.arguments))
+        self.assertTrue(found.in_its_own_window, "it promised a window and did not")
+
+    def test_with_nothing_that_can_do_a_window_it_falls_back_to_a_tab(self) -> None:
+        """A browser tab is the honest last answer, and the icon says which of
+        the three you got rather than leaving somebody to guess."""
+
+        with mock.patch.object(installer, "_installed_app", lambda: None), \
+             mock.patch.object(installer, "_built_app", lambda root: None), \
+             mock.patch.object(installer, "_a_browser_that_can_do_windows", lambda: None):
             found = installer.what_to_launch(self.root, is_there=lambda where: False)
         self.assertIn("harness.py", " ".join(found.arguments))
         self.assertIn("ui", found.arguments)
@@ -594,6 +615,46 @@ class MakingTheShortcutWithoutPowerShellTests(unittest.TestCase):
         # never asked at all.
         self.assertEqual(asked, [], "PowerShell was asked when it did not need to be")
         self.assertEqual(installer._desktop_out_of_the_registry(), held)
+
+
+class TheRealBrowserFinderTests(unittest.TestCase):
+    """Tested only through a stand-in, the real one could return nothing at all
+    and every test still passed - and then the icon opens a browser tab, which
+    is the thing somebody complained about."""
+
+    @unittest.skipUnless(os.name == "nt", "the Windows one")
+    def test_it_finds_a_browser_on_a_windows_machine(self) -> None:
+        import sys as sys_lab
+
+        sys_lab.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import open_the_app
+
+        found = open_the_app.a_browser_that_can_do_windows()
+        self.assertIsNotNone(
+            found, "no browser found, so the icon can only open a tab")
+        self.assertTrue(found.is_file())
+
+    def test_it_looks_for_edge_before_anything_else(self) -> None:
+        """Edge is on every Windows machine and cannot be removed, which makes
+        it the one that is really there when it matters."""
+
+        import sys as sys_lab
+
+        sys_lab.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import open_the_app
+
+        looked = [str(one).lower() for one in open_the_app._where_browsers_live()]
+        self.assertTrue(looked, "it looks nowhere at all")
+        self.assertIn("msedge.exe", looked[0])
+
+    def test_it_finds_nothing_when_there_is_nothing(self) -> None:
+        import sys as sys_lab
+
+        sys_lab.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import open_the_app
+
+        with mock.patch.object(open_the_app, "_where_browsers_live", lambda: ()):
+            self.assertIsNone(open_the_app.a_browser_that_can_do_windows())
 
 
 if __name__ == "__main__":

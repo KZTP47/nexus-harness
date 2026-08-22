@@ -109,6 +109,14 @@ lost, and opening it again reads it back.
 Every one of these is that agent's own conversation, filed under its own name.
 Two agents both using Claude never read each other's words.
 
+
+## The page they share, and the tray of chats
+
+Agents write to a shared page rather than talking into each other's chats, and
+every open chat lives in a tray along the bottom. See
+[The page they share](THE_PAGE_THEY_SHARE.md) and
+[The tray of chats](THE_CHAT_TRAY.md).
+
 ## Every conversation, down the side
 
 The left of the board lists all of them: **You and The planner**, one row per

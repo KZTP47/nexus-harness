@@ -9,7 +9,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
-const { attachGuards } = require("./guards");
+const { attachGuards, onlyOnce, whyItReallyIs } = require("./guards");
 
 const server = new HarnessServer({ onExit: (code) => reportServerStopped(code) });
 let window = null;
@@ -78,11 +78,15 @@ async function openProject(chosen) {
   } catch (error) {
     showPage("problem.html", {
       title: "The harness could not start",
-      detail: error.message,
+      detail: onlyOnce(error.message),
+      // What this one really means, when the app can tell. Three guesses that
+      // are all wrong send somebody looking in three wrong places.
+      because: whyItReallyIs(error.message),
       log: server.recentLog().split("\n").slice(-12).join("\n"),
     });
   }
 }
+
 
 function allowedTarget(candidate) {
   return isLoopbackUrl(candidate) || isOwnPage(candidate, pageUrl(""));

@@ -780,6 +780,7 @@
 
       <div id="swarmBoard" class="swarm-board" role="group" aria-label="The board">
         <svg id="swarmLines" class="swarm-lines" aria-hidden="true"></svg>
+        <svg id="swarmPointer" aria-hidden="true" focusable="false"></svg>
       </div>
 
       <div class="swarm-tools">
@@ -790,6 +791,58 @@
         <button id="swarmTidy" type="button" title="Lay every box out in rows again">Tidy the board</button>
         <button id="swarmRefresh" type="button">Look again</button>
       </div>
+
+      <div id="theBigChat" class="the-big-chat" hidden
+        role="dialog" aria-modal="true" aria-labelledby="theBigChatTitle">
+        <div class="the-big-chat-sheet">
+          <div class="the-big-chat-top">
+            <h3 id="theBigChatTitle">Chat</h3>
+            <div class="button-row">
+              <button id="theBigChatSmall" type="button">Minimise</button>
+              <button id="theBigChatShut" type="button">Close this chat</button>
+            </div>
+          </div>
+          <div class="the-big-chat-middle">
+            <ol id="theBigChatSaid" class="the-big-chat-said"
+              aria-labelledby="theBigChatTitle"></ol>
+            <aside class="the-big-chat-doing" aria-labelledby="theBigChatDoingTitle">
+              <h4 id="theBigChatDoingTitle">What it has going on</h4>
+              <ul id="theBigChatDoing" class="the-big-chat-doing-list"></ul>
+            </aside>
+          </div>
+          <div class="the-big-chat-bottom">
+            <label class="sr-only" for="theBigChatBox">What to say to this agent</label>
+            <textarea id="theBigChatBox" rows="3" maxlength="6000"
+              placeholder="Type here to talk to this agent."></textarea>
+            <div class="button-row">
+              <button id="theBigChatSend" class="primary" type="button">Send</button>
+              <span id="theBigChatSaidBack" class="hint" role="status" aria-live="polite"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <details id="thePage" class="swarm-exchange">
+        <summary id="thePageTitle">The page they share</summary>
+        <p class="hint">One page for each project folder. Every agent reads the
+          whole page before it says anything and adds to the bottom, so nobody
+          is ever talking over anybody. Nothing on it is written over.</p>
+        <div class="button-row">
+          <label class="sr-only" for="thePageWhich">Which project's page</label>
+          <select id="thePageWhich"></select>
+          <button id="thePageRefresh" type="button">Look again</button>
+          <button id="thePagePutAway" type="button">Start a fresh page</button>
+        </div>
+        <p id="thePageSaid" class="hint" role="status" aria-live="polite"></p>
+        <label for="thePageStands">Where it stands - your block, and every agent reads it</label>
+        <textarea id="thePageStands" rows="2" maxlength="2000"
+          placeholder="One sentence to steer all of them at once."></textarea>
+        <div class="button-row">
+          <button id="thePageStandsSave" type="button">Save where it stands</button>
+          <button id="thePageAdd" type="button">Add something of my own</button>
+        </div>
+        <ol id="thePageList" class="swarm-exchange-list" aria-labelledby="thePageTitle"></ol>
+      </details>
 
       <details id="swarmExchange" class="swarm-exchange">
         <summary id="swarmExchangeTitle">What they said to each other</summary>
@@ -1211,6 +1264,13 @@
 
   <div id="liveStatus" class="sr-only" role="status" aria-live="polite"></div>
   <div id="liveAlert" class="sr-only" role="alert" aria-live="assertive"></div>
+  <div id="theChatTray" class="the-chat-tray" hidden aria-label="Chats that are open">
+    <button id="theChatTrayBack" class="the-chat-tray-arrow" type="button"
+      aria-label="Show the chats further left">&#8592;</button>
+    <ul id="theChatTrayList" class="the-chat-tray-list"></ul>
+    <button id="theChatTrayOn" class="the-chat-tray-arrow" type="button"
+      aria-label="Show the chats further right">&#8594;</button>
+  </div>
   <script src="/app.js"></script>
 </body>
 </html>

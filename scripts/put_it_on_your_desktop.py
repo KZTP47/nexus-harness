@@ -25,6 +25,7 @@ instead, so nobody has to open a terminal to get started.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -108,6 +109,28 @@ def what_to_launch(root: Path = ROOT, is_there=None) -> Launcher:
                 program=Path(where), arguments=[], working_folder=Path(where).parent,
                 what_it_is=what, in_its_own_window=True, icon=Path(where),
             )
+    # A window of its own without the desktop app, for the machine that has no
+    # desktop app and no way of building one. Somebody ran the installer on a
+    # company computer, pressed the icon and got a browser tab; they had asked
+    # for an app. Building the real one needs npm, a few minutes and a couple of
+    # hundred megabytes from the internet, and on a company machine any of those
+    # three can be blocked - none of which is a thing to ask of somebody who
+    # double-clicked an installer.
+    #
+    # Every Windows machine has Edge, and Edge will show one page in a window
+    # with no tabs and no address bar. It is not the desktop app and does not
+    # pretend to be. It is the same panel in something that behaves like a
+    # program: its own button on the taskbar, its own icon, and closing it
+    # really closes it.
+    if _a_browser_that_can_do_windows() is not None:
+        return Launcher(
+            program=_python_that_shows_no_terminal(),
+            arguments=[str(root / "scripts" / "open_the_app.py")],
+            working_folder=root,
+            what_it_is="the panel in a window of its own, without the desktop app",
+            in_its_own_window=True,
+            icon=root / "desktop" / "nexus-harness.ico",
+        )
     return Launcher(
         program=_python_that_shows_no_terminal(),
         arguments=[str(root / "scripts" / "harness.py"), "--project", str(root), "ui"],
@@ -116,6 +139,21 @@ def what_to_launch(root: Path = ROOT, is_there=None) -> Launcher:
         in_its_own_window=False,
         icon=root / "desktop" / "nexus-harness.ico",
     )
+
+
+def _a_browser_that_can_do_windows():
+    """Whether anything here can show one page as a window.
+
+    Asked of the same code that would do it, so the icon can never promise a
+    window that the thing behind it cannot open.
+    """
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from open_the_app import a_browser_that_can_do_windows
+    except ImportError:
+        return None
+    return a_browser_that_can_do_windows()
 
 
 # ---- putting it where somebody will find it -------------------------------
@@ -492,11 +530,106 @@ def what_to_say_about_trust(root: Path = ROOT) -> list[str]:
     ]
 
 
+def which_settings_file_is_in_the_way(root: Path = ROOT) -> Path | None:
+    """The settings file the panel will refuse to read, if there is one.
+
+    A project cloned from somewhere else usually has only the shared one, and a
+    project somebody has set up here has both.
+    """
+
+    local = root / ".harness" / "config.local.json"
+    shared = root / ".harness" / "config.json"
+    if local.is_file():
+        return local
+    return shared if shared.is_file() else None
+
+
+def ask_whether_this_project_is_yours(root: Path = ROOT, ask=input) -> bool:
+    """Offer to do the last step, rather than pointing at a terminal.
+
+    The person double-clicking an installer inside their own copy of a project
+    is exactly the person who gets to say the project is theirs. Sending them to
+    a terminal to say so is sending them to the one place the installer exists
+    to keep them out of - and when they do not go, the icon they were just given
+    opens nothing, quietly.
+
+    What is not changed is the stop itself. A settings file can name commands to
+    run, so it is a question, and no is a perfectly good answer.
+    """
+
+    which = which_settings_file_is_in_the_way(root)
+    if which is None:
+        return False
+    print()
+    print("One thing before this icon will work.")
+    print()
+    print("This project has a settings file. A settings file can name commands to")
+    print("run, so nothing here reads one until you say the file is yours.")
+    print()
+    print(f"  the file  {which}")
+    for line in _the_parts_worth_reading(which):
+        print(f"  {line}")
+    print()
+    try:
+        said = ask("Is this project yours, and may these settings be used? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if str(said).strip().lower() not in ("y", "yes"):
+        print()
+        print("Left as it was. The icon will say the same thing when you press it,")
+        print("and you can run this installer again whenever you want to.")
+        return False
+    try:
+        from our_harness.config import trust_project_local_config
+
+        where = trust_project_local_config(root, which)
+    except Exception as exc:  # noqa: BLE001 - any of a dozen, and all the same to somebody here
+        print()
+        print(f"That did not work: {exc}")
+        return False
+    print()
+    print(f"Done. Written down in {where}.")
+    print("Change the settings file again and this goes back to untrusted, on purpose.")
+    return True
+
+
+def _the_parts_worth_reading(which: Path) -> list[str]:
+    """The bits of a settings file somebody should look at before saying yes.
+
+    The whole file is a page of JSON and printing all of it is the same as
+    printing none of it. What matters is the handful of settings that can start
+    a program, which is the entire reason for asking.
+    """
+
+    try:
+        held = json.loads(which.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["  (this file could not be read, which is its own reason to look)"]
+    if not isinstance(held, dict):
+        return ["  (this file does not hold settings)"]
+    worrying: list[str] = []
+    project = held.get("project") if isinstance(held.get("project"), dict) else {}
+    for name in ("test_commands", "build_commands", "commands"):
+        for one in project.get(name, []) or []:
+            worrying.append(f"  it can run: {str(one)[:90]}")
+    for route, one in (held.get("providers") or {}).items():
+        if isinstance(one, dict) and one.get("command"):
+            worrying.append(f"  {route} runs: {str(one['command'])[:90]}")
+    if not worrying:
+        return ["  nothing in it starts a program"]
+    return ["", "  what is in it that can start something:", *worrying[:8]]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--desktop", default="",
         help="Put it somewhere other than the desktop. Only used by the checks.",
+    )
+    parser.add_argument(
+        "--yes-it-is-mine", action="store_true",
+        help="Say up front that this project is yours, instead of being asked",
     )
     said = parser.parse_args(argv)
 
@@ -528,8 +661,21 @@ def main(argv: list[str] | None = None) -> int:
         print("    npm install")
         print("    npm run build")
         print("then run this again and the icon will open that instead.")
-    for line in what_to_say_about_trust():
-        print(line)
+    if is_the_settings_file_trusted(ROOT) is False:
+        # Asked, not announced. Announced, somebody reads "Done" at the bottom,
+        # presses the icon, gets nothing, and has no reason to connect the two.
+        if not (said.yes_it_is_mine or ask_whether_this_project_is_yours(ROOT)):
+            for line in what_to_say_about_trust():
+                print(line)
+            return 0
+        if said.yes_it_is_mine:
+            which = which_settings_file_is_in_the_way(ROOT)
+            if which is not None:
+                from our_harness.config import trust_project_local_config
+
+                trust_project_local_config(ROOT, which)
+        print()
+        print("The icon is ready to use.")
     return 0
 
 

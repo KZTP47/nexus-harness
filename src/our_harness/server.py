@@ -1479,6 +1479,90 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     str(body.get("text") or ""),
                     filed_as=swarm_lab.filed_as(one.name),
                 ), agent=one.to_dict()))
+            elif self.path == "/api/team/connect":
+                # One press to make an assistant usable. Somebody had Claude
+                # installed and signed in, an agent set to use it, and the board
+                # still said not ready - because nothing in the settings pointed
+                # at it by name, and the only way to say so was a settings file
+                # or a terminal. They had to ask somebody else for help with
+                # their own machine.
+                wanted = str(body.get("kind") or "").strip()
+                if wanted not in seat_setup.KNOWN_SEATS:
+                    raise HarnessError(
+                        f"{wanted or 'that'} is not an assistant this can set up on its own. "
+                        f"It knows: {', '.join(seat_setup.KNOWN_SEATS)}."
+                    )
+                with self.server.seats_lock:
+                    settings = self._settings_now()
+                    name = seat_setup.ROUTE_NAMES.get(wanted, wanted)
+                    # One route added, and nothing else touched. Setting a seat
+                    # up the usual way also picks it as the assistant used by
+                    # default, which is right for somebody choosing their first
+                    # one and wrong here: connecting Gemini so one agent can use
+                    # it should not quietly move everything else onto Gemini.
+                    route = seat_setup.routes_for(settings, [wanted])[name]
+                    # Google will not answer a work account until it is told
+                    # which Cloud project to bill. Taken here, at the moment of
+                    # connecting, rather than leaving somebody to find out from
+                    # a refusal and then go looking for the setting.
+                    project = str(body.get("google_project") or "").strip()
+                    if project and wanted == "gemini-cli":
+                        route["google_project"] = project
+                    done = seat_setup.write_one_route(settings, name, route)
+                    # And the panel reads its settings again, or the board goes
+                    # on saying not ready about something that is now ready -
+                    # which reads as the button having done nothing.
+                    self.server.config = self._settings_now()
+                self._json({
+                    "route": name,
+                    "trusted": done.trusted,
+                    "note": done.note,
+                    "needs_your_say": done.needs_your_say,
+                })
+            elif self.path == "/api/swarm/the-page":
+                # The page every agent on one project writes to. Read through
+                # the same door the run uses, so what the panel shows is what
+                # the agents saw.
+                from . import pages as pages_lab
+
+                folder = str(body.get("folder") or "").strip()
+                if not folder:
+                    raise HarnessError("Which project folder's page? None was named.")
+                held = pages_lab.read_the_page(
+                    self.server.config, folder, str(body.get("name") or ""))
+                self._json(held.to_dict())
+            elif self.path == "/api/swarm/where-it-stands":
+                from . import pages as pages_lab
+
+                self._json(pages_lab.where_it_stands(
+                    self.server.config,
+                    str(body.get("folder") or "").strip(),
+                    str(body.get("text") or ""),
+                    str(body.get("instead_of") or ""),
+                    str(body.get("name") or ""),
+                ))
+            elif self.path == "/api/swarm/add-to-the-page":
+                # The person is a writer on the page too. Filed as "you", so
+                # anybody reading it later can tell which parts were theirs.
+                from . import pages as pages_lab
+
+                self._json(pages_lab.add_to_the_page(
+                    self.server.config,
+                    str(body.get("folder") or "").strip(),
+                    who=str(body.get("who") or "You"),
+                    text=str(body.get("text") or ""),
+                    what_they_were_doing="typed in by the person",
+                    after=int(body.get("after") or 0),
+                    name=str(body.get("name") or ""),
+                ))
+            elif self.path == "/api/swarm/put-the-page-away":
+                from . import pages as pages_lab
+
+                self._json(pages_lab.put_the_page_away(
+                    self.server.config,
+                    str(body.get("folder") or "").strip(),
+                    str(body.get("name") or ""),
+                ))
             elif self.path == "/api/swarm/keep":
                 # Saving the board as it stands, under a name. One board came
                 # back on its own and only ever one, so a second arrangement

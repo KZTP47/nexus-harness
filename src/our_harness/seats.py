@@ -335,13 +335,50 @@ def _is_this_machine(endpoint: str) -> bool:
     return host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}
 
 
+def _a_model_codex_really_has(where: str) -> str:
+    """One model this copy of Codex carries, asked of it.
+
+    Codex refuses a model it does not have, and which models it has changes with
+    the version. A name written down in here is right until the day it is not,
+    and then it is a route that fails with a message about a catalog.
+    """
+
+    try:
+        done = subprocess.run(
+            [where, "debug", "models", "--bundled"],
+            capture_output=True, text=True, timeout=VERSION_TIMEOUT_SECONDS,
+            encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if done.returncode != 0:
+        return ""
+    try:
+        held = json.loads(done.stdout or "{}")
+    except json.JSONDecodeError:
+        return ""
+    for one in held.get("models", []) or []:
+        if isinstance(one, dict) and isinstance(one.get("slug"), str) and one["slug"]:
+            return one["slug"]
+    return ""
+
+
 def _default_model(config: LoadedConfig, kind: str) -> str:
     """The model already written down for this kind, or the one it ships with."""
 
     for name, route in (config.get("providers", {}) or {}).items():
         if isinstance(route, dict) and route.get("kind") == kind and route.get("model"):
             return str(route["model"])
-    return {"claude-cli": "claude-sonnet-4-5", "copilot-cli": "gpt-5"}.get(kind, "")
+    # Every kind this can set up needs one. Left out, the route written for it
+    # holds an empty model, an empty model is refused, and the settings file
+    # stops loading at all - so connecting one assistant took every other route
+    # down with it. Connecting Codex turned Claude off.
+    return {
+        "claude-cli": "claude-sonnet-4-5",
+        "copilot-cli": "gpt-5",
+        "gemini-cli": "gemini-2.5-pro",
+        "codex-cli": "gpt-5-codex",
+    }.get(kind, "")
 
 
 # What each tool said its version was, against the file it was asked of. Kept on
@@ -539,13 +576,35 @@ def routes_for(config: LoadedConfig, kinds: list[str]) -> dict[str, Any]:
         raise SeatError(f"{unknown[0]} is not an assistant this can set up on its own")
     routes: dict[str, Any] = {}
     for kind in kinds:
-        routes[ROUTE_NAMES[kind]] = {
+        held: dict[str, Any] = {
             "kind": kind,
             "model": _default_model(config, kind),
             # A signed-in tool has no address to call, and a route holding both
             # is refused, so this is written out plainly rather than left off.
             "endpoint": "",
         }
+        # Codex is the one that has to be told where it is. Its desktop app
+        # keeps it in a folder of its own and nothing ever puts it on the path,
+        # so a route without the full path is a route that cannot find it - and
+        # its settings refuse an empty command rather than let that happen
+        # quietly.
+        if kind == "codex-cli":
+            where = available(kind)
+            if not where:
+                raise SeatError(
+                    "Codex is not on this machine, so there is nothing to point a "
+                    "route at. Install it and sign in, then try again."
+                )
+            held["command"] = [where]
+            held["auth_mode"] = "chatgpt"
+            # Asked rather than guessed. A model name written down here ages
+            # badly - Codex refuses one it does not carry, and the guess that
+            # was right last month is the reason somebody's route stops working
+            # this month with a message about a catalog.
+            asked = _a_model_codex_really_has(where)
+            if asked:
+                held["model"] = asked
+        routes[ROUTE_NAMES[kind]] = held
     return routes
 
 
@@ -655,8 +714,74 @@ def write_one_route(config: LoadedConfig, name: str, route: dict[str, Any]) -> O
         config.project_root, ".harness/config.local.json",
         allow_missing=True, allow_control=True,
     )
+    # Checked against the file that is really on disk, inside the same lock the
+    # write happens in. Checked against the settings held in memory instead, it
+    # was checking a different thing from the one being written: the write
+    # re-reads the file and merges onto whatever is there. And when that file is
+    # already broken, the settings in memory are quietly the defaults - so the
+    # check saw a clean slate, passed, and the file stayed exactly as unloadable
+    # as before while this said it had worked.
     with _while_the_settings_are_written:
+        _would_the_settings_still_load(local, name, route)
         return _write_the_routes(config, [], {name: route}, local, True)
+
+
+def _would_the_settings_still_load(local: Path, name: str, route: dict[str, Any]) -> None:
+    """Refuse a route that would stop the settings file loading.
+
+    Read off the disk rather than out of memory, because the disk is what the
+    write is about to change and the two are not always the same thing.
+    """
+
+    import copy as copy_lab
+
+    from .config import DEFAULT_CONFIG, validate_config
+
+    on_disk: dict[str, Any] = {}
+    if local.is_file():
+        try:
+            on_disk = json.loads(local.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SeatError(
+                f"{local.name} is there and cannot be read: {exc}. Fix or move "
+                "that file first; nothing was changed."
+            ) from exc
+    if not isinstance(on_disk, dict):
+        raise SeatError(f"{local.name} does not hold settings, so it was left alone")
+    trying = copy_lab.deepcopy(DEFAULT_CONFIG)
+    for key, value in on_disk.items():
+        if isinstance(value, dict) and isinstance(trying.get(key), dict):
+            trying[key] = {**trying[key], **value}
+        else:
+            trying[key] = value
+    trying.setdefault("providers", {})
+    was_already_broken = False
+    try:
+        validate_config(copy_lab.deepcopy(trying))
+    except HarnessError as exc:
+        # Broken before this touched it. Said plainly rather than blamed on the
+        # route being added, and rather than reported as a success that changed
+        # nothing.
+        was_already_broken = True
+        already = str(exc)
+    trying["providers"][name] = route
+    try:
+        validate_config(trying)
+    except HarnessError as exc:
+        if was_already_broken:
+            raise SeatError(
+                f"{local.name} does not load as it is, before anything was added: "
+                f"{already} Fix that first; nothing was changed."
+            ) from exc
+        raise SeatError(
+            f"{name} was not written, because the settings would not load with it: "
+            f"{exc} Nothing was changed."
+        ) from exc
+    if was_already_broken:
+        raise SeatError(
+            f"{local.name} does not load as it is: {already} Adding {name} would "
+            "not have helped, so nothing was changed. Fix that first."
+        )
 
 
 def _write_the_routes(config, kinds, routes, local, trust) -> Outcome:

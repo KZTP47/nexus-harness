@@ -32,4 +32,43 @@ function attachGuards(contents, options = {}) {
   return contents;
 }
 
-module.exports = { attachGuards };
+
+function onlyOnce(said) {
+  // The same sentence twelve times over is not more information than once. The
+  // harness prints one line per attempt and they were all pasted together, so
+  // the page opened with a paragraph of the same words repeating.
+  const seen = [];
+  for (const one of String(said || "").split(/(?<=\.)\s+|\n/)) {
+    const tidy = one.trim();
+    if (tidy && !seen.includes(tidy)) seen.push(tidy);
+  }
+  return seen.join(" ") || String(said || "");
+}
+
+function whyItReallyIs(said) {
+  // The app carries its own copy of the harness - that is how it runs with
+  // nothing installed - and that copy is only as new as the last time somebody
+  // built the app. Settings written by a newer harness can name things this
+  // copy has never heard of.
+  const held = String(said || "");
+  if (/must name a supported provider|is not a kind|Unknown config key/i.test(held)) {
+    return (
+      "This app carries its own copy of the harness, and that copy looks older "
+      + "than your settings: the settings name something it has never heard of. "
+      + "Nothing is wrong with Python or with the folder. Install the newest "
+      + "version of this app, or open the project with "
+      + "python scripts/harness.py ui, which uses the code in the folder itself."
+    );
+  }
+  if (/has not been told to trust/i.test(held)) {
+    return (
+      "This project has a settings file, and a settings file can name commands "
+      + "to run - so nothing reads one until you say the file is yours. That is "
+      + "a deliberate stop, not a fault. Run the installer again and say yes "
+      + "when it asks, or run python scripts/harness.py trust in the folder."
+    );
+  }
+  return "";
+}
+
+module.exports = { attachGuards, onlyOnce, whyItReallyIs };

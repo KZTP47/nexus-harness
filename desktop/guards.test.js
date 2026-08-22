@@ -85,3 +85,41 @@ test("the real app hands in its own answer", () => {
   assert.match(main, /attachGuards\(window\.webContents, \{\s*allowedTarget,/,
     "main.js must give attachGuards the rule it uses");
 });
+
+// ---------------------------------------------------------------------------
+// The app carries its own copy of the harness, so it can be older than the
+// settings it is reading. When that happened, the app showed three guesses -
+// Python missing, wrong folder, bad download - and every one of them was wrong.
+// Somebody spent the evening looking in three wrong places.
+// ---------------------------------------------------------------------------
+
+const { onlyOnce, whyItReallyIs } = require("./guards");
+
+test("an old copy of the harness is named as the reason", () => {
+  const said = whyItReallyIs(
+    "error: providers.gemini.kind must name a supported provider");
+  assert.match(said, /older than your settings/);
+  // It says Python is fine, which is the opposite of the guess it replaces.
+  assert.match(said, /Nothing is wrong with Python/);
+  assert.doesNotMatch(said, /Python 3\.11 or newer is not installed/);
+});
+
+test("an untrusted settings file is named as the reason", () => {
+  const said = whyItReallyIs(
+    "error: project.test_commands is set in a settings file this machine has "
+    + "not been told to trust");
+  assert.match(said, /deliberate stop/);
+});
+
+test("anything else falls back to the guesses", () => {
+  assert.strictEqual(whyItReallyIs("something nobody has seen before"), "");
+});
+
+test("the same sentence twelve times is said once", () => {
+  const over = Array(12).fill(
+    "error: providers.gemini.kind must name a supported provider.").join(" ");
+  const said = onlyOnce(over);
+  assert.strictEqual(
+    said.split("must name a supported provider").length - 1, 1,
+    "the page opened with a paragraph of the same words repeating");
+});

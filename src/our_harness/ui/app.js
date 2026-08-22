@@ -3733,6 +3733,18 @@ function bindEvents() {
   $("talkRefresh").addEventListener("click", () => refreshTalk(talkOpen));
   wireUpTheSwarmBoard();
   wireUpMicrosoft();
+  wireUpTheTray();
+  if ($("thePageRefresh")) {
+    $("thePageRefresh").addEventListener("click", refreshThePage);
+    $("thePageWhich").addEventListener("change", (event) => {
+      thePageFolder = event.target.value;
+      refreshThePage();
+    });
+    $("thePageStandsSave").addEventListener("click", saveWhereItStands);
+    $("thePageAdd").addEventListener("click", addSomethingOfMyOwn);
+    $("thePagePutAway").addEventListener("click", putThePageAway);
+    $("thePage").addEventListener("toggle", () => $("thePage").open && refreshThePage());
+  }
   $("swarmKeep").addEventListener("click", keepThisBoard);
   $("talkStartAgain").addEventListener("click", startTalkingAgain);
   $("talkAskEveryone").addEventListener("click", askEveryone);
@@ -5496,6 +5508,13 @@ const SWARM_DRAWINGS = {
   folder: [
     "M3.5 6.5h6l2 2.5h9v10h-17z",
   ],
+  // A person, for the turns in a chat that are yours. Without one, your own
+  // words and an assistant's carry the same little robot and the two read as
+  // the same voice.
+  person: [
+    "M12 3.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z",
+    "M4.5 20.5c0-4 3.4-6.5 7.5-6.5s7.5 2.5 7.5 6.5",
+  ],
   cross: [
     "M5 5l14 14",
     "M19 5L5 19",
@@ -5581,6 +5600,8 @@ async function refreshSwarm(quietly) {
     renderSwarmPanel();
     renderTheChatsOnThisBoard();
     renderTheKeptBoards();
+    renderTheChatTray();
+    if (theBigOne) renderTheBigChat();
     // What the agents passed to each other, so the list down the side holds
     // those conversations too rather than only the ones you have had. It is
     // small, and without it the list is half a list until somebody opens the
@@ -5627,6 +5648,9 @@ function whatTheBoardSays() {
 // ---- drawing it ----------------------------------------------------------
 
 function renderSwarmBoard() {
+  // Anything pointed at is about to be a different element. Left behind, the
+  // line stays on screen pointing at a box that no longer exists.
+  stopPointing();
   const board = $("swarmBoard");
   for (const old of [...board.querySelectorAll(
     ".swarm-box, .swarm-empty, .swarm-line-tools, .swarm-chat-card")]) {
@@ -5849,7 +5873,38 @@ function renderSwarmNotReady() {
       + "project has somebody on it and jobs to do."));
     return;
   }
-  for (const one of said) list.append(make("li", "", one));
+  for (const one of said) {
+    const row = make("li", "", one);
+    // A button right where the problem is said, when one press would fix it.
+    // Somebody had Claude installed and signed in, an agent set to use it, and
+    // this list saying not ready - with nothing to press, because the only way
+    // to point the settings at it was a terminal.
+    const stuck = (theSwarmBoard().agents || []).find(
+      (agent) => agent.can_be_connected && one.startsWith(`${agent.name}:`));
+    if (stuck) {
+      const connect = make("button", "swarm-connect", "Connect it");
+      connect.type = "button";
+      connect.setAttribute("aria-label",
+        `Connect ${stuck.who} so ${stuck.name} can be used`);
+      connect.addEventListener("click", () => connectThisAssistant(
+        stuck.can_be_connected, connect));
+      row.append(connect);
+    }
+    list.append(row);
+  }
+  // And one line for anything on this machine that nothing points at yet, even
+  // when no agent is asking for it - so it can be connected before somebody
+  // spends ten minutes wondering why the dropdown is short.
+  for (const one of swarmSaid.who_can_be_used || []) {
+    if (one.ready || !one.can_be_connected) continue;
+    const row = make("li", "", `${one.label || one.route}: on this machine and not connected yet.`);
+    const connect = make("button", "swarm-connect", "Connect it");
+    connect.type = "button";
+    connect.setAttribute("aria-label", `Connect ${one.label || one.route}`);
+    connect.addEventListener("click", () => connectThisAssistant(one.can_be_connected, connect));
+    row.append(connect);
+    list.append(row);
+  }
 }
 
 // ---- dragging ------------------------------------------------------------
@@ -6405,6 +6460,7 @@ function openTheChatFor(agentId) {
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
   refreshTheChatFor(agentId);
+  renderTheChatTray();
   const card = theChatCardFor(agentId);
   if (card) {
     card.querySelector(".swarm-chat-box").focus();
@@ -6416,6 +6472,7 @@ function closeTheChatFor(agentId) {
   swarmChats = swarmChats.filter((one) => one.agent !== agentId);
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
+  renderTheChatTray();
 }
 
 function theChatCardFor(agentId) {
@@ -6725,6 +6782,7 @@ async function setThemGoing() {
     const said = await request("/api/swarm/start", {
       method: "POST", body: JSON.stringify({}),
     });
+    swarmDoing = said.doing || null;
     renderWhatTheyAreDoing(said.doing);
     watchWhatTheyAreDoing();
     sayInSwarm("They are going. What each one says lands in its own chat.");
@@ -6740,6 +6798,7 @@ async function stopThemGoing() {
     const said = await request("/api/swarm/stop", {
       method: "POST", body: JSON.stringify({}),
     });
+    swarmDoing = said.doing || null;
     renderWhatTheyAreDoing(said.doing);
     $("swarmDoingSaid").textContent = said.note;
   } catch (error) {
@@ -6755,7 +6814,8 @@ function watchWhatTheyAreDoing() {
   swarmWatching = window.setInterval(async () => {
     try {
       const said = await request("/api/swarm/how-it-is-going");
-      renderWhatTheyAreDoing(said.doing);
+      swarmDoing = said.doing || null;
+    renderWhatTheyAreDoing(said.doing);
       if (!said.doing || !said.doing.going) {
         window.clearInterval(swarmWatching);
         swarmWatching = 0;
@@ -6773,6 +6833,10 @@ function watchWhatTheyAreDoing() {
     }
   }, 1500);
 }
+
+// What the run last said it was doing, kept so the big chat can show what one
+// agent has going on without asking for it again.
+let swarmDoing = null;
 
 function renderWhatTheyAreDoing(doing) {
   const list = $("swarmDoing");
@@ -7164,6 +7228,468 @@ async function useThisLocalModel(server, model, button) {
   } finally {
     button.disabled = false;
   }
+}
+
+
+// ---- the page they share --------------------------------------------------
+//
+// Two agents talking to each other in a chat is two agents taking turns at a
+// place where speaking is exclusive - one of them is always being cut off. On a
+// page there is no such thing as an interruption: you read it, you add to the
+// bottom, and your words sit under somebody else's without touching them.
+
+let thePage = null;
+let thePageFolder = "";
+
+function sayAboutThePage(words) {
+  const where = $("thePageSaid");
+  if (where) where.textContent = words;
+}
+
+function whichProjectsHavePages() {
+  return (theSwarmBoard().projects || []).filter((one) => one.path);
+}
+
+function renderWhichPage() {
+  const pick = $("thePageWhich");
+  if (!pick) return;
+  const projects = whichProjectsHavePages();
+  const was = thePageFolder || pick.value;
+  pick.replaceChildren();
+  for (const one of projects) {
+    const choice = make("option", "", one.name);
+    choice.value = one.path;
+    pick.append(choice);
+  }
+  if (!projects.length) {
+    const none = make("option", "", "no project folders on the board yet");
+    none.value = "";
+    pick.append(none);
+  }
+  if (was && projects.some((one) => one.path === was)) pick.value = was;
+  thePageFolder = pick.value || "";
+}
+
+async function refreshThePage() {
+  if (!$("thePage")) return;
+  renderWhichPage();
+  if (!thePageFolder) {
+    thePage = null;
+    renderThePage();
+    return;
+  }
+  const named = whichProjectsHavePages().find((one) => one.path === thePageFolder);
+  try {
+    thePage = await request("/api/swarm/the-page", {
+      method: "POST",
+      body: JSON.stringify({folder: thePageFolder, name: named ? named.name : ""}),
+    });
+    renderThePage();
+  } catch (trouble) {
+    sayAboutThePage(String(trouble.message || trouble));
+  }
+}
+
+function renderThePage() {
+  const list = $("thePageList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!thePage) {
+    list.append(make("li", "hint", "Pick a project folder to see its page."));
+    $("thePageStands").value = "";
+    return;
+  }
+  $("thePageStands").value = thePage.where_it_stands || "";
+  if (!thePage.parts.length) {
+    list.append(make("li", "hint",
+      "Nothing on this page yet. It fills in as the agents work, and you can add to it too."));
+  }
+  for (const one of thePage.parts) {
+    const row = make("li", "swarm-exchange-one");
+    row.append(make("strong", "", `${one.number}. ${one.who}`));
+    const about = [one.what_they_were_doing, one.at].filter(Boolean).join(" | ");
+    row.append(make("p", "hint", about));
+    row.append(make("p", "swarm-exchange-text", one.text));
+    list.append(row);
+  }
+  // What a person wants to know first: how much is on it and who wrote last.
+  const bits = [`${thePage.how_many} part${thePage.how_many === 1 ? "" : "s"}`];
+  if (thePage.last_was) bits.push(`the last was ${thePage.last_was}, ${thePage.last_at}`);
+  if (thePage.put_away_before) {
+    bits.push(`${thePage.put_away_before} older page${
+      thePage.put_away_before === 1 ? " was" : "s were"} put away`);
+  }
+  sayAboutThePage(thePage.trouble ? `${bits.join(". ")}. ${thePage.trouble}` : `${bits.join(". ")}.`);
+}
+
+async function saveWhereItStands() {
+  if (!thePageFolder) return;
+  try {
+    await request("/api/swarm/where-it-stands", {
+      method: "POST",
+      body: JSON.stringify({
+        folder: thePageFolder,
+        text: $("thePageStands").value,
+        // What it was when this window read it, so two windows cannot write
+        // over each other without one of them being told.
+        instead_of: thePage ? thePage.where_it_stands_now : "",
+      }),
+    });
+    await refreshThePage();
+    sayAboutThePage("Saved. Every agent working on this project reads that.");
+  } catch (trouble) {
+    sayAboutThePage(String(trouble.message || trouble));
+  }
+}
+
+async function addSomethingOfMyOwn() {
+  if (!thePageFolder) return;
+  const said = await askForOneLine(
+    "Add to the page", "This goes on the page under your name, and every agent reads it.", "");
+  if (said === null || !said.trim()) return;
+  try {
+    await request("/api/swarm/add-to-the-page", {
+      method: "POST",
+      body: JSON.stringify({
+        folder: thePageFolder, who: "You", text: said,
+        after: thePage ? thePage.up_to : 0,
+      }),
+    });
+    await refreshThePage();
+  } catch (trouble) {
+    sayAboutThePage(String(trouble.message || trouble));
+  }
+}
+
+async function putThePageAway() {
+  if (!thePageFolder) return;
+  if (!window.confirm(
+      "Start a fresh page? The one you have now is kept, in a folder called before.")) {
+    return;
+  }
+  try {
+    const said = await request("/api/swarm/put-the-page-away", {
+      method: "POST", body: JSON.stringify({folder: thePageFolder}),
+    });
+    await refreshThePage();
+    sayAboutThePage(said.put_away
+      ? "Put away. This page starts empty, and the old one is kept."
+      : String(said.why || ""));
+  } catch (trouble) {
+    sayAboutThePage(String(trouble.message || trouble));
+  }
+}
+
+// ---- connecting an assistant ----------------------------------------------
+//
+// Somebody had Claude installed and signed in, an agent set to use it, and the
+// board still said not ready - because nothing in the settings pointed at it by
+// name, and the only way to say so was a settings file or a terminal. They had
+// to ask somebody else for help with their own machine.
+
+async function connectThisAssistant(kind, button) {
+  // Google will not answer a work account until it knows which Cloud project to
+  // bill the work to. Asked once here, rather than letting somebody connect it,
+  // watch it refuse, and go hunting for a setting.
+  let googleProject = "";
+  if (kind === "gemini-cli") {
+    const said = await askForOneLine(
+      "Connect Gemini",
+      "If yours is a work Google account, Google needs the Cloud project id to "
+      + "bill the work to. A personal account needs none - leave this empty.",
+      "");
+    if (said === null) return;
+    googleProject = said.trim();
+  }
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Connecting...";
+  try {
+    const said = await request("/api/team/connect", {
+      method: "POST", body: JSON.stringify({kind, google_project: googleProject}),
+    });
+    sayInSwarm(said.needs_your_say
+      ? `${said.route} was written down. ${said.note}`
+      : `${said.route} is connected. The agents using it are ready now.`);
+    await refreshSwarm(true);
+  } catch (trouble) {
+    sayInSwarm(String(trouble.message || trouble));
+  } finally {
+    button.disabled = false;
+    button.textContent = was;
+  }
+}
+
+
+// ---- the tray of chats, and one chat opened big ---------------------------
+//
+// A board with five agents on it is five conversations. They used to be small
+// cards floating on the board itself, so two open at once covered the board
+// they were about, and a fifth was somewhere off the side.
+//
+// Now every open chat is a button along the bottom, the way a taskbar works.
+// One is opened big over the board, the rest wait in the tray. Hovering the
+// face on a tray button draws a line to that agent's box, because five chats
+// called "chat with an agent" are five chats nobody can tell apart.
+
+// Which chat is open big, by agent id. Empty means none, and the board is
+// showing.
+let theBigOne = "";
+
+function everyOpenChat() {
+  const board = theSwarmBoard();
+  return swarmChats
+    .map((one) => (board.agents || []).find((agent) => agent.id === one.agent))
+    .filter(Boolean);
+}
+
+function renderTheChatTray() {
+  const tray = $("theChatTray");
+  if (!tray) return;
+  const open = everyOpenChat();
+  tray.hidden = !open.length;
+  document.body.classList.toggle("has-a-tray", open.length > 0);
+  const list = $("theChatTrayList");
+  list.replaceChildren();
+  for (const one of open) {
+    const row = make("li");
+    const pick = make("button", `the-chat-tray-one ${theBigOne === one.id ? "open" : ""}`);
+    pick.type = "button";
+    pick.dataset.chatTray = one.id;
+    pick.setAttribute("aria-label",
+      `Open the chat with ${one.name} big. It uses ${one.who || "no assistant yet"}.`);
+    const face = make("span", "the-chat-tray-face");
+    face.append(aSwarmDrawing("robot", 18));
+    // The face is what points at the board. Hovering it says which of five
+    // agents this is without reading anything.
+    face.addEventListener("pointerenter", () => pointAtTheBox(one.id));
+    face.addEventListener("pointerleave", stopPointing);
+    pick.append(face);
+    pick.append(make("span", "", `${one.name} | ${one.who || "nobody yet"}`));
+    pick.addEventListener("focus", () => pointAtTheBox(one.id));
+    pick.addEventListener("blur", stopPointing);
+    pick.addEventListener("click", () => openTheBigChat(one.id));
+    row.append(pick);
+    list.append(row);
+  }
+}
+
+function scrollTheTray(byHowMuch) {
+  const list = $("theChatTrayList");
+  if (list) list.scrollBy({left: byHowMuch, behavior: "smooth"});
+}
+
+// ---- the line from the tray to the box ------------------------------------
+
+function theSheetToDrawOn() {
+  // Declared in the page rather than made up here. An id invented in code is an
+  // id nothing checks the spelling of, and a typo in one is a line that never
+  // appears with nothing at all to say why.
+  return $("swarmPointer");
+}
+
+function pointAtTheBox(agentId) {
+  stopPointing();
+  const box = document.querySelector(`.swarm-box[data-kind="agent"][data-id="${agentId}"]`);
+  const sheet = theSheetToDrawOn();
+  if (!box || !sheet) return;
+  box.classList.add("pointed-at");
+  const middle = theMiddleOf(box);
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  // From the bottom of the board up to the box, because the tray is along the
+  // bottom and that is where the eye is coming from.
+  line.setAttribute("x1", String(middle.x));
+  line.setAttribute("y1", String($("swarmBoard").scrollHeight));
+  line.setAttribute("x2", String(middle.x));
+  line.setAttribute("y2", String(middle.y));
+  sheet.append(line);
+  box.scrollIntoView({block: "nearest", inline: "nearest"});
+}
+
+function stopPointing() {
+  const sheet = $("swarmPointer");
+  if (sheet) sheet.replaceChildren();
+  for (const one of document.querySelectorAll(".swarm-box.pointed-at")) {
+    one.classList.remove("pointed-at");
+  }
+}
+
+// ---- one chat, opened big -------------------------------------------------
+
+function openTheBigChat(agentId) {
+  const agent = theSwarmAgent(agentId);
+  if (!agent) return;
+  if (!swarmChats.some((one) => one.agent === agentId)) openTheChatFor(agentId);
+  theBigOne = agentId;
+  $("theBigChatTitle").textContent = `${agent.name} | ${agent.who || "no assistant yet"}`;
+  $("theBigChat").hidden = false;
+  renderTheChatTray();
+  renderTheBigChat();
+  $("theBigChatBox").focus();
+}
+
+function keepTabInsideTheBigChat(event) {
+  // It says it is modal, so it has to behave like one. Without this, Tab walked
+  // straight out of it and landed on something completely hidden underneath -
+  // a control somebody is now typing into and cannot see.
+  if (event.key !== "Tab" || $("theBigChat").hidden) return;
+  const inside = [...$("theBigChat").querySelectorAll(
+    "button, textarea, input, select, a[href]")].filter((one) => !one.disabled);
+  if (!inside.length) return;
+  const first = inside[0];
+  const last = inside[inside.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  } else if (!$("theBigChat").contains(document.activeElement)) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function minimiseTheBigChat() {
+  // Back to the tray, not closed. The conversation is still open; it is just
+  // not the one on screen.
+  theBigOne = "";
+  $("theBigChat").hidden = true;
+  renderTheChatTray();
+}
+
+function shutTheBigChat() {
+  const was = theBigOne;
+  minimiseTheBigChat();
+  if (was) closeTheChatFor(was);
+  renderTheChatTray();
+}
+
+function aFaceFor(kind) {
+  const face = make("span", "the-big-chat-face");
+  face.append(aSwarmDrawing(kind === "you" ? "person" : "robot", 24));
+  return face;
+}
+
+function renderTheBigChat() {
+  const list = $("theBigChatSaid");
+  if (!list || !theBigOne) return;
+  const agent = theSwarmAgent(theBigOne);
+  const held = swarmChats.find((one) => one.agent === theBigOne);
+  list.replaceChildren();
+
+  const turns = [];
+  for (const one of (held && held.said) || []) {
+    turns.push({
+      kind: one.who === "you" ? "you" : "them",
+      who: one.who === "you" ? "You" : (agent ? agent.name : "The assistant"),
+      text: one.text,
+      at: one.at,
+    });
+  }
+  // What this agent said to another agent, and what another said to it. Shown
+  // here because a conversation between two of them is a conversation, and
+  // reading it in a different place from your own is how you lose the thread.
+  for (const one of (swarmWhatTheySaid.notes || [])) {
+    if (one.said_by !== theBigOne && one.shown_to !== theBigOne) continue;
+    turns.push({
+      kind: "between",
+      who: `${one.said_by_name} to ${one.shown_to_name}`,
+      text: one.text,
+      at: one.at,
+    });
+  }
+  // A turn with no time on it goes where it was put, at the end, rather than
+  // sorting to the very top. Empty sorts before everything, so the newest thing
+  // said - the one somebody is waiting to read - jumped to the top of the list
+  // and then got scrolled out of sight.
+  turns.forEach((one, place) => { one.place = place; });
+  turns.sort((a, b) => {
+    if (!a.at || !b.at) return a.place - b.place;
+    const said = String(a.at).localeCompare(String(b.at));
+    return said || a.place - b.place;
+  });
+
+  if (!turns.length) {
+    list.append(make("li", "hint",
+      "Nothing said yet. Type below, and anything this one says to another agent "
+      + "turns up here too."));
+  }
+  for (const one of turns) {
+    const row = make("li", `the-big-chat-turn from-${one.kind === "you" ? "you" : "them"} `
+      + (one.kind === "between" ? "between" : ""));
+    row.append(aFaceFor(one.kind));
+    const what = make("div", "the-big-chat-what");
+    what.append(make("span", "the-big-chat-who", `${one.who}${one.at ? ` | ${one.at}` : ""}`));
+    what.append(make("p", "", one.text));
+    row.append(what);
+    list.append(row);
+  }
+  list.scrollTop = list.scrollHeight;
+  renderWhatItHasGoingOn(agent);
+}
+
+function renderWhatItHasGoingOn(agent) {
+  const list = $("theBigChatDoing");
+  if (!list) return;
+  list.replaceChildren();
+  const doing = swarmDoing || {};
+  const mine = (doing.turns || []).filter((one) => one.agent === theBigOne);
+  if (!mine.length) {
+    list.append(make("li", "hint", "Nothing running for this one right now."));
+  }
+  for (const one of mine) {
+    const row = make("li", "the-big-chat-doing-one");
+    row.append(make("strong", "", one.where || "a project"));
+    const bits = [one.round, one.state];
+    if (one.part) bits.push(`part ${one.part} of the page`);
+    if (one.milliseconds) bits.push(`${Math.round(one.milliseconds / 1000)}s`);
+    row.append(make("p", "hint", bits.filter(Boolean).join(" | ")));
+    if (one.why_not) row.append(make("p", "hint", one.why_not));
+    list.append(row);
+  }
+  if (agent && agent.trouble_last_time) {
+    list.append(make("li", "the-big-chat-doing-one", agent.trouble_last_time));
+  }
+}
+
+async function sendFromTheBigChat() {
+  const box = $("theBigChatBox");
+  const said = box.value.trim();
+  if (!said || !theBigOne) return;
+  const button = $("theBigChatSend");
+  button.disabled = true;
+  $("theBigChatSaidBack").textContent = "Asking...";
+  try {
+    const answered = await request("/api/swarm/say", {
+      method: "POST", body: JSON.stringify({agent: theBigOne, text: said}),
+    });
+    box.value = "";
+    const held = swarmChats.find((one) => one.agent === theBigOne);
+    if (held) held.said = answered.said || [];
+    $("theBigChatSaidBack").textContent = "";
+    renderTheBigChat();
+    refreshSwarm(true);
+  } catch (trouble) {
+    $("theBigChatSaidBack").textContent = String(trouble.message || trouble);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function wireUpTheTray() {
+  if (!$("theChatTray")) return;
+  $("theChatTrayBack").addEventListener("click", () => scrollTheTray(-320));
+  $("theChatTrayOn").addEventListener("click", () => scrollTheTray(320));
+  $("theBigChatSmall").addEventListener("click", minimiseTheBigChat);
+  $("theBigChatShut").addEventListener("click", shutTheBigChat);
+  $("theBigChatSend").addEventListener("click", sendFromTheBigChat);
+  // Escape puts it back in the tray rather than closing it, because closing
+  // would throw away which chats somebody had open.
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && theBigOne) minimiseTheBigChat();
+  });
+  document.addEventListener("keydown", keepTabInsideTheBigChat);
 }
 
 

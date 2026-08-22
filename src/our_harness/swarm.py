@@ -158,6 +158,19 @@ class Board:
         }
 
 
+def filed_as_on_the_board(name: str) -> str:
+    """Where a swarm run's side of the conversation with one agent is kept.
+
+    Apart from the person's own chat with that agent, on purpose. A run asked
+    each agent under the plain name, which is the very file the person's
+    conversation lives in - so a run left somebody's chat with The reviewer full
+    of machine-to-machine talk they never said a word of, and answers that were
+    never to them.
+    """
+
+    return f"{name} on the board"
+
+
 def filed_as(name: str) -> str:
     """What one agent's conversation is filed under.
 
@@ -488,6 +501,7 @@ def _how_much_was_said_to(config, who: str, filed: str) -> dict[str, Any]:
     """How much has been said in one agent's chat, and the last line of it."""
 
     from . import chat as chat_lab
+    from . import pages as pages_lab
 
     nothing = {"said": 0, "last_said": "", "last_said_at": ""}
     # An agent with nobody to ask has no conversation of its own. A name outlives
@@ -528,6 +542,7 @@ def how_it_stands(config) -> dict[str, Any]:
     """The board, and everything the panel needs to draw and judge it."""
 
     from . import chat as chat_lab
+    from . import pages as pages_lab
     from . import projects as projects_lab
 
     board = load()
@@ -538,6 +553,12 @@ def how_it_stands(config) -> dict[str, Any]:
     # whatever that project happened to use. Somebody with no named routes is
     # sent to Your team, where one press makes them.
     can_talk = [one for one in chat_lab.who_can_talk(config) if one.get("route")]
+    # Which of them one press would connect: on this machine, and nothing
+    # pointing at it yet. Anything else must not offer a button, because a
+    # button that fails is worse than no button.
+    for one in can_talk:
+        one["can_be_connected"] = (
+            "" if one.get("ready") else _which_one_to_connect(one.get("route", ""), one))
     ready = {one["route"]: one for one in can_talk}
     agents = []
     for one in board.agents:
@@ -554,6 +575,11 @@ def how_it_stands(config) -> dict[str, Any]:
             )
         )
         held["how_to_fix_it"] = (known or {}).get("how_to_fix_it", "")
+        # Which assistant this one would need set up, when that is all that is
+        # missing. Somebody had Claude installed and signed in, an agent set to
+        # use it, and the board still said not ready - with nothing on screen to
+        # press, because the only way to point the settings at it was a terminal.
+        held["can_be_connected"] = _which_one_to_connect(one.who, known)
         # What happened the last time this route was asked anything. Not the
         # same as not being ready - this one is still tried - so that somebody
         # knows before they type instead of after.
@@ -638,6 +664,27 @@ def who_works_on(board: Board | dict[str, Any], project_id: str) -> list[Any]:
         one for one in agents
         if (one["id"] if isinstance(one, dict) else one.id) in on_it
     ]
+
+
+def _which_one_to_connect(who: str, known: dict[str, Any] | None) -> str:
+    """The assistant a not-ready agent needs, when one press would fix it.
+
+    Only when the tool really is on this machine and nothing points at it. A
+    button offering to connect something that is not installed is a button that
+    fails, and a button that fails is worse than no button.
+    """
+
+    from . import seats as seats_lab
+
+    if not who or (known or {}).get("ready"):
+        return ""
+    for kind, route in seats_lab.ROUTE_NAMES.items():
+        if route != who:
+            continue
+        from .providers.subscription_cli import available
+
+        return kind if available(kind) else ""
+    return ""
 
 
 def what_is_not_ready(config, said: dict[str, Any] | None = None) -> list[str]:
@@ -753,6 +800,11 @@ class OneTurn:
     # The agents whose answers this one was shown before it was asked. Empty on
     # the first round, because that is the point of the first round.
     shown: list[str] = field(default_factory=list)
+    # Which part of the shared page this answer became, and how far the page had
+    # got when this agent was asked. The second is how the page can tell it what
+    # turned up while it was writing.
+    part: int = 0
+    after: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         # What the agent said is not in here. It is kept where somebody would
@@ -771,6 +823,7 @@ class OneTurn:
             "why_not": self.why_not,
             "milliseconds": self.milliseconds,
             "shown": list(self.shown),
+            "part": self.part,
         }
 
 
@@ -821,10 +874,36 @@ def what_to_ask(agent: dict[str, Any], project: dict[str, Any]) -> str:
     )
 
 
+def what_the_page_says(
+    agent: dict[str, Any], project: dict[str, Any], page_text: str
+) -> str:
+    """What one agent is shown of the page, second time round.
+
+    The whole page rather than a few notes somebody else picked out. An agent
+    handed a tidied-up version of what the others said is being told what to
+    think about it; an agent handed the page can read it for itself, in the
+    order it was written, with names on it.
+    """
+
+    return (
+        f"{page_text}\n\n"
+        f"That is the page everybody working on {project['name']} shares. All of "
+        "you read the same one and add to the bottom, so nothing anybody writes "
+        "is written over and nobody has to wait for a turn to speak.\n\n"
+        "Now say your own answer again, taking the page into account. Say "
+        "plainly where you disagree with what is on it and why. Do not agree "
+        "with something only because somebody else wrote it down."
+    )
+
+
 def what_the_others_said(
     agent: dict[str, Any], project: dict[str, Any], notes: list[tuple[str, str]]
 ) -> str:
-    """What one agent is shown of the others, second time round."""
+    """What one agent is shown of the others, second time round.
+
+    Kept for the board with no page to share - a project box whose folder is
+    gone, where there is nowhere to write. The page is what a run uses.
+    """
 
     said = "\n\n".join(f"{name} said:\n{text}" for name, text in notes)
     return (
@@ -995,6 +1074,7 @@ class Running:
 
     def _do_it(self, config, said: dict[str, Any], doing: Doing) -> None:
         from . import chat as chat_lab
+        from . import pages as pages_lab
 
         board = said["board"]
         agents = {one["id"]: one for one in board["agents"]}
@@ -1026,7 +1106,26 @@ class Running:
                     turn.state = "not done"
                     turn.why_not = "Nobody it may talk to had anything to show it."
                     continue
-                asking = what_the_others_said(agent, project, notes)
+                # The page itself, rather than the notes gathered above. Read
+                # here, so what goes in front of this agent is the page as it
+                # stands this moment - including anything another agent wrote
+                # while this one was waiting its turn.
+                page_now = None
+                if project.get("path"):
+                    try:
+                        page_now = pages_lab.read_the_page(
+                            config, project["path"], project["name"])
+                    except HarnessError:
+                        page_now = None
+                if page_now is not None and page_now.parts:
+                    turn.after = page_now.up_to
+                    asking = what_the_page_says(
+                        agent, project, pages_lab.the_page_for_a_prompt(page_now))
+                else:
+                    # No page to share, which happens when a project box points
+                    # at a folder that is not there any more. The notes gathered
+                    # by hand are what is left, and are better than nothing.
+                    asking = what_the_others_said(agent, project, notes)
                 # Written down as it is passed, so somebody watching can read
                 # what each agent was actually given rather than take it on
                 # trust that the right thing was shown to the right one.
@@ -1056,13 +1155,46 @@ class Running:
             started = time.monotonic()
             try:
                 answered = chat_lab.say(
-                    config, agent["who"], asking, filed_as=filed_as(agent["name"]))
+                    config, agent["who"], asking,
+                    filed_as=filed_as(filed_as_on_the_board(agent["name"])))
             except HarnessError as exc:
                 turn.state = "went wrong"
                 turn.why_not = str(exc)
             else:
                 turn.state = "done"
                 turn.said = str(answered.get("answer", {}).get("text") or "")
+                # On the page, in the order the lock let it through. This is the
+                # part that makes two agents unable to talk over each other:
+                # nobody writes into anybody else's words, so there is nothing
+                # to interrupt.
+                if turn.said and project.get("path"):
+                    try:
+                        landed = pages_lab.add_to_the_page(
+                            config, project["path"],
+                            who=agent["name"],
+                            text=turn.said,
+                            # Compared against the round itself rather than a
+                            # sentence typed out again here. Written twice, the
+                            # two drifted apart and every part on the page said
+                            # "after reading the page", including the first
+                            # round where nobody had read anything.
+                            what_they_were_doing=(
+                                ON_ITS_OWN if turn.round == ON_ITS_OWN
+                                else "after reading the page"),
+                            after=turn.after,
+                            name=project["name"],
+                        )
+                        turn.part = int(landed.get("number") or 0)
+                        # Said out loud when somebody got there first, because
+                        # that is the moment a person wants to know two of them
+                        # were working at once.
+                        if landed.get("note"):
+                            doing.note = str(landed["note"])
+                    except HarnessError as exc:
+                        # The answer is not lost over this. It is in the turn,
+                        # it is on the screen, and the page is a record rather
+                        # than the only copy.
+                        turn.why_not = f"It answered, and the page would not take it: {exc}"
                 heard[(turn.agent, turn.project)] = turn.said
             turn.milliseconds = int((time.monotonic() - started) * 1000)
         doing.note = _how_it_went(doing)
