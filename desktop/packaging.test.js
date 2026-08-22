@@ -104,6 +104,18 @@ test("every page uses only actions the bridge really offers", () => {
   }
 });
 
+test("the version-mismatch page cannot ship without its repair button wiring", () => {
+  const html = fs.readFileSync(path.join(__dirname, "pages", "problem.html"), "utf8");
+  const page = fs.readFileSync(path.join(__dirname, "pages", "problem.js"), "utf8");
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.match(html, /id=["']repair["'][^>]*>Fix and start</);
+  assert.match(page, /query\.get\(["']repair["']\)/);
+  assert.match(page, /harnessDesktop\.repairVersionMismatch\(\)/);
+  assert.match(preload, /repairVersionMismatch.*harness:repairVersionMismatch/);
+  assert.match(main, /ipcMain\.handle\(["']harness:repairVersionMismatch["']/);
+});
+
 test("test and smoke files stay out of the installer", () => {
   for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js"]) {
     assert.ok(!shipped(name), `${name} should not be shipped`);
