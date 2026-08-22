@@ -676,7 +676,7 @@ def _which_one_to_connect(who: str, known: dict[str, Any] | None) -> str:
 
     from . import seats as seats_lab
 
-    if not who or (known or {}).get("ready"):
+    if not who or (known or {}).get("ready") or (known or {}).get("setup_blocked"):
         return ""
     for kind, route in seats_lab.ROUTE_NAMES.items():
         if route != who:

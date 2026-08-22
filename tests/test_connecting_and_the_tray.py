@@ -150,6 +150,10 @@ class WhatTheBoardOffersToConnectTests(unittest.TestCase):
     def test_nothing_is_offered_for_one_that_already_works(self) -> None:
         self.assertEqual(swarm._which_one_to_connect("claude", {"ready": True}), "")
 
+    def test_nothing_is_offered_when_an_account_policy_blocks_the_tool(self) -> None:
+        self.assertEqual(swarm._which_one_to_connect(
+            "claude", {"ready": False, "setup_blocked": True}), "")
+
     def test_nothing_is_offered_for_an_agent_with_no_assistant_chosen(self) -> None:
         """There is nothing to connect. What that one needs is somebody to pick
         an assistant for it, which is a different sentence and a different fix."""

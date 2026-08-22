@@ -1098,31 +1098,31 @@ def _the_version_of(program: str) -> tuple[int, ...]:
 
 
 def _in_a_few_words(said: str) -> str:
-    """What a tool printed about itself, as one line somebody can read.
+    """Whether a tool says it is signed in, without account identity.
 
-    These tools answer with JSON, and the whole of it in the middle of a
-    sentence is worse than none of it. The few fields that say who is signed in
-    are picked out by name; anything else falls back to the first line.
+    Auth-status output can contain an email address, organisation, account name
+    and subscription plan. None is needed to explain a provider failure, and
+    copying it into a chat turns a local diagnostic into stored personal data.
+    Only the yes/no status is allowed out of this boundary.
     """
 
     try:
         held = json.loads(said.strip() or "{}")
     except json.JSONDecodeError:
         held = None
-    if not isinstance(held, dict):
-        return " ".join(said.split())[:300]
-    words = []
-    # Named one at a time on purpose, and nothing here holds a secret. A field
-    # called authMethod was read at first: it said "claude.ai", which told
-    # nobody anything, and the same name on another tool holds a session.
-    for name in ("loggedIn", "email", "orgName", "subscriptionType",
-                 "account", "user", "plan", "status"):
-        found = held.get(name)
-        if isinstance(found, bool):
-            words.append("signed in" if found else "not signed in")
-        elif isinstance(found, (str, int)) and str(found).strip():
-            words.append(str(found).strip())
-    return ", ".join(words) or " ".join(said.split())[:300]
+    if isinstance(held, dict):
+        for name in ("loggedIn", "authenticated", "signedIn"):
+            found = held.get(name)
+            if isinstance(found, bool):
+                return "signed in" if found else "not signed in"
+        status = str(held.get("status") or "").strip().lower()
+    else:
+        status = " ".join(said.split()).lower()
+    if any(words in status for words in ("not signed in", "not logged in", "logged out")):
+        return "not signed in"
+    if any(words in status for words in ("signed in", "logged in", "authenticated")):
+        return "signed in"
+    return "the sign-in check answered"
 
 
 def _whole(value: Any) -> int | None:

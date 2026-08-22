@@ -327,6 +327,52 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
             self.config, "claude", "your organisation has Claude Code turned off")
         self.assertIn("turned off", self.only_one()["trouble_last_time"])
 
+    def test_a_gemini_route_missing_its_required_project_is_repairable(self) -> None:
+        self.config.data["providers"] = {
+            "gemini": {"kind": "gemini-cli", "model": "gemini-2.5-pro"}
+        }
+        chat._write_down_that_it_would_not(
+            self.config,
+            "gemini",
+            "This account requires setting the GOOGLE_CLOUD_PROJECT env var",
+        )
+        route = chat.already_set_up(self.config)[0]
+        self.assertFalse(route["ready"])
+        self.assertIn("project id", route["why_not"])
+        self.assertIn("Connect it", route["how_to_fix_it"])
+
+    def test_an_account_policy_that_forbids_claude_code_is_not_called_ready(self) -> None:
+        chat._write_down_that_it_would_not(
+            self.config,
+            "claude",
+            "Your organization has disabled Claude subscription access for Claude Code",
+        )
+        route = self.only_one()
+        self.assertFalse(route["ready"])
+        self.assertTrue(route["setup_blocked"])
+        self.assertIn("administrator", route["how_to_fix_it"])
+
+    def test_account_identity_is_removed_from_new_and_old_refusals(self) -> None:
+        private = (
+            "It says of itself: signed in, somebody@example.test, A Company, pro. "
+            "Ask an administrator."
+        )
+        chat._write_down_that_it_would_not(self.config, "claude", private)
+        kept = chat.what_would_not_answer(self.config)["claude"]["why"]
+        self.assertNotIn("somebody@example.test", kept)
+        self.assertNotIn("A Company", kept)
+        self.assertNotIn(", pro", kept)
+        self.assertIn("It says of itself: signed in.", kept)
+
+        # Old files written by an earlier build are cleaned on the way out too.
+        where = chat._where_the_noes_are(self.config)
+        held = json.loads(where.read_text(encoding="utf-8"))
+        held["claude"]["why"] = private
+        where.write_text(json.dumps(held), encoding="utf-8")
+        read_back = chat.what_would_not_answer(self.config)["claude"]["why"]
+        self.assertNotIn("somebody@example.test", read_back)
+        self.assertNotIn("A Company", read_back)
+
     def test_what_happened_last_time_does_not_stop_it_being_tried(self) -> None:
         """The whole point, and the thing this got wrong the first time.
 

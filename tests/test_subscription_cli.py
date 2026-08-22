@@ -464,13 +464,24 @@ class RunningTests(unittest.TestCase):
             self.provider("claude-cli", tool).complete(self.request())
         message = str(caught.exception)
         self.assertIn("is on this machine and did answer", message)
-        self.assertIn("A Company", message, "it should say what the tool says of itself")
         self.assertIn("signed in", message)
+        self.assertNotIn("somebody@example.test", message)
+        self.assertNotIn("A Company", message)
+        self.assertNotIn(", pro", message)
         # This one prints no timing, so it is not known whether it asked
         # anybody, and neither answer is claimed. What it does get is the order
         # to try things in, cheapest first.
         self.assertIn("neither is claimed", message)
         self.assertIn("claude auth login", message)
+
+    def test_auth_status_keeps_only_the_fact_that_it_is_signed_in(self) -> None:
+        said = subscription_cli._in_a_few_words(json.dumps({
+            "loggedIn": True,
+            "email": "somebody@example.test",
+            "orgName": "A Company",
+            "subscriptionType": "pro",
+        }))
+        self.assertEqual(said, "signed in")
 
     def test_a_tool_that_prints_no_timing_is_not_told_the_service_refused_it(self) -> None:
         """The one that came back. Whether it asked anybody has three answers,

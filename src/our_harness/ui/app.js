@@ -5519,6 +5519,9 @@ const SWARM_DRAWINGS = {
     "M5 5l14 14",
     "M19 5L5 19",
   ],
+  minus: [
+    "M5 12h14",
+  ],
 };
 
 function aSwarmDrawing(which, size) {
@@ -5664,7 +5667,9 @@ function renderSwarmBoard() {
   }
   for (const one of said.agents) board.append(oneSwarmBox("agent", one));
   for (const one of said.projects) board.append(oneSwarmBox("project", one));
-  for (const one of swarmChats) board.append(oneSwarmChatCard(one));
+  for (const one of swarmChats) {
+    if (!one.minimised) board.append(oneSwarmChatCard(one));
+  }
   drawSwarmLines();
 }
 
@@ -5784,7 +5789,7 @@ function drawSwarmLines() {
   }
   // The thin line from a chat box to the agent it belongs to, so an open chat
   // is never a box floating on its own.
-  for (const held of swarmChats) {
+  for (const held of swarmChats.filter((one) => !one.minimised)) {
     drawOneSwarmLine(sheet, found.get(`chat:${held.agent}`),
       found.get(`agent:${held.agent}`), "to-its-chat");
   }
@@ -5895,8 +5900,10 @@ function renderSwarmNotReady() {
   // And one line for anything on this machine that nothing points at yet, even
   // when no agent is asking for it - so it can be connected before somebody
   // spends ten minutes wondering why the dropdown is short.
+  const routesAnAgentWants = new Set(
+    (theSwarmBoard().agents || []).map((agent) => agent.who).filter(Boolean));
   for (const one of swarmSaid.who_can_be_used || []) {
-    if (one.ready || !one.can_be_connected) continue;
+    if (one.ready || !one.can_be_connected || routesAnAgentWants.has(one.route)) continue;
     const row = make("li", "", `${one.label || one.route}: on this machine and not connected yet.`);
     const connect = make("button", "swarm-connect", "Connect it");
     connect.type = "button";
@@ -6451,11 +6458,17 @@ function tidyTheSwarmBoard() {
 function openTheChatFor(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
-  if (!swarmChats.some((one) => one.agent === agentId)) {
+  const already = swarmChats.find((one) => one.agent === agentId);
+  if (!already) {
     swarmChats.push({
       agent: agentId,
       at: {x: Math.max(0, agent.at.x - 20), y: agent.at.y + 190},
+      minimised: false,
     });
+  } else {
+    // The chat button on the agent means show its board card again. A chat in
+    // the tray is still open; it was only put out of the way.
+    already.minimised = false;
   }
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
@@ -6470,6 +6483,15 @@ function openTheChatFor(agentId) {
 
 function closeTheChatFor(agentId) {
   swarmChats = swarmChats.filter((one) => one.agent !== agentId);
+  renderSwarmBoard();
+  renderTheChatsOnThisBoard();
+  renderTheChatTray();
+}
+
+function minimiseTheChatFor(agentId) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  if (!held) return;
+  held.minimised = true;
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
   renderTheChatTray();
@@ -6492,6 +6514,8 @@ function oneSwarmChatCard(held) {
   grip.append(make("strong", "", `Chat with ${agent.name}`));
   grip.title = "Drag to move this chat, or use the arrow keys";
   bar.append(grip);
+  bar.append(aSwarmButton("swarm-icon-button", "minus", "minimise",
+    () => minimiseTheChatFor(held.agent), `minimise the chat with ${agent.name}`, "minimise"));
   bar.append(aSwarmButton("swarm-icon-button", "cross", "close",
     () => closeTheChatFor(held.agent), `close the chat with ${agent.name}`, "close"));
   card.append(bar);

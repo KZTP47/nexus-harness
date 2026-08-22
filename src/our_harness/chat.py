@@ -79,6 +79,23 @@ HOW_TO_ANSWER = (
     "something, ask them to paste it."
 )
 
+# Provider diagnostics sometimes include the identity behind a subscription.
+# An email address and the rest of an auth-status line are not needed to fix a
+# connection and must not be kept in chat history or painted on the board.
+_ACCOUNT_EMAIL = re.compile(
+    r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+)
+_AUTH_STATUS_DETAILS = re.compile(
+    r"It says of itself:\s*(signed in|not signed in)[^.]*\.", re.IGNORECASE
+)
+
+
+def _without_personal_account_details(said: str) -> str:
+    held = _ACCOUNT_EMAIL.sub("[ACCOUNT EMAIL HIDDEN]", str(said or ""))
+    return _AUTH_STATUS_DETAILS.sub(
+        lambda found: f"It says of itself: {found.group(1).lower()}.", held
+    )
+
 
 # How many conversations get a lock of their own before they start sharing one.
 # Far above the number of assistants anybody has; low enough that a stream of
@@ -218,7 +235,7 @@ def _cut_at_a_full_stop(said: str) -> str:
 # written back, which is three things, and two routes failing in the same moment
 # each wrote back what the other had not seen. One of the two notes then never
 # existed - and the one that goes missing is the one nobody knows to look for.
-_while_writing_the_noes = threading.Lock()
+_while_writing_the_noes = threading.RLock()
 
 
 def _where_the_noes_are(config: LoadedConfig) -> Path:
@@ -235,22 +252,44 @@ def what_would_not_answer(config: LoadedConfig) -> dict[str, dict[str, Any]]:
     """
 
     where = _where_the_noes_are(config)
-    try:
-        held = json.loads(where.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(held, dict):
-        return {}
-    now = time.time()
-    kept: dict[str, dict[str, Any]] = {}
-    for route, one in held.items():
-        if not isinstance(one, dict) or not isinstance(one.get("why"), str):
-            continue
-        when = one.get("when")
-        if not isinstance(when, (int, float)) or now - when > A_NO_IS_WORTH_MENTIONING_FOR:
-            continue
-        kept[str(route)] = {"why": one["why"], "when": float(when), "at": str(one.get("at") or "")}
-    return kept
+    with _while_writing_the_noes:
+        try:
+            held = json.loads(where.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(held, dict):
+            return {}
+        now = time.time()
+        kept: dict[str, dict[str, Any]] = {}
+        cleaned = dict(held)
+        changed = False
+        for route, one in held.items():
+            if not isinstance(one, dict) or not isinstance(one.get("why"), str):
+                continue
+            safe_why = _without_personal_account_details(one["why"])
+            if safe_why != one["why"]:
+                cleaned[route] = dict(one, why=safe_why)
+                changed = True
+            when = one.get("when")
+            if not isinstance(when, (int, float)) or now - when > A_NO_IS_WORTH_MENTIONING_FOR:
+                continue
+            kept[str(route)] = {
+                "why": safe_why,
+                "when": float(when),
+                "at": str(one.get("at") or ""),
+            }
+        # Earlier builds persisted the whole auth-status line. Clean it from
+        # the existing file as soon as it is read, not only from the screen.
+        if changed:
+            try:
+                beside = where.with_name(
+                    f"{where.name}.{os.getpid()}-{threading.get_ident()}.part"
+                )
+                beside.write_text(json.dumps(cleaned, indent=2) + "\n", encoding="utf-8")
+                os.replace(beside, where)
+            except OSError:
+                pass
+        return kept
 
 
 def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) -> None:
@@ -270,7 +309,12 @@ def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) ->
             held = what_would_not_answer(config)
             if why:
                 held[route] = {
-                    "why": _cut_at_a_full_stop(why), "when": time.time(), "at": _now()}
+                    "why": _cut_at_a_full_stop(
+                        _without_personal_account_details(why)
+                    ),
+                    "when": time.time(),
+                    "at": _now(),
+                }
             elif route not in held:
                 return
             else:
@@ -305,22 +349,60 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
         if not isinstance(held, dict):
             continue
         no = turned_down.get(str(name))
+        kind = str(held.get("kind") or held.get("name") or "")
+        # A transient refusal remains retryable. This one is different: Gemini
+        # says it cannot make any request until a route setting is supplied.
+        # Calling that route ready leaves the input enabled but provides no
+        # place to enter the value that every retry will keep asking for.
+        needs_setup = bool(
+            kind == "gemini-cli"
+            and no
+            and any(mark in no["why"].lower() for mark in (
+                "google_cloud_project", "google cloud project", "google_project"
+            ))
+        )
+        blocked_by_account = bool(
+            kind == "claude-cli"
+            and no
+            and any(mark in no["why"].lower() for mark in (
+                "disabled claude subscription access",
+                "claude code turned off",
+            ))
+        )
         found.append({
             "route": str(name),
             "label": str(name),
             "model": str(held.get("model") or ""),
-            "kind": str(held.get("kind") or ""),
-            # Ready still means what it always meant: there is a route here and
-            # something may be sent to it. Three other things read this word as
+            "kind": kind,
+            # Ready normally means what it always meant: there is a route here
+            # and something may be sent to it. Three other things read this word as
             # "may this be used at all" - a run picking who to set going,
             # asking everyone at once, and which conversation the panel opens -
             # so hanging last Tuesday's bad minute on it stopped all three,
             # quietly, for a day. The note itself said "send something and it
             # will try again", and then nothing would send anything. A warning
-            # belongs beside the word and not inside it.
-            "ready": True,
-            "why_not": "",
-            "how_to_fix_it": "",
+            # belongs beside the word and not inside it. The exception above is
+            # not a past outage: it is a required route setting, so no retry can
+            # start until the setting is supplied.
+            "ready": not (needs_setup or blocked_by_account),
+            "why_not": (
+                "Gemini needs the Google Cloud project id for this Workspace account."
+                if needs_setup else (
+                    "This Claude account is not allowed to use Claude Code."
+                    if blocked_by_account else ""
+                )
+            ),
+            "how_to_fix_it": (
+                "Press Connect it and enter the project id. No API key is needed."
+                if needs_setup else (
+                    "An organisation administrator must enable Claude Code subscription access."
+                    if blocked_by_account else ""
+                )
+            ),
+            # Installed is not the same as repairable. Reconnecting cannot
+            # override an organisation policy, so it must not offer a button
+            # that will run the same command and fail in the same way.
+            "setup_blocked": blocked_by_account,
             "trouble_last_time": (
                 f"The last time this was asked something, it would not answer: {no['why']}"
                 if no else ""
@@ -484,10 +566,10 @@ def say(
         # back inside "incorrect API key provided: ..." when it is wrong, and
         # that sentence is put on the screen.
         raise ChatError(
-            redactor.text(
+            _without_personal_account_details(redactor.text(
                 f"{named or 'The assistant this project uses'} cannot be reached: "
                 f"{_in_plain_words(exc)}"
-            )
+            ))
         ) from exc
 
     model = str(routed.get("provider.model") or "")
@@ -526,12 +608,15 @@ def _ask_and_keep(
     except HarnessError as exc:  # noqa: PERF203 - one shape of failure, one sentence
         # Remembered against the route, so the board can say this before the
         # next person types rather than after.
-        _write_down_that_it_would_not(config, route, redactor.text(_in_plain_words(exc)))
+        safe_reason = _without_personal_account_details(
+            redactor.text(_in_plain_words(exc))
+        )
+        _write_down_that_it_would_not(config, route, safe_reason)
         raise ChatError(
-            redactor.text(
+            _without_personal_account_details(redactor.text(
                 f"{named or 'The assistant'} was asked and did not answer: "
                 f"{_in_plain_words(exc)}"
-            )
+            ))
         ) from exc
     # It answered, so whatever it said last time is over.
     _write_down_that_it_would_not(config, route, "")

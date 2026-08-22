@@ -128,6 +128,26 @@ async function main() {
     );
     console.log("pass  what is typed into it really goes in");
 
+    // Minimise is different from close: the card leaves the board, while its
+    // tray button keeps the conversation open and can bring it back big.
+    await page.click(
+      `.swarm-chat-card[data-agent="${which}"] .swarm-icon-button[data-does="minimise"]`,
+      { timeout: 20000 });
+    await page.waitForFunction(
+      (agent) => !document.querySelector(`.swarm-chat-card[data-agent="${agent}"]`)
+        && document.querySelector(`[data-chat-tray="${agent}"]`),
+      which, { timeout: 20000 }
+    );
+    console.log("pass  the chat minimises into the tray");
+
+    // The agent's chat button restores the board card; close then removes the
+    // conversation from both the board and the tray.
+    await page.click(
+      `.swarm-box[data-id="${which}"] .swarm-icon-button[data-does="chat"]`,
+      { timeout: 20000 });
+    await page.waitForSelector(
+      `.swarm-chat-card[data-agent="${which}"]`, { timeout: 20000 });
+
     await page.click(
       `.swarm-chat-card[data-agent="${which}"] .swarm-icon-button[data-does="close"]`,
       { timeout: 20000 });
