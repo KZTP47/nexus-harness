@@ -41,6 +41,22 @@ function theBuiltApp() {
   );
 }
 
+async function reachThePanel(page) {
+  const first = await Promise.race([
+    page.waitForFunction(() => location.protocol === "http:", null, { timeout: 90000 })
+      .then(() => "panel"),
+    page.waitForSelector("#repair", { state: "visible", timeout: 90000 })
+      .then(() => "repair"),
+  ]);
+  if (first === "repair") {
+    await page.click("#repair");
+    await page.waitForFunction(
+      () => location.protocol === "http:", null, { timeout: 90000 }
+    );
+    console.log("pass  the packaged app repaired a newer-project mismatch");
+  }
+}
+
 async function main() {
   const exe = theBuiltApp();
   console.log(`Starting the built app at ${exe}\n`);
@@ -48,9 +64,7 @@ async function main() {
   try {
     const page = await app.firstWindow({ timeout: TIMEOUT_MS });
     try {
-      await page.waitForFunction(
-        () => location.protocol === "http:", null, { timeout: 90000 }
-      );
+      await reachThePanel(page);
     } catch (error) {
       const shown = await page.textContent("body").catch(() => "");
       throw new Error(

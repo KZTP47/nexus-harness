@@ -26,8 +26,14 @@ const { _electron: electron } = require("playwright");
 const TIMEOUT_MS = 120000;
 const OUTPUT = path.join(__dirname, "build-output");
 const CALLED = "Added by a smoke check";
+const GIVEN_APP = process.argv[2] || "";
 
 function theBuiltApp() {
+  if (GIVEN_APP) {
+    const given = path.resolve(GIVEN_APP);
+    if (!fs.existsSync(given)) throw new Error(`The app does not exist: ${given}`);
+    return given;
+  }
   for (const name of fs.readdirSync(OUTPUT)) {
     const folder = path.join(OUTPUT, name);
     if (!fs.statSync(folder).isDirectory() || !name.includes("unpacked")) continue;
@@ -40,6 +46,22 @@ function theBuiltApp() {
   throw new Error(`No built app in ${OUTPUT}. Build it first: npm run build`);
 }
 
+async function reachThePanel(page) {
+  const first = await Promise.race([
+    page.waitForFunction(() => location.protocol === "http:", null, { timeout: 90000 })
+      .then(() => "panel"),
+    page.waitForSelector("#repair", { state: "visible", timeout: 90000 })
+      .then(() => "repair"),
+  ]);
+  if (first === "repair") {
+    await page.click("#repair");
+    await page.waitForFunction(
+      () => location.protocol === "http:", null, { timeout: 90000 }
+    );
+    console.log("pass  the packaged app repaired a newer-project mismatch");
+  }
+}
+
 async function main() {
   const exe = theBuiltApp();
   console.log(`Starting the built app at ${exe}\n`);
@@ -47,9 +69,7 @@ async function main() {
   const page = await app.firstWindow({ timeout: TIMEOUT_MS });
   let putBack = null;
   try {
-    await page.waitForFunction(
-      () => location.protocol === "http:", null, { timeout: 90000 }
-    );
+    await reachThePanel(page);
     await page.click('[data-view="swarm"]', { timeout: 30000 });
     await page.waitForFunction(
       () => !document.getElementById("swarmView").hidden
