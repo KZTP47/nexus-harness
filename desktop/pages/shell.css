@@ -57,6 +57,7 @@ button {
 }
 button.primary { color: #03202b; background: var(--green); border-color: var(--green); }
 button:hover { border-color: var(--green); }
+button:disabled { opacity: 0.65; cursor: wait; }
 button:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
 .spinner {
   width: 22px;

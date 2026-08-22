@@ -93,7 +93,7 @@ test("the real app hands in its own answer", () => {
 // Somebody spent the evening looking in three wrong places.
 // ---------------------------------------------------------------------------
 
-const { onlyOnce, whyItReallyIs } = require("./guards");
+const { onlyOnce, isHarnessVersionMismatch, whyItReallyIs } = require("./guards");
 
 test("an old copy of the harness is named as the reason", () => {
   const said = whyItReallyIs(
@@ -102,6 +102,21 @@ test("an old copy of the harness is named as the reason", () => {
   // It says Python is fine, which is the opposite of the guess it replaces.
   assert.match(said, /Nothing is wrong with Python/);
   assert.doesNotMatch(said, /Python 3\.11 or newer is not installed/);
+});
+
+test("only version-shaped startup errors offer the automatic repair", () => {
+  assert.strictEqual(isHarnessVersionMismatch("error: Unknown config key: persistent_memory"), true);
+  assert.strictEqual(isHarnessVersionMismatch("No Python was found on this machine"), false);
+  assert.strictEqual(isHarnessVersionMismatch("project has not been told to trust"), false);
+});
+
+test("a repairable mismatch explains what the repair button will do", () => {
+  const said = whyItReallyIs(
+    "error: Unknown config key: persistent_memory", { canRepair: true }
+  );
+  assert.match(said, /Choose Fix and start/);
+  assert.match(said, /use the newer harness code in this project/);
+  assert.match(said, /recover automatically on later starts/);
 });
 
 test("an untrusted settings file is named as the reason", () => {

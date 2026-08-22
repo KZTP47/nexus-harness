@@ -363,6 +363,55 @@ test("what the app carries comes before anything in the project", () => {
   fs.rmSync(folder, { recursive: true, force: true });
 });
 
+test("a repair retry can put the project's newer harness first", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-repair-order-"));
+  const carried = path.join(folder, "resources");
+  const project = path.join(folder, "project");
+  for (const where of [
+    path.join(carried, "harness", "src", "our_harness"),
+    path.join(project, "src", "our_harness"),
+  ]) {
+    fs.mkdirSync(where, { recursive: true });
+    fs.writeFileSync(path.join(where, "__init__.py"), "");
+  }
+  const found = whereTheHarnessLives(
+    path.join(folder, "app"), project, carried, { preferProjectHarness: true }
+  );
+  assert.strictEqual(found[0], path.join(project, "src"));
+  assert.strictEqual(found[1], path.join(carried, "harness", "src"));
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("the repair choice reaches the Python process environment", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-repair-start-"));
+  const carried = path.join(folder, "resources");
+  const project = path.join(folder, "project");
+  for (const where of [
+    path.join(carried, "harness", "src", "our_harness"),
+    path.join(project, "src", "our_harness"),
+  ]) {
+    fs.mkdirSync(where, { recursive: true });
+    fs.writeFileSync(path.join(where, "__init__.py"), "");
+  }
+  const child = fakeChild();
+  let startedWith = null;
+  const server = new HarnessServer({
+    candidates: [["python", []]],
+    appFolder: path.join(folder, "app"),
+    resources: carried,
+    environment: {},
+    spawn: (_command, _argv, options) => { startedWith = options; return child; },
+  });
+  const started = server.start(project, { preferProjectHarness: true });
+  child.stdout.emit("data", 'harness-ui-ready {"url":"http://127.0.0.1:5/"}\n');
+  await started;
+  assert.strictEqual(
+    startedWith.env.PYTHONPATH.split(path.delimiter)[0], path.join(project, "src")
+  );
+  server.stop();
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
 test("the bridge offers a picker that only picks", () => {
   // The Project menu's picker opens what it finds, which is right there and
   // wrong for a list somebody adds to while working on something else. So

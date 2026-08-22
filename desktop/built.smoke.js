@@ -20,8 +20,14 @@ const { _electron: electron } = require("playwright");
 
 const TIMEOUT_MS = 120000;
 const OUTPUT = path.join(__dirname, "build-output");
+const GIVEN_APP = process.argv[2] || "";
 
 function theBuiltApp() {
+  if (GIVEN_APP) {
+    const given = path.resolve(GIVEN_APP);
+    if (!fs.existsSync(given)) throw new Error(`The app does not exist: ${given}`);
+    return given;
+  }
   for (const name of fs.readdirSync(OUTPUT)) {
     const folder = path.join(OUTPUT, name);
     if (!fs.statSync(folder).isDirectory() || !name.includes("unpacked")) continue;

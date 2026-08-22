@@ -36,8 +36,20 @@ function pythonCandidates(environment = process.env) {
 // this, every Python on the machine answered "No module named our_harness", and
 // the app showed three of those and nothing anybody could act on. Everybody who
 // has only downloaded the project - which is everybody, the first time - hit it.
-function whereTheHarnessLives(appFolder = __dirname, projectPath = "", resources = "") {
+function whereTheHarnessLives(
+  appFolder = __dirname,
+  projectPath = "",
+  resources = "",
+  options = {}
+) {
   const looking = [];
+  const projectSource = projectPath ? path.resolve(projectPath, "src") : "";
+  // The installed app normally wins, because its Python and desktop halves
+  // were released together. After a confirmed schema-version mismatch, the
+  // user can explicitly ask to use the newer harness source in the project.
+  // This is the same code `python scripts/harness.py ui` would use, without
+  // making them leave the error screen and type the command themselves.
+  if (options.preferProjectHarness && projectSource) looking.push(projectSource);
   // An installed app has no src folder beside it - it has a resources folder,
   // and the harness is put in there when the app is built. Without this the
   // installed app was an empty window: it could only ever work if the project
@@ -45,7 +57,7 @@ function whereTheHarnessLives(appFolder = __dirname, projectPath = "", resources
   const carried = resources || process.resourcesPath || "";
   if (carried) looking.push(path.resolve(carried, "harness", "src"));
   looking.push(path.resolve(appFolder, "..", "src"));
-  if (projectPath) looking.push(path.resolve(projectPath, "src"));
+  if (projectSource && !options.preferProjectHarness) looking.push(projectSource);
   return looking.filter((one) => {
     try {
       return fs.existsSync(path.join(one, "our_harness", "__init__.py"));
@@ -168,12 +180,12 @@ class HarnessServer {
   // it". So the failure from a Python that really ran is kept and reported,
   // and "not on this machine" is only the answer when that was true of all of
   // them.
-  async start(projectPath) {
+  async start(projectPath, options = {}) {
     const missing = [];
     let realProblem = null;
     for (const [command, leadingArguments] of this.candidates) {
       try {
-        return await this.startOnce(command, leadingArguments, projectPath);
+        return await this.startOnce(command, leadingArguments, projectPath, options);
       } catch (error) {
         if (error.commandIsMissing) missing.push(command);
         else if (!realProblem) realProblem = error;
@@ -186,7 +198,7 @@ class HarnessServer {
     );
   }
 
-  startOnce(command, leadingArguments, projectPath) {
+  startOnce(command, leadingArguments, projectPath, options = {}) {
     const argv = [
       ...leadingArguments,
       "-m", "our_harness",
@@ -207,7 +219,7 @@ class HarnessServer {
           cwd: projectPath,
           env: environmentForStarting(
             this.environment,
-            whereTheHarnessLives(this.appFolder, projectPath, this.resources)
+            whereTheHarnessLives(this.appFolder, projectPath, this.resources, options)
           ),
           windowsHide: true,
         });

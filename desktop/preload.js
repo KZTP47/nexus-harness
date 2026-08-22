@@ -12,5 +12,6 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   // project somebody is in the middle of.
   pickAFolder: () => ipcRenderer.invoke("harness:pickAFolder"),
   retry: () => ipcRenderer.invoke("harness:retry"),
+  repairVersionMismatch: () => ipcRenderer.invoke("harness:repairVersionMismatch"),
   showHelp: () => ipcRenderer.invoke("harness:help"),
 });

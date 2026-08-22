@@ -45,13 +45,27 @@ function onlyOnce(said) {
   return seen.join(" ") || String(said || "");
 }
 
-function whyItReallyIs(said) {
+function isHarnessVersionMismatch(said) {
+  return /must name a supported provider|is not a kind|Unknown config key/i.test(String(said || ""));
+}
+
+function whyItReallyIs(said, options = {}) {
   // The app carries its own copy of the harness - that is how it runs with
   // nothing installed - and that copy is only as new as the last time somebody
   // built the app. Settings written by a newer harness can name things this
   // copy has never heard of.
   const held = String(said || "");
-  if (/must name a supported provider|is not a kind|Unknown config key/i.test(held)) {
+  if (isHarnessVersionMismatch(held)) {
+    if (options.canRepair) {
+      return (
+        "This app carries its own copy of the harness, and that copy looks older "
+        + "than your settings: the settings name something it has never heard of. "
+        + "Nothing is wrong with Python or with the folder. Choose Fix and start "
+        + "below to use the newer harness code in this project. The app will remember "
+        + "that choice for this project and recover automatically on later starts. "
+        + "Install the newest version of the app when one is available."
+      );
+    }
     return (
       "This app carries its own copy of the harness, and that copy looks older "
       + "than your settings: the settings name something it has never heard of. "
@@ -71,4 +85,4 @@ function whyItReallyIs(said) {
   return "";
 }
 
-module.exports = { attachGuards, onlyOnce, whyItReallyIs };
+module.exports = { attachGuards, onlyOnce, isHarnessVersionMismatch, whyItReallyIs };

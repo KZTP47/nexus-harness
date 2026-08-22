@@ -9,11 +9,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
-const { attachGuards, onlyOnce, whyItReallyIs } = require("./guards");
+const { attachGuards, onlyOnce, isHarnessVersionMismatch, whyItReallyIs } = require("./guards");
 
 const server = new HarnessServer({ onExit: (code) => reportServerStopped(code) });
 let window = null;
 let projectPath = "";
+let repairAvailable = false;
 
 function settingsFile() {
   return path.join(app.getPath("userData"), "settings.json");
@@ -67,21 +68,62 @@ function chooseProject(startAt) {
   return answer && answer.length ? answer[0] : "";
 }
 
-async function openProject(chosen) {
+function projectCarriesHarness(chosen) {
+  try {
+    return fs.existsSync(path.join(chosen, "src", "our_harness", "__init__.py"));
+  } catch (error) {
+    return false;
+  }
+}
+
+function projectKey(chosen) {
+  const resolved = path.resolve(chosen);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function remembersProjectHarness(chosen) {
+  const remembered = readSettings().projectHarnessRepairs;
+  if (!Array.isArray(remembered)) return false;
+  return remembered.includes(projectKey(chosen));
+}
+
+function rememberProjectHarness(chosen) {
+  const settings = readSettings();
+  const remembered = Array.isArray(settings.projectHarnessRepairs)
+    ? settings.projectHarnessRepairs.filter((one) => typeof one === "string")
+    : [];
+  const key = projectKey(chosen);
+  if (!remembered.includes(key)) remembered.push(key);
+  // This is a convenience history, not an audit log. Keeping it bounded also
+  // prevents a damaged settings file from growing forever through this path.
+  writeSettings({ ...settings, projectHarnessRepairs: remembered.slice(-20) });
+}
+
+async function openProject(chosen, options = {}) {
   projectPath = chosen;
+  repairAvailable = false;
   writeSettings({ ...readSettings(), lastProject: chosen });
   showPage("starting.html", { project: path.basename(chosen) });
   server.stop();
   try {
-    const url = await server.start(chosen);
+    const url = await server.start(chosen, options);
     if (window && !window.isDestroyed()) window.loadURL(url);
   } catch (error) {
+    const canRepair = isHarnessVersionMismatch(error.message) && projectCarriesHarness(chosen);
+    // Once somebody has chosen this repair for this project, future launches
+    // recover without stopping at the error page. The bundled copy still gets
+    // the first attempt, so an updated installer naturally takes over again.
+    if (canRepair && !options.preferProjectHarness && remembersProjectHarness(chosen)) {
+      return openProject(chosen, { preferProjectHarness: true });
+    }
+    repairAvailable = canRepair && !options.preferProjectHarness;
     showPage("problem.html", {
       title: "The harness could not start",
       detail: onlyOnce(error.message),
       // What this one really means, when the app can tell. Three guesses that
       // are all wrong send somebody looking in three wrong places.
-      because: whyItReallyIs(error.message),
+      because: whyItReallyIs(error.message, { canRepair: repairAvailable }),
+      repair: repairAvailable ? "1" : "",
       log: server.recentLog().split("\n").slice(-12).join("\n"),
     });
   }
@@ -183,6 +225,15 @@ ipcMain.handle("harness:retry", () => {
   if (projectPath) openProject(projectPath);
   else showPage("welcome.html");
   return projectPath;
+});
+ipcMain.handle("harness:repairVersionMismatch", () => {
+  if (!repairAvailable || !projectPath) return false;
+  // Consume the offer before starting. If the newer project code also fails,
+  // openProject will decide from that fresh error whether repair still applies.
+  repairAvailable = false;
+  rememberProjectHarness(projectPath);
+  openProject(projectPath, { preferProjectHarness: true });
+  return true;
 });
 ipcMain.handle("harness:help", () => {
   showPage("help.html");

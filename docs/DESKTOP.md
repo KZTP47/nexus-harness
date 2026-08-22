@@ -73,13 +73,20 @@ without clashing.
 If the server does not start within 45 seconds, or stops on its own, the window
 shows what it printed and offers to try again.
 
+If an installed app is older than the project's settings, the error page also
+offers **Fix and start**. That action uses `src/our_harness` from the chosen
+project for the retry and remembers the choice for that project. On later
+starts, the bundled harness is still tried first; if it reports the same
+version mismatch, the app falls back to the project copy automatically. This
+means a newly installed compatible bundle takes over without any cleanup.
+
 ## What it will not do
 
 - It never loads a page from outside this machine. A link to anywhere else opens
   in your own browser instead, where you can see the address first.
-- The page has no access to Node, the file system, or a shell. The only three
-  actions it can ask the app for are "choose a folder", "try again", and "show
-  the help page".
+- The page has no access to Node, the file system, or a shell. It can ask the
+  app only for narrow named actions such as choosing a folder, trying again,
+  showing help, or accepting the project-copy repair described above.
 - It answers no to every browser permission request, such as camera or location.
 
 ## Testing it
