@@ -144,7 +144,9 @@ class Member:
     label: str
     kind: str
     ready: bool = False
-    signed_in: bool = False
+    signed_in: bool | None = None
+    connection_state: str = "unknown"
+    can_login: bool = False
     already_set_up: bool = False
     version: str = ""
     found_at: str = ""
@@ -160,6 +162,8 @@ class Member:
             "kind": self.kind,
             "ready": self.ready,
             "signed_in": self.signed_in,
+            "connection_state": self.connection_state,
+            "can_login": self.can_login,
             "already_set_up": self.already_set_up,
             "version": self.version,
             "found_at": "",
@@ -185,17 +189,36 @@ def who_is_here(config: LoadedConfig) -> dict[str, Any]:
     from . import local_models as local_lab
 
     look = seats_lab.look(config)
+    from .providers.subscription_cli import connection_status
+
+    candidates = [seat for seat in look.seats if seat.ready]
+    checked = [
+        connection_status(seat.kind, use_cache=True, probe=False)
+        for seat in candidates
+    ]
+    status_by_kind = {
+        seat.kind: status for seat, status in zip(candidates, checked)
+    }
     members: list[Member] = []
     for seat in look.seats:
+        connection = status_by_kind.get(seat.kind, {})
+        authentication = str(connection.get("authentication") or "unknown")
         members.append(
             Member(
                 route=seat.route,
                 label=seat.label,
                 kind=seat.kind,
                 ready=bool(seat.ready),
-                # Being installed is not being signed in. The tool answers with
-                # its version either way, so this says what was really shown.
-                signed_in=bool(seat.ready and seat.version),
+                # Being installed is not being signed in. Only a provider's
+                # own auth-status command can make this true; tools without a
+                # safe status command stay unknown rather than guessed.
+                signed_in=(True if authentication == "signed-in" else (
+                    False if authentication == "signed-out" else None
+                )),
+                connection_state=str(connection.get("state") or (
+                    "not-installed" if not seat.ready else "installed"
+                )),
+                can_login=bool(connection.get("can_login")),
                 already_set_up=bool(seat.already_set_up),
                 version=seat.version,
                 found_at=seat.found_at,
@@ -218,6 +241,7 @@ def who_is_here(config: LoadedConfig) -> dict[str, Any]:
                 kind=kind or "your own",
                 ready=True,
                 signed_in=not held.get("api_key_env"),
+                connection_state="configured",
                 already_set_up=True,
                 version=str(held.get("model") or ""),
                 found_at=str(held.get("endpoint") or ""),

@@ -707,6 +707,27 @@ class SettingThemGoing(BoardTestCase):
         self.assertEqual(len(doing["turns"]), 2)
         self.assertEqual(len(self.asked), 2)
 
+    def test_the_shared_page_does_not_bypass_communication_permissions(self) -> None:
+        """A durable page is not a back door around a crossed grey line."""
+
+        self.a_board(
+            agents=[
+                {"name": "Reviewer", "who": "claude"},
+                {"name": "Writer", "who": "claude"},
+                {"name": "Private researcher", "who": "claude"},
+            ],
+            projects=[{"path": str(self.where), "tasks": ["Make it pass"]}],
+            works_on=[
+                {"agent": f"agent-{number}", "project": "project-1"}
+                for number in (1, 2, 3)
+            ],
+            talks_to=[{"one": "agent-1", "other": "agent-2"}],
+        )
+        self.a_run()
+        reviewer_second_round = self.asked[3][2]
+        self.assertIn("Writer on the board says so", reviewer_second_round)
+        self.assertNotIn("Private researcher on the board says so", reviewer_second_round)
+
     def test_a_project_with_no_jobs_is_left_alone(self) -> None:
         self.a_board(
             agents=[{"name": "The reviewer", "who": "claude"}],
@@ -888,6 +909,31 @@ class WhatTheySaidToEachOther(BoardTestCase):
             ("The writer", "The reviewer"),
             ("The reviewer", "The writer"),
         })
+
+    def test_successfully_received_messages_are_durably_acknowledged(self) -> None:
+        self.a_working_board()
+        said = self.a_run().what_they_said()
+        self.assertEqual(said["delivery"]["queued"], 0)
+        self.assertEqual(said["delivery"]["acknowledged"], 2)
+        self.assertTrue(all(one["message_id"] for one in said["notes"]))
+        self.assertTrue(all(one["status"] == "acknowledged" for one in said["notes"]))
+
+    def test_a_message_survives_when_its_receiving_provider_fails(self) -> None:
+        self.a_working_board()
+        turns = 0
+
+        def one_failure(config, route, text, filed_as=""):
+            nonlocal turns
+            turns += 1
+            if turns == 3:
+                raise swarm.SwarmError("the receiving subscription was unavailable")
+            return {"answer": {"text": f"{filed_as} says so"}}
+
+        with mock.patch.object(chat, "say", one_failure):
+            said = self.a_run().what_they_said()
+        self.assertEqual(said["delivery"]["queued"], 1)
+        self.assertEqual(said["delivery"]["retrying"], 1)
+        self.assertIn("queued", {one["status"] for one in said["notes"]})
 
     def test_what_was_passed_is_the_words_themselves(self) -> None:
         """Not a count of them. Reading what was passed is the whole point."""

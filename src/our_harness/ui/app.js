@@ -3885,10 +3885,26 @@ function renderTeamWho() {
     const row = make("li", `team-who-one ${one.ready ? "ready" : "not-ready"}`);
     row.dataset.who = one.route;
     row.append(make("strong", "", one.label));
-    row.append(make("p", "team-who-state", one.ready
-      ? (one.already_set_up ? "Ready, and already set up." : "Ready. It is not set up yet.")
-      : (one.why_not || "Not on this machine.")));
+    let state = one.ready
+      ? (one.already_set_up ? "Installed and set up." : "Installed. It is not set up yet.")
+      : (one.why_not || "Not on this machine.");
+    if (one.connection_state === "authenticated") {
+      state = one.already_set_up
+        ? "Command-line sign-in confirmed; connected and ready."
+        : "Command-line sign-in confirmed; ready to connect.";
+    } else if (one.connection_state === "needs-login") {
+      state = "Installed, but its separate command line needs sign-in.";
+    } else if (one.ready && one.connection_state === "installed") {
+      state += " Sign-in will be verified by its first request.";
+    }
+    row.append(make("p", "team-who-state", state));
     if (one.version) row.append(make("p", "hint", one.version));
+    if (one.connection_state === "needs-login" && one.can_login) {
+      const signIn = make("button", "team-sign-in", "Open sign-in");
+      signIn.type = "button";
+      signIn.addEventListener("click", () => signInThisAssistant(one.kind, signIn));
+      row.append(signIn);
+    }
     if (!one.ready && one.install_hint) row.append(make("p", "hint", one.install_hint));
     list.append(row);
   }
@@ -6535,6 +6551,13 @@ function oneSwarmChatCard(held) {
   if (agent.how_to_fix_it) {
     card.append(make("p", "swarm-chat-repair hint", agent.how_to_fix_it));
   }
+  if (agent.trouble_last_time && agent.can_sign_in && agent.assistant_kind) {
+    const signIn = make("button", "swarm-sign-in", "Open its sign-in");
+    signIn.type = "button";
+    signIn.addEventListener("click", () => signInThisAssistant(
+      agent.assistant_kind, signIn));
+    card.append(signIn);
+  }
   card.append(make("ol", "swarm-chat-thread talk-thread"));
 
   const form = make("form", "swarm-chat-form");
@@ -6781,10 +6804,16 @@ function renderWhatTheySaidToEachOther(said) {
     list.append(row);
   }
   const dropped = said.dropped || 0;
+  const delivery = said.delivery || {};
+  const waiting = Number(delivery.queued || 0);
+  const retrying = Number(delivery.retrying || 0);
   $("swarmExchangeSaid").textContent = notes.length
     ? `${notes.length} answer${notes.length === 1 ? "" : "s"} passed`
       + (dropped ? `, and ${dropped} older ones dropped to keep the list readable` : "")
-    : "nothing passed yet";
+      + (waiting ? `; ${waiting} safely queued${retrying ? ` (${retrying} awaiting retry)` : ""}` : "")
+    : (waiting
+      ? `${waiting} message${waiting === 1 ? " is" : "s are"} safely queued for the next successful turn`
+      : "nothing passed yet");
   if (!notes.length) {
     list.append(make("li", "hint",
       "Nothing has been passed between agents yet. It happens on the second round "
@@ -6797,6 +6826,11 @@ function renderWhatTheySaidToEachOther(said) {
       `${one.said_by_name} to ${one.shown_to_name}`));
     const under = [one.where];
     if (one.at) under.push(one.at);
+    if (one.status === "queued") {
+      under.push(one.attempts ? "delivery failed; kept for retry" : "queued for delivery");
+    } else if (one.message_id) {
+      under.push("received and acknowledged");
+    }
     row.append(make("p", "hint", under.join(" | ")));
     row.append(make("p", "swarm-exchange-text", one.text));
     list.append(row);
@@ -7444,9 +7478,19 @@ async function connectThisAssistant(kind, button) {
     const said = await request("/api/team/connect", {
       method: "POST", body: JSON.stringify({kind, google_project: googleProject}),
     });
-    sayInSwarm(said.needs_your_say
-      ? `${said.route} was written down. ${said.note}`
-      : `${said.route} is connected. The agents using it are ready now.`);
+    if (said.needs_your_say) {
+      sayInSwarm(`${said.route} was written down. ${said.note}`);
+    } else if (said.authentication === "signed-out" && said.can_login) {
+      sayInSwarm(`${said.route} is installed and connected to the board, but its command line needs sign-in.`);
+      if (window.confirm(
+        `${said.route} is installed, but its command line is signed out. Open its own sign-in window now?`)) {
+        await signInThisAssistant(kind);
+      }
+    } else if (said.authentication === "signed-in") {
+      sayInSwarm(`${said.route} is connected and its command-line sign-in is ready.`);
+    } else {
+      sayInSwarm(`${said.route} is connected. Its command line will verify the subscription on the first message.`);
+    }
     await refreshSwarm(true);
   } catch (trouble) {
     sayInSwarm(String(trouble.message || trouble));
@@ -7689,6 +7733,29 @@ function renderWhatItHasGoingOn(agent) {
   }
   if (agent && agent.how_to_fix_it) {
     list.append(make("li", "the-big-chat-doing-one", agent.how_to_fix_it));
+  }
+}
+
+async function signInThisAssistant(kind, button = null) {
+  const was = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Opening...";
+  }
+  try {
+    const said = await request("/api/team/login", {
+      method: "POST", body: JSON.stringify({kind}),
+    });
+    sayInSwarm(said.note || "The provider sign-in opened in its own terminal.");
+  } catch (trouble) {
+    const words = String(trouble.message || trouble);
+    showError(words);
+    sayInSwarm(words);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = was;
+    }
   }
 }
 

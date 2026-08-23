@@ -575,6 +575,8 @@ def how_it_stands(config) -> dict[str, Any]:
             )
         )
         held["how_to_fix_it"] = (known or {}).get("how_to_fix_it", "")
+        held["assistant_kind"] = (known or {}).get("kind", "")
+        held["can_sign_in"] = bool((known or {}).get("can_sign_in"))
         # Which assistant this one would need set up, when that is all that is
         # missing. Somebody had Claude installed and signed in, an agent set to
         # use it, and the board still said not ready - with nothing on screen to
@@ -770,6 +772,12 @@ class OneNote:
     where: str
     text: str
     at: str = ""
+    # A durable delivery identity.  Older saved runs have neither, which is
+    # fine: they remain readable as the plain notes they always were.
+    message_id: str = ""
+    thread_id: str = ""
+    status: str = "acknowledged"
+    attempts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -781,6 +789,10 @@ class OneNote:
             "where": self.where,
             "text": self.text,
             "at": self.at,
+            "message_id": self.message_id,
+            "thread_id": self.thread_id,
+            "status": self.status,
+            "attempts": self.attempts,
         }
 
 
@@ -793,6 +805,7 @@ class OneTurn:
     project: str
     where: str
     round: str
+    shared_goal: str = ""
     state: str = "waiting"     # waiting, asking, done, went wrong, not done
     said: str = ""
     why_not: str = ""
@@ -818,6 +831,7 @@ class OneTurn:
             "project": self.project,
             "where": self.where,
             "round": self.round,
+            "shared_goal": self.shared_goal,
             "state": self.state,
             "letters": len(self.said),
             "why_not": self.why_not,
@@ -863,7 +877,9 @@ def what_to_ask(agent: dict[str, Any], project: dict[str, Any]) -> str:
 
     jobs = "\n".join(f"- {one}" for one in project["tasks"])
     what_it_is_for = f"\nWhat you are here for: {agent['job']}" if agent["job"] else ""
+    goal = shared_goal_id(project)
     return (
+        f"SHARED GOAL {goal}\n"
         f"You are {agent['name']}, working on {project['name']}, "
         f"which is the folder at {project['path']}."
         f"{what_it_is_for}\n\n"
@@ -875,7 +891,8 @@ def what_to_ask(agent: dict[str, Any], project: dict[str, Any]) -> str:
 
 
 def what_the_page_says(
-    agent: dict[str, Any], project: dict[str, Any], page_text: str
+    agent: dict[str, Any], project: dict[str, Any], page_text: str,
+    messages: list[tuple[str, str]] | None = None,
 ) -> str:
     """What one agent is shown of the page, second time round.
 
@@ -885,11 +902,14 @@ def what_the_page_says(
     order it was written, with names on it.
     """
 
+    inbox = _messages_for_a_prompt(messages or [])
     return (
+        f"SHARED GOAL {shared_goal_id(project)}\n"
         f"{page_text}\n\n"
         f"That is the page everybody working on {project['name']} shares. All of "
         "you read the same one and add to the bottom, so nothing anybody writes "
         "is written over and nobody has to wait for a turn to speak.\n\n"
+        f"{inbox}"
         "Now say your own answer again, taking the page into account. Say "
         "plainly where you disagree with what is on it and why. Do not agree "
         "with something only because somebody else wrote it down."
@@ -905,15 +925,48 @@ def what_the_others_said(
     gone, where there is nowhere to write. The page is what a run uses.
     """
 
-    said = "\n\n".join(f"{name} said:\n{text}" for name, text in notes)
+    said = _messages_for_a_prompt(notes)
     return (
+        f"SHARED GOAL {shared_goal_id(project)}\n"
         f"Here is what the others working on {project['name']} said. You are "
         "being shown these because somebody said you two may talk.\n\n"
-        f"{said}\n\n"
+        f"{said}"
         "Now say your own answer again, taking theirs into account. Say plainly "
         "where you disagree with them and why. Do not agree with something only "
         "because somebody else said it."
     )
+
+
+def shared_goal_id(project: dict[str, Any]) -> str:
+    """Stable identity for one project's current list of jobs.
+
+    A changed job list is a changed goal.  Messages for the previous goal stay
+    in the audit file but are never replayed into the new one.
+    """
+
+    body = json.dumps({
+        "project": str(project.get("id") or ""),
+        "tasks": [str(one) for one in project.get("tasks", [])],
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+def _messages_for_a_prompt(notes: list[tuple[str, str]]) -> str:
+    if not notes:
+        return ""
+    said = "\n\n".join(f"Message from {name}:\n{text}" for name, text in notes)
+    return (
+        "AGENT INBOX\n"
+        "These messages were durably queued for you. They are acknowledged only "
+        "after you answer this turn.\n\n"
+        f"{said}\n\n"
+    )
+
+
+def where_the_mailbox_lives() -> Path:
+    """The cross-agent mailbox beside the board it belongs to."""
+
+    return where_it_lives().with_name("swarm-mailbox.json")
 
 
 class Running:
@@ -963,6 +1016,12 @@ class Running:
         after the panel has been closed and opened again.
         """
 
+        from . import agent_mailbox as mailbox
+
+        try:
+            delivery = mailbox.status(where_the_mailbox_lives())
+        except (OSError, HarnessError):
+            delivery = {"queued": 0, "acknowledged": 0, "retrying": 0}
         with self._lock:
             doing = self._doing
         if doing is not None:
@@ -971,9 +1030,13 @@ class Running:
                 "going": doing.going,
                 "dropped": doing.dropped,
                 "most": MOST_NOTES,
+                "delivery": delivery,
                 "notes": [one.to_dict() for one in doing.notes],
             }
-        return dict(read_what_they_said(), going=False, most=MOST_NOTES)
+        return dict(
+            read_what_they_said(), going=False, most=MOST_NOTES,
+            delivery=delivery,
+        )
 
     def stop(self) -> str:
         with self._lock:
@@ -1059,6 +1122,7 @@ class Running:
                 first.append(OneTurn(
                     agent=agent["id"], name=agent["name"],
                     project=project["id"], where=project["name"], round=ON_ITS_OWN,
+                    shared_goal=shared_goal_id(project),
                 ))
             for agent in ready:
                 if any(
@@ -1069,12 +1133,14 @@ class Running:
                         agent=agent["id"], name=agent["name"],
                         project=project["id"], where=project["name"],
                         round=AFTER_THE_OTHERS,
+                        shared_goal=shared_goal_id(project),
                     ))
         return first + second
 
     def _do_it(self, config, said: dict[str, Any], doing: Doing) -> None:
         from . import chat as chat_lab
         from . import pages as pages_lab
+        from . import agent_mailbox as mailbox
 
         board = said["board"]
         agents = {one["id"]: one for one in board["agents"]}
@@ -1094,14 +1160,35 @@ class Running:
             project = projects[turn.project]
             if turn.round == ON_ITS_OWN:
                 asking = what_to_ask(agent, project)
+                incoming = []
             else:
-                notes = [
+                allowed = [
+                    held for held in agents
+                    if held != turn.agent
+                    and may_they_talk(board, turn.agent, held)
+                ]
+                try:
+                    incoming = mailbox.pending(
+                        where_the_mailbox_lives(),
+                        shared_goal_id=turn.shared_goal,
+                        receiver=turn.agent,
+                        allowed_senders=allowed,
+                    )
+                except (OSError, HarnessError):
+                    # The same-run answers remain a safe fallback. A mailbox is
+                    # resilience around the handoff, never a new single point
+                    # of failure for a run that could already proceed.
+                    incoming = []
+                notes = [(one.sender_name, one.body) for one in incoming]
+                already = {one.sender for one in incoming}
+                notes.extend([
                     (agents[held]["name"], text)
                     for (held, where), text in heard.items()
                     if where == turn.project
+                    and held not in already
                     and held != turn.agent
                     and may_they_talk(board, turn.agent, held)
-                ]
+                ])
                 if not notes:
                     turn.state = "not done"
                     turn.why_not = "Nobody it may talk to had anything to show it."
@@ -1120,7 +1207,16 @@ class Running:
                 if page_now is not None and page_now.parts:
                     turn.after = page_now.up_to
                     asking = what_the_page_says(
-                        agent, project, pages_lab.the_page_for_a_prompt(page_now))
+                        agent,
+                        project,
+                        pages_lab.the_page_for_a_prompt(
+                            page_now,
+                            only_from={agent["name"], *(
+                                agents[held]["name"] for held in allowed
+                            )},
+                        ),
+                        notes,
+                    )
                 else:
                     # No page to share, which happens when a project box points
                     # at a folder that is not there any more. The notes gathered
@@ -1130,19 +1226,26 @@ class Running:
                 # what each agent was actually given rather than take it on
                 # trust that the right thing was shown to the right one.
                 turn.shown = [name for name, _text in notes]
-                for (held, where), text in heard.items():
-                    if (where != turn.project or held == turn.agent
-                            or not may_they_talk(board, turn.agent, held)):
-                        continue
+                delivered = incoming or [None for _one in notes]
+                for at, note in enumerate(notes):
+                    message = delivered[at] if at < len(delivered) else None
+                    sender_name, text = note
+                    sender = message.sender if message is not None else next(
+                        (held for held, known in agents.items()
+                         if known["name"] == sender_name), "")
                     doing.notes.append(OneNote(
-                        said_by=held,
-                        said_by_name=agents[held]["name"],
+                        said_by=sender,
+                        said_by_name=sender_name,
                         shown_to=turn.agent,
                         shown_to_name=agent["name"],
                         project=turn.project,
                         where=project["name"],
                         text=text[:LONGEST_NOTE],
                         at=_the_time_now(),
+                        message_id=(message.message_id if message is not None else ""),
+                        thread_id=(message.thread_id if message is not None else ""),
+                        status="queued" if message is not None else "acknowledged",
+                        attempts=(message.attempts if message is not None else 0),
                     ))
                     # The oldest fall off the end rather than the newest never
                     # being written: what somebody reads this for is what just
@@ -1160,9 +1263,34 @@ class Running:
             except HarnessError as exc:
                 turn.state = "went wrong"
                 turn.why_not = str(exc)
+                if incoming:
+                    try:
+                        mailbox.attempted(
+                            where_the_mailbox_lives(),
+                            [one.message_id for one in incoming],
+                            str(exc),
+                        )
+                    except (OSError, HarnessError):
+                        pass
             else:
                 turn.state = "done"
                 turn.said = str(answered.get("answer", {}).get("text") or "")
+                if incoming:
+                    try:
+                        mailbox.acknowledge(
+                            where_the_mailbox_lives(),
+                            [one.message_id for one in incoming],
+                        )
+                        acknowledged = {one.message_id for one in incoming}
+                        for note in doing.notes:
+                            if note.message_id in acknowledged:
+                                note.status = "acknowledged"
+                                note.attempts += 1
+                    except (OSError, HarnessError) as exc:
+                        turn.why_not = (
+                            f"It answered, but its inbox acknowledgement could not be "
+                            f"written: {exc}"
+                        )
                 # On the page, in the order the lock let it through. This is the
                 # part that makes two agents unable to talk over each other:
                 # nobody writes into anybody else's words, so there is nothing
@@ -1196,6 +1324,35 @@ class Running:
                         # than the only copy.
                         turn.why_not = f"It answered, and the page would not take it: {exc}"
                 heard[(turn.agent, turn.project)] = turn.said
+                # First-round answers are durable messages to every connected
+                # collaborator. If a receiving provider fails later, these are
+                # replayed on the next run instead of disappearing with this
+                # process.
+                if turn.round == ON_ITS_OWN and turn.said:
+                    thread_id = ""
+                    for receiver in who_works_on(board, turn.project):
+                        if (receiver["id"] == turn.agent or not receiver.get("ready")
+                                or not may_they_talk(
+                                    board, turn.agent, receiver["id"])):
+                            continue
+                        try:
+                            queued = mailbox.enqueue(
+                                where_the_mailbox_lives(),
+                                shared_goal_id=turn.shared_goal,
+                                sender=turn.agent,
+                                sender_name=agent["name"],
+                                receiver=receiver["id"],
+                                receiver_name=receiver["name"],
+                                project=turn.project,
+                                project_name=project["name"],
+                                body=turn.said,
+                                expects_reply=True,
+                                thread_id=thread_id,
+                            )
+                            thread_id = queued.thread_id
+                        except (OSError, HarnessError) as exc:
+                            warning = f"Its answer was kept, but one handoff was not queued: {exc}"
+                            turn.why_not = f"{turn.why_not} {warning}".strip()
             turn.milliseconds = int((time.monotonic() - started) * 1000)
         doing.note = _how_it_went(doing)
         _keep_what_they_said(doing)

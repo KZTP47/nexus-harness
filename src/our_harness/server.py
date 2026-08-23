@@ -1513,12 +1513,30 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     # on saying not ready about something that is now ready -
                     # which reads as the button having done nothing.
                     self.server.config = self._settings_now()
+                from .providers.subscription_cli import connection_status
+
+                connection = connection_status(wanted)
                 self._json({
                     "route": name,
                     "trusted": done.trusted,
                     "note": done.note,
                     "needs_your_say": done.needs_your_say,
+                    **connection,
                 })
+            elif self.path == "/api/team/login":
+                # This is intentionally a separate, explicit press from adding
+                # a route. Connecting settings must never pop up an account
+                # window by surprise. The provider CLI owns the window and the
+                # credentials; the harness captures neither.
+                wanted = str(body.get("kind") or "").strip()
+                if wanted not in seat_setup.KNOWN_SEATS:
+                    raise HarnessError(
+                        f"{wanted or 'that'} is not an assistant this app knows "
+                        "how to sign in."
+                    )
+                from .providers.subscription_cli import start_interactive_login
+
+                self._json(start_interactive_login(wanted))
             elif self.path == "/api/swarm/the-page":
                 # The page every agent on one project writes to. Read through
                 # the same door the run uses, so what the panel shows is what

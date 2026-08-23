@@ -184,6 +184,17 @@ BUILT_ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "is not, is proven in tests/test_settings.py, on a throwaway project "
         "where breaking one costs nothing."
     ),
+    "Open sign-in": (
+        "This deliberately opens a real provider's interactive OAuth terminal. "
+        "A browser check must not start or alter a developer's account session. "
+        "The fixed command, visible console, and uncaptured output are exercised "
+        "with a mocked process in tests/test_agent_mailbox.py."
+    ),
+    "Open its sign-in": (
+        "This is the same explicit provider OAuth action from an agent chat. A "
+        "browser check must not start or alter a developer's real account session; "
+        "tests/test_agent_mailbox.py verifies the safe process boundary instead."
+    ),
 }
 
 

@@ -17,6 +17,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +26,7 @@ from typing import Any, Mapping
 
 from ..models import HarnessError, ProviderRequest, ProviderResponse
 from .base import Provider
-from .codex_cli import _remaining, _run_bounded
+from .codex_cli import _minimal_codex_environment, _remaining, _run_bounded
 
 SUBSCRIPTION_KINDS = ("claude-cli", "copilot-cli", "assistant-cli")
 UNPRICED = "subscription-unpriced"
@@ -67,6 +69,10 @@ class CliRecipe:
     # signed in and the request is still turned down. Only ever run on the way
     # to an error message, so it costs nothing on a working machine.
     signed_in_arguments: tuple[str, ...] = ()
+    # A fixed, interactive command the app may open only after the person
+    # presses Sign in. None means this CLI has no supported login flow here;
+    # an empty tuple means running the command itself opens that flow.
+    interactive_login_arguments: tuple[str, ...] | None = None
     when_it_is_refused: str = ""
     # When the service's own answer already names what would fix it. Words to
     # look for in what it said, and what to say instead of guessing - because a
@@ -173,6 +179,7 @@ CLAUDE_RECIPE = CliRecipe(
     input_tokens_field="usage.input_tokens",
     output_tokens_field="usage.output_tokens",
     signed_in_arguments=("auth", "status"),
+    interactive_login_arguments=("auth", "login"),
     key_it_reads="ANTHROPIC_API_KEY",
     # The desktop app keeps its own copy of Claude Code and updates it, while an
     # npm install months ago sits on the path never changing. Both are here on
@@ -279,6 +286,7 @@ GEMINI_RECIPE = CliRecipe(
         ("GOOGLE_CLOUD_PROJECT", "google_project"),
     ),
     key_it_reads="GEMINI_API_KEY",
+    interactive_login_arguments=(),
     when_it_is_refused=(
         "Signed in and still turned down usually means the account has no "
         "Gemini to give. A personal Google account gets some for free; a work "
@@ -330,6 +338,7 @@ CODEX_RECIPE = CliRecipe(
         "HOME/.codex/bin/codex",
     ),
     signed_in_arguments=("login", "status"),
+    interactive_login_arguments=("login",),
     install_hint=(
         "Install Codex and sign in with your ChatGPT account, then run: "
         "codex --version. It comes with the Codex desktop app, or from npm: "
@@ -345,6 +354,10 @@ RECIPES: dict[str, CliRecipe] = {
     GEMINI_RECIPE.id: GEMINI_RECIPE,
     CODEX_RECIPE.id: CODEX_RECIPE,
 }
+
+_connection_cache_lock = threading.Lock()
+_connection_cache: dict[tuple[str, str, int], tuple[float, dict[str, Any]]] = {}
+CONNECTION_STATUS_CACHE_SECONDS = 60.0
 
 
 def recipe_for(kind: str) -> CliRecipe:
@@ -379,6 +392,153 @@ def available(kind: str, command: list[str] | None = None) -> str:
     # already have.
     somewhere = _where_else_it_might_be(recipe.also_found_at)
     return str(somewhere[0]) if somewhere else ""
+
+
+def connection_status(
+    kind: str,
+    timeout_seconds: float = 10.0,
+    *,
+    use_cache: bool = False,
+    probe: bool = True,
+) -> dict[str, Any]:
+    """Installed and CLI-authenticated are reported as different facts.
+
+    Opening a provider's desktop app proves neither that its separate command
+    line OAuth session exists nor that non-interactive subscription calls are
+    entitled.  This asks only the CLI's local status command; it sends no model
+    prompt and returns none of the account details that command may print.
+    """
+
+    recipe = recipe_for(kind)
+    program = available(kind)
+    try:
+        changed = Path(program).stat().st_mtime_ns if program else 0
+    except OSError:
+        changed = 0
+    cache_key = (kind, program, changed)
+    if use_cache:
+        with _connection_cache_lock:
+            remembered = _connection_cache.get(cache_key)
+        if remembered and time.monotonic() - remembered[0] < CONNECTION_STATUS_CACHE_SECONDS:
+            return dict(remembered[1])
+
+    def done(result: dict[str, Any]) -> dict[str, Any]:
+        # Fresh explicit checks populate the cache; ordinary page refreshes may
+        # then reuse the fact without starting provider CLIs over and over.
+        with _connection_cache_lock:
+            _connection_cache[cache_key] = (time.monotonic(), dict(result))
+        return result
+
+    base = {
+        "kind": kind,
+        "installed": bool(program),
+        "authentication": "unknown",
+        "can_login": recipe.interactive_login_arguments is not None,
+    }
+    if not program:
+        return done(dict(base, state="not-installed"))
+    if not recipe.signed_in_arguments:
+        return done(dict(base, state="installed"))
+    if not probe:
+        return dict(base, state="installed")
+    try:
+        result = _run_bounded(
+            [program, *recipe.signed_in_arguments],
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=max(1.0, min(float(timeout_seconds), 15.0)),
+            max_output_bytes=32_000,
+        )
+    except HarnessError:
+        return done(dict(base, state="installed"))
+    if result.timed_out:
+        return done(dict(base, state="installed"))
+    answer = f"{result.stdout}\n{result.stderr}".lower()
+    compact = answer.replace(" ", "")
+    negative = (
+        '"loggedin":false', '"logged_in":false', "not logged in",
+        "not signed in", "login required", "authentication required",
+    )
+    positive = (
+        '"loggedin":true', '"logged_in":true', "logged in", "signed in",
+        "chatgpt",
+    )
+    if any(mark in compact for mark in negative[:2]) or any(
+            mark in answer for mark in negative[2:]):
+        authentication = "signed-out"
+    elif result.exit_code == 0 and (
+            not answer.strip() or any(mark in compact for mark in positive[:2])
+            or any(mark in answer for mark in positive[2:])):
+        authentication = "signed-in"
+    elif result.exit_code != 0:
+        authentication = "signed-out"
+    else:
+        authentication = "unknown"
+    return done(dict(
+        base,
+        authentication=authentication,
+        state=("authenticated" if authentication == "signed-in" else (
+            "needs-login" if authentication == "signed-out" else "installed"
+        )),
+    ))
+
+
+def start_interactive_login(kind: str) -> dict[str, Any]:
+    """Open the provider's own login flow after an explicit button press.
+
+    Credentials stay between the provider CLI and its service.  The harness
+    neither asks for them nor captures the terminal's output.
+    """
+
+    recipe = recipe_for(kind)
+    arguments = recipe.interactive_login_arguments
+    if arguments is None:
+        raise HarnessError(
+            f"{recipe.label} has no login command this app can safely open. "
+            "Open its command line yourself and follow its sign-in instructions."
+        )
+    program = available(kind)
+    if not program:
+        raise HarnessError(f"{recipe.label} is not installed. {recipe.install_hint}")
+    command = [program, *arguments]
+    if os.name != "nt":
+        raise HarnessError(
+            f"Open a terminal and run {Path(program).name} "
+            f"{' '.join(arguments)}. The app can open the interactive login "
+            "window automatically on Windows."
+        )
+    # .cmd launchers need cmd.exe, while a real executable starts directly.
+    # Both are fixed commands from the built-in recipe; no user text is placed
+    # in this command line.
+    if Path(program).suffix.lower() in {".cmd", ".bat"}:
+        command = [
+            os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
+            subprocess.list2cmdline([program, *arguments]),
+        ]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=Path.cwd(),
+            env=_minimal_codex_environment(),
+            stdin=None,
+            stdout=None,
+            stderr=None,
+            shell=False,
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+    except OSError as exc:
+        raise HarnessError(f"The {recipe.label} login window could not open: {exc}") from exc
+    return {
+        "opened": True,
+        "kind": kind,
+        "note": (
+            f"The {recipe.label} sign-in opened in its own terminal. Finish it "
+            "there, then come back and send the message again."
+        ),
+        # Useful only to establish that a process really started. Never an
+        # executable path, command, account name, or token.
+        "process": int(process.pid),
+    }
 
 
 def _where_else_it_might_be(patterns: tuple[str, ...]) -> list[Path]:

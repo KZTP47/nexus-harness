@@ -374,6 +374,12 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
             continue
         no = turned_down.get(str(name))
         kind = str(held.get("kind") or held.get("name") or "")
+        try:
+            from .providers.subscription_cli import recipe_for
+
+            can_sign_in = recipe_for(kind).interactive_login_arguments is not None
+        except HarnessError:
+            can_sign_in = False
         # A transient refusal remains retryable. This one is different: Gemini
         # says it cannot make any request until a route setting is supplied.
         # Calling that route ready leaves the input enabled but provides no
@@ -423,6 +429,7 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
                 )
             ),
             "retryable": not needs_setup,
+            "can_sign_in": can_sign_in,
             "setup_blocked": False,
             "trouble_last_time": (
                 f"The last time this was asked something, it would not answer: {no['why']}"

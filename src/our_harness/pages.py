@@ -543,7 +543,9 @@ WHOSE_WORDS_THESE_ARE = (
 )
 
 
-def the_page_for_a_prompt(page: Page, longest: int = 12_000) -> str:
+def the_page_for_a_prompt(
+    page: Page, longest: int = 12_000, only_from: set[str] | None = None
+) -> str:
     """The page as text to put in front of an assistant.
 
     Newest last, because that is the order it happened in and the order anybody
@@ -558,6 +560,12 @@ def the_page_for_a_prompt(page: Page, longest: int = 12_000) -> str:
     if page.where_it_stands and not page.where_it_stands.startswith("Nothing said yet"):
         said += ["Where it stands, written by the person:", page.where_it_stands, ""]
     for one in page.parts:
+        # The page is a durable record for the person, but a board's green
+        # communication lines are still the authority for what one agent may
+        # read. `None` preserves the full-page view for callers that explicitly
+        # want it; a set is a capability filter, including an empty one.
+        if only_from is not None and one.who not in only_from:
+            continue
         said.append(f"Part {one.number}, {one.who}, {one.at}:")
         said.append(one.text)
         said.append("")
