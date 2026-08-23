@@ -541,6 +541,65 @@ def start_interactive_login(kind: str) -> dict[str, Any]:
     }
 
 
+def start_claude_repair() -> dict[str, Any]:
+    """Open Claude's own update/logout/login repair in a visible terminal.
+
+    The repair deliberately stays outside this process.  Nexus neither reads
+    the terminal nor receives the account page, cookies, credentials, or the
+    provider's output.  Logging out is consequential, so the panel asks for a
+    confirmation before it calls this function.
+    """
+
+    kind = "claude-cli"
+    recipe = recipe_for(kind)
+    program = available(kind)
+    if not program:
+        raise HarnessError(f"{recipe.label} is not installed. {recipe.install_hint}")
+    if os.name != "nt":
+        raise HarnessError(
+            "Open a terminal, run 'claude update', then 'claude auth logout', "
+            "then 'claude auth login'. Nexus can open this repair automatically "
+            "on Windows."
+        )
+
+    # Update before logging out.  If updating cannot start, the fixed `&&`
+    # chain stops and leaves the existing account session alone.  Every word
+    # here is built in; no request text or setting is inserted into a shell.
+    repairs = (
+        [program, "update"],
+        [program, "auth", "logout"],
+        [program, "auth", "login"],
+    )
+    chain = " && ".join(subprocess.list2cmdline(one) for one in repairs)
+    command = [
+        os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/k", chain,
+    ]
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=Path.cwd(),
+            env=_minimal_codex_environment(),
+            stdin=None,
+            stdout=None,
+            stderr=None,
+            shell=False,
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+    except OSError as exc:
+        raise HarnessError(f"The Claude repair window could not open: {exc}") from exc
+    return {
+        "opened": True,
+        "kind": kind,
+        "note": (
+            "Claude's repair opened in its own terminal. It updates Claude, "
+            "signs the command line out, and opens Claude's fresh sign-in. "
+            "Finish there, then try the message again. Nexus cannot see the "
+            "sign-in details or credentials."
+        ),
+        "process": int(process.pid),
+    }
+
+
 def _where_else_it_might_be(patterns: tuple[str, ...]) -> list[Path]:
     """Every copy of a tool found under those patterns, newest first.
 

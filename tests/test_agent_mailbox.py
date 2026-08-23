@@ -130,6 +130,27 @@ class SubscriptionConnectionState(unittest.TestCase):
         self.assertIsNone(call.kwargs["stderr"])
         self.assertNotIn("account", json.dumps(found).lower())
 
+    @unittest.skipUnless(subscription_cli.os.name == "nt", "Windows repair window")
+    def test_claude_repair_is_visible_fixed_and_captures_nothing(self) -> None:
+        started = mock.Mock(pid=84)
+        with mock.patch.object(
+                subscription_cli, "available", return_value=r"C:\Claude\claude.exe"), \
+             mock.patch.object(subscription_cli.subprocess, "Popen", return_value=started) as popen:
+            found = subscription_cli.start_claude_repair()
+        call = popen.call_args
+        command = call.args[0]
+        self.assertEqual(command[:4], [
+            subscription_cli.os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/k",
+        ])
+        self.assertIn("update", command[4])
+        self.assertIn("auth logout", command[4])
+        self.assertIn("auth login", command[4])
+        self.assertLess(command[4].index("update"), command[4].index("auth logout"))
+        self.assertIsNone(call.kwargs["stdout"])
+        self.assertIsNone(call.kwargs["stderr"])
+        self.assertFalse(call.kwargs["shell"])
+        self.assertNotIn("account", json.dumps(found).lower())
+
 
 if __name__ == "__main__":
     unittest.main()

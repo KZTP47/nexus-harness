@@ -1537,6 +1537,13 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 from .providers.subscription_cli import start_interactive_login
 
                 self._json(start_interactive_login(wanted))
+            elif self.path == "/api/team/repair-claude":
+                # A separate explicit press, with a confirmation in the panel.
+                # The visible provider terminal owns the update and OAuth flow;
+                # this server captures no output and no account information.
+                from .providers.subscription_cli import start_claude_repair
+
+                self._json(start_claude_repair())
             elif self.path == "/api/swarm/the-page":
                 # The page every agent on one project writes to. Read through
                 # the same door the run uses, so what the panel shows is what

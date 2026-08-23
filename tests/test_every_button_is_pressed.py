@@ -195,6 +195,18 @@ BUILT_ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "browser check must not start or alter a developer's real account session; "
         "tests/test_agent_mailbox.py verifies the safe process boundary instead."
     ),
+    "Repair Claude access": (
+        "This deliberately updates and resets the real Claude command-line OAuth "
+        "session after an explicit confirmation. A browser check must not alter a "
+        "developer's account; tests/test_agent_mailbox.py proves the fixed visible "
+        "command and uncaptured process boundary, and tests/test_bug_fixes_two.py "
+        "proves the authenticated panel endpoint."
+    ),
+    "Find Cloud project ID": (
+        "This opens the signed-in person's Google Cloud Console in the system "
+        "browser. A browser check must not inspect or alter a developer's Google "
+        "account; the fixed official URL and click wiring are checked as source."
+    ),
 }
 
 
@@ -226,6 +238,23 @@ class BuiltButtonTests(unittest.TestCase):
         _pressed, said, _chosen = what_the_checks_do()
         missing = [name for name in built_by_class() if name not in said]
         self.assertEqual(missing, [], f"No check touches these: {missing}")
+
+    def test_gemini_help_opens_the_official_cloud_welcome_page(self) -> None:
+        script = (PANEL / "app.js").read_text(encoding="utf-8")
+        self.assertIn(
+            'GOOGLE_CLOUD_PROJECT_WELCOME = "https://console.cloud.google.com/welcome"',
+            script,
+        )
+        self.assertIn('window.open(GOOGLE_CLOUD_PROJECT_WELCOME, "_blank"', script)
+        self.assertIn("copy Project ID — not Project name or Project number", script)
+
+    def test_claude_repair_requires_confirmation_before_the_endpoint(self) -> None:
+        script = (PANEL / "app.js").read_text(encoding="utf-8")
+        function = script.split("async function repairClaudeAccess", 1)[1].split(
+            "async function signInThisAssistant", 1
+        )[0]
+        self.assertLess(function.index("window.confirm"), function.index("/api/team/repair-claude"))
+        self.assertIn("Nexus will not see your account or credentials", function)
 
 
 class TickBoxTests(unittest.TestCase):

@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
@@ -73,6 +74,17 @@ class ServerRequestTests(unittest.TestCase):
         self.assertTrue(body["started_id"])
         _status, events = self.call("GET", "/api/events?after=0&meta=1")
         self.assertEqual(events["started_id"], body["started_id"])
+
+    def test_claude_repair_endpoint_opens_only_the_safe_provider_flow(self) -> None:
+        opened = {"opened": True, "kind": "claude-cli", "note": "repair opened", "process": 42}
+        with mock.patch(
+                "our_harness.providers.subscription_cli.start_claude_repair",
+                return_value=opened,
+        ) as repair:
+            status, body = self.call("POST", "/api/team/repair-claude", "{}")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, opened)
+        repair.assert_called_once_with()
 
     def test_json_nested_far_too_deep_is_refused_politely(self) -> None:
         deep = "[" * 60_000 + "]" * 60_000

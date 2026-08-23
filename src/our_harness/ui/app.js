@@ -3905,6 +3905,18 @@ function renderTeamWho() {
       signIn.addEventListener("click", () => signInThisAssistant(one.kind, signIn));
       row.append(signIn);
     }
+    if (one.ready && one.kind === "claude-cli") {
+      const repair = make("button", "team-repair", "Repair Claude access");
+      repair.type = "button";
+      repair.addEventListener("click", () => repairClaudeAccess(repair));
+      row.append(repair);
+    }
+    if (one.ready && one.kind === "gemini-cli") {
+      const projectHelp = make("button", "team-project-help", "Find Cloud project ID");
+      projectHelp.type = "button";
+      projectHelp.addEventListener("click", showGeminiProjectHelp);
+      row.append(projectHelp);
+    }
     if (!one.ready && one.install_hint) row.append(make("p", "hint", one.install_hint));
     list.append(row);
   }
@@ -6551,12 +6563,23 @@ function oneSwarmChatCard(held) {
   if (agent.how_to_fix_it) {
     card.append(make("p", "swarm-chat-repair hint", agent.how_to_fix_it));
   }
-  if (agent.trouble_last_time && agent.can_sign_in && agent.assistant_kind) {
+  if (agent.trouble_last_time && agent.assistant_kind === "claude-cli") {
+    const repair = make("button", "swarm-repair", "Repair Claude access");
+    repair.type = "button";
+    repair.addEventListener("click", () => repairClaudeAccess(repair));
+    card.append(repair);
+  } else if (agent.trouble_last_time && agent.can_sign_in && agent.assistant_kind) {
     const signIn = make("button", "swarm-sign-in", "Open its sign-in");
     signIn.type = "button";
     signIn.addEventListener("click", () => signInThisAssistant(
       agent.assistant_kind, signIn));
     card.append(signIn);
+  }
+  if (agent.trouble_last_time && agent.assistant_kind === "gemini-cli") {
+    const projectHelp = make("button", "swarm-project-help", "Find Cloud project ID");
+    projectHelp.type = "button";
+    projectHelp.addEventListener("click", showGeminiProjectHelp);
+    card.append(projectHelp);
   }
   card.append(make("ol", "swarm-chat-thread talk-thread"));
 
@@ -7733,6 +7756,68 @@ function renderWhatItHasGoingOn(agent) {
   }
   if (agent && agent.how_to_fix_it) {
     list.append(make("li", "the-big-chat-doing-one", agent.how_to_fix_it));
+  }
+  if (agent && agent.trouble_last_time && agent.assistant_kind === "claude-cli") {
+    const row = make("li", "the-big-chat-doing-one");
+    const repair = make("button", "swarm-repair", "Repair Claude access");
+    repair.type = "button";
+    repair.addEventListener("click", () => repairClaudeAccess(repair));
+    row.append(repair);
+    list.append(row);
+  }
+  if (agent && agent.trouble_last_time && agent.assistant_kind === "gemini-cli") {
+    const row = make("li", "the-big-chat-doing-one");
+    const projectHelp = make("button", "swarm-project-help", "Find Cloud project ID");
+    projectHelp.type = "button";
+    projectHelp.addEventListener("click", showGeminiProjectHelp);
+    row.append(projectHelp);
+    list.append(row);
+  }
+}
+
+const GOOGLE_CLOUD_PROJECT_WELCOME = "https://console.cloud.google.com/welcome";
+
+function showGeminiProjectHelp() {
+  const openIt = window.confirm(
+    "Open Google Cloud Console in your browser?\n\n"
+    + "1. Use the project picker at the top to select your project.\n"
+    + "2. On the Welcome page, copy Project ID — not Project name or Project number.\n"
+    + "3. Paste that ID into Nexus when connecting Gemini.\n\n"
+    + "If no project is listed, use Manage resources to create one or ask your "
+    + "Google Workspace administrator which project your Gemini Code Assist seat uses."
+  );
+  if (!openIt) return;
+  window.open(GOOGLE_CLOUD_PROJECT_WELCOME, "_blank", "noopener,noreferrer");
+  sayInSwarm("Google Cloud Console opened. Choose a project and copy the Project ID from its Welcome page.");
+}
+
+async function repairClaudeAccess(button = null) {
+  if (!window.confirm(
+      "Repair Claude command-line access?\n\n"
+      + "This opens a visible terminal, updates Claude, signs the Claude command line out, "
+      + "and starts a fresh Claude sign-in. Your open Claude app is a separate session. "
+      + "Nexus will not see your account or credentials.")) {
+    return;
+  }
+  const was = button ? button.textContent : "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Opening repair...";
+  }
+  try {
+    const said = await request("/api/team/repair-claude", {
+      method: "POST", body: JSON.stringify({}),
+    });
+    sayInSwarm(said.note || "Claude's repair opened in its own terminal.");
+  } catch (trouble) {
+    const words = String(trouble.message || trouble);
+    showError(words);
+    sayInSwarm(words);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = was;
+    }
   }
 }
 
