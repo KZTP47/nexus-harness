@@ -710,18 +710,20 @@ class SubscriptionCLIProvider(Provider):
     def _preflight(self, command: list[str], deadline_at: float) -> None:
         if self._checked:
             return
+        # A version banner is only a diagnostic, not the work somebody asked
+        # the assistant to do.  Gemini CLI can wait for account setup even for
+        # ``--version`` on Windows while the real non-interactive request still
+        # starts and returns the useful setup error.  Treating that banner as a
+        # gate hid the real answer behind a thirty-second, misleading failure.
+        # Keep the probe short and advisory; the actual request below remains
+        # bounded by the caller's deadline and is the authoritative check.
         result = _run_bounded(
             [*command, *self.recipe.version_arguments],
             cwd=Path.cwd(),
             stdin_text=None,
-            timeout_seconds=min(30.0, _remaining(deadline_at)),
+            timeout_seconds=min(3.0, _remaining(deadline_at)),
             max_output_bytes=32_000,
         )
-        if result.timed_out or result.exit_code != 0:
-            detail = self._redactor.text((result.stderr or result.stdout).strip()[:500])
-            raise HarnessError(
-                f"{self.recipe.label} did not answer when asked for its version. {detail}"
-            )
         self._checked = True
 
     @staticmethod

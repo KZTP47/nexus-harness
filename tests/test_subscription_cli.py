@@ -237,6 +237,15 @@ if "--version" in sys.argv[1:]:
 time.sleep(30)
 '''
 
+VERSION_HANGS_BUT_REQUEST_WORKS = '''
+import json, sys, time
+if "--version" in sys.argv[1:]:
+    time.sleep(30)
+    raise SystemExit(0)
+sys.stdin.read()
+print(json.dumps({"is_error": False, "result": "the real request answered"}))
+'''
+
 
 class RecipeTests(unittest.TestCase):
     def test_the_model_is_passed_through(self) -> None:
@@ -541,6 +550,13 @@ class RunningTests(unittest.TestCase):
         with self.assertRaises(HarnessError) as caught:
             self.provider("copilot-cli", tool, timeout_seconds=2).complete(self.request())
         self.assertIn("ran past its", str(caught.exception))
+
+    def test_a_hung_version_banner_does_not_hide_the_real_request(self) -> None:
+        tool = fake_tool(self.folder, "versionhang", VERSION_HANGS_BUT_REQUEST_WORKS)
+        started = time.monotonic()
+        answer = self.provider("claude-cli", tool, timeout_seconds=10).complete(self.request())
+        self.assertEqual(answer.text, "the real request answered")
+        self.assertLess(time.monotonic() - started, 8)
 
     def test_a_tool_that_is_not_installed_says_how_to_get_it(self) -> None:
         data = copy.deepcopy(DEFAULT_CONFIG)
