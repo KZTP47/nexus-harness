@@ -131,6 +131,18 @@ class RunningOneThroughThePanelTests(PanelTestCase):
 
 
 class KeepingThemThroughThePanelTests(PanelTestCase):
+    def test_creating_one_saves_and_lists_a_blank_automation_immediately(self) -> None:
+        status, said = self.ask("/api/pipelines/create", {"name": "Fresh automation"})
+        self.assertEqual(status, 200)
+        self.assertEqual(said["pipeline"], {
+            "name": "Fresh automation", "nodes": [], "edges": [],
+        })
+        self.assertIn("Fresh automation", said["saved"])
+
+        status, duplicate = self.ask("/api/pipelines/create", {"name": "Fresh automation"})
+        self.assertEqual(status, 400)
+        self.assertIn("already an automation", duplicate["error"])
+
     def test_saving_listing_loading_and_removing(self) -> None:
         drawn = pipelines.a_starting_pipeline()
         status, said = self.ask("/api/pipelines/save", {"pipeline": drawn})
@@ -174,6 +186,7 @@ class KeepingThemThroughThePanelTests(PanelTestCase):
     def test_everything_here_needs_the_token(self) -> None:
         for path, body in (
             ("/api/pipelines", None),
+            ("/api/pipelines/create", {"name": "Fresh automation"}),
             ("/api/pipelines/save", {"pipeline": pipelines.a_starting_pipeline()}),
             ("/api/pipelines/run", {"pipeline": pipelines.a_starting_pipeline()}),
             ("/api/pipelines/delete", {"name": "First pipeline"}),

@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from our_harness import chat
+from our_harness import chat, web_chats
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
 
@@ -107,6 +107,78 @@ class OneConversation(TalkingTestCase):
             chat.say(self.config, "one", "Only to the first")
         self.assertTrue(chat.read_it(self.config, "one"))
         self.assertEqual(chat.read_it(self.config, "two"), [])
+
+    def test_claude_chat_names_its_real_home_and_not_claude_desktop(self) -> None:
+        self.config.data["providers"] = {
+            "claude": {"kind": "claude-cli", "model": "claude-sonnet-4-5"},
+        }
+        destination = chat.chat_destination(self.config, "claude", "Claude2")
+        self.assertEqual(destination["owner_label"], "Nexus Harness")
+        self.assertEqual(destination["provider_label"], "Claude Code command line")
+        self.assertEqual(destination["provider_app_name"], "Claude Desktop")
+        self.assertFalse(destination["provider_app_linked"])
+        self.assertIn("will not contain these messages", destination["explanation"])
+        self.assertEqual(
+            destination["transcript_path"],
+            chat.where_it_is_kept(self.config, "claude", "Claude2")
+            .relative_to(self.root).as_posix(),
+        )
+
+    def test_every_supported_provider_says_the_nexus_chat_is_not_an_app_chat(self) -> None:
+        for kind in (
+            "openai", "anthropic", "gemini", "ollama", "local", "openai-compatible",
+            "claude-cli", "copilot-cli", "assistant-cli", "gemini-cli", "codex-cli",
+            "m365-copilot",
+        ):
+            with self.subTest(kind=kind):
+                self.config.data["providers"] = {
+                    "one": {"kind": kind, "model": "model"},
+                }
+                destination = chat.chat_destination(self.config, "one", "Agent")
+                self.assertEqual(destination["owner"], "nexus")
+                self.assertFalse(destination["provider_app_linked"])
+                self.assertTrue(destination["provider_label"])
+                self.assertTrue(destination["explanation"])
+
+    def test_a_removed_provider_route_is_named_without_losing_the_saved_chat(self) -> None:
+        destination = chat.chat_destination(self.config, "gone", "Agent")
+        self.assertFalse(destination["connected"])
+        self.assertIn("Missing route", destination["provider_label"])
+        self.assertTrue(destination["transcript_path"].startswith(".harness/chats/"))
+
+    def test_a_live_web_chat_is_a_connected_destination_with_its_saved_transcript(self) -> None:
+        broker = web_chats.WebChatBroker()
+        broker.heartbeat([{
+            "id": "gemini-abcdef123456", "provider": "gemini",
+            "title": "Release helper", "url": "https://gemini.google.com/app/one",
+        }])
+        with mock.patch.object(web_chats, "_active", broker):
+            destination = chat.chat_destination(
+                self.config, "web:gemini-abcdef123456", "Gemini and Codex"
+            )
+        self.assertTrue(destination["connected"])
+        self.assertEqual(destination["provider_kind"], "web-chat")
+        self.assertEqual(destination["web_chat_id"], "gemini-abcdef123456")
+        self.assertEqual(destination["url"], "https://gemini.google.com/app/one")
+        self.assertIn("Gemini web", destination["provider_label"])
+        self.assertTrue(destination["transcript_path"].startswith(".harness/chats/"))
+
+    def test_a_disconnected_web_chat_stays_identifiable_and_reconnectable(self) -> None:
+        with mock.patch.object(web_chats, "_active", web_chats.WebChatBroker()):
+            destination = chat.chat_destination(
+                self.config, "web:gemini-abcdef123456", "Gemini and Codex"
+            )
+        self.assertFalse(destination["connected"])
+        self.assertEqual(destination["web_chat_id"], "gemini-abcdef123456")
+        self.assertIn("Disconnected web chat", destination["provider_label"])
+        self.assertIn("Reconnect", destination["explanation"])
+
+    def test_the_project_default_provider_names_the_same_nexus_chat_home(self) -> None:
+        destination = chat.chat_destination(self.config, "")
+        self.assertTrue(destination["connected"])
+        self.assertEqual(destination["route"], "project default")
+        self.assertEqual(destination["owner"], "nexus")
+        self.assertTrue(destination["transcript_path"].endswith("the-usual-one.json"))
 
     def test_only_the_last_few_dozen_turns_are_kept(self) -> None:
         """A conversation is the thread of thought, not everything ever said."""
@@ -342,6 +414,10 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
         self.assertFalse(route["ready"])
         self.assertIn("project id", route["why_not"])
         self.assertIn("Connect it", route["how_to_fix_it"])
+        self.assertIn("Set Cloud project", route["how_to_fix_it"])
+        self.assertIn("installed", route["trouble_last_time"])
+        self.assertIn("reached", route["trouble_last_time"])
+        self.assertNotIn("GOOGLE_CLOUD_PROJECT", route["trouble_last_time"])
 
     def test_a_claude_subscription_refusal_stays_retryable_and_private(self) -> None:
         chat._write_down_that_it_would_not(

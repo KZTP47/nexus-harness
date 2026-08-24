@@ -271,6 +271,26 @@
         }
       }
     },
+    "persistent_memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "vault_path": {
+          "type": "string"
+        },
+        "max_context_chars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 200000
+        },
+        "enforce_desktop_deployment": {
+          "type": "boolean"
+        }
+      }
+    },
     "context": {
       "type": "object",
       "additionalProperties": false,

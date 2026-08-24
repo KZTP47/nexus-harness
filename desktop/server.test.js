@@ -426,6 +426,65 @@ test("the bridge offers a picker that only picks", () => {
   const upto = handler.slice(0, handler.indexOf("});"));
   assert.ok(upto.includes("chooseProject"), "it opens a folder picker");
   assert.ok(!upto.includes("openProject"), "and does not open what it picked");
+
+  const markup = fs.readFileSync(
+    path.join(__dirname, "..", "src", "our_harness", "ui", "index.html"), "utf8");
+  const page = fs.readFileSync(
+    path.join(__dirname, "..", "src", "our_harness", "ui", "app.js"), "utf8");
+  assert.ok(markup.includes('id="askDialogBrowse"'), "the dialog has a Browse folder button");
+  assert.ok(page.includes("browseFolder && canWeBrowseForAFolder()"),
+    "it is offered only when the Electron picker exists");
+  assert.ok(page.includes("window.harnessDesktop.pickAFolder()"),
+    "the button uses the narrow folder-only bridge");
+});
+
+test("Work on this tells Electron which project must open next time", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  assert.ok(preload.includes("rememberProject"));
+  assert.ok(preload.includes('invoke(\n    "harness:rememberProject"'));
+
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.ok(main.includes('ipcMain.handle("harness:rememberProject"'));
+  assert.ok(main.includes("lastProjectAt: new Date().toISOString()"));
+  assert.ok(main.includes("newestProjectFromTheHarnessList"),
+    "an existing stale lastProject is migrated from the actual opened-project history");
+
+  const page = fs.readFileSync(
+    path.join(__dirname, "..", "src", "our_harness", "ui", "app.js"), "utf8");
+  const switching = page.slice(
+    page.indexOf("async function workOnThisProject"),
+    page.indexOf("async function renameThisProject")
+  );
+  assert.ok(switching.includes("window.harnessDesktop?.rememberProject"));
+  assert.ok(switching.includes("said.here.path"));
+  assert.ok(switching.indexOf("rememberProject") < switching.indexOf("window.location.reload"));
+});
+
+test("the page can ask the real Electron window to enter and leave full screen", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  assert.ok(preload.includes("setFullScreen"), "the page gets a named action");
+  assert.ok(preload.includes('invoke("harness:setFullScreen"'), "the action uses IPC");
+  assert.ok(preload.includes("onFullScreenChanged"), "the page hears native exits too");
+  assert.ok(preload.includes('on("harness:fullScreenChanged"'), "the event is bridged");
+
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.ok(main.includes('ipcMain.handle("harness:setFullScreen"'));
+  assert.ok(main.includes("window.setFullScreen(Boolean(on))"));
+  assert.ok(main.includes('send("harness:fullScreenChanged"'));
+});
+
+test("the saved chat button can reveal only a file inside the open project", () => {
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  assert.ok(preload.includes("showProjectFile"));
+  assert.ok(preload.includes('"harness:showProjectFile"'));
+  assert.ok(preload.includes("String(relativePath || \"\")"));
+
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.ok(main.includes('ipcMain.handle("harness:showProjectFile"'));
+  assert.ok(main.includes("path.isAbsolute(asked)"), "absolute paths are refused");
+  assert.ok(main.includes('within.startsWith(`..${path.sep}`)'), "parent traversal is refused");
+  assert.ok(main.includes("fs.statSync(target).isFile()"), "only an existing file is opened");
+  assert.ok(main.includes("shell.showItemInFolder(target)"));
 });
 
 test("the bridge exposes named actions and nothing else", () => {

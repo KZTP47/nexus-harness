@@ -54,21 +54,47 @@ async function request(path, options = {}) {
 //
 // Answers with the text, or null when somebody said no, which is what prompt
 // did and what every caller was already written for.
-function askForOneLine(title, question, value = "") {
+function askForOneLine(title, question, value = "", help = null, browseFolder = false) {
   return new Promise((finish) => {
     const box = $("askDialog");
     $("askDialogTitle").textContent = title;
     $("askDialogWhy").textContent = question || "";
     $("askDialogWhy").hidden = !question;
-    $("askDialogInput").value = value == null ? "" : String(value);
+    const helpLink = $("askDialogHelp");
+    helpLink.textContent = help?.label || "";
+    helpLink.hidden = !help?.href;
+    if (help?.href) helpLink.href = help.href;
+    else helpLink.removeAttribute("href");
+    const input = $("askDialogInput");
+    input.value = value == null ? "" : String(value);
+    const browse = $("askDialogBrowse");
+    browse.hidden = !(browseFolder && canWeBrowseForAFolder());
+    browse.disabled = false;
+    browse.onclick = browse.hidden ? null : async () => {
+      browse.disabled = true;
+      try {
+        const chosen = await window.harnessDesktop.pickAFolder();
+        if (chosen) {
+          input.value = chosen;
+          input.focus();
+          input.select();
+        }
+      } catch (error) {
+        showError(error.message);
+      } finally {
+        browse.disabled = false;
+      }
+    };
     const done = () => {
       box.removeEventListener("close", done);
-      finish(box.returnValue === "ok" ? $("askDialogInput").value : null);
+      browse.onclick = null;
+      browse.hidden = true;
+      finish(box.returnValue === "ok" ? input.value : null);
     };
     box.addEventListener("close", done);
     box.showModal();
-    $("askDialogInput").focus();
-    $("askDialogInput").select();
+    input.focus();
+    input.select();
   });
 }
 
@@ -1416,6 +1442,19 @@ async function workOnThisProject(one, button) {
       method: "POST", body: JSON.stringify({path: one.path}),
     });
     sayAboutProjects(said.note || "");
+    if (window.harnessDesktop?.rememberProject && said.here?.path) {
+      // The server has already moved. Tell Electron which project it now owns
+      // so closing and reopening the app comes back here, not to the folder
+      // that happened to start this server.
+      try {
+        await window.harnessDesktop.rememberProject(said.here.path);
+      } catch (error) {
+        // Still reload: the server has already moved, so leaving the old
+        // project's controls on screen would be more misleading than losing
+        // the startup convenience for this one switch.
+        showError(error.message);
+      }
+    }
     // Everything on this page belongs to the project it came from - the
     // workflow, the checks, the automations, what it knows. Reading it fresh
     // is the honest thing, and it is what somebody expects to see.
@@ -2355,8 +2394,35 @@ function vaultGraphKey(event) {
 
 let settingsHeld = [];
 let settingsGroups = [];
+const MORE_OPTIONS_KEY = "nexus-harness-more-options";
+
+function moreOptionsAreEnabled() {
+  try { return window.localStorage.getItem(MORE_OPTIONS_KEY) === "yes"; }
+  catch (_error) { return false; }
+}
+
+function applyMoreOptionsPreference({open = false} = {}) {
+  const enabled = moreOptionsAreEnabled();
+  const menu = $("moreOptionsMenu");
+  menu.hidden = !enabled;
+  if (!enabled) menu.open = false;
+  else if (open) menu.open = true;
+  $("moreOptionsEnabled").checked = enabled;
+}
+
+function changeMoreOptionsPreference() {
+  const enabled = $("moreOptionsEnabled").checked;
+  try { window.localStorage.setItem(MORE_OPTIONS_KEY, enabled ? "yes" : "no"); }
+  catch (_error) {
+    $("moreOptionsEnabled").checked = false;
+    announce("This browser could not remember the More options setting.", true);
+  }
+  applyMoreOptionsPreference({open: enabled});
+  announce(enabled ? "More options is enabled." : "More options is disabled.");
+}
 
 async function refreshSettings() {
+  applyMoreOptionsPreference();
   try {
     const said = await request("/api/settings");
     settingsHeld = said.settings || [];
@@ -2530,6 +2596,102 @@ let pipelineJoining = "";      // the node an arrow is being drawn from
 let pipelineDragging = null;
 let pipelineEditing = "";
 let pipelineStates = new Map();
+const PIPELINE_ZOOM_MIN = 0.35;
+const PIPELINE_ZOOM_MAX = 1.8;
+let pipelineZoom = 1;
+let pipelineIsFullScreen = false;
+let pipelineFullScreenHomes = [];
+
+function sizeThePipelineCanvas() {
+  const canvas = $("pipelineCanvas");
+  const surface = $("pipelineSurface");
+  const nodes = $("pipelineNodes");
+  let width = Math.max(1200, canvas.clientWidth / pipelineZoom);
+  let height = Math.max(600, canvas.clientHeight / pipelineZoom);
+  for (const one of nodes.querySelectorAll(".pipeline-node")) {
+    width = Math.max(width, one.offsetLeft + one.offsetWidth + 80);
+    height = Math.max(height, one.offsetTop + one.offsetHeight + 80);
+  }
+  nodes.style.width = `${Math.ceil(width)}px`;
+  nodes.style.height = `${Math.ceil(height)}px`;
+  nodes.style.transform = `scale(${pipelineZoom})`;
+  surface.style.width = `${Math.ceil(width * pipelineZoom)}px`;
+  surface.style.height = `${Math.ceil(height * pipelineZoom)}px`;
+}
+
+function sayThePipelineZoom() {
+  $("pipelineZoomValue").textContent = `${Math.round(pipelineZoom * 100)}%`;
+  $("pipelineZoomOut").disabled = pipelineZoom <= PIPELINE_ZOOM_MIN;
+  $("pipelineZoomIn").disabled = pipelineZoom >= PIPELINE_ZOOM_MAX;
+}
+
+function setThePipelineZoom(wanted, keepTheMiddle = true) {
+  const canvas = $("pipelineCanvas");
+  const middle = {
+    x: (canvas.scrollLeft + canvas.clientWidth / 2) / pipelineZoom,
+    y: (canvas.scrollTop + canvas.clientHeight / 2) / pipelineZoom,
+  };
+  pipelineZoom = Math.max(PIPELINE_ZOOM_MIN, Math.min(PIPELINE_ZOOM_MAX, wanted));
+  sizeThePipelineCanvas();
+  if (keepTheMiddle) {
+    canvas.scrollLeft = middle.x * pipelineZoom - canvas.clientWidth / 2;
+    canvas.scrollTop = middle.y * pipelineZoom - canvas.clientHeight / 2;
+  }
+  sayThePipelineZoom();
+}
+
+function fitTheWholePipeline() {
+  const canvas = $("pipelineCanvas");
+  const things = [...$("pipelineNodes").querySelectorAll(".pipeline-node")];
+  if (!things.length) { setThePipelineZoom(1, false); return; }
+  const left = Math.min(...things.map((one) => one.offsetLeft));
+  const top = Math.min(...things.map((one) => one.offsetTop));
+  const right = Math.max(...things.map((one) => one.offsetLeft + one.offsetWidth));
+  const bottom = Math.max(...things.map((one) => one.offsetTop + one.offsetHeight));
+  const wanted = Math.min((canvas.clientWidth - 40) / Math.max(1, right - left),
+    (canvas.clientHeight - 40) / Math.max(1, bottom - top));
+  setThePipelineZoom(wanted, false);
+  canvas.scrollLeft = Math.max(0, left * pipelineZoom - 20);
+  canvas.scrollTop = Math.max(0, top * pipelineZoom - 20);
+}
+
+function putTheFlowStepsInFullScreen() {
+  for (const home of pipelineFullScreenHomes) $("pipelineFocusSide").append(home.element);
+}
+
+function putTheFlowStepsBack() {
+  for (const home of pipelineFullScreenHomes) home.parent.insertBefore(home.element, home.next);
+}
+
+function showHowThePipelineFillsTheScreen(full) {
+  pipelineIsFullScreen = Boolean(full);
+  $("pipelineStage").classList.toggle("is-fullscreen", pipelineIsFullScreen);
+  document.body.classList.toggle("workspace-is-fullscreen", pipelineIsFullScreen);
+  $("pipelineFullScreen").textContent = pipelineIsFullScreen ? "Exit full screen" : "Full screen";
+  $("pipelineFullScreen").setAttribute("aria-pressed", String(pipelineIsFullScreen));
+  if (pipelineIsFullScreen) putTheFlowStepsInFullScreen();
+  else putTheFlowStepsBack();
+  sizeThePipelineCanvas();
+}
+
+async function toggleThePipelineFullScreen() {
+  const wanted = !pipelineIsFullScreen;
+  try {
+    if (window.harnessDesktop?.setFullScreen) {
+      showHowThePipelineFillsTheScreen(wanted);
+      const changed = await window.harnessDesktop.setFullScreen(wanted);
+      if (changed !== wanted) showHowThePipelineFillsTheScreen(changed);
+    } else if (document.fullscreenElement === $("pipelineStage")) {
+      await document.exitFullscreen();
+    } else {
+      putTheFlowStepsInFullScreen();
+      await $("pipelineStage").requestFullscreen();
+    }
+  } catch (error) {
+    showHowThePipelineFillsTheScreen(false);
+    say(`Full screen could not be opened: ${error.message || error}`);
+  }
+}
 
 async function refreshPipelines(name) {
   try {
@@ -2743,6 +2905,7 @@ function renderPipeline() {
     card.addEventListener("click", () => { if (pipelineJoining && pipelineJoining !== node.id) joinPipelineNodes(node.id); });
     box.append(card);
   }
+  sizeThePipelineCanvas();
   drawPipelineWires();
 }
 
@@ -2849,11 +3012,12 @@ function keepPipelineFocus(nodeId) {
 function startPipelineDrag(event, node) {
   if (event.target.closest("button")) return;
   const card = event.currentTarget;
-  const box = $("pipelineCanvas").getBoundingClientRect();
+  const canvas = $("pipelineCanvas");
+  const box = canvas.getBoundingClientRect();
   pipelineDragging = {
     node,
-    grabX: event.clientX - box.left - (node.at?.x || 0),
-    grabY: event.clientY - box.top - (node.at?.y || 0),
+    grabX: (event.clientX - box.left + canvas.scrollLeft) / pipelineZoom - (node.at?.x || 0),
+    grabY: (event.clientY - box.top + canvas.scrollTop) / pipelineZoom - (node.at?.y || 0),
   };
   card.setPointerCapture(event.pointerId);
   card.classList.add("moving");
@@ -2861,11 +3025,14 @@ function startPipelineDrag(event, node) {
 
 function movePipelineDrag(event) {
   if (!pipelineDragging) return;
-  const box = $("pipelineCanvas").getBoundingClientRect();
+  const canvas = $("pipelineCanvas");
+  const box = canvas.getBoundingClientRect();
   const node = pipelineDragging.node;
   node.at = {
-    x: Math.max(0, event.clientX - box.left - pipelineDragging.grabX),
-    y: Math.max(0, event.clientY - box.top - pipelineDragging.grabY),
+    x: Math.max(0, (event.clientX - box.left + canvas.scrollLeft) / pipelineZoom
+      - pipelineDragging.grabX),
+    y: Math.max(0, (event.clientY - box.top + canvas.scrollTop) / pipelineZoom
+      - pipelineDragging.grabY),
   };
   const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(node.id)}"]`);
   if (card) { card.style.left = `${node.at.x}px`; card.style.top = `${node.at.y}px`; }
@@ -2877,6 +3044,55 @@ function endPipelineDrag() {
   const card = $("pipelineNodes").querySelector(`[data-node="${CSS.escape(pipelineDragging.node.id)}"]`);
   if (card) card.classList.remove("moving");
   pipelineDragging = null;
+}
+
+function makePipelineCanvasPannable() {
+  const canvas = $("pipelineCanvas");
+  let panning = null;
+  canvas.addEventListener("pointerdown", (event) => {
+    const paper = ["pipelineCanvas", "pipelineSurface", "pipelineNodes"];
+    if (event.button !== 0 || !paper.includes(event.target.id)) return;
+    panning = {x: event.clientX, y: event.clientY, left: canvas.scrollLeft,
+      top: canvas.scrollTop, pointer: event.pointerId};
+    canvas.classList.add("panning");
+    canvas.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!panning || event.pointerId !== panning.pointer) return;
+    canvas.scrollLeft = panning.left - (event.clientX - panning.x);
+    canvas.scrollTop = panning.top - (event.clientY - panning.y);
+  });
+  const stop = (event) => {
+    if (!panning || event.pointerId !== panning.pointer) return;
+    panning = null;
+    canvas.classList.remove("panning");
+    if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  };
+  canvas.addEventListener("pointerup", stop);
+  canvas.addEventListener("pointercancel", stop);
+  canvas.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    setThePipelineZoom(pipelineZoom + (event.deltaY < 0 ? 0.1 : -0.1));
+  }, {passive: false});
+}
+
+function wireUpPipelineView() {
+  pipelineFullScreenHomes = [$("pipelineLibraryControls"), $("pipelinePaletteTitle"), $("pipelinePalette")]
+    .map((element) => ({element, parent: element.parentNode, next: element.nextSibling}));
+  makePipelineCanvasPannable();
+  $("pipelineFullScreen").addEventListener("click", toggleThePipelineFullScreen);
+  $("pipelineZoomOut").addEventListener("click", () => setThePipelineZoom(pipelineZoom - 0.1));
+  $("pipelineZoomReset").addEventListener("click", () => setThePipelineZoom(1));
+  $("pipelineZoomIn").addEventListener("click", () => setThePipelineZoom(pipelineZoom + 0.1));
+  $("pipelineFit").addEventListener("click", fitTheWholePipeline);
+  document.addEventListener("fullscreenchange", () => {
+    if (pipelineIsFullScreen || document.fullscreenElement === $("pipelineStage")) {
+      showHowThePipelineFillsTheScreen(document.fullscreenElement === $("pipelineStage"));
+    }
+  });
+  sayThePipelineZoom();
 }
 
 /* ---- one step's settings ---- */
@@ -3069,14 +3285,25 @@ async function deletePipeline() {
   } catch (error) { say(error.message); showError(error.message); }
 }
 
-function newPipeline() {
-  pipeline = {name: "New pipeline", nodes: [], edges: []};
-  pipelineStates = new Map();
-  $("pipelineName").value = pipeline.name;
-  $("pipelineLog").replaceChildren();
-  renderPipeline();
-  renderPipelineSaved();
-  say("A fresh one. Add a step from the left.");
+async function newPipeline() {
+  const name = await askForOneLine(
+    "Create new automation", "What should the new automation be called?", "New automation");
+  if (!name) return;
+  try {
+    const said = await request("/api/pipelines/create", {
+      method: "POST", body: JSON.stringify({name}),
+    });
+    pipeline = said.pipeline;
+    pipelineSavedName = pipeline.name;
+    pipelineSaved = said.saved || [];
+    pipelineOlderOnes = [];
+    pipelineStates = new Map();
+    $("pipelineName").value = pipeline.name;
+    $("pipelineLog").replaceChildren();
+    renderPipeline();
+    renderPipelineSaved();
+    say(`Created and saved ${pipeline.name}. Add steps from the left.`);
+  } catch (error) { say(error.message); showError(error.message); }
 }
 
 async function runPipeline(options = {}) {
@@ -3669,6 +3896,7 @@ function applyCheckEvent(event) {
 }
 
 function bindEvents() {
+  applyMoreOptionsPreference();
   document.querySelectorAll("[data-node-type]").forEach((button) => { button.addEventListener("click", () => addNode(button.dataset.nodeType, 360, 300, button)); button.addEventListener("dragstart", (event) => event.dataTransfer.setData("application/x-harness-node", button.dataset.nodeType)); });
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
   $("canvas").addEventListener("dragover", (event) => { if (event.dataTransfer.types.includes("application/x-harness-node")) event.preventDefault(); });
@@ -3687,7 +3915,7 @@ function bindEvents() {
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
-  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
+  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("moreOptionsEnabled").addEventListener("change", changeMoreOptionsPreference); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
   $("teamSetUp").addEventListener("click", setUpTheTeam);
   // This one says what went wrong. Without it, a request that failed threw
@@ -3740,7 +3968,13 @@ function bindEvents() {
   $("timerHowOften").addEventListener("change", sayWhatTheTimerMeans);
   $("timerCopyLine").addEventListener("click", copyTheMachineLine);
   $("talkRefresh").addEventListener("click", () => refreshTalk(talkOpen));
+  wireUpPipelineView();
   wireUpTheSwarmBoard();
+  window.harnessDesktop?.onFullScreenChanged?.((on) => {
+    if (on) return;
+    if (swarmIsFullScreen) showHowTheSwarmFillsTheScreen(false);
+    if (pipelineIsFullScreen) showHowThePipelineFillsTheScreen(false);
+  });
   wireUpMicrosoft();
   wireUpTheTray();
   if ($("thePageRefresh")) {
@@ -3757,6 +3991,7 @@ function bindEvents() {
   $("swarmKeep").addEventListener("click", keepThisBoard);
   $("talkStartAgain").addEventListener("click", startTalkingAgain);
   $("talkAskEveryone").addEventListener("click", askEveryone);
+  $("talkStop").addEventListener("click", stopTalking);
   $("talkForm").addEventListener("submit", (event) => { event.preventDefault(); sendWhatIsTyped(); });
   $("talkBox").addEventListener("input", countWhatIsTyped);
   $("talkBox").addEventListener("keydown", (event) => {
@@ -5122,6 +5357,8 @@ async function copyTheMachineLine() {
 let talkWho = [];        // everyone on this machine, ready or not
 let talkOpen = "";       // whose conversation is on screen
 let talkBusy = false;    // waiting for an answer
+let talkStopping = false;
+let talkBusyRequest = null;
 // Which refresh is the newest. Looking over the machine runs each assistant's
 // own tool, which takes about a second, so an old one can land long after
 // somebody has moved on - and used to write its words over theirs.
@@ -5169,6 +5406,8 @@ function setWhatCanBePressed() {
   const somebody = talkTheOpenOne();
   $("talkBox").disabled = !somebody;
   $("talkSend").disabled = talkBusy || !somebody;
+  $("talkStop").disabled = !talkBusy || talkStopping;
+  $("talkStop").textContent = talkStopping ? "Stopping…" : "Stop";
   $("talkAskEveryone").disabled = talkBusy || !talkWho.some((one) => one.ready);
   $("talkStartAgain").disabled = talkBusy || !somebody;
   // The names on the left too, and now rather than the next time the list is
@@ -5250,6 +5489,8 @@ async function sendWhatIsTyped() {
   if (!one) { sayInTalk("Nobody is set up to talk to yet."); return; }
   if (talkBusy) { sayInTalk("Still waiting for the last answer."); return; }
   talkBusy = true;
+  talkStopping = false;
+  talkBusyRequest = {who: one.route, everyone: false};
   setWhatCanBePressed();
   sayInTalk(`Asking ${one.label}...`);
   // Shown straight away, so the words are on screen while the answer is coming.
@@ -5278,9 +5519,11 @@ async function sendWhatIsTyped() {
     // Quietly: the reason it failed is the last word, not "type below".
     await refreshTalk(one.route, true);
     sayInTalk(error.message);
-    showError(error.message);
+    if (!stoppedChatError(error)) showError(error.message);
   } finally {
     talkBusy = false;
+    talkStopping = false;
+    talkBusyRequest = null;
     setWhatCanBePressed();
     renderTalkWho();
   }
@@ -5302,6 +5545,8 @@ async function askEveryone() {
   if (!words) { sayInTalk("Type something first."); return; }
   if (talkBusy) { sayInTalk("Still waiting for the last answer."); return; }
   talkBusy = true;
+  talkStopping = false;
+  talkBusyRequest = {who: "", everyone: true};
   setWhatCanBePressed();
   sayInTalk("Asking every one of them at once...");
   try {
@@ -5315,11 +5560,44 @@ async function askEveryone() {
     sayInTalk(`${(said.answers || []).length} of them were asked.`);
   } catch (error) {
     sayInTalk(error.message);
-    showError(error.message);
+    if (!stoppedChatError(error)) showError(error.message);
   } finally {
     talkBusy = false;
+    talkStopping = false;
+    talkBusyRequest = null;
     setWhatCanBePressed();
     renderTalkWho();
+  }
+}
+
+async function stopTalking() {
+  if (!talkBusy || talkStopping || !talkBusyRequest) return;
+  talkStopping = true;
+  setWhatCanBePressed();
+  sayInTalk("Stopping this AI request...");
+  try {
+    const jobs = [request("/api/chat/stop", {
+      method: "POST", body: JSON.stringify(talkBusyRequest),
+    })];
+    const routes = talkBusyRequest.everyone
+      ? talkWho.filter((one) => one.ready).map((one) => one.route)
+      : [talkBusyRequest.who];
+    if (window.harnessDesktop?.stopWebChat) {
+      for (const route of routes.filter((one) => String(one).startsWith("web:"))) {
+        jobs.push(window.harnessDesktop.stopWebChat(route));
+      }
+    }
+    const [serverResult] = await Promise.allSettled(jobs);
+    if (serverResult.status === "rejected") throw serverResult.reason;
+    if (!serverResult.value?.stopped) {
+      talkStopping = false;
+      setWhatCanBePressed();
+      sayInTalk(serverResult.value?.note || "This chat is not waiting for an answer.");
+    }
+  } catch (error) {
+    talkStopping = false;
+    setWhatCanBePressed();
+    showError(String(error?.message || error));
   }
 }
 
@@ -5346,6 +5624,11 @@ async function startTalkingAgain() {
     const said = await request("/api/chat/start-again", {
       method: "POST", body: JSON.stringify({who: one.route}),
     });
+    if (said.web_chat_id && said.web_conversation_key
+        && window.harnessDesktop?.resetWebChat) {
+      await window.harnessDesktop.resetWebChat(
+        one.route, said.web_conversation_key);
+    }
     renderTalkThread([]);
     $("talkEveryone").hidden = true;
     sayInTalk(said.note || "That conversation is gone.");
@@ -5455,7 +5738,35 @@ function renderLookupAnswer(said) {
 
 async function boot() {
   bindEvents();
-  try { const value = await request("/api/bootstrap"); token = value.token; startedId = value.started_id || ""; template = migrateGraph(value.template); graph = structuredClone(template); catalog = await request("/api/catalog"); nextId = graph.nodes.length + graph.edges.length + 1; focusedNodeId = graph.nodes[0]?.id || ""; render(); renderTeamNotes(); renderWhatItIsDoing(); await refreshProjects(); await validate(); await refreshUsage(); await loadWhatCanBeDoneForYou(); await refreshCheckup(); await refreshHowItWorks(); await refreshChecks(); await refreshTeamNotes(); await refreshWorkflows(); pollEvents(); } catch (error) { showError(error.message); }
+  try {
+    const value = await request("/api/bootstrap");
+    token = value.token;
+    startedId = value.started_id || "";
+    // Event wiring happens before bootstrap, but the token-protected web-chat
+    // courier cannot start until this point. Start it explicitly now instead
+    // of relying on a later timer tick to rescue the first no-token attempt.
+    startWebChatBridge();
+    template = migrateGraph(value.template);
+    graph = structuredClone(template);
+    catalog = await request("/api/catalog");
+    nextId = graph.nodes.length + graph.edges.length + 1;
+    focusedNodeId = graph.nodes[0]?.id || "";
+    render();
+    renderTeamNotes();
+    renderWhatItIsDoing();
+    await refreshProjects();
+    await validate();
+    await refreshUsage();
+    await loadWhatCanBeDoneForYou();
+    await refreshCheckup();
+    await refreshHowItWorks();
+    await refreshChecks();
+    await refreshTeamNotes();
+    await refreshWorkflows();
+    pollEvents();
+  } catch (error) {
+    showError(error.message);
+  }
 }
 
 // ---- the board of agents -------------------------------------------------
@@ -5490,11 +5801,295 @@ let swarmSaid = {
 // {kind: "works", agent, project} or {kind: "talks", one, other}.
 let swarmPicked = null;
 let swarmBusy = new Set();   // the agents waiting on an answer right now
+let swarmStopping = new Set(); // per-chat stops already being delivered
 let swarmNewestRefresh = 0;  // so a slow look cannot overwrite a newer one
 // The chats open on the board, in the order they were opened. Kept here rather
 // than written down with the board: which boxes you have open is about this
 // window and this minute, and two windows should not fight over it.
 let swarmChats = [];
+const swarmChatAttachments = new Map();
+// A long provider request remains one HTTP call, but its truthful Nexus stages
+// arrive through a second, lightweight activity feed.  This map lets both the
+// movable and maximised views show the same live state.
+const swarmChatActivity = new Map();
+const AGENT_ICONS = new Set(["robot", "person", "code", "star", "brain"]);
+const AGENT_COLOUR = /^#[0-9a-f]{6}$/i;
+const AGENT_PICTURE = /^data:image\/(?:png|jpeg|webp);base64,/i;
+const MAX_AGENT_PICTURE_LENGTH = 400000;
+let swarmAgentPictureDraft = "";
+const SWARM_AGENT_AUTOSAVE_DELAY = 450;
+// Unsaved form state lives outside the rendered board. Every successful board
+// change redraws this panel, so keeping a draft only in its inputs allowed an
+// unrelated drag or checkbox save to replace what somebody was still typing.
+// Drafts are per agent so switching cards can flush one without losing another.
+const swarmAgentSettingDrafts = new Map();
+
+function safeAgentPicture(value) {
+  return typeof value === "string" && value.length <= MAX_AGENT_PICTURE_LENGTH
+    && AGENT_PICTURE.test(value) ? value : "";
+}
+
+function agentAppearance(agent) {
+  const bubble = AGENT_COLOUR.test(agent?.bubble_colour || "")
+    ? agent.bubble_colour : "#173b49";
+  const rgb = [1, 3, 5].map((at) => parseInt(bubble.slice(at, at + 2), 16));
+  const luminance = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255;
+  return {
+    icon: AGENT_ICONS.has(agent?.icon) ? agent.icon : "robot",
+    colour: AGENT_COLOUR.test(agent?.colour || "") ? agent.colour : "#52d5ea",
+    bubble,
+    bubbleInk: luminance > 0.58 ? "#07151d" : "#f4fbff",
+    picture: safeAgentPicture(agent?.profile_picture),
+    pictureZoom: Math.max(100, Math.min(300, Number(agent?.picture_zoom) || 100)),
+    pictureHue: Math.max(0, Math.min(360, Number(agent?.picture_hue) || 0)),
+  };
+}
+
+function styleForAgent(node, agent) {
+  const appearance = agentAppearance(agent);
+  node.style.setProperty("--agent-colour", appearance.colour);
+  node.style.setProperty("--agent-bubble-colour", appearance.bubble);
+  node.style.setProperty("--agent-bubble-ink", appearance.bubbleInk);
+  return appearance;
+}
+
+function putAgentFaceIn(node, appearance, iconSize = 24) {
+  node.replaceChildren();
+  node.style.setProperty("--agent-picture-zoom", String(appearance.pictureZoom / 100));
+  node.style.setProperty("--agent-picture-hue", `${appearance.pictureHue}deg`);
+  if (appearance.picture) {
+    const picture = document.createElement("img");
+    picture.src = appearance.picture;
+    picture.alt = "";
+    picture.draggable = false;
+    node.append(picture);
+  } else {
+    node.append(aSwarmDrawing(appearance.icon, iconSize));
+  }
+  node.classList.toggle("has-picture", Boolean(appearance.picture));
+  return node;
+}
+
+function anAgentFace(agent, className = "", iconSize = 24) {
+  const face = make("span", `swarm-agent-face ${className}`.trim());
+  const appearance = styleForAgent(face, agent);
+  return putAgentFaceIn(face, appearance, iconSize);
+}
+
+function agentForChatTurn(one, fallback) {
+  return theSwarmAgent(one?.speaker_id) || fallback || null;
+}
+
+function chatTurnsWhileWorking(agentId, saved = []) {
+  const activity = swarmChatActivity.get(agentId);
+  if (!activity) return saved;
+  return [
+    ...saved,
+    ...(activity.localTurns || []),
+    ...(activity.remoteTurns || []),
+  ];
+}
+
+function renderTurnsThatArrived(agentId) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  if (!held) return;
+  renderTheChatThreadFor(agentId, keptTranscriptFor(agentId));
+  if (theBigOne === agentId) renderTheBigChat();
+}
+// A chat read can still be in flight when an answer or "start again" changes
+// the transcript.  Only the newest operation may replace the copy both chat
+// views render; otherwise a slow, older read makes a fresh answer disappear.
+const swarmChatRevisions = new Map();
+// Conversation metadata is fetched independently from its transcript. Keep a
+// latest-only counter for those reads, and briefly lock selection while the
+// server records it, so an older list can never restore a previous chat.
+const swarmConversationListRevisions = new Map();
+const swarmConversationSwitching = new Set();
+
+function activeConversationFor(agentId) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  return (held?.conversations || []).find((one) => one.id === held?.conversation) || null;
+}
+
+function swarmChatKey(agentId) {
+  return `${agentId}:${activeConversationFor(agentId)?.id || "legacy"}`;
+}
+
+function activeConversationIdFor(agentId) {
+  return activeConversationFor(agentId)?.id || "";
+}
+
+function transcriptIdentityFor(agentId) {
+  return activeConversationIdFor(agentId) || "legacy";
+}
+
+function keptTranscriptFor(agentId) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  return held?.saidFor === transcriptIdentityFor(agentId) && Array.isArray(held.said)
+    ? held.said : [];
+}
+
+function nextConversationListRevision(agentId) {
+  const revision = (swarmConversationListRevisions.get(agentId) || 0) + 1;
+  swarmConversationListRevisions.set(agentId, revision);
+  return revision;
+}
+
+function nextSwarmChatRevision(agentId) {
+  const key = swarmChatKey(agentId);
+  const revision = Math.max(
+    swarmChatRevisions.get(key) || 0,
+    swarmChatRevisions.get(agentId) || 0,
+  ) + 1;
+  swarmChatRevisions.set(key, revision);
+  // The aggregate key invalidates a read when the active conversation changes;
+  // the pair-chat key keeps revisions independent once it is selected again.
+  swarmChatRevisions.set(agentId, revision);
+  return revision;
+}
+
+function aChatActivityPanel(extraClass = "") {
+  const panel = make("section", `chat-activity ${extraClass}`.trim());
+  panel.hidden = true;
+  panel.setAttribute("role", "status");
+  panel.setAttribute("aria-live", "polite");
+  panel.setAttribute("aria-atomic", "true");
+  const heading = make("div", "chat-activity-heading");
+  const spinner = make("span", "chat-activity-spinner");
+  spinner.setAttribute("aria-hidden", "true");
+  heading.append(spinner);
+  heading.append(make("strong", "chat-activity-stage", "Starting the request"));
+  heading.append(make("span", "chat-activity-elapsed", "Working now"));
+  panel.append(heading);
+  panel.append(make("p", "chat-activity-detail", "Nexus is preparing the agent connection."));
+  const track = make("div", "chat-activity-track");
+  track.setAttribute("aria-hidden", "true");
+  track.append(make("span"));
+  panel.append(track);
+  return panel;
+}
+
+function activityWords(activity) {
+  const seconds = Math.max(0, Math.floor((Date.now() - activity.startedAt) / 1000));
+  if (activity.state === "complete") return `Completed in ${seconds}s`;
+  if (activity.state === "error") return `Stopped after ${seconds}s`;
+  return seconds ? `Working for ${seconds}s` : "Working now";
+}
+
+function showActivityInPanel(panel, activity) {
+  panel.hidden = !activity;
+  if (!activity) return;
+  panel.dataset.state = activity.state;
+  panel.querySelector(".chat-activity-stage").textContent = activity.stage;
+  panel.querySelector(".chat-activity-detail").textContent = activity.detail;
+  panel.querySelector(".chat-activity-elapsed").textContent = activityWords(activity);
+}
+
+function renderSwarmChatActivity(agentId) {
+  const activity = swarmChatActivity.get(agentId);
+  const panels = [];
+  const card = theChatCardFor(agentId);
+  if (card) panels.push(card.querySelector(".chat-activity"));
+  if (theBigOne === agentId) panels.push($("theBigChatActivity"));
+  for (const panel of panels.filter(Boolean)) {
+    showActivityInPanel(panel, activity);
+  }
+}
+
+async function pollSwarmChatActivity(agentId, activityId) {
+  const current = swarmChatActivity.get(agentId);
+  if (!current || current.id !== activityId || current.state !== "working") return;
+  try {
+    const update = await request(
+      `/api/swarm/activity?activity=${encodeURIComponent(activityId)}`
+    );
+    const still = swarmChatActivity.get(agentId);
+    if (!still || still.id !== activityId || still.state !== "working") return;
+    still.stage = update.stage || still.stage;
+    still.detail = update.detail || still.detail;
+    const turns = Array.isArray(update.turns) ? update.turns : [];
+    if (turns.length !== still.remoteTurns.length) {
+      still.remoteTurns = turns;
+      renderTurnsThatArrived(agentId);
+    }
+    renderSwarmChatActivity(agentId);
+  } catch (_) {
+    // The main request owns errors. A missed progress poll must never turn a
+    // healthy provider answer into a failed chat.
+  }
+  const still = swarmChatActivity.get(agentId);
+  if (still && still.id === activityId && still.state === "working") {
+    still.pollTimer = window.setTimeout(
+      () => pollSwarmChatActivity(agentId, activityId), 450
+    );
+  }
+}
+
+function beginSwarmChatActivity(agentId, mode, agent, words = "", attachments = []) {
+  const previous = swarmChatActivity.get(agentId);
+  if (previous) {
+    window.clearInterval(previous.elapsedTimer);
+    window.clearTimeout(previous.pollTimer);
+    window.clearTimeout(previous.finishTimer);
+  }
+  const id = globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `nexus-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const first = {
+    auto: ["Reading your request", "Nexus will decide whether connected agents should help."],
+    chat: [`Contacting ${agent?.name || "the selected agent"}`, "Nexus is sending a direct chat request."],
+    collaborate: ["Preparing the connected-agent relay", "Nexus will contact ready agents on green communication lines."],
+    work: ["Preparing confirmed project work", "Nexus will collect plans before validating any file changes."],
+  }[mode] || ["Starting the request", "Nexus is preparing the agent connection."];
+  const activity = {
+    id, state: "working", stage: first[0], detail: first[1], startedAt: Date.now(),
+    elapsedTimer: 0, pollTimer: 0, finishTimer: 0, remoteTurns: [],
+    localTurns: words ? [{
+      who: "you", speaker_name: "You", text: words, phase: "user_prompt",
+      attachments: attachments.map((one) => ({
+        name: one.name, type: one.type, image: String(one.type || "").startsWith("image/"),
+      })),
+    }] : [],
+  };
+  swarmChatActivity.set(agentId, activity);
+  activity.elapsedTimer = window.setInterval(() => renderSwarmChatActivity(agentId), 1000);
+  renderSwarmChatActivity(agentId);
+  renderTurnsThatArrived(agentId);
+  activity.pollTimer = window.setTimeout(() => pollSwarmChatActivity(agentId, id), 150);
+  return activity;
+}
+
+function finishSwarmChatActivity(agentId, succeeded, detail = "") {
+  const activity = swarmChatActivity.get(agentId);
+  if (!activity) return;
+  window.clearInterval(activity.elapsedTimer);
+  window.clearTimeout(activity.pollTimer);
+  activity.state = succeeded ? "complete" : "error";
+  if (succeeded) {
+    activity.localTurns = [];
+    activity.remoteTurns = [];
+  }
+  activity.stage = succeeded ? "Answer received" : "Request stopped";
+  activity.detail = detail || (succeeded
+    ? "Nexus saved the answer and updated the conversation."
+    : "The request ended before an answer was saved.");
+  renderSwarmChatActivity(agentId);
+  renderTurnsThatArrived(agentId);
+  activity.finishTimer = window.setTimeout(() => {
+    if (swarmChatActivity.get(agentId) !== activity) return;
+    swarmChatActivity.delete(agentId);
+    renderSwarmChatActivity(agentId);
+  }, succeeded ? 1600 : 3000);
+}
+
+function markSwarmChatActivityStopping(agentId) {
+  const activity = swarmChatActivity.get(agentId);
+  if (!activity) return;
+  activity.state = "stopping";
+  activity.stage = "Stopping";
+  activity.detail = "Nexus is interrupting only this chat's current request.";
+  renderSwarmChatActivity(agentId);
+}
 
 function sayInSwarm(words) { $("swarmSaid").textContent = words; }
 
@@ -5555,6 +6150,19 @@ const SWARM_DRAWINGS = {
   cross: [
     "M5 5l14 14",
     "M19 5L5 19",
+  ],
+  code: [
+    "M9 7l-5 5 5 5",
+    "M15 7l5 5-5 5",
+    "M13.5 4l-3 16",
+  ],
+  star: [
+    "M12 2.8l2.8 5.7 6.3.9-4.6 4.5 1.1 6.3-5.6-3-5.6 3 1.1-6.3-4.6-4.5 6.3-.9z",
+  ],
+  brain: [
+    "M9.5 5.5a3 3 0 0 0-5 2.2 3 3 0 0 0 .2 5.7A3.2 3.2 0 0 0 8 18.5h1.5z",
+    "M14.5 5.5a3 3 0 0 1 5 2.2 3 3 0 0 1-.2 5.7 3.2 3.2 0 0 1-3.3 5.1h-1.5z",
+    "M9.5 7.5v11M14.5 7.5v11M7 11h2.5M14.5 11H17",
   ],
   minus: [
     "M5 12h14",
@@ -5662,6 +6270,9 @@ async function refreshSwarm(quietly) {
 // window. Rather than a panel showing an agent that is not there, it falls away.
 function keepTheSwarmPick() {
   swarmChats = swarmChats.filter((one) => theSwarmAgent(one.agent));
+  for (const agentId of swarmAgentSettingDrafts.keys()) {
+    if (!theSwarmAgent(agentId)) discardSwarmAgentSettings(agentId);
+  }
   if (!swarmPicked) return;
   if (swarmPicked.kind === "agent" && !theSwarmAgent(swarmPicked.id)) swarmPicked = null;
   if (swarmPicked.kind === "project" && !theSwarmProject(swarmPicked.id)) swarmPicked = null;
@@ -5687,25 +6298,93 @@ function whatTheBoardSays() {
 
 // ---- drawing it ----------------------------------------------------------
 
+const SWARM_ZOOM_MIN = 0.35;
+const SWARM_ZOOM_MAX = 1.8;
+let swarmZoom = 1;
+
+// The scroll surface is the scaled size; the canvas inside it keeps the
+// board's own coordinates. That lets lines, boxes, chats, dragging, and saved
+// positions all continue to speak the same language at every zoom level.
+function sizeTheSwarmCanvas() {
+  const board = $("swarmBoard");
+  const surface = $("swarmSurface");
+  const canvas = $("swarmCanvas");
+  let width = Math.max(600, board.clientWidth / swarmZoom);
+  let height = Math.max(500, board.clientHeight / swarmZoom);
+  for (const one of canvas.querySelectorAll(".swarm-box, .swarm-chat-card")) {
+    width = Math.max(width, one.offsetLeft + one.offsetWidth + 80);
+    height = Math.max(height, one.offsetTop + one.offsetHeight + 80);
+  }
+  canvas.style.width = `${Math.ceil(width)}px`;
+  canvas.style.height = `${Math.ceil(height)}px`;
+  canvas.style.transform = `scale(${swarmZoom})`;
+  surface.style.width = `${Math.ceil(width * swarmZoom)}px`;
+  surface.style.height = `${Math.ceil(height * swarmZoom)}px`;
+  for (const sheet of [$("swarmLines"), $("swarmPointer")]) {
+    sheet.setAttribute("width", String(Math.ceil(width)));
+    sheet.setAttribute("height", String(Math.ceil(height)));
+    sheet.style.width = `${Math.ceil(width)}px`;
+    sheet.style.height = `${Math.ceil(height)}px`;
+  }
+}
+
+function sayTheSwarmZoom() {
+  $("swarmZoomValue").textContent = `${Math.round(swarmZoom * 100)}%`;
+  $("swarmZoomOut").disabled = swarmZoom <= SWARM_ZOOM_MIN;
+  $("swarmZoomIn").disabled = swarmZoom >= SWARM_ZOOM_MAX;
+}
+
+function setTheSwarmZoom(wanted, keepTheMiddle = true) {
+  const board = $("swarmBoard");
+  const middle = {
+    x: (board.scrollLeft + board.clientWidth / 2) / swarmZoom,
+    y: (board.scrollTop + board.clientHeight / 2) / swarmZoom,
+  };
+  swarmZoom = Math.max(SWARM_ZOOM_MIN, Math.min(SWARM_ZOOM_MAX, wanted));
+  sizeTheSwarmCanvas();
+  drawSwarmLines();
+  if (keepTheMiddle) {
+    board.scrollLeft = middle.x * swarmZoom - board.clientWidth / 2;
+    board.scrollTop = middle.y * swarmZoom - board.clientHeight / 2;
+  }
+  sayTheSwarmZoom();
+}
+
+function fitTheWholeSwarm() {
+  const board = $("swarmBoard");
+  const things = [...$("swarmCanvas").querySelectorAll(".swarm-box, .swarm-chat-card")];
+  if (!things.length) { setTheSwarmZoom(1, false); return; }
+  const left = Math.min(...things.map((one) => one.offsetLeft));
+  const top = Math.min(...things.map((one) => one.offsetTop));
+  const right = Math.max(...things.map((one) => one.offsetLeft + one.offsetWidth));
+  const bottom = Math.max(...things.map((one) => one.offsetTop + one.offsetHeight));
+  const wanted = Math.min((board.clientWidth - 40) / Math.max(1, right - left),
+    (board.clientHeight - 40) / Math.max(1, bottom - top));
+  setTheSwarmZoom(wanted, false);
+  board.scrollLeft = Math.max(0, left * swarmZoom - 20);
+  board.scrollTop = Math.max(0, top * swarmZoom - 20);
+}
+
 function renderSwarmBoard() {
   // Anything pointed at is about to be a different element. Left behind, the
   // line stays on screen pointing at a box that no longer exists.
   stopPointing();
   const board = $("swarmBoard");
+  const canvas = $("swarmCanvas");
   for (const old of [...board.querySelectorAll(
     ".swarm-box, .swarm-empty, .swarm-line-tools, .swarm-chat-card")]) {
     old.remove();
   }
   const said = theSwarmBoard();
   if (!said.agents.length && !said.projects.length) {
-    board.append(make("div", "swarm-empty",
+    canvas.append(make("div", "swarm-empty",
       "Nothing on the board yet. Press Add another agent under the board, then Add "
       + "another project folder, then press the gear on the line between them."));
   }
-  for (const one of said.agents) board.append(oneSwarmBox("agent", one));
-  for (const one of said.projects) board.append(oneSwarmBox("project", one));
+  for (const one of said.agents) canvas.append(oneSwarmBox("agent", one));
+  for (const one of said.projects) canvas.append(oneSwarmBox("project", one));
   for (const one of swarmChats) {
-    if (!one.minimised) board.append(oneSwarmChatCard(one));
+    if (!one.minimised) canvas.append(oneSwarmChatCard(one));
   }
   drawSwarmLines();
 }
@@ -5722,6 +6401,7 @@ function oneSwarmBox(kind, one) {
   box.dataset.id = one.id;
   box.style.left = `${one.at.x}px`;
   box.style.top = `${one.at.y}px`;
+  const appearance = kind === "agent" ? styleForAgent(box, one) : null;
 
   // The box itself is what you press to pick it, drag it, or move it with the
   // arrows. It is a button so a keyboard can reach it; the gear and the chat
@@ -5735,7 +6415,11 @@ function oneSwarmBox(kind, one) {
   pick.setAttribute("aria-label", kind === "agent"
     ? `${one.name}, an agent on the board. Pick it, or move it with the arrow keys`
     : `${one.name}, a project on the board. Pick it, or move it with the arrow keys`);
-  pick.append(aSwarmDrawing(kind === "agent" ? "robot" : "folder", 26));
+  if (kind === "agent") {
+    pick.append(anAgentFace(one, "swarm-box-face", 28));
+  } else {
+    pick.append(aSwarmDrawing("folder", 26));
+  }
   const words = make("span", "swarm-box-words");
   words.append(make("span", "swarm-box-name", one.name));
   if (kind === "agent") {
@@ -5767,6 +6451,28 @@ function oneSwarmBox(kind, one) {
       () => openTheChatFor(one.id), `chat with ${one.name}`, "chat"));
   }
   box.append(tools);
+  // Put the repair beside the problem itself.  The readiness list may be off
+  // screen in a full-board view, and a provider setting hidden behind an agent
+  // gear looks like an agent setting.  Gemini's project id belongs to the
+  // provider route, so this calls the existing guarded connection flow.
+  if (kind === "agent" && one.can_be_connected) {
+    const label = one.assistant_kind === "gemini-cli"
+      ? "Set Cloud project"
+      : "Connect it";
+    const connect = make("button", "swarm-connect swarm-box-connect", label);
+    connect.type = "button";
+    // The whole card is draggable and captures a pointer that starts anywhere
+    // inside it.  Keep this action out of that drag gesture, just like the gear
+    // and chat buttons above, or a real mouse press is retargeted to the card
+    // before its click can reach the connection flow.
+    connect.addEventListener("pointerdown", (event) => event.stopPropagation());
+    connect.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      connectThisAssistant(one.can_be_connected, connect);
+    });
+    box.append(connect);
+  }
   makeSwarmBoxDraggable(box, pick);
   return box;
 }
@@ -5783,6 +6489,7 @@ function drawSwarmLines() {
   const sheet = $("swarmLines");
   sheet.replaceChildren();
   const board = $("swarmBoard");
+  const canvas = $("swarmCanvas");
   for (const old of [...board.querySelectorAll(".swarm-line-tools")]) old.remove();
   const found = new Map();
   for (const box of board.querySelectorAll(".swarm-box")) {
@@ -5793,10 +6500,11 @@ function drawSwarmLines() {
   }
   // The sheet is stretched to whatever the board scrolls to, so a line to a box
   // that is off the bottom is still drawn instead of being cut off at the edge.
-  sheet.setAttribute("width", String(board.scrollWidth));
-  sheet.setAttribute("height", String(board.scrollHeight));
-  sheet.style.width = `${board.scrollWidth}px`;
-  sheet.style.height = `${board.scrollHeight}px`;
+  sizeTheSwarmCanvas();
+  sheet.setAttribute("width", String(canvas.offsetWidth));
+  sheet.setAttribute("height", String(canvas.offsetHeight));
+  sheet.style.width = `${canvas.offsetWidth}px`;
+  sheet.style.height = `${canvas.offsetHeight}px`;
 
   const said = theSwarmBoard();
   for (const line of said.works_on) {
@@ -5805,7 +6513,7 @@ function drawSwarmLines() {
     if (!drawn) continue;
     const agent = theSwarmAgent(line.agent);
     const project = theSwarmProject(line.project);
-    board.append(theToolsOnALine(drawn, "works on", true,
+    canvas.append(theToolsOnALine(drawn, "works on", true,
       () => pickSwarmLine({kind: "works", agent: line.agent, project: line.project}),
       `${agent ? agent.name : "this agent"} works on ${project ? project.name : "it"}`));
   }
@@ -5820,7 +6528,7 @@ function drawSwarmLines() {
     if (!drawn) continue;
     const first = theSwarmAgent(pair.one);
     const other = theSwarmAgent(pair.other);
-    board.append(theToolsOnALine(drawn, on ? "communicates? YES" : "communicates? NO", on,
+    canvas.append(theToolsOnALine(drawn, on ? "communicates? YES" : "communicates? NO", on,
       () => pickSwarmLine({kind: "talks", one: pair.one, other: pair.other}),
       `whether ${first ? first.name : "one"} and ${other ? other.name : "the other"} may talk`));
   }
@@ -5973,8 +6681,8 @@ function makeSwarmBoxDraggable(box, pick) {
   });
   box.addEventListener("pointermove", (event) => {
     if (!dragging) return;
-    const across = event.clientX - dragging.x;
-    const down = event.clientY - dragging.y;
+    const across = (event.clientX - dragging.x) / swarmZoom;
+    const down = (event.clientY - dragging.y) / swarmZoom;
     if (!dragging.moved && Math.abs(across) + Math.abs(down) < 4) return;
     dragging.moved = true;
     box.style.left = `${Math.max(0, Math.min(4000, Math.round(dragging.left + across)))}px`;
@@ -6041,18 +6749,207 @@ function putThisBoxDown(box) {
 }
 
 function pickSwarmBox(kind, id) {
+  const previous = thePickedAgent();
+  if (previous && (kind !== "agent" || previous.id !== id)) {
+    // Start the last pending save before the form is replaced. The captured
+    // per-agent draft remains valid while the next panel opens.
+    void flushSwarmAgentSettings(previous.id);
+  }
   swarmPicked = {kind, id};
+  showTheSwarmPanel();
   renderSwarmBoard();
   renderSwarmPanel();
 }
 
 function pickSwarmLine(which) {
+  const previous = thePickedAgent();
+  if (previous) void flushSwarmAgentSettings(previous.id);
   swarmPicked = which;
+  showTheSwarmPanel();
   renderSwarmBoard();
   renderSwarmPanel();
 }
 
 // ---- what you picked -----------------------------------------------------
+
+function agentSettingsFromAgent(agent) {
+  const appearance = agentAppearance(agent);
+  return {
+    name: agent.name || "",
+    who: agent.who || "",
+    job: agent.job || "",
+    icon: appearance.icon,
+    colour: appearance.colour,
+    bubbleColour: appearance.bubble,
+    profilePicture: appearance.picture,
+    pictureZoom: appearance.pictureZoom,
+    pictureHue: appearance.pictureHue,
+  };
+}
+
+function agentSettingsFromForm() {
+  return {
+    name: $("swarmAgentName").value,
+    who: $("swarmAgentWho").value,
+    job: $("swarmAgentJob").value,
+    icon: $("swarmAgentIcon").value,
+    colour: $("swarmAgentColour").value,
+    bubbleColour: $("swarmAgentBubbleColour").value,
+    profilePicture: swarmAgentPictureDraft,
+    pictureZoom: Number($("swarmAgentPictureZoom").value),
+    pictureHue: Number($("swarmAgentPictureHue").value),
+  };
+}
+
+function renderSwarmAgentSaveState(agentId = (thePickedAgent() || {}).id) {
+  const state = $("swarmAgentSaveState");
+  const save = $("swarmAgentSave");
+  if (!state || !save) return;
+  const draft = agentId ? swarmAgentSettingDrafts.get(agentId) : null;
+  const held = Boolean(whyTheBoardIsHeld());
+  let kind = "saved";
+  let words = "All changes are saved automatically.";
+  if (held && draft) {
+    kind = "saving";
+    words = "Changes are waiting. They will save when the board is available.";
+  } else if (draft?.error) {
+    kind = "error";
+    words = draft.error;
+  } else if (draft?.inFlight) {
+    kind = "saving";
+    words = "Saving changes…";
+  } else if (draft) {
+    kind = "saving";
+    words = "Changes waiting to save…";
+  }
+  state.dataset.state = kind;
+  state.textContent = words;
+  save.textContent = draft?.inFlight ? "Saving…" : "Save now";
+  save.disabled = held || !agentId || !draft || Boolean(draft.inFlight);
+}
+
+function rememberSwarmAgentSettings(delay = SWARM_AGENT_AUTOSAVE_DELAY) {
+  const agent = thePickedAgent();
+  if (!agent) return null;
+  let draft = swarmAgentSettingDrafts.get(agent.id);
+  if (!draft) {
+    draft = {
+      agentId: agent.id, values: agentSettingsFromForm(), revision: 0,
+      savedRevision: 0, timer: 0, inFlight: null, error: "", waitingForBoard: false,
+    };
+    swarmAgentSettingDrafts.set(agent.id, draft);
+  }
+  draft.values = agentSettingsFromForm();
+  draft.revision += 1;
+  draft.error = "";
+  draft.waitingForBoard = false;
+  if (draft.timer) window.clearTimeout(draft.timer);
+  draft.timer = 0;
+  if (delay !== null) {
+    draft.timer = window.setTimeout(() => {
+      draft.timer = 0;
+      void flushSwarmAgentSettings(agent.id);
+    }, Math.max(0, delay));
+  }
+  renderSwarmAgentSaveState(agent.id);
+  return draft;
+}
+
+async function flushSwarmAgentSettings(agentId, announce = false) {
+  const draft = swarmAgentSettingDrafts.get(agentId);
+  if (!draft) {
+    if (announce) sayInSwarm("All agent settings are already saved.");
+    return true;
+  }
+  if (draft.timer) window.clearTimeout(draft.timer);
+  draft.timer = 0;
+  if (draft.inFlight) {
+    await draft.inFlight;
+    return flushSwarmAgentSettings(agentId, announce);
+  }
+  if (whyTheBoardIsHeld()) {
+    draft.waitingForBoard = true;
+    renderSwarmAgentSaveState(agentId);
+    return false;
+  }
+
+  const values = {...draft.values};
+  const revision = draft.revision;
+  const name = values.name.trim().replace(/\s+/g, " ");
+  if (!name) {
+    draft.error = "Not saved yet — give this agent a name.";
+    renderSwarmAgentSaveState(agentId);
+    if (thePickedAgent()?.id === agentId) $("swarmAgentName").focus();
+    return false;
+  }
+  const before = theSwarmAgent(agentId);
+  if (!before) {
+    if (draft.timer) window.clearTimeout(draft.timer);
+    swarmAgentSettingDrafts.delete(agentId);
+    return false;
+  }
+  const wasCalled = before.name;
+  renderSwarmAgentSaveState(agentId);
+  draft.inFlight = (async () => {
+    const who = values.who;
+    const job = values.job.trim();
+    const icon = values.icon;
+    const colour = values.colour;
+    const bubbleColour = values.bubbleColour;
+    const profilePicture = values.profilePicture;
+    const pictureZoom = Number(values.pictureZoom);
+    const pictureHue = Number(values.pictureHue);
+    const worked = await changeTheSwarmBoard((board) => {
+      const held = board.agents.find((one) => one.id === agentId);
+      if (!held) return false;
+      held.name = name;
+      held.who = who;
+      held.job = job;
+      held.icon = icon;
+      held.colour = colour;
+      held.bubble_colour = bubbleColour;
+      held.profile_picture = profilePicture;
+      held.picture_zoom = pictureZoom;
+      held.picture_hue = pictureHue;
+    });
+    if (!worked) {
+      draft.error = "Could not save these settings. Your edits are still here — press Save now to retry.";
+      return false;
+    }
+    draft.savedRevision = Math.max(draft.savedRevision, revision);
+    draft.error = "";
+    draft.waitingForBoard = false;
+    if (name !== wasCalled) refreshTheChatFor(agentId);
+    if (draft.revision === revision) {
+      swarmAgentSettingDrafts.delete(agentId);
+      if (announce) sayInSwarm(`${name} is saved.`);
+    }
+    return true;
+  })();
+  renderSwarmAgentSaveState(agentId);
+  let worked = false;
+  try {
+    worked = await draft.inFlight;
+  } finally {
+    if (swarmAgentSettingDrafts.get(agentId) === draft) {
+      draft.inFlight = null;
+      if (worked && draft.revision > draft.savedRevision && !draft.timer) {
+        draft.timer = window.setTimeout(() => {
+          draft.timer = 0;
+          void flushSwarmAgentSettings(agentId);
+        }, SWARM_AGENT_AUTOSAVE_DELAY);
+      }
+    }
+    if (thePickedAgent()?.id === agentId) renderSwarmPanel();
+  }
+  return worked;
+}
+
+function discardSwarmAgentSettings(agentId) {
+  const draft = swarmAgentSettingDrafts.get(agentId);
+  if (draft?.timer) window.clearTimeout(draft.timer);
+  swarmAgentSettingDrafts.delete(agentId);
+}
 
 function renderSwarmPanel() {
   const agent = thePickedAgent();
@@ -6082,8 +6979,23 @@ function renderSwarmPanel() {
 }
 
 function renderSwarmAgentPanel(agent) {
-  $("swarmAgentName").value = agent.name;
-  $("swarmAgentJob").value = agent.job || "";
+  // A board redraw must never replace an edit that is waiting for autosave.
+  // Render from that agent's durable page draft until the server accepts it.
+  const draft = swarmAgentSettingDrafts.get(agent.id);
+  const values = draft?.values || agentSettingsFromAgent(agent);
+  $("swarmAgentName").value = values.name;
+  $("swarmAgentJob").value = values.job;
+  $("swarmAgentIcon").value = values.icon;
+  $("swarmAgentColour").value = values.colour;
+  $("swarmAgentBubbleColour").value = values.bubbleColour;
+  swarmAgentPictureDraft = values.profilePicture;
+  $("swarmAgentPictureZoom").value = String(values.pictureZoom);
+  $("swarmAgentPictureHue").value = String(values.pictureHue);
+  $("swarmAgentPictureFile").value = "";
+  $("swarmAgentPictureSaid").textContent = values.profilePicture
+    ? "Custom picture selected. Browse again to replace it."
+    : "PNG, JPEG, or WebP. Nexus resizes the picture before keeping it.";
+  previewSwarmAgentAppearance();
   const who = $("swarmAgentWho");
   who.replaceChildren();
   const none = make("option", "", "Not chosen yet");
@@ -6094,14 +7006,24 @@ function renderSwarmAgentPanel(agent) {
     choice.value = one.route;
     who.append(choice);
   }
+  if (canUseWebChats() && webChatProviderChoices.length) {
+    const group = document.createElement("optgroup");
+    group.label = "Connect a web AI chat";
+    for (const provider of webChatProviderChoices) {
+      const choice = make("option", "", `${provider.label} web chat — sign in or choose a chat…`);
+      choice.value = `__connect_web__:${provider.id}`;
+      group.append(choice);
+    }
+    who.append(group);
+  }
   // One that is written down but no longer on this machine still has to be
   // shown, or opening its settings would quietly change it to something else.
-  if (agent.who && !(swarmSaid.who_can_be_used || []).some((one) => one.route === agent.who)) {
-    const gone = make("option", "", `${agent.who} - not on this machine`);
-    gone.value = agent.who;
+  if (values.who && !(swarmSaid.who_can_be_used || []).some((one) => one.route === values.who)) {
+    const gone = make("option", "", `${values.who} - not on this machine`);
+    gone.value = values.who;
     who.append(gone);
   }
-  who.value = agent.who || "";
+  who.value = values.who;
 
   const worksOn = $("swarmWorksOn");
   worksOn.replaceChildren();
@@ -6134,6 +7056,7 @@ function renderSwarmAgentPanel(agent) {
       (on) => setWhetherTheyTalk(agent.id, one.id, on),
     ));
   }
+  renderSwarmAgentSaveState(agent.id);
 }
 
 function oneSwarmTick(id, words, ticked, whenChanged) {
@@ -6267,9 +7190,28 @@ function setWhatCanBePressedInSwarm() {
   $("swarmRemoveAgent").disabled = held || !agent;
   $("swarmRemoveProject").disabled = held || !project;
   $("swarmTidy").disabled = held || (!board.agents.length && !board.projects.length);
-  $("swarmAgentSave").disabled = held || !agent;
   $("swarmAgentRemove").disabled = held || !agent;
   $("swarmOpenChat").disabled = !agent;
+  for (const id of [
+    "swarmAgentName", "swarmAgentWho", "swarmAgentJob", "swarmAgentIcon",
+    "swarmAgentColour", "swarmAgentBubbleColour", "swarmAgentPictureBrowse",
+  ]) {
+    $(id).disabled = held || !agent;
+  }
+  const hasAgentPicture = Boolean(agent && safeAgentPicture(
+    swarmAgentSettingDrafts.get(agent.id)?.values?.profilePicture ?? agent.profile_picture));
+  $("swarmAgentPictureClear").disabled = held || !agent || !hasAgentPicture;
+  $("swarmAgentPictureZoom").disabled = held || !agent || !hasAgentPicture;
+  $("swarmAgentPictureHue").disabled = held || !agent || !hasAgentPicture;
+  const settingsDraft = agent ? swarmAgentSettingDrafts.get(agent.id) : null;
+  if (!held && settingsDraft?.waitingForBoard && !settingsDraft.timer && !settingsDraft.inFlight) {
+    settingsDraft.waitingForBoard = false;
+    settingsDraft.timer = window.setTimeout(() => {
+      settingsDraft.timer = 0;
+      void flushSwarmAgentSettings(agent.id);
+    }, 0);
+  }
+  renderSwarmAgentSaveState(agent?.id);
   $("swarmAddTask").disabled = held
     || !project || project.tasks.length >= (most.tasks || 40);
   $("swarmProjectRemove").disabled = held || !project;
@@ -6281,6 +7223,31 @@ function setWhatCanBePressedInSwarm() {
   $("swarmStop").disabled = !swarmGoing;
   for (const card of $("swarmBoard").querySelectorAll(".swarm-chat-card")) {
     setWhatCanBePressedInAChat(card);
+  }
+  if (theBigOne) {
+    const busy = swarmBusy.has(theBigOne);
+    const waiting = busy || swarmConversationSwitching.has(theBigOne);
+    const stopping = swarmStopping.has(theBigOne);
+    for (const id of ["theBigChatSend", "theBigChatAttach", "theBigChatCollaborate", "theBigChatWork"]) {
+      const button = $(id);
+      if (button) button.disabled = waiting;
+    }
+    const conversation = activeConversationFor(theBigOne);
+    if ($("theBigChatWork")) {
+      $("theBigChatWork").disabled = waiting || (Boolean(conversation) && !conversation.project);
+      $("theBigChatWork").title = conversation && !conversation.project
+        ? "Choose this chat's active project first"
+        : "Ask this pair to work together on the selected project";
+    }
+    if ($("theBigChatProject")) $("theBigChatProject").disabled = waiting || !conversation;
+    for (const button of $("theBigChatConversationList")?.querySelectorAll("button") || []) {
+      button.disabled = waiting;
+    }
+    const stop = $("theBigChatStop");
+    if (stop) {
+      stop.disabled = !busy || stopping;
+      stop.textContent = stopping ? "Stopping…" : "Stop";
+    }
   }
 }
 
@@ -6384,7 +7351,7 @@ async function addAProjectToTheBoard() {
     .find((one) => !already.has(one.path));
   const said = await askForOneLine(
     "Add another project folder", "Which folder do you want worked on?",
-    known ? known.path : "");
+    known ? known.path : "", null, true);
   if (said === null) { sayInSwarm("Nothing was added."); return; }
   const path = said.trim();
   if (!path) { sayInSwarm("A project needs a folder."); return; }
@@ -6401,26 +7368,15 @@ async function addAProjectToTheBoard() {
 async function saveTheSwarmAgent() {
   const agent = thePickedAgent();
   if (!agent) { sayInSwarm("Press the gear on an agent first."); return; }
-  const name = $("swarmAgentName").value.trim().replace(/\s+/g, " ");
-  if (!name) { sayInSwarm("An agent needs a name."); return; }
-  const wasCalled = agent.name;
-  const who = $("swarmAgentWho").value;
-  const job = $("swarmAgentJob").value.trim();
-  const worked = await changeTheSwarmBoard((board) => {
-    const held = board.agents.find((one) => one.id === agent.id);
-    if (!held) return false;
-    held.name = name;
-    held.who = who;
-    held.job = job;
-  }, `${name} was saved.`);
-  // Its chat is kept under its name, so a rename opens a different one. Read
-  // it again rather than leaving somebody else's words on screen.
-  if (worked && name !== wasCalled) refreshTheChatFor(agent.id);
+  rememberSwarmAgentSettings(null);
+  await flushSwarmAgentSettings(agent.id, true);
 }
 
 async function removeTheSwarmAgent() {
   const agent = thePickedAgent();
   if (!agent) { sayInSwarm("Press the gear on an agent first."); return; }
+  // Removal is an explicit decision to discard the form as well as the agent.
+  discardSwarmAgentSettings(agent.id);
   await changeTheSwarmBoard((board) => {
     board.agents = board.agents.filter((one) => one.id !== agent.id);
     board.works_on = board.works_on.filter((line) => line.agent !== agent.id);
@@ -6501,6 +7457,10 @@ function openTheChatFor(agentId) {
       agent: agentId,
       at: {x: Math.max(0, agent.at.x - 20), y: agent.at.y + 190},
       minimised: false,
+      said: [],
+      saidFor: "",
+      conversations: [],
+      conversation: "",
     });
   } else {
     // The chat button on the agent means show its board card again. A chat in
@@ -6509,7 +7469,7 @@ function openTheChatFor(agentId) {
   }
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
-  refreshTheChatFor(agentId);
+  loadConversationsFor(agentId);
   renderTheChatTray();
   const card = theChatCardFor(agentId);
   if (card) {
@@ -6525,6 +7485,401 @@ function closeTheChatFor(agentId) {
   renderTheChatTray();
 }
 
+function pairKey(pair) {
+  return [...pair].sort().join("|");
+}
+
+function connectedPairsFor(agentId) {
+  const board = theSwarmBoard();
+  const peers = (board.agents || []).filter((one) => (
+    one.id !== agentId && (board.talks_to || []).some((line) => (
+      [line.one, line.other].sort().join("|") === pairKey([agentId, one.id])
+    ))
+  ));
+  return peers.length ? peers.map((peer) => [agentId, peer.id].sort()) : [[agentId]];
+}
+
+function applyConversationList(agentId, said) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  if (!held) return;
+  const before = held.conversation;
+  held.conversations = Array.isArray(said?.chats) ? said.chats : [];
+  const ids = new Set(held.conversations.map((one) => one.id));
+  held.conversation = ids.has(said?.active) ? said.active
+    : ids.has(held.conversation) ? held.conversation
+    : held.conversations[0]?.id || "";
+  // Selection and transcript become one atomic piece of visible state. A
+  // transcript is never reusable merely because it belongs to the same lead
+  // agent; it must belong to this exact pair-chat id.
+  if (before !== held.conversation || held.saidFor !== transcriptIdentityFor(agentId)) {
+    held.said = [];
+    held.saidFor = transcriptIdentityFor(agentId);
+    nextSwarmChatRevision(agentId);
+    renderTheChatThreadFor(agentId, []);
+  }
+  const card = theChatCardFor(agentId);
+  const oldDestination = card?.querySelector(".chat-destination");
+  if (oldDestination) {
+    oldDestination.replaceWith(aChatDestination(theSwarmAgent(agentId), {
+      offerFullChat: true, conversation: activeConversationFor(agentId),
+    }));
+    setWhatCanBePressedInAChat(card);
+  }
+  if (theBigOne === agentId) renderTheBigChat();
+}
+
+async function loadConversationsFor(agentId, refresh = true) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  if (!held || swarmConversationSwitching.has(agentId)) return;
+  const revision = nextConversationListRevision(agentId);
+  try {
+    const said = await request(
+      `/api/swarm/chats?agent=${encodeURIComponent(agentId)}`
+    );
+    if (!swarmChats.includes(held)
+        || swarmConversationListRevisions.get(agentId) !== revision) return;
+    applyConversationList(agentId, said);
+    if (refresh && swarmConversationListRevisions.get(agentId) === revision) {
+      await refreshTheChatFor(agentId);
+    }
+  } catch (error) {
+    if (swarmConversationListRevisions.get(agentId) !== revision) return;
+    sayInTheChatFor(agentId, error.message);
+    if (theBigOne === agentId) {
+      $("theBigChatConversationSaid").textContent = error.message;
+    }
+  }
+}
+
+async function createConversationFor(agentId, peerId) {
+  if (swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
+  swarmConversationSwitching.add(agentId);
+  nextConversationListRevision(agentId);
+  setWhatCanBePressedInSwarm();
+  try {
+    const said = await request("/api/swarm/chats/create", {
+      method: "POST", body: JSON.stringify({agent: agentId, peer: peerId}),
+    });
+    applyConversationList(agentId, said);
+    keepWhatWasSaidTo(agentId, []);
+    await refreshTheChatFor(agentId);
+    $("theBigChatConversationSaid").textContent = "New pair chat created.";
+    $("theBigChatBox").focus();
+  } catch (error) {
+    $("theBigChatConversationSaid").textContent = error.message;
+  } finally {
+    swarmConversationSwitching.delete(agentId);
+    setWhatCanBePressedInSwarm();
+  }
+}
+
+async function activateConversationFor(agentId, chatId) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  if (!held || held.conversation === chatId || swarmBusy.has(agentId)
+      || swarmConversationSwitching.has(agentId)
+      || !(held.conversations || []).some((one) => one.id === chatId)) return;
+  swarmConversationSwitching.add(agentId);
+  nextConversationListRevision(agentId);
+  // Change the highlighted row, header, destination, project, and transcript
+  // together before waiting for disk. This makes it impossible to show the
+  // previous chat under the newly selected title even for one frame.
+  held.conversation = chatId;
+  held.said = [];
+  held.saidFor = transcriptIdentityFor(agentId);
+  nextSwarmChatRevision(agentId);
+  renderTheChatThreadFor(agentId, []);
+  if (theBigOne === agentId) renderTheBigChat();
+  setWhatCanBePressedInSwarm();
+  let failed = null;
+  try {
+    const said = await request("/api/swarm/chats/activate", {
+      method: "POST", body: JSON.stringify({agent: agentId, chat: chatId}),
+    });
+    if (!swarmChats.includes(held) || held.conversation !== chatId) return;
+    applyConversationList(agentId, said);
+    $("theBigChatSaidBack").textContent = "Switched chat.";
+    await refreshTheChatFor(agentId);
+  } catch (error) {
+    failed = error;
+  } finally {
+    swarmConversationSwitching.delete(agentId);
+    setWhatCanBePressedInSwarm();
+  }
+  if (failed) {
+    // The optimistic selection was not committed. Re-read the authoritative
+    // selection rather than leaving the interface on a chat the server did
+    // not accept.
+    await loadConversationsFor(agentId);
+    $("theBigChatConversationSaid").textContent = failed.message;
+  }
+}
+
+async function deleteConversationFor(agentId, chatId) {
+  const conversation = (swarmChats.find((one) => one.agent === agentId)?.conversations || [])
+    .find((one) => one.id === chatId);
+  if (!conversation || swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
+  const pair = (conversation.pair_agents || []).map((one) => one.name).join(" and ");
+  if (!window.confirm(
+    `Delete ${conversation.name} between ${pair || "these agents"}?\n\n`
+    + "Its saved transcript and attachments will be removed."
+  )) return;
+  swarmConversationSwitching.add(agentId);
+  nextConversationListRevision(agentId);
+  setWhatCanBePressedInSwarm();
+  try {
+    const said = await request("/api/swarm/chats/delete", {
+      method: "POST", body: JSON.stringify({agent: agentId, chat: chatId}),
+    });
+    if (conversation.destination?.route?.startsWith("web:")
+        && conversation.destination?.web_conversation_key
+        && window.harnessDesktop?.resetWebChat) {
+      await window.harnessDesktop.resetWebChat(
+        conversation.destination.route,
+        conversation.destination.web_conversation_key,
+      );
+    }
+    applyConversationList(agentId, said);
+    keepWhatWasSaidTo(agentId, []);
+    if (activeConversationFor(agentId)) await refreshTheChatFor(agentId);
+    $("theBigChatConversationSaid").textContent = "Chat deleted.";
+  } catch (error) {
+    $("theBigChatConversationSaid").textContent = error.message;
+  } finally {
+    swarmConversationSwitching.delete(agentId);
+    setWhatCanBePressedInSwarm();
+  }
+}
+
+async function selectConversationProject(agentId, projectId) {
+  const conversation = activeConversationFor(agentId);
+  if (!conversation || swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
+  swarmConversationSwitching.add(agentId);
+  nextConversationListRevision(agentId);
+  setWhatCanBePressedInSwarm();
+  try {
+    const said = await request("/api/swarm/chats/project", {
+      method: "POST", body: JSON.stringify({
+        agent: agentId, chat: conversation.id, project: projectId,
+      }),
+    });
+    applyConversationList(agentId, said);
+    const selected = activeConversationFor(agentId);
+    $("theBigChatProjectHelp").textContent = selected?.project
+      ? "This chat's file work is confined to the selected folder."
+      : "Choose a shared project before asking the pair to change files.";
+  } catch (error) {
+    $("theBigChatConversationSaid").textContent = error.message;
+    renderTheBigChat();
+  } finally {
+    swarmConversationSwitching.delete(agentId);
+    setWhatCanBePressedInSwarm();
+  }
+}
+
+// The cards move when they are dragged; the empty drawing paper moves the
+// view. This makes a wide board usable without having to chase two small
+// scrollbars, and deliberately starts only on the paper so dragging a card or
+// pressing one of its controls keeps doing exactly what it did before.
+function makeSwarmBoardPannable() {
+  const board = $("swarmBoard");
+  let panning = null;
+  board.addEventListener("pointerdown", (event) => {
+    const paper = ["swarmBoard", "swarmSurface", "swarmCanvas"];
+    if (event.button !== 0 || !paper.includes(event.target.id)) return;
+    panning = {
+      x: event.clientX,
+      y: event.clientY,
+      left: board.scrollLeft,
+      top: board.scrollTop,
+      pointer: event.pointerId,
+    };
+    board.classList.add("panning");
+    board.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  board.addEventListener("pointermove", (event) => {
+    if (!panning || event.pointerId !== panning.pointer) return;
+    board.scrollLeft = panning.left - (event.clientX - panning.x);
+    board.scrollTop = panning.top - (event.clientY - panning.y);
+  });
+  const stop = (event) => {
+    if (!panning || event.pointerId !== panning.pointer) return;
+    panning = null;
+    board.classList.remove("panning");
+    if (board.hasPointerCapture(event.pointerId)) board.releasePointerCapture(event.pointerId);
+  };
+  board.addEventListener("pointerup", stop);
+  board.addEventListener("pointercancel", stop);
+  board.addEventListener("wheel", (event) => {
+    if (!event.ctrlKey) return;
+    event.preventDefault();
+    setTheSwarmZoom(swarmZoom + (event.deltaY < 0 ? 0.1 : -0.1));
+  }, {passive: false});
+}
+
+let swarmFullScreenHomes = [];
+let swarmIsFullScreen = false;
+
+function showTheSwarmPanel() {
+  $("swarmPanel").hidden = false;
+  drawSwarmLines();
+}
+
+async function closeTheSwarmPanel() {
+  if (!swarmIsFullScreen) return;
+  const agent = thePickedAgent();
+  if (agent && !(await flushSwarmAgentSettings(agent.id))) return;
+  renderSwarmBoard();
+  $("swarmPanel").hidden = true;
+  drawSwarmLines();
+  $("swarmFullScreen").focus({preventScroll: true});
+}
+
+function putTheChatsInTheSwarmFullScreen() {
+  for (const home of swarmFullScreenHomes) $("swarmStage").append(home.element);
+}
+
+function putTheChatsBackWhereTheyLive() {
+  for (const home of swarmFullScreenHomes) {
+    home.parent.insertBefore(home.element, home.next);
+  }
+}
+
+function appearanceFromAgentForm(agent) {
+  return {
+    ...agent,
+    name: $("swarmAgentName").value.trim() || agent.name,
+    icon: $("swarmAgentIcon").value,
+    colour: $("swarmAgentColour").value,
+    bubble_colour: $("swarmAgentBubbleColour").value,
+    profile_picture: swarmAgentPictureDraft,
+    picture_zoom: Number($("swarmAgentPictureZoom").value),
+    picture_hue: Number($("swarmAgentPictureHue").value),
+  };
+}
+
+function previewSwarmAgentAppearance() {
+  const agent = thePickedAgent();
+  if (!agent) return;
+  const draft = appearanceFromAgentForm(agent);
+  const appearance = agentAppearance(draft);
+  const preview = $("swarmAgentAppearancePreview");
+  styleForAgent(preview, draft);
+  putAgentFaceIn($("swarmAgentPreviewFace"), appearance, 36);
+  $("swarmAgentPreviewName").textContent = draft.name;
+  $("swarmPanelTitle").textContent = draft.name || agent.name;
+  $("swarmAgentPictureZoomValue").textContent = `${Math.round(appearance.pictureZoom)}%`;
+  $("swarmAgentPictureHueValue").textContent = `${Math.round(appearance.pictureHue)}°`;
+  $("swarmAgentPictureClear").hidden = !appearance.picture;
+  $("swarmAgentPictureZoom").disabled = !appearance.picture;
+  $("swarmAgentPictureHue").disabled = !appearance.picture;
+
+  // Show the draft on the actual board card too while its debounced autosave
+  // is waiting. The form draft survives any board redraw until that save lands.
+  const card = [...document.querySelectorAll('.swarm-box[data-kind="agent"]')]
+    .find((one) => one.dataset.id === agent.id);
+  if (card) {
+    styleForAgent(card, draft);
+    const face = card.querySelector(".swarm-box-face");
+    if (face) {
+      styleForAgent(face, draft);
+      putAgentFaceIn(face, appearance, 28);
+    }
+    const name = card.querySelector(".swarm-box-name");
+    if (name) name.textContent = draft.name;
+  }
+}
+
+async function resizedAgentPicture(file) {
+  if (!file || !["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+    throw new Error("Choose a PNG, JPEG, or WebP picture.");
+  }
+  if (file.size > 15_000_000) {
+    throw new Error("That picture is larger than 15 MB. Choose a smaller copy.");
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    const image = new Image();
+    image.src = url;
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new Error("That picture could not be read."));
+    });
+    if (!image.naturalWidth || !image.naturalHeight) {
+      throw new Error("That picture has no readable pixels.");
+    }
+    for (const longest of [512, 420, 340, 280, 220]) {
+      const ratio = Math.min(1, longest / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * ratio));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * ratio));
+      canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+      for (const quality of [0.9, 0.78, 0.64]) {
+        const data = canvas.toDataURL("image/webp", quality);
+        if (data.length <= MAX_AGENT_PICTURE_LENGTH) return data;
+      }
+    }
+    throw new Error("That picture could not be made small enough to keep safely.");
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function useAgentPictureFile() {
+  const file = $("swarmAgentPictureFile").files?.[0];
+  if (!file) return;
+  $("swarmAgentPictureSaid").textContent = "Preparing the picture…";
+  try {
+    swarmAgentPictureDraft = await resizedAgentPicture(file);
+    $("swarmAgentPictureSaid").textContent =
+      `${file.name} is ready. You can adjust zoom and hue while it saves.`;
+    previewSwarmAgentAppearance();
+    rememberSwarmAgentSettings(0);
+  } catch (error) {
+    $("swarmAgentPictureSaid").textContent = error.message;
+    sayInSwarm(error.message);
+  } finally {
+    $("swarmAgentPictureFile").value = "";
+  }
+}
+
+function showHowTheSwarmFillsTheScreen(full = document.fullscreenElement === $("swarmStage")) {
+  const stage = $("swarmStage");
+  swarmIsFullScreen = Boolean(full);
+  stage.classList.toggle("is-fullscreen", swarmIsFullScreen);
+  document.body.classList.toggle("workspace-is-fullscreen", swarmIsFullScreen);
+  const button = $("swarmFullScreen");
+  button.textContent = swarmIsFullScreen ? "Exit full screen" : "Full screen";
+  button.setAttribute("aria-pressed", String(swarmIsFullScreen));
+  button.title = swarmIsFullScreen
+    ? "Return the board to the page"
+    : "Fill the screen with the board and these controls";
+  if (!swarmIsFullScreen) {
+    putTheChatsBackWhereTheyLive();
+    showTheSwarmPanel();
+  }
+  drawSwarmLines();
+}
+
+async function toggleTheSwarmFullScreen() {
+  const wanted = !swarmIsFullScreen;
+  try {
+    if (wanted) putTheChatsInTheSwarmFullScreen();
+    if (window.harnessDesktop?.setFullScreen) {
+      showHowTheSwarmFillsTheScreen(wanted);
+      const changed = await window.harnessDesktop.setFullScreen(wanted);
+      if (changed !== wanted) showHowTheSwarmFillsTheScreen(changed);
+    } else if (document.fullscreenElement === $("swarmStage")) {
+      await document.exitFullscreen();
+    } else {
+      await $("swarmStage").requestFullscreen();
+    }
+  } catch (error) {
+    putTheChatsBackWhereTheyLive();
+    sayInSwarm(`Full screen could not be opened: ${error.message || error}`);
+  }
+}
+
 function minimiseTheChatFor(agentId) {
   const held = swarmChats.find((one) => one.agent === agentId);
   if (!held) return;
@@ -6538,17 +7893,183 @@ function theChatCardFor(agentId) {
   return $("swarmBoard").querySelector(`.swarm-chat-card[data-agent="${agentId}"]`);
 }
 
+function chatDestinationFor(agent, conversation = null) {
+  return conversation?.destination || (agent && agent.chat_destination) || {
+    owner_label: "Nexus Harness",
+    connected: Boolean(agent && agent.who),
+    provider_label: (agent && (agent.who || agent.assistant_kind)) || "No assistant chosen",
+    provider_app_linked: false,
+    route: (agent && agent.who) || "",
+    model: "",
+    transcript_path: "",
+    transcript_exists: false,
+    explanation: agent && agent.who
+      ? "This conversation is kept by Nexus; no provider-app chat link is available."
+      : "Choose an assistant before this Nexus chat can send a message.",
+  };
+}
+
+async function showTheSavedChat(destination, button) {
+  if (!window.harnessDesktop?.showProjectFile || !destination.transcript_path) return;
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Opening...";
+  try {
+    const opened = await window.harnessDesktop.showProjectFile(destination.transcript_path);
+    if (!opened) sayInSwarm("The saved transcript file is not there yet.");
+  } finally {
+    button.disabled = !destination.transcript_exists;
+    button.textContent = was;
+  }
+}
+
+function aChatDestination(agent, {offerFullChat = false, conversation = null} = {}) {
+  const destination = chatDestinationFor(agent, conversation);
+  const box = make("section", "chat-destination");
+  box.append(make("strong", "", "Where this chat happens"));
+  box.append(make("p", "",
+    `${destination.owner_label || "Nexus Harness"} owns and saves this conversation.`));
+  const route = [];
+  if (destination.provider_label) route.push(`Answers come through ${destination.provider_label}`);
+  if (destination.route) route.push(`route “${destination.route}”`);
+  if (destination.model) route.push(`model ${destination.model}`);
+  box.append(make("p", "chat-destination-route", route.join(" • ")));
+  if (destination.transcript_path) {
+    box.append(make("p", "chat-destination-route",
+      `Saved transcript: ${destination.transcript_path}`));
+  }
+  box.append(make("p", "chat-destination-warning", destination.explanation));
+  const actions = make("div", "chat-destination-actions");
+  if (offerFullChat && agent) {
+    const open = make("button", "", "Open full Nexus chat");
+    open.type = "button";
+    open.addEventListener("click", () => openTheBigChat(agent.id));
+    actions.append(open);
+  }
+  if (destination.web_chat_id && window.harnessDesktop?.showWebChat) {
+    const fullWeb = make("button", "primary", "View full web AI chat");
+    fullWeb.type = "button";
+    fullWeb.title = "Show the complete provider website conversation inside Nexus";
+    fullWeb.addEventListener("click", () => (
+      showFullWebChatInsideNexus(
+        destination.web_chat_id,
+        destination.web_conversation_key || "",
+        Boolean(destination.web_prefer_existing_conversation),
+      )
+    ));
+    actions.append(fullWeb);
+  }
+  if (destination.web_chat_id && window.harnessDesktop?.openWebChatWindow) {
+    const provider = make("button", "", "Open web AI in a window");
+    provider.type = "button";
+    provider.addEventListener("click", () => (
+      window.harnessDesktop.openWebChatWindow(
+        destination.web_chat_id,
+        destination.web_conversation_key || "",
+        Boolean(destination.web_prefer_existing_conversation),
+      )
+    ));
+    actions.append(provider);
+  }
+  if (window.harnessDesktop?.showProjectFile && destination.transcript_path) {
+    const saved = make("button", "", "Show saved transcript file");
+    saved.type = "button";
+    saved.disabled = !destination.transcript_exists;
+    saved.title = destination.transcript_exists
+      ? destination.transcript_path
+      : "The transcript file appears after the first message is saved.";
+    saved.addEventListener("click", () => showTheSavedChat(destination, saved));
+    actions.append(saved);
+  }
+  if (actions.childElementCount) box.append(actions);
+  return box;
+}
+
+function readChatAttachment(file) {
+  return new Promise((resolve, reject) => {
+    if (file.size > 4000000) {
+      reject(new Error(`${file.name} is larger than 4 MB.`));
+      return;
+    }
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve({
+      name: file.name, type: file.type || "application/octet-stream",
+      size: file.size, data: String(reader.result || ""),
+    }));
+    reader.addEventListener("error", () => reject(new Error(`${file.name} could not be read.`)));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addChatAttachments(agentId, files) {
+  const key = swarmChatKey(agentId);
+  const existing = swarmChatAttachments.get(key) || [];
+  const selected = [...files];
+  if (existing.length + selected.length > 6) {
+    showError("Attach at most 6 files at once.");
+    return;
+  }
+  try {
+    const added = await Promise.all(selected.map(readChatAttachment));
+    if ([...existing, ...added].reduce((sum, one) => sum + one.size, 0) > 8000000) {
+      throw new Error("The attachments together are larger than 8 MB.");
+    }
+    swarmChatAttachments.set(key, [...existing, ...added]);
+    renderChatAttachments(agentId);
+  } catch (error) {
+    showError(String(error.message || error));
+  }
+}
+
+function removeChatAttachment(agentId, index) {
+  const key = swarmChatKey(agentId);
+  const kept = [...(swarmChatAttachments.get(key) || [])];
+  kept.splice(index, 1);
+  if (kept.length) swarmChatAttachments.set(key, kept);
+  else swarmChatAttachments.delete(key);
+  renderChatAttachments(agentId);
+}
+
+function attachmentChip(agentId, one, index) {
+  const chip = make("span", "chat-attachment");
+  if (String(one.type || "").startsWith("image/") && one.data) {
+    const preview = document.createElement("img");
+    preview.src = one.data;
+    preview.alt = "";
+    chip.append(preview);
+  }
+  chip.append(make("span", "chat-attachment-name", one.name));
+  const remove = make("button", "chat-attachment-remove", "×");
+  remove.type = "button";
+  remove.title = `Remove ${one.name}`;
+  remove.addEventListener("click", () => removeChatAttachment(agentId, index));
+  chip.append(remove);
+  return chip;
+}
+
+function renderChatAttachments(agentId) {
+  const attachments = swarmChatAttachments.get(swarmChatKey(agentId)) || [];
+  const card = theChatCardFor(agentId);
+  const compact = card && card.querySelector(".chat-attachments");
+  if (compact) compact.replaceChildren(...attachments.map(
+    (one, index) => attachmentChip(agentId, one, index)));
+  const big = $("theBigChatAttachments");
+  if (big && theBigOne === agentId) big.replaceChildren(...attachments.map(
+    (one, index) => attachmentChip(agentId, one, index)));
+}
+
 function oneSwarmChatCard(held) {
   const agent = theSwarmAgent(held.agent);
   const card = make("div", "swarm-chat-card");
   card.dataset.agent = held.agent;
   card.style.left = `${held.at.x}px`;
   card.style.top = `${held.at.y}px`;
+  styleForAgent(card, agent);
 
   const bar = make("div", "swarm-chat-bar");
   const grip = make("button", "swarm-chat-grip");
   grip.type = "button";
-  grip.append(make("strong", "", `Chat with ${agent.name}`));
+  grip.append(make("strong", "", `Nexus chat with ${agent.name}`));
   grip.title = "Drag to move this chat, or use the arrow keys";
   bar.append(grip);
   bar.append(aSwarmButton("swarm-icon-button", "minus", "minimise",
@@ -6581,7 +8102,18 @@ function oneSwarmChatCard(held) {
     projectHelp.addEventListener("click", showGeminiProjectHelp);
     card.append(projectHelp);
   }
-  card.append(make("ol", "swarm-chat-thread talk-thread"));
+  card.append(aChatDestination(agent, {
+    offerFullChat: true, conversation: activeConversationFor(held.agent),
+  }));
+  const thread = make("ol", "swarm-chat-thread talk-thread");
+  card.append(thread);
+  putTheChatTurnsIn(
+    thread, agent, chatTurnsWhileWorking(held.agent, keptTranscriptFor(held.agent)), false
+  );
+
+  const activityPanel = aChatActivityPanel("swarm-chat-activity");
+  showActivityInPanel(activityPanel, swarmChatActivity.get(held.agent));
+  card.append(activityPanel);
 
   const form = make("form", "swarm-chat-form");
   const box = make("textarea", "swarm-chat-box");
@@ -6590,10 +8122,43 @@ function oneSwarmChatCard(held) {
   box.placeholder = "What did you change and why?";
   box.setAttribute("aria-label", `What to say to ${agent.name}`);
   form.append(box);
+  const attachments = make("div", "chat-attachments");
+  form.append(attachments);
+  const files = document.createElement("input");
+  files.type = "file";
+  files.multiple = true;
+  files.className = "sr-only swarm-chat-files";
+  files.accept = "image/*,.txt,.md,.json,.yaml,.yml,.toml,.ini,.csv,.py,.js,.ts,.tsx,.jsx,.css,.html,.xml";
+  files.addEventListener("change", async () => {
+    await addChatAttachments(held.agent, files.files || []);
+    files.value = "";
+  });
+  form.append(files);
   const row = make("div", "button-row");
   const send = make("button", "primary swarm-chat-send", "Send");
   send.type = "submit";
+  send.title = "Send directly or automatically involve connected agents when useful";
   row.append(send);
+  const stop = make("button", "danger swarm-chat-stop", "Stop");
+  stop.type = "button";
+  stop.title = "Stop only this chat's current request";
+  stop.disabled = true;
+  stop.addEventListener("click", () => stopChatFor(held.agent));
+  row.append(stop);
+  const attach = make("button", "swarm-chat-attach", "Attach");
+  attach.type = "button";
+  attach.addEventListener("click", () => files.click());
+  row.append(attach);
+  const collaborate = make("button", "swarm-chat-collaborate", "Ask connected agents");
+  collaborate.type = "button";
+  collaborate.title = "Immediately relay this prompt to every ready connected agent";
+  collaborate.addEventListener("click", () => sendWhatIsTypedTo(held.agent, "collaborate"));
+  row.append(collaborate);
+  const work = make("button", "swarm-chat-work", "Work on project files");
+  work.type = "button";
+  work.title = "Ask connected project agents to plan, then apply validated file changes";
+  work.addEventListener("click", () => sendWhatIsTypedTo(held.agent, "work"));
+  row.append(work);
   const again = make("button", "swarm-chat-again", "Start again");
   again.type = "button";
   again.addEventListener("click", () => startTheChatAgainFor(held.agent));
@@ -6611,6 +8176,8 @@ function oneSwarmChatCard(held) {
       sendWhatIsTypedTo(held.agent);
     }
   });
+  attachments.replaceChildren(...(swarmChatAttachments.get(swarmChatKey(held.agent)) || []).map(
+    (one, index) => attachmentChip(held.agent, one, index)));
   card.append(form);
   makeTheChatCardDraggable(card, grip, held);
   return card;
@@ -6632,8 +8199,10 @@ function makeTheChatCardDraggable(card, grip, held) {
   grip.addEventListener("pointermove", (event) => {
     if (!dragging) return;
     held.at = {
-      x: Math.max(0, Math.min(4000, Math.round(dragging.left + event.clientX - dragging.x))),
-      y: Math.max(0, Math.min(4000, Math.round(dragging.top + event.clientY - dragging.y))),
+      x: Math.max(0, Math.min(4000, Math.round(
+        dragging.left + (event.clientX - dragging.x) / swarmZoom))),
+      y: Math.max(0, Math.min(4000, Math.round(
+        dragging.top + (event.clientY - dragging.y) / swarmZoom))),
     };
     card.style.left = `${held.at.x}px`;
     card.style.top = `${held.at.y}px`;
@@ -6670,30 +8239,163 @@ function sayInTheChatFor(agentId, words) {
 
 function setWhatCanBePressedInAChat(card) {
   const agent = theSwarmAgent(card.dataset.agent);
-  const waiting = swarmBusy.has(card.dataset.agent);
+  const busy = swarmBusy.has(card.dataset.agent);
+  const waiting = busy || swarmConversationSwitching.has(card.dataset.agent);
   card.querySelector(".swarm-chat-box").disabled = !agent || !agent.ready;
   card.querySelector(".swarm-chat-send").disabled = waiting || !agent || !agent.ready;
+  const stop = card.querySelector(".swarm-chat-stop");
+  stop.disabled = !busy || swarmStopping.has(card.dataset.agent);
+  stop.textContent = swarmStopping.has(card.dataset.agent) ? "Stopping…" : "Stop";
+  card.querySelector(".swarm-chat-attach").disabled = waiting || !agent || !agent.ready;
+  card.querySelector(".swarm-chat-collaborate").disabled = waiting || !agent || !agent.ready;
+  const conversation = activeConversationFor(card.dataset.agent);
+  card.querySelector(".swarm-chat-work").disabled = waiting || !agent || !agent.ready
+    || (Boolean(conversation) && !conversation.project);
   card.querySelector(".swarm-chat-again").disabled = waiting || !agent;
+}
+
+function stoppedChatError(error) {
+  return String(error?.message || error || "").includes("Stopped by you");
+}
+
+async function stopChatFor(agentId) {
+  if (!swarmBusy.has(agentId) || swarmStopping.has(agentId)) return;
+  const agent = theSwarmAgent(agentId);
+  const activity = swarmChatActivity.get(agentId);
+  const conversation = activeConversationFor(agentId);
+  swarmStopping.add(agentId);
+  markSwarmChatActivityStopping(agentId);
+  sayInTheChatFor(agentId, "Stopping this chat...");
+  if (theBigOne === agentId) $("theBigChatSaidBack").textContent = "Stopping this chat...";
+  setWhatCanBePressedInSwarm();
+  try {
+    const jobs = [request("/api/swarm/stop-chat", {
+      method: "POST", body: JSON.stringify({
+        agent: agentId, activity: activity?.id || "", chat: conversation?.id || "",
+      }),
+    })];
+    if (String(agent?.who || "").startsWith("web:") && window.harnessDesktop?.stopWebChat) {
+      jobs.push(window.harnessDesktop.stopWebChat(
+        agent.who, conversation?.filed_as || ""));
+    }
+    const [serverResult] = await Promise.allSettled(jobs);
+    if (serverResult.status === "rejected") throw serverResult.reason;
+    if (!serverResult.value?.stopped) {
+      swarmStopping.delete(agentId);
+      setWhatCanBePressedInSwarm();
+      sayInTheChatFor(agentId, serverResult.value?.note || "This chat is not waiting for an answer.");
+    }
+  } catch (error) {
+    swarmStopping.delete(agentId);
+    setWhatCanBePressedInSwarm();
+    showError(String(error?.message || error));
+  }
 }
 
 async function refreshTheChatFor(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
+  const conversation = activeConversationFor(agentId);
+  const conversationId = conversation?.id || "";
+  const revisionKey = swarmChatKey(agentId);
+  const revision = nextSwarmChatRevision(agentId);
   try {
     const said = await request(
-      `/api/swarm/said?agent=${encodeURIComponent(agentId)}`);
-    renderTheChatThreadFor(agentId, said.said || []);
+      `/api/swarm/said?agent=${encodeURIComponent(agentId)}`
+      + (conversation ? `&chat=${encodeURIComponent(conversation.id)}` : ""));
+    if (activeConversationIdFor(agentId) !== conversationId
+        || swarmChatRevisions.get(agentId) !== revision
+        || swarmChatRevisions.get(revisionKey) !== revision) return;
+    keepWhatWasSaidTo(agentId, said.said || [], conversationId);
     countWhatIsTypedTo(agentId);
   } catch (error) {
+    if (activeConversationIdFor(agentId) !== conversationId
+        || swarmChatRevisions.get(agentId) !== revision
+        || swarmChatRevisions.get(revisionKey) !== revision) return;
     sayInTheChatFor(agentId, error.message);
   }
 }
 
-function renderTheChatThreadFor(agentId, said) {
-  const card = theChatCardFor(agentId);
-  if (!card) return;
-  const agent = theSwarmAgent(agentId);
-  const list = card.querySelector(".swarm-chat-thread");
+async function copyChatCode(button, code) {
+  const before = button.textContent;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(code);
+    } else {
+      const held = make("textarea", "sr-only");
+      held.value = code;
+      held.setAttribute("readonly", "");
+      document.body.append(held);
+      held.select();
+      if (!document.execCommand("copy")) throw new Error("Copy was refused");
+      held.remove();
+    }
+    button.textContent = "Copied";
+  } catch (_) {
+    button.textContent = "Select code";
+    const selection = window.getSelection();
+    const codeNode = button.closest(".chat-code-block")?.querySelector("code");
+    if (selection && codeNode) {
+      const range = document.createRange();
+      range.selectNodeContents(codeNode);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    }
+  }
+  window.setTimeout(() => { button.textContent = before; }, 1800);
+}
+
+function appendChatText(container, text) {
+  const value = String(text || "");
+  const fences = /```([^\r\n`]*)\r?\n([\s\S]*?)```/g;
+  let after = 0;
+  let found;
+  const plain = (words) => {
+    if (words) container.append(make("p", "chat-prose", words));
+  };
+  while ((found = fences.exec(value)) !== null) {
+    plain(value.slice(after, found.index));
+    const language = found[1].trim() || "Plain text";
+    const code = found[2];
+    const block = make("section", "chat-code-block");
+    const bar = make("div", "chat-code-bar");
+    bar.append(make("span", "chat-code-language", language));
+    const copy = make("button", "chat-code-copy", "Copy code");
+    copy.type = "button";
+    copy.title = `Copy this ${language} code block`;
+    copy.addEventListener("click", () => copyChatCode(copy, code));
+    bar.append(copy);
+    const pre = make("pre", "chat-code");
+    pre.append(make("code", "", code));
+    block.append(bar, pre);
+    container.append(block);
+    after = fences.lastIndex;
+  }
+  plain(value.slice(after));
+}
+
+const chatPhaseNames = {
+  user_prompt: "Sent to the team",
+  agent_reply: "Connected-agent reply",
+  lead_draft: "Lead agent's first reply",
+  agent_plan: "Connected-agent plan",
+  lead_plan: "Lead agent's plan",
+  agent_discussion: "Team discussion",
+  agent_plan_review: "Plan review",
+  lead_execution: "Applied execution pass",
+  agent_verification: "Work verification",
+  final_answer: "Final answer",
+};
+
+function chatPhaseName(phase) { return chatPhaseNames[phase] || ""; }
+
+function chatTurnSpeaker(one, agent) {
+  const from = one.speaker_name
+    || (one.who === "you" ? "You" : ((agent && agent.name) || "The assistant"));
+  return one.recipient_name ? `${from} → ${one.recipient_name}` : from;
+}
+
+function putTheChatTurnsIn(list, agent, said, scroll = true) {
   list.replaceChildren();
   if (!said.length) {
     list.append(make("li", "hint",
@@ -6702,18 +8404,61 @@ function renderTheChatThreadFor(agentId, said) {
     return;
   }
   for (const one of said) {
-    const row = make("li", `talk-turn ${one.who}`);
-    row.append(make("strong", "talk-turn-who",
-      one.who === "you" ? "You" : ((agent && agent.name) || "Them")));
-    row.append(make("p", "talk-turn-text", one.text));
+    const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
+      "agent_discussion", "agent_plan_review", "lead_execution", "agent_verification"]
+      .includes(one.phase);
+    const row = make("li", `talk-turn ${one.who} ${collaboration ? "between" : ""}`);
+    const speaker = agentForChatTurn(one, agent);
+    if (one.who !== "you") styleForAgent(row, speaker);
+    const heading = make("div", "talk-turn-heading");
+    if (one.who !== "you") heading.append(anAgentFace(speaker, "talk-turn-face", 16));
+    heading.append(make("strong", "talk-turn-who", chatTurnSpeaker(one, agent)));
+    const phase = chatPhaseName(one.phase);
+    if (phase) heading.append(make("span", `chat-turn-phase phase-${one.phase}`, phase));
+    row.append(heading);
+    const text = make("div", "talk-turn-text");
+    appendChatText(text, one.text);
+    row.append(text);
+    if (Array.isArray(one.attachments) && one.attachments.length) {
+      const files = make("div", "talk-attachments");
+      for (const attached of one.attachments) {
+        files.append(make("span", "talk-attachment",
+          `${attached.image ? "Screenshot" : "File"}: ${attached.name}`));
+      }
+      row.append(files);
+    }
     const under = [];
     if (one.at) under.push(one.at);
     if (one.milliseconds) under.push(prettyTime(one.milliseconds));
+    if (one.speaker_route) under.push(`route ${one.speaker_route}`);
     if (one.model) under.push(one.model);
     if (under.length) row.append(make("p", "hint", under.join(" | ")));
     list.append(row);
   }
-  list.lastElementChild.scrollIntoView({block: "nearest"});
+  if (scroll) list.lastElementChild.scrollIntoView({block: "nearest"});
+}
+
+function renderTheChatThreadFor(agentId, said) {
+  const card = theChatCardFor(agentId);
+  if (!card) return;
+  putTheChatTurnsIn(card.querySelector(".swarm-chat-thread"), theSwarmAgent(agentId),
+    chatTurnsWhileWorking(agentId, said));
+}
+
+function keepWhatWasSaidTo(agentId, said, conversationId = activeConversationIdFor(agentId)) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  // Network answers and reads carry the conversation they were requested for.
+  // If the user has moved elsewhere, save/display belongs to that old request,
+  // never to the conversation now named by the header.
+  if (!held || activeConversationIdFor(agentId) !== conversationId) return false;
+  // This write may be an answer landing after a read began. Move the revision
+  // on again so that read cannot arrive afterwards and put the old turns back.
+  nextSwarmChatRevision(agentId);
+  held.said = Array.isArray(said) ? said : [];
+  held.saidFor = conversationId || "legacy";
+  renderTheChatThreadFor(agentId, held.said);
+  if (theBigOne === agentId) renderTheBigChat();
+  return true;
 }
 
 function countWhatIsTypedTo(agentId) {
@@ -6723,7 +8468,30 @@ function countWhatIsTypedTo(agentId) {
   card.querySelector(".swarm-chat-count").textContent = typed ? `${typed} letters` : "";
 }
 
+function looksLikeProjectWork(words) {
+  const action = "(?:add|build|change|create|delete|edit|fix|implement|make|modify|move|refactor|remove|rename|replace|update|write)";
+  const target = "(?:code|files?|folders?|projects?|repositor(?:y|ies)|repos?|scripts?|tests?)";
+  return new RegExp(`\\b${action}\\b[\\s\\S]{0,100}\\b${target}\\b|\\b${target}\\b[\\s\\S]{0,100}\\b${action}\\b`, "i")
+    .test(String(words || ""));
+}
+
+function confirmProjectWork(agent, words, mode) {
+  const needsConfirmation = mode === "work" || (mode === "auto" && looksLikeProjectWork(words));
+  if (!needsConfirmation) return {allowed: true, confirmed: false};
+  const conversation = activeConversationFor(agent?.id);
+  const project = (conversation?.projects || []).find(
+    (one) => one.id === conversation?.project
+  );
+  const allowed = window.confirm(
+    `Allow Nexus to apply file changes proposed by ${agent?.name || "this agent"}`
+    + ` to ${project?.name || "its connected project"}?\n\n`
+    + "The agents will discuss, apply, inspect, and revise the result. Nexus validates paths, checks file baselines, and keeps rollback backups."
+  );
+  return {allowed, confirmed: allowed};
+}
+
 async function sendWhatIsTypedTo(agentId) {
+  const mode = arguments[1] || "auto";
   const card = theChatCardFor(agentId);
   const agent = theSwarmAgent(agentId);
   if (!card || !agent) return;
@@ -6738,25 +8506,53 @@ async function sendWhatIsTypedTo(agentId) {
     sayInTheChatFor(agentId, "Still waiting for the last answer.");
     return;
   }
+  if (swarmConversationSwitching.has(agentId)) {
+    sayInTheChatFor(agentId, "Finishing the chat switch first.");
+    return;
+  }
+  const projectPermission = confirmProjectWork(agent, words, mode);
+  if (!projectPermission.allowed) return;
   // One agent at a time, not one chat at a time: two chats open on two
   // different agents can both be waiting, which is the whole point of having
   // several of them on the board.
   swarmBusy.add(agentId);
+  swarmStopping.delete(agentId);
+  nextSwarmChatRevision(agentId);
   setWhatCanBePressedInSwarm();
-  sayInTheChatFor(agentId, `Asking ${agent.name}...`);
+  const attachmentKey = swarmChatKey(agentId);
+  const attachments = swarmChatAttachments.get(attachmentKey) || [];
+  const activity = beginSwarmChatActivity(agentId, mode, agent, words, attachments);
+  sayInTheChatFor(agentId, mode === "auto" ? "Deciding whether connected agents should help..."
+    : mode === "chat" ? `Asking ${agent.name}...`
+    : mode === "collaborate" ? "Relaying to connected agents..."
+    : "Planning and validating project-file work...");
   try {
+    const conversation = activeConversationFor(agentId);
     const said = await request("/api/swarm/say", {
-      method: "POST", body: JSON.stringify({agent: agentId, text: words}),
+      method: "POST", body: JSON.stringify({
+        agent: agentId, text: words, mode, attachments, activity: activity.id,
+        chat: conversation?.id || "",
+        allow_project_changes: projectPermission.confirmed,
+      }),
     });
+    finishSwarmChatActivity(agentId, true);
     if (!theChatCardFor(agentId)) {
       // The chat was closed while the answer was on its way. It is kept, and is
       // there when it is opened again.
       return;
     }
     box.value = "";
+    swarmChatAttachments.delete(attachmentKey);
+    renderChatAttachments(agentId);
     countWhatIsTypedTo(agentId);
-    renderTheChatThreadFor(agentId, said.said || []);
-    sayInTheChatFor(agentId, `${agent.name} answered.`);
+    keepWhatWasSaidTo(agentId, said.said || [], conversation?.id || "");
+    sayInTheChatFor(agentId, said.changed?.length
+      ? `${agent.name} answered. Nexus applied ${said.changed.length} file change(s).`
+      : said.routing?.requested === "auto" && said.routing?.selected === "collaborate"
+        ? `${agent.name} answered after Nexus automatically involved ${said.collaborated_with?.length || 0} connected agent(s).`
+      : said.collaborated_with?.length
+        ? `${agent.name} answered after hearing ${said.collaborated_with.length} connected agent(s).`
+        : `${agent.name} answered.`);
     // The list down the side carries the last thing said under each name, and
     // something was just said.
     refreshSwarm(true);
@@ -6764,10 +8560,12 @@ async function sendWhatIsTypedTo(agentId) {
     // Read back what was really kept, so a message that did not get through
     // stops looking like one that did. The words stay in the box.
     await refreshTheChatFor(agentId);
-    showError(error.message);
+    if (!stoppedChatError(error)) showError(error.message);
     sayInTheChatFor(agentId, error.message);
+    finishSwarmChatActivity(agentId, false, String(error.message || error));
   } finally {
     swarmBusy.delete(agentId);
+    swarmStopping.delete(agentId);
     setWhatCanBePressedInSwarm();
   }
 }
@@ -6775,11 +8573,20 @@ async function sendWhatIsTypedTo(agentId) {
 async function startTheChatAgainFor(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
+  nextSwarmChatRevision(agentId);
   try {
+    const conversation = activeConversationFor(agentId);
     const said = await request("/api/swarm/start-again", {
-      method: "POST", body: JSON.stringify({agent: agentId}),
+      method: "POST", body: JSON.stringify({
+        agent: agentId, chat: conversation?.id || "",
+      }),
     });
-    renderTheChatThreadFor(agentId, []);
+    if (said.web_chat_id && said.web_conversation_key
+        && window.harnessDesktop?.resetWebChat) {
+      await window.harnessDesktop.resetWebChat(
+        agent.who, said.web_conversation_key);
+    }
+    keepWhatWasSaidTo(agentId, [], conversation?.id || "");
     sayInTheChatFor(agentId, said.note || `${agent.name} starts again.`);
   } catch (error) {
     showError(error.message);
@@ -7480,6 +9287,9 @@ async function putThePageAway() {
 // name, and the only way to say so was a settings file or a terminal. They had
 // to ask somebody else for help with their own machine.
 
+const GEMINI_CLI_CLOUD_PROJECT_HELP =
+  "https://geminicli.com/docs/get-started/authentication/#set-your-google-cloud-project";
+
 async function connectThisAssistant(kind, button) {
   // Google will not answer a work account until it knows which Cloud project to
   // bill the work to. Asked once here, rather than letting somebody connect it,
@@ -7490,7 +9300,11 @@ async function connectThisAssistant(kind, button) {
       "Connect Gemini",
       "If yours is a work Google account, Google needs the Cloud project id to "
       + "bill the work to. A personal account needs none - leave this empty.",
-      "");
+      "",
+      {
+        label: "WHAT IS THIS? (external link)",
+        href: GEMINI_CLI_CLOUD_PROJECT_HELP,
+      });
     if (said === null) return;
     googleProject = said.trim();
   }
@@ -7561,14 +9375,15 @@ function renderTheChatTray() {
     pick.dataset.chatTray = one.id;
     pick.setAttribute("aria-label",
       `Open the chat with ${one.name} big. It uses ${one.who || "no assistant yet"}.`);
-    const face = make("span", "the-chat-tray-face");
-    face.append(aSwarmDrawing("robot", 18));
+    const face = anAgentFace(one, "the-chat-tray-face", 18);
     // The face is what points at the board. Hovering it says which of five
     // agents this is without reading anything.
     face.addEventListener("pointerenter", () => pointAtTheBox(one.id));
     face.addEventListener("pointerleave", stopPointing);
     pick.append(face);
-    pick.append(make("span", "", `${one.name} | ${one.who || "nobody yet"}`));
+    const destination = chatDestinationFor(one);
+    pick.append(make("span", "",
+      `${one.name} — Nexus chat via ${destination.provider_label || one.who || "nobody yet"}`));
     pick.addEventListener("focus", () => pointAtTheBox(one.id));
     pick.addEventListener("blur", stopPointing);
     pick.addEventListener("click", () => openTheBigChat(one.id));
@@ -7602,7 +9417,7 @@ function pointAtTheBox(agentId) {
   // From the bottom of the board up to the box, because the tray is along the
   // bottom and that is where the eye is coming from.
   line.setAttribute("x1", String(middle.x));
-  line.setAttribute("y1", String($("swarmBoard").scrollHeight));
+  line.setAttribute("y1", String($("swarmCanvas").offsetHeight));
   line.setAttribute("x2", String(middle.x));
   line.setAttribute("y2", String(middle.y));
   sheet.append(line);
@@ -7622,12 +9437,16 @@ function stopPointing() {
 function openTheBigChat(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
-  if (!swarmChats.some((one) => one.agent === agentId)) openTheChatFor(agentId);
+  const alreadyOpen = swarmChats.some((one) => one.agent === agentId);
+  if (!alreadyOpen) openTheChatFor(agentId);
   theBigOne = agentId;
-  $("theBigChatTitle").textContent = `${agent.name} | ${agent.who || "no assistant yet"}`;
+  $("theBigChatTitle").textContent = `${agent.name} — Nexus chat`;
   $("theBigChat").hidden = false;
   renderTheChatTray();
   renderTheBigChat();
+  // Opening the compact chat already started this read. Starting it twice made
+  // two independent active-chat snapshots race each other on first open.
+  if (alreadyOpen) loadConversationsFor(agentId);
   $("theBigChatBox").focus();
 }
 
@@ -7668,10 +9487,101 @@ function shutTheBigChat() {
   renderTheChatTray();
 }
 
-function aFaceFor(kind) {
-  const face = make("span", "the-big-chat-face");
-  face.append(aSwarmDrawing(kind === "you" ? "person" : "robot", 24));
+function aFaceFor(kind, agent = null) {
+  if (kind !== "you") return anAgentFace(agent, "the-big-chat-face", 24);
+  const face = make("span", "swarm-agent-face the-big-chat-face");
+  face.append(aSwarmDrawing("person", 24));
   return face;
+}
+
+function renderTheConversationSidebar(agentId) {
+  const list = $("theBigChatConversationList");
+  if (!list) return;
+  const held = swarmChats.find((one) => one.agent === agentId);
+  const conversations = held?.conversations || [];
+  const groups = new Map();
+  for (const pair of connectedPairsFor(agentId)) groups.set(pairKey(pair), pair);
+  for (const one of conversations) groups.set(pairKey(one.pair || []), one.pair || []);
+  list.replaceChildren();
+  for (const pair of groups.values()) {
+    const agents = pair.map(theSwarmAgent).filter(Boolean);
+    if (!agents.length) continue;
+    const peer = agents.find((one) => one.id !== agentId);
+    const group = make("section", "the-big-chat-pair");
+    const heading = make("div", "the-big-chat-pair-head");
+    const faces = make("span", "the-big-chat-pair-faces");
+    agents.forEach((one) => faces.append(anAgentFace(one, "", 16)));
+    heading.append(faces);
+    heading.append(make("strong", "the-big-chat-pair-name",
+      agents.map((one) => one.name).join(" ↔ ") || "Direct agent chat"));
+    group.append(heading);
+    const items = make("div", "the-big-chat-conversation-items");
+    const chats = conversations.filter((one) => pairKey(one.pair || []) === pairKey(pair));
+    if (!chats.length) items.append(make("p", "hint", "No saved chats for this pair."));
+    for (const conversation of chats) {
+      const row = make("div", "the-big-chat-conversation-item");
+      const pick = make("button", "the-big-chat-conversation-pick");
+      pick.type = "button";
+      pick.classList.toggle("active", held.conversation === conversation.id);
+      pick.disabled = swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId);
+      const project = (conversation.projects || []).find(
+        (one) => one.id === conversation.project
+      );
+      pick.append(make("strong", "", conversation.name));
+      pick.append(make("span", "", project?.name || (
+        (conversation.projects || []).length
+          ? "No project selected" : "No project shared by this pair"
+      )));
+      pick.addEventListener("click", () => activateConversationFor(agentId, conversation.id));
+      row.append(pick);
+      const remove = make("button", "danger the-big-chat-conversation-delete", "×");
+      remove.type = "button";
+      remove.title = `Delete ${conversation.name}`;
+      remove.setAttribute("aria-label", `Delete ${conversation.name}`);
+      remove.disabled = swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId);
+      remove.addEventListener("click", () => deleteConversationFor(agentId, conversation.id));
+      row.append(remove);
+      items.append(row);
+    }
+    group.append(items);
+    const add = make("button", "the-big-chat-pair-new", "+ New chat for this pair");
+    add.type = "button";
+    add.disabled = swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId);
+    add.addEventListener("click", () => createConversationFor(agentId, peer?.id || ""));
+    group.append(add);
+    list.append(group);
+  }
+  if (!list.childElementCount) {
+    list.append(make("p", "hint", "Connect this agent to another AI with a green line."));
+  }
+}
+
+function renderTheConversationProject(agentId) {
+  const select = $("theBigChatProject");
+  if (!select) return;
+  const conversation = activeConversationFor(agentId);
+  select.replaceChildren();
+  const projects = conversation?.projects || [];
+  const none = make("option", "", projects.length
+    ? "Choose a shared project" : "No project shared by this pair");
+  none.value = "";
+  select.append(none);
+  for (const project of projects) {
+    const option = make("option", "", project.name);
+    option.value = project.id;
+    option.title = project.path;
+    select.append(option);
+  }
+  select.value = conversation?.project || "";
+  select.disabled = !conversation || swarmBusy.has(agentId)
+    || swarmConversationSwitching.has(agentId);
+  $("theBigChatProjectHelp").textContent = !conversation
+    ? "Create or select a pair chat first."
+    : conversation.project
+      ? "This chat's file work is confined to the selected folder."
+      : projects.length
+        ? "Choose which shared project this chat may write to."
+        : "This selected pair has no project in common. Choose another pair chat or connect both agents to the same project.";
 }
 
 function renderTheBigChat() {
@@ -7679,27 +9589,50 @@ function renderTheBigChat() {
   if (!list || !theBigOne) return;
   const agent = theSwarmAgent(theBigOne);
   const held = swarmChats.find((one) => one.agent === theBigOne);
+  const conversation = activeConversationFor(theBigOne);
+  const pairNames = (conversation?.pair_agents || []).map((one) => one.name);
+  $("theBigChatTitle").textContent = conversation
+    ? `${pairNames.join(" ↔ ")} — ${conversation.name}`
+    : `${agent.name} — Nexus chat`;
+  renderTheConversationSidebar(theBigOne);
+  renderTheConversationProject(theBigOne);
   list.replaceChildren();
+  const destination = $("theBigChatDestination");
+  if (destination) destination.replaceChildren(aChatDestination(agent, {conversation}));
 
   const turns = [];
-  for (const one of (held && held.said) || []) {
+  for (const one of chatTurnsWhileWorking(theBigOne, keptTranscriptFor(theBigOne))) {
+    const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
+      "agent_discussion", "agent_plan_review", "lead_execution", "agent_verification"]
+      .includes(one.phase);
     turns.push({
-      kind: one.who === "you" ? "you" : "them",
-      who: one.who === "you" ? "You" : (agent ? agent.name : "The assistant"),
+      kind: one.who === "you" ? "you" : (collaboration ? "between" : "them"),
+      who: chatTurnSpeaker(one, agent),
       text: one.text,
       at: one.at,
+      attachments: one.attachments || [],
+      phase: one.phase || "",
+      route: one.speaker_route || "",
+      model: one.model || "",
+      milliseconds: Number(one.milliseconds || 0),
+      speakerId: one.speaker_id || "",
     });
   }
   // What this agent said to another agent, and what another said to it. Shown
   // here because a conversation between two of them is a conversation, and
   // reading it in a different place from your own is how you lose the thread.
-  for (const one of (swarmWhatTheySaid.notes || [])) {
+  for (const one of (conversation ? [] : (swarmWhatTheySaid.notes || []))) {
     if (one.said_by !== theBigOne && one.shown_to !== theBigOne) continue;
     turns.push({
       kind: "between",
       who: `${one.said_by_name} to ${one.shown_to_name}`,
       text: one.text,
       at: one.at,
+      phase: "agent_reply",
+      route: "",
+      model: "",
+      milliseconds: Number(one.milliseconds || 0),
+      speakerId: one.said_by || "",
     });
   }
   // A turn with no time on it goes where it was put, at the end, rather than
@@ -7721,14 +9654,35 @@ function renderTheBigChat() {
   for (const one of turns) {
     const row = make("li", `the-big-chat-turn from-${one.kind === "you" ? "you" : "them"} `
       + (one.kind === "between" ? "between" : ""));
-    row.append(aFaceFor(one.kind));
+    const speaker = theSwarmAgent(one.speakerId) || agent;
+    if (one.kind !== "you") styleForAgent(row, speaker);
+    row.append(aFaceFor(one.kind, speaker));
     const what = make("div", "the-big-chat-what");
-    what.append(make("span", "the-big-chat-who", `${one.who}${one.at ? ` | ${one.at}` : ""}`));
-    what.append(make("p", "", one.text));
+    const heading = make("div", "the-big-chat-turn-head");
+    heading.append(make("span", "the-big-chat-who", `${one.who}${one.at ? ` | ${one.at}` : ""}`));
+    const phase = chatPhaseName(one.phase);
+    if (phase) heading.append(make("span", `chat-turn-phase phase-${one.phase}`, phase));
+    what.append(heading);
+    appendChatText(what, one.text);
+    if (Array.isArray(one.attachments) && one.attachments.length) {
+      const files = make("div", "talk-attachments");
+      for (const attached of one.attachments) {
+        files.append(make("span", "talk-attachment",
+          `${attached.image ? "Screenshot" : "File"}: ${attached.name}`));
+      }
+      what.append(files);
+    }
+    const under = [];
+    if (one.milliseconds) under.push(prettyTime(one.milliseconds));
+    if (one.route) under.push(`route ${one.route}`);
+    if (one.model) under.push(one.model);
+    if (under.length) what.append(make("p", "hint chat-turn-under", under.join(" | ")));
     row.append(what);
     list.append(row);
   }
   list.scrollTop = list.scrollHeight;
+  renderChatAttachments(theBigOne);
+  renderSwarmChatActivity(theBigOne);
   renderWhatItHasGoingOn(agent);
 }
 
@@ -7844,27 +9798,83 @@ async function signInThisAssistant(kind, button = null) {
   }
 }
 
-async function sendFromTheBigChat() {
+async function sendFromTheBigChat(mode = "auto") {
   const box = $("theBigChatBox");
   const said = box.value.trim();
-  if (!said || !theBigOne) return;
-  const button = $("theBigChatSend");
-  button.disabled = true;
-  $("theBigChatSaidBack").textContent = "Asking...";
+  if (!theBigOne) return;
+  const agentId = theBigOne;
+  const agent = theSwarmAgent(agentId);
+  if (!said) {
+    $("theBigChatSaidBack").textContent = mode === "work"
+      ? "Describe the project-file change first."
+      : mode === "collaborate"
+        ? "Type the question or task the agents should discuss first."
+        : "Type a message first.";
+    box.focus();
+    return;
+  }
+  if (!agent?.ready) {
+    $("theBigChatSaidBack").textContent = agent?.why_not || "This agent is not ready yet.";
+    return;
+  }
+  if (swarmBusy.has(agentId)) {
+    $("theBigChatSaidBack").textContent = "Still waiting for the previous answer.";
+    return;
+  }
+  if (swarmConversationSwitching.has(agentId)) {
+    $("theBigChatSaidBack").textContent = "Finishing the chat switch first.";
+    return;
+  }
+  const projectPermission = confirmProjectWork(agent, said, mode);
+  if (!projectPermission.allowed) return;
+  swarmBusy.add(agentId);
+  swarmStopping.delete(agentId);
+  nextSwarmChatRevision(agentId);
+  setWhatCanBePressedInSwarm();
+  const buttons = ["theBigChatSend", "theBigChatAttach", "theBigChatCollaborate", "theBigChatWork"]
+    .map($).filter(Boolean);
+  buttons.forEach((button) => { button.disabled = true; });
+  const attachmentKey = swarmChatKey(agentId);
+  const attachments = swarmChatAttachments.get(attachmentKey) || [];
+  const activity = beginSwarmChatActivity(agentId, mode, agent, said, attachments);
+  $("theBigChatSaidBack").textContent = mode === "auto"
+    ? "Deciding whether connected agents should help..."
+    : mode === "chat" ? "Asking..."
+    : mode === "collaborate" ? "Relaying to connected agents..."
+    : "Planning and validating file changes...";
   try {
+    const conversation = activeConversationFor(agentId);
     const answered = await request("/api/swarm/say", {
-      method: "POST", body: JSON.stringify({agent: theBigOne, text: said}),
+      method: "POST", body: JSON.stringify({
+        agent: agentId, text: said, mode, attachments, activity: activity.id,
+        chat: conversation?.id || "",
+        allow_project_changes: projectPermission.confirmed,
+      }),
     });
+    finishSwarmChatActivity(agentId, true);
     box.value = "";
-    const held = swarmChats.find((one) => one.agent === theBigOne);
-    if (held) held.said = answered.said || [];
-    $("theBigChatSaidBack").textContent = "";
-    renderTheBigChat();
+    swarmChatAttachments.delete(attachmentKey);
+    renderChatAttachments(agentId);
+    keepWhatWasSaidTo(agentId, answered.said || [], conversation?.id || "");
+    $("theBigChatSaidBack").textContent = answered.changed?.length
+      ? `Applied ${answered.changed.length} file change(s).`
+      : answered.routing?.requested === "auto" && answered.routing?.selected === "collaborate"
+        ? `Automatically involved ${answered.collaborated_with?.length || 0} connected agent(s).`
+      : answered.collaborated_with?.length
+        ? `Heard ${answered.collaborated_with.length} connected agent(s).`
+        : answered.routing?.reason || "Answered directly.";
     refreshSwarm(true);
   } catch (trouble) {
-    $("theBigChatSaidBack").textContent = String(trouble.message || trouble);
+    await refreshTheChatFor(agentId);
+    const words = String(trouble.message || trouble);
+    $("theBigChatSaidBack").textContent = words;
+    if (!stoppedChatError(trouble)) showError(words);
+    finishSwarmChatActivity(agentId, false, words);
   } finally {
-    button.disabled = false;
+    swarmBusy.delete(agentId);
+    swarmStopping.delete(agentId);
+    buttons.forEach((button) => { button.disabled = false; });
+    setWhatCanBePressedInSwarm();
   }
 }
 
@@ -7874,7 +9884,18 @@ function wireUpTheTray() {
   $("theChatTrayOn").addEventListener("click", () => scrollTheTray(320));
   $("theBigChatSmall").addEventListener("click", minimiseTheBigChat);
   $("theBigChatShut").addEventListener("click", shutTheBigChat);
-  $("theBigChatSend").addEventListener("click", sendFromTheBigChat);
+  $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("auto"));
+  $("theBigChatStop").addEventListener("click", () => stopChatFor(theBigOne));
+  $("theBigChatAttach").addEventListener("click", () => $("theBigChatFiles").click());
+  $("theBigChatFiles").addEventListener("change", async () => {
+    await addChatAttachments(theBigOne, $("theBigChatFiles").files || []);
+    $("theBigChatFiles").value = "";
+  });
+  $("theBigChatProject").addEventListener("change", () => (
+    selectConversationProject(theBigOne, $("theBigChatProject").value)
+  ));
+  $("theBigChatCollaborate").addEventListener("click", () => sendFromTheBigChat("collaborate"));
+  $("theBigChatWork").addEventListener("click", () => sendFromTheBigChat("work"));
   // Escape puts it back in the tray rather than closing it, because closing
   // would throw away which chats somebody had open.
   document.addEventListener("keydown", (event) => {
@@ -7883,17 +9904,411 @@ function wireUpTheTray() {
   document.addEventListener("keydown", keepTabInsideTheBigChat);
 }
 
+// ---- ordinary provider web chats ----------------------------------------
+//
+// Electron owns the authenticated browser session.  The Python agent loop
+// owns collaboration.  This page is the small, token-protected courier
+// between them: heartbeat the routes, claim a queued turn, hand it to the
+// fixed Electron adapter, and return the visible reply.
+let webChatConnections = [];
+let webChatShown = null;
+let webChatBridgeBusy = false;
+let webChatBridgeTimer = 0;
+let webChatHeartbeatTimer = 0;
+let webChatRouteSignature = "";
+let webChatProviderChoices = [];
+let webChatAssignTarget = null;
+
+function canUseWebChats() {
+  return Boolean(window.harnessDesktop?.webChats && window.harnessDesktop?.answerWebChat);
+}
+
+function webChatBounds() {
+  const rect = $("webChatViewport").getBoundingClientRect();
+  return {x: rect.left, y: rect.top, width: rect.width, height: rect.height};
+}
+
+async function refreshWebChatProviderChoices() {
+  if (!canUseWebChats()) return [];
+  webChatProviderChoices = await window.harnessDesktop.webChatProviders();
+  if (thePickedAgent()) renderSwarmAgentPanel(thePickedAgent());
+  return webChatProviderChoices;
+}
+
+async function connectPickedAgentToWebProvider(providerId) {
+  const agent = thePickedAgent();
+  const provider = webChatProviderChoices.find((one) => one.id === providerId);
+  if (!agent || !provider) return false;
+  webChatAssignTarget = {
+    agentId: agent.id, providerId, expiresAt: Date.now() + 10 * 60 * 1000,
+  };
+  renderSwarmAgentPanel(agent);
+  sayInSwarm(`Sign in to ${provider.label} in the Nexus window, open or start a chat, then press Use this chat in Nexus.`);
+  try {
+    await window.harnessDesktop.connectWebChat(providerId);
+    return true;
+  } catch (error) {
+    webChatAssignTarget = null;
+    sayInSwarm(error.message || String(error));
+    return false;
+  }
+}
+
+async function assignSelectedWebChatToPendingAgent(chat) {
+  const target = webChatAssignTarget;
+  if (!target || target.providerId !== chat.provider || target.expiresAt < Date.now()) return false;
+  webChatAssignTarget = null;
+  const route = `web:${chat.id}`;
+  const worked = await changeTheSwarmBoard((board) => {
+    const agent = board.agents.find((one) => one.id === target.agentId);
+    if (!agent) return false;
+    agent.who = route;
+  }, () => `${chat.title || chat.provider} is now the web AI chat used by this agent.`);
+  const assigned = theSwarmAgent(target.agentId);
+  if (worked && assigned) pickSwarmBox("agent", assigned.id);
+  return worked;
+}
+
+async function heartbeatWebChats(refreshBoard = false) {
+  if (!canUseWebChats() || !token) return;
+  const before = JSON.stringify(webChatConnections);
+  webChatConnections = await window.harnessDesktop.webChats();
+  const heartbeat = await request("/api/web-chats/heartbeat", {
+    method: "POST", body: JSON.stringify({connections: webChatConnections}),
+  });
+  const routeSignature = JSON.stringify((heartbeat.routes || []).map((one) => ({
+    route: one.route, provider: one.provider, title: one.title, url: one.url,
+  })));
+  const changed = before !== JSON.stringify(webChatConnections)
+    || routeSignature !== webChatRouteSignature;
+  webChatRouteSignature = routeSignature;
+  if (!$("webChatDialog").hidden && $("webChatDialog").open) renderWebChatConnections();
+  if ((refreshBoard || changed) && !$("swarmView").hidden) {
+    await refreshSwarm(true);
+    // Conversation destinations are server-computed snapshots. An already
+    // open pair chat must be re-read too, or its header and controls can keep
+    // claiming the web agent is missing after the heartbeat made it live.
+    await Promise.all(swarmChats.map((held) => loadConversationsFor(held.agent, false)));
+  }
+}
+
+async function serviceWebChatBridge() {
+  if (!canUseWebChats() || !token || webChatBridgeBusy) return;
+  webChatBridgeBusy = true;
+  try {
+    await heartbeatWebChats();
+    const pending = await request("/api/web-chats/pending");
+    await Promise.all((pending.requests || []).map(async (one) => {
+      const started = performance.now();
+      let answer = "";
+      let error = "";
+      let model = "";
+      try {
+        $("webChatSaid").textContent = `Relaying a Nexus turn through ${one.route}...`;
+        const said = await window.harnessDesktop.answerWebChat(
+          one.route, one.prompt, one.attachments || [],
+          one.conversation_key || "", Boolean(one.prefer_existing_conversation));
+        answer = said.answer || "";
+        model = said.model || "";
+      } catch (trouble) {
+        error = trouble.message || String(trouble);
+      }
+      await request("/api/web-chats/complete", {method: "POST", body: JSON.stringify({
+        request_id: one.request_id, answer, error, model,
+        milliseconds: Math.round(performance.now() - started),
+      })});
+      $("webChatSaid").textContent = error
+        ? `The web relay stopped: ${error}` : `${one.route} returned its visible reply to Nexus.`;
+    }));
+  } catch (error) {
+    // The ordinary app still works in a browser, where there is deliberately
+    // no Electron bridge. A transient server restart is retried at the next
+    // heartbeat and should not cover the whole app with an unrelated error.
+    if ($("webChatDialog").open) $("webChatSaid").textContent = error.message;
+  } finally {
+    webChatBridgeBusy = false;
+  }
+}
+
+function startWebChatBridge() {
+  if (!canUseWebChats() || !token) return;
+  if (!webChatBridgeTimer) {
+    webChatBridgeTimer = window.setInterval(serviceWebChatBridge, 1200);
+  }
+  if (!webChatHeartbeatTimer) {
+    webChatHeartbeatTimer = window.setInterval(
+      () => heartbeatWebChats().catch(() => {}), 4000);
+  }
+  void serviceWebChatBridge();
+}
+
+async function addWebChatAgent(chat) {
+  const route = `web:${chat.id}`;
+  const already = theSwarmBoard().agents.find((one) => one.who === route);
+  if (already) {
+    pickSwarmBox("agent", already.id);
+    sayInSwarm(`${already.name} is already on the board and is selected now.`);
+    if ($("webChatDialog").open) $("webChatDialog").close();
+    return true;
+  }
+  const base = String(chat.title || `${chat.provider} web`).replace(/[^A-Za-z0-9 _.-]/g, " ")
+    .trim().replace(/\s+/g, " ").slice(0, 54) || `${chat.provider} web`;
+  let name = base;
+  const worked = await changeTheSwarmBoard((board) => {
+    // The Electron event and a quick press on the fallback button may queue
+    // together.  Check again when this change actually reaches the board.
+    if (board.agents.some((one) => one.who === route)) return false;
+    const taken = new Set(board.agents.map((one) => one.name.toLowerCase()));
+    name = base;
+    for (let number = 2; taken.has(name.toLowerCase()); number += 1) {
+      name = `${base.slice(0, 54 - String(number).length)} ${number}`;
+    }
+    board.agents.push({id: "", name, who: route, job: "",
+      at: aFreeSpotOnTheBoard("agent")});
+  }, () => `${name} was added to the board with the connected ${chat.provider} web chat.`);
+  const added = theSwarmBoard().agents.find((one) => one.who === route);
+  if (added) pickSwarmBox("agent", added.id);
+  if (worked && $("webChatDialog").open) $("webChatDialog").close();
+  return Boolean(added);
+}
+
+function renderWebChatConnections() {
+  const list = $("webChatConnections");
+  list.replaceChildren();
+  if (!webChatConnections.length) {
+    list.append(make("p", "hint", "No web chats are connected yet. Open a provider above, log in, choose or start a chat, then press Use this chat in Nexus."));
+    return;
+  }
+  for (const chat of webChatConnections) {
+    const card = make("article", "web-chat-connection");
+    card.append(make("strong", "", chat.title || chat.provider));
+    card.append(make("p", "hint", `${chat.provider} web chat`));
+    const actions = make("div", "button-row");
+    const show = make("button", "", chat.external ? "Show secure browser" : "Show here");
+    const open = make("button", "", "Open window");
+    const onBoard = theSwarmBoard().agents.some((one) => one.who === `web:${chat.id}`);
+    const agent = make("button", "primary", onBoard ? "On board" : "Add to board");
+    const remove = make("button", "", "Disconnect");
+    for (const button of [show, open, agent, remove]) button.type = "button";
+    show.addEventListener("click", () => showFullWebChatInsideNexus(chat.id));
+    open.addEventListener("click", () => window.harnessDesktop.openWebChatWindow(chat.id));
+    agent.disabled = onBoard;
+    agent.addEventListener("click", () => addWebChatAgent(chat));
+    remove.addEventListener("click", async () => {
+      if (!window.confirm(`Disconnect ${chat.title}? Its provider login remains in the isolated browser session.`)) return;
+      await window.harnessDesktop.removeWebChat(chat.id);
+      await heartbeatWebChats(true);
+    });
+    actions.append(show, open, agent, remove);
+    card.append(actions);
+    list.append(card);
+  }
+}
+
+async function openWebChatManager() {
+  if (!canUseWebChats()) {
+    sayInSwarm("Web AI chats are available in the Electron app. The browser version keeps desktop and command-line agents only.");
+    return;
+  }
+  const providers = await refreshWebChatProviderChoices();
+  const list = $("webChatProviders");
+  list.replaceChildren();
+  for (const provider of providers) {
+    const card = make("div", "web-chat-provider");
+    card.append(make("strong", "", provider.label));
+    if (provider.external) card.append(make(
+      "span", "hint", "Uses a Nexus-owned Chrome or Edge profile for secure sign-in."));
+    const connect = make("button", "primary", "Open sign-in or choose a chat");
+    connect.type = "button";
+    connect.addEventListener("click", () => window.harnessDesktop.connectWebChat(provider.id));
+    card.append(connect);
+    list.append(card);
+  }
+  await heartbeatWebChats();
+  renderWebChatConnections();
+  $("webChatDialog").classList.remove("is-chat-viewing");
+  $("webChatDialogTitle").textContent = "Web AI chats";
+  $("webChatSaid").textContent = webChatConnections.length
+    ? `${webChatConnections.length} web chat${webChatConnections.length === 1 ? " is" : "s are"} connected.`
+    : "Connect a provider chat above.";
+  if (!$("webChatDialog").open) $("webChatDialog").showModal();
+}
+
+async function showFullWebChatInsideNexus(
+  id, conversationKey = "", preferExisting = false
+) {
+  if (!canUseWebChats()) {
+    sayInSwarm("Full web AI chats are available inside the Electron app.");
+    return false;
+  }
+  if (!$("webChatDialog").open) await openWebChatManager();
+  else await heartbeatWebChats();
+  const chat = webChatConnections.find((one) => one.id === String(id));
+  if (!chat) {
+    const said = "That web AI chat is no longer connected. Choose it again below to view it.";
+    $("webChatSaid").textContent = said;
+    sayInSwarm(said);
+    return false;
+  }
+  if (chat.external) {
+    await window.harnessDesktop.openWebChatWindow(
+      chat.id, String(conversationKey || ""), Boolean(preferExisting));
+    const said = `${chat.title || chat.provider} opened in its secure Nexus browser window.`;
+    $("webChatSaid").textContent = said;
+    sayInSwarm(said);
+    return true;
+  }
+  webChatShown = {
+    id: chat.id,
+    conversationKey: String(conversationKey || ""),
+    preferExisting: Boolean(preferExisting),
+  };
+  $("webChatDialog").classList.add("is-chat-viewing");
+  $("webChatDialogTitle").textContent = "Full web AI chat";
+  $("webChatViewerTitle").textContent = chat.title || `${chat.provider} web chat`;
+  $("webChatViewer").hidden = false;
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  try {
+    const shown = await window.harnessDesktop.showWebChat(
+      chat.id, webChatShown.conversationKey, webChatShown.preferExisting,
+      webChatBounds());
+    if (!shown) throw new Error("The provider page could not be shown.");
+    return true;
+  } catch (error) {
+    await hideEmbeddedWebChat();
+    const said = error.message || String(error);
+    $("webChatSaid").textContent = said;
+    sayInSwarm(said);
+    return false;
+  }
+}
+
+async function hideEmbeddedWebChat() {
+  webChatShown = null;
+  $("webChatDialog").classList.remove("is-chat-viewing");
+  $("webChatDialogTitle").textContent = "Web AI chats";
+  $("webChatViewer").hidden = true;
+  if (canUseWebChats()) await window.harnessDesktop.hideWebChat();
+}
+
+async function closeWebChatManager() {
+  await hideEmbeddedWebChat();
+  $("webChatDialog").close();
+  $("swarmWebChats").focus({preventScroll: true});
+}
+
+function wireUpWebChats() {
+  $("swarmWebChats").addEventListener("click", openWebChatManager);
+  $("webChatDialogClose").addEventListener("click", closeWebChatManager);
+  $("webChatViewerClose").addEventListener("click", hideEmbeddedWebChat);
+  $("webChatOpenWindow").addEventListener("click", async () => {
+    if (!webChatShown) return;
+    await window.harnessDesktop.openWebChatWindow(
+      webChatShown.id, webChatShown.conversationKey, webChatShown.preferExisting);
+    await hideEmbeddedWebChat();
+  });
+  $("webChatDialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeWebChatManager();
+  });
+  window.addEventListener("resize", () => {
+    if (webChatShown) window.harnessDesktop.resizeWebChat(
+      webChatShown.id, webChatShown.conversationKey, webChatBounds());
+  });
+  if (window.harnessDesktop?.onWebChatsChanged) {
+    window.harnessDesktop.onWebChatsChanged(async (chats, selected) => {
+      webChatConnections = Array.isArray(chats) ? chats : [];
+      renderWebChatConnections();
+      await heartbeatWebChats(true);
+      // "Use this chat in Nexus" is the user's choice to put this web AI on
+      // the board.  Do not make them discover and press a second button in a
+      // different window before anything visible happens.
+      if (selected?.id && !(await assignSelectedWebChatToPendingAgent(selected))) {
+        await addWebChatAgent(selected);
+      }
+    });
+  }
+  if (canUseWebChats()) {
+    refreshWebChatProviderChoices().catch(() => {});
+    startWebChatBridge();
+    window.addEventListener("focus", () => void serviceWebChatBridge());
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") void serviceWebChatBridge();
+    });
+  }
+}
+
 
 function wireUpTheSwarmBoard() {
+  swarmFullScreenHomes = [$("swarmPanel"), $("theBigChat"), $("theChatTray")].map((element) => ({
+    element, parent: element.parentNode, next: element.nextSibling,
+  }));
+  makeSwarmBoardPannable();
+  $("swarmFullScreen").addEventListener("click", toggleTheSwarmFullScreen);
+  $("swarmPanelClose").addEventListener("click", closeTheSwarmPanel);
+  document.addEventListener("fullscreenchange", () => {
+    if (swarmIsFullScreen || document.fullscreenElement === $("swarmStage")) {
+      showHowTheSwarmFillsTheScreen(document.fullscreenElement === $("swarmStage"));
+    }
+  });
+  $("swarmZoomOut").addEventListener("click", () => setTheSwarmZoom(swarmZoom - 0.1));
+  $("swarmZoomReset").addEventListener("click", () => setTheSwarmZoom(1));
+  $("swarmZoomIn").addEventListener("click", () => setTheSwarmZoom(swarmZoom + 0.1));
+  $("swarmFit").addEventListener("click", fitTheWholeSwarm);
+  sayTheSwarmZoom();
   $("swarmAddAgent").addEventListener("click", addAnAgentToTheBoard);
   $("swarmAddProject").addEventListener("click", addAProjectToTheBoard);
   $("swarmRemoveAgent").addEventListener("click", removeTheSwarmAgent);
   $("swarmRemoveProject").addEventListener("click", removeTheSwarmProject);
   $("swarmTidy").addEventListener("click", tidyTheSwarmBoard);
   $("swarmRefresh").addEventListener("click", () => refreshSwarm());
+  wireUpWebChats();
   $("swarmStart").addEventListener("click", setThemGoing);
   $("swarmStop").addEventListener("click", stopThemGoing);
   $("swarmAgentSave").addEventListener("click", saveTheSwarmAgent);
+  $("swarmAgentWho").addEventListener("change", async (event) => {
+    const value = String(event.target.value || "");
+    if (value.startsWith("__connect_web__:")) {
+      const agent = thePickedAgent();
+      if (agent) await flushSwarmAgentSettings(agent.id);
+      await connectPickedAgentToWebProvider(value.slice("__connect_web__:".length));
+    } else {
+      rememberSwarmAgentSettings(0);
+    }
+  });
+  for (const id of ["swarmAgentName", "swarmAgentJob"]) {
+    $(id).addEventListener("input", () => {
+      if (id === "swarmAgentName") previewSwarmAgentAppearance();
+      rememberSwarmAgentSettings(550);
+    });
+    // Leaving a text field is a natural save boundary; do not make a quick
+    // panel switch race the debounce timer.
+    $(id).addEventListener("change", () => rememberSwarmAgentSettings(0));
+  }
+  $("swarmAgentIcon").addEventListener("change", () => {
+    previewSwarmAgentAppearance();
+    rememberSwarmAgentSettings(0);
+  });
+  for (const id of [
+    "swarmAgentColour", "swarmAgentBubbleColour",
+    "swarmAgentPictureZoom", "swarmAgentPictureHue",
+  ]) {
+    $(id).addEventListener("input", () => {
+      previewSwarmAgentAppearance();
+      rememberSwarmAgentSettings(250);
+    });
+    $(id).addEventListener("change", () => rememberSwarmAgentSettings(0));
+  }
+  $("swarmAgentPictureBrowse").addEventListener(
+    "click", () => $("swarmAgentPictureFile").click());
+  $("swarmAgentPictureFile").addEventListener("change", useAgentPictureFile);
+  $("swarmAgentPictureClear").addEventListener("click", () => {
+    swarmAgentPictureDraft = "";
+    $("swarmAgentPictureSaid").textContent =
+      "Using the fallback icon. This change is saving automatically.";
+    previewSwarmAgentAppearance();
+    rememberSwarmAgentSettings(0);
+  });
   $("swarmAgentRemove").addEventListener("click", removeTheSwarmAgent);
   $("swarmOpenChat").addEventListener("click", () => {
     const agent = thePickedAgent();
@@ -7914,6 +10329,15 @@ function wireUpTheSwarmBoard() {
   // shape has to draw them again.
   window.addEventListener("resize", () => {
     if (!$("swarmView").hidden) drawSwarmLines();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "hidden") return;
+    const agent = thePickedAgent();
+    if (agent) void flushSwarmAgentSettings(agent.id);
+  });
+  window.addEventListener("pagehide", () => {
+    const agent = thePickedAgent();
+    if (agent) void flushSwarmAgentSettings(agent.id);
   });
 }
 

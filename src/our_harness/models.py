@@ -128,6 +128,17 @@ class ProviderRequest:
     native_continuation: NativeToolContinuation | None = None
     native_function_call_outputs: list[FunctionCallOutput] = field(default_factory=list)
     reasoning_effort: str | None = None
+    # User-selected files that belong to this one request.  Adapters translate
+    # image bytes to their provider's native multimodal shape; text files are
+    # already represented in the bounded dynamic context.
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    # Opaque durable-conversation identity for stateful transports. API and
+    # command providers may ignore it; Electron web-chat providers use it to
+    # keep two Nexus chats from sharing one provider-site thread.
+    conversation_key: str = ""
+    # The first chat attached to a manually selected provider conversation may
+    # adopt that existing remote thread. Later Nexus chats always start new.
+    prefer_existing_conversation: bool = False
 
 
 @dataclass(frozen=True)

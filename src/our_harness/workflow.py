@@ -56,6 +56,7 @@ from .models import (
     RunState,
 )
 from .plugins import load_plugins
+from .persistent_memory import PersistentMemoryHooks
 from .programmatic_workspace import PersistentProgrammaticWorkspace
 from .providers import Provider, ProviderRegistry, collect_stream, create_embedding_provider, create_provider
 from .refinement import RefinementManager
@@ -973,6 +974,13 @@ class HarnessApplication:
         self.workflow_graph = built_in_workflow_graph(config, self.plugins.workflow_nodes)
         self.runner = CommandRunner(config)
         self.memory = MemoryStore(config)
+        self.persistent_memory = PersistentMemoryHooks(
+            config,
+            redact_text=self.memory.redact_text,
+            redact_value=self.memory.redact_value,
+        )
+        self._persistent_memory_context = ""
+        self._persistent_memory_consulted: list[str] = []
         self.provider: Provider = create_provider(config)
         self.provider_registry = ProviderRegistry(config)
         self.price_catalog = PriceCatalog(config)
@@ -1217,30 +1225,64 @@ class HarnessApplication:
         self.last_provider_usage = None
         self.agent_tool_session = None
         with self.transactions.locked():
+            self._consult_persistent_memory(task)
             try:
-                return self._run_task_locked(task, dry_run, graph, None)
+                result = self._run_task_locked(task, dry_run, graph, None)
+            except Exception as exc:
+                self._record_persistent_memory(task, {"state": "failed", "error": str(exc)})
+                raise
+            else:
+                self._record_persistent_memory(task, result)
+                return result
             finally:
                 self._active_run_id = ""
                 self._active_node = None
                 self._active_graph_nodes = {}
+                self._persistent_memory_context = ""
+                self._persistent_memory_consulted = []
 
     def resume_task(self, run_id: str) -> dict[str, Any]:
         self.provider_usage = []
         self.last_provider_usage = None
         self.agent_tool_session = None
         with self.transactions.locked(timeout_seconds=0.0):
-            terminal = self._terminal_run_result(run_id)
-            if terminal is not None:
-                return terminal
-            checkpoint = self.memory.load_run_checkpoint(run_id)
-            if checkpoint is None:
-                raise HarnessError(f"Run has no resumable checkpoint: {run_id}")
+            row = self.memory.connection.execute("SELECT task FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is None:
+                raise HarnessError(f"Run does not exist: {run_id}")
+            task = str(row["task"])
+            self._consult_persistent_memory(task)
             try:
-                return self._run_task_locked(checkpoint.task, False, None, checkpoint)
+                terminal = self._terminal_run_result(run_id)
+                if terminal is not None:
+                    result = terminal
+                else:
+                    checkpoint = self.memory.load_run_checkpoint(run_id)
+                    if checkpoint is None:
+                        raise HarnessError(f"Run has no resumable checkpoint: {run_id}")
+                    result = self._run_task_locked(checkpoint.task, False, None, checkpoint)
+            except Exception as exc:
+                self._record_persistent_memory(task, {"run_id": run_id, "state": "failed", "error": str(exc)})
+                raise
+            else:
+                self._record_persistent_memory(task, result)
+                return result
             finally:
                 self._active_run_id = ""
                 self._active_node = None
                 self._active_graph_nodes = {}
+                self._persistent_memory_context = ""
+                self._persistent_memory_consulted = []
+
+    def _consult_persistent_memory(self, task: str) -> None:
+        context, consulted = self.persistent_memory.before_session(task)
+        self._persistent_memory_context = context
+        self._persistent_memory_consulted = consulted
+
+    def _record_persistent_memory(self, task: str, result: dict[str, Any]) -> None:
+        safe = dict(result)
+        if self._active_run_id and "run_id" not in safe:
+            safe["run_id"] = self._active_run_id
+        self.persistent_memory.after_session(task, safe)
 
     def cancel_run(self, run_id: str, decision: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(decision, dict):
@@ -1277,6 +1319,7 @@ class HarnessApplication:
             self.memory.finish_run(run_id, "cancelled", result)
             if not self.memory.delete_run_checkpoint(run_id, expected_version=checkpoint.version):
                 raise HarnessError(f"Run checkpoint changed while cancellation was being recorded: {run_id}")
+            self._record_persistent_memory(checkpoint.task, result)
             return result
 
     def decide_run_approval(self, run_id: str, approved: bool, decision: dict[str, Any]) -> RunCheckpoint:
@@ -1554,7 +1597,12 @@ class HarnessApplication:
             deadline.check("after project detection")
             self.emit(run_id, "observation", interpreter.current, {"index": index_result, "detections": [item.to_dict() for item in detections]})
             query_vector = self._embedding(task, deadline)
-            compiled = ContextCompiler(self.config, self.memory).compile(
+            compiled = ContextCompiler(
+                self.config,
+                self.memory,
+                persistent_memory_context=self._persistent_memory_context,
+                persistent_memory_consulted=self._persistent_memory_consulted,
+            ).compile(
                 task,
                 [item.to_dict() for item in detections],
                 self.memory.events(run_id),
@@ -2133,7 +2181,12 @@ class HarnessApplication:
 
         def refreshed_context(node_id: str, route: _ProviderRoute) -> CompiledContext:
             """Compile bounded current memory at a node boundary, after prior node commits."""
-            fresh = ContextCompiler(self.config, self.memory).compile(
+            fresh = ContextCompiler(
+                self.config,
+                self.memory,
+                persistent_memory_context=self._persistent_memory_context,
+                persistent_memory_consulted=self._persistent_memory_consulted,
+            ).compile(
                 task,
                 [item.to_dict() for item in detections],
                 self.memory.events(run_id),
@@ -2156,7 +2209,12 @@ class HarnessApplication:
                 "index": index_result, "detections": [item.to_dict() for item in detections],
             })
             query_vector = self._embedding(task, deadline)
-            compiled = ContextCompiler(self.config, self.memory).compile(
+            compiled = ContextCompiler(
+                self.config,
+                self.memory,
+                persistent_memory_context=self._persistent_memory_context,
+                persistent_memory_consulted=self._persistent_memory_consulted,
+            ).compile(
                 task, [item.to_dict() for item in detections], self.memory.events(run_id),
                 query_vector, deadline,
             )
@@ -4027,7 +4085,12 @@ class HarnessApplication:
         if any(item["name"] == name for item in manager.candidates()):
             return
         try:
-            compiled = ContextCompiler(self.config, self.memory).compile(
+            compiled = ContextCompiler(
+                self.config,
+                self.memory,
+                persistent_memory_context=self._persistent_memory_context,
+                persistent_memory_consulted=self._persistent_memory_consulted,
+            ).compile(
                 "Propose a narrow supplemental instruction", [], [], deadline=deadline
             )
             value = self._request(

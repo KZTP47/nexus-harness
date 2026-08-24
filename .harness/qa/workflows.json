@@ -6191,6 +6191,25 @@
         },
         {
           "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 200; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 50)); } return false; }; window.__folderBrowseDesktop = window.harnessDesktop; window.__folderBrowsePicked = 'C:' + String.fromCharCode(92) + 'picked project'; window.__folderBrowseAnswers = [window.__folderBrowsePicked, '']; window.harnessDesktop = {pickAFolder: async () => window.__folderBrowseAnswers.shift()}; document.getElementById('swarmAddProject').click(); if (!await waitFor(() => document.getElementById('askDialog').open)) return 'the add-project dialog did not open'; const browse = document.getElementById('askDialogBrowse'); return !browse.hidden && browse.textContent.trim() === 'Browse folder…' ? 'the add-project dialog offers Browse folder' : 'the folder browser is missing from the dialog';",
+          "text": "the add-project dialog offers Browse folder",
+          "timeout_ms": 45000,
+          "note": "Expose the same secure Electron picker already used by the Projects view"
+        },
+        {
+          "do": "click",
+          "target": "#askDialogBrowse",
+          "note": "Browse for the folder instead of typing its path"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 200; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 50)); } return false; }; const input = document.getElementById('askDialogInput'); const browse = document.getElementById('askDialogBrowse'); if (!await waitFor(() => input.value === window.__folderBrowsePicked)) return 'the selected folder did not fill the path'; browse.click(); await waitFor(() => !browse.disabled); const kept = input.value === window.__folderBrowsePicked; document.getElementById('askDialogCancel').click(); await waitFor(() => !document.getElementById('askDialog').open); window.harnessDesktop = window.__folderBrowseDesktop; delete window.__folderBrowseDesktop; delete window.__folderBrowsePicked; delete window.__folderBrowseAnswers; return kept ? 'Browse folder fills the path and picker cancellation keeps it' : 'cancelling the picker erased the selected path';",
+          "text": "Browse folder fills the path and picker cancellation keeps it",
+          "timeout_ms": 45000,
+          "note": "A selected folder fills the editable field, while cancelling the native picker changes nothing"
+        },
+        {
+          "do": "run",
           "script": "const answerTheBox = async (words) => { for (let tries = 0; tries < 200; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 50)); } if (!document.getElementById('askDialog').open) return false; document.getElementById('askDialogInput').value = words; document.getElementById('askDialogOk').click(); await new Promise(r => setTimeout(r, 200)); return true; }; const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const here = (await request('/api/projects')).here.path; document.getElementById('swarmAddProject').click(); if (!await answerTheBox(here)) return 'pressing Add another project folder opened no box'; if (!await waitFor(() => document.querySelectorAll('.swarm-box.project').length === 1)) return 'the project was not added'; return 'Add another project folder puts a folder on the board';",
           "text": "Add another project folder puts a folder on the board",
           "timeout_ms": 45000,
@@ -7053,6 +7072,13 @@
         },
         {
           "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; pickSwarmBox('agent', 'agent-1'); document.getElementById('swarmAgentIcon').value = 'brain'; document.getElementById('swarmAgentColour').value = '#ff8844'; document.getElementById('swarmAgentBubbleColour').value = '#302050'; document.getElementById('swarmAgentSave').click(); const rendered = await waitFor(() => { const one = theSwarmAgent('agent-1'); const box = document.querySelector('.swarm-box[data-id=\"agent-1\"]'); return one && one.icon === 'brain' && one.colour === '#ff8844' && one.bubble_colour === '#302050' && box?.style.getPropertyValue('--agent-colour').trim() === '#ff8844' && box?.querySelectorAll('.swarm-box-pick > svg path').length === 3; }); if (!rendered) return 'the appearance settings were not saved and redrawn'; return 'icon, agent color, and bubble color are controlled in settings';",
+          "text": "icon, agent color, and bubble color are controlled in settings",
+          "timeout_ms": 45000,
+          "note": "Appearance belongs to the agent and survives a board save"
+        },
+        {
+          "do": "run",
           "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheChatFor('agent-1'); openTheChatFor('agent-2'); if (!await waitFor(() => document.querySelectorAll('.the-chat-tray-one').length === 2)) return 'the tray does not hold the open chats'; if (document.getElementById('theChatTray').hidden) return 'the tray is there and hidden'; const named = [...document.querySelectorAll('.the-chat-tray-one')].map(one => one.textContent); return named.some(one => one.includes('Tray agent one')) ? 'every open chat sits in the tray, named' : 'the tray says ' + named.join(', ');",
           "text": "every open chat sits in the tray, named",
           "timeout_ms": 45000,
@@ -7088,10 +7114,45 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; document.getElementById('theChatTrayBack').click(); document.getElementById('theChatTrayOn').click(); const real = window.request; let asked = null; window.request = async (where, how) => { if (where === '/api/swarm/say') { asked = JSON.parse(how.body); return {said: [{who: 'you', text: 'hello', at: ''}]}; } return real(where, how); }; document.getElementById('theBigChatBox').value = 'hello'; document.getElementById('theBigChatSend').click(); await waitFor(() => asked !== null); window.request = real; document.getElementById('theBigChatSmall').click(); return asked && asked.text === 'hello' ? 'the arrows move the tray and Send asks the agent' : 'sending asked for ' + JSON.stringify(asked);",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; document.getElementById('theChatTrayBack').click(); document.getElementById('theChatTrayOn').click(); const real = window.request; let asked = null; window.request = async (where, how) => { if (where === '/api/swarm/say') { asked = JSON.parse(how.body); return {said: [{who: 'you', text: 'hello', at: ''}], routing: {requested: 'auto', selected: 'chat', reason: 'direct'}}; } return real(where, how); }; document.getElementById('theBigChatBox').value = 'hello'; document.getElementById('theBigChatSend').click(); await waitFor(() => asked !== null); window.request = real; document.getElementById('theBigChatSmall').click(); return asked && asked.text === 'hello' && asked.mode === 'auto' ? 'the arrows move the tray and Send asks the agent' : 'sending asked for ' + JSON.stringify(asked);",
           "text": "the arrows move the tray and Send asks the agent",
           "timeout_ms": 45000,
           "note": "A big chat you cannot type into is a list, not a chat"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const real = window.request; let sent = null; window.request = async (where, how) => { if (where.startsWith('/api/swarm/activity?')) return {state: 'working', stage: 'Contacting 2 agents in parallel', detail: 'Nexus is relaying the request to Claude and Codex.', turns: [{who: 'them', speaker_id: 'agent-1', speaker_name: 'Tray agent one', recipient_name: 'Tray agent two', text: 'first peer reply while the lead is still working', phase: 'agent_reply'}]}; if (where === '/api/swarm/say') { sent = JSON.parse(how.body); await new Promise(r => setTimeout(r, 1250)); return {said: [{who: 'them', text: 'done', at: ''}], routing: {requested: 'auto', selected: 'collaborate', reason: 'team input helps'}, collaborated_with: [{name: 'peer'}]}; } return real(where, how); }; document.getElementById('theBigChatBox').value = 'compare both approaches'; document.getElementById('theBigChatSend').click(); const visible = await waitFor(() => { const panel = document.getElementById('theBigChatActivity'); return !panel.hidden && panel.querySelector('.chat-activity-stage').textContent.includes('Contacting 2 agents'); }); const liveTurn = await waitFor(() => [...document.querySelectorAll('#theBigChatSaid .the-big-chat-turn')].some(one => one.textContent.includes('first peer reply while the lead is still working'))); const elapsed = document.querySelector('#theBigChatActivity .chat-activity-elapsed')?.textContent || ''; const hasTrack = !!document.querySelector('#theBigChatActivity .chat-activity-track span'); const hasActivityId = !!sent?.activity; const completed = await waitFor(() => document.getElementById('theBigChatActivity').dataset.state === 'complete'); window.request = real; document.getElementById('theBigChatSmall').click(); return visible && liveTurn && hasTrack && hasActivityId && completed && elapsed.startsWith('Working') ? 'completed agent replies appear while the lead is still working' : 'progress=' + visible + ', live turn=' + liveTurn + ', track=' + hasTrack + ', activity=' + hasActivityId + ', completed=' + completed;",
+          "text": "completed agent replies appear while the lead is still working",
+          "timeout_ms": 45000,
+          "note": "A long provider request must look alive without inventing private reasoning"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const held = swarmChats.find(one => one.agent === 'agent-2'); const before = held.said; held.said = [{who: 'you', text: 'compare both approaches', at: '2026-01-01T00:00:00Z', speaker_name: 'You', recipient_name: 'GPT Codex, Claude2', phase: 'user_prompt'}, {who: 'them', text: 'Claude exact reply', at: '2026-01-01T00:00:01Z', speaker_name: 'Claude2', speaker_route: 'claude', recipient_name: 'GPT Codex', phase: 'agent_reply', model: 'claude-sonnet'}, {who: 'them', text: 'Codex first reply', at: '2026-01-01T00:00:02Z', speaker_name: 'GPT Codex', speaker_route: 'codex', recipient_name: 'Team deliberation', phase: 'lead_draft', model: 'gpt-5.5'}, {who: 'them', text: 'Combined final answer', at: '2026-01-01T00:00:03Z', speaker_name: 'GPT Codex', speaker_route: 'codex', recipient_name: 'You', phase: 'final_answer', model: 'gpt-5.5'}]; renderTheBigChat(); const rows = [...document.querySelectorAll('#theBigChatSaid .the-big-chat-turn')].map(one => one.textContent); const allVisible = rows.length === 4 && rows[0].includes('You → GPT Codex, Claude2') && rows[1].includes('Claude2 → GPT Codex') && rows[1].includes('Claude exact reply') && rows[1].includes('Connected-agent reply') && rows[1].includes('route claude') && rows[2].includes(`Lead agent's first reply`) && rows[3].includes('Final answer'); held.said = before; renderTheBigChat(); document.getElementById('theBigChatSmall').click(); return allVisible ? 'the chat shows the exact user, connected-agent, lead-draft, and final-answer turns in order' : 'the multi-agent transcript rendered as ' + JSON.stringify(rows);",
+          "text": "the chat shows the exact user, connected-agent, lead-draft, and final-answer turns in order",
+          "timeout_ms": 45000,
+          "note": "A lead summary is not a substitute for the exact connected-agent replies"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; document.getElementById('theBigChatCollaborate').click(); if (!document.getElementById('theBigChatSaidBack').textContent.includes('Type the question')) return 'an empty collaboration click still looks dead'; document.getElementById('theBigChatWork').click(); if (!document.getElementById('theBigChatSaidBack').textContent.includes('Describe the project')) return 'an empty work click still looks dead'; const compactAttach = [...document.querySelectorAll('button')].find(one => one.textContent === 'Attach'); if (!compactAttach) return 'the compact chat has no Attach button'; compactAttach.click(); document.getElementById('theBigChatAttach').click(); swarmChatAttachments.set('agent-2', [{name: 'screen.png', type: 'image/png', size: 5, data: 'data:image/png;base64,aW1hZ2U='}]); renderChatAttachments('agent-2'); const remove = [...document.querySelectorAll('#theBigChatAttachments button')].find(one => one.textContent === '×'); if (!remove) return 'the selected screenshot has no remove button'; remove.click(); if (swarmChatAttachments.has('agent-2')) return 'remove left the screenshot selected'; const realRequest = window.request; const realConfirm = window.confirm; const modes = []; window.confirm = () => true; window.request = async (where, how) => { if (where === '/api/swarm/say') { const body = JSON.parse(how.body); modes.push(body.mode); return {said: [{who: 'them', text: body.mode === 'auto' ? '```js\\nconst answer = 42;\\n```' : body.text, at: ''}], routing: {requested: body.mode, selected: body.mode === 'auto' ? 'collaborate' : body.mode, reason: 'test route'}, collaborated_with: ['auto', 'collaborate'].includes(body.mode) ? [{name: 'peer'}] : [], changed: body.mode === 'work' ? ['made.txt'] : []}; } return realRequest(where, how); }; document.getElementById('theBigChatBox').value = 'decide who should answer'; document.getElementById('theBigChatSend').click(); if (!await waitFor(() => modes.includes('auto'))) return 'Send made no automatic routing request'; const copy = document.querySelector('#theBigChatSaid .chat-code-copy'); if (!copy) return 'a fenced code answer has no Copy code button'; copy.click(); if (!await waitFor(() => ['Copied', 'Select code'].includes(copy.textContent))) return 'the code copy button gave no result'; document.getElementById('theBigChatBox').value = 'relay this'; const relay = document.getElementById('theBigChatCollaborate'); if (relay.textContent !== 'Ask connected agents') return 'the relay action is not named clearly'; relay.click(); if (!await waitFor(() => modes.includes('collaborate'))) return 'Ask connected agents sent no relay request'; document.getElementById('theBigChatBox').value = 'make a file'; document.getElementById('theBigChatWork').click(); if (!await waitFor(() => modes.includes('work'))) return 'Work together on project files sent no work request'; window.request = realRequest; window.confirm = realConfirm; const destinationButtons = [...document.querySelectorAll('.chat-destination-actions button')]; const openFull = destinationButtons.find(one => one.textContent === 'Open full Nexus chat'); if (openFull) openFull.click(); const saved = destinationButtons.find(one => one.textContent === 'Show saved transcript file'); if (saved && !saved.disabled) saved.click(); document.getElementById('theBigChatSmall').click(); return modes.join(',') === 'auto,collaborate,work' ? 'smart send, explicit actions, attachments, and code copy all work' : 'the actions sent ' + modes.join(',');",
+          "text": "smart send, explicit actions, attachments, and code copy all work",
+          "timeout_ms": 45000,
+          "note": "A green line, an attachment, and project mutation are three different authorities"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const realRequest = window.request; const realConfirm = window.confirm; let sent = null; let confirmed = 0; window.confirm = () => { confirmed += 1; return true; }; window.request = async (where, how) => { if (where === '/api/swarm/say') { sent = JSON.parse(how.body); return {said: [{who: 'you', text: sent.text, at: ''}, {who: 'them', text: 'verified', at: '', speaker_name: 'Tray agent two', recipient_name: 'You', phase: 'final_answer'}], changed: ['Claude.txt', 'Codex.txt'], goal_complete: true, routing: {requested: 'auto', selected: 'work', reason: 'explicit file task'}}; } return realRequest(where, how); }; document.getElementById('theBigChatBox').value = 'create two files in the project folder'; document.getElementById('theBigChatSend').click(); if (!await waitFor(() => sent !== null)) return 'normal Send did not route the file task'; window.request = realRequest; window.confirm = realConfirm; document.getElementById('theBigChatSmall').click(); return confirmed === 1 && sent.mode === 'auto' && sent.allow_project_changes === true ? 'normal Send confirms and authorizes explicit project work' : 'confirmation=' + confirmed + ', request=' + JSON.stringify(sent);",
+          "text": "normal Send confirms and authorizes explicit project work",
+          "timeout_ms": 45000,
+          "note": "A clear file goal uses the work architecture without making the user discover a separate button"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const held = swarmChats.find(one => one.agent === 'agent-2'); const before = held.said; held.said = [{who: 'them', text: 'replying to the team now', at: '', speaker_name: 'Tray agent one', recipient_name: 'Team deliberation', phase: 'agent_discussion'}, {who: 'them', text: 'the reviewed plan is ready', at: '', speaker_name: 'Tray agent two', recipient_name: 'Team deliberation', phase: 'agent_plan_review'}, {who: 'them', text: 'applied the first pass', at: '', speaker_name: 'Tray agent two', recipient_name: 'Team verification', phase: 'lead_execution'}, {who: 'them', text: 'one requirement is still missing', at: '', speaker_name: 'Tray agent one', recipient_name: 'Team deliberation', phase: 'agent_verification'}]; renderTheBigChat(); const words = [...document.querySelectorAll('#theBigChatSaid .the-big-chat-turn')].map(one => one.textContent).join(' | '); held.said = before; renderTheBigChat(); document.getElementById('theBigChatSmall').click(); return ['Team discussion', 'Plan review', 'Applied execution pass', 'Work verification'].every(label => words.includes(label)) ? 'discussion, execution, and verification rounds are visibly distinct' : 'the iterative transcript says ' + words;",
+          "text": "discussion, execution, and verification rounds are visibly distinct",
+          "timeout_ms": 45000,
+          "note": "The user can follow every real turn instead of receiving only a lead retelling"
         },
         {
           "do": "run",
@@ -7260,6 +7321,146 @@
       "expect": {
         "max_console_errors": 0,
         "max_page_errors": 0
+      }
+    },
+    {
+      "id": "the-right-settings-panel-follows-the-board-into-full-screen",
+      "title": "The selected board panel stays available in full screen and can be closed",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "swarm",
+        "fullscreen"
+      ],
+      "touches": [
+        "the board of agents"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 180,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"swarm\"]",
+          "note": "Open the board"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); window.__fullPanelBoardWas = (await request('/api/swarm')).board; window.__fullPanelDesktopWas = window.harnessDesktop; window.harnessDesktop = {setFullScreen: async (wanted) => wanted}; await saveBoard({agents: [{id: 'full-panel-agent', name: 'Full screen panel agent', at: {x: 80, y: 80}}], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(() => document.querySelector('.swarm-box[data-id=\"full-panel-agent\"]'))) return 'the test agent was not drawn'; document.querySelector('.swarm-box[data-id=\"full-panel-agent\"] .swarm-icon-button[data-does=\"settings\"]').click(); if (!await waitFor(() => document.getElementById('swarmPanelTitle').textContent === 'Full screen panel agent')) return 'its settings did not open'; return 'the right settings panel is ready';",
+          "text": "the right settings panel is ready",
+          "timeout_ms": 45000,
+          "note": "Open a known panel and replace only the native full-screen bridge with a deterministic browser check"
+        },
+        {
+          "do": "click",
+          "target": "#swarmFullScreen",
+          "note": "Fill the view with the board"
+        },
+        {
+          "do": "run",
+          "script": "const stage = document.getElementById('swarmStage'); const panel = document.getElementById('swarmPanel'); const close = document.getElementById('swarmPanelClose'); if (!stage.classList.contains('is-fullscreen')) return 'the board did not enter full screen'; if (panel.parentElement !== stage) return 'the right panel stayed outside the full-screen stage'; if (panel.hidden || getComputedStyle(close).display === 'none') return 'the selected panel or its Close button is missing'; return 'the right panel and Close button are visible in full screen';",
+          "text": "the right panel and Close button are visible in full screen",
+          "note": "The details panel must be inside the element that owns full screen"
+        },
+        {
+          "do": "click",
+          "target": "#swarmPanelClose",
+          "note": "Close only the right settings panel"
+        },
+        {
+          "do": "run",
+          "script": "const stage = document.getElementById('swarmStage'); const panel = document.getElementById('swarmPanel'); return panel.hidden && stage.classList.contains('is-fullscreen') && document.getElementById('swarmFullScreen').textContent === 'Exit full screen' ? 'Close gives the full board back without leaving full screen' : 'closing the panel also closed or failed to free the board';",
+          "text": "Close gives the full board back without leaving full screen",
+          "note": "Closing a panel must not be confused with closing full screen"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; document.querySelector('.swarm-box[data-id=\"full-panel-agent\"] .swarm-icon-button[data-does=\"settings\"]').click(); if (!await waitFor(() => !document.getElementById('swarmPanel').hidden)) return 'the panel stayed closed after its gear was pressed'; return document.getElementById('swarmPanel').parentElement.id === 'swarmStage' ? 'a gear reopens its panel inside full screen' : 'the panel reopened outside full screen';",
+          "text": "a gear reopens its panel inside full screen",
+          "note": "Closing is reversible: any agent, project, or line gear opens the dock again"
+        },
+        {
+          "do": "click",
+          "target": "#swarmFullScreen",
+          "note": "Return the board to the page"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (swarmIsFullScreen) showHowTheSwarmFillsTheScreen(false); if (window.__fullPanelDesktopWas === undefined) delete window.harnessDesktop; else window.harnessDesktop = window.__fullPanelDesktopWas; if (window.__fullPanelBoardWas) { await saveBoard(window.__fullPanelBoardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the original board did not return'; } return document.getElementById('swarmPanel').parentElement.id === 'swarmView' && !document.getElementById('swarmPanel').hidden ? 'the panel returned to its normal place and the board is restored' : 'the panel did not return to its normal place';",
+          "text": "the panel returned to its normal place and the board is restored",
+          "timeout_ms": 45000,
+          "always": true,
+          "note": "Restore the board and bridge even when an earlier assertion fails"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0
+      }
+    },
+    {
+      "id": "more-options-can-only-be-enabled-from-settings",
+      "title": "Settings reveals the optional second navigation row",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "settings",
+        "navigation"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "run",
+          "script": "window.localStorage.setItem(MORE_OPTIONS_KEY, 'no'); applyMoreOptionsPreference(); return document.getElementById('moreOptionsMenu').hidden ? 'More options starts disabled' : 'More options is still visible';",
+          "text": "More options starts disabled",
+          "note": "The extra navigation cannot appear until Settings enables it"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"settings\"]",
+          "note": "Open Settings, the only place that controls the extra row"
+        },
+        {
+          "do": "click",
+          "target": "#moreOptionsEnabled",
+          "note": "Enable More options"
+        },
+        {
+          "do": "run",
+          "script": "const menu = document.getElementById('moreOptionsMenu'); const names = [...menu.querySelectorAll('[data-view]')].map(one => one.textContent.trim()).join('|'); return !menu.hidden && menu.open && names === 'Checks|Workflow|Your team|Talk to them|Look it up|What it knows|History|Memory|Prompt history' ? 'the complete second row opens' : 'the row contains ' + names;",
+          "text": "the complete second row opens",
+          "note": "Every highlighted destination is under the More options dropdown"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"history\"]",
+          "note": "A button in the new row still navigates normally"
+        },
+        {
+          "do": "expect_visible",
+          "target": "#historyView",
+          "note": "History opens from the second row"
+        },
+        {
+          "do": "click",
+          "target": "[data-view=\"settings\"]",
+          "note": "Return to Settings"
+        },
+        {
+          "do": "click",
+          "target": "#moreOptionsEnabled",
+          "note": "Disable it again and leave the preference as it started"
+        },
+        {
+          "do": "expect_hidden",
+          "target": "#moreOptionsMenu",
+          "note": "Disabling the preference removes the whole dropdown"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0
       }
     }
   ]

@@ -4,10 +4,13 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from our_harness import cancellation
 from our_harness.config import load_isolated_config
 from our_harness.doctor import run_doctor
 from our_harness.models import HarnessError, ProviderRequest, ResponseFormat
@@ -95,6 +98,32 @@ else:
 
 
 class CodexCLIProviderTests(unittest.TestCase):
+    def test_stop_terminates_the_active_cli_process_tree(self) -> None:
+        token = cancellation.Cancellation()
+        errors: list[Exception] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            def run() -> None:
+                try:
+                    with cancellation.use(token):
+                        codex_cli._run_bounded(
+                            [sys.executable, "-c", "import time; time.sleep(30)"],
+                            cwd=Path(temporary), stdin_text=None,
+                            timeout_seconds=30, max_output_bytes=1000,
+                        )
+                except Exception as exc:
+                    errors.append(exc)
+
+            started = time.monotonic()
+            thread = threading.Thread(target=run)
+            thread.start()
+            time.sleep(0.2)
+            token.cancel()
+            thread.join(3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIsInstance(errors[0], cancellation.ChatCancelled)
+
     def make_provider(self, root: Path, mode: str = "ok", *, output_limit: int = 250_000):
         script = root / "fake_codex.py"
         script.write_text(FAKE_CODEX, encoding="utf-8")

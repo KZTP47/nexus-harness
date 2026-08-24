@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nexus web chat</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; }
+    body { margin: 0; min-height: 56px; overflow: hidden; background: #071922; color: #f4fbff; }
+    header { height: 56px; box-sizing: border-box; display: flex; align-items: center; gap: 9px;
+      padding: 8px 12px; border-bottom: 1px solid #315a68; }
+    strong { margin-right: auto; }
+    button { border: 1px solid #567b87; border-radius: 8px; padding: 7px 10px;
+      background: #12303b; color: inherit; cursor: pointer; }
+    button.primary { background: #6be4f5; border-color: #9bf0fb; color: #07151d; font-weight: 800; }
+    #said { max-width: 34rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: #b8ced6; }
+    #external { margin: 18px; padding: 14px 16px; border: 1px solid #315a68; border-radius: 10px;
+      background: #0b2631; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong id="title">Provider web chat</strong>
+    <span id="said" role="status">This login is separate from your normal browser. Sign in here, then start or open a chat.</span>
+    <button id="new" type="button">Start a new chat</button>
+    <button id="use" class="primary" type="button">Use this chat in Nexus</button>
+    <button id="close" type="button">Close</button>
+  </header>
+  <main id="external" hidden>
+    <strong id="externalTitle">Secure browser opened</strong>
+    <p>Finish signing in and open the Claude chat in the Chrome or Edge window. Then return here and press <b>Use this chat in Nexus</b>.</p>
+    <p>This browser has its own persistent Nexus profile, so the login survives restarts without sharing your everyday browser profile.</p>
+  </main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const provider = params.get("provider") || "Provider";
+    const external = params.get("external") === "1";
+    document.getElementById("title").textContent = `${provider} web chat`;
+    if (external) {
+      document.getElementById("external").hidden = false;
+      document.getElementById("said").textContent = "A secure Nexus browser window is handling this provider.";
+    }
+    document.getElementById("new").onclick = () => window.nexusWebChatWindow.startNew();
+    document.getElementById("use").onclick = async () => {
+      const said = document.getElementById("said");
+      try {
+        const chat = await window.nexusWebChatWindow.useCurrent();
+        said.textContent = `${chat.title} was sent to the Nexus board. You can close this window or keep using it here.`;
+      } catch (error) { said.textContent = error.message || String(error); }
+    };
+    document.getElementById("close").onclick = () => window.nexusWebChatWindow.close();
+  </script>
+</body>
+</html>

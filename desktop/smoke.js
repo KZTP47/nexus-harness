@@ -11,16 +11,16 @@ const path = require("node:path");
 
 const { _electron: electron } = require("playwright");
 
-const PROJECT = process.argv[2] || path.resolve(__dirname, "..");
+const GIVEN_PROJECT = process.argv[2] || "";
 const TIMEOUT_MS = 90000;
 
-function seedSettings() {
-  const base = process.platform === "win32"
-    ? path.join(process.env.APPDATA || os.homedir(), "our-harness-desktop")
-    : path.join(os.homedir(), ".config", "our-harness-desktop");
-  fs.mkdirSync(base, { recursive: true });
-  fs.writeFileSync(path.join(base, "settings.json"), JSON.stringify({ lastProject: PROJECT }, null, 2));
-  return base;
+function seedSettings(userData, project) {
+  fs.mkdirSync(userData, { recursive: true });
+  fs.writeFileSync(path.join(userData, "settings.json"), JSON.stringify({
+    lastProject: project,
+    lastProjectAt: new Date().toISOString(),
+  }, null, 2));
+  return userData;
 }
 
 async function main() {
@@ -30,11 +30,34 @@ async function main() {
     if (!ok) problems.push(label);
   };
 
-  seedSettings();
-  // Playwright looks for Electron beside itself, and here it lives one folder
-  // down, so hand it the path the electron package reports.
-  const executablePath = require("electron");
-  const app = await electron.launch({ args: [__dirname], executablePath, timeout: TIMEOUT_MS });
+  const smokeHome = fs.mkdtempSync(path.join(os.tmpdir(), "harness-desktop-smoke-"));
+  const configHome = path.join(smokeHome, "config");
+  const userData = path.join(smokeHome, "electron-user-data");
+  const firstProject = GIVEN_PROJECT
+    ? path.resolve(GIVEN_PROJECT)
+    : path.join(smokeHome, "First opened by desktop smoke");
+  const otherProject = path.join(smokeHome, "Last opened by desktop smoke");
+  if (!GIVEN_PROJECT) fs.mkdirSync(firstProject, { recursive: true });
+  fs.mkdirSync(otherProject, { recursive: true });
+  seedSettings(userData, firstProject);
+  // Both Electron and the Python server use these machine-level configuration
+  // roots. Keeping them temporary means a smoke run can never replace the
+  // real person's last project or their project list.
+  const environment = {
+    ...process.env,
+    APPDATA: configHome,
+    XDG_CONFIG_HOME: configHome,
+  };
+  // With no override this exercises the source app. Pointing it at the built
+  // executable runs the same restart check against what the installer ships.
+  const executablePath = process.env.HARNESS_SMOKE_EXE || require("electron");
+  const launchArguments = process.env.HARNESS_SMOKE_EXE
+    ? [`--user-data-dir=${userData}`]
+    : [__dirname, `--user-data-dir=${userData}`];
+  let app = await electron.launch({
+    args: launchArguments,
+    executablePath, env: environment, timeout: TIMEOUT_MS,
+  });
   try {
     const page = await app.firstWindow({ timeout: TIMEOUT_MS });
     const consoleErrors = [];
@@ -65,6 +88,10 @@ ${said || "(nothing)"}`
     const heading = await page.textContent("#startTitle");
     check(heading.trim() === "Welcome", "the guided view opens first");
 
+    // Checks and Workflow are optional navigation now. Turn that preference on
+    // in this isolated profile before exercising those two views.
+    await page.click('[data-view="settings"]');
+    await page.check("#moreOptionsEnabled");
     await page.click('[data-view="checks"]');
     await page.waitForSelector("#checksView:not([hidden])", { timeout: 15000 });
     check(true, "the checks view opens");
@@ -77,11 +104,35 @@ ${said || "(nothing)"}`
     await page.click('[data-view="start"]');
     await page.waitForSelector("#startView:not([hidden])", { timeout: 15000 });
 
+    await page.click("#projectBar");
+    await page.fill("#projectAddPath", otherProject);
+    await page.click("#projectAdd");
+    const row = page.locator("#projectList .project-one", { hasText: otherProject });
+    await row.getByRole("button", { name: "Work on this" }).click();
+    await page.waitForFunction(
+      (wanted) => document.getElementById("projectBarName").textContent.trim() === wanted,
+      path.basename(otherProject), { timeout: 30000 }
+    );
+    check(true, "Work on this changes the current project");
+
     check(consoleErrors.length === 0, `no browser console errors (${consoleErrors.length})`);
     check(pageErrors.length === 0, `no page script errors (${pageErrors.length})`);
     for (const text of [...consoleErrors, ...pageErrors].slice(0, 5)) console.log(`      ${text}`);
-  } finally {
     await app.close();
+    app = await electron.launch({
+      args: launchArguments,
+      executablePath, env: environment, timeout: TIMEOUT_MS,
+    });
+    const reopened = await app.firstWindow({ timeout: TIMEOUT_MS });
+    await reopened.waitForFunction(() => location.protocol === "http:", null, { timeout: TIMEOUT_MS });
+    await reopened.waitForFunction(
+      (wanted) => document.getElementById("projectBarName").textContent.trim() === wanted,
+      path.basename(otherProject), { timeout: 30000 }
+    );
+    check(true, "reopening the app returns to the project last worked on");
+  } finally {
+    await app.close().catch(() => {});
+    fs.rmSync(smokeHome, { recursive: true, force: true });
   }
 
   if (problems.length) {

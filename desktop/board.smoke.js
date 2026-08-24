@@ -78,9 +78,83 @@ async function main() {
     );
     console.log("pass  the board opens");
 
+    // This must be the app window's full screen, not only the browser API. The
+    // latter worked in a browser while the installed app's button did nothing.
+    const nativeWindow = await app.browserWindow(page);
+    await page.click("#swarmFullScreen", { timeout: 20000 });
+    await page.waitForFunction(
+      () => document.getElementById("swarmStage").classList.contains("is-fullscreen")
+        && document.getElementById("swarmFullScreen").textContent === "Exit full screen",
+      null, { timeout: 20000 }
+    );
+    if (!await nativeWindow.evaluate((window) => window.isFullScreen())) {
+      throw new Error("the board changed shape but the Electron window did not enter full screen");
+    }
+    console.log("pass  the board fills the real Electron window");
+    await page.click("#swarmFullScreen", { timeout: 20000 });
+    await page.waitForFunction(
+      () => !document.getElementById("swarmStage").classList.contains("is-fullscreen"),
+      null, { timeout: 20000 }
+    );
+
+    await page.click('[data-view="pipelines"]', { timeout: 20000 });
+    await page.waitForSelector("#pipelineNodes .pipeline-node", { timeout: 30000 });
+    await page.click("#pipelineFullScreen", { timeout: 20000 });
+    await page.waitForFunction(
+      () => document.getElementById("pipelineStage").classList.contains("is-fullscreen")
+        && document.getElementById("pipelineLibraryControls").parentElement.id === "pipelineFocusSide"
+        && document.getElementById("pipelinePalette").parentElement.id === "pipelineFocusSide",
+      null, { timeout: 20000 }
+    );
+    if (!await nativeWindow.evaluate((window) => window.isFullScreen())) {
+      throw new Error("the pipeline changed shape but the Electron window did not enter full screen");
+    }
+    console.log("pass  the pipeline, automation controls, and flow steps fill the real Electron window");
+    await page.click("#pipelineZoomOut", { timeout: 20000 });
+    await page.waitForFunction(
+      () => document.getElementById("pipelineZoomValue").textContent !== "100%",
+      null, { timeout: 20000 }
+    );
+    console.log("pass  the full-screen pipeline can zoom");
+    await page.click("#pipelineNew", { timeout: 20000 });
+    await page.waitForSelector("#askDialog[open]", { timeout: 15000 });
+    const smokeAutomation = `Blank smoke automation ${Date.now()}`;
+    await page.fill("#askDialogInput", smokeAutomation);
+    await page.click("#askDialogOk");
+    await page.waitForFunction(
+      (wanted) => document.getElementById("pipelineName").value === wanted
+        && document.querySelectorAll("#pipelineNodes .pipeline-node").length === 0
+        && [...document.querySelectorAll("#pipelineList .pipeline-saved-one")]
+          .some((button) => button.textContent === wanted && button.classList.contains("chosen")),
+      smokeAutomation, { timeout: 20000 }
+    );
+    console.log("pass  a named new automation is saved, listed, selected, and blank");
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.click("#pipelineDelete", { timeout: 20000 });
+    await page.waitForFunction(
+      (wanted) => ![...document.querySelectorAll("#pipelineList .pipeline-saved-one")]
+        .some((button) => button.textContent === wanted),
+      smokeAutomation, { timeout: 20000 }
+    );
+    await page.click("#pipelineFullScreen", { timeout: 20000 });
+    await page.waitForFunction(
+      () => !document.getElementById("pipelineStage").classList.contains("is-fullscreen")
+        && document.getElementById("pipelinePalette").parentElement.classList.contains("pipeline-side"),
+      null, { timeout: 20000 }
+    );
+    await page.click('[data-view="swarm"]', { timeout: 20000 });
+
     // What this machine's board holds, so it can be put back whatever happens.
     putBack = await page.evaluate(async () => (await request("/api/swarm")).board);
     const was = putBack.agents.length;
+
+    await page.click("#swarmAddProject", { timeout: 20000 });
+    await page.waitForSelector("#askDialog[open]", { timeout: 15000 });
+    if (!await page.locator("#askDialogBrowse").isVisible()) {
+      throw new Error("the packaged app did not offer its native folder picker");
+    }
+    console.log("pass  Add another project folder offers Browse folder in the packaged app");
+    await page.click("#askDialogCancel", { timeout: 15000 });
 
     await page.click("#swarmAddAgent", { timeout: 20000 });
     await page.waitForSelector("#askDialog[open]", { timeout: 15000 });
@@ -125,6 +199,40 @@ async function main() {
     );
     console.log("pass  the gear on the box opens its settings");
 
+    await page.click("#swarmFullScreen", { timeout: 20000 });
+    await page.waitForFunction(
+      () => document.getElementById("swarmStage").classList.contains("is-fullscreen")
+        && document.getElementById("swarmPanel").parentElement.id === "swarmStage"
+        && !document.getElementById("swarmPanel").hidden
+        && getComputedStyle(document.getElementById("swarmPanelClose")).display !== "none",
+      null, { timeout: 20000 }
+    );
+    await page.click("#swarmPanelClose", { timeout: 20000 });
+    await page.waitForFunction(
+      () => document.getElementById("swarmPanel").hidden
+        && document.getElementById("swarmStage").classList.contains("is-fullscreen"),
+      null, { timeout: 20000 }
+    );
+    if (!await nativeWindow.evaluate((window) => window.isFullScreen())) {
+      throw new Error("closing the right panel also closed the Electron window's full screen");
+    }
+    await page.click(
+      `.swarm-box[data-id="${which}"] .swarm-icon-button[data-does="settings"]`,
+      { timeout: 20000 });
+    await page.waitForFunction(
+      () => !document.getElementById("swarmPanel").hidden
+        && document.getElementById("swarmPanel").parentElement.id === "swarmStage",
+      null, { timeout: 20000 }
+    );
+    console.log("pass  the right settings panel opens, closes, and reopens inside board full screen");
+    await page.click("#swarmFullScreen", { timeout: 20000 });
+    await page.waitForFunction(
+      () => !document.getElementById("swarmStage").classList.contains("is-fullscreen")
+        && document.getElementById("swarmPanel").parentElement.id === "swarmView"
+        && !document.getElementById("swarmPanel").hidden,
+      null, { timeout: 20000 }
+    );
+
     // The chat button, and the big box it opens on the board.
     await page.click(
       `.swarm-box[data-id="${which}"] .swarm-icon-button[data-does="chat"]`,
@@ -137,6 +245,113 @@ async function main() {
       which);
     if (tall < 90) throw new Error(`the box to type in is only ${tall} tall`);
     console.log(`pass  the chat button opens a big box to type in (${tall} tall)`);
+
+    const compactStop = page.locator(
+      `.swarm-chat-card[data-agent="${which}"] .swarm-chat-stop`);
+    await compactStop.waitFor({state: "visible", timeout: 20000});
+    if (!(await compactStop.isDisabled())) {
+      throw new Error("the compact Stop button is enabled when no request is running");
+    }
+    console.log("pass  the compact agent chat always exposes Stop");
+
+    await page.getByRole("button", {name: "Open full Nexus chat"}).click();
+    await page.waitForSelector("#theBigChat:not([hidden])", {timeout: 20000});
+    const fullStop = page.locator("#theBigChatStop");
+    if (!(await fullStop.isVisible()) || !(await fullStop.isDisabled())) {
+      throw new Error("the maximised chat does not expose an idle Stop button");
+    }
+    console.log("pass  the maximised agent chat always exposes Stop");
+
+    // Metadata and transcript arrive through separate HTTP reads. Exercise
+    // their real renderer with deliberately crossed responses: a newly
+    // selected title must never retain the old chat's words, and an older list
+    // response must not restore the selection after a newer one has landed.
+    await page.evaluate(async (agentId) => {
+      const held = swarmChats.find((one) => one.agent === agentId);
+      if (!held) throw new Error("the smoke chat state disappeared");
+      const original = {
+        conversations: held.conversations,
+        conversation: held.conversation,
+        said: held.said,
+        saidFor: held.saidFor,
+      };
+      const originalRequest = request;
+      const agent = theSwarmAgent(agentId);
+      const conversation = (id, name) => ({
+        id, name, pair: [agentId], pair_agents: [{id: agentId, name: agent.name}],
+        projects: [], project: "", destination: {
+          owner_label: "Nexus Harness", connected: true,
+          provider_label: "Smoke route", route: "smoke", model: "",
+          transcript_path: "", transcript_exists: false,
+          explanation: `Synthetic ${name} destination.`,
+        },
+      });
+      const alpha = conversation("smoke-chat-alpha", "Alpha chat");
+      const beta = conversation("smoke-chat-beta", "Beta chat");
+      try {
+        nextConversationListRevision(agentId);
+        held.conversations = [alpha, beta];
+        held.conversation = alpha.id;
+        held.saidFor = alpha.id;
+        held.said = [{who: "them", text: "ALPHA TRANSCRIPT MARKER", at: ""}];
+        renderTheBigChat();
+
+        applyConversationList(agentId, {active: beta.id, chats: [alpha, beta]});
+        const visibleAfterSwitch = document.getElementById("theBigChatSaid").textContent;
+        if (!document.getElementById("theBigChatTitle").textContent.includes("Beta chat")
+            || visibleAfterSwitch.includes("ALPHA TRANSCRIPT MARKER")) {
+          throw new Error("a new chat title was rendered with the previous transcript");
+        }
+
+        held.conversation = alpha.id;
+        held.saidFor = alpha.id;
+        held.said = [];
+        renderTheBigChat();
+        let releaseOld;
+        let releaseNew;
+        const oldList = new Promise((resolve) => { releaseOld = resolve; });
+        const newList = new Promise((resolve) => { releaseNew = resolve; });
+        let listReads = 0;
+        request = async (url, options) => {
+          if (url.startsWith("/api/swarm/chats?")) {
+            listReads += 1;
+            return listReads === 1 ? oldList : newList;
+          }
+          return originalRequest(url, options);
+        };
+        const olderRead = loadConversationsFor(agentId, false);
+        const newerRead = loadConversationsFor(agentId, false);
+        releaseNew({active: beta.id, chats: [alpha, beta]});
+        await newerRead;
+        releaseOld({active: alpha.id, chats: [alpha, beta]});
+        await olderRead;
+        if (held.conversation !== beta.id) {
+          throw new Error("an older conversation-list response restored the previous selection");
+        }
+
+        keepWhatWasSaidTo(agentId,
+          [{who: "them", text: "STALE ALPHA ANSWER", at: ""}], alpha.id);
+        keepWhatWasSaidTo(agentId,
+          [{who: "them", text: "BETA TRANSCRIPT MARKER", at: ""}], beta.id);
+        const finalWords = document.getElementById("theBigChatSaid").textContent;
+        if (!finalWords.includes("BETA TRANSCRIPT MARKER")
+            || finalWords.includes("STALE ALPHA ANSWER")) {
+          throw new Error("a stale transcript response crossed into the selected chat");
+        }
+      } finally {
+        request = originalRequest;
+        held.conversations = original.conversations;
+        held.conversation = original.conversation;
+        held.said = original.said;
+        held.saidFor = original.saidFor;
+        nextConversationListRevision(agentId);
+        nextSwarmChatRevision(agentId);
+        renderTheChatThreadFor(agentId, keptTranscriptFor(agentId));
+        renderTheBigChat();
+      }
+    }, which);
+    console.log("pass  selected chat, title, project, and transcript stay atomic under stale reads");
+    await page.click("#theBigChatSmall");
 
     await page.fill(`.swarm-chat-card[data-agent="${which}"] .swarm-chat-box`,
       "Typed by a smoke check");

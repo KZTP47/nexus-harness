@@ -1,0 +1,1376 @@
+"""Explicit, provider-neutral collaboration and project-file work from the board.
+
+Ordinary chat stays conversational. Explicit actions can request collaboration
+or project work directly, while normal Send may route an unmistakable team/file
+goal into the same path after the user confirms mutation. Provider text is never
+treated as a command; file proposals cross the confined, baseline-checked
+transaction boundary owned by Nexus.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Callable
+
+from . import chat as chat_lab
+from . import cancellation
+from .changes import FileTransaction, file_sha256
+from .config import LoadedConfig
+from .models import ChangePlan, HarnessError, ResponseFormat
+from .safety import confined_path
+from .swarm import SwarmError, may_they_talk
+
+
+Progress = Callable[[str, str], None]
+LiveTurn = Callable[[dict[str, Any]], None]
+
+
+def _report(progress: Progress | None, stage: str, detail: str = "") -> None:
+    if progress:
+        progress(stage, detail)
+
+
+def _show_turn(live_turn: LiveTurn | None, turn: dict[str, Any]) -> None:
+    if live_turn:
+        live_turn(turn)
+
+
+PLAN_FORMAT = ResponseFormat("nexus_board_contribution_v1", {
+    "type": "object",
+    "properties": {
+        "contribution": {"type": "string", "maxLength": 8000},
+        "message_to_lead": {"type": "string", "maxLength": 4000},
+        "needs_files": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 240},
+        },
+    },
+    "required": ["contribution", "message_to_lead", "needs_files"],
+    "additionalProperties": False,
+})
+
+WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string", "maxLength": 12000},
+        "changes": {
+            "type": "array", "maxItems": 12,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "maxLength": 240},
+                    "content": {"type": "string", "maxLength": 500000},
+                    "reason": {"type": "string", "maxLength": 1000},
+                },
+                "required": ["path", "content", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["reply", "changes"],
+    "additionalProperties": False,
+})
+
+DISCUSSION_FORMAT = ResponseFormat("nexus_board_goal_discussion_v1", {
+    "type": "object",
+    "properties": {
+        "message": {"type": "string", "maxLength": 12000},
+        "goal_complete": {"type": "boolean"},
+        "remaining": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 500},
+        },
+    },
+    "required": ["message", "goal_complete", "remaining"],
+    "additionalProperties": False,
+})
+
+PLAN_REVIEW_FORMAT = ResponseFormat("nexus_board_plan_review_v1", {
+    "type": "object",
+    "properties": {
+        "contribution": {"type": "string", "maxLength": 8000},
+        "message_to_lead": {"type": "string", "maxLength": 4000},
+        "needs_files": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 240},
+        },
+        "ready_to_execute": {"type": "boolean"},
+        "remaining": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 500},
+        },
+    },
+    "required": [
+        "contribution", "message_to_lead", "needs_files",
+        "ready_to_execute", "remaining",
+    ],
+    "additionalProperties": False,
+})
+
+WORK_VERIFICATION_FORMAT = ResponseFormat("nexus_board_work_verification_v1", {
+    "type": "object",
+    "properties": {
+        "goal_complete": {"type": "boolean"},
+        "feedback": {"type": "string", "maxLength": 8000},
+        "remaining": {
+            "type": "array", "maxItems": 12,
+            "items": {"type": "string", "maxLength": 500},
+        },
+    },
+    "required": ["goal_complete", "feedback", "remaining"],
+    "additionalProperties": False,
+})
+
+MAX_DISCUSSION_ROUNDS = 12
+MAX_PLAN_REVIEW_ROUNDS = 12
+MAX_WORK_PASSES = 12
+
+_DIRECT_COLLABORATION = re.compile(
+    r"\b(?:work\s+together|collaborat(?:e|ion|ively)?|ask\s+(?:the\s+)?(?:other|connected)\s+agents?"
+    r"|both\s+of\s+you|all\s+of\s+you|team\s+up|peer\s+review|second\s+opinion|compare\s+your\s+answers)\b",
+    re.IGNORECASE,
+)
+_IMPLICIT_COLLABORATION = re.compile(
+    r"\b(?:independent|different|multiple|several|competing)\s+"
+    r"(?:opinions?|perspectives?|approaches?|reviews?)\b"
+    r"|\b(?:assess|analy[sz]e|evaluate|review|check|audit|verify)\b.{0,100}"
+    r"\b(?:perspectives?|trade[ -]?offs?|risks?|implementation|security|testing|design)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_REFUSE_COLLABORATION = re.compile(
+    r"\b(?:do\s+not|don't|without)\b.{0,60}\b(?:collaborat|other\s+agents?|team|peer|together)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_PROJECT_CHANGE = re.compile(
+    r"\b(?:add|build|change|create|delete|edit|fix|implement|make|modify|move|"
+    r"refactor|remove|rename|replace|update|write)\b.{0,100}"
+    r"\b(?:code|file|files|folder|project|repo|repository|script|scripts|test|tests)\b"
+    r"|\b(?:code|file|files|folder|project|repo|repository|script|scripts|test|tests)\b"
+    r".{0,100}\b(?:add|build|change|create|delete|edit|fix|implement|make|modify|"
+    r"move|refactor|remove|rename|replace|update|write)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_PROJECT_SCOPE = re.compile(
+    r"\b(?:code|file|files|folder|folders|game|project|repo|repository|script|scripts|test|tests|"
+    r"html|css|javascript|typescript|python|app|application|website|webapp)\b",
+    re.IGNORECASE,
+)
+_DIRECT_RELAY = re.compile(
+    r"\b(?:ask|contact|forward|message|pass|relay|say|send|speak|talk|tell)\b",
+    re.IGNORECASE,
+)
+
+
+def _agent(board: dict[str, Any], agent_id: str) -> dict[str, Any]:
+    for one in board.get("agents", []):
+        if isinstance(one, dict) and one.get("id") == agent_id:
+            return one
+    raise SwarmError("That agent is not on the board any more. Refresh the board.")
+
+
+def _participants(
+    board: dict[str, Any], lead: dict[str, Any], peer_id: str = ""
+) -> list[dict[str, Any]]:
+    found = [lead]
+    for one in board.get("agents", []):
+        if (
+            isinstance(one, dict)
+            and one.get("id") != lead.get("id")
+            and one.get("ready")
+            and one.get("who")
+            and may_they_talk(board, str(lead.get("id")), str(one.get("id")))
+        ):
+            found.append(one)
+    if peer_id:
+        chosen = next(
+            (one for one in found if str(one.get("id")) == peer_id), None
+        )
+        if chosen is None:
+            raise SwarmError(
+                "The other agent in this chat is not ready or no longer connected."
+            )
+        return [lead, chosen]
+    return found[:chat_lab.MOST_AT_ONCE]
+
+
+def board_context(
+    board: dict[str, Any], agent_id: str,
+    peer_id: str = "", project_id: str = "",
+) -> str:
+    """Truthful board identity for every normal chat provider."""
+
+    lead = _agent(board, agent_id)
+    project_ids = {
+        str(line.get("project")) for line in board.get("works_on", [])
+        if isinstance(line, dict) and line.get("agent") == agent_id
+    }
+    projects = [
+        one for one in board.get("projects", [])
+        if isinstance(one, dict) and str(one.get("id")) in project_ids
+    ]
+    peers = [one for one in _participants(board, lead, peer_id) if one is not lead]
+    active = next(
+        (one for one in projects if str(one.get("id")) == project_id), None
+    )
+    return (
+        "NEXUS BOARD IDENTITY (authoritative harness data)\n"
+        f"You are the board agent {lead.get('name')!r}, using provider route {lead.get('who')!r}.\n"
+        f"Your stated job: {lead.get('job') or '(none written)'}.\n"
+        "Assigned projects: "
+        + (", ".join(
+            f"{one.get('name')} ({one.get('path')})" for one in projects
+        ) or "none")
+        + "\nThis chat's active project: "
+        + (
+            f"{active.get('name')} ({active.get('path')})"
+            if active else "none selected; this chat may not change project files"
+        )
+        + "\nConnected agents Nexus may relay to: "
+        + (", ".join(
+            f"{one.get('name')} (route {one.get('who')})" for one in peers
+        ) or "none")
+        + "\nNo relay has happened merely because this list is present."
+    )
+
+
+def automatic_mode(
+    config: LoadedConfig,
+    board: dict[str, Any],
+    agent_id: str,
+    text: str,
+    progress: Progress | None = None,
+    peer_id: str = "",
+    project_id: str = "",
+) -> dict[str, str]:
+    """Choose direct chat, goal collaboration, or confirmed project work.
+
+    Routing is a local control-plane decision. It must never be sent through a
+    user-visible provider web chat: doing that exposed Nexus's JSON classifier
+    reply in the provider conversation and could race the real user turn. Clear
+    collaboration/file language and bounded expertise hints route locally;
+    everything else stays ordinary chat, the least expansive action.
+    """
+
+    lead = _agent(board, agent_id)
+    _report(
+        progress, "Deciding whether connected agents should help",
+        "Nexus is checking the request against the ready agents on the green communication lines."
+    )
+    asked = str(text or "").strip()
+    if _REFUSE_COLLABORATION.search(asked):
+        _report(progress, f"Waiting for {lead.get('name')}", "The request says to keep this chat direct.")
+        return {
+            "mode": "chat",
+            "reason": "The request explicitly says not to involve other agents.",
+        }
+    if _PROJECT_CHANGE.search(asked):
+        _report(
+            progress, "Project work selected",
+            "The request explicitly asks to change project files; Nexus will require confirmation before applying anything."
+        )
+        return {
+            "mode": "work",
+            "reason": "The request explicitly asks the connected team to change project files.",
+        }
+    peers = [
+        one for one in _participants(board, lead, peer_id)
+        if one.get("id") != agent_id
+    ]
+    if not peers:
+        _report(progress, f"Waiting for {lead.get('name')}", "No ready connected agent is available.")
+        return {
+            "mode": "chat",
+            "reason": "No ready connected agent is available, so Nexus kept this as ordinary chat.",
+        }
+    names = [str(one.get("name") or "").strip() for one in peers]
+    named_peer = next(
+        (name for name in names if name and name.casefold() in asked.casefold()), ""
+    )
+    if named_peer and _DIRECT_RELAY.search(asked):
+        _report(
+            progress, "Directed connected-agent relay selected",
+            f"Nexus will ask {lead.get('name')} first, relay its real message to {named_peer}, then return the real reply."
+        )
+        return {
+            "mode": "relay",
+            "reason": f"The request asks the selected agent to relay a message to {named_peer}.",
+        }
+    if named_peer or _DIRECT_COLLABORATION.search(asked):
+        _report(progress, "Connected-agent collaboration selected", "The request explicitly asks agents to confer.")
+        return {
+            "mode": "collaborate",
+            "reason": (
+                f"The request names connected agent {named_peer}." if named_peer
+                else "The request explicitly asks the agents to work together."
+            ),
+        }
+
+    use_team = bool(_IMPLICIT_COLLABORATION.search(asked))
+    reason = (
+        "The request asks for analysis that benefits from independent connected-agent perspectives."
+        if use_team else
+        "The request does not explicitly need another agent, so Nexus kept the conversation direct."
+    )
+    _report(
+        progress,
+        "Connected-agent collaboration selected" if use_team else f"Waiting for {lead.get('name')}",
+        reason,
+    )
+    return {
+        "mode": "collaborate" if use_team else "chat",
+        "reason": reason,
+    }
+
+
+def mentions_project_scope(text: str) -> bool:
+    """Whether an explicit Work action actually names project/file subject matter."""
+
+    return bool(_PROJECT_SCOPE.search(str(text or "")))
+
+
+def _contribution(
+    one: dict[str, Any], answer: dict[str, Any], phase: str, text: str,
+    *, recipient_id: str = "", recipient_name: str = "Team deliberation",
+) -> dict[str, Any]:
+    return {
+        "speaker_id": one.get("id"),
+        "speaker_name": one.get("name"),
+        "speaker_route": one.get("who"),
+        "recipient_id": recipient_id,
+        "recipient_name": recipient_name,
+        "text": text,
+        "milliseconds": answer.get("milliseconds", answer.get("_milliseconds", 0)),
+        "model": answer.get("model", answer.get("_model", "")),
+        "phase": phase,
+    }
+
+
+def _actual_conversation(contributions: list[dict[str, Any]]) -> str:
+    transcript = "\n\n".join(
+        f"{one.get('speaker_name') or 'An agent'} ({one.get('speaker_route') or 'unknown route'}):\n"
+        f"{one.get('text') or ''}"
+        for one in contributions
+    )
+    return transcript[-160_000:]
+
+
+def _remaining(value: dict[str, Any]) -> list[str]:
+    raw = value.get("remaining")
+    return [str(one).strip()[:500] for one in raw if str(one).strip()] if isinstance(raw, list) else []
+
+
+def _schema_problem(value: object, schema: dict[str, Any], path: str = "result") -> str:
+    """Validate the small strict JSON-schema subset used by board agents."""
+
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict):
+            return f"{path} must be an object"
+        required = schema.get("required", [])
+        missing = [str(one) for one in required if one not in value]
+        if missing:
+            return f"{path} is missing {', '.join(missing)}"
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            extra = [str(one) for one in value if one not in properties]
+            if extra:
+                return f"{path} contains unexpected {', '.join(extra)}"
+        for name, child in properties.items():
+            if name in value:
+                problem = _schema_problem(value[name], child, f"{path}.{name}")
+                if problem:
+                    return problem
+        return ""
+    if kind == "array":
+        if not isinstance(value, list):
+            return f"{path} must be an array"
+        maximum = schema.get("maxItems")
+        if isinstance(maximum, int) and len(value) > maximum:
+            return f"{path} has too many items"
+        child = schema.get("items", {})
+        for index, item in enumerate(value):
+            problem = _schema_problem(item, child, f"{path}[{index}]")
+            if problem:
+                return problem
+        return ""
+    if kind == "string":
+        if not isinstance(value, str):
+            return f"{path} must be text"
+        maximum = schema.get("maxLength")
+        if isinstance(maximum, int) and len(value) > maximum:
+            return f"{path} is too long"
+        return ""
+    if kind == "boolean" and not isinstance(value, bool):
+        return f"{path} must be true or false"
+    return ""
+
+
+def _decode(
+    answer: dict[str, Any], label: str, response_format: ResponseFormat
+) -> dict[str, Any]:
+    raw = str(answer.get("text") or "").strip().lstrip("\ufeff")
+    # API providers can enforce response_format natively; consumer web chats
+    # cannot. ChatGPT and Gemini occasionally wrap an otherwise exact JSON
+    # object in a Markdown JSON fence. Accept that presentation wrapper while
+    # retaining the same strict schema boundary below. Arbitrary prose around a
+    # payload is still rejected rather than silently reinterpreted as control.
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, re.IGNORECASE | re.DOTALL)
+    if fenced:
+        raw = fenced.group(1).strip()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HarnessError(f"{label} did not return the structured collaboration result Nexus requested") from exc
+    if not isinstance(value, dict):
+        raise HarnessError(f"{label} returned the wrong collaboration result shape")
+    problem = _schema_problem(value, response_format.schema)
+    if problem:
+        raise HarnessError(
+            f"{label} returned an invalid {response_format.name} result: {problem}"
+        )
+    return value
+
+
+def relay(
+    config: LoadedConfig,
+    board: dict[str, Any],
+    agent_id: str,
+    text: str,
+    attachments: object = None,
+    progress: Progress | None = None,
+    live_turn: LiveTurn | None = None,
+    peer_id: str = "",
+    project_id: str = "",
+    filed_as: str = "",
+    conversation_key: str = "",
+    prefer_existing_conversation: bool = False,
+) -> dict[str, Any]:
+    """Relay one real lead message to one peer, then return the real reply.
+
+    A directed relay is deliberately sequential. Broadcasting the user's raw
+    wording to every provider made peers answer identity questions addressed to
+    the lead and made it impossible to tell whether any inter-agent message had
+    actually crossed the Nexus boundary.
+    """
+
+    lead = _agent(board, agent_id)
+    participants = _participants(board, lead, peer_id)
+    peers = [one for one in participants if one.get("id") != lead.get("id")]
+    named = [
+        one for one in peers
+        if str(one.get("name") or "").strip()
+        and str(one.get("name") or "").casefold() in str(text or "").casefold()
+    ]
+    if len(named) == 1:
+        peer = named[0]
+    elif len(peers) == 1:
+        peer = peers[0]
+    else:
+        raise SwarmError("Name exactly one connected agent for this directed relay.")
+
+    public, provider_files, attachment_text = chat_lab.keep_attachments(
+        config, str(lead.get("who") or ""), attachments,
+        filed_as or str(lead.get("name") or ""),
+    )
+
+    def identity(one: dict[str, Any], paired_with: str) -> str:
+        return board_context(
+            board, str(one.get("id") or ""), paired_with, project_id,
+        )
+
+    _report(
+        progress, f"Asking {lead.get('name')} what to relay",
+        f"The user's request is addressed to {lead.get('name')}; Nexus has not contacted {peer.get('name')} yet.",
+    )
+    lead_answer = chat_lab.ask_once(
+        config, str(lead.get("who") or ""), text,
+        context=(
+            identity(lead, str(peer.get("id") or ""))
+            + "\n\nDIRECTED RELAY — LEAD TURN\n"
+            + f"The quoted user request is addressed to you, {lead.get('name')}, not to {peer.get('name')}. "
+              f"Write the exact useful message you want Nexus to relay to {peer.get('name')}. "
+              f"Do not answer as {peer.get('name')} and do not claim the relay already happened."
+            + ("\n\n" + attachment_text if attachment_text else "")
+        ),
+        provider_attachments=provider_files,
+        conversation_key=conversation_key,
+        prefer_existing_conversation=prefer_existing_conversation,
+    )
+    lead_turn = _contribution(
+        lead, lead_answer, "lead_draft", str(lead_answer.get("text") or ""),
+        recipient_id=str(peer.get("id") or ""),
+        recipient_name=str(peer.get("name") or "The connected agent"),
+    )
+    _show_turn(live_turn, {"who": "them", **lead_turn})
+
+    _report(
+        progress, f"Relaying {lead.get('name')}'s message to {peer.get('name')}",
+        "Nexus is sending the lead agent's actual words, not rebroadcasting the user's request.",
+    )
+    relayed = str(lead_answer.get("text") or "").strip()
+    peer_answer = chat_lab.ask_once(
+        config, str(peer.get("who") or ""),
+        f"Message relayed by Nexus from {lead.get('name')}:\n{relayed}",
+        context=(
+            identity(peer, str(lead.get("id") or ""))
+            + "\n\nDIRECTED RELAY — PEER TURN\n"
+            + f"The quoted task above is a real message from {lead.get('name')} to you, {peer.get('name')}. "
+              f"Reply to {lead.get('name')}. Do not treat the end user's earlier first-person wording as addressed to you, "
+              f"and never impersonate {lead.get('name')}."
+            + ("\n\n" + attachment_text if attachment_text else "")
+        ),
+        provider_attachments=provider_files,
+        conversation_key=conversation_key,
+        prefer_existing_conversation=prefer_existing_conversation,
+    )
+    peer_turn = _contribution(
+        peer, peer_answer, "agent_reply", str(peer_answer.get("text") or ""),
+        recipient_id=str(lead.get("id") or ""),
+        recipient_name=str(lead.get("name") or "The lead agent"),
+    )
+    _show_turn(live_turn, {"who": "them", **peer_turn})
+
+    _report(
+        progress, f"Waiting for {lead.get('name')} to report the relay",
+        f"{lead.get('name')} is receiving {peer.get('name')}'s actual reply and will answer the user as itself.",
+    )
+    conversation = _actual_conversation([lead_turn, peer_turn])
+    began = time.monotonic()
+    final = chat_lab.ask_once(
+        config, str(lead.get("who") or ""), text,
+        context=(
+            identity(lead, str(peer.get("id") or ""))
+            + "\n\nDIRECTED RELAY — FINAL USER REPORT\n"
+            + "Nexus completed this relay. Here is the exact exchange:\n"
+            + conversation
+            + f"\n\nAnswer the user as {lead.get('name')}. Clearly attribute {peer.get('name')}'s real reply; "
+              f"do not answer as {peer.get('name')} and do not invent any additional relay."
+        ),
+        provider_attachments=provider_files,
+        conversation_key=conversation_key,
+        prefer_existing_conversation=prefer_existing_conversation,
+    )
+    kept = chat_lab.keep_multiparty_exchange(
+        config, str(lead.get("who") or ""), text, str(final.get("text") or ""),
+        filed_as=filed_as or str(lead.get("name") or ""),
+        lead=lead, participants=[lead, peer],
+        contributions=[lead_turn, peer_turn], attachments=public,
+        model=final.get("model", ""), milliseconds=int((time.monotonic() - began) * 1000),
+    )
+    return {
+        **kept,
+        "collaborated_with": [{
+            "id": peer.get("id"), "name": peer.get("name"), "route": peer.get("who"),
+        }],
+        "relay_complete": True,
+    }
+
+
+def _plan_state_signature(
+    participants: list[dict[str, Any]],
+    latest: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+) -> str:
+    """The actionable planning state, excluding harmless prose paraphrases."""
+
+    state = []
+    for one in participants:
+        value = latest[str(one.get("id"))][1]
+        state.append({
+            "agent": str(one.get("id") or ""),
+            "ready": value.get("ready_to_execute") is True,
+            "remaining": [item.casefold() for item in _remaining(value)],
+            "needs_files": [
+                str(path).strip().replace("\\", "/").casefold()
+                for path in value.get("needs_files", [])
+                if isinstance(path, str) and path.strip()
+            ],
+        })
+    return json.dumps(state, sort_keys=True, ensure_ascii=False)
+
+
+def collaborate(
+    config: LoadedConfig,
+    board: dict[str, Any],
+    agent_id: str,
+    text: str,
+    attachments: object = None,
+    progress: Progress | None = None,
+    live_turn: LiveTurn | None = None,
+    peer_id: str = "",
+    project_id: str = "",
+    filed_as: str = "",
+    conversation_key: str = "",
+    prefer_existing_conversation: bool = False,
+) -> dict[str, Any]:
+    lead = _agent(board, agent_id)
+    participants = _participants(board, lead, peer_id)
+    if len(participants) < 2:
+        raise SwarmError(
+            "This agent has no ready connected agent. Draw a green communicates line first."
+        )
+    public, provider_files, attachment_text = chat_lab.keep_attachments(
+        config, str(lead.get("who") or ""), attachments,
+        filed_as or str(lead.get("name") or "")
+    )
+    roster = ", ".join(str(one.get("name")) for one in participants)
+    routed_roster = ", ".join(
+        f"{one.get('name')} ({one.get('who')})" for one in participants
+    )
+    _report(
+        progress, f"Contacting {len(participants)} agents in parallel",
+        f"Nexus is relaying the request to {routed_roster}."
+    )
+
+    def first_round(one: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        is_lead = one.get("id") == lead.get("id")
+        turn_role = (
+            f"The quoted user request is addressed to you as the lead agent, {lead.get('name')}. "
+            "Give your own draft answer for the peers to review."
+            if is_lead else
+            f"The quoted user request is addressed to the lead agent, {lead.get('name')}; you are the peer {one.get('name')}. "
+            f"Give advice or a proposed reply to {lead.get('name')}. Do not reinterpret first-person or identity questions as being addressed to you."
+        )
+        context = (
+            board_context(
+                board, str(one.get("id")),
+                str(lead.get("id")) if one.get("id") != lead.get("id") else peer_id,
+                project_id,
+            )
+            + f"\n\nCOLLABORATION ROUND\nThe user explicitly asked this team to confer: {roster}. "
+            + turn_role
+            + ("\n\n" + attachment_text if attachment_text else "")
+        )
+        try:
+            return one, chat_lab.ask_once(
+                config, str(one.get("who") or ""), text,
+                context=context, provider_attachments=provider_files,
+                conversation_key=conversation_key,
+                prefer_existing_conversation=prefer_existing_conversation,
+            )
+        except cancellation.ChatCancelled:
+            raise
+        except HarnessError as exc:
+            return one, {"text": f"[This agent could not answer: {exc}]", "milliseconds": 0, "model": ""}
+
+    completed: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=len(participants)) as pool:
+        futures = [cancellation.submit(pool, first_round, one) for one in participants]
+        for future in as_completed(futures):
+            one, answer = future.result()
+            completed[str(one.get("id"))] = (one, answer)
+            _show_turn(live_turn, {
+                "who": "them",
+                "speaker_id": one.get("id"),
+                "speaker_name": one.get("name"),
+                "speaker_route": one.get("who"),
+                "recipient_id": lead.get("id"),
+                "recipient_name": lead.get("name"),
+                "text": answer.get("text"),
+                "milliseconds": answer.get("milliseconds"),
+                "model": answer.get("model"),
+                "phase": "lead_draft" if one.get("id") == agent_id else "agent_reply",
+            })
+    # The screen shows actual completion order. The lead receives stable board
+    # order so provider timing does not make otherwise identical runs drift.
+    drafts = [completed[str(one.get("id"))] for one in participants]
+    contributions = [
+        _contribution(
+            one, draft,
+            "lead_draft" if one.get("id") == agent_id else "agent_reply",
+            str(draft.get("text") or ""),
+            recipient_id=str(lead.get("id") or ""),
+            recipient_name=str(lead.get("name") or "The lead agent"),
+        )
+        for one, draft in drafts
+    ]
+    _report(
+        progress, "Starting goal-directed team discussion",
+        "Each agent will see the real conversation so far and the team will continue until everyone reports the goal complete."
+    )
+    goal_complete = False
+    remaining: list[str] = []
+    discussion_rounds = 0
+    previous_cycle = ""
+    stale_cycles = 0
+    for round_number in range(1, MAX_DISCUSSION_ROUNDS + 1):
+        discussion_rounds = round_number
+        cycle_complete = True
+        cycle_remaining: list[str] = []
+        cycle_text: list[str] = []
+        _report(
+            progress, f"Team discussion round {round_number}",
+            "Agents are responding in board order, so every later reply sees every earlier reply."
+        )
+        for one in participants:
+            is_lead = one.get("id") == lead.get("id")
+            turn_role = (
+                f"You are the lead agent {lead.get('name')}; continue toward a user-facing answer."
+                if is_lead else
+                f"You are the peer {one.get('name')}. Respond to the lead agent {lead.get('name')}, not directly to the end user. "
+                "Do not answer identity or first-person wording as though it were addressed to you."
+            )
+            context = (
+                board_context(
+                    board, str(one.get("id")),
+                    str(lead.get("id")) if one.get("id") != lead.get("id") else peer_id,
+                    project_id,
+                )
+                + "\n\nGOAL-DIRECTED TEAM CONVERSATION\n"
+                + f"Original user goal:\n{text}\n\n"
+                + "ACTUAL CONVERSATION SO FAR\n"
+                + _actual_conversation(contributions)
+                + "\n\nContinue the real conversation. Address the other agents directly when useful. "
+                  "Do not claim the goal is complete merely because you gave advice: completion means the user's requested outcome has actually been achieved. "
+                  "Set goal_complete false and list concrete remaining work whenever anything is unfinished."
+                + "\n" + turn_role
+                + ("\n\n" + attachment_text if attachment_text else "")
+            )
+            try:
+                answer = chat_lab.ask_once(
+                    config, str(one.get("who") or ""), text,
+                    context=context, provider_attachments=provider_files,
+                    response_format=DISCUSSION_FORMAT,
+                    conversation_key=conversation_key,
+                    prefer_existing_conversation=prefer_existing_conversation,
+                )
+                value = _decode(answer, str(one.get("name")), DISCUSSION_FORMAT)
+                message = str(value.get("message") or "").strip()
+                one_remaining = _remaining(value)
+                one_complete = value.get("goal_complete") is True and not one_remaining
+            except cancellation.ChatCancelled:
+                raise
+            except HarnessError as exc:
+                answer = {"milliseconds": 0, "model": ""}
+                message = f"[This agent could not continue the discussion: {exc}]"
+                one_remaining = [f"{one.get('name')} could not complete its turn."]
+                one_complete = False
+            contribution = _contribution(
+                one, answer, "agent_discussion", message,
+                recipient_name="Team deliberation",
+            )
+            contributions.append(contribution)
+            _show_turn(live_turn, {"who": "them", **contribution})
+            cycle_text.append(message.strip().casefold())
+            cycle_remaining.extend(one_remaining)
+            cycle_complete = cycle_complete and one_complete
+        remaining = list(dict.fromkeys(cycle_remaining))
+        if cycle_complete:
+            goal_complete = True
+            break
+        cycle_signature = "\n".join(cycle_text)
+        if cycle_signature == previous_cycle:
+            stale_cycles += 1
+        else:
+            stale_cycles = 0
+        previous_cycle = cycle_signature
+        if stale_cycles >= 2:
+            remaining.append("The team repeated the same discussion without making further progress.")
+            break
+
+    began = time.monotonic()
+    _report(
+        progress, f"Waiting for {lead.get('name')} to report the outcome",
+        "The lead agent is preparing a truthful completion report from the full visible discussion."
+    )
+    final = chat_lab.ask_once(
+        config,
+        str(lead.get("who") or ""),
+        text,
+        context=(
+            board_context(board, agent_id, peer_id, project_id)
+            + "\n\nFULL ACTUAL TEAM CONVERSATION\n"
+            + _actual_conversation(contributions)
+            + f"\n\nNEXUS COMPLETION STATE: {'complete' if goal_complete else 'incomplete'}"
+            + ("\nREMAINING WORK: " + "; ".join(remaining) if remaining else "")
+            + "\n\nGive the user a truthful final report. Name disagreements plainly. "
+              "If Nexus says incomplete, explicitly say the goal is incomplete and list what remains; do not present discussion or suggested work as completed work."
+            + ("\n\n" + attachment_text if attachment_text else "")
+        ),
+        provider_attachments=provider_files,
+        conversation_key=conversation_key,
+        prefer_existing_conversation=prefer_existing_conversation,
+    )
+    kept = chat_lab.keep_multiparty_exchange(
+        config,
+        str(lead.get("who") or ""),
+        text,
+        final["text"],
+        filed_as=filed_as or str(lead.get("name") or ""),
+        lead=lead,
+        participants=participants,
+        contributions=contributions,
+        attachments=public,
+        model=final.get("model", ""),
+        milliseconds=int((time.monotonic() - began) * 1000),
+    )
+    return {
+        **kept,
+        "collaborated_with": [
+            {"id": one.get("id"), "name": one.get("name"), "route": one.get("who")}
+            for one in participants if one.get("id") != agent_id
+        ],
+        "goal_complete": goal_complete,
+        "discussion_rounds": discussion_rounds,
+        "remaining": remaining,
+    }
+
+
+def _one_project(
+    board: dict[str, Any], lead: dict[str, Any], project_id: str = ""
+) -> dict[str, Any]:
+    ids = [
+        str(line.get("project")) for line in board.get("works_on", [])
+        if isinstance(line, dict) and line.get("agent") == lead.get("id")
+    ]
+    projects = [
+        one for one in board.get("projects", [])
+        if isinstance(one, dict) and str(one.get("id")) in ids
+    ]
+    if project_id:
+        projects = [one for one in projects if str(one.get("id")) == project_id]
+        if not projects:
+            raise SwarmError(
+                "The active chat project is not connected to this agent any more."
+            )
+    if not projects:
+        raise SwarmError("Connect this agent to a project folder before asking it to change files.")
+    if len(projects) != 1:
+        raise SwarmError("This agent is connected to more than one project. Leave one project connected for this file task.")
+    project = projects[0]
+    root = Path(str(project.get("path") or "")).resolve()
+    if not root.is_dir():
+        raise SwarmError("The connected project folder is not available on this machine.")
+    return project
+
+
+def _project_participants(
+    board: dict[str, Any], lead: dict[str, Any], project_id: str,
+    peer_id: str = "",
+) -> list[dict[str, Any]]:
+    assigned = {
+        str(line.get("agent")) for line in board.get("works_on", [])
+        if isinstance(line, dict) and str(line.get("project")) == project_id
+    }
+    # A communication line permits a relay.  It does not itself grant the
+    # connected agent access to a project tree; the works-on line is that
+    # separate authority.
+    return [
+        one for one in _participants(board, lead, peer_id)
+        if str(one.get("id")) in assigned
+    ]
+
+
+def _tree(root: Path) -> str:
+    paths: list[str] = []
+    skipped = {".git", ".harness", "node_modules", ".venv", "venv", "dist", "build"}
+    for folder, directories, files in os.walk(root, followlinks=False):
+        directories[:] = sorted(one for one in directories if one not in skipped)[:80]
+        base = Path(folder)
+        for name in sorted(files):
+            path = base / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                paths.append(path.relative_to(root).as_posix())
+            except (OSError, ValueError):
+                continue
+            if len(paths) >= 600:
+                return "\n".join(paths) + "\n[tree truncated]"
+    return "\n".join(paths) or "[empty project]"
+
+
+def _requested_files(root: Path, plans: list[tuple[dict[str, Any], dict[str, Any]]]) -> str:
+    wanted: list[str] = []
+    for _agent_row, plan in plans:
+        raw = plan.get("needs_files", [])
+        if isinstance(raw, list):
+            wanted.extend(str(one) for one in raw if isinstance(one, str))
+    blocks: list[str] = []
+    used = 0
+    for relative in list(dict.fromkeys(wanted))[:20]:
+        try:
+            path = confined_path(root, relative)
+            if not path.is_file() or path.is_symlink() or path.stat().st_size > 250_000:
+                continue
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except (HarnessError, OSError):
+            continue
+        if used + len(content) > 180_000:
+            break
+        blocks.append(f"FILE {relative}\n{content}")
+        used += len(content)
+    return "\n\n".join(blocks) or "[No existing file content was requested.]"
+
+
+def _plan_words(value: dict[str, Any]) -> str:
+    words = (
+        f"Contribution: {value.get('contribution') or '(none)'}\n"
+        f"Message to team: {value.get('message_to_lead') or '(none)'}\n"
+        "Requested files: "
+        + (", ".join(str(path) for path in value.get("needs_files", [])) or "none")
+    )
+    if "ready_to_execute" in value or "remaining" in value:
+        remaining = _remaining(value)
+        words += (
+            "\nExecution readiness: "
+            + ("ready" if value.get("ready_to_execute") is True else "not ready")
+            + "\nRemaining planning work: "
+            + ("; ".join(remaining) or "none")
+        )
+    return words
+
+
+def _validated_changes(root: Path, raw_changes: object) -> list[ChangePlan]:
+    if not isinstance(raw_changes, list):
+        raise HarnessError("The lead returned an invalid file change list")
+    changes: list[ChangePlan] = []
+    seen: set[str] = set()
+    for raw in raw_changes:
+        if not isinstance(raw, dict):
+            raise HarnessError("A proposed file change is malformed")
+        relative = str(raw.get("path") or "").replace("\\", "/").strip()
+        if not relative or relative in seen:
+            raise HarnessError("The proposed file changes contain a missing or duplicate path")
+        path = confined_path(root, relative)
+        if path.is_symlink():
+            raise HarnessError(f"Refusing to replace a symbolic link: {relative}")
+        seen.add(relative)
+        changes.append(ChangePlan(
+            path=relative,
+            baseline_sha256=file_sha256(path),
+            content=str(raw.get("content") or ""),
+            reason=str(raw.get("reason") or "Board work request")[:1000],
+        ))
+    return changes
+
+
+def _file_snapshot(root: Path, paths: list[str]) -> str:
+    blocks: list[str] = []
+    used = 0
+    for relative in list(dict.fromkeys(paths))[:30]:
+        try:
+            path = confined_path(root, relative)
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > 500_000:
+                continue
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except (HarnessError, OSError):
+            continue
+        if used + len(content) > 300_000:
+            break
+        blocks.append(f"FILE {relative}\n{content}")
+        used += len(content)
+    return "\n\n".join(blocks) or "[No readable changed or requested files.]"
+
+
+def work_together(
+    config: LoadedConfig,
+    board: dict[str, Any],
+    agent_id: str,
+    text: str,
+    attachments: object = None,
+    progress: Progress | None = None,
+    live_turn: LiveTurn | None = None,
+    peer_id: str = "",
+    project_id: str = "",
+    filed_as: str = "",
+    conversation_key: str = "",
+    prefer_existing_conversation: bool = False,
+) -> dict[str, Any]:
+    lead = _agent(board, agent_id)
+    project = _one_project(board, lead, project_id)
+    root = Path(str(project.get("path"))).resolve()
+    participants = _project_participants(
+        board, lead, str(project.get("id")), peer_id
+    )
+    if len(participants) < 2:
+        raise SwarmError(
+            "No ready connected agent also works on this project. Connect another ready "
+            "agent with both a green communication line and a works-on line first."
+        )
+    public, provider_files, attachment_text = chat_lab.keep_attachments(
+        config, str(lead.get("who") or ""), attachments,
+        filed_as or str(lead.get("name") or "")
+    )
+    roster = ", ".join(str(one.get("name")) for one in participants)
+    routed_roster = ", ".join(
+        f"{one.get('name')} ({one.get('who')})" for one in participants
+    )
+    began = time.monotonic()
+    _report(
+        progress, f"Collecting project plans from {len(participants)} agents",
+        f"Nexus is asking {routed_roster} for bounded proposals; no files are being changed yet."
+    )
+    common = (
+        f"EXPLICIT PROJECT-WORK REQUEST\nProject: {project.get('name')}\n"
+        "Nexus, not the provider process, owns the project-file transaction. "
+        "Paths must be relative to this project. Do not propose .git or .harness files.\n"
+        f"Team: {roster}\nPROJECT TREE\n{_tree(root)}"
+        + ("\n\n" + attachment_text if attachment_text else "")
+    )
+
+    def context_for(one: dict[str, Any]) -> str:
+        paired_with = (
+            str(lead.get("id") or "")
+            if peer_id and one.get("id") != lead.get("id") else peer_id
+        )
+        return board_context(
+            board, str(one.get("id")), paired_with, str(project.get("id"))
+        )
+
+    def plan(one: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        try:
+            answer = chat_lab.ask_once(
+                config,
+                str(one.get("who") or ""),
+                text,
+                context=context_for(one) + "\n\n" + common
+                + "\nPlan your contribution and write a message to the lead. Request only existing files you truly need.",
+                provider_attachments=provider_files,
+                response_format=PLAN_FORMAT,
+                conversation_key=conversation_key,
+                prefer_existing_conversation=prefer_existing_conversation,
+            )
+            decoded = _decode(answer, str(one.get("name")), PLAN_FORMAT)
+        except cancellation.ChatCancelled:
+            raise
+        except HarnessError as exc:
+            answer = {"milliseconds": 0, "model": ""}
+            decoded = {
+                "contribution": f"[Initial plan failed: {exc}]",
+                "message_to_lead": "Retry my planning turn during team review.",
+                "needs_files": [],
+            }
+        decoded["_milliseconds"] = int(answer.get("milliseconds") or 0)
+        decoded["_model"] = str(answer.get("model") or "")
+        return one, decoded
+
+    completed: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    with ThreadPoolExecutor(max_workers=len(participants)) as pool:
+        futures = [cancellation.submit(pool, plan, one) for one in participants]
+        for future in as_completed(futures):
+            one, value = future.result()
+            completed[str(one.get("id"))] = (one, value)
+            live_text = (
+                f"Contribution: {value.get('contribution') or '(none)'}\n"
+                f"Message to lead: {value.get('message_to_lead') or '(none)'}\n"
+                "Requested files: "
+                + (", ".join(str(path) for path in value.get("needs_files", [])) or "none")
+            )
+            _show_turn(live_turn, {
+                "who": "them",
+                "speaker_id": one.get("id"),
+                "speaker_name": one.get("name"),
+                "speaker_route": one.get("who"),
+                "recipient_id": lead.get("id"),
+                "recipient_name": lead.get("name"),
+                "text": live_text,
+                "milliseconds": value.get("_milliseconds"),
+                "model": value.get("_model"),
+                "phase": "lead_plan" if one.get("id") == agent_id else "agent_plan",
+            })
+    plans = [completed[str(one.get("id"))] for one in participants]
+    contributions = [
+        _contribution(
+            one, value,
+            "lead_plan" if one.get("id") == agent_id else "agent_plan",
+            _plan_words(value),
+            recipient_id=str(lead.get("id") or ""),
+            recipient_name=str(lead.get("name") or "The lead agent"),
+        )
+        for one, value in plans
+    ]
+
+    latest = {str(one.get("id")): (one, value) for one, value in plans}
+    previous_cycle = ""
+    stale_cycles = 0
+    plan_rounds = 0
+    plan_remaining: list[str] = []
+    for round_number in range(1, MAX_PLAN_REVIEW_ROUNDS + 1):
+        plan_rounds = round_number
+        everyone_ready = True
+        cycle_remaining: list[str] = []
+        _report(
+            progress, f"Team plan review round {round_number}",
+            "Agents are reviewing one another's real messages in order before any files change."
+        )
+        for one in participants:
+            try:
+                answer = chat_lab.ask_once(
+                    config, str(one.get("who") or ""), text,
+                    context=(
+                        context_for(one) + "\n\n" + common
+                        + "\n\nACTUAL PLAN CONVERSATION SO FAR\n"
+                        + _actual_conversation(contributions)
+                        + "\n\nReview the team plan and respond to the other agents. Improve your own contribution, "
+                          "request any existing files still needed, and set ready_to_execute only when this plan can actually fulfill the user's goal. "
+                          "ready_to_execute means no more planning or input is needed before Nexus starts the file transaction; it does not mean the files already exist. "
+                          "Execution and post-transaction verification steps belong in the plan and are not remaining planning work. "
+                          "When the plan already specifies the requested changes and how to verify them, set ready_to_execute true and remaining to an empty list."
+                    ),
+                    provider_attachments=provider_files,
+                    response_format=PLAN_REVIEW_FORMAT,
+                    conversation_key=conversation_key,
+                    prefer_existing_conversation=prefer_existing_conversation,
+                )
+                value = _decode(answer, str(one.get("name")), PLAN_REVIEW_FORMAT)
+            except cancellation.ChatCancelled:
+                raise
+            except HarnessError as exc:
+                answer = {"milliseconds": 0, "model": ""}
+                value = {
+                    "contribution": f"[Plan review failed: {exc}]",
+                    "message_to_lead": "My planning turn is still incomplete.",
+                    "needs_files": [], "ready_to_execute": False,
+                    "remaining": [f"Retry the plan review with {one.get('name')}."],
+                }
+            value["_milliseconds"] = int(answer.get("milliseconds") or 0)
+            value["_model"] = str(answer.get("model") or "")
+            latest[str(one.get("id"))] = (one, value)
+            one_remaining = _remaining(value)
+            everyone_ready = everyone_ready and value.get("ready_to_execute") is True and not one_remaining
+            cycle_remaining.extend(one_remaining)
+            words = _plan_words(value)
+            contribution = _contribution(one, value, "agent_plan_review", words)
+            contributions.append(contribution)
+            _show_turn(live_turn, {"who": "them", **contribution})
+        plan_remaining = list(dict.fromkeys(cycle_remaining))
+        if everyone_ready:
+            break
+        # Prose naturally changes when an agent paraphrases the same plan.
+        # Convergence is about the state that can still block execution:
+        # readiness, remaining work, and requested files. Comparing full prose
+        # let cosmetically different sentences reset this guard indefinitely.
+        signature = _plan_state_signature(participants, latest)
+        if signature == previous_cycle:
+            stale_cycles += 1
+        else:
+            stale_cycles = 0
+        previous_cycle = signature
+        # Two consecutive rounds with the same actionable state are enough to
+        # prove that another prose rewrite will not unblock execution.
+        if stale_cycles >= 1:
+            plan_remaining.append("The team repeated the same plan without resolving its remaining work.")
+            break
+
+    plans = [latest[str(one.get("id"))] for one in participants]
+    if not everyone_ready:
+        plan_remaining = list(dict.fromkeys(
+            plan_remaining or ["The team did not produce a valid execution-ready plan."]
+        ))
+        reply = (
+            "Nexus stopped before opening a project-file transaction because every participating agent "
+            "did not produce a valid, execution-ready plan.\nRemaining: "
+            + "; ".join(plan_remaining)
+            + "\n\nNexus applied no project-file changes."
+        )
+        kept = chat_lab.keep_multiparty_exchange(
+            config, str(lead.get("who") or ""), text, reply,
+            filed_as=filed_as or str(lead.get("name") or ""),
+            lead=lead, participants=participants, contributions=contributions,
+            attachments=public, model="",
+            milliseconds=int((time.monotonic() - began) * 1000),
+        )
+        return {
+            **kept,
+            "worked_with": [
+                {"id": one.get("id"), "name": one.get("name"), "route": one.get("who")}
+                for one in participants
+            ],
+            "project": {"id": project.get("id"), "name": project.get("name"), "path": str(root)},
+            "transaction_id": "", "transaction_ids": [], "changed": [],
+            "goal_complete": False, "plan_rounds": plan_rounds,
+            "work_passes": 0, "remaining": plan_remaining,
+        }
+    team_plans = "\n\n".join(
+        f"CURRENT PLAN FROM {one.get('name')} ({one.get('who')}):\n{_plan_words(value)}"
+        for one, value in plans
+    )
+    _report(
+        progress, "Reading the requested project files",
+        "Nexus is confining requested paths to the connected project before sharing their current contents."
+    )
+    existing = _requested_files(root, plans)
+    all_changed: list[str] = []
+    transaction_ids: list[str] = []
+    work_passes = 0
+    goal_complete = False
+    remaining = plan_remaining
+    feedback = ""
+    final_answer: dict[str, Any] = {"model": ""}
+    final: dict[str, Any] = {"reply": "The team did not produce an execution result."}
+    previous_feedback = ""
+    stale_work = 0
+    for pass_number in range(1, MAX_WORK_PASSES + 1):
+        work_passes = pass_number
+        _report(
+            progress, f"Project execution pass {pass_number}",
+            f"{lead.get('name')} is preparing complete file contents from the reviewed team plan."
+        )
+        try:
+            final_answer = chat_lab.ask_once(
+                config,
+                str(lead.get("who") or ""),
+                text,
+                context=(
+                    context_for(lead) + "\n\n" + common
+                    + "\n\nACTUAL TEAM CONVERSATION\n" + _actual_conversation(contributions)
+                    + "\n\nCURRENT TEAM PLANS\n" + team_plans
+                    + "\n\nREQUESTED/CURRENT FILES\n" + existing
+                    + ("\n\nVERIFICATION FEEDBACK FROM THE LAST PASS\n" + feedback if feedback else "")
+                    + "\n\nReturn a truthful progress reply and complete contents for every file to create or replace in this pass. "
+                      "Resolve all verification feedback. Do not return unchanged files. Nexus will atomically validate and apply the proposal."
+                ),
+                provider_attachments=provider_files,
+                response_format=WORK_FORMAT,
+                conversation_key=conversation_key,
+                prefer_existing_conversation=prefer_existing_conversation,
+            )
+            final = _decode(final_answer, str(lead.get("name")), WORK_FORMAT)
+        except cancellation.ChatCancelled:
+            raise
+        except HarnessError as exc:
+            final_answer = {"milliseconds": 0, "model": ""}
+            final = {
+                "reply": f"This execution pass could not produce a valid file proposal: {exc}",
+                "changes": [],
+            }
+        changes = _validated_changes(root, final.get("changes"))
+        pass_changed: list[str] = []
+        transaction_id = ""
+        if changes:
+            _report(
+                progress, "Validating and applying proposed project changes",
+                "Nexus is checking paths and fresh baselines before opening the atomic transaction."
+            )
+            manifest = FileTransaction(root, max_files=12, max_bytes=2_000_000).apply(changes)
+            transaction_id = str(manifest.get("transaction_id") or "")
+            if transaction_id:
+                transaction_ids.append(transaction_id)
+            pass_changed = [
+                str(one.get("path")) for one in manifest.get("changes", [])
+                if isinstance(one, dict)
+            ]
+            all_changed.extend(path for path in pass_changed if path not in all_changed)
+        execution_words = str(final.get("reply") or "Execution pass finished.").strip()
+        execution_words += "\nApplied in this pass: " + (", ".join(pass_changed) or "none")
+        execution_turn = _contribution(
+            lead, final_answer, "lead_execution", execution_words,
+            recipient_name="Team verification",
+        )
+        contributions.append(execution_turn)
+        _show_turn(live_turn, {"who": "them", **execution_turn})
+
+        requested_paths = [
+            str(path) for _one, value in plans for path in value.get("needs_files", [])
+            if isinstance(path, str)
+        ]
+        current_files = _file_snapshot(root, all_changed + requested_paths)
+        _report(
+            progress, f"Team verification pass {pass_number}",
+            "Every participating agent is checking the actual files now on disk against the original goal."
+        )
+        pass_complete = True
+        pass_remaining: list[str] = []
+        verification_feedback: list[str] = []
+        for one in participants:
+            try:
+                answer = chat_lab.ask_once(
+                    config, str(one.get("who") or ""), text,
+                    context=(
+                        context_for(one) + "\n\n" + common
+                        + "\n\nORIGINAL USER GOAL\n" + text
+                        + "\n\nACTUAL TEAM CONVERSATION\n" + _actual_conversation(contributions)
+                        + "\n\nACTUAL PROJECT TREE NOW\n" + _tree(root)
+                        + "\n\nACTUAL CHANGED/REQUESTED FILES NOW\n" + current_files
+                        + "\n\nVerify the real on-disk result, not the lead's claims. Set goal_complete true only if the whole user goal is fulfilled. "
+                          "Otherwise give specific corrective feedback and list every remaining item."
+                    ),
+                    provider_attachments=provider_files,
+                    response_format=WORK_VERIFICATION_FORMAT,
+                    conversation_key=conversation_key,
+                    prefer_existing_conversation=prefer_existing_conversation,
+                )
+                value = _decode(
+                    answer, str(one.get("name")), WORK_VERIFICATION_FORMAT
+                )
+            except cancellation.ChatCancelled:
+                raise
+            except HarnessError as exc:
+                answer = {"milliseconds": 0, "model": ""}
+                value = {
+                    "goal_complete": False,
+                    "feedback": f"[Verification failed: {exc}]",
+                    "remaining": [f"Retry verification with {one.get('name')}."],
+                }
+            one_remaining = _remaining(value)
+            one_complete = value.get("goal_complete") is True and not one_remaining
+            words = str(value.get("feedback") or "").strip()
+            if one_remaining:
+                words += "\nRemaining: " + "; ".join(one_remaining)
+            turn = _contribution(one, answer, "agent_verification", words)
+            contributions.append(turn)
+            _show_turn(live_turn, {"who": "them", **turn})
+            pass_complete = pass_complete and one_complete
+            pass_remaining.extend(one_remaining)
+            if not one_complete:
+                verification_feedback.append(f"{one.get('name')}: {words}")
+        remaining = list(dict.fromkeys(pass_remaining))
+        if pass_complete:
+            goal_complete = True
+            break
+        feedback = "\n\n".join(verification_feedback)
+        normalized_feedback = feedback.strip().casefold()
+        if normalized_feedback and normalized_feedback == previous_feedback and not pass_changed:
+            stale_work += 1
+        else:
+            stale_work = 0
+        previous_feedback = normalized_feedback
+        if stale_work >= 1:
+            remaining.append("Verification repeated without any new file change or progress.")
+            break
+        existing = _file_snapshot(root, all_changed + requested_paths)
+
+    reply = str(final.get("reply") or "Project work finished.").strip()
+    if goal_complete:
+        reply += "\n\nNexus verification: every participating agent marked the requested goal complete."
+    else:
+        reply += "\n\nNexus verification: the requested goal is still incomplete."
+        if remaining:
+            reply += "\nRemaining: " + "; ".join(remaining)
+    if all_changed:
+        reply += "\n\nNexus applied: " + ", ".join(all_changed)
+    else:
+        reply += "\n\nNexus applied no project-file changes."
+    kept = chat_lab.keep_multiparty_exchange(
+        config,
+        str(lead.get("who") or ""),
+        text,
+        reply,
+        filed_as=filed_as or str(lead.get("name") or ""),
+        lead=lead,
+        participants=participants,
+        contributions=contributions,
+        attachments=public,
+        model=final_answer.get("model", ""),
+        milliseconds=int((time.monotonic() - began) * 1000),
+    )
+    return {
+        **kept,
+        "worked_with": [
+            {"id": one.get("id"), "name": one.get("name"), "route": one.get("who")}
+            for one in participants
+        ],
+        "project": {"id": project.get("id"), "name": project.get("name"), "path": str(root)},
+        "transaction_id": transaction_ids[-1] if transaction_ids else "",
+        "transaction_ids": transaction_ids,
+        "changed": all_changed,
+        "goal_complete": goal_complete,
+        "plan_rounds": plan_rounds,
+        "work_passes": work_passes,
+        "remaining": remaining,
+    }

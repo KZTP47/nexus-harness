@@ -13,12 +13,22 @@
 # What you said to an assistant, and what it said back. Yours, and about this
 # machine, so it never goes into a repository.
 .harness/chats/
+# Machine-local memory and agent policy. These can contain private project
+# paths and must never be staged with the product source.
+.harness/vault/
+AGENTS.md
 # The report from a run of the checks. Written every time anybody runs them,
 # and about that machine at that moment, so it is nobody else's business.
 .harness/qa/full-report.json
 .harness/qa/ci-report.json
 .harness/qa/candidates.json
 .harness/transaction.lock
+
+# The private project memory lives outside this repository. These names are a
+# second boundary in case anybody accidentally copies the vault under the root.
+Persistent memory for Nexus harness project/
+Nexus Harness Memory/
+**/.nexus-project-memory.json
 
 # Dependencies and build output
 node_modules/

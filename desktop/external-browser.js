@@ -1,0 +1,259 @@
+"use strict";
+
+const fs = require("node:fs");
+const net = require("node:net");
+const path = require("node:path");
+const {spawn} = require("node:child_process");
+const {EventEmitter} = require("node:events");
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function browserCandidates(environment = process.env) {
+  const local = environment.LOCALAPPDATA || "";
+  const systemRoot = (environment.SystemDrive || "C:") + path.win32.sep;
+  const program = environment.ProgramFiles || environment.PROGRAMFILES
+    || path.win32.join(systemRoot, "Program Files");
+  const program32 = environment["ProgramFiles(x86)"] || environment.PROGRAMFILES_X86
+    || path.win32.join(systemRoot, "Program Files (x86)");
+  return [
+    {family: "chrome", executable: path.join(program, "Google", "Chrome", "Application", "chrome.exe")},
+    {family: "chrome", executable: path.join(program32, "Google", "Chrome", "Application", "chrome.exe")},
+    {family: "chrome", executable: path.join(local, "Google", "Chrome", "Application", "chrome.exe")},
+    {family: "edge", executable: path.join(program32, "Microsoft", "Edge", "Application", "msedge.exe")},
+    {family: "edge", executable: path.join(program, "Microsoft", "Edge", "Application", "msedge.exe")},
+    {family: "edge", executable: path.join(local, "Microsoft", "Edge", "Application", "msedge.exe")},
+  ];
+}
+
+function findInstalledBrowser(preferred = ["chrome", "edge"], options = {}) {
+  const exists = options.exists || fs.existsSync;
+  const candidates = options.candidates || browserCandidates(options.environment);
+  for (const family of preferred) {
+    const found = candidates.find((one) => one.family === family && exists(one.executable));
+    if (found) return found;
+  }
+  return null;
+}
+
+async function reserveLoopbackPort() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", reject);
+    server.listen({host: "127.0.0.1", port: 0, exclusive: true}, () => {
+      const address = server.address();
+      server.close((error) => error ? reject(error) : resolve(address.port));
+    });
+  });
+}
+
+class ExternalPageContents extends EventEmitter {
+  constructor(transport, initialUrl) {
+    super();
+    this.transport = transport;
+    this.url = String(initialUrl || "about:blank");
+    this.title = transport.provider.label;
+    this.closed = false;
+    this.loading = true;
+    this.page = null;
+    this.ready = transport.openPage(this.url).then(async (page) => {
+      if (this.closed) {
+        await page.close().catch(() => {});
+        throw new Error(`${transport.provider.label}'s browser page was closed`);
+      }
+      this.page = page;
+      this.url = page.url() || this.url;
+      this.title = (await page.title().catch(() => "")) || this.title;
+      this.loading = false;
+      page.on("framenavigated", async (frame) => {
+        if (frame !== page.mainFrame()) return;
+        this.url = frame.url() || this.url;
+        this.title = (await page.title().catch(() => "")) || this.title;
+        this.emit("did-navigate", {}, this.url, 200, "OK");
+        this.emit("page-title-updated", {}, this.title);
+      });
+      page.on("close", () => {
+        this.closed = true;
+        this.emit("destroyed");
+      });
+      this.emit("did-finish-load");
+      return page;
+    }).catch((error) => {
+      this.loading = false;
+      this.emit("did-fail-load", {}, -2, error.message, this.url, true);
+      throw error;
+    });
+  }
+
+  isDestroyed() { return this.closed; }
+  isLoading() { return this.loading; }
+  getURL() { return this.url; }
+  getTitle() { return this.title; }
+
+  async loadURL(url) {
+    this.url = String(url || "about:blank");
+    this.loading = true;
+    const page = await this.ready;
+    try {
+      await page.goto(this.url, {waitUntil: "domcontentloaded", timeout: 90000});
+      this.url = page.url() || this.url;
+      this.title = (await page.title().catch(() => "")) || this.title;
+      this.emit("did-navigate", {}, this.url, 200, "OK");
+      return this.url;
+    } finally {
+      this.loading = false;
+      this.emit("did-finish-load");
+    }
+  }
+
+  async executeJavaScript(script) {
+    const page = await this.ready;
+    return page.evaluate(String(script));
+  }
+
+  async pressEnter() {
+    const page = await this.ready;
+    await page.keyboard.press("Enter");
+  }
+
+  async setFiles(files) {
+    const page = await this.ready;
+    const input = page.locator("input[type=file]").last();
+    await input.waitFor({state: "attached", timeout: 5000});
+    await input.setInputFiles(files);
+  }
+
+  async bringToFront() {
+    const page = await this.ready;
+    await page.bringToFront();
+  }
+
+  close() {
+    this.closed = true;
+    if (this.page && !this.page.isClosed()) this.page.close().catch(() => {});
+  }
+}
+
+class ExternalBrowserTransport {
+  constructor(options) {
+    this.provider = options.provider;
+    this.profilePath = options.profilePath;
+    this.preferred = options.preferred || ["chrome", "edge"];
+    this.findBrowser = options.findBrowser || findInstalledBrowser;
+    this.spawn = options.spawn || spawn;
+    this.reservePort = options.reservePort || reserveLoopbackPort;
+    this.ensureDirectory = options.ensureDirectory || ((directory) => fs.mkdirSync(directory, {recursive: true}));
+    this.chromium = options.chromium || null;
+    this.browser = null;
+    this.context = null;
+    this.process = null;
+    this.port = 0;
+    this.starting = null;
+    this.initialPage = null;
+    this.initialClaimed = false;
+    this.pages = new Set();
+  }
+
+  async playwright() {
+    if (!this.chromium) this.chromium = require("playwright-core").chromium;
+    return this.chromium;
+  }
+
+  async start(initialUrl) {
+    if (this.context && this.browser?.isConnected()) return this.context;
+    if (this.starting) return this.starting;
+    this.starting = (async () => {
+      const selected = this.findBrowser(this.preferred);
+      if (!selected) throw new Error(
+        `${this.provider.label} needs Google Chrome or Microsoft Edge for its secure sign-in, but neither browser was found.`);
+      this.ensureDirectory(this.profilePath);
+      this.port = await this.reservePort();
+      const args = [
+        `--user-data-dir=${this.profilePath}`,
+        `--remote-debugging-port=${this.port}`,
+        "--remote-debugging-address=127.0.0.1",
+        "--no-first-run", "--no-default-browser-check", "--disable-session-crashed-bubble",
+        "--new-window", String(initialUrl || this.provider.home),
+      ];
+      // Do not use --enable-automation, --headless, or --remote-debugging-port=0.
+      // Claude's Cloudflare policy rejects those identities. A fixed loopback
+      // endpoint lets Nexus attach after an ordinary browser has started while
+      // navigator.webdriver remains false.
+      this.process = this.spawn(selected.executable, args, {
+        stdio: "ignore", windowsHide: false,
+      });
+      const engine = await this.playwright();
+      let lastError = null;
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (this.process.exitCode != null) throw new Error(
+          `${selected.family === "edge" ? "Microsoft Edge" : "Google Chrome"} closed before ${this.provider.label} opened.`);
+        try {
+          this.browser = await engine.connectOverCDP(`http://127.0.0.1:${this.port}`);
+          break;
+        } catch (error) {
+          lastError = error;
+          await wait(250);
+        }
+      }
+      if (!this.browser) throw new Error(
+        `Nexus could not connect to the ${this.provider.label} browser window: ${lastError?.message || "startup timed out"}`);
+      this.context = this.browser.contexts()[0];
+      this.initialPage = this.context.pages().find((page) => (
+        page.url() === "about:blank" || page.url().includes(new URL(initialUrl).hostname)
+      )) || null;
+      this.browser.on("disconnected", () => {
+        this.browser = null;
+        this.context = null;
+        this.initialPage = null;
+        for (const contents of this.pages) {
+          contents.closed = true;
+          contents.emit("destroyed");
+        }
+        this.pages.clear();
+      });
+      return this.context;
+    })().finally(() => { this.starting = null; });
+    return this.starting;
+  }
+
+  createContents(initialUrl) {
+    const contents = new ExternalPageContents(this, initialUrl);
+    this.pages.add(contents);
+    contents.once("destroyed", () => this.pages.delete(contents));
+    return contents;
+  }
+
+  async openPage(initialUrl) {
+    const context = await this.start(initialUrl);
+    let page = null;
+    if (!this.initialClaimed && this.initialPage && !this.initialPage.isClosed()) {
+      this.initialClaimed = true;
+      page = this.initialPage;
+    } else {
+      page = await context.newPage();
+      await page.goto(initialUrl, {waitUntil: "domcontentloaded", timeout: 90000});
+    }
+    if (page.url() === "about:blank") {
+      await page.goto(initialUrl, {waitUntil: "domcontentloaded", timeout: 90000});
+    }
+    await page.bringToFront();
+    return page;
+  }
+
+  async close() {
+    for (const contents of [...this.pages]) contents.close();
+    this.pages.clear();
+    // Kill immediately as well as closing CDP so an app shutdown cannot leave
+    // a controlled browser process behind while Electron's event loop exits.
+    if (this.process && this.process.exitCode == null) this.process.kill();
+    if (this.browser) await this.browser.close().catch(() => {});
+    this.browser = null;
+    this.context = null;
+    this.process = null;
+  }
+}
+
+module.exports = {
+  ExternalBrowserTransport, ExternalPageContents,
+  browserCandidates, findInstalledBrowser, reserveLoopbackPort,
+};

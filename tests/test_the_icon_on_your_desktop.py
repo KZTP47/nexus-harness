@@ -111,11 +111,86 @@ class WhichThingTheIconOpensTests(unittest.TestCase):
 
     def test_the_installed_app_wins(self) -> None:
         installed = Path("C:/somewhere/Programs/our-harness-desktop/Nexus Harness.exe")
-        with mock.patch.object(installer, "_installed_app", lambda: installed):
+        with mock.patch.object(installer, "_built_app", lambda root: None), \
+             mock.patch.object(installer, "_installed_app", lambda: installed):
             found = installer.what_to_launch(self.root, is_there=lambda where: True)
         self.assertEqual(found.program, installed)
         self.assertTrue(found.in_its_own_window)
         self.assertIn("installed", found.what_it_is)
+
+    def test_an_installed_app_that_cannot_open_this_project_is_passed_over(self) -> None:
+        """The bug somebody actually hit: an icon that opens an error page.
+
+        An installed app carries the harness from the day it was built. This
+        folder moves on, its settings name something that copy has never heard
+        of, and the app opens on a page about Python and folders - none of
+        which is wrong with the machine. There is a working app right here, so
+        the icon is pointed at that one instead.
+        """
+
+        installed = Path("C:/somewhere/Programs/our-harness-desktop/Nexus Harness.exe")
+        built = self.root / "desktop" / "build-output" / "win-unpacked" / "Nexus Harness.exe"
+        with mock.patch.object(installer, "_installed_app", lambda: installed),              mock.patch.object(installer, "_built_app", lambda root: built),              mock.patch.object(installer, "_this_copy_reads_this_project",
+                               lambda where, root: True):
+            found = installer.what_to_launch(
+                self.root,
+                is_there=lambda where: True,
+                can_it_open=lambda where, root: where != installed,
+            )
+        self.assertEqual(found.program, built)
+        self.assertEqual(found.passed_over, ())
+
+    def test_settings_no_copy_can_read_are_not_held_against_the_app(self) -> None:
+        """When every copy refuses, the settings are the problem.
+
+        Taking somebody's app window away then would fix nothing and cost them
+        the window, and the panel would say the same thing in a browser.
+        """
+
+        installed = Path("C:/somewhere/Programs/our-harness-desktop/Nexus Harness.exe")
+        with mock.patch.object(installer, "_built_app", lambda root: None), \
+             mock.patch.object(installer, "_installed_app", lambda: installed),              mock.patch.object(installer, "_this_copy_reads_this_project",
+                               lambda where, root: False):
+            found = installer.what_to_launch(
+                self.root,
+                is_there=lambda where: True,
+                can_it_open=lambda where, root: False,
+            )
+        self.assertEqual(found.program, installed)
+        self.assertEqual(found.passed_over, ())
+
+    def test_an_app_that_cannot_be_asked_is_left_alone(self) -> None:
+        """No answer is not an answer of no."""
+
+        installed = Path("C:/somewhere/Programs/our-harness-desktop/Nexus Harness.exe")
+        with mock.patch.object(installer, "_built_app", lambda root: None), \
+             mock.patch.object(installer, "_installed_app", lambda: installed):
+            found = installer.what_to_launch(
+                self.root,
+                is_there=lambda where: True,
+                can_it_open=lambda where, root: None,
+            )
+        self.assertEqual(found.program, installed)
+        self.assertEqual(found.passed_over, ())
+
+    def test_what_is_said_about_the_app_that_was_passed_over(self) -> None:
+        """It names the app, why, and the one thing to run about it."""
+
+        setup = self.root / "desktop" / "build-output" / "Nexus Harness Setup 0.1.0.exe"
+        setup.parent.mkdir(parents=True, exist_ok=True)
+        setup.write_bytes(b"")
+        installed = Path("C:/somewhere/Programs/our-harness-desktop/Nexus Harness.exe")
+        launcher = installer.Launcher(
+            program=Path(sys.executable), arguments=[], working_folder=self.root,
+            what_it_is="something that works", in_its_own_window=True,
+            icon=self.root, passed_over=(installed,),
+        )
+        lines = installer.what_to_say_about_an_app_left_behind(launcher, self.root)
+        said = os.linesep.join(lines)
+        self.assertIn(str(installed), said)
+        self.assertIn("older than", said)
+        self.assertIn(str(setup), said)
+        self.assertIn("Start menu", said, "it opens from there too, and will still fail")
 
     def test_one_built_here_is_next(self) -> None:
         built = self.root / "desktop" / "build-output" / "win-unpacked" / "Nexus Harness.exe"
@@ -168,7 +243,8 @@ class WhichThingTheIconOpensTests(unittest.TestCase):
         """So it keeps its icon if this folder is ever moved or thrown away."""
 
         installed = Path("C:/somewhere/Nexus Harness.exe")
-        with mock.patch.object(installer, "_installed_app", lambda: installed):
+        with mock.patch.object(installer, "_built_app", lambda root: None), \
+             mock.patch.object(installer, "_installed_app", lambda: installed):
             found = installer.what_to_launch(self.root, is_there=lambda where: True)
         self.assertEqual(found.icon, installed)
 

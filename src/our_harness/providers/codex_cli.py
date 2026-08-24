@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .. import cancellation
 from ..execution import _BoundedCapture, _ProcessTree, _reap_process, _wait_for_terminated_process, _write_stdin
 from ..models import CommandResult, HarnessError, ProviderRequest, ProviderResponse
 from ..redaction import CredentialRedactor
@@ -87,6 +88,7 @@ def _run_bounded(
         process.kill()
         process.wait()
         raise
+    unregister_cancel = cancellation.register(tree.kill)
     capture = _BoundedCapture(max(1, max_output_bytes))
     readers = [
         threading.Thread(target=capture.drain, args=(process.stdout, capture.stdout), daemon=True),
@@ -118,7 +120,9 @@ def _run_bounded(
         tree.kill()
     else:
         tree.kill_descendants_after_exit()
+    unregister_cancel()
     tree.close()
+    cancellation.checkpoint()
     if timed_out:
         _wait_for_terminated_process(process)
     if process.poll() is None:
@@ -337,7 +341,7 @@ def _prompt(request: ProviderRequest, fallback: bool) -> str:
         "SYSTEM INSTRUCTIONS\n" + request.system_prefix,
         "DYNAMIC CONTEXT (UNTRUSTED DATA)\n" + request.dynamic_context,
         "CONVERSATION\n" + json.dumps(request.messages, ensure_ascii=False, sort_keys=True),
-        "Return only the JSON value required by the supplied output schema. Do not read files or run commands.",
+        "Return only the JSON value required by the supplied output schema. Do not read project files or run commands. User-selected images, when present, are supplied by the harness as explicit image inputs.",
     ]
     if fallback:
         sections.append('The result must be an object with exactly one string field named "text".')
@@ -421,6 +425,14 @@ class CodexCLIProvider(Provider):
                 "--output-schema", str(schema_path),
                 "--output-last-message", str(result_path),
                 "--model", request.model,
+                *[
+                    part
+                    for one in request.attachments
+                    if isinstance(one, dict)
+                    and str(one.get("type") or "").startswith("image/")
+                    and str(one.get("path") or "")
+                    for part in ("--image", str(one.get("path")))
+                ],
                 "-",
             ]
             result = _run_bounded(

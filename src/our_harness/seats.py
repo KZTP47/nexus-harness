@@ -184,6 +184,10 @@ WHAT_TRUSTING_UNLOCKS: tuple[tuple[str, str], ...] = (
     ("qa", "addresses your checks are allowed to call"),
     ("project", "the commands the harness runs to test, lint, and build"),
     ("memory", "sending pieces of your code away to be turned into numbers"),
+    (
+        "persistent_memory",
+        "which private external folder is read before and written after every agent session",
+    ),
     ("workflow", "how many reviews a change has to survive"),
 )
 

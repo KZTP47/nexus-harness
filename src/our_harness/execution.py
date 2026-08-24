@@ -9,6 +9,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import cancellation
 from .config import LoadedConfig
 from .models import CommandResult, HarnessError
 from .safety import confined_path, safe_environment
@@ -238,6 +239,7 @@ class CommandRunner:
             process.kill()
             process.wait()
             raise
+        unregister_cancel = cancellation.register(tree.kill)
         capture = _BoundedCapture(limit)
         readers = [
             threading.Thread(target=capture.drain, args=(process.stdout, capture.stdout), daemon=True),
@@ -271,7 +273,9 @@ class CommandRunner:
             # job or killing the POSIX group prevents detached background work
             # from surviving after a successful foreground command.
             tree.kill_descendants_after_exit()
+        unregister_cancel()
         tree.close()
+        cancellation.checkpoint()
         if timed_out:
             _wait_for_terminated_process(process)
         if process.poll() is None:

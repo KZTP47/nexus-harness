@@ -738,6 +738,19 @@ def save(config: LoadedConfig, pipeline: Any) -> dict[str, Any]:
     return tidy
 
 
+def create_blank(config: LoadedConfig, name: str) -> dict[str, Any]:
+    """Create and save a new, empty pipeline without replacing an existing one."""
+
+    tidy = read_it({"name": name, "nodes": [], "edges": []})
+    path = file_for(config, tidy["name"])
+    if path.is_file():
+        raise PipelineError(
+            f"There is already an automation called {tidy['name']}. Choose a different name."
+        )
+    _write_it_whole(path, json.dumps(tidy, indent=2) + "\n")
+    return tidy
+
+
 def remove(config: LoadedConfig, name: str) -> str:
     path, held = _the_one_called(config, name)
     take_the_file_away(path)

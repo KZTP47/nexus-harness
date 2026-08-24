@@ -154,16 +154,25 @@ class NobodyLosesATurn(PanelTestCase):
         for status, said in answers:
             self.assertEqual(status, 200, said)
 
-    def test_two_sends_at_once_keep_both(self) -> None:
-        self.two_at_once(
-            ("/api/chat/say", {"who": "one", "text": "message A"}),
-            ("/api/chat/say", {"who": "one", "text": "message B"}),
-        )
+    def test_two_sends_at_once_do_not_start_two_provider_turns(self) -> None:
+        answers: list = []
+
+        def go(text: str) -> None:
+            answers.append(self.ask("/api/chat/say", {"who": "one", "text": text}))
+
+        threads = [threading.Thread(target=go, args=(text,)) for text in ("message A", "message B")]
+        for one in threads:
+            one.start()
+        for one in threads:
+            one.join(timeout=60)
+
+        self.assertEqual(sorted(status for status, _said in answers), [200, 400])
+        refused = next(said for status, said in answers if status == 400)
+        self.assertIn("already waiting", refused["error"])
         _status, said = self.ask("/api/chat?who=one")
         words = " ".join(one["text"] for one in said["said"])
-        self.assertIn("message A", words)
-        self.assertIn("message B", words)
-        self.assertEqual(len(said["said"]), 4, said["said"])
+        self.assertTrue(("message A" in words) ^ ("message B" in words), said["said"])
+        self.assertEqual(len(said["said"]), 2, said["said"])
 
     def test_asking_everyone_does_not_lose_a_turn_either(self) -> None:
         """The one the lock was missing from.

@@ -631,6 +631,18 @@ def _prompt(request: ProviderRequest) -> str:
     for message in request.messages:
         role = str(message.get("role", "user")).upper()
         sections.append(f"{role}\n{message.get('content', '')}")
+    images = [
+        str(one.get("path") or "") for one in request.attachments
+        if isinstance(one, dict)
+        and str(one.get("type") or "").startswith("image/")
+        and str(one.get("path") or "")
+    ]
+    if images:
+        sections.append(
+            "USER-SELECTED IMAGE ATTACHMENTS\n"
+            "Inspect these exact files as part of the user's message:\n"
+            + "\n".join(images)
+        )
     if request.response_format is not None:
         sections.append(
             "ANSWER FORMAT\n"
@@ -813,6 +825,25 @@ class SubscriptionCLIProvider(Provider):
         self._preflight(command, deadline_at)
         output_limit = min(2_000_000, int(self.config.get("execution.max_output_bytes")))
         argv = recipe.argv(command, str(request.model or ""))
+        image_paths = [
+            str(one.get("path") or "") for one in request.attachments
+            if isinstance(one, dict)
+            and str(one.get("type") or "").startswith("image/")
+            and str(one.get("path") or "")
+        ]
+        if image_paths and recipe.id not in {"claude-cli", "gemini-cli", "copilot-cli"}:
+            raise HarnessError(
+                f"{recipe.label} has no declared screenshot-input contract. "
+                "Use a Claude, Codex, Gemini, Copilot, API, or vision-capable Ollama route."
+            )
+        if image_paths and recipe.id == "claude-cli":
+            argv.extend(["--tools", "Read", "--allowedTools", "Read"])
+            for folder in sorted({str(Path(path).parent) for path in image_paths}):
+                argv.extend(["--add-dir", folder])
+        elif image_paths and recipe.id == "gemini-cli":
+            argv.extend(["--allowed-tools", "read_file"])
+            for folder in sorted({str(Path(path).parent) for path in image_paths}):
+                argv.extend(["--include-directories", folder])
         started = time.monotonic()
         result = _run_bounded(
             argv,

@@ -40,6 +40,50 @@ class PipelineTestCase(unittest.TestCase):
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
 
 
+class PipelineFullScreenViewTests(unittest.TestCase):
+    def setUp(self) -> None:
+        here = Path(__file__).resolve().parents[1] / "src" / "our_harness" / "ui"
+        self.markup = (here / "index.html").read_text(encoding="utf-8")
+        self.script = (here / "app.js").read_text(encoding="utf-8")
+        self.styles = (here / "styles.css").read_text(encoding="utf-8")
+
+    def test_the_automation_controls_flow_steps_and_picture_share_one_full_screen_stage(self) -> None:
+        stage = self.markup[self.markup.index('<div id="pipelineStage"'):]
+        stage = stage[:stage.index('<h3 id="pipelineLogTitle"')]
+        for element in ("pipelineFocusSide", "pipelineFullScreen", "pipelineCanvas"):
+            self.assertIn(f'id="{element}"', stage)
+        self.assertIn(".pipeline-stage.is-fullscreen", self.styles)
+        self.assertIn('$("pipelineLibraryControls")', self.script)
+        self.assertIn('$("pipelineFocusSide").append(home.element)', self.script)
+        self.assertIn("putTheFlowStepsBack()", self.script)
+
+    def test_a_named_new_automation_starts_with_a_clean_slate(self) -> None:
+        self.assertIn('id="pipelineNew"', self.markup)
+        self.assertIn('Create new automation</button>', self.markup)
+        self.assertIn('"Create new automation", "What should the new automation be called?"',
+                      self.script)
+        self.assertIn('request("/api/pipelines/create"', self.script)
+        self.assertIn("pipelineSavedName = pipeline.name", self.script)
+        self.assertIn("pipelineSaved = said.saved || []", self.script)
+
+    def test_pipeline_full_screen_uses_the_native_window_and_is_a_toggle(self) -> None:
+        self.assertIn("window.harnessDesktop?.setFullScreen", self.script)
+        self.assertIn('$("pipelineStage").classList.toggle("is-fullscreen", pipelineIsFullScreen)',
+                      self.script)
+        self.assertIn('$("pipelineFullScreen").textContent = pipelineIsFullScreen ? "Exit full screen" : "Full screen"',
+                      self.script)
+
+    def test_large_pipelines_can_be_zoomed_fitted_and_dragged(self) -> None:
+        for control in ("pipelineZoomOut", "pipelineZoomReset", "pipelineZoomIn",
+                        "pipelineFit"):
+            self.assertIn(f'id="{control}"', self.markup)
+        self.assertIn("const PIPELINE_ZOOM_MIN = 0.35", self.script)
+        self.assertIn("const PIPELINE_ZOOM_MAX = 1.8", self.script)
+        self.assertIn("function fitTheWholePipeline()", self.script)
+        self.assertIn("function makePipelineCanvasPannable()", self.script)
+        self.assertIn("nodes.style.transform = `scale(${pipelineZoom})`", self.script)
+
+
 class ReadingOneTests(PipelineTestCase):
     def test_the_one_it_ships_with_is_a_good_one(self) -> None:
         tidy = pipelines.read_it(pipelines.a_starting_pipeline())
@@ -110,6 +154,20 @@ class ReadingOneTests(PipelineTestCase):
 
 
 class KeepingThemTests(PipelineTestCase):
+    def test_creating_a_blank_one_saves_it_immediately(self) -> None:
+        created = pipelines.create_blank(self.config, "Fresh automation")
+        self.assertEqual(created, {"name": "Fresh automation", "nodes": [], "edges": []})
+        self.assertEqual(pipelines.saved_ones(self.config), ["Fresh automation"])
+        self.assertEqual(pipelines.load(self.config, "Fresh automation"), created)
+
+    def test_creating_one_never_replaces_an_existing_automation(self) -> None:
+        existing = pipelines.a_starting_pipeline()
+        existing["name"] = "Already here"
+        pipelines.save(self.config, existing)
+        with self.assertRaisesRegex(pipelines.PipelineError, "already an automation"):
+            pipelines.create_blank(self.config, "Already here")
+        self.assertEqual(len(pipelines.load(self.config, "Already here")["nodes"]), 6)
+
     def test_saving_then_loading_gives_the_same_pipeline_back(self) -> None:
         saved = pipelines.save(self.config, pipelines.a_starting_pipeline())
         again = pipelines.load(self.config, saved["name"])

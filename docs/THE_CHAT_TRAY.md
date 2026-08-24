@@ -20,6 +20,32 @@ Now every open chat is a button along the bottom, the way a taskbar works.
 
 ## The big chat
 
+The left pane is the conversation switcher. It groups chats by the canonical
+two-agent pair on the green communication line, shows both agents' names and
+faces, and can create, switch, or delete several durable chats for that pair.
+A chat under GPT Codex ↔ Claude is not reused by GPT Codex ↔ Gemini, even when
+the same provider route appears in both pairs. A lone agent keeps a direct-chat
+fallback until another agent is connected.
+
+Every chat also stores one **This chat writes to** selection. The dropdown lists
+only projects that both agents work on. Ordinary conversation can continue with
+no project selected, but project-file work is refused until one is chosen. The
+server resolves the saved conversation again on every request, so changing a
+browser field cannot substitute another pair or folder.
+
+Every compact and big chat starts by saying **where this chat happens**. The
+conversation belongs to Nexus Harness and is saved under `.harness/chats`.
+The named provider route and model say how Nexus obtains an answer; they do not
+mean that Nexus has opened a matching conversation in Claude Desktop, the
+Codex app, Gemini, Copilot chat, ChatGPT, or another provider app. The panel
+says this explicitly for the configured provider instead of implying a link
+that does not exist.
+
+**Open full Nexus chat** opens the conversation that is actually in use. In the
+Electron app, **Show saved transcript file** reveals its exact JSON transcript
+inside the current project. The desktop bridge refuses absolute paths, parent
+directory traversal, missing files, and anything outside that project.
+
 Three parts side by side:
 
 **What was said.** Your turns and the assistant's, each with a face. And what
@@ -27,11 +53,68 @@ this agent said to *another* agent, in a colour of its own — because a
 conversation between two of them is a conversation, and reading it somewhere
 else is how you lose the thread.
 
+Interactive collaboration is kept as a real multi-party transcript rather
+than collapsed into the lead's summary. In order, the chat shows the prompt
+sent to the team, every contacted agent's exact redacted reply or project
+plan, every sequential discussion/review turn, each execution and verification
+pass, and the lead's final completion report.
+Each turn names its speaker, recipient, provider route, phase, model, and
+timing when available. The connected-agent turns remain visible in later
+history but are not replayed to a provider as though the lead agent had said
+them; only the user/final-answer conversation continues under assistant roles.
+
 **What it has going on.** What this agent is doing in the run right now: which
 project, which round, which part of the shared page it wrote, how long it took.
 And what went wrong the last time it was asked anything.
 
-**A box to type in.** Send talks to that agent.
+**A box to type in.** It has three deliberately different actions:
+
+- **Send** is intent-aware. Nexus first decides whether the request is best
+  answered directly or would materially benefit from the ready agents joined
+  by green communication lines. Clear collaboration wording is routed
+  immediately; implicit requests use a small structured decision by the open
+  agent. A routing failure safely falls back to direct chat. An unmistakable
+  file/code mutation request asks for confirmation and then routes through the
+  same bounded project-work transaction as the explicit Work button.
+- **Ask connected agents** asks the other agent in the selected pair,
+  then continues sequential discussion rounds in which every later agent sees
+  the full real conversation. It ends when every participant marks the goal
+  complete, or reports honestly that progress stalled or reached its safety
+  ceiling.
+- **Work together on project files** is explicit mutation authority. The pair
+  reviews a shared plan for the project selected by this chat. Nexus
+  validates relative paths and current-file baselines, applies each set
+  atomically, then gives all participants the actual tree and file contents to
+  verify. Their concrete failures feed another execution pass until everyone
+  marks the goal complete, progress stalls, or the safety ceiling is reached.
+
+Attachments are copied into `.harness/chats/attachments`. The transcript keeps
+only safe metadata. Text enters bounded context; images use each supported
+provider's native multimodal input.
+
+Assistant replies keep fenced code blocks as code. Every block has its own
+**Copy code** button; if clipboard access is unavailable, the block is selected
+so it can still be copied manually.
+
+## While an agent is working
+
+Compact and maximised chats show the same prominent activity panel as soon as
+a request starts. It includes an animated spinner and progress track, a
+shimmering stage label, supporting detail, and elapsed time. The animation is
+disabled when the operating system requests reduced motion; the words and
+elapsed time remain visible.
+
+These are real Nexus orchestration stages, not invented provider thoughts. A
+direct request says which named agent and provider route Nexus is waiting for.
+Collaboration reports initial contact, each visible team-discussion round, and
+the final outcome report. Project work also reports plan reviews, confined file
+reads, every bounded apply pass, and every on-disk verification pass. The
+provider's private reasoning is neither requested nor shown.
+
+The long answer request and lightweight activity reads use separate server
+threads, so the UI keeps updating while a provider command is still running.
+Activity records are bounded and process-local; transcripts remain the durable
+record of what was actually said.
 
 ## With nothing open
 

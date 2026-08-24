@@ -4,6 +4,9 @@
   "description": "Desktop window for the Nexus Harness control panel",
   "main": "main.js",
   "private": true,
+  "dependencies": {
+    "playwright-core": "^1.62.1"
+  },
   "scripts": {
     "start": "electron .",
     "test": "node --test",
@@ -12,10 +15,12 @@
     "smoke:packaged": "node packaged.smoke.js",
     "smoke:built": "node built.smoke.js",
     "smoke:asking": "node asking.smoke.js",
-    "smoke:board": "node board.smoke.js"
+    "smoke:board": "node board.smoke.js",
+    "smoke:web-chat": "node web-chat.smoke.js",
+    "smoke:claude-browser": "node claude-browser.smoke.js"
   },
   "devDependencies": {
-    "electron": "^33.0.0",
+    "electron": "^43.4.1",
     "electron-builder": "^25.0.0"
   },
   "build": {
@@ -26,6 +31,9 @@
       "server.js",
       "guards.js",
       "preload.js",
+      "web-chats.js",
+      "external-browser.js",
+      "web-chat-shell-preload.js",
       "pages/**",
       "nexus-harness.ico",
       "package.json",
@@ -33,7 +41,8 @@
       "!smoke.js",
       "!packaged.smoke.js",
       "!built.smoke.js",
-      "!asking.smoke.js"
+      "!asking.smoke.js",
+      "!web-chat.smoke.js"
     ],
     "win": {
       "target": "nsis",

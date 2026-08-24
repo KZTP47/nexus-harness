@@ -108,9 +108,9 @@ class ServerRequestTests(unittest.TestCase):
                 self.assertIn("runs", body["error"])
 
     def test_a_body_that_is_too_big_gets_an_answer(self) -> None:
-        status, body = self.call("POST", "/api/validate", "x" * 10, {"Content-Length": "2000001"})
+        status, body = self.call("POST", "/api/validate", "x" * 10, {"Content-Length": "12000001"})
         self.assertEqual(status, 400)
-        self.assertIn("2000000", body["error"])
+        self.assertIn("12000000", body["error"])
 
 
 class WorkflowNameCollisionTests(unittest.TestCase):

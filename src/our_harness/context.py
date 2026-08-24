@@ -146,9 +146,18 @@ def fit_request_context(config: LoadedConfig, compiled: CompiledContext, prompt:
 
 
 class ContextCompiler:
-    def __init__(self, config: LoadedConfig, memory: MemoryStore):
+    def __init__(
+        self,
+        config: LoadedConfig,
+        memory: MemoryStore,
+        *,
+        persistent_memory_context: str = "",
+        persistent_memory_consulted: list[str] | None = None,
+    ):
         self.config = config
         self.memory = memory
+        self.persistent_memory_context = persistent_memory_context
+        self.persistent_memory_consulted = list(persistent_memory_consulted or [])
         self.ignore_policy = IgnorePolicy(config.project_root, set(config.get("project.ignore", [])))
 
     def _semantic_query_vector(
@@ -230,6 +239,8 @@ class ContextCompiler:
             "PROJECT PATH RULE: all paths are project-relative; never use a host absolute path.",
             "TASK CONTRACT",
             task.strip(),
+            "PROJECT-BOUND PERSISTENT MEMORY",
+            self.persistent_memory_context or "(disabled)",
             "DETECTED STACKS",
             json.dumps(detections, sort_keys=True),
             "LOCAL STANDARDS",
@@ -262,6 +273,14 @@ class ContextCompiler:
             "cacheable_ratio": round(len(prefix) / max(1, len(prefix) + len(dynamic)), 4),
             "standards": standards,
             "memory": memory_manifest,
+            "persistent_memory": {
+                "enabled": bool(self.persistent_memory_context),
+                "consulted": self.persistent_memory_consulted,
+                "included_chars": len(self.persistent_memory_context),
+                "sha256": hashlib.sha256(self.persistent_memory_context.encode()).hexdigest()
+                if self.persistent_memory_context
+                else "",
+            },
             "workspace": workspace_manifest,
             "workspace_coverage": {
                 "indexed_files": len(indexed_paths),

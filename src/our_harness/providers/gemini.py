@@ -38,6 +38,16 @@ class GeminiProvider(Provider):
                 raise HarnessError("Gemini messages must contain string content")
             role = message.get("role")
             content = [{"type": "text", "text": message["content"]}]
+            if role == "user" and message is next(
+                (one for one in reversed(request.messages) if one.get("role") == "user"), None
+            ):
+                content.extend([
+                    {"type": "image", "mime_type": str(one.get("type")), "data": str(one.get("data"))}
+                    for one in request.attachments
+                    if isinstance(one, dict)
+                    and str(one.get("type") or "").startswith("image/")
+                    and str(one.get("data") or "")
+                ])
             if role == "assistant":
                 steps.append({"type": "model_output", "content": content})
             elif role == "user":

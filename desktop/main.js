@@ -4,17 +4,20 @@
 // panel, and stops the server when the app closes. Nothing outside this
 // machine is ever loaded.
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
+const electron = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = electron;
 const fs = require("node:fs");
 const path = require("node:path");
 
 const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
 const { attachGuards, onlyOnce, isHarnessVersionMismatch, whyItReallyIs } = require("./guards");
+const { WebChatManager } = require("./web-chats");
 
 const server = new HarnessServer({ onExit: (code) => reportServerStopped(code) });
 let window = null;
 let projectPath = "";
 let repairAvailable = false;
+let webChatManager = null;
 
 function settingsFile() {
   return path.join(app.getPath("userData"), "settings.json");
@@ -36,6 +39,74 @@ function writeSettings(value) {
   } catch (error) {
     /* a missing settings file only costs one extra folder pick */
   }
+}
+
+function projectListFile() {
+  return path.join(app.getPath("appData"), "our-harness", "projects.json");
+}
+
+function existingProject(chosen) {
+  if (typeof chosen !== "string" || !chosen.trim()) return "";
+  try {
+    const resolved = path.resolve(chosen);
+    return fs.statSync(resolved).isDirectory() ? resolved : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function newestProjectFromTheHarnessList() {
+  try {
+    const value = JSON.parse(fs.readFileSync(projectListFile(), "utf8"));
+    const projects = Array.isArray(value && value.projects) ? value.projects : [];
+    const newest = projects
+      .filter((one) => one && typeof one.path === "string" && one.last_opened)
+      .sort((one, other) => String(other.last_opened).localeCompare(String(one.last_opened)))
+      .map((one) => ({ path: existingProject(one.path), openedAt: String(one.last_opened) }))
+      .find((one) => one.path);
+    return newest || null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function projectToOpenAtStartup() {
+  const settings = readSettings();
+  const remembered = existingProject(settings.lastProject);
+  const newest = newestProjectFromTheHarnessList();
+  // Older versions did not hear about Work on this. The Python side did keep
+  // that exact action in its project history. Compare it with the old settings
+  // file's write time so a later native folder pick still wins. New settings
+  // carry their own timestamp and stay the source of truth for both paths.
+  if (!settings.lastProjectAt) {
+    let settingsChangedAt = Number.NaN;
+    try { settingsChangedAt = fs.statSync(settingsFile()).mtimeMs; } catch (_error) { /* none */ }
+    const newestAt = Date.parse(String(newest?.openedAt || ""));
+    if (newest && Number.isFinite(newestAt)
+        && (!Number.isFinite(settingsChangedAt) || newestAt > settingsChangedAt)) {
+      return newest.path;
+    }
+    return remembered || newest?.path || "";
+  }
+  const rememberedAt = Date.parse(String(settings.lastProjectAt));
+  const newestAt = Date.parse(String(newest?.openedAt || ""));
+  if (newest && Number.isFinite(newestAt)
+      && (!Number.isFinite(rememberedAt) || newestAt > rememberedAt)) {
+    return newest.path;
+  }
+  return remembered || newest?.path || "";
+}
+
+function rememberCurrentProject(chosen) {
+  const resolved = existingProject(chosen);
+  if (!resolved) return "";
+  projectPath = resolved;
+  writeSettings({
+    ...readSettings(),
+    lastProject: resolved,
+    lastProjectAt: new Date().toISOString(),
+  });
+  return resolved;
 }
 
 function pageUrl(name, parameters = {}) {
@@ -100,9 +171,16 @@ function rememberProjectHarness(chosen) {
 }
 
 async function openProject(chosen, options = {}) {
-  projectPath = chosen;
+  const remembered = rememberCurrentProject(chosen);
+  if (!remembered) {
+    showPage("problem.html", {
+      title: "That project could not be opened",
+      detail: "The project folder is missing or is not a folder any more.",
+    });
+    return;
+  }
+  chosen = remembered;
   repairAvailable = false;
-  writeSettings({ ...readSettings(), lastProject: chosen });
   showPage("starting.html", { project: path.basename(chosen) });
   server.stop();
   try {
@@ -134,6 +212,19 @@ function allowedTarget(candidate) {
   return isLoopbackUrl(candidate) || isOwnPage(candidate, pageUrl(""));
 }
 
+function projectFileToShow(root, asked) {
+  if (!root || typeof asked !== "string" || !asked.trim() || path.isAbsolute(asked)) return "";
+  const project = path.resolve(root);
+  const target = path.resolve(project, asked);
+  const within = path.relative(project, target);
+  if (!within || within.startsWith(`..${path.sep}`) || path.isAbsolute(within)) return "";
+  try {
+    return fs.statSync(target).isFile() ? target : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
 function createWindow() {
   window = new BrowserWindow({
     width: 1280,
@@ -150,17 +241,44 @@ function createWindow() {
       sandbox: true,
       webviewTag: false,
       spellcheck: false,
+      // This window is the authenticated web-chat courier as well as the UI.
+      // Chromium otherwise throttles its heartbeat and request listener while
+      // Nexus is minimised or covered by another app.
+      backgroundThrottling: false,
     },
   });
   window.once("ready-to-show", () => window.show());
-  window.on("closed", () => { window = null; });
+  window.on("closed", () => {
+    if (webChatManager) webChatManager.close();
+    webChatManager = null;
+    window = null;
+  });
+  window.on("enter-full-screen", () => {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send("harness:fullScreenChanged", true);
+    }
+  });
+  window.on("leave-full-screen", () => {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send("harness:fullScreenChanged", false);
+    }
+  });
 
   attachGuards(window.webContents, {
     allowedTarget,
     openExternally: (url) => shell.openExternal(url),
   });
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  webChatManager = new WebChatManager({
+    electron, owner: window, readSettings, writeSettings,
+    shellPage: pageUrl("web-chat.html"),
+    shellPreload: path.join(__dirname, "web-chat-shell-preload.js"),
+  });
   return window;
+}
+
+function fromHarnessWindow(event) {
+  return Boolean(window && !window.isDestroyed() && event.sender === window.webContents);
 }
 
 function buildMenu() {
@@ -221,6 +339,11 @@ ipcMain.handle("harness:pickAFolder", () => {
   // while working on something else.
   return chooseProject(projectPath);
 });
+ipcMain.handle("harness:rememberProject", (_event, chosen) => {
+  // Work on this changes the already-running Python server. Keep Electron in
+  // step without starting a second server or asking for the folder again.
+  return rememberCurrentProject(String(chosen || ""));
+});
 ipcMain.handle("harness:retry", () => {
   if (projectPath) openProject(projectPath);
   else showPage("welcome.html");
@@ -237,6 +360,95 @@ ipcMain.handle("harness:repairVersionMismatch", () => {
 });
 ipcMain.handle("harness:help", () => {
   showPage("help.html");
+  return true;
+});
+ipcMain.handle("harness:showProjectFile", (_event, relativePath) => {
+  const target = projectFileToShow(projectPath, relativePath);
+  if (!target) return false;
+  shell.showItemInFolder(target);
+  return true;
+});
+ipcMain.handle("harness:setFullScreen", (_event, on) => {
+  if (!window || window.isDestroyed()) return false;
+  window.setFullScreen(Boolean(on));
+  return Boolean(on);
+});
+ipcMain.handle("harness:webChatProviders", (event) => (
+  fromHarnessWindow(event) && webChatManager ? webChatManager.providers() : []
+));
+ipcMain.handle("harness:webChats", (event) => (
+  fromHarnessWindow(event) && webChatManager ? webChatManager.list() : []
+));
+ipcMain.handle("harness:webChatConnect", (event, provider) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  return webChatManager.openSetup(String(provider || ""));
+});
+ipcMain.handle("harness:webChatOpen", (event, id, conversationKey, preferExisting) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  return webChatManager.openHeadered(
+    String(id || ""), String(conversationKey || ""), Boolean(preferExisting));
+});
+ipcMain.handle("harness:webChatShow", (event, id, conversationKey, preferExisting, bounds) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  return webChatManager.showEmbedded(
+    String(id || ""), String(conversationKey || ""), Boolean(preferExisting), bounds);
+});
+ipcMain.handle("harness:webChatResize", (event, id, conversationKey, bounds) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  return webChatManager.resizeEmbedded(String(id || ""), String(conversationKey || ""), bounds);
+});
+ipcMain.handle("harness:webChatHide", (event) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  return webChatManager.hideEmbedded();
+});
+ipcMain.handle("harness:webChatRemove", (event, id) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  return webChatManager.remove(String(id || ""));
+});
+ipcMain.handle("harness:webChatAnswer", async (
+  event, route, prompt, attachments, conversationKey, preferExisting
+) => {
+  if (!fromHarnessWindow(event) || !webChatManager) throw new Error("Web chats are not available");
+  const found = /^web:([a-z0-9][a-z0-9-]{5,63})$/.exec(String(route || ""));
+  if (!found) throw new Error("That web-chat route is not valid");
+  const root = path.resolve(projectPath || ".");
+  const safeAttachments = (Array.isArray(attachments) ? attachments : []).slice(0, 6)
+    .map((one) => ({
+      name: String(one?.name || "").slice(0, 180),
+      path: path.resolve(String(one?.path || "")),
+    }))
+    .filter((one) => {
+      const relative = path.relative(root, one.path);
+      const parts = relative.split(path.sep);
+      return relative && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+        && parts[0] === ".harness" && parts[1] === "chats" && parts[2] === "attachments";
+    });
+  return webChatManager.ask(
+    found[1], String(prompt || ""), safeAttachments,
+    String(conversationKey || ""), Boolean(preferExisting));
+});
+ipcMain.handle("harness:webChatStop", async (event, route, conversationKey) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  const found = /^web:([a-z0-9][a-z0-9-]{5,63})$/.exec(String(route || ""));
+  return found ? webChatManager.stop(found[1], String(conversationKey || "")) : false;
+});
+ipcMain.handle("harness:webChatReset", async (event, route, conversationKey) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return false;
+  const found = /^web:([a-z0-9][a-z0-9-]{5,63})$/.exec(String(route || ""));
+  return found
+    ? webChatManager.resetThread(found[1], String(conversationKey || "")) : false;
+});
+ipcMain.handle("harness:webChatShellStartNew", (event) => (
+  webChatManager ? webChatManager.startNew(event.sender) : false
+));
+ipcMain.handle("harness:webChatShellUseCurrent", (event) => {
+  if (!webChatManager) throw new Error("The Nexus window is closed");
+  return webChatManager.useCurrent(event.sender);
+});
+ipcMain.handle("harness:webChatShellClose", (event) => {
+  const held = webChatManager?.shellFor(event.sender);
+  if (!held) return false;
+  held.shell.close();
   return true;
 });
 
@@ -264,10 +476,8 @@ app.whenReady().then(async () => {
   });
   if (!window || window.isDestroyed()) return;
 
-  const remembered = readSettings().lastProject;
-  if (remembered && fs.existsSync(remembered)) {
-    openProject(remembered);
-  }
+  const remembered = projectToOpenAtStartup();
+  if (remembered) openProject(remembered);
 });
 
 app.on("activate", () => {

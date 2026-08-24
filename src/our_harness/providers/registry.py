@@ -30,6 +30,16 @@ class ProviderProfile:
     timeout_seconds: int
     command: tuple[str, ...]
     auth_mode: str
+    # Provider-specific connection settings must survive profile routing.  A
+    # profile is not merely display metadata: provider_config() reconstructs
+    # the legacy-shaped settings the adapter actually receives.  Dropping one
+    # here makes the UI successfully save it and the runtime silently ignore
+    # it.  Gemini Workspace accounts expose that bug immediately because every
+    # request needs GOOGLE_CLOUD_PROJECT.
+    google_project: str
+    microsoft_app: str
+    microsoft_organisation: str
+    time_zone: str
     reasoning_effort: str | None
     max_concurrency: int
     pricing_ref: str | None
@@ -98,6 +108,10 @@ class ProviderRegistry:
             timeout_seconds=int(value.get("timeout_seconds", 180)),
             command=tuple(value.get("command", [])),
             auth_mode=str(value.get("auth_mode") or ""),
+            google_project=str(value.get("google_project") or ""),
+            microsoft_app=str(value.get("microsoft_app") or ""),
+            microsoft_organisation=str(value.get("microsoft_organisation") or ""),
+            time_zone=str(value.get("time_zone") or ""),
             reasoning_effort=str(value["reasoning_effort"]) if value.get("reasoning_effort") else None,
             max_concurrency=int(value.get("max_concurrency", 1)),
             pricing_ref=str(value["pricing_ref"]) if value.get("pricing_ref") else None,
@@ -179,6 +193,10 @@ class ProviderRegistry:
                 "timeout_seconds": profile.timeout_seconds,
                 "command": list(profile.command),
                 "auth_mode": profile.auth_mode,
+                "google_project": profile.google_project,
+                "microsoft_app": profile.microsoft_app,
+                "microsoft_organisation": profile.microsoft_organisation,
+                "time_zone": profile.time_zone,
                 "reasoning_effort": profile.reasoning_effort,
             }
         )

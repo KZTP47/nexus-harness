@@ -55,6 +55,9 @@ class Launcher:
     # keeps its icon if the folder is ever moved. The one started by Python
     # points here, which is fine, because that one needs this folder anyway.
     icon: Path
+    # Any desktop app that was passed over because it could not open this
+    # project, so the person can be told which one and what to do about it.
+    passed_over: tuple[Path, ...] = ()
 
 
 def _installed_app() -> Path | None:
@@ -76,6 +79,66 @@ def _built_app(root: Path) -> Path | None:
     return root / "desktop" / "build-output" / "win-unpacked" / "Nexus Harness.exe"
 
 
+def _the_harness_an_app_carries(app: Path) -> Path:
+    """The copy of the harness packed inside a desktop app.
+
+    The app carries one so it runs on a machine with nothing installed. That
+    copy is only as new as the day the app was built, and it sits next to the
+    program itself.
+    """
+
+    return Path(app).parent / "resources" / "harness" / "src"
+
+
+def _this_copy_reads_this_project(harness_src: Path, root: Path) -> bool | None:
+    """Whether one copy of the harness can read this project's settings.
+
+    Asked by running that copy, because that is the only answer worth having:
+    version numbers do not move on every change, and comparing files says
+    "different" without saying which way round.
+
+    Nothing, when there is no answer to be had - that copy is not really there,
+    or Python could not be started at all. Nothing is not a no: passing over a
+    perfectly good app because the question could not be asked would take
+    somebody's app window away for no reason.
+    """
+
+    started = {**os.environ}
+    already = started.get("PYTHONPATH", "")
+    started["PYTHONPATH"] = os.pathsep.join([str(harness_src), *([already] if already else [])])
+    try:
+        done = subprocess.run(
+            [sys.executable, "-m", "our_harness", "--project", str(root), "config"],
+            capture_output=True, text=True, timeout=120, cwd=str(root), env=started,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return True
+    # Python could not find that copy at all, which is a question that was never
+    # really asked rather than an answer of no.
+    if "No module named" in f"{done.stdout} {done.stderr}":
+        return None
+    return False
+
+
+def _can_that_app_open_this_project(app: Path, root: Path) -> bool | None:
+    """Whether the icon, pointed at this app, would open the panel.
+
+    This is the whole of the bug it exists for. An app installed a while ago
+    carries a harness from a while ago, and settings written since can name
+    things that copy has never heard of - a provider, a setting, anything new.
+    The app then opens on an error page, and the error page talks about Python
+    and folders, because from inside the app that is what a refusal looks like.
+    The installer can find that out here, before handing anybody the icon.
+    """
+
+    carried = _the_harness_an_app_carries(app)
+    if not (carried / "our_harness" / "__init__.py").is_file():
+        return None
+    return _this_copy_reads_this_project(carried, root)
+
+
 def _python_that_shows_no_terminal() -> Path:
     """The Python that opens no black window behind the panel.
 
@@ -92,23 +155,47 @@ def _python_that_shows_no_terminal() -> Path:
     return here
 
 
-def what_to_launch(root: Path = ROOT, is_there=None) -> Launcher:
+def what_to_launch(root: Path = ROOT, is_there=None, can_it_open=None) -> Launcher:
     """Which of the three the icon should start, best first.
 
-    `is_there` is only for tests, so this can be asked what it would do on a
-    machine that is not this one.
+    Best first, and working before best: an app that cannot open this project
+    is passed over for one that can, however good it would otherwise be. An
+    installed app is a snapshot of the day it was built, and this folder moves
+    on without it; pointing the icon at it anyway is how somebody presses their
+    new icon and gets an error page about Python.
+
+    `is_there` and `can_it_open` are only for tests, so this can be asked what
+    it would do on a machine that is not this one.
     """
 
     is_there = is_there or (lambda where: Path(where).is_file())
+    can_it_open = can_it_open or _can_that_app_open_this_project
+    passed_over: list[Path] = []
+    this_folder: bool | None = None
+    # A local build is the source of truth while developing this project. The
+    # installed app is a snapshot and can lag behind source changes, so the
+    # desktop icon must point at win-unpacked whenever it exists.
     for where, what in (
+        (_built_app(root), "the newest desktop app built in this folder"),
         (_installed_app(), "the desktop app, already installed on this machine"),
-        (_built_app(root), "the desktop app built in this folder"),
     ):
-        if where is not None and is_there(where):
-            return Launcher(
-                program=Path(where), arguments=[], working_folder=Path(where).parent,
-                what_it_is=what, in_its_own_window=True, icon=Path(where),
-            )
+        if where is None or not is_there(where):
+            continue
+        if can_it_open(Path(where), root) is False:
+            # Only worth holding against the app if this folder's own copy does
+            # better. When both refuse, the settings are the problem and every
+            # copy of the harness will say so - passing the app over then would
+            # cost somebody their app window and fix nothing.
+            if this_folder is None:
+                this_folder = _this_copy_reads_this_project(root / "src", root)
+            if this_folder:
+                passed_over.append(Path(where))
+                continue
+        return Launcher(
+            program=Path(where), arguments=[], working_folder=Path(where).parent,
+            what_it_is=what, in_its_own_window=True, icon=Path(where),
+            passed_over=tuple(passed_over),
+        )
     # A window of its own without the desktop app, for the machine that has no
     # desktop app and no way of building one. Somebody ran the installer on a
     # company computer, pressed the icon and got a browser tab; they had asked
@@ -130,6 +217,7 @@ def what_to_launch(root: Path = ROOT, is_there=None) -> Launcher:
             what_it_is="the panel in a window of its own, without the desktop app",
             in_its_own_window=True,
             icon=root / "desktop" / "nexus-harness.ico",
+            passed_over=tuple(passed_over),
         )
     return Launcher(
         program=_python_that_shows_no_terminal(),
@@ -138,6 +226,7 @@ def what_to_launch(root: Path = ROOT, is_there=None) -> Launcher:
         what_it_is="the panel, started by Python out of this folder",
         in_its_own_window=False,
         icon=root / "desktop" / "nexus-harness.ico",
+        passed_over=tuple(passed_over),
     )
 
 
@@ -449,6 +538,56 @@ def _mac_launcher(where: Path, launcher: Launcher, _icon: Path) -> None:
     where.chmod(0o755)
 
 
+def a_newer_installer_sitting_here(root: Path = ROOT) -> Path | None:
+    """The setup program built in this folder, if somebody has built one.
+
+    Naming it is the difference between "your app is old" and something a
+    person can act on without going and looking for how any of this is built.
+    """
+
+    where = root / "desktop" / "build-output"
+    try:
+        found = sorted(where.glob("*Setup*.exe"))
+    except OSError:
+        return None
+    return found[-1] if found else None
+
+
+def what_to_say_about_an_app_left_behind(launcher: Launcher, root: Path = ROOT) -> list[str]:
+    """What to tell somebody whose installed app was passed over, and why.
+
+    Said out loud rather than quietly worked around, because the icon is not
+    the only way into that app: it has a Start menu entry of its own, and the
+    person who opens it that way gets the error page this installer just went
+    out of its way to avoid.
+    """
+
+    if not launcher.passed_over:
+        return []
+    lines = ["", "One app here was passed over:"]
+    for where in launcher.passed_over:
+        lines.append(f"  {where}")
+    lines += [
+        "",
+        "It carries its own copy of the harness, and that copy is older than",
+        "this folder: it refuses this project's settings, so it would have",
+        "opened on an error page. The icon opens something that works instead.",
+        "",
+        "It is still in your Start menu, and opening it from there will still",
+        "show that page. To bring it up to date:",
+    ]
+    setup = a_newer_installer_sitting_here(root)
+    if setup is not None:
+        lines += ["", f"    \"{setup}\"", "",
+                  "That is the setup program built from this folder. Run it and it",
+                  "replaces the installed app with this one."]
+    else:
+        lines += ["", "    cd desktop", "    npm install", "    npm run build", "",
+                  "then run the setup program that appears in desktop\build-output,",
+                  "and run this installer again."]
+    return lines
+
+
 def what_the_launcher_is_called() -> str:
     """What the thing on the desktop is named, on this kind of machine."""
 
@@ -654,6 +793,8 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"  it opens   {launcher.what_it_is}")
     print(f"  it lives   {where}")
+    for line in what_to_say_about_an_app_left_behind(launcher, ROOT):
+        print(line)
     if not launcher.in_its_own_window:
         print()
         print("That one opens the panel in your browser. For a window of its own,")

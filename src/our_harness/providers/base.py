@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import Any
 
+from .. import cancellation
 from ..config import LoadedConfig, validate_embedding_provider_route
 from ..execution import CommandRunner
 from ..models import (
@@ -138,16 +139,26 @@ class Provider(ABC):
             headers={"Content-Type": "application/json", **(headers or {})},
             method="POST",
         )
+        response_holder: dict[str, Any] = {}
+        unregister_cancel = cancellation.register(
+            lambda: _interrupt_http_response(response_holder.get("response"))
+            if response_holder.get("response") is not None else None
+        )
         try:
+            cancellation.checkpoint()
             with self._http_opener.open(request, timeout=self._timeout(timeout_seconds)) as response:
+                response_holder["response"] = response
+                cancellation.checkpoint()
                 raw = response.read(20_000_000)
         except urllib.error.HTTPError as exc:
             try:
                 body = exc.read(16_000).decode("utf-8", errors="replace")
             finally:
                 exc.close()
+            cancellation.checkpoint()
             raise HarnessError(f"Provider HTTP {exc.code}: {self._redactor.text(body)}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            cancellation.checkpoint()
             raise HarnessError(
                 f"Provider request failed: {self._redactor.text(str(exc))}"
             ) from exc
@@ -159,6 +170,9 @@ class Provider(ABC):
             raise HarnessError(
                 f"Provider request failed: {self._redactor.text(str(exc))}"
             ) from exc
+        finally:
+            unregister_cancel()
+        cancellation.checkpoint()
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -189,6 +203,15 @@ class Provider(ABC):
         received: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=8)
         response_lock = threading.Lock()
         response_holder: dict[str, Any] = {}
+
+        def cancel_stream() -> None:
+            stopped.set()
+            with response_lock:
+                response = response_holder.get("response")
+            if response is not None:
+                _interrupt_http_response(response)
+
+        unregister_cancel = cancellation.register(cancel_stream)
 
         def offer(kind: str, value: object) -> None:
             while not stopped.is_set():
@@ -221,6 +244,7 @@ class Provider(ABC):
             reader = threading.Thread(target=read_response, name="harness-http-stream-reader", daemon=True)
             reader.start()
             while True:
+                cancellation.checkpoint()
                 remaining = deadline_at - time.monotonic()
                 if remaining <= 0:
                     raise HarnessError(
@@ -252,10 +276,13 @@ class Provider(ABC):
                 body = exc.read(16_000).decode("utf-8", errors="replace")
             finally:
                 _interrupt_http_response(exc)
+            cancellation.checkpoint()
             raise HarnessError(f"Provider HTTP {exc.code}: {self._redactor.text(body)}") from exc
         except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError) as exc:
+            cancellation.checkpoint()
             raise HarnessError(f"Provider stream failed: {exc}") from exc
         finally:
+            unregister_cancel()
             stopped.set()
             with response_lock:
                 response = response_holder.get("response")
@@ -267,6 +294,20 @@ class Provider(ABC):
 def message_list(request: ProviderRequest) -> list[dict[str, Any]]:
     system = f"{request.system_prefix}\n\n{request.dynamic_context}"
     return [{"role": "system", "content": system}, *request.messages]
+
+
+def request_images(request: ProviderRequest) -> list[dict[str, str]]:
+    """Validated inline images selected by the user for this request."""
+
+    found: list[dict[str, str]] = []
+    for one in request.attachments:
+        if not isinstance(one, dict):
+            continue
+        mime = str(one.get("type") or "")
+        data = str(one.get("data") or "")
+        if mime.startswith("image/") and data:
+            found.append({"type": mime, "data": data, "name": str(one.get("name") or "image")})
+    return found
 
 
 def _openai_usage(usage: object) -> dict[str, int | None]:
@@ -391,6 +432,33 @@ def _chat_tool_calls(fragments: object) -> list[dict[str, Any]]:
 
 
 class OpenAIProvider(Provider):
+    @staticmethod
+    def _with_images(request: ProviderRequest, messages: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
+        images = request_images(request)
+        if not images:
+            return copy.deepcopy(messages)
+        copied = copy.deepcopy(messages)
+        at = next((index for index in range(len(copied) - 1, -1, -1) if copied[index].get("role") == "user"), -1)
+        if at < 0 or not isinstance(copied[at].get("content"), str):
+            raise HarnessError("Image attachments require a user text message")
+        text = copied[at]["content"]
+        if mode == "responses":
+            copied[at]["content"] = [
+                {"type": "input_text", "text": text},
+                *[
+                    {"type": "input_image", "image_url": f"data:{one['type']};base64,{one['data']}", "detail": "auto"}
+                    for one in images
+                ],
+            ]
+        else:
+            copied[at]["content"] = [
+                {"type": "text", "text": text},
+                *[
+                    {"type": "image_url", "image_url": {"url": f"data:{one['type']};base64,{one['data']}", "detail": "auto"}}
+                    for one in images
+                ],
+            ]
+        return copied
     def _api_mode(self) -> str:
         configured = str(self.settings.get("api_mode") or "auto")
         if configured != "auto":
@@ -461,7 +529,7 @@ class OpenAIProvider(Provider):
         if continuation is not None and not outputs:
             raise HarnessError("Responses continuation requires at least one function output")
         if continuation is None:
-            return copy.deepcopy(request.messages), {}, "initial"
+            return self._with_images(request, request.messages, "responses"), {}, "initial"
 
         typed_outputs: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -490,7 +558,7 @@ class OpenAIProvider(Provider):
         if continuation is not None and not outputs:
             raise HarnessError("Chat Completions continuation requires function outputs")
         if continuation is None:
-            return message_list(request)
+            return self._with_images(request, message_list(request), "chat")
         if self.settings.get("name") != "openai":
             raise HarnessError("Native Chat Completions continuation is available only for the official OpenAI provider")
         if not continuation.messages or not continuation.pending_call_ids:
@@ -813,7 +881,20 @@ class AnthropicProvider(Provider):
         if continuation is None:
             if outputs:
                 raise HarnessError("Anthropic tool results require continuation state")
-            return copy.deepcopy(request.messages)
+            messages = copy.deepcopy(request.messages)
+            images = request_images(request)
+            if images:
+                at = next((index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"), -1)
+                if at < 0 or not isinstance(messages[at].get("content"), str):
+                    raise HarnessError("Image attachments require a user text message")
+                messages[at]["content"] = [
+                    {"type": "text", "text": messages[at]["content"]},
+                    *[
+                        {"type": "image", "source": {"type": "base64", "media_type": one["type"], "data": one["data"]}}
+                        for one in images
+                    ],
+                ]
+            return messages
         if continuation.provider != "anthropic":
             raise HarnessError("Anthropic received continuation state from another provider")
         if continuation.state.get("model") != request.model:
@@ -1059,7 +1140,14 @@ class OllamaProvider(Provider):
         if continuation is None:
             if outputs:
                 raise HarnessError("Ollama tool results require continuation state")
-            return message_list(request)
+            messages = message_list(request)
+            images = request_images(request)
+            if images:
+                at = next((index for index in range(len(messages) - 1, -1, -1) if messages[index].get("role") == "user"), -1)
+                if at < 0:
+                    raise HarnessError("Image attachments require a user text message")
+                messages[at] = {**messages[at], "images": [one["data"] for one in images]}
+            return messages
         if continuation.provider != "ollama":
             raise HarnessError("Ollama received continuation state from another provider")
         if continuation.state.get("model") != request.model:
@@ -1247,6 +1335,7 @@ class LocalProcessProvider(Provider):
             "system_prefix": request.system_prefix,
             "dynamic_context": request.dynamic_context,
             "messages": request.messages,
+            "attachments": request.attachments,
             "temperature": request.temperature,
             "max_output_tokens": request.max_output_tokens,
             "response_format": (

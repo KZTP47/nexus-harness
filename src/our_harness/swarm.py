@@ -70,6 +70,42 @@ LONGEST_TASK = 300
 # Letters, numbers, spaces, dashes and underscores: the same shape the chat
 # already allows, because that is where the name ends up.
 A_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,59}$")
+AN_AGENT_COLOUR = re.compile(r"^#[0-9a-fA-F]{6}$")
+AN_AGENT_PICTURE = re.compile(
+    r"^data:image/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$"
+)
+AGENT_ICONS = {"robot", "person", "code", "star", "brain"}
+DEFAULT_AGENT_COLOUR = "#52d5ea"
+DEFAULT_BUBBLE_COLOUR = "#173b49"
+DEFAULT_PICTURE_ZOOM = 100
+DEFAULT_PICTURE_HUE = 0
+# The page resizes a chosen image before saving it. Keep a second boundary
+# here because the board is durable user configuration, not an image store.
+# At the limit, all 24 agents still fit below the server's request-body cap.
+LONGEST_PROFILE_PICTURE = 400_000
+
+
+def _agent_colour(said: Any, otherwise: str) -> str:
+    value = str(said or "").strip()
+    return value.lower() if AN_AGENT_COLOUR.fullmatch(value) else otherwise
+
+
+def _agent_icon(said: Any) -> str:
+    value = str(said or "").strip().lower()
+    return value if value in AGENT_ICONS else "robot"
+
+
+def _agent_picture(said: Any) -> str:
+    value = str(said or "").strip()
+    if len(value) > LONGEST_PROFILE_PICTURE:
+        return ""
+    return value if AN_AGENT_PICTURE.fullmatch(value) else ""
+
+
+def _picture_number(said: Any, otherwise: int, least: int, most: int) -> int:
+    if isinstance(said, bool) or not isinstance(said, (int, float)):
+        return otherwise
+    return max(least, min(most, int(said)))
 
 
 class SwarmError(HarnessError):
@@ -85,6 +121,12 @@ class Agent:
     who: str = ""
     job: str = ""
     at: dict[str, int] = field(default_factory=lambda: {"x": 40, "y": 40})
+    colour: str = DEFAULT_AGENT_COLOUR
+    icon: str = "robot"
+    bubble_colour: str = DEFAULT_BUBBLE_COLOUR
+    profile_picture: str = ""
+    picture_zoom: int = DEFAULT_PICTURE_ZOOM
+    picture_hue: int = DEFAULT_PICTURE_HUE
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -93,6 +135,12 @@ class Agent:
             "who": self.who,
             "job": self.job,
             "at": dict(self.at),
+            "colour": self.colour,
+            "icon": self.icon,
+            "bubble_colour": self.bubble_colour,
+            "profile_picture": self.profile_picture,
+            "picture_zoom": self.picture_zoom,
+            "picture_hue": self.picture_hue,
             # What its conversation is filed under. Worked out from the name
             # rather than stored, so renaming an agent renames its file too and
             # nothing is left behind pointing at the old one.
@@ -326,6 +374,18 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
             who=_some_words(one.get("who"), 64),
             job=_some_words(one.get("job"), LONGEST_JOB),
             at=_a_place(one.get("at"), across, down),
+            colour=_agent_colour(one.get("colour"), DEFAULT_AGENT_COLOUR),
+            icon=_agent_icon(one.get("icon")),
+            bubble_colour=_agent_colour(
+                one.get("bubble_colour"), DEFAULT_BUBBLE_COLOUR
+            ),
+            profile_picture=_agent_picture(one.get("profile_picture")),
+            picture_zoom=_picture_number(
+                one.get("picture_zoom"), DEFAULT_PICTURE_ZOOM, 100, 300
+            ),
+            picture_hue=_picture_number(
+                one.get("picture_hue"), DEFAULT_PICTURE_HUE, 0, 360
+            ),
         ))
     projects: list[OneProject] = []
     for one in _a_list(said.get("projects"))[:MOST_PROJECTS]:
@@ -538,8 +598,13 @@ def _how_much_was_said_to(config, who: str, filed: str) -> dict[str, Any]:
     return held
 
 
-def how_it_stands(config) -> dict[str, Any]:
-    """The board, and everything the panel needs to draw and judge it."""
+def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The board, and everything the panel needs to draw and judge it.
+
+    A normal read probes provider availability. A save may pass the routes from
+    the most recent read so acknowledging a board write never waits on every
+    installed CLI merely to rediscover status the panel already has.
+    """
 
     from . import chat as chat_lab
     from . import pages as pages_lab
@@ -552,13 +617,18 @@ def how_it_stands(config) -> dict[str, Any]:
     # nobody, so an agent nobody had set up read as ready and pointed at
     # whatever that project happened to use. Somebody with no named routes is
     # sent to Your team, where one press makes them.
-    can_talk = [one for one in chat_lab.who_can_talk(config) if one.get("route")]
+    probing = known_routes is None
+    can_talk = (
+        [one for one in chat_lab.who_can_talk(config) if one.get("route")]
+        if probing else [dict(one) for one in known_routes or []]
+    )
     # Which of them one press would connect: on this machine, and nothing
     # pointing at it yet. Anything else must not offer a button, because a
     # button that fails is worse than no button.
     for one in can_talk:
-        one["can_be_connected"] = (
-            "" if one.get("ready") else _which_one_to_connect(one.get("route", ""), one))
+        if probing or "can_be_connected" not in one:
+            one["can_be_connected"] = (
+                "" if one.get("ready") else _which_one_to_connect(one.get("route", ""), one))
     ready = {one["route"]: one for one in can_talk}
     agents = []
     for one in board.agents:
@@ -577,11 +647,17 @@ def how_it_stands(config) -> dict[str, Any]:
         held["how_to_fix_it"] = (known or {}).get("how_to_fix_it", "")
         held["assistant_kind"] = (known or {}).get("kind", "")
         held["can_sign_in"] = bool((known or {}).get("can_sign_in"))
+        held["chat_destination"] = chat_lab.chat_destination(
+            config, one.who, filed_as(one.name)
+        )
         # Which assistant this one would need set up, when that is all that is
         # missing. Somebody had Claude installed and signed in, an agent set to
         # use it, and the board still said not ready - with nothing on screen to
         # press, because the only way to point the settings at it was a terminal.
-        held["can_be_connected"] = _which_one_to_connect(one.who, known)
+        held["can_be_connected"] = (
+            _which_one_to_connect(one.who, known) if probing
+            else str((known or {}).get("can_be_connected") or "")
+        )
         # What happened the last time this route was asked anything. Not the
         # same as not being ready - this one is still tried - so that somebody
         # knows before they type instead of after.
@@ -1049,8 +1125,11 @@ class Running:
             "no way to un-ask it, and nothing after it will be asked."
         )
 
-    def start(self, config) -> dict[str, Any]:
-        said = how_it_stands(config)
+    def start(self, config, standing: dict[str, Any] | None = None) -> dict[str, Any]:
+        # Electron decorates the ordinary board view with live consumer-web
+        # routes.  A server-started run must use that same view or a web agent
+        # appears ready in its settings and then vanishes from the run plan.
+        said = standing if standing is not None else how_it_stands(config)
         # Which board this run is working from. Anything that would change it
         # is turned down while the run is going: a turn already in flight
         # writes what it says under the name the agent had when it was asked,

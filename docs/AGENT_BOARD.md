@@ -14,10 +14,12 @@ That is what the board is for.
 
 ## What is on it
 
-**Agents.** A name, which assistant on this machine it uses, and one line
-saying what it is for. An agent is not a new kind of program: it is one of the
-assistants you already pay for, given a name and a job. Two agents can both use
-Claude, and they will not read each other's words.
+**Agents.** A name, which assistant on this machine it uses, one line saying
+what it is for, and its own icon or profile picture, accent colour, and
+chat-bubble colour. A picture can be chosen from the desktop, then zoomed and
+hue-shifted in the settings preview. An agent is not a new kind of program: it
+is one of the assistants you already pay for, given a name and a job. Two
+agents can both use Claude, and they will not read each other's words.
 
 **Projects.** A folder, and the jobs you want done in it.
 
@@ -29,16 +31,22 @@ one folder.
 **Talks to.** Which pairs of agents may pass notes to each other while a run is
 going.
 
-## Two agents never share a conversation
+## Conversations belong to an exact pair
 
-An agent's conversation is filed under its own name, not under the assistant it
-uses. Two agents both on Claude would otherwise each read the other's half of
-it, which is worse than useless: it is one assistant answering as though it were
-two, and quietly agreeing with itself.
+The full chat has a left pane of durable conversations grouped by the exact two
+agents on a green communication line. Each pair can have several chats. You can
+create a fresh one, return to an older one, or delete one transcript without
+touching any other pair's history.
 
-So the name matters. Rename an agent and its conversation moves with it. Two
-agents may not have the same name, and the board says so plainly rather than
-letting it happen.
+Pair identity uses stable board IDs rather than provider routes or display
+names. Two agents both using Claude therefore remain distinct, renaming either
+agent does not orphan its pair chats, and GPT Codex ↔ Claude can never read the
+history from GPT Codex ↔ Gemini.
+
+Each chat stores one active project. Its dropdown contains only folders that
+both agents work on. That selection is included in their authoritative board
+context and is the only folder the Work action can change; with no shared
+project selected, file work is refused.
 
 ## Nobody talks to anybody unless you say so
 
@@ -77,9 +85,16 @@ YES** or **communicates? NO** between two agents. A pair who may not talk still
 gets a line, crossed out and grey, so there is always a gear to press. Pressing
 it opens the line on the right, where one tick turns it on or off.
 
-An agent's settings hold its name, which assistant it uses, what it is for, the
-projects it works on, and the agents it may talk to. **Save this agent** writes
-the top part down; the ticks save themselves as you make them.
+An agent's settings hold its name, which assistant it uses, what it is for, its
+fallback icon, optional profile picture, picture zoom and hue, colours, the
+projects it works on, and the agents it may talk to. Names and appearance are
+previewed immediately on both the settings card and the real board card.
+Agent fields save automatically after a short typing pause and immediately when
+a control is finished. The panel keeps an unsaved draft across board redraws,
+flushes it when another agent is opened or the panel closes, and says whether it
+is waiting, saving, saved, or needs a retry. **Save now** remains as a manual
+fallback. The ticks save themselves as you make them. The appearance follows the speaker into every chat, including
+a connected agent speaking in somebody else's chat.
 
 A project's settings hold the jobs you want done there. Taking a project off the
 board changes nothing in the folder.
@@ -100,14 +115,22 @@ by a thin line. It is a big box on purpose: a chat squeezed into a strip at the
 edge of a page is a chat nobody uses, and the answer is the part you came to
 read.
 
-Several can be open at once, one per agent, and each can be dragged where you
+Several can be open at once, one launcher per agent, and each can be dragged where you
 want it. Two of them can be waiting for an answer at the same time, because they
 are two different assistants being asked two different things. **Start again**
 empties that one chat and no other. **Close** puts it away; nothing said is
 lost, and opening it again reads it back.
 
-Every one of these is that agent's own conversation, filed under its own name.
-Two agents both using Claude never read each other's words.
+When a request involves connected agents, each completed reply appears in the
+chat immediately. Nexus does not wait for every provider and then drop the
+whole exchange onto the screen at once. The lead can still be working on the
+final answer while finished peer replies are already readable. Once the final
+answer is saved, the temporary live view is replaced by the durable transcript
+with the same named turns.
+
+Inside the maximised view, each connected pair has its own list of saved chats.
+The transcript file name is generated from the stable pair and chat ID, so two
+pair workspaces never read each other's words.
 
 
 ## The page they share, and the tray of chats
@@ -188,6 +211,7 @@ Beside your own settings, in `swarm.json`, next to the list of projects - not
 inside any project. A board spans projects and belongs to none of them, and a
 board kept inside one project would be invisible from the others.
 
-Each agent's conversation is kept in the project's own `.harness/chats`, which
-is never committed, with credentials taken out before anything is written down.
+Pair-chat metadata and transcripts are kept in the project's own
+`.harness/chats`, which is never committed, with credentials taken out before
+anything is written down.
 

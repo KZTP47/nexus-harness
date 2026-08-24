@@ -11,11 +11,14 @@ a seat you signed into, a model running here, a route with a key in an
 environment variable - and all of them the same way, because they all go
 through the same road as everything else in the harness.
 
-What it is not, on purpose:
+Its boundaries, on purpose:
 
-  - Not an agent. It cannot read your files, run anything, or change anything.
-    It is talked to and it answers. Anything that changes your project goes
-    through the run, where there is a record of it.
+  - Send is conversation. It receives truthful board identity and anything the
+    person explicitly attaches, but does not mutate the project.
+  - Ask connected agents performs a real harness relay; a green line is never
+    presented to the model as if a provider app had already been contacted.
+  - Work together is explicit mutation authority. Provider output remains a
+    proposal until confined paths and baselines pass the transaction boundary.
   - Not a place for credentials. Everything typed in and everything said back
     has credentials taken out of it before it is written down, the same as
     every other thing the harness keeps.
@@ -26,19 +29,23 @@ What it is not, on purpose:
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
+import mimetypes
 import os
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+from . import cancellation
 from .config import LoadedConfig
-from .models import HarnessError, ProviderRequest
+from .models import HarnessError, ProviderRequest, ResponseFormat
 from .providers import ProviderRegistry, create_provider
 from .redaction import CredentialRedactor
 from .safety import confined_path
@@ -68,15 +75,82 @@ LONGEST_ANSWER = 20_000
 LONGEST_WAIT_SECONDS = 180.0
 # How many can be asked the same thing at once.
 MOST_AT_ONCE = 6
+MOST_ATTACHMENTS = 6
+MOST_ATTACHMENT_BYTES = 4_000_000
+MOST_ATTACHMENTS_BYTES = 8_000_000
+MOST_ATTACHMENT_TEXT = 80_000
 # The name the default route is filed under, since it has no name of its own.
 THE_USUAL_ONE = "the-usual-one"
+
+# A provider account is not a provider-app conversation. Every adapter below
+# either makes a headless command/API request or (for Microsoft 365 Copilot)
+# opens a fresh remote conversation for one request. The durable conversation
+# is the one Nexus keeps. This metadata is deliberately central rather than
+# guessed by the page, so every chat surface tells the same truth.
+_CHAT_CONNECTIONS: dict[str, tuple[str, str, str]] = {
+    "claude-cli": (
+        "Claude Code command line", "Claude Desktop",
+        "Nexus sends each turn through Claude Code's non-interactive command line.",
+    ),
+    "codex-cli": (
+        "Codex command line", "Codex desktop app",
+        "Nexus runs an ephemeral, headless Codex command for each turn.",
+    ),
+    "gemini-cli": (
+        "Gemini command line", "Gemini or Antigravity",
+        "Nexus sends each turn through the Gemini command line.",
+    ),
+    "copilot-cli": (
+        "GitHub Copilot command line", "GitHub Copilot chat",
+        "Nexus sends each turn through the GitHub Copilot command line.",
+    ),
+    "assistant-cli": (
+        "Configured assistant command", "",
+        "Nexus sends each turn through the configured command.",
+    ),
+    "m365-copilot": (
+        "Microsoft 365 Copilot through Microsoft Graph", "Microsoft 365 Copilot app",
+        "Nexus opens a fresh Microsoft Graph Copilot conversation for each request and carries this Nexus history into it.",
+    ),
+    "openai": (
+        "OpenAI API", "ChatGPT",
+        "Nexus sends API requests and keeps the conversation here.",
+    ),
+    "anthropic": (
+        "Anthropic API", "Claude",
+        "Nexus sends API requests and keeps the conversation here.",
+    ),
+    "gemini": (
+        "Gemini API", "Gemini app",
+        "Nexus sends API requests and keeps the conversation here.",
+    ),
+    "ollama": (
+        "Ollama service", "",
+        "Nexus sends requests to the configured Ollama service and keeps the conversation here.",
+    ),
+    "openai-compatible": (
+        "OpenAI-compatible API", "",
+        "Nexus sends requests to the configured API and keeps the conversation here.",
+    ),
+    "local": (
+        "Local provider", "",
+        "Nexus asks the configured local provider and keeps the conversation here.",
+    ),
+}
 # What each one is told about itself. Short on purpose: this is a conversation,
 # not a job, and an assistant told it is running a job starts trying to run one.
 HOW_TO_ANSWER = (
-    "You are talking to somebody working on a software project. Answer what "
-    "they ask, briefly and plainly. Say when you do not know. You cannot read "
-    "their files or run anything, so do not offer to; if you need to see "
-    "something, ask them to paste it."
+    "You are an AI agent on a Nexus Harness board, talking to a person working "
+    "on a software project. Answer briefly and plainly and say when you do not "
+    "know. Nexus may supply board identities, connected-agent replies, attached "
+    "file contents, or images below; use that evidence. A green board connection "
+    "means Nexus is allowed to relay messages, not that you can control another "
+    "provider app yourself. Never claim you contacted another agent unless Nexus "
+    "supplies its actual reply. Ordinary chat cannot change project files. "
+    "In ordinary chat you cannot read their files except the attachments or "
+    "bounded file contents Nexus explicitly supplies. "
+    "The separate Work together action may apply explicitly proposed files through "
+    "Nexus's bounded transaction layer."
 )
 
 # Provider diagnostics sometimes include the identity behind a subscription.
@@ -164,15 +238,137 @@ class Said:
     at: str
     milliseconds: int = 0
     model: str = ""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    speaker_id: str = ""
+    speaker_name: str = ""
+    speaker_route: str = ""
+    recipient_id: str = ""
+    recipient_name: str = ""
+    phase: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "who": self.who,
             "text": self.text,
             "at": self.at,
             "milliseconds": self.milliseconds,
             "model": self.model,
+            "attachments": [dict(one) for one in self.attachments],
         }
+        for key in (
+            "speaker_id", "speaker_name", "speaker_route",
+            "recipient_id", "recipient_name", "phase",
+        ):
+            held = getattr(self, key)
+            if held:
+                value[key] = held
+        return value
+
+
+def _attachment_folder(config: LoadedConfig, route: str, filed_as: str) -> Path:
+    return confined_path(
+        config.project_root,
+        Path(WHERE_THEY_LIVE) / "attachments" / _filed_under(filed_as or route),
+        allow_missing=True,
+        allow_control=True,
+    )
+
+
+def keep_attachments(
+    config: LoadedConfig, route: str, supplied: object, filed_as: str = ""
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+    """Validate, persist and prepare user-selected files for one provider turn."""
+
+    if supplied in (None, []):
+        return [], [], ""
+    if not isinstance(supplied, list) or len(supplied) > MOST_ATTACHMENTS:
+        raise ChatError(f"Attach at most {MOST_ATTACHMENTS} files at once.")
+    total = 0
+    kept: list[dict[str, Any]] = []
+    provider_files: list[dict[str, Any]] = []
+    text_blocks: list[str] = []
+    folder = _attachment_folder(config, route, filed_as)
+    folder.mkdir(parents=True, exist_ok=True)
+    for position, raw in enumerate(supplied):
+        if not isinstance(raw, dict):
+            raise ChatError("An attachment is malformed.")
+        name = Path(str(raw.get("name") or "")).name.strip()
+        if not name or len(name) > 180:
+            raise ChatError("Every attachment needs a short file name.")
+        mime = str(raw.get("type") or mimetypes.guess_type(name)[0] or "application/octet-stream")
+        encoded = str(raw.get("data") or "")
+        if encoded.startswith("data:"):
+            _, mark, encoded = encoded.partition(",")
+            if not mark:
+                raise ChatError(f"{name} has an invalid data URL.")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise ChatError(f"{name} is not a valid attachment.") from exc
+        if not content or len(content) > MOST_ATTACHMENT_BYTES:
+            raise ChatError(
+                f"{name} is empty or larger than {MOST_ATTACHMENT_BYTES // 1_000_000} MB."
+            )
+        total += len(content)
+        if total > MOST_ATTACHMENTS_BYTES:
+            raise ChatError("The attachments together are larger than 8 MB.")
+        attachment_id = uuid.uuid4().hex
+        suffix = Path(name).suffix[:16]
+        stored = folder / f"{attachment_id}{suffix}"
+        beside = folder / f".{attachment_id}.part"
+        descriptor = os.open(beside, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(beside, stored)
+        public = {
+            "id": attachment_id,
+            "name": name,
+            "type": mime,
+            "size": len(content),
+            "image": mime.startswith("image/"),
+        }
+        kept.append(public)
+        provider_files.append({
+            **public,
+            "data": base64.b64encode(content).decode("ascii"),
+            "path": str(stored),
+        })
+        textual = (
+            mime.startswith("text/")
+            or mime in {"application/json", "application/xml", "application/javascript"}
+            or Path(name).suffix.lower() in {
+                ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".md",
+                ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv",
+            }
+        )
+        if textual:
+            decoded = content.decode("utf-8", errors="replace")[:MOST_ATTACHMENT_TEXT]
+            text_blocks.append(f"ATTACHED TEXT FILE {position + 1}: {name}\n{decoded}")
+    return kept, provider_files, "\n\n".join(text_blocks)
+
+
+def attachment_path(
+    config: LoadedConfig, route: str, filed_as: str, attachment_id: str
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve only an attachment that is actually recorded in this chat."""
+
+    if not re.fullmatch(r"[0-9a-f]{32}", str(attachment_id or "")):
+        raise ChatError("That attachment id is invalid.")
+    metadata = None
+    for turn in read_it(config, route, filed_as):
+        for one in turn.attachments:
+            if one.get("id") == attachment_id:
+                metadata = one
+                break
+    if metadata is None:
+        raise ChatError("That attachment is not in this conversation.")
+    folder = _attachment_folder(config, route, filed_as)
+    matches = list(folder.glob(f"{attachment_id}.*"))
+    if len(matches) != 1 or not matches[0].is_file():
+        raise ChatError("That attachment is no longer available.")
+    return matches[0], dict(metadata)
 
 
 def _now() -> str:
@@ -217,6 +413,132 @@ def where_it_is_kept(config: LoadedConfig, route: str, filed_as: str = "") -> Pa
         allow_missing=True,
         allow_control=True,
     )
+
+
+def chat_destination(
+    config: LoadedConfig,
+    route: str,
+    filed_as: str = "",
+    *,
+    conversation_key: str = "",
+    prefer_existing_conversation: bool = True,
+) -> dict[str, Any]:
+    """Say exactly where a chat lives and how its answers are obtained."""
+
+    named = str(route or "").strip()
+    if named.startswith("web:"):
+        # Web-chat routes are deliberately not part of ProviderRegistry: the
+        # authenticated browser belongs to Electron and announces itself to
+        # the in-process broker with a heartbeat.  Treating one like a static
+        # provider route made a live Gemini/ChatGPT/Claude chat say "Missing
+        # route" in its own header even while that same broker could answer it.
+        from . import web_chats
+
+        where = where_it_is_kept(config, named, filed_as)
+        found = web_chats.active().route(named)
+        connection_id = named.removeprefix("web:")
+        provider = str((found or {}).get("provider") or "web").strip()
+        title = str((found or {}).get("title") or connection_id).strip()
+        provider_name = {
+            "chatgpt": "ChatGPT",
+            "claude": "Claude",
+            "gemini": "Gemini",
+            "copilot": "Microsoft Copilot",
+        }.get(provider.lower(), provider.replace("-", " ").title() or "Web AI")
+        connected = found is not None
+        return {
+            "kind": "provider-web-chat",
+            "owner": "nexus",
+            "owner_label": "Nexus Harness",
+            "connected": connected,
+            "provider_kind": "web-chat",
+            "provider_label": (
+                f"{provider_name} web — {title}"
+                if connected else f"Disconnected web chat “{connection_id}”"
+            ),
+            "provider_app_name": provider_name if connected else "",
+            "provider_app_linked": connected,
+            "route": named,
+            "model": "consumer web chat",
+            "transcript_path": where.relative_to(config.project_root).as_posix(),
+            "transcript_exists": where.is_file(),
+            "url": str((found or {}).get("url") or ""),
+            "web_chat_id": str((found or {}).get("id") or connection_id),
+            "web_conversation_key": str(
+                conversation_key or _filed_under(filed_as or named)
+            ),
+            "web_prefer_existing_conversation": bool(prefer_existing_conversation),
+            "explanation": (
+                "Nexus relays turns through the logged-in provider page and "
+                "saves the full multi-agent transcript locally."
+                if connected else
+                "Reconnect this provider chat from Web AI chats before sending. "
+                "Its saved Nexus transcript is still available."
+            ),
+        }
+    uses_project_default = not named and not bool(config.get("providers", {}))
+    if not named and not uses_project_default:
+        return {
+            "owner": "nexus",
+            "owner_label": "Nexus Harness",
+            "connected": False,
+            "provider_kind": "",
+            "provider_label": "No assistant chosen",
+            "provider_app_name": "",
+            "provider_app_linked": False,
+            "route": "",
+            "model": "",
+            "transcript_path": "",
+            "transcript_exists": False,
+            "explanation": "Choose an assistant before this Nexus chat can send a message.",
+        }
+    try:
+        routed = ProviderRegistry(config).provider_config(
+            "default" if uses_project_default else named
+        )
+    except HarnessError:
+        where = where_it_is_kept(config, named, filed_as)
+        return {
+            "owner": "nexus",
+            "owner_label": "Nexus Harness",
+            "connected": False,
+            "provider_kind": "",
+            "provider_label": f"Missing route “{named}”",
+            "provider_app_name": "",
+            "provider_app_linked": False,
+            "route": named,
+            "model": "",
+            "transcript_path": where.relative_to(config.project_root).as_posix(),
+            "transcript_exists": where.is_file(),
+            "explanation": "This Nexus chat is saved here, but its provider route is no longer configured.",
+        }
+    kind = str(routed.get("provider.name") or "")
+    model = str(routed.get("provider.model") or "")
+    provider_label, provider_app, explanation = _CHAT_CONNECTIONS.get(
+        kind,
+        (kind or "Configured provider", "", "Nexus asks the configured provider and keeps the conversation here."),
+    )
+    where = where_it_is_kept(config, named, filed_as)
+    relative = where.relative_to(config.project_root).as_posix()
+    not_linked = (
+        f"It is not linked to a chat in {provider_app}; that app will not contain these messages."
+        if provider_app
+        else "This provider exposes no separate app chat for Nexus to open."
+    )
+    return {
+        "owner": "nexus",
+        "owner_label": "Nexus Harness",
+        "connected": True,
+        "provider_kind": kind,
+        "provider_label": provider_label,
+        "provider_app_name": provider_app,
+        "provider_app_linked": False,
+        "route": named or "project default",
+        "model": model,
+        "transcript_path": relative,
+        "transcript_exists": where.is_file(),
+        "explanation": f"{explanation} {not_linked}",
+    }
 
 
 def _cut_at_a_full_stop(said: str) -> str:
@@ -420,7 +742,8 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
                 if needs_setup else ""
             ),
             "how_to_fix_it": (
-                "Press Connect it and enter the project id. No API key is needed."
+                "Press Set Cloud project on the agent card (or Connect it in the "
+                "readiness list) and enter the Project ID. No API key is needed."
                 if needs_setup else (_claude_subscription_repair() if claude_needs_attention else "")
             ),
             "connection_state": (
@@ -432,10 +755,16 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
             "can_sign_in": can_sign_in,
             "setup_blocked": False,
             "trouble_last_time": (
-                f"The last time this was asked something, it would not answer: {no['why']}"
+                (
+                    "Gemini is installed and Nexus reached its command line, but "
+                    "this Workspace account needs a Google Cloud Project ID."
+                    if needs_setup else
+                    f"The last time this was asked something, it would not answer: {no['why']}"
+                )
                 if no else ""
             ),
             "when_that_was": no["at"] if no else "",
+            "chat_destination": chat_destination(config, str(name)),
         })
     if not found:
         # No named routes: the one this project uses is still somebody, and on
@@ -450,6 +779,7 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
                 "ready": True,
                 "why_not": "",
                 "how_to_fix_it": "",
+                "chat_destination": chat_destination(config, ""),
             })
     return found
 
@@ -521,6 +851,16 @@ def read_it(config: LoadedConfig, route: str, filed_as: str = "") -> list[Said]:
             at=str(one.get("at") or ""),
             milliseconds=int(one.get("milliseconds") or 0),
             model=str(one.get("model") or ""),
+            attachments=[
+                dict(item) for item in one.get("attachments", [])
+                if isinstance(item, dict)
+            ] if isinstance(one.get("attachments"), list) else [],
+            speaker_id=str(one.get("speaker_id") or "")[:120],
+            speaker_name=str(one.get("speaker_name") or "")[:240],
+            speaker_route=str(one.get("speaker_route") or "")[:120],
+            recipient_id=str(one.get("recipient_id") or "")[:120],
+            recipient_name=str(one.get("recipient_name") or "")[:500],
+            phase=str(one.get("phase") or "")[:80],
         ))
     return kept
 
@@ -544,6 +884,40 @@ def _keep_it(
     os.replace(beside, where)
 
 
+def merge_transcript(
+    config: LoadedConfig, route: str, filed_as: str, recovered: list[Said]
+) -> int:
+    """Merge proven historical turns into one transcript without duplicates.
+
+    Pair-chat migration uses this only after it has established ownership from
+    explicit agent IDs. The original legacy file is never changed. Sorting by
+    the stored ISO timestamp restores old blocks ahead of newer pair-native
+    turns, while Python's stable sort preserves each block's internal order.
+    """
+
+    if not recovered:
+        return 0
+    with _the_lock_for(_filed_under(filed_as or route)):
+        existing = read_it(config, route, filed_as)
+        seen = {
+            json.dumps(one.to_dict(), ensure_ascii=False, sort_keys=True)
+            for one in existing
+        }
+        added: list[Said] = []
+        for one in recovered:
+            marked = json.dumps(one.to_dict(), ensure_ascii=False, sort_keys=True)
+            if marked in seen:
+                continue
+            seen.add(marked)
+            added.append(one)
+        if not added:
+            return 0
+        combined = added + existing
+        combined.sort(key=lambda one: str(one.at or ""))
+        _keep_it(config, route, combined, filed_as)
+        return len(added)
+
+
 def start_again(config: LoadedConfig, route: str, filed_as: str = "") -> str:
     """Throw the conversation away and start a fresh one."""
 
@@ -554,6 +928,30 @@ def start_again(config: LoadedConfig, route: str, filed_as: str = "") -> str:
         if where.is_file():
             take_the_file_away(where, missing_ok=True)
     return "That conversation is gone. Say something and a new one starts."
+
+
+def remove_conversation(config: LoadedConfig, route: str, filed_as: str = "") -> None:
+    """Remove one exact transcript and only the attachments filed with it."""
+
+    from .safety import take_the_file_away
+
+    filed = _filed_under(filed_as or route)
+    with _the_lock_for(filed):
+        where = where_it_is_kept(config, route, filed_as)
+        if where.is_file():
+            take_the_file_away(where, missing_ok=True)
+        folder = _attachment_folder(config, route, filed_as)
+        if folder.is_dir() and not folder.is_symlink():
+            # Attachment folders are flat and contain only Nexus-generated
+            # names. Remove each exact file before the directory, rather than
+            # recursively deleting a path assembled from user input.
+            for child in folder.iterdir():
+                if child.is_file() and not child.is_symlink():
+                    take_the_file_away(child, missing_ok=True)
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
 
 
 def _check_what_was_typed(text: str) -> str:
@@ -571,7 +969,17 @@ def _check_what_was_typed(text: str) -> str:
 
 
 def say(
-    config: LoadedConfig, route: str, text: str, filed_as: str = ""
+    config: LoadedConfig,
+    route: str,
+    text: str,
+    filed_as: str = "",
+    *,
+    context: str = "",
+    attachments: object = None,
+    speaker: dict[str, Any] | None = None,
+    recipients: list[dict[str, Any]] | None = None,
+    conversation_key: str = "",
+    prefer_existing_conversation: bool = True,
 ) -> dict[str, Any]:
     """Say one thing to one of them, and keep what comes back.
 
@@ -587,8 +995,14 @@ def say(
     registry = ProviderRegistry(config)
     named = str(route or "").strip()
     try:
-        routed = registry.provider_config(named) if named else config
-        provider = create_provider(routed)
+        if named.startswith("web:"):
+            from . import web_chats
+
+            provider = web_chats.active().provider(named)
+            routed = config
+        else:
+            routed = registry.provider_config(named) if named else config
+            provider = create_provider(routed)
     except HarnessError as exc:
         # Redacted, like everything else. A key typed into a settings file comes
         # back inside "incorrect API key provided: ..." when it is wrong, and
@@ -600,35 +1014,89 @@ def say(
             ))
         ) from exc
 
-    model = str(routed.get("provider.model") or "")
+    model = (
+        f"{(web_chats.active().route(named) or {}).get('provider', 'web')} web chat"
+        if named.startswith("web:") else str(routed.get("provider.model") or "")
+    )
     # From here to the write is one piece of work: read what was said, add to
     # it, write it back. Two of those at once each write what the other did not
     # know about, and a turn disappears with nobody told.
     with _the_lock_for(_filed_under(filed_as or route)):
+        kept_files, provider_files, attachment_text = keep_attachments(
+            config, route, attachments, filed_as
+        )
+        dynamic = "\n\n".join(
+            one for one in (str(context or "").strip(), attachment_text) if one
+        )
         return _ask_and_keep(
-            config, route, asked, provider, model, redactor, named, filed_as
+            config,
+            route,
+            asked,
+            provider,
+            model,
+            redactor,
+            named,
+            filed_as,
+            dynamic_context=dynamic,
+            kept_attachments=kept_files,
+            provider_attachments=provider_files,
+            speaker=speaker,
+            recipients=recipients,
+            conversation_key=conversation_key,
+            prefer_existing_conversation=prefer_existing_conversation,
         )
 
 
 def _ask_and_keep(
-    config, route, asked, provider, model, redactor, named, filed_as=""
+    config,
+    route,
+    asked,
+    provider,
+    model,
+    redactor,
+    named,
+    filed_as="",
+    *,
+    dynamic_context="",
+    kept_attachments=None,
+    provider_attachments=None,
+    speaker=None,
+    recipients=None,
+    conversation_key="",
+    prefer_existing_conversation=False,
 ) -> dict[str, Any]:
     so_far = read_it(config, route, filed_as)
     messages = [
-        {"role": "user" if one.who == "you" else "assistant", "content": one.text}
+        {
+            "role": "user" if one.who == "you" else "assistant",
+            "content": (
+                f"{one.speaker_name}: {one.text}"
+                if speaker and one.who == "them" and one.speaker_name else one.text
+            ),
+        }
         for one in so_far
+        if one.phase not in {
+            "agent_reply", "lead_draft", "agent_plan", "lead_plan",
+            "agent_discussion", "agent_plan_review", "lead_execution",
+            "agent_verification",
+        }
     ]
     messages.append({"role": "user", "content": redactor.text(asked)})
     # Built here rather than passed in, so everything that goes to an assistant
     # is built in the one place.
     request = ProviderRequest(
         system_prefix=HOW_TO_ANSWER,
-        dynamic_context="",
+        dynamic_context=str(dynamic_context or ""),
         messages=messages,
         model=model,
         temperature=0.3,
         max_output_tokens=2048,
         timeout_seconds=LONGEST_WAIT_SECONDS,
+        attachments=list(provider_attachments or []),
+        conversation_key=str(
+            conversation_key or _filed_under(filed_as or route)
+        ),
+        prefer_existing_conversation=bool(prefer_existing_conversation),
     )
     started = time.monotonic()
     try:
@@ -652,18 +1120,199 @@ def _ask_and_keep(
     if not back:
         raise ChatError(f"{named or 'The assistant'} answered with nothing at all.")
     turns = so_far + [
-        Said(who="you", text=redactor.text(asked), at=_now()),
+        Said(
+            who="you",
+            text=redactor.text(asked),
+            at=_now(),
+            attachments=list(kept_attachments or []),
+            speaker_name="You" if speaker else "",
+            recipient_id=",".join(
+                str(one.get("id") or "") for one in (recipients or [])
+            ),
+            recipient_name=", ".join(
+                str(one.get("name") or "An agent") for one in (recipients or [])
+            )[:500],
+            phase="user_prompt" if speaker else "",
+        ),
         Said(
             who="them",
             text=back[:LONGEST_ANSWER],
             at=_now(),
             milliseconds=int((time.monotonic() - started) * 1000),
             model=model,
+            speaker_id=str((speaker or {}).get("id") or "")[:120],
+            speaker_name=str((speaker or {}).get("name") or "")[:240],
+            speaker_route=str((speaker or {}).get("who") or route)[:120]
+            if speaker else "",
+            recipient_name="You" if speaker else "",
+            phase="final_answer" if speaker else "",
         ),
     ]
     _keep_it(config, route, turns, filed_as)
     return {
         "route": named,
+        "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
+        "answer": turns[-1].to_dict(),
+    }
+
+
+def ask_once(
+    config: LoadedConfig,
+    route: str,
+    text: str,
+    *,
+    context: str = "",
+    provider_attachments: list[dict[str, Any]] | None = None,
+    response_format: ResponseFormat | None = None,
+    conversation_key: str = "",
+    prefer_existing_conversation: bool = False,
+) -> dict[str, Any]:
+    """Ask without touching a transcript, for a bounded collaboration round."""
+
+    asked = _check_what_was_typed(text)
+    redactor = CredentialRedactor(config)
+    named = str(route or "").strip()
+    try:
+        if named.startswith("web:"):
+            from . import web_chats
+
+            routed = config
+            provider = web_chats.active().provider(named)
+        else:
+            routed = ProviderRegistry(config).provider_config(named) if named else config
+            provider = create_provider(routed)
+        request = ProviderRequest(
+            system_prefix=HOW_TO_ANSWER,
+            dynamic_context=str(context or ""),
+            messages=[{"role": "user", "content": redactor.text(asked)}],
+            model=str(routed.get("provider.model") or ""),
+            temperature=0.2,
+            max_output_tokens=4096,
+            timeout_seconds=LONGEST_WAIT_SECONDS,
+            response_format=response_format,
+            attachments=list(provider_attachments or []),
+            conversation_key=str(conversation_key or _filed_under(named)),
+            prefer_existing_conversation=bool(prefer_existing_conversation),
+        )
+        started = time.monotonic()
+        response = provider.complete(request)
+    except HarnessError as exc:
+        raise ChatError(
+            _without_personal_account_details(
+                redactor.text(f"{named or 'The assistant'} was asked and did not answer: {_in_plain_words(exc)}")
+            )
+        ) from exc
+    answer = redactor.text(str(response.text or "").strip())
+    if not answer:
+        raise ChatError(f"{named or 'The assistant'} answered with nothing at all.")
+    return {
+        "text": answer[:LONGEST_ANSWER],
+        "milliseconds": int((time.monotonic() - started) * 1000),
+        "model": (
+            f"{(web_chats.active().route(named) or {}).get('provider', 'web')} web chat"
+            if named.startswith("web:") else str(routed.get("provider.model") or "")
+        ),
+    }
+
+
+def keep_exchange(
+    config: LoadedConfig,
+    route: str,
+    text: str,
+    answer: str,
+    *,
+    filed_as: str = "",
+    attachments: list[dict[str, Any]] | None = None,
+    model: str = "",
+    milliseconds: int = 0,
+) -> dict[str, Any]:
+    """Record a harness-orchestrated exchange after its side effects succeed."""
+
+    redactor = CredentialRedactor(config)
+    with _the_lock_for(_filed_under(filed_as or route)):
+        turns = read_it(config, route, filed_as) + [
+            Said("you", redactor.text(_check_what_was_typed(text)), _now(), attachments=list(attachments or [])),
+            Said("them", redactor.text(answer)[:LONGEST_ANSWER], _now(), milliseconds, model),
+        ]
+        _keep_it(config, route, turns, filed_as)
+    return {
+        "route": str(route or "").strip(),
+        "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
+        "answer": turns[-1].to_dict(),
+    }
+
+
+def keep_multiparty_exchange(
+    config: LoadedConfig,
+    route: str,
+    text: str,
+    answer: str,
+    *,
+    filed_as: str,
+    lead: dict[str, Any],
+    participants: list[dict[str, Any]],
+    contributions: list[dict[str, Any]],
+    attachments: list[dict[str, Any]] | None = None,
+    model: str = "",
+    milliseconds: int = 0,
+) -> dict[str, Any]:
+    """Keep every real turn from a bounded fan-out/fan-in exchange.
+
+    Provider calls remain transient, but their exact redacted replies are part
+    of the conversation the user asked to see.  The legacy ``who`` field stays
+    intact for compatibility; the explicit speaker/recipient/phase fields make
+    a multi-party transcript unambiguous without pretending there were rounds
+    that the orchestrator did not actually run.
+    """
+
+    redactor = CredentialRedactor(config)
+    lead_id = str(lead.get("id") or "")
+    lead_name = str(lead.get("name") or "The lead agent")
+    team_name = ", ".join(str(one.get("name") or "an agent") for one in participants)
+    team_ids = ",".join(str(one.get("id") or "") for one in participants)
+    with _the_lock_for(_filed_under(filed_as or route)):
+        turns = read_it(config, route, filed_as)
+        now = _now()
+        turns.append(Said(
+            "you", redactor.text(_check_what_was_typed(text)), now,
+            attachments=list(attachments or []),
+            speaker_name="You", recipient_id=team_ids,
+            recipient_name=team_name, phase="user_prompt",
+        ))
+        for contribution in contributions:
+            speaker_id = str(contribution.get("speaker_id") or "")
+            is_lead = speaker_id == lead_id
+            recipient_id = str(contribution.get("recipient_id") or (
+                lead_id if not is_lead else team_ids
+            ))
+            recipient_name = str(contribution.get("recipient_name") or (
+                lead_name if not is_lead else "Team deliberation"
+            ))[:240]
+            turns.append(Said(
+                "them",
+                redactor.text(str(contribution.get("text") or ""))[:LONGEST_ANSWER],
+                now,
+                int(contribution.get("milliseconds") or 0),
+                str(contribution.get("model") or ""),
+                speaker_id=speaker_id,
+                speaker_name=str(contribution.get("speaker_name") or "An agent")[:240],
+                speaker_route=str(contribution.get("speaker_route") or "")[:120],
+                recipient_id=recipient_id,
+                recipient_name=recipient_name,
+                phase=str(contribution.get("phase") or (
+                    "lead_draft" if is_lead else "agent_reply"
+                ))[:80],
+            ))
+        turns.append(Said(
+            "them", redactor.text(answer)[:LONGEST_ANSWER], now,
+            milliseconds, model,
+            speaker_id=lead_id, speaker_name=lead_name,
+            speaker_route=str(lead.get("who") or "")[:120],
+            recipient_name="You", phase="final_answer",
+        ))
+        _keep_it(config, route, turns, filed_as)
+    return {
+        "route": str(route or "").strip(),
         "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
         "answer": turns[-1].to_dict(),
     }
@@ -696,6 +1345,8 @@ def ask_everyone(config: LoadedConfig, text: str) -> list[dict[str, Any]]:
                 "milliseconds": got["answer"]["milliseconds"],
                 "went_wrong": "",
             }
+        except cancellation.ChatCancelled:
+            raise
         except Exception as exc:  # noqa: BLE001 - one route may not fell the rest
             # One that will not answer must not stop the others being read, and
             # that has to hold for every way of not answering - not only the one
@@ -714,7 +1365,10 @@ def ask_everyone(config: LoadedConfig, text: str) -> list[dict[str, Any]]:
             }
 
     with ThreadPoolExecutor(max_workers=min(len(ready), MOST_AT_ONCE)) as pool:
-        return list(pool.map(one_of_them, ready))
+        return [
+            future.result()
+            for future in [cancellation.submit(pool, one_of_them, one) for one in ready]
+        ]
 
 
 # How much of a reason is worth reading. Four hundred letters was enough while a

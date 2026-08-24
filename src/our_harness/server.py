@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import socket
 import threading
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from . import bundle
+from . import cancellation
 from . import comparison
 from . import coverage
 from . import handover
@@ -25,6 +27,9 @@ from . import pipeline_starters
 from . import pipelines as pipeline_lab
 from . import chat as chat_lab
 from . import swarm as swarm_lab
+from . import swarm_chats
+from . import swarm_work
+from . import web_chats
 from . import projects as projects_lab
 from . import tell_somebody as telling_lab
 from . import timer as timer_lab
@@ -149,6 +154,88 @@ def _a_name_for_a_local_route(server: str, model: str) -> str:
         plain = plain.replace("--", "-")
     return (plain or server)[:48].lower()
 
+_CHAT_ACTIVITY_ID = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+
+
+class ChatActivities:
+    """Small process-local progress feed for long board-chat requests."""
+
+    def __init__(self, limit: int = 128):
+        self.limit = limit
+        self.lock = threading.Lock()
+        self.records: dict[str, dict[str, Any]] = {}
+
+    def _id(self, activity_id: object) -> str:
+        value = str(activity_id or "").strip()
+        if value and not _CHAT_ACTIVITY_ID.fullmatch(value):
+            raise HarnessError("That chat activity ID is not valid")
+        return value
+
+    def update(
+        self, activity_id: object, stage: str, detail: str = "", *, state: str = "working"
+    ) -> None:
+        wanted = self._id(activity_id)
+        if not wanted:
+            return
+        now = time.time()
+        with self.lock:
+            previous = self.records.get(wanted, {})
+            began = previous.get("started_at", now)
+            self.records[wanted] = {
+                "activity": wanted,
+                "state": state,
+                "stage": str(stage)[:180],
+                "detail": str(detail)[:500],
+                "started_at": began,
+                "updated_at": now,
+                "turns": list(previous.get("turns", [])),
+            }
+            while len(self.records) > self.limit:
+                self.records.pop(next(iter(self.records)))
+
+    def add_turn(self, activity_id: object, turn: object) -> None:
+        wanted = self._id(activity_id)
+        if not wanted or not isinstance(turn, dict):
+            return
+        kept = {
+            key: str(turn.get(key) or "")[:longest]
+            for key, longest in {
+                "who": 12, "speaker_id": 100, "speaker_name": 100,
+                "speaker_route": 100, "recipient_id": 100,
+                "recipient_name": 100, "text": 20000, "model": 200,
+                "phase": 40,
+            }.items()
+        }
+        kept["milliseconds"] = max(0, int(turn.get("milliseconds") or 0))
+        now = time.time()
+        with self.lock:
+            previous = self.records.get(wanted, {})
+            previous["activity"] = wanted
+            previous.setdefault("state", "working")
+            previous.setdefault("stage", "Receiving agent replies")
+            previous.setdefault("detail", "Completed agent turns are appearing in the chat.")
+            previous.setdefault("started_at", now)
+            previous["updated_at"] = now
+            previous["turns"] = [*previous.get("turns", []), kept][-16:]
+            self.records[wanted] = previous
+
+    def read(self, activity_id: object) -> dict[str, Any]:
+        wanted = self._id(activity_id)
+        if not wanted:
+            raise HarnessError("A chat activity ID is required")
+        with self.lock:
+            record = self.records.get(wanted)
+            if record:
+                return dict(record)
+        return {
+            "activity": wanted,
+            "state": "waiting",
+            "stage": "Starting the request",
+            "detail": "Nexus is preparing the agent connection.",
+            "turns": [],
+        }
+
+
 class HarnessHTTPServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], config: LoadedConfig):
         if ":" in address[0]:
@@ -161,6 +248,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # beginning, instead of waiting forever for numbers that will never come.
         self.started_id = secrets.token_urlsafe(8)
         self.events = EventBus(redactor=CredentialRedactor(config))
+        self.chat_activities = ChatActivities()
+        self.chat_cancellations = cancellation.ChatCancellationRegistry()
+        self.web_chats = web_chats.WebChatBroker()
+        self.swarm_known_routes: list[dict[str, Any]] | None = None
+        # Board runners and direct chat use the provider-neutral chat module,
+        # which may execute on background threads. Give all of those paths the
+        # same Electron mailbox owned by this server.
+        web_chats.replace_active(self.web_chats)
         self.run_lock = threading.Lock()
         self.qa_lock = threading.Lock()
         # Changing the suite is read, change, write. Two of those at once
@@ -219,6 +314,24 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.workflow_policy = resolve_workflow_policy(config, registry.workflow_nodes)
         self.check_kinds = dict(registry.check_kinds)
         self.template = migrate_graph(json.loads(files("our_harness.templates").joinpath("gauntlet.json").read_text(encoding="utf-8")))
+
+    def swarm_standing(self, *, refresh_providers: bool = True) -> dict[str, Any]:
+        probing = refresh_providers or self.swarm_known_routes is None
+        standing = (
+            swarm_lab.how_it_stands(self.config) if probing
+            else swarm_lab.how_it_stands(
+                self.config, known_routes=self.swarm_known_routes
+            )
+        )
+        if probing:
+            # Keep only ordinary route status. Live web-chat routes are added
+            # below from the Electron heartbeat on every response.
+            self.swarm_known_routes = [
+                dict(one) for one in standing.get("who_can_be_used", [])
+                if not str(one.get("route") or "").startswith("web:")
+            ]
+        self.web_chats.decorate_swarm(standing)
+        return standing
 
     def move_to(self, where: str) -> dict[str, Any]:
         """Show a different project, without stopping and starting again.
@@ -382,6 +495,23 @@ class HarnessHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _chat_attachment(self, agent_id: str, attachment_id: str) -> None:
+        with self.server.swarm_lock:
+            board = swarm_lab.load()
+        one = swarm_lab.the_agent(board, agent_id)
+        path, metadata = chat_lab.attachment_path(
+            self.server.config, one.who, swarm_lab.filed_as(one.name), attachment_id
+        )
+        raw = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", str(metadata.get("type") or "application/octet-stream"))
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(raw)
+
     def _body(self) -> dict[str, Any]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -390,9 +520,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
             # trusted to be the right length, so this connection ends here.
             self.close_connection = True
             raise HarnessError("Invalid Content-Length") from exc
-        if length <= 0 or length > 2_000_000:
+        if length <= 0 or length > 12_000_000:
             self.close_connection = True
-            raise HarnessError("Request body must contain 1 to 2000000 bytes")
+            raise HarnessError("Request body must contain 1 to 12000000 bytes")
         try:
             value = json.loads(self.rfile.read(length))
         except json.JSONDecodeError as exc:
@@ -766,6 +896,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self._json({**self.server.events.snapshot_after(after), "started_id": self.server.started_id})
                 else:
                     self._json({"events": self.server.events.after(after), "started_id": self.server.started_id})
+            elif parsed.path == "/api/swarm/activity":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                self._json(self.server.chat_activities.read(
+                    query.get("activity", [""])[0]
+                ))
+            elif parsed.path == "/api/web-chats/pending":
+                self._require_token()
+                self._json({"requests": self.server.web_chats.pending()})
             elif parsed.path == "/api/qa/picture":
                 try:
                     self._require_token()
@@ -914,12 +1053,29 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._require_token()
                 config = self.server.config
                 with self.server.swarm_lock:
-                    said = swarm_lab.how_it_stands(config)
+                    said = self.server.swarm_standing()
                     said["what_is_not_ready"] = swarm_lab.what_is_not_ready(config, said)
                 said["cannot_be_changed"] = (
                     self.server.swarm_runner.why_it_cannot_be_changed()
                 )
                 self._json(said)
+            elif parsed.path == "/api/swarm/chats":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                agent_id = query.get("agent", [""])[0]
+                with self.server.swarm_lock:
+                    # Listing saved conversations is a local registry read. It
+                    # must not re-run every provider CLI/version/readiness
+                    # probe: the board has already cached those results, and
+                    # chat switching asks for this list immediately before or
+                    # after reading the selected transcript. A fresh scan here
+                    # made one click wait for several unrelated assistants.
+                    standing = self.server.swarm_standing(
+                        refresh_providers=False
+                    )
+                self._json(swarm_chats.list_for_agent(
+                    self.server.config, standing["board"], agent_id
+                ))
             elif parsed.path == "/api/swarm/said":
                 # One agent's own conversation. Its name decides which file is
                 # read, so two agents both using Claude do not read each
@@ -927,20 +1083,43 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
                 with self.server.swarm_lock:
-                    board = swarm_lab.load()
-                one = swarm_lab.the_agent(board, query.get("agent", [""])[0])
+                    # Transcript identity comes from the saved board and pair
+                    # registry. Provider discovery cannot change which file a
+                    # chat owns, so reuse the cached route status just as a
+                    # live chat turn does below.
+                    standing = self.server.swarm_standing(
+                        refresh_providers=False
+                    )
+                    board = swarm_lab.read_it(standing["board"])
+                agent_id = query.get("agent", [""])[0]
+                one = swarm_lab.the_agent(board, agent_id)
+                chat_id = query.get("chat", [""])[0]
+                conversation = swarm_chats.resolve(
+                    self.server.config, standing["board"], agent_id, chat_id
+                ) if chat_id else None
+                filed_as = (
+                    str(conversation["filed_as"]) if conversation
+                    else swarm_lab.filed_as(one.name)
+                )
                 self._json({
                     "agent": one.to_dict(),
                     "said": [
                         held.to_dict() for held in chat_lab.read_it(
-                            self.server.config, one.who, swarm_lab.filed_as(one.name)
+                            self.server.config, one.who, filed_as
                         )
                     ],
                     "most_letters": chat_lab.MOST_LETTERS,
+                    "conversation": conversation,
                 })
             elif parsed.path == "/api/swarm/how-it-is-going":
                 self._require_token()
                 self._json({"doing": self.server.swarm_runner.how_it_is_going()})
+            elif parsed.path == "/api/swarm/attachment":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                self._chat_attachment(
+                    query.get("agent", [""])[0], query.get("id", [""])[0]
+                )
             elif parsed.path == "/api/swarm/what-they-said":
                 # Asked for on its own rather than sent with every "how is it
                 # going": these are whole answers, and a page watching a run
@@ -1181,7 +1360,17 @@ class HarnessHandler(BaseHTTPRequestHandler):
         try:
             self._authorize()
             body = self._body()
-            if self.path == "/api/validate":
+            if self.path == "/api/web-chats/heartbeat":
+                routes = self.server.web_chats.heartbeat(body.get("connections"))
+                self._json({"routes": routes})
+            elif self.path == "/api/web-chats/complete":
+                self.server.web_chats.complete(
+                    body.get("request_id"),
+                    answer=body.get("answer"), error=body.get("error"),
+                    milliseconds=body.get("milliseconds"), model=body.get("model"),
+                )
+                self._json({"accepted": True})
+            elif self.path == "/api/validate":
                 graph, issues = self._executable_graph(body.get("graph", {}))
                 self._json({"valid": not issues, "issues": issues, "graph": graph})
             elif self.path == "/api/simulate":
@@ -1455,9 +1644,51 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     if stopping:
                         raise swarm_lab.SwarmError(stopping)
                     swarm_lab.save(body.get("board"))
-                    said = swarm_lab.how_it_stands(self.server.config)
+                    # Saving settings must finish at disk speed. Provider
+                    # discovery is refreshed by board reads and Look again;
+                    # reusing that status here avoids multi-second CLI probes
+                    # between every keystroke and its autosave acknowledgement.
+                    said = self.server.swarm_standing(refresh_providers=False)
                     said["what_is_not_ready"] = swarm_lab.what_is_not_ready(
                         self.server.config, said
+                    )
+                self._json(said)
+            elif self.path in {
+                "/api/swarm/chats/create",
+                "/api/swarm/chats/activate",
+                "/api/swarm/chats/project",
+                "/api/swarm/chats/delete",
+            }:
+                agent_id = str(body.get("agent") or "")
+                with self.server.swarm_lock:
+                    # These mutations only change local pair-chat metadata.
+                    # Provider readiness is refreshed by /api/swarm and Look
+                    # again; probing every installed CLI while this lock is
+                    # held turned an atomic file update into a multi-second UI
+                    # stall and then the transcript read repeated that stall.
+                    standing = self.server.swarm_standing(
+                        refresh_providers=False
+                    )
+                if self.path == "/api/swarm/chats/create":
+                    said = swarm_chats.create(
+                        self.server.config, standing["board"], agent_id,
+                        str(body.get("peer") or ""),
+                    )
+                elif self.path == "/api/swarm/chats/activate":
+                    said = swarm_chats.activate(
+                        self.server.config, standing["board"], agent_id,
+                        str(body.get("chat") or ""),
+                    )
+                elif self.path == "/api/swarm/chats/project":
+                    said = swarm_chats.select_project(
+                        self.server.config, standing["board"], agent_id,
+                        str(body.get("chat") or ""),
+                        str(body.get("project") or ""),
+                    )
+                else:
+                    said = swarm_chats.delete(
+                        self.server.config, standing["board"], agent_id,
+                        str(body.get("chat") or ""),
                     )
                 self._json(said)
             elif self.path == "/api/swarm/say":
@@ -1465,20 +1696,191 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # take a minute, and holding the lock that long would freeze
                 # every other window looking at the same board. The
                 # conversation has its own lock, which is the one that matters.
-                with self.server.swarm_lock:
-                    board = swarm_lab.load()
-                one = swarm_lab.the_agent(board, str(body.get("agent") or ""))
-                if not one.who:
-                    raise swarm_lab.SwarmError(
-                        f"{one.name} has no assistant chosen yet. Open its "
-                        "settings and pick which one it uses."
+                activity_id = str(body.get("activity") or "")
+                activity = self.server.chat_activities
+                activity.update(
+                    activity_id, "Reading your request",
+                    "Nexus is checking the selected agent and board connections."
+                )
+                progress = lambda stage, detail="": activity.update(  # noqa: E731
+                    activity_id, stage, detail
+                )
+                live_turn = lambda turn: activity.add_turn(activity_id, turn)  # noqa: E731
+                agent_id = str(body.get("agent") or "")
+                chat_id = str(body.get("chat") or "")
+                chat_key = chat_id or agent_id
+                cancel_token = self.server.chat_cancellations.begin(chat_key, activity_id)
+                cancel_scope = cancellation.use(cancel_token)
+                cancel_scope.__enter__()
+                try:
+                    with self.server.swarm_lock:
+                        # A chat turn needs the saved board topology, not a fresh
+                        # probe of every installed provider.  Probing here can
+                        # take seconds (or wait on a CLI), and because the board
+                        # lock is held it serialises otherwise independent chats.
+                        # It does still need the cached readiness decoration.
+                        # The raw persisted board intentionally contains no
+                        # ephemeral `ready` fields; passing that raw shape to
+                        # pair selection made every explicitly selected peer
+                        # look disconnected even when /api/swarm showed both
+                        # agents green. Live web routes are re-applied here too.
+                        standing = self.server.swarm_standing(
+                            refresh_providers=False
+                        )
+                        board_payload = standing["board"]
+                        board = swarm_lab.read_it(board_payload)
+                    one = swarm_lab.the_agent(board, agent_id)
+                    conversation = swarm_chats.resolve(
+                        self.server.config, board_payload, agent_id, chat_id
+                    ) if chat_id else None
+                    peer_id = str(conversation.get("peer") or "") if conversation else ""
+                    project_id = str(conversation.get("project") or "") if conversation else ""
+                    filed_as = (
+                        str(conversation.get("filed_as") or "") if conversation
+                        else swarm_lab.filed_as(one.name)
                     )
-                self._json(dict(chat_lab.say(
-                    self.server.config,
-                    one.who,
-                    str(body.get("text") or ""),
-                    filed_as=swarm_lab.filed_as(one.name),
-                ), agent=one.to_dict()))
+                    if not one.who:
+                        raise swarm_lab.SwarmError(
+                            f"{one.name} has no assistant chosen yet. Open its "
+                            "settings and pick which one it uses."
+                        )
+                    requested_mode = str(body.get("mode") or "auto")
+                    routing = {
+                        "requested": requested_mode,
+                        "selected": requested_mode,
+                        "reason": "The user chose this action explicitly.",
+                    }
+                    mode = requested_mode
+                    if mode == "auto":
+                        decision = swarm_work.automatic_mode(
+                            self.server.config, board_payload, agent_id,
+                            str(body.get("text") or ""), progress=progress,
+                            peer_id=peer_id, project_id=project_id,
+                        )
+                        mode = decision["mode"]
+                        routing = {
+                            "requested": "auto",
+                            "selected": mode,
+                            "reason": decision["reason"],
+                        }
+                    elif mode == "work" and not swarm_work.mentions_project_scope(
+                        str(body.get("text") or "")
+                    ):
+                        # The project-work button grants mutation authority; it
+                        # cannot turn an unrelated identity/message question
+                        # into a file transaction. Re-run the local intent
+                        # router and choose the least expansive matching action.
+                        decision = swarm_work.automatic_mode(
+                            self.server.config, board_payload, agent_id,
+                            str(body.get("text") or ""), progress=progress,
+                            peer_id=peer_id, project_id=project_id,
+                        )
+                        mode = decision["mode"]
+                        routing = {
+                            "requested": "work",
+                            "selected": mode,
+                            "reason": (
+                                "No project or file subject was present, so Nexus did not open a file transaction. "
+                                + decision["reason"]
+                            ),
+                        }
+                    if (
+                        mode == "work"
+                        and requested_mode == "auto"
+                        and body.get("allow_project_changes") is not True
+                    ):
+                        raise swarm_lab.SwarmError(
+                            "This message asks the team to change project files, but that change was not confirmed. Send it again and approve the project-file confirmation."
+                        )
+                    if mode == "relay":
+                        answer = swarm_work.relay(
+                            self.server.config, board_payload, agent_id,
+                            str(body.get("text") or ""), body.get("attachments"),
+                            progress=progress, live_turn=live_turn,
+                            peer_id=peer_id, project_id=project_id,
+                            filed_as=filed_as,
+                            conversation_key=str(conversation.get("filed_as") or "")
+                            if conversation else filed_as,
+                            prefer_existing_conversation=bool(
+                                conversation.get("web_legacy_candidate")
+                            ) if conversation else True,
+                        )
+                    elif mode == "collaborate":
+                        answer = swarm_work.collaborate(
+                            self.server.config, board_payload, agent_id,
+                            str(body.get("text") or ""), body.get("attachments"),
+                            progress=progress, live_turn=live_turn,
+                            peer_id=peer_id, project_id=project_id,
+                            filed_as=filed_as,
+                            conversation_key=str(conversation.get("filed_as") or "")
+                            if conversation else filed_as,
+                            prefer_existing_conversation=bool(
+                                conversation.get("web_legacy_candidate")
+                            ) if conversation else True,
+                        )
+                    elif mode == "work":
+                        if conversation and not project_id:
+                            raise swarm_lab.SwarmError(
+                                "Select the project this chat should write to first."
+                            )
+                        answer = swarm_work.work_together(
+                            self.server.config, board_payload, agent_id,
+                            str(body.get("text") or ""), body.get("attachments"),
+                            progress=progress, live_turn=live_turn,
+                            peer_id=peer_id, project_id=project_id,
+                            filed_as=filed_as,
+                            conversation_key=str(conversation.get("filed_as") or "")
+                            if conversation else filed_as,
+                            prefer_existing_conversation=bool(
+                                conversation.get("web_legacy_candidate")
+                            ) if conversation else True,
+                        )
+                    elif mode == "chat":
+                        progress(
+                            f"Waiting for {one.name}",
+                            f"Nexus sent the request through the {one.who} route."
+                        )
+                        answer = chat_lab.say(
+                            self.server.config,
+                            one.who,
+                            str(body.get("text") or ""),
+                            filed_as=filed_as,
+                            context=swarm_work.board_context(
+                                board_payload, agent_id, peer_id, project_id
+                            ),
+                            attachments=body.get("attachments"),
+                            speaker=one.to_dict() if conversation else None,
+                            recipients=conversation.get("pair_agents", [])
+                            if conversation else None,
+                            conversation_key=str(conversation.get("filed_as") or "")
+                            if conversation else filed_as,
+                            prefer_existing_conversation=bool(
+                                conversation.get("web_legacy_candidate")
+                            ) if conversation else True,
+                        )
+                    else:
+                        raise swarm_lab.SwarmError("That chat action is not recognised.")
+                    activity.update(
+                        activity_id, "Answer received",
+                        "Nexus saved the conversation and is updating the chat.",
+                        state="complete",
+                    )
+                    self._json(dict(
+                        answer, agent=one.to_dict(), routing=routing,
+                        conversation=conversation,
+                    ))
+                except Exception as exc:
+                    stopped = isinstance(exc, cancellation.ChatCancelled)
+                    activity.update(
+                        activity_id, "Stopped" if stopped else "Request stopped",
+                        str(exc) if isinstance(exc, HarnessError)
+                        else "Nexus could not finish this request. The chat will show the safe error details.",
+                        state="stopped" if stopped else "error",
+                    )
+                    raise
+                finally:
+                    self.server.chat_cancellations.finish(chat_key, cancel_token)
+                    cancel_scope.__exit__(None, None, None)
             elif self.path == "/api/team/connect":
                 # One press to make an assistant usable. Somebody had Claude
                 # installed and signed in, an agent set to use it, and the board
@@ -1600,7 +2002,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/swarm/open-kept":
                 with self.server.swarm_lock:
                     swarm_lab.open_this_board(str(body.get("name") or ""))
-                    said = swarm_lab.how_it_stands(self.server.config)
+                    said = self.server.swarm_standing()
                     said["what_is_not_ready"] = swarm_lab.what_is_not_ready(
                         self.server.config, said)
                     said["kept"] = swarm_lab.every_kept_board()
@@ -1691,13 +2093,27 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json({"signed_out": True})
             elif self.path == "/api/swarm/start-again":
                 with self.server.swarm_lock:
-                    board = swarm_lab.load()
-                one = swarm_lab.the_agent(board, str(body.get("agent") or ""))
+                    standing = self.server.swarm_standing()
+                    board = swarm_lab.read_it(standing["board"])
+                agent_id = str(body.get("agent") or "")
+                one = swarm_lab.the_agent(board, agent_id)
+                chat_id = str(body.get("chat") or "")
+                conversation = swarm_chats.resolve(
+                    self.server.config, standing["board"], agent_id, chat_id
+                ) if chat_id else None
+                destination = conversation.get("destination", {}) if conversation else {}
                 self._json({
                     "note": chat_lab.start_again(
-                        self.server.config, one.who, swarm_lab.filed_as(one.name)
+                        self.server.config, one.who,
+                        str(conversation["filed_as"]) if conversation
+                        else swarm_lab.filed_as(one.name)
                     ),
                     "said": [],
+                    "conversation": conversation,
+                    "web_chat_id": str(destination.get("web_chat_id") or ""),
+                    "web_conversation_key": str(
+                        destination.get("web_conversation_key") or ""
+                    ),
                 })
             elif self.path == "/api/swarm/start":
                 # The lock is held only while the board is read and the run is
@@ -1707,8 +2123,28 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # it; held for the whole run, every window looking at the board
                 # would freeze for as long as the assistants took.
                 with self.server.swarm_lock:
-                    doing = self.server.swarm_runner.start(self.server.config)
+                    doing = self.server.swarm_runner.start(
+                        self.server.config, self.server.swarm_standing())
                 self._json({"doing": doing})
+            elif self.path == "/api/swarm/stop-chat":
+                agent_id = str(body.get("agent") or "")
+                if not agent_id:
+                    raise HarnessError("A chat agent ID is required")
+                activity_id = str(body.get("activity") or "")
+                chat_id = str(body.get("chat") or "")
+                stopped, active_activity = self.server.chat_cancellations.stop(
+                    chat_id or agent_id, activity_id
+                )
+                if stopped and active_activity:
+                    self.server.chat_activities.update(
+                        active_activity, "Stopping", "Nexus is interrupting this chat request.",
+                        state="stopping",
+                    )
+                self._json({
+                    "stopped": stopped,
+                    "activity": active_activity,
+                    "note": "Stopping this chat." if stopped else "This chat is not waiting for an answer.",
+                })
             elif self.path == "/api/swarm/stop":
                 self._json({
                     "note": self.server.swarm_runner.stop(),
@@ -1818,25 +2254,50 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/chat/say":
                 # No lock here: the conversation has one of its own, taken by
                 # every way of reaching it, including asking everyone at once.
-                self._json(chat_lab.say(
-                    self.server.config,
-                    str(body.get("who") or ""),
-                    str(body.get("text") or ""),
-                ))
+                who = str(body.get("who") or "")
+                chat_key = f"talk:{who}"
+                cancel_token = self.server.chat_cancellations.begin(chat_key)
+                try:
+                    with cancellation.use(cancel_token):
+                        self._json(chat_lab.say(
+                            self.server.config, who, str(body.get("text") or ""),
+                        ))
+                finally:
+                    self.server.chat_cancellations.finish(chat_key, cancel_token)
             elif self.path == "/api/chat/ask-everyone":
                 # Every one of them, at the same time. Six one after another is
                 # six waits.
+                chat_key = "talk:everyone"
+                cancel_token = self.server.chat_cancellations.begin(chat_key)
+                try:
+                    with cancellation.use(cancel_token):
+                        self._json({
+                            "answers": chat_lab.ask_everyone(
+                                self.server.config, str(body.get("text") or "")
+                            )
+                        })
+                finally:
+                    self.server.chat_cancellations.finish(chat_key, cancel_token)
+            elif self.path == "/api/chat/stop":
+                who = str(body.get("who") or "")
+                chat_key = "talk:everyone" if body.get("everyone") is True else f"talk:{who}"
+                stopped, _activity = self.server.chat_cancellations.stop(chat_key)
                 self._json({
-                    "answers": chat_lab.ask_everyone(
-                        self.server.config, str(body.get("text") or "")
-                    )
+                    "stopped": stopped,
+                    "note": "Stopping this chat." if stopped else "This chat is not waiting for an answer.",
                 })
             elif self.path == "/api/chat/start-again":
+                route = str(body.get("who") or "")
+                destination = chat_lab.chat_destination(self.server.config, route)
                 self._json({
                     "note": chat_lab.start_again(
-                        self.server.config, str(body.get("who") or "")
+                        self.server.config, route
                     ),
                     "said": [],
+                    "web_chat_id": str(destination.get("web_chat_id") or ""),
+                    "web_conversation_key": str(
+                        destination.get("web_conversation_key") or ""
+                    ),
                 })
             elif self.path == "/api/look-up":
                 self._json(navigate_lab.look_it_up(
@@ -1890,6 +2351,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/pipelines/save":
                 with self.server.pipelines_lock:
                     self._json({"pipeline": pipeline_lab.save(self.server.config, body.get("pipeline"))})
+            elif self.path == "/api/pipelines/create":
+                with self.server.pipelines_lock:
+                    created = pipeline_lab.create_blank(
+                        self.server.config, str(body.get("name") or "")
+                    )
+                    self._json({
+                        "pipeline": created,
+                        "saved": pipeline_lab.saved_ones(self.server.config),
+                    })
             elif self.path == "/api/pipelines/put-one-back":
                 # Bringing an old version back is itself a save, so what is on
                 # disk now goes on the pile too. Nothing is ever lost by this.

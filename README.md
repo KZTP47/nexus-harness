@@ -207,10 +207,37 @@ the same time, and lays the answers side by side. That is what two
 subscriptions are actually for: one model's blind spot is not usually the
 other's.
 
-It cannot read your files, run anything, or change anything - paste what you
-want it to see. Everything typed and everything said back has credentials taken
+**Send** decides whether the selected agent should answer directly or ask its
+ready, green-line-connected peers first. It can automatically relay, but it can
+never change project files. You can attach bounded text files and screenshots
+for the agents to inspect. **Ask connected agents** forces that relay when you
+want it regardless of the automatic decision. In the full board chat, a left
+pane keeps multiple durable chats for each exact two-agent pair, and each chat
+has its own active-project dropdown. **Work together on project files** gathers
+structured contributions from that pair and applies validated,
+baseline-checked changes only to the selected shared project, with rollback backups.
+Fenced code replies have a per-block **Copy code** control.
+Everything typed and everything said back has credentials taken
 out before it is written down, and the conversations live in `.harness/chats`,
 which is never committed.
+
+### Web AI chats
+
+Nexus can also connect an agent to an ordinary ChatGPT, Claude, Gemini, or
+Microsoft Copilot website using the subscription already signed in on this
+machine. Each Nexus conversation receives its own opaque conversation key and
+its own provider conversation URL, so creating Chat 2 does not silently reuse
+Chat 1. Every relayed turn carries a one-use transport marker; Nexus accepts an
+answer only when it follows that exact newly submitted user turn. A provider
+page rerender therefore cannot turn an older answer into the answer for a new
+task.
+
+Provider pages keep rendering while they work in the background. ChatGPT,
+Gemini, and Copilot use isolated Electron browser storage; Claude uses a
+dedicated secure Chrome or Edge profile because its sign-in rejects embedded
+Chromium. Login cookies, provider URLs, local transcripts, and browser profiles
+stay in local application data and are not written to this repository. See
+[WEB_AI_CHATS.md](docs/WEB_AI_CHATS.md) for setup and transport details.
 
 See [TALK_TO_THEM.md](docs/TALK_TO_THEM.md).
 
@@ -230,9 +257,11 @@ Every line has a gear too, saying **works on**, or **communicates? YES** or
 **NO** - and a pair who may not talk still gets a crossed-out line, so there is
 always a gear to press.
 
-Each agent keeps its own conversation, so two agents both using Claude never
-read each other's words - and a pair with no line between them never hears from
-each other at all. **What they said to each other** lists every answer that was
+Each connected pair keeps its own set of conversations, so two pairs using the
+same provider never read each other's words. Create, switch, and delete chats
+from the full chat's left pane; its project dropdown names the one shared folder
+that chat may change. A pair with no line between them never hears from each
+other at all. **What they said to each other** lists every answer that was
 passed, so you can read what each of them was actually given.
 
 **Set them going** acts on it. Every agent is asked about the projects it is on,
@@ -341,7 +370,7 @@ when it did not, and dim when a gate stopped the work before it got there.
 | Git repo | Reads which branch you are on and what is uncommitted. It never writes. |
 | AI drafts a test | Asks the model you set up to write a test, and saves it as a draft for you to read. Nothing runs a draft where it is kept. |
 | Keep the evidence | Writes what happened into one file you can send to somebody. |
-| Ask an assistant | Puts one question to a model you already pay for and keeps the answer. It cannot read files or change anything. |
+| Ask an assistant | Keeps a provider-neutral Nexus conversation, accepts explicit file/screenshot attachments, automatically relays when connected-agent expertise would help, provides per-block code copying, and can apply an explicit bounded project-file transaction. |
 | Run another pipeline | Runs one of your saved pipelines as a single step. |
 
 Any step can be told to try again up to five times before it gives up, which is
@@ -732,6 +761,7 @@ Cloning a repository never gives that repository the right to run code.
 | [QA.md](docs/QA.md) | Checks, in full: every kind, every option, every command |
 | [PIPELINES.md](docs/PIPELINES.md) | Automating work: jobs as boxes, arrows between them, and it runs itself |
 | [TALK_TO_THEM.md](docs/TALK_TO_THEM.md) | Typing to the assistants you have hooked up, one or all at once |
+| [WEB_AI_CHATS.md](docs/WEB_AI_CHATS.md) | Connecting provider websites, including Claude's secure browser transport |
 | [ON_A_TIMER.md](docs/ON_A_TIMER.md) | Having an automation run itself, with nobody watching |
 | [WHEN_IT_IS_STUCK.md](docs/WHEN_IT_IS_STUCK.md) | Noticing a run going round in circles, and seeing what it is doing |
 | [INSIDE_YOUR_EDITOR.md](docs/INSIDE_YOUR_EDITOR.md) | Working inside an editor you already have open |

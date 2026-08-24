@@ -327,5 +327,20 @@ class KeepingThemTests(TeamTestCase):
         self.assertEqual(all_of_it["teams"], [])
 
 
+class TeamAccessibilityTests(unittest.TestCase):
+    def test_light_sidebar_overrides_late_dark_local_model_styles(self) -> None:
+        styles = (
+            Path(__file__).parents[1] / "src" / "our_harness" / "ui" / "styles.css"
+        ).read_text(encoding="utf-8")
+        scoped = styles.index(".team-side .local-model-one {")
+        generic = styles.index(".local-model-one {")
+        self.assertGreater(scoped, generic, "the light-panel override must win the cascade")
+        accessible = styles[scoped:]
+        self.assertIn("color: #0f172a", accessible)
+        self.assertIn("background: #fff", accessible)
+        self.assertIn(".team-side .local-model-names button", styles)
+        self.assertIn(".team-side .local-model-one.not-running { opacity: 1; }", styles)
+
+
 if __name__ == "__main__":
     unittest.main()

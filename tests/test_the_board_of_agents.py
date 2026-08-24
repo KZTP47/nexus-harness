@@ -30,7 +30,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from our_harness import chat, server, swarm
+from our_harness import cancellation, chat, server, swarm, swarm_work
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
 
 
@@ -93,6 +93,48 @@ class WhatABoardIs(BoardTestCase):
         )
         self.assertEqual([one.name for one in board.agents], ["The reviewer"])
         self.assertEqual(board.projects[0].tasks, ["Make it pass"])
+
+    def test_reusing_known_provider_status_does_not_probe_installed_clis(self) -> None:
+        self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
+        config = load_config(self.a_project("known-routes"))
+        known = [{
+            "route": "claude", "label": "Claude command line", "ready": False,
+            "why_not": "Not connected", "can_be_connected": "claude",
+        }]
+        with mock.patch("our_harness.chat.who_can_talk") as who_can_talk, \
+                mock.patch.object(swarm, "_which_one_to_connect") as connect_probe:
+            said = swarm.how_it_stands(config, known_routes=known)
+        who_can_talk.assert_not_called()
+        connect_probe.assert_not_called()
+        self.assertEqual(said["who_can_be_used"][0]["route"], "claude")
+        self.assertEqual(said["board"]["agents"][0]["can_be_connected"], "claude")
+
+    def test_agent_appearance_is_kept_and_untrusted_values_use_safe_defaults(self) -> None:
+        board = self.a_board(agents=[{
+            "name": "The reviewer", "colour": "#aabbcc", "icon": "brain",
+            "bubble_colour": "#102030",
+            "profile_picture": "data:image/webp;base64,AAAA",
+            "picture_zoom": 175, "picture_hue": 210,
+        }])
+        self.assertEqual(board.agents[0].colour, "#aabbcc")
+        self.assertEqual(board.agents[0].icon, "brain")
+        self.assertEqual(board.agents[0].bubble_colour, "#102030")
+        self.assertEqual(
+            board.agents[0].profile_picture, "data:image/webp;base64,AAAA")
+        self.assertEqual(board.agents[0].picture_zoom, 175)
+        self.assertEqual(board.agents[0].picture_hue, 210)
+        unsafe = swarm.read_it({"agents": [{
+            "name": "Unsafe", "colour": "red; display:none", "icon": "<svg>",
+            "bubble_colour": "url(secret)",
+            "profile_picture": "data:image/svg+xml;base64,PHN2Zz4=",
+            "picture_zoom": "250", "picture_hue": True,
+        }]})
+        self.assertEqual(unsafe.agents[0].colour, swarm.DEFAULT_AGENT_COLOUR)
+        self.assertEqual(unsafe.agents[0].icon, "robot")
+        self.assertEqual(unsafe.agents[0].bubble_colour, swarm.DEFAULT_BUBBLE_COLOUR)
+        self.assertEqual(unsafe.agents[0].profile_picture, "")
+        self.assertEqual(unsafe.agents[0].picture_zoom, swarm.DEFAULT_PICTURE_ZOOM)
+        self.assertEqual(unsafe.agents[0].picture_hue, swarm.DEFAULT_PICTURE_HUE)
 
     def test_it_is_kept_beside_your_own_settings(self) -> None:
         """Not inside a project. A board is above every project, and putting it
@@ -571,7 +613,7 @@ class SettingThemGoing(BoardTestCase):
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.where, [], {})
         self.asked: list[tuple[str, str, str]] = []
 
-        def instead(config, route, text, filed_as=""):
+        def instead(config, route, text, filed_as="", **_context):
             self.asked.append((route, filed_as, text))
             return {"answer": {"who": "them", "text": f"{filed_as} says so", "at": ""}}
 
@@ -1353,9 +1395,12 @@ class TheTabItself(unittest.TestCase):
         self.assertIn("AI Agent Swarm orchestrator", self.markup)
         self.assertNotIn(">Agent board<", self.markup)
 
-    def test_it_sits_between_start_here_and_checks(self) -> None:
+    def test_it_sits_after_start_here_with_checks_in_more_options(self) -> None:
         tabs = self.the_tabs()
-        self.assertEqual(tabs[:3], ["start", "swarm", "checks"], tabs)
+        self.assertEqual(tabs[:2], ["start", "swarm"], tabs)
+        more = self.markup[self.markup.index('id="moreOptionsMenu"'):]
+        more = more[:more.index("</details>")]
+        self.assertIn('data-view="checks"', more)
 
     def the_rules_for_the_tab(self) -> list[str]:
         """Every rule written for this tab, and what each one sets.
@@ -1395,6 +1440,328 @@ class TheTabItself(unittest.TestCase):
         ]
         self.assertEqual(len(pressed), 1, pressed)
         self.assertTrue(_is_yellow(pressed[0]), pressed[0])
+
+
+class MovingAroundTheBoard(unittest.TestCase):
+    def setUp(self) -> None:
+        here = Path(__file__).resolve().parents[1] / "src" / "our_harness" / "ui"
+        self.markup = (here / "index.html").read_text(encoding="utf-8")
+        self.script = (here / "app.js").read_text(encoding="utf-8")
+        self.styles = (here / "styles.css").read_text(encoding="utf-8")
+
+    def test_the_board_and_its_buttons_share_one_full_screen_stage(self) -> None:
+        stage = self.markup[self.markup.index('<div id="swarmStage"'):]
+        stage = stage[:stage.index('<div id="theBigChat"')]
+        self.assertIn('id="swarmBoard"', stage)
+        self.assertIn('id="swarmFullScreen"', stage)
+        self.assertIn('id="swarmAddAgent"', stage)
+        self.assertIn('id="swarmRefresh"', stage)
+        self.assertIn(".swarm-stage:fullscreen", self.styles)
+
+    def test_every_compact_and_maximised_agent_chat_has_a_real_stop_control(self) -> None:
+        self.assertIn('id="talkStop"', self.markup)
+        self.assertIn('id="theBigChatStop"', self.markup)
+        self.assertIn('"danger swarm-chat-stop", "Stop"', self.script)
+        self.assertIn('request("/api/chat/stop"', self.script)
+        self.assertIn('request("/api/swarm/stop-chat"', self.script)
+        self.assertIn("window.harnessDesktop.stopWebChat(agent.who)", self.script)
+
+    def test_full_screen_is_a_toggle_and_says_when_it_is_on(self) -> None:
+        self.assertIn('$("swarmStage").requestFullscreen()', self.script)
+        self.assertIn("document.exitFullscreen()", self.script)
+        self.assertIn("window.harnessDesktop?.setFullScreen", self.script)
+        self.assertIn('stage.classList.toggle("is-fullscreen", swarmIsFullScreen)', self.script)
+        self.assertIn('button.textContent = swarmIsFullScreen ? "Exit full screen" : "Full screen"',
+                      self.script)
+        self.assertIn('button.setAttribute("aria-pressed", String(swarmIsFullScreen))',
+                      self.script)
+
+    def test_the_right_panel_chat_tray_and_big_chat_move_into_full_screen(self) -> None:
+        self.assertIn('[$("swarmPanel"), $("theBigChat"), $("theChatTray")]', self.script)
+        self.assertIn('$("swarmStage").append(home.element)', self.script)
+        self.assertIn("putTheChatsBackWhereTheyLive()", self.script)
+        self.assertIn(":has(.the-chat-tray:not([hidden]))", self.styles)
+
+    def test_full_screen_right_panel_can_close_and_reopen_from_any_gear(self) -> None:
+        self.assertIn('id="swarmPanelClose"', self.markup)
+        self.assertIn('$("swarmPanelClose").addEventListener("click", closeTheSwarmPanel)',
+                      self.script)
+        self.assertIn('$("swarmPanel").hidden = true', self.script)
+        self.assertIn("function showTheSwarmPanel()", self.script)
+        self.assertIn("showTheSwarmPanel();\n  renderSwarmBoard();", self.script)
+        self.assertIn(
+            ".swarm-stage.is-fullscreen:not(:has(> .swarm-panel:not([hidden])))",
+            self.styles,
+        )
+
+    def test_compact_and_maximised_chat_render_the_same_kept_transcript(self) -> None:
+        card = self.script[
+            self.script.index("function oneSwarmChatCard(held)"):
+            self.script.index("function makeTheChatCardDraggable")
+        ]
+        refreshed = self.script[
+            self.script.index("async function refreshTheChatFor(agentId)"):
+            self.script.index("function countWhatIsTypedTo")
+        ]
+        answered = self.script[
+            self.script.index("async function sendWhatIsTypedTo(agentId)"):
+            self.script.index("async function startTheChatAgainFor")
+        ]
+        big = self.script[
+            self.script.index("function renderTheBigChat()"):
+            self.script.index("function renderWhatItHasGoingOn")
+        ]
+        self.assertIn("keptTranscriptFor(held.agent)", card)
+        self.assertIn(
+            "keepWhatWasSaidTo(agentId, said.said || [], conversationId)", refreshed
+        )
+        self.assertIn("conversation?.id || \"\"", answered)
+        self.assertIn("keptTranscriptFor(theBigOne)", big)
+        self.assertIn("if (theBigOne === agentId) renderTheBigChat()", refreshed)
+
+    def test_selected_chat_and_visible_transcript_share_one_identity(self) -> None:
+        kept = self.script[
+            self.script.index("function keptTranscriptFor(agentId)"):
+            self.script.index("function nextSwarmChatRevision")
+        ]
+        applied = self.script[
+            self.script.index("function applyConversationList(agentId, said)"):
+            self.script.index("async function loadConversationsFor")
+        ]
+        switched = self.script[
+            self.script.index("async function activateConversationFor(agentId, chatId)"):
+            self.script.index("async function deleteConversationFor")
+        ]
+        self.assertIn("held?.saidFor === transcriptIdentityFor(agentId)", kept)
+        self.assertIn("before !== held.conversation", applied)
+        self.assertIn("held.said = []", applied)
+        self.assertIn("held.saidFor = transcriptIdentityFor(agentId)", applied)
+        self.assertLess(switched.index("held.conversation = chatId"),
+                        switched.index('request("/api/swarm/chats/activate"'))
+        self.assertIn("swarmConversationSwitching.has(agentId)", switched)
+
+    def test_only_the_latest_conversation_list_can_change_the_selection(self) -> None:
+        loaded = self.script[
+            self.script.index("async function loadConversationsFor(agentId"):
+            self.script.index("async function createConversationFor")
+        ]
+        self.assertIn("const revision = nextConversationListRevision(agentId)", loaded)
+        self.assertIn(
+            "swarmConversationListRevisions.get(agentId) !== revision", loaded
+        )
+
+    def test_maximised_chat_has_pair_scoped_history_and_an_active_project(self) -> None:
+        for identity in (
+            'id="theBigChatConversationList"',
+            'id="theBigChatProject"',
+            'id="theBigChatProjectHelp"',
+        ):
+            self.assertIn(identity, self.markup)
+        self.assertIn("function activeConversationFor(agentId)", self.script)
+        self.assertIn('request("/api/swarm/chats/create"', self.script)
+        self.assertIn('request("/api/swarm/chats/activate"', self.script)
+        self.assertIn('request("/api/swarm/chats/project"', self.script)
+        self.assertIn('request("/api/swarm/chats/delete"', self.script)
+        self.assertIn('chat: conversation?.id || ""', self.script)
+        self.assertIn(".the-big-chat-workspace", self.styles)
+        self.assertIn(".the-big-chat-conversation-pick.active", self.styles)
+
+    def test_every_chat_plainly_names_where_it_lives_and_opens_full(self) -> None:
+        self.assertIn('id="theBigChatDestination"', self.markup)
+        self.assertIn('"Where this chat happens"', self.script)
+        self.assertIn('"Open full Nexus chat"', self.script)
+        self.assertIn('"View full web AI chat"', self.script)
+        self.assertRegex(
+            self.script,
+            r"showFullWebChatInsideNexus\(\s*destination\.web_chat_id,",
+        )
+        self.assertIn('classList.add("is-chat-viewing")', self.script)
+        self.assertIn('"Show saved transcript file"', self.script)
+        self.assertIn('`Nexus chat with ${agent.name}`', self.script)
+        self.assertIn('`${agent.name} — Nexus chat`', self.script)
+        self.assertIn('`Saved transcript: ${destination.transcript_path}`', self.script)
+        self.assertIn("openTheBigChat(agent.id)", self.script)
+        self.assertIn("destination.explanation", self.script)
+        self.assertIn("destination.provider_label", self.script)
+
+    def test_web_chat_listener_starts_after_bootstrap_and_refreshes_open_chats(self) -> None:
+        boot = self.script[self.script.index("async function boot()"):
+                           self.script.index("// ---- the board of agents")]
+        bridge = self.script[self.script.index("async function heartbeatWebChats"):
+                             self.script.index("async function addWebChatAgent")]
+        self.assertLess(boot.index("token = value.token"), boot.index("startWebChatBridge()"))
+        self.assertIn("routeSignature !== webChatRouteSignature", bridge)
+        self.assertIn("loadConversationsFor(held.agent, false)", bridge)
+        self.assertIn("function startWebChatBridge()", bridge)
+
+    def test_an_old_chat_read_cannot_erase_a_new_answer(self) -> None:
+        refreshed = self.script[
+            self.script.index("async function refreshTheChatFor(agentId)"):
+            self.script.index("function putTheChatTurnsIn")
+        ]
+        answered = self.script[
+            self.script.index("async function sendWhatIsTypedTo(agentId)"):
+            self.script.index("async function startTheChatAgainFor")
+        ]
+        self.assertIn("const revision = nextSwarmChatRevision(agentId)", refreshed)
+        self.assertIn("swarmChatRevisions.get(agentId) !== revision", refreshed)
+        self.assertIn("nextSwarmChatRevision(agentId)", answered)
+        kept = self.script[
+            self.script.index("function keepWhatWasSaidTo(agentId, said,"):
+            self.script.index("function countWhatIsTypedTo")
+        ]
+        self.assertIn("nextSwarmChatRevision(agentId)", kept)
+        self.assertIn("activeConversationIdFor(agentId) !== conversationId", kept)
+
+    def test_send_can_route_to_connected_agents_and_code_blocks_can_be_copied(self) -> None:
+        self.assertIn('const mode = arguments[1] || "auto"', self.script)
+        self.assertIn('sendFromTheBigChat("auto")', self.script)
+        self.assertIn('answered.routing?.selected === "collaborate"', self.script)
+        self.assertIn('function appendChatText(container, text)', self.script)
+        self.assertIn('make("button", "chat-code-copy", "Copy code")', self.script)
+        self.assertIn('navigator.clipboard?.writeText', self.script)
+        self.assertIn(".chat-code-block", self.styles)
+
+    def test_normal_send_confirms_explicit_project_work_and_labels_iterative_turns(self) -> None:
+        self.assertIn("function looksLikeProjectWork(words)", self.script)
+        self.assertIn("function confirmProjectWork(agent, words, mode)", self.script)
+        self.assertIn("allow_project_changes: projectPermission.confirmed", self.script)
+        self.assertIn('agent_discussion: "Team discussion"', self.script)
+        self.assertIn('agent_plan_review: "Plan review"', self.script)
+        self.assertIn('agent_verification: "Work verification"', self.script)
+
+    def test_add_project_dialog_offers_the_electron_folder_picker(self) -> None:
+        self.assertIn('id="askDialogBrowse"', self.markup)
+        self.assertIn('Browse folder…', self.markup)
+        asked = self.script[
+            self.script.index("function askForOneLine"):
+            self.script.index("function make(tag")
+        ]
+        self.assertIn("browseFolder && canWeBrowseForAFolder()", asked)
+        self.assertIn("window.harnessDesktop.pickAFolder()", asked)
+        adding = self.script[
+            self.script.index("async function addAProjectToTheBoard()"):
+            self.script.index("async function saveTheSwarmAgent()")
+        ]
+        self.assertIn('known ? known.path : "", null, true', adding)
+
+    def test_long_chat_requests_show_live_truthful_progress_in_both_views(self) -> None:
+        self.assertIn('id="theBigChatActivity"', self.markup)
+        self.assertIn('role="status" aria-live="polite" aria-atomic="true"', self.markup)
+        self.assertIn('aChatActivityPanel("swarm-chat-activity")', self.script)
+        self.assertIn("/api/swarm/activity?activity=", self.script)
+        self.assertIn("Working for ${seconds}s", self.script)
+        self.assertIn("prefers-reduced-motion: reduce", self.styles)
+        self.assertIn("chat-activity-shimmer", self.styles)
+        self.assertIn("chat-activity-track", self.styles)
+
+    def test_completed_collaboration_turns_stream_into_both_chat_views(self) -> None:
+        self.assertIn("Array.isArray(update.turns)", self.script)
+        self.assertIn("renderTurnsThatArrived(agentId)", self.script)
+        self.assertIn("chatTurnsWhileWorking(agentId", self.script)
+        self.assertIn("localTurns: words ?", self.script)
+
+    def test_agent_icon_and_colours_are_editable_and_follow_each_speaker(self) -> None:
+        for control in ("swarmAgentIcon", "swarmAgentColour", "swarmAgentBubbleColour",
+                        "swarmAgentPictureFile", "swarmAgentPictureZoom",
+                        "swarmAgentPictureHue"):
+            self.assertIn(f'id="{control}"', self.markup)
+        self.assertIn("function agentForChatTurn(one, fallback)", self.script)
+        self.assertIn('styleForAgent(row, speaker)', self.script)
+        self.assertIn('held.bubble_colour = bubbleColour', self.script)
+        self.assertIn('held.profile_picture = profilePicture', self.script)
+        self.assertIn("function previewSwarmAgentAppearance()", self.script)
+        self.assertIn("async function resizedAgentPicture(file)", self.script)
+        self.assertIn("putAgentFaceIn", self.script)
+        self.assertIn("--agent-bubble-colour", self.styles)
+        self.assertIn("--agent-picture-zoom", self.styles)
+        self.assertIn("--agent-picture-hue", self.styles)
+
+    def test_agent_settings_autosave_without_board_redraws_dropping_the_draft(self) -> None:
+        self.assertIn('id="swarmAgentSaveState"', self.markup)
+        self.assertIn("Changes save automatically", self.markup)
+        self.assertIn("const swarmAgentSettingDrafts = new Map()", self.script)
+        self.assertIn("function rememberSwarmAgentSettings", self.script)
+        self.assertIn("async function flushSwarmAgentSettings", self.script)
+        self.assertIn("const values = draft?.values || agentSettingsFromAgent(agent)", self.script)
+        self.assertIn("void flushSwarmAgentSettings(previous.id)", self.script)
+        self.assertIn('document.addEventListener("visibilitychange"', self.script)
+        self.assertIn(".swarm-agent-save-state", self.styles)
+
+    def test_multi_agent_turns_keep_named_speakers_in_both_chat_views(self) -> None:
+        self.assertIn("function chatTurnSpeaker(one, agent)", self.script)
+        self.assertIn("one.speaker_name", self.script)
+        self.assertIn("one.recipient_name", self.script)
+        self.assertIn('agent_reply: "Connected-agent reply"', self.script)
+        self.assertIn('final_answer: "Final answer"', self.script)
+        self.assertIn('collaboration ? "between" : "them"', self.script)
+        self.assertIn("one.speaker_route", self.script)
+        self.assertIn(".talk-turn.between", self.styles)
+        self.assertIn(".chat-turn-phase", self.styles)
+
+    def test_big_chat_actions_explain_empty_and_failed_requests(self) -> None:
+        sending = self.script[
+            self.script.index("async function sendFromTheBigChat"):
+            self.script.index("function wireUpTheTray")
+        ]
+        self.assertIn("Describe the project-file change first.", sending)
+        self.assertIn("Type the question or task", sending)
+        self.assertIn("swarmBusy.has(agentId)", sending)
+        self.assertIn("showError(words)", sending)
+
+    def test_large_swarms_can_be_zoomed_and_fitted_to_the_view(self) -> None:
+        for control in ("swarmZoomOut", "swarmZoomReset", "swarmZoomIn", "swarmFit"):
+            self.assertIn(f'id="{control}"', self.markup)
+        self.assertIn("const SWARM_ZOOM_MIN = 0.35", self.script)
+        self.assertIn("const SWARM_ZOOM_MAX = 1.8", self.script)
+        self.assertIn("function fitTheWholeSwarm()", self.script)
+        self.assertIn("canvas.style.transform = `scale(${swarmZoom})`", self.script)
+        self.assertIn("(event.clientX - dragging.x) / swarmZoom", self.script)
+
+    def test_dragging_empty_board_space_pans_without_moving_a_box(self) -> None:
+        self.assertIn('["swarmBoard", "swarmSurface", "swarmCanvas"]', self.script)
+        self.assertIn("!paper.includes(event.target.id)", self.script)
+        self.assertIn("board.scrollLeft = panning.left", self.script)
+        self.assertIn("board.scrollTop = panning.top", self.script)
+        self.assertIn("Drag empty board space to move the view.", self.markup)
+
+    def test_connect_actions_do_not_start_the_card_drag(self) -> None:
+        action = self.script[self.script.index(
+            'const connect = make("button", "swarm-connect swarm-box-connect", label);'
+        ):]
+        action = action[:action.index("box.append(connect);")]
+        self.assertIn(
+            'connect.addEventListener("pointerdown", (event) => event.stopPropagation())',
+            action,
+        )
+        self.assertIn("event.preventDefault();", action)
+        self.assertIn("connectThisAssistant(one.can_be_connected, connect);", action)
+
+    def test_gemini_project_dialog_links_to_the_official_explanation(self) -> None:
+        self.assertIn('id="askDialogHelp"', self.markup)
+        self.assertIn('target="_blank"', self.markup)
+        self.assertIn('rel="noopener noreferrer"', self.markup)
+        self.assertIn('label: "WHAT IS THIS? (external link)"', self.script)
+        self.assertIn(
+            '"https://geminicli.com/docs/get-started/authentication/'
+            '#set-your-google-cloud-project"',
+            self.script,
+        )
+        self.assertIn("helpLink.hidden = !help?.href;", self.script)
+
+    def test_using_a_web_chat_immediately_adds_or_selects_its_board_box(self) -> None:
+        self.assertIn("onWebChatsChanged(async (chats, selected)", self.script)
+        self.assertIn("await assignSelectedWebChatToPendingAgent(selected)", self.script)
+        self.assertIn("await addWebChatAgent(selected)", self.script)
+        self.assertIn('group.label = "Connect a web AI chat"', self.script)
+        adding = self.script[
+            self.script.index("async function addWebChatAgent(chat)"):
+            self.script.index("function renderWebChatConnections()")
+        ]
+        self.assertIn("one.who === route", adding)
+        self.assertIn('pickSwarmBox("agent", already.id)', adding)
+        self.assertIn("board.agents.push", adding)
+        self.assertIn('who: route', adding)
 
 
 class WhatThePanelIsTold(BoardTestCase):
@@ -1437,6 +1804,135 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertIn("agents", said["most"])
         self.assertIn("no agents yet", " ".join(said["what_is_not_ready"]))
 
+    def test_chat_activity_feed_returns_current_or_waiting_stage(self) -> None:
+        activity_id = "activity-test-123"
+        status, waiting = self.ask(f"/api/swarm/activity?activity={activity_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(waiting["state"], "waiting")
+        self.panel.chat_activities.update(
+            activity_id, "Waiting for Claude", "Sent through the claude route."
+        )
+        status, working = self.ask(f"/api/swarm/activity?activity={activity_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(working["stage"], "Waiting for Claude")
+        self.assertEqual(working["state"], "working")
+
+    def test_chat_activity_feed_keeps_live_agent_turns_across_progress_updates(self) -> None:
+        activity_id = "activity-live-turns-123"
+        self.panel.chat_activities.update(activity_id, "Asking the team")
+        self.panel.chat_activities.add_turn(activity_id, {
+            "who": "them", "speaker_id": "agent-2", "speaker_name": "Codex",
+            "recipient_name": "Claude", "text": "I found the issue.",
+            "phase": "agent_reply", "milliseconds": 12,
+        })
+        self.panel.chat_activities.update(activity_id, "Waiting for Claude")
+        status, working = self.ask(f"/api/swarm/activity?activity={activity_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(working["turns"][0]["speaker_name"], "Codex")
+        self.assertEqual(working["turns"][0]["text"], "I found the issue.")
+
+    def test_chat_request_marks_its_activity_complete(self) -> None:
+        self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "The reviewer", "who": "claude"},
+        ]}})
+        with mock.patch.object(chat, "say", return_value={"said": []}):
+            status, _said = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "text": "hello", "mode": "chat",
+                "activity": "activity-complete-123",
+            })
+        self.assertEqual(status, 200)
+        _status, activity = self.ask(
+            "/api/swarm/activity?activity=activity-complete-123"
+        )
+        self.assertEqual(activity["state"], "complete")
+        self.assertEqual(activity["stage"], "Answer received")
+
+    def test_activity_can_be_read_while_the_provider_request_is_still_running(self) -> None:
+        self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "The reviewer", "who": "claude"},
+        ]}})
+        entered = threading.Event()
+        release = threading.Event()
+        result: list[tuple[int, dict]] = []
+
+        def slow_answer(*_args, **_kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5), "the activity probe did not release the provider")
+            return {"said": []}
+
+        def send() -> None:
+            result.append(self.ask("/api/swarm/say", {
+                "agent": "agent-1", "text": "hello", "mode": "chat",
+                "activity": "activity-running-123",
+            }))
+
+        with mock.patch.object(chat, "say", side_effect=slow_answer):
+            thread = threading.Thread(target=send)
+            thread.start()
+            self.assertTrue(entered.wait(5), "the provider request did not start")
+            status, activity = self.ask(
+                "/api/swarm/activity?activity=activity-running-123"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(activity["state"], "working")
+            self.assertEqual(activity["stage"], "Waiting for The reviewer")
+            release.set()
+            thread.join(5)
+        self.assertEqual(result[0][0], 200)
+
+    def test_stopping_one_chat_cancels_it_without_stopping_another_chat(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "First", "who": "claude"},
+            {"name": "Second", "who": "codex"},
+        ]}})
+        self.assertEqual(status, 200)
+        by_name = {one["name"]: one["id"] for one in saved["board"]["agents"]}
+        first_id, second_id = by_name["First"], by_name["Second"]
+        entered = {"first": threading.Event(), "second": threading.Event()}
+        release_second = threading.Event()
+        results: dict[str, tuple[int, dict]] = {}
+
+        def slow_answer(_config, _route, _text, filed_as="", **_kwargs):
+            which = "first" if str(filed_as).casefold().startswith("first") else "second"
+            entered[which].set()
+            while which == "first" or not release_second.is_set():
+                cancellation.checkpoint()
+                release_second.wait(0.01)
+            return {"said": []}
+
+        def send(which: str, agent: str) -> None:
+            results[which] = self.ask("/api/swarm/say", {
+                "agent": agent, "text": "hello", "mode": "chat",
+                "activity": f"activity-{which}-123",
+            })
+
+        with mock.patch.object(chat, "say", side_effect=slow_answer):
+            first = threading.Thread(target=send, args=("first", first_id))
+            second = threading.Thread(target=send, args=("second", second_id))
+            first.start()
+            second.start()
+            self.assertTrue(entered["first"].wait(5))
+            self.assertTrue(entered["second"].wait(5))
+
+            status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": first_id, "activity": "activity-first-123",
+            })
+            self.assertEqual(status, 200)
+            self.assertTrue(stopped["stopped"])
+            first.join(2)
+            self.assertFalse(first.is_alive())
+            self.assertTrue(second.is_alive(), "another chat was stopped too")
+            release_second.set()
+            second.join(2)
+
+        self.assertEqual(results["first"][0], 400)
+        self.assertEqual(results["first"][1]["error"], "Stopped by you.")
+        self.assertEqual(results["second"][0], 200)
+        _status, activity = self.ask(
+            "/api/swarm/activity?activity=activity-first-123"
+        )
+        self.assertEqual(activity["state"], "stopped")
+
     def test_saving_a_board_writes_it_down(self) -> None:
         status, said = self.ask("/api/swarm/save", {"board": {
             "agents": [{"name": "The reviewer", "who": "claude"}],
@@ -1447,6 +1943,17 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(said["board"]["agents"][0]["name"], "The reviewer")
         self.assertEqual(swarm.load().agents[0].name, "The reviewer")
+
+    def test_saving_reuses_the_last_provider_scan_for_an_immediate_reply(self) -> None:
+        status, standing = self.ask("/api/swarm")
+        self.assertEqual(status, 200)
+        board = standing["board"]
+        board["agents"] = [{"name": "Autosaved", "who": ""}]
+        with mock.patch.object(swarm, "how_it_stands", wraps=swarm.how_it_stands) as how:
+            status, saved = self.ask("/api/swarm/save", {"board": board})
+        self.assertEqual(status, 200)
+        self.assertEqual(saved["board"]["agents"][0]["name"], "Autosaved")
+        self.assertIn("known_routes", how.call_args.kwargs)
 
     def test_a_board_that_makes_no_sense_is_refused_and_says_why(self) -> None:
         status, said = self.ask(
@@ -1467,6 +1974,198 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(said["agent"]["name"], "The reviewer")
         self.assertEqual(said["said"], [])
+
+    def test_pair_chats_create_switch_and_select_the_exact_shared_project(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [
+                {"name": "One", "path": str(self.root)},
+                {"name": "Two", "path": str(self.where)},
+            ],
+            "works_on": [
+                {"agent": agent, "project": project}
+                for agent in ("agent-1", "agent-2")
+                for project in ("project-1", "project-2")
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listed["chats"]), 1)
+        first = listed["active"]
+        status, made = self.ask("/api/swarm/chats/create", {
+            "agent": "agent-1", "peer": "agent-2",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(len(made["chats"]), 2)
+        second = made["active"]
+        self.assertNotEqual(first, second)
+        status, selected = self.ask("/api/swarm/chats/project", {
+            "agent": "agent-1", "chat": second, "project": "project-2",
+        })
+        self.assertEqual(status, 200)
+        active = next(one for one in selected["chats"] if one["id"] == second)
+        self.assertEqual(active["project"], "project-2")
+        self.assertEqual([one["name"] for one in active["pair_agents"]], [
+            "The lead", "The peer",
+        ])
+
+    def test_switching_pair_chats_does_not_probe_providers_again(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        first = listed["active"]
+        _status, made = self.ask("/api/swarm/chats/create", {
+            "agent": "agent-1", "peer": "agent-2",
+        })
+        second = made["active"]
+        self.assertNotEqual(first, second)
+
+        # A normal board read is the explicit provider-refresh boundary. Once
+        # that has populated the cache, list/activate/transcript are local chat
+        # operations and must pass known_routes back into how_it_stands. A call
+        # without it would launch the real provider probes and add seconds to
+        # every switch.
+        status, _standing = self.ask("/api/swarm")
+        self.assertEqual(status, 200)
+        with mock.patch.object(
+            swarm, "how_it_stands", wraps=swarm.how_it_stands
+        ) as how:
+            status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+            self.assertEqual(status, 200)
+            status, activated = self.ask("/api/swarm/chats/activate", {
+                "agent": "agent-1", "chat": first,
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(activated["active"], first)
+            status, transcript = self.ask(
+                f"/api/swarm/said?agent=agent-1&chat={first}"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(transcript["conversation"]["id"], first)
+
+        self.assertEqual(how.call_count, 3)
+        self.assertTrue(all(
+            "known_routes" in call.kwargs for call in how.call_args_list
+        ), how.call_args_list)
+
+    def test_pair_chat_request_routes_only_its_peer_project_and_transcript(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+                {"name": "A third", "who": "gemini"},
+            ],
+            "projects": [{"name": "Chosen", "path": str(self.root)}],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [
+                {"one": "agent-1", "other": "agent-2"},
+                {"one": "agent-1", "other": "agent-3"},
+            ],
+        }})
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        conversation = next(
+            one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-2"]
+        )
+        answer = {"said": [{"who": "them", "text": "done", "at": ""}], "changed": []}
+        with mock.patch.object(
+            swarm_work, "work_together", return_value=answer
+        ) as work:
+            status, _said = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "Inspect the selected project", "mode": "work",
+                "allow_project_changes": True,
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(work.call_args.kwargs["peer_id"], "agent-2")
+        self.assertEqual(work.call_args.kwargs["project_id"], "project-1")
+        self.assertEqual(work.call_args.kwargs["filed_as"], conversation["filed_as"])
+        self.assertEqual(
+            work.call_args.kwargs["conversation_key"], conversation["filed_as"]
+        )
+        self.assertEqual(
+            work.call_args.kwargs["prefer_existing_conversation"],
+            conversation["web_legacy_candidate"],
+        )
+
+    def test_project_work_button_cannot_turn_a_directed_message_into_file_work(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [{"name": "Chosen", "path": str(self.root)}],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        conversation = next(
+            one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-2"]
+        )
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        answer = {
+            "said": [{"who": "them", "text": "relay complete", "at": ""}],
+            "collaborated_with": [{"id": "agent-2", "name": "The peer"}],
+        }
+        with (
+            mock.patch.object(swarm_work, "relay", return_value=answer) as relayed,
+            mock.patch.object(swarm_work, "work_together") as worked,
+        ):
+            status, said = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "Are you The lead? Send a message to The peer.",
+                "mode": "work", "allow_project_changes": True,
+            })
+        self.assertEqual(status, 200, said)
+        relayed.assert_called_once()
+        worked.assert_not_called()
+        self.assertEqual(said["routing"]["requested"], "work")
+        self.assertEqual(said["routing"]["selected"], "relay")
+
+    def test_pair_chat_uses_cached_readiness_instead_of_rejecting_its_live_peer(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        conversation = next(
+            one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-2"]
+        )
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        answer = {"said": [{"who": "them", "text": "peer seen", "at": ""}]}
+        with mock.patch.object(chat, "say", return_value=answer) as talked:
+            status, said = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "hello", "mode": "chat",
+            })
+        self.assertEqual(status, 200, said)
+        self.assertIn("The peer", talked.call_args.kwargs["context"])
+        self.assertEqual(
+            talked.call_args.kwargs["conversation_key"], conversation["filed_as"]
+        )
 
     def test_asking_about_an_agent_that_is_gone(self) -> None:
         status, said = self.ask("/api/swarm/said?agent=agent-9")
@@ -1490,7 +2189,7 @@ class WhatThePanelIsTold(BoardTestCase):
         ]}})
         said = []
 
-        def instead(config, route, text, filed_as=""):
+        def instead(config, route, text, filed_as="", **_context):
             said.append((route, filed_as, text))
             return {"said": [{"who": "them", "text": "ok", "at": ""}]}
 
@@ -1499,6 +2198,74 @@ class WhatThePanelIsTold(BoardTestCase):
                 "/api/swarm/say", {"agent": "agent-2", "text": "hello"})
         self.assertEqual(status, 200)
         self.assertEqual(said, [("claude", "The writer", "hello")])
+
+    def test_send_automatically_uses_the_collaboration_router(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        answer = {
+            "said": [{"who": "them", "text": "team answer", "at": ""}],
+            "collaborated_with": [{"id": "agent-2", "name": "The peer"}],
+        }
+        with (
+            mock.patch.object(swarm_work, "automatic_mode", return_value={
+                "mode": "collaborate", "reason": "A review perspective helps."
+            }) as choose,
+            mock.patch.object(swarm_work, "collaborate", return_value=answer) as confer,
+        ):
+            status, said = self.ask(
+                "/api/swarm/say", {"agent": "agent-1", "text": "Review this design"}
+            )
+        self.assertEqual(status, 200)
+        choose.assert_called_once()
+        confer.assert_called_once()
+        self.assertIn("live_turn", confer.call_args.kwargs)
+        self.assertTrue(callable(confer.call_args.kwargs["live_turn"]))
+        self.assertEqual(said["routing"], {
+            "requested": "auto",
+            "selected": "collaborate",
+            "reason": "A review perspective helps.",
+        })
+
+    def test_automatic_file_work_requires_confirmation_before_the_transaction(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [{"name": "Demo", "path": str(self.root)}],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        answer = {"said": [{"who": "them", "text": "done", "at": ""}], "changed": ["one.txt"]}
+        with (
+            mock.patch.object(swarm_work, "automatic_mode", return_value={
+                "mode": "work", "reason": "The request changes files."
+            }),
+            mock.patch.object(swarm_work, "work_together", return_value=answer) as work,
+        ):
+            status, refused = self.ask(
+                "/api/swarm/say", {"agent": "agent-1", "text": "Create one.txt"}
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("not confirmed", refused["error"])
+            work.assert_not_called()
+            status, allowed = self.ask(
+                "/api/swarm/say", {
+                    "agent": "agent-1", "text": "Create one.txt",
+                    "allow_project_changes": True,
+                }
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(allowed["changed"], ["one.txt"])
+        work.assert_called_once()
 
     def test_starting_again_clears_only_that_agents_conversation(self) -> None:
         self.ask("/api/swarm/save", {"board": {"agents": [

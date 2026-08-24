@@ -103,6 +103,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "embedding_model": "",
         "allow_remote_embeddings": False,
     },
+    "persistent_memory": {
+        "enabled": False,
+        "vault_path": "",
+        "max_context_chars": 20_000,
+        "enforce_desktop_deployment": False,
+    },
     "context": {
         "max_chars": 120_000,
         "reserve_chars": 20_000,
@@ -159,6 +165,7 @@ RESOURCE_LIMIT_MAXIMA: dict[str, int] = {
     "execution.max_changed_bytes": 1_000_000_000,
     "memory.max_results": 100,
     "memory.retention_days": 3_650,
+    "persistent_memory.max_context_chars": 200_000,
     "context.max_chars": 10_000_000,
     "context.reserve_chars": 10_000_000,
     "context.recent_event_chars": 10_000_000,
@@ -617,6 +624,23 @@ def _validate_capability_provenance(
             "memory.allow_remote_embeddings requires trusted local, user, environment, explicit, or command-line config"
         )
 
+    if any(
+        project_controls(key)
+        for key in (
+            "persistent_memory.enabled",
+            "persistent_memory.vault_path",
+            "persistent_memory.enforce_desktop_deployment",
+        )
+    ) and (
+        data["persistent_memory"]["enabled"]
+        or data["persistent_memory"]["vault_path"]
+        or data["persistent_memory"]["enforce_desktop_deployment"]
+    ):
+        raise HarnessError(
+            "External persistent memory may only be enabled and selected from trusted local, user, "
+            "environment, explicit, or command-line config"
+        )
+
     if data["mcp"]["servers"] and project_controls("mcp.servers"):
         raise HarnessError("MCP servers require trusted local, user, environment, or command-line config")
 
@@ -1054,6 +1078,25 @@ def validate_config(data: dict[str, Any]) -> None:
     _require_string(memory["embedding_model"], "memory.embedding_model")
     if not isinstance(memory["allow_remote_embeddings"], bool):
         raise HarnessError("memory.allow_remote_embeddings must be a boolean")
+
+    persistent_memory = data["persistent_memory"]
+    if not isinstance(persistent_memory["enabled"], bool):
+        raise HarnessError("persistent_memory.enabled must be a boolean")
+    _require_string(persistent_memory["vault_path"], "persistent_memory.vault_path")
+    if persistent_memory["enabled"] and not Path(persistent_memory["vault_path"]).is_absolute():
+        raise HarnessError("persistent_memory.vault_path must be an absolute path when enabled")
+    if not isinstance(persistent_memory["enforce_desktop_deployment"], bool):
+        raise HarnessError("persistent_memory.enforce_desktop_deployment must be a boolean")
+    if persistent_memory["enforce_desktop_deployment"] and not persistent_memory["enabled"]:
+        raise HarnessError(
+            "persistent_memory.enforce_desktop_deployment requires persistent_memory.enabled"
+        )
+    _require_int(
+        persistent_memory["max_context_chars"],
+        "persistent_memory.max_context_chars",
+        1_000,
+        RESOURCE_LIMIT_MAXIMA["persistent_memory.max_context_chars"],
+    )
 
     context = data["context"]
     _require_int(context["max_chars"], "context.max_chars", 2000, RESOURCE_LIMIT_MAXIMA["context.max_chars"])

@@ -308,6 +308,30 @@ class TheSettingsForThemTests(unittest.TestCase):
             "google_project": "a-project"})
         validate_config(data)
 
+    def test_a_named_gemini_route_hands_its_cloud_project_to_the_cli(self) -> None:
+        """The board talks through ProviderRegistry, not directly through the
+        route dictionary.  Saving a project id is useless if that routing step
+        drops it before the Gemini adapter builds its environment."""
+
+        from our_harness.providers import ProviderRegistry
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {"gemini": {
+            "kind": "gemini-cli",
+            "model": "gemini-2.5-pro",
+            "endpoint": "",
+            "google_project": "a-project",
+        }}
+        config = LoadedConfig(data, Path.cwd(), [], {})
+        routed = ProviderRegistry(config).provider_config("gemini")
+        provider = SubscriptionCLIProvider(routed, "gemini-cli")
+
+        self.assertEqual(routed.get("provider.google_project"), "a-project")
+        self.assertEqual(
+            provider._what_it_is_handed(GEMINI_RECIPE),
+            {"GOOGLE_CLOUD_PROJECT": "a-project"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

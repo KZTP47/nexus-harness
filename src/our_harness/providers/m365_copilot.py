@@ -48,7 +48,8 @@ from pathlib import Path
 from typing import Any
 
 from ..models import HarnessError, ProviderRequest, ProviderResponse
-from .base import Provider
+from .. import cancellation
+from .base import Provider, _interrupt_http_response
 from .subscription_cli import UNPRICED
 
 # Where Microsoft is asked for a sign-in and where the questions go.
@@ -416,6 +417,14 @@ class M365CopilotProvider(Provider):
         self.where_they_are = str(self.settings.get("time_zone") or "").strip() or "UTC"
 
     def complete(self, request: ProviderRequest) -> ProviderResponse:
+        if any(
+            isinstance(one, dict) and str(one.get("type") or "").startswith("image/")
+            for one in request.attachments
+        ):
+            raise HarnessError(
+                "Microsoft 365 Copilot chat has no declared screenshot-input contract in Nexus. "
+                "Use a vision-capable Claude, Codex, Gemini, OpenAI, Anthropic, or Ollama route."
+            )
         started = time.monotonic()
         token = a_token_to_use(self.app, self.organisation)
         held = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -495,19 +504,32 @@ class M365CopilotProvider(Provider):
             headers=headers,
             method="POST",
         )
+        response_holder: dict[str, Any] = {}
+        unregister_cancel = cancellation.register(
+            lambda: _interrupt_http_response(response_holder.get("response"))
+            if response_holder.get("response") is not None else None
+        )
         try:
+            cancellation.checkpoint()
             with self._http_opener.open(asked, timeout=min(timeout or LONGEST_WAIT, LONGEST_WAIT)) as answered:
+                response_holder["response"] = answered
+                cancellation.checkpoint()
                 raw = answered.read(20_000_000)
         except urllib.error.HTTPError as exc:
             try:
                 body_said = exc.read(16_000).decode("utf-8", errors="replace")
             finally:
                 exc.close()
+            cancellation.checkpoint()
             raise self._what_that_number_meant(exc.code, body_said) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            cancellation.checkpoint()
             raise HarnessError(
                 f"Microsoft 365 Copilot could not be reached: {self._redactor.text(str(exc))}"
             ) from exc
+        finally:
+            unregister_cancel()
+        cancellation.checkpoint()
         try:
             held = json.loads(raw)
         except json.JSONDecodeError as exc:
