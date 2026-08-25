@@ -1464,7 +1464,8 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('"danger swarm-chat-stop", "Stop"', self.script)
         self.assertIn('request("/api/chat/stop"', self.script)
         self.assertIn('request("/api/swarm/stop-chat"', self.script)
-        self.assertIn("window.harnessDesktop.stopWebChat(agent.who)", self.script)
+        self.assertIn("window.harnessDesktop.stopWebChat(", self.script)
+        self.assertIn('agent.who, conversation?.filed_as || ""', self.script)
 
     def test_full_screen_is_a_toggle_and_says_when_it_is_on(self) -> None:
         self.assertIn('$("swarmStage").requestFullscreen()', self.script)

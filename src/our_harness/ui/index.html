@@ -932,6 +932,7 @@
               placeholder="Type here to talk to this agent."></textarea>
             <div id="theBigChatAttachments" class="chat-attachments" aria-live="polite"></div>
             <input id="theBigChatFiles" class="sr-only" type="file" multiple
+              aria-label="Attach files or screenshots to this chat"
               accept="image/*,.txt,.md,.json,.yaml,.yml,.toml,.ini,.csv,.py,.js,.ts,.tsx,.jsx,.css,.html,.xml">
             <p class="hint chat-auto-hint">Send automatically involves connected agents when their
               expertise would help. Explicit file tasks ask for confirmation before project files change.</p>
@@ -1038,6 +1039,7 @@
             <button id="swarmAgentPictureClear" type="button" hidden>Use the fallback icon</button>
           </div>
           <input id="swarmAgentPictureFile" class="sr-only" type="file"
+            aria-label="Choose this agent's profile picture"
             accept="image/png,image/jpeg,image/webp">
           <p id="swarmAgentPictureSaid" class="field-help" role="status">PNG, JPEG, or WebP. Nexus resizes the picture before keeping it.</p>
 

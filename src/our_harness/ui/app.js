@@ -7274,6 +7274,8 @@ function setWhatCanBePressedInSwarm() {
 // happened. Queueing the change means it runs against the board the one before
 // it really wrote.
 let theChangeBeforeThis = Promise.resolve();
+let swarmAddingAgent = false;
+let swarmAddingProject = false;
 
 function changeTheSwarmBoard(change, note) {
   const mine = theChangeBeforeThis.then(() => applyOneChangeToTheBoard(change, note));
@@ -7322,6 +7324,16 @@ function aFreeSpotOnTheBoard(kind) {
 }
 
 async function addAnAgentToTheBoard() {
+  if (swarmAddingAgent) return;
+  swarmAddingAgent = true;
+  try {
+    await addOneAgentToTheBoard();
+  } finally {
+    swarmAddingAgent = false;
+  }
+}
+
+async function addOneAgentToTheBoard() {
   const taken = new Set(theSwarmBoard().agents.map((one) => one.name.toLowerCase()));
   let name = "New agent";
   for (let number = 2; taken.has(name.toLowerCase()); number += 1) name = `New agent ${number}`;
@@ -7346,6 +7358,16 @@ async function addAnAgentToTheBoard() {
 }
 
 async function addAProjectToTheBoard() {
+  if (swarmAddingProject) return;
+  swarmAddingProject = true;
+  try {
+    await addOneProjectToTheBoard();
+  } finally {
+    swarmAddingProject = false;
+  }
+}
+
+async function addOneProjectToTheBoard() {
   const already = new Set(theSwarmBoard().projects.map((one) => one.path));
   const known = (swarmSaid.projects_on_this_machine || [])
     .find((one) => !already.has(one.path));

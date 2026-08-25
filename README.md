@@ -8,6 +8,112 @@ Python 3.11 or newer. The core uses only the standard library: no packages to
 install, no account to create, nothing sent anywhere unless you set that up
 yourself.
 
+## Two main workspaces
+
+Nexus Harness opens around two primary workspaces. They are the centre of the
+desktop app and the best place to begin:
+
+| Workspace | Use it when you want to... |
+| --- | --- |
+| **AI Agent Swarm orchestrator** | Put local, command-line, and signed-in web AIs on one board; decide which projects they may work on and which agents may talk; then inspect or start their conversations. |
+| **visual test automation** | Draw repeatable work as a pipeline; connect tests, gates, retries, security checks, evidence, and human decisions; then watch the real run move through the diagram. |
+
+The distinction is useful: the **Swarm orchestrator controls who collaborates
+and where**, while **visual test automation controls what runs, in which order,
+and what must pass before work continues**. They can be used independently, or
+together as the human-facing control layer for a local project.
+
+### AI Agent Swarm orchestrator
+
+The swarm board is a live map of agents, projects, and permission boundaries.
+An agent box can represent a command-line assistant already available on the
+machine or an ordinary ChatGPT, Claude, Gemini, or Microsoft Copilot web chat
+opened through Nexus. A project box is a real local folder. The lines between
+them are not decoration: they say which agent works on which project and which
+two agents are allowed to exchange messages.
+
+![The AI Agent Swarm orchestrator board](docs/images/agent-swarm-board.png)
+
+On this board you can:
+
+- add agents and project folders, move them freely, tidy the layout, zoom, or
+  fit the whole graph on screen;
+- use the gear on any box or line to edit the thing it belongs to, without
+  leaving the board;
+- connect an agent to one or more projects, and keep each chat's file work
+  bounded to a project shared by that exact pair;
+- turn agent-to-agent communication on or off per pair, with the current rule
+  visible on the line;
+- open several compact chats at once, expand one into the full pair-chat view,
+  and keep multiple separately identified conversations for the same pair;
+- connect signed-in provider web chats without putting browser cookies, login
+  details, or provider conversations in the repository;
+- save several boards and return to a particular team-and-project arrangement
+  later; and
+- read the relayed messages and live activity instead of treating collaboration
+  as an invisible model-side event.
+
+Each pair chat owns its own local transcript and conversation identity. Chat 1
+and Chat 2 between the same two agents remain different conversations, and a
+web provider chat is bound to that Nexus conversation rather than being reused
+as a global destination. The selected project is part of the conversation's
+state too, so switching chats does not silently carry the previous folder into
+the next one.
+
+Ordinary chat is read-only with respect to project files. A file-changing task
+uses the explicit **Work together on project files** action, gathers structured
+contributions, validates the bounded transaction, checks the baseline, and
+keeps rollback material. That makes the board useful for real project work
+without making every message an implicit write permission.
+
+See [AGENT_BOARD.md](docs/AGENT_BOARD.md) for the board model and
+[TALK_TO_THEM.md](docs/TALK_TO_THEM.md) for conversations and collaboration.
+
+### visual test automation
+
+The visual automation workspace turns a runbook into an executable graph. Drag
+a step onto the canvas, connect it to the next step, configure it in place, and
+press **Run**. The diagram is both the editor and the live status view: nodes
+light up while they run and retain the result and evidence afterwards.
+
+Use it to build flows such as:
+
+1. start two independent test suites in parallel;
+2. scan the project for credentials or unsafe changes;
+3. stop at a gate unless the required checks passed;
+4. retry a flaky job with a fixed or increasing delay;
+5. ask a person before a risky branch continues;
+6. run another saved pipeline as one reusable step; and
+7. collect the outcome and screenshots into evidence that can be reviewed or
+   sent to somebody else.
+
+The canvas supports ready-made pipelines as well as blank ones. Steps can run
+unit tests, Nexus check suites, security scans, Git status inspection, evidence
+packaging, assistant tasks, gates, and nested pipelines. Branches may run in
+parallel; gates decide whether downstream work is allowed to start; retry and
+time-limit settings keep a stuck command from owning the whole run forever.
+
+The visual status is deliberately plain: working, passed, failed, or skipped
+because a gate stopped the branch. Open a step to see its configuration and the
+result that produced that colour. Saved versions let you restore an earlier
+automation, and schedules can run a saved pipeline later while preserving the
+same reviewable definition.
+
+See [PIPELINES.md](docs/PIPELINES.md) for step types, gates, retries, schedules,
+and evidence.
+
+### A practical way to use both
+
+Start in the **AI Agent Swarm orchestrator** when the question is about people
+and boundaries: which assistants are available, which project is in scope, and
+who may consult whom. Move to **visual test automation** when that work should
+become repeatable: the build command, browser checks, security gate, review,
+and evidence can be drawn once and run the same way every time.
+
+That gives Nexus Harness two complementary control surfaces: one for a team of
+agents and one for a dependable process. The older, more specialised features
+are still documented below, but these two workspaces are the main product.
+
 ![The checks view, with every check passing](docs/images/checks.png)
 
 ---

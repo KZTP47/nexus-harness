@@ -441,7 +441,8 @@ test("the bridge offers a picker that only picks", () => {
 test("Work on this tells Electron which project must open next time", () => {
   const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
   assert.ok(preload.includes("rememberProject"));
-  assert.ok(preload.includes('invoke(\n    "harness:rememberProject"'));
+  assert.match(preload, /invoke\(\s*"harness:rememberProject"/,
+    "the check must work with either LF or CRLF after a Windows checkout");
 
   const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
   assert.ok(main.includes('ipcMain.handle("harness:rememberProject"'));

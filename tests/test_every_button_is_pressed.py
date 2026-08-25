@@ -85,6 +85,43 @@ ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "Pressing it downloads a file. A browser download during a check is a "
         "file left on the machine that nothing takes away again."
     ),
+    "talkStop": (
+        "This is enabled only while a real assistant or signed-in web provider "
+        "is answering. The browser suite must not spend a real account turn merely "
+        "to make Stop clickable; cancellation is exercised with bounded fakes in "
+        "tests/test_talking_to_them.py and the desktop web-chat tests."
+    ),
+    "theBigChatStop": (
+        "This is enabled only during a live pair-chat request. Starting an external "
+        "model turn just so a browser check can cancel it would make CI depend on a "
+        "private account; tests/test_the_board_of_agents.py and the desktop tests "
+        "exercise the server and provider cancellation paths instead."
+    ),
+    "webChatDialogClose": (
+        "This dialog exists only when the Electron web-chat bridge is available. "
+        "The panel browser checks deliberately have no signed-in provider session; "
+        "desktop tests cover the bridge and closing lifecycle."
+    ),
+    "webChatOpenWindow": (
+        "This asks Electron to move a signed-in provider page into its own window. "
+        "A headless browser runner has neither that bridge nor a provider account, "
+        "so desktop tests cover the bounded IPC action."
+    ),
+    "webChatViewerClose": (
+        "This closes an Electron-hosted provider view which cannot exist in the "
+        "headless panel runner. Desktop tests cover hiding the embedded provider "
+        "view and preserving its isolated session."
+    ),
+    "swarmAgentPictureBrowse": (
+        "This opens the operating system file picker. Browser automation supplies "
+        "files through the hidden input instead; the picture validation and saved "
+        "appearance are covered by the board tests."
+    ),
+    "swarmAgentPictureClear": (
+        "This is enabled only after a local profile image has been selected. The "
+        "image lifecycle is exercised with synthetic bounded image data in the board "
+        "tests rather than opening a developer's personal file picker in CI."
+    ),
 }
 
 
@@ -139,6 +176,14 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
                     chosen.add(found.group(1))
             pressed.update(re.findall(r"getElementById\('([A-Za-z0-9_]+)'\)\.click\(\)", script))
             pressed.update(re.findall(r'\$\("([A-Za-z0-9_]+)"\)\.click\(\)', script))
+            # Some stateful checks choose a generated option and then dispatch
+            # its change event inside one atomic step. Count that real choice;
+            # requiring a separate `choose` step would make the save race the
+            # assertion it belongs to.
+            chosen.update(re.findall(
+                r"getElementById\('([A-Za-z0-9_]+)'\)\.value\s*=", script
+            ))
+            chosen.update(re.findall(r'\$\("([A-Za-z0-9_]+)"\)\.value\s*=', script))
     return pressed, " ".join(said), chosen
 
 
@@ -206,6 +251,30 @@ BUILT_ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "This opens the signed-in person's Google Cloud Console in the system "
         "browser. A browser check must not inspect or alter a developer's Google "
         "account; the fixed official URL and click wiring are checked as source."
+    ),
+    "View full web AI chat": (
+        "This is created only for an Electron-connected, signed-in provider chat. "
+        "The headless panel suite has no provider session; desktop tests exercise "
+        "the exact embedded-view action and its isolated conversation binding."
+    ),
+    "Open web AI in a window": (
+        "This is created only for an Electron-connected provider chat and opens a "
+        "native window. Desktop tests cover that IPC path without requiring CI to "
+        "sign in to a private web account."
+    ),
+    "Open window": (
+        "This native provider-window action is present only with the Electron web "
+        "chat bridge. Its IPC and URL boundaries are covered by desktop tests."
+    ),
+    "Disconnect": (
+        "This would remove a real signed-in provider connection after confirmation. "
+        "CI must not alter a developer account session; desktop tests exercise the "
+        "connection removal lifecycle with isolated fakes."
+    ),
+    "Open sign-in or choose a chat": (
+        "This deliberately starts an interactive provider sign-in or selects a real "
+        "account conversation. CI has no account and must not manufacture one; the "
+        "desktop transport and provider boundary are tested independently."
     ),
 }
 

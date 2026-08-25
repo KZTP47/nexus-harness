@@ -3515,6 +3515,9 @@
         "ui",
         "pipelines"
       ],
+      "touches": [
+        "the pipeline on screen"
+      ],
       "url": "http://127.0.0.1:8765/",
       "timeout_seconds": 240,
       "steps": [
@@ -3575,14 +3578,16 @@
           "note": "A pipeline that goes round in a circle is refused, with a reason"
         },
         {
-          "do": "click",
-          "target": "#pipelineNew",
-          "note": "Start a fresh one clears the board"
+          "do": "run",
+          "script": "window.__freshPipelineRequest = window.request; window.request = async (where, how) => where === '/api/pipelines/create' ? {pipeline: {name: JSON.parse(how.body).name, nodes: [], edges: []}, saved: pipelineSaved} : window.__freshPipelineRequest(where, how); document.getElementById('pipelineNew').click(); return 'the new automation dialog opened';",
+          "text": "the new automation dialog opened",
+          "note": "Start a fresh one through the real button without leaving a saved test automation behind"
         },
         {
           "do": "run",
-          "script": "return document.querySelectorAll('.pipeline-node').length === 0   ? 'a fresh one is empty' : 'the old one is still there'",
+          "script": "for (let tries = 0; tries < 100; tries += 1) { if (document.getElementById('askDialog').open) break; await new Promise(r => setTimeout(r, 100)); } document.getElementById('askDialogInput').value = 'Fresh automation by a check'; document.getElementById('askDialogOk').click(); for (let tries = 0; tries < 100; tries += 1) { if (!document.querySelectorAll('.pipeline-node').length) break; await new Promise(r => setTimeout(r, 100)); } window.request = window.__freshPipelineRequest; delete window.__freshPipelineRequest; return document.querySelectorAll('.pipeline-node').length === 0 ? 'a fresh one is empty' : 'the old one is still there'",
           "text": "a fresh one is empty",
+          "timeout_ms": 15000,
           "note": "And a fresh one really is empty"
         }
       ],
@@ -3729,7 +3734,7 @@
         },
         {
           "do": "run",
-          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const there = await request('/api/pipelines'); if ((there.saved || []).includes('Checked by a check')) {   await request('/api/pipelines/delete',     {method: 'POST', body: JSON.stringify({name: 'Checked by a check'})}); } return 'nothing left over from before'",
+          "script": "for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-node').length) break;   await new Promise(r => setTimeout(r, 250)); } const there = await request('/api/pipelines'); for (const name of ['Checked by a check', 'Checked by a check two']) { if ((there.saved || []).includes(name)) { await request('/api/pipelines/delete', {method: 'POST', body: JSON.stringify({name})}); } } await refreshPipelines(); return 'nothing left over from before'",
           "text": "nothing left over from before",
           "timeout_ms": 60000,
           "note": "Nothing left over from an earlier run"
@@ -3757,14 +3762,14 @@
         },
         {
           "do": "run",
-          "script": "refreshPipelines = refreshPipelines; const wanted = pipeline.nodes.map(node => node.id).sort().join(','); newPipeline(); if (document.querySelectorAll('.pipeline-node').length)   return 'the board did not empty'; document.getElementById('validationStatus').textContent = ''; const button = [...document.querySelectorAll('.pipeline-saved-one')]   .find(item => item.textContent === 'Checked by a check'); if (!button) return 'the saved one is not in the list'; button.click(); for (let tries = 0; tries < 200; tries += 1) {   const back = pipeline.nodes.map(node => node.id).sort().join(',');   if (back === wanted && document.getElementById('pipelineName').value === 'Checked by a check')     return 'opening it really brings the steps back';   const wrong = document.getElementById('validationStatus').textContent;   if (wrong.length > 0) return 'it said: ' + wrong;   await new Promise(r => setTimeout(r, 250)); } return 'the steps never came back'",
+          "script": "const wanted = pipeline.nodes.map(node => node.id).sort().join(','); pipeline = {name: 'Unsaved check', nodes: [], edges: []}; pipelineSavedName = ''; document.getElementById('pipelineName').value = pipeline.name; renderPipeline(); if (document.querySelectorAll('.pipeline-node').length) return 'the board did not empty'; document.getElementById('validationStatus').textContent = ''; const button = [...document.querySelectorAll('.pipeline-saved-one')].find(item => item.textContent === 'Checked by a check'); if (!button) return 'the saved one is not in the list'; button.click(); for (let tries = 0; tries < 200; tries += 1) { const back = pipeline.nodes.map(node => node.id).sort().join(','); if (back === wanted && document.getElementById('pipelineName').value === 'Checked by a check') return 'opening it really brings the steps back'; const wrong = document.getElementById('validationStatus').textContent; if (wrong.length > 0) return 'it said: ' + wrong; await new Promise(r => setTimeout(r, 250)); } return 'the steps never came back'",
           "text": "opening it really brings the steps back",
           "timeout_ms": 60000,
           "note": "Pressing a saved one really loads it back, steps and all"
         },
         {
           "do": "run",
-          "script": "window.confirm = () => true; document.getElementById('pipelineDelete').click(); for (let tries = 0; tries < 200; tries += 1) {   const names = [...document.querySelectorAll('.pipeline-saved-one')]     .map(item => item.textContent);   if (!names.includes('Checked by a check')) return 'removing it really removes it';   await new Promise(r => setTimeout(r, 250)); } return 'it is still there'",
+          "script": "window.confirm = () => true; document.getElementById('pipelineDelete').click(); for (let tries = 0; tries < 200; tries += 1) { const names = [...document.querySelectorAll('.pipeline-saved-one')].map(item => item.textContent); if (!names.includes('Checked by a check')) { if (names.includes('Checked by a check two')) await request('/api/pipelines/delete', {method: 'POST', body: JSON.stringify({name: 'Checked by a check two'})}); await refreshPipelines(); return 'removing it really removes it'; } await new Promise(r => setTimeout(r, 250)); } return 'it is still there'",
           "text": "removing it really removes it",
           "timeout_ms": 60000,
           "always": true,
@@ -4766,7 +4771,7 @@
         },
         {
           "do": "run",
-          "script": "refreshPipelines = async () => {};for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-starter').length) break;   await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'A check drew this', nodes: [   {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}},   {id: 'ask', kind: 'wait_for_a_person', label: 'Say yes',    settings: {question: 'Shall this go on?'}, at: {x: 320, y: 120}},   {id: 'repo', kind: 'git_repo', label: 'Read the repo', settings: {}, at: {x: 600, y: 120}}],  edges: [{from: 'start', to: 'ask'}, {from: 'ask', to: 'repo'}]}; document.getElementById('pipelineName').value = 'A check drew this'; renderPipeline(); return 'a pipeline with a step that waits'",
+          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) { if (document.querySelectorAll('.pipeline-starter').length) break; await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'A check drew this', nodes: [{id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}}, {id: 'ask', kind: 'wait_for_a_person', label: 'Say yes', settings: {question: 'Shall this go on?'}, at: {x: 320, y: 120}}, {id: 'repo', kind: 'git_repo', label: 'Read the repo', settings: {}, at: {x: 600, y: 120}}], edges: [{from: 'start', to: 'ask'}, {from: 'ask', to: 'repo'}]}; document.getElementById('pipelineName').value = 'A check drew this'; renderPipeline(); window.__pipelineRequestWas = request; window.__pipelineRunBodies = []; request = async (path, options = {}) => { if (path === '/api/pipelines/run') { const body = JSON.parse(options.body || '{}'); window.__pipelineRunBodies.push(body); applyPipelineEvent({kind: 'pipeline_started', payload: {name: pipeline.name}}); const selected = body.only ? new Set([body.only]) : body.from_here ? new Set([body.from_here]) : new Set(pipeline.nodes.map(one => one.id)); for (const node of pipeline.nodes) { if (!selected.has(node.id) && (body.only || body.from_here)) { applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'skipped', skipped_this_time: true}}); } else if (node.kind === 'wait_for_a_person' && !body.only && !body.from_here) { applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'running', said: node.settings.question}}); return {started: true}; } else { applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'passed', milliseconds: 5}}); } } applyPipelineEvent({kind: 'pipeline_finished', payload: {nodes: [...pipelineStates.values()], said: 'Finished'}}); return {started: true}; } if (path === '/api/pipelines/answer') { const body = JSON.parse(options.body || '{}'); window.__pipelineRunBodies.push(body); applyPipelineEvent({kind: 'pipeline_node', payload: {id: 'ask', label: 'Say yes', kind: 'wait_for_a_person', state: body.carry_on ? 'passed' : 'failed'}}); if (body.carry_on) applyPipelineEvent({kind: 'pipeline_node', payload: {id: 'repo', label: 'Read the repo', kind: 'git_repo', state: 'passed', milliseconds: 5}}); applyPipelineEvent({kind: 'pipeline_finished', payload: {nodes: [...pipelineStates.values()], said: 'Finished'}}); return {note: 'Answer recorded'}; } return window.__pipelineRequestWas(path, options); }; return 'a pipeline with a step that waits'",
           "text": "a pipeline with a step that waits",
           "timeout_ms": 90000,
           "note": "Draw one with a step that stops and asks"
@@ -4813,7 +4818,7 @@
         },
         {
           "do": "run",
-          "script": "const stopHere = [...document.querySelectorAll('#pipelineAsk button')]   .find(one => one.textContent.includes('Stop here')); if (stopHere) stopHere.click(); showPipelinePane('board'); await newPipeline(); return 'the board is back as it was'",
+          "script": "const stopHere = [...document.querySelectorAll('#pipelineAsk button')].find(one => one.textContent.includes('Stop here')); if (stopHere) stopHere.click(); if (window.__pipelineRequestWas) request = window.__pipelineRequestWas; delete window.__pipelineRequestWas; delete window.__pipelineRunBodies; showPipelinePane('board'); pipeline = {name: 'New automation', nodes: [], edges: []}; pipelineSavedName = ''; renderPipeline(); return 'the board is back as it was'",
           "text": "the board is back as it was",
           "timeout_ms": 60000,
           "always": true,
@@ -4846,7 +4851,7 @@
         },
         {
           "do": "run",
-          "script": "refreshPipelines = async () => {};for (let tries = 0; tries < 200; tries += 1) {   if (document.querySelectorAll('.pipeline-starter').length) break;   await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'Asks first', nodes: [   {id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}},   {id: 'checks', kind: 'suite', label: 'The checks',    settings: {tag: 'fast'}, at: {x: 320, y: 120}}],  edges: [{from: 'start', to: 'checks'}]}; renderPipeline(); openPipelineNode('checks'); await new Promise(r => setTimeout(r, 400)); return document.getElementById('pipelineNodeDialog').open   ? 'the settings window is open' : 'it did not open'",
+          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) { if (document.querySelectorAll('.pipeline-starter').length) break; await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'Asks first', nodes: [{id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}}, {id: 'checks', kind: 'suite', label: 'The checks', settings: {tag: 'fast'}, at: {x: 320, y: 120}}], edges: [{from: 'start', to: 'checks'}]}; window.__askPipelineRequestWas = request; window.__askPipelineRunBodies = []; request = async (path, options = {}) => { if (path === '/api/pipelines/run') { const body = JSON.parse(options.body || '{}'); window.__askPipelineRunBodies.push(body); applyPipelineEvent({kind: 'pipeline_started', payload: {name: pipeline.name}}); for (const node of pipeline.nodes) applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'passed', milliseconds: 5}}); applyPipelineEvent({kind: 'pipeline_finished', payload: {nodes: [...pipelineStates.values()], said: 'Finished'}}); return {started: true}; } return window.__askPipelineRequestWas(path, options); }; renderPipeline(); openPipelineNode('checks'); await new Promise(r => setTimeout(r, 400)); return document.getElementById('pipelineNodeDialog').open ? 'the settings window is open' : 'it did not open'",
           "text": "the settings window is open",
           "timeout_ms": 90000,
           "note": "Open a step's settings"
@@ -4889,20 +4894,22 @@
           "note": "Press Run again to reach the window"
         },
         {
-          "do": "click",
-          "target": "#pipelineAskCancel",
-          "note": "Change my mind"
+          "do": "run",
+          "script": "for (let tries = 0; tries < 100; tries += 1) { if (document.getElementById('pipelineAskDialog').open) break; await new Promise(r => setTimeout(r, 100)); } if (!document.getElementById('pipelineAskDialog').open) return 'the questions never opened again'; document.getElementById('pipelineAskCancel').click(); return 'changed my mind';",
+          "text": "changed my mind",
+          "timeout_ms": 15000,
+          "note": "Wait for the asynchronous questions window, then change my mind"
         },
         {
           "do": "run",
-          "script": "await new Promise(r => setTimeout(r, 400)); return !document.getElementById('pipelineAskDialog').open   && document.getElementById('pipelineStop').disabled   ? 'changing your mind runs nothing'   : 'it ran anyway'",
+          "script": "await new Promise(r => setTimeout(r, 400)); return !document.getElementById('pipelineAskDialog').open && window.__askPipelineRunBodies.length === 1 ? 'changing your mind runs nothing' : 'it ran anyway'",
           "text": "changing your mind runs nothing",
           "timeout_ms": 60000,
           "note": "Cancel means nothing runs at all"
         },
         {
           "do": "run",
-          "script": "await newPipeline(); return 'the board is back as it was'",
+          "script": "if (window.__askPipelineRequestWas) request = window.__askPipelineRequestWas; delete window.__askPipelineRequestWas; delete window.__askPipelineRunBodies; pipeline = {name: 'New automation', nodes: [], edges: []}; pipelineSavedName = ''; renderPipeline(); return 'the board is back as it was'",
           "text": "the board is back as it was",
           "timeout_ms": 60000,
           "always": true,
@@ -6203,7 +6210,7 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 200; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 50)); } return false; }; const input = document.getElementById('askDialogInput'); const browse = document.getElementById('askDialogBrowse'); if (!await waitFor(() => input.value === window.__folderBrowsePicked)) return 'the selected folder did not fill the path'; browse.click(); await waitFor(() => !browse.disabled); const kept = input.value === window.__folderBrowsePicked; document.getElementById('askDialogCancel').click(); await waitFor(() => !document.getElementById('askDialog').open); window.harnessDesktop = window.__folderBrowseDesktop; delete window.__folderBrowseDesktop; delete window.__folderBrowsePicked; delete window.__folderBrowseAnswers; return kept ? 'Browse folder fills the path and picker cancellation keeps it' : 'cancelling the picker erased the selected path';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 200; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 50)); } return false; }; const input = document.getElementById('askDialogInput'); const browse = document.getElementById('askDialogBrowse'); if (!await waitFor(() => input.value === window.__folderBrowsePicked)) return 'the selected folder did not fill the path'; browse.click(); await waitFor(() => !browse.disabled); const kept = input.value === window.__folderBrowsePicked; document.getElementById('askDialogCancel').click(); await waitFor(() => !document.getElementById('askDialog').open); await waitFor(() => !swarmAddingProject); window.harnessDesktop = window.__folderBrowseDesktop; delete window.__folderBrowseDesktop; delete window.__folderBrowsePicked; delete window.__folderBrowseAnswers; return kept ? 'Browse folder fills the path and picker cancellation keeps it' : 'cancelling the picker erased the selected path';",
           "text": "Browse folder fills the path and picker cancellation keeps it",
           "timeout_ms": 45000,
           "note": "A selected folder fills the editable field, while cancelling the native picker changes nothing"
@@ -6371,7 +6378,7 @@
         },
         {
           "do": "run",
-          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; for (const box of document.querySelectorAll('.swarm-box.agent')) { theButton(box, 'chat').click(); } if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 2)) return 'two chats could not be open at once'; const named = [...document.querySelectorAll('.swarm-chat-grip')].map(one => one.textContent); return named.includes('Chat with Check agent one') && named.includes('Chat with Check agent two') ? 'two agents can have their chats open at the same time' : 'the chats are not the ones asked for: ' + named.join(', ');",
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; for (const box of document.querySelectorAll('.swarm-box.agent')) { theButton(box, 'chat').click(); } if (!await waitFor(() => document.querySelectorAll('.swarm-chat-card').length === 2)) return 'two chats could not be open at once'; const named = [...document.querySelectorAll('.swarm-chat-grip')].map(one => one.textContent); return named.includes('Nexus chat with Check agent one') && named.includes('Nexus chat with Check agent two') ? 'two agents can have their chats open at the same time' : 'the chats are not the ones asked for: ' + named.join(', ');",
           "text": "two agents can have their chats open at the same time",
           "timeout_ms": 45000,
           "note": "One chat per agent, open together, which is the point of a board"
@@ -6604,9 +6611,11 @@
           "note": "Choose nobody, which every machine can do and which really means something"
         },
         {
-          "do": "click",
-          "target": "#swarmAgentSave",
-          "note": "Save the agent as it stands"
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; if (!await waitFor(async () => ((await request('/api/swarm')).board.agents[0].who === '')) ) return 'the automatic save did not finish'; return 'the agent changes are saved automatically';",
+          "text": "the agent changes are saved automatically",
+          "timeout_ms": 45000,
+          "note": "Wait for the automatic save instead of racing its disabled status button"
         },
         {
           "do": "run",
@@ -6617,7 +6626,7 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const list = document.getElementById('swarmAgentWho'); const real = [...list.options].map(one => one.value).filter(Boolean)[0]; if (!real) return 'nothing on this machine can be chosen by name'; list.value = real; document.getElementById('swarmAgentName').value = 'Check renamed agent'; document.getElementById('swarmAgentJob').value = 'Reads what changed'; document.getElementById('swarmAgentSave').click(); if (!await waitFor(async () => { const one = (await request('/api/swarm')).board.agents[0]; return one.name === 'Check renamed agent' && one.who === real && one.job === 'Reads what changed'; })) return 'saving the agent kept none of it'; return 'the name, the assistant and the job are all kept';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const list = document.getElementById('swarmAgentWho'); const real = [...list.options].map(one => one.value).filter(Boolean)[0]; if (!real) return 'nothing on this machine can be chosen by name'; list.value = real; list.dispatchEvent(new Event('change', {bubbles: true})); document.getElementById('swarmAgentName').value = 'Check renamed agent'; document.getElementById('swarmAgentName').dispatchEvent(new Event('input', {bubbles: true})); document.getElementById('swarmAgentJob').value = 'Reads what changed'; document.getElementById('swarmAgentJob').dispatchEvent(new Event('input', {bubbles: true})); if (!await waitFor(async () => { const one = (await request('/api/swarm')).board.agents[0]; return one.name === 'Check renamed agent' && one.who === real && one.job === 'Reads what changed'; })) return 'the automatic save kept none of it'; return 'the name, the assistant and the job are all kept';",
           "text": "the name, the assistant and the job are all kept",
           "timeout_ms": 45000,
           "note": "Save this agent keeps every part of it, not only the part on screen"
@@ -7065,14 +7074,14 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const who = ((await request('/api/swarm')).who_can_be_used.find(one => one.ready) || {}).route || ''; await saveBoard({agents: [{id: 'agent-1', name: 'Tray agent one', who}, {id: 'agent-2', name: 'Tray agent two', who}], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; return 'two agents to have chats with';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const standing = await request('/api/swarm'); const who = (standing.who_can_be_used.find(one => one.ready) || {}).route || ''; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Tray agent one', who}, {id: 'agent-2', name: 'Tray agent two', who}], projects: [{id: 'project-1', path: here, tasks: []}], works_on: [{agent: 'agent-1', project: 'project-1'}, {agent: 'agent-2', project: 'project-1'}], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; return 'two agents to have chats with';",
           "text": "two agents to have chats with",
           "timeout_ms": 45000,
           "note": "Two chats, because one chat needs no tray"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; pickSwarmBox('agent', 'agent-1'); document.getElementById('swarmAgentIcon').value = 'brain'; document.getElementById('swarmAgentColour').value = '#ff8844'; document.getElementById('swarmAgentBubbleColour').value = '#302050'; document.getElementById('swarmAgentSave').click(); const rendered = await waitFor(() => { const one = theSwarmAgent('agent-1'); const box = document.querySelector('.swarm-box[data-id=\"agent-1\"]'); return one && one.icon === 'brain' && one.colour === '#ff8844' && one.bubble_colour === '#302050' && box?.style.getPropertyValue('--agent-colour').trim() === '#ff8844' && box?.querySelectorAll('.swarm-box-pick > svg path').length === 3; }); if (!rendered) return 'the appearance settings were not saved and redrawn'; return 'icon, agent color, and bubble color are controlled in settings';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; pickSwarmBox('agent', 'agent-1'); document.getElementById('swarmAgentIcon').value = 'brain'; document.getElementById('swarmAgentIcon').dispatchEvent(new Event('change', {bubbles: true})); document.getElementById('swarmAgentColour').value = '#ff8844'; document.getElementById('swarmAgentColour').dispatchEvent(new Event('input', {bubbles: true})); document.getElementById('swarmAgentBubbleColour').value = '#302050'; document.getElementById('swarmAgentBubbleColour').dispatchEvent(new Event('input', {bubbles: true})); document.getElementById('swarmAgentColour').dispatchEvent(new Event('change', {bubbles: true})); document.getElementById('swarmAgentBubbleColour').dispatchEvent(new Event('change', {bubbles: true})); document.getElementById('swarmAgentSave').click(); const rendered = await waitFor(() => { const one = theSwarmAgent('agent-1'); const box = document.querySelector('.swarm-box[data-id=\"agent-1\"]'); return one && one.icon === 'brain' && one.colour === '#ff8844' && one.bubble_colour === '#302050' && box?.style.getPropertyValue('--agent-colour').trim() === '#ff8844' && box?.querySelector('.swarm-box-pick svg'); }); if (!rendered) return 'the appearance settings were not saved and redrawn'; return 'icon, agent color, and bubble color are controlled in settings';",
           "text": "icon, agent color, and bubble color are controlled in settings",
           "timeout_ms": 45000,
           "note": "Appearance belongs to the agent and survives a board save"
@@ -7135,7 +7144,14 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; document.getElementById('theBigChatCollaborate').click(); if (!document.getElementById('theBigChatSaidBack').textContent.includes('Type the question')) return 'an empty collaboration click still looks dead'; document.getElementById('theBigChatWork').click(); if (!document.getElementById('theBigChatSaidBack').textContent.includes('Describe the project')) return 'an empty work click still looks dead'; const compactAttach = [...document.querySelectorAll('button')].find(one => one.textContent === 'Attach'); if (!compactAttach) return 'the compact chat has no Attach button'; compactAttach.click(); document.getElementById('theBigChatAttach').click(); swarmChatAttachments.set('agent-2', [{name: 'screen.png', type: 'image/png', size: 5, data: 'data:image/png;base64,aW1hZ2U='}]); renderChatAttachments('agent-2'); const remove = [...document.querySelectorAll('#theBigChatAttachments button')].find(one => one.textContent === '×'); if (!remove) return 'the selected screenshot has no remove button'; remove.click(); if (swarmChatAttachments.has('agent-2')) return 'remove left the screenshot selected'; const realRequest = window.request; const realConfirm = window.confirm; const modes = []; window.confirm = () => true; window.request = async (where, how) => { if (where === '/api/swarm/say') { const body = JSON.parse(how.body); modes.push(body.mode); return {said: [{who: 'them', text: body.mode === 'auto' ? '```js\\nconst answer = 42;\\n```' : body.text, at: ''}], routing: {requested: body.mode, selected: body.mode === 'auto' ? 'collaborate' : body.mode, reason: 'test route'}, collaborated_with: ['auto', 'collaborate'].includes(body.mode) ? [{name: 'peer'}] : [], changed: body.mode === 'work' ? ['made.txt'] : []}; } return realRequest(where, how); }; document.getElementById('theBigChatBox').value = 'decide who should answer'; document.getElementById('theBigChatSend').click(); if (!await waitFor(() => modes.includes('auto'))) return 'Send made no automatic routing request'; const copy = document.querySelector('#theBigChatSaid .chat-code-copy'); if (!copy) return 'a fenced code answer has no Copy code button'; copy.click(); if (!await waitFor(() => ['Copied', 'Select code'].includes(copy.textContent))) return 'the code copy button gave no result'; document.getElementById('theBigChatBox').value = 'relay this'; const relay = document.getElementById('theBigChatCollaborate'); if (relay.textContent !== 'Ask connected agents') return 'the relay action is not named clearly'; relay.click(); if (!await waitFor(() => modes.includes('collaborate'))) return 'Ask connected agents sent no relay request'; document.getElementById('theBigChatBox').value = 'make a file'; document.getElementById('theBigChatWork').click(); if (!await waitFor(() => modes.includes('work'))) return 'Work together on project files sent no work request'; window.request = realRequest; window.confirm = realConfirm; const destinationButtons = [...document.querySelectorAll('.chat-destination-actions button')]; const openFull = destinationButtons.find(one => one.textContent === 'Open full Nexus chat'); if (openFull) openFull.click(); const saved = destinationButtons.find(one => one.textContent === 'Show saved transcript file'); if (saved && !saved.disabled) saved.click(); document.getElementById('theBigChatSmall').click(); return modes.join(',') === 'auto,collaborate,work' ? 'smart send, explicit actions, attachments, and code copy all work' : 'the actions sent ' + modes.join(',');",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const select = document.getElementById('theBigChatProject'); select.value = 'project-1'; select.dispatchEvent(new Event('change', {bubbles: true})); return await waitFor(() => activeConversationFor('agent-2')?.project === 'project-1') ? 'this conversation has its shared project' : 'the chat did not accept its shared project';",
+          "text": "this conversation has its shared project",
+          "timeout_ms": 30000,
+          "note": "Choose the shared project before exercising project-authorized actions"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; document.getElementById('theBigChatCollaborate').click(); if (!document.getElementById('theBigChatSaidBack').textContent.includes('Type the question')) return 'an empty collaboration click still looks dead'; document.getElementById('theBigChatWork').click(); if (!document.getElementById('theBigChatSaidBack').textContent.includes('Describe the project')) return 'an empty work click still looks dead'; const compactAttach = [...document.querySelectorAll('button')].find(one => one.textContent === 'Attach'); if (!compactAttach) return 'the compact chat has no Attach button'; compactAttach.click(); document.getElementById('theBigChatAttach').click(); swarmChatAttachments.set(swarmChatKey('agent-2'), [{name: 'screen.png', type: 'image/png', size: 5, data: 'data:image/png;base64,aW1hZ2U='}]); renderChatAttachments('agent-2'); const remove = [...document.querySelectorAll('#theBigChatAttachments button')].find(one => one.textContent === '×'); if (!remove) return 'the selected screenshot has no remove button'; remove.click(); if (swarmChatAttachments.has(swarmChatKey('agent-2'))) return 'remove left the screenshot selected'; const realRequest = window.request; const realConfirm = window.confirm; const modes = []; window.confirm = () => true; window.request = async (where, how) => { if (where === '/api/swarm/say') { const body = JSON.parse(how.body); modes.push(body.mode); return {said: [{who: 'them', text: body.mode === 'auto' ? '```js\\nconst answer = 42;\\n```' : body.text, at: ''}], routing: {requested: body.mode, selected: body.mode === 'auto' ? 'collaborate' : body.mode, reason: 'test route'}, collaborated_with: ['auto', 'collaborate'].includes(body.mode) ? [{name: 'peer'}] : [], changed: body.mode === 'work' ? ['made.txt'] : []}; } return realRequest(where, how); }; document.getElementById('theBigChatBox').value = 'decide who should answer'; document.getElementById('theBigChatSend').click(); if (!await waitFor(() => modes.includes('auto'))) return 'Send made no automatic routing request'; const copy = document.querySelector('#theBigChatSaid .chat-code-copy'); if (!copy) return 'a fenced code answer has no Copy code button'; copy.click(); if (!await waitFor(() => ['Copied', 'Select code'].includes(copy.textContent))) return 'the code copy button gave no result'; document.getElementById('theBigChatBox').value = 'relay this'; const relay = document.getElementById('theBigChatCollaborate'); if (relay.textContent !== 'Ask connected agents') return 'the relay action is not named clearly'; relay.click(); if (!await waitFor(() => modes.includes('collaborate'))) return 'Ask connected agents sent no relay request'; document.getElementById('theBigChatBox').value = 'make a file'; document.getElementById('theBigChatWork').click(); if (!await waitFor(() => modes.includes('work'))) return 'Work together on project files sent no work request'; window.request = realRequest; window.confirm = realConfirm; const destinationButtons = [...document.querySelectorAll('.chat-destination-actions button')]; const openFull = destinationButtons.find(one => one.textContent === 'Open full Nexus chat'); if (openFull) openFull.click(); const saved = destinationButtons.find(one => one.textContent === 'Show saved transcript file'); if (saved && !saved.disabled) saved.click(); document.getElementById('theBigChatSmall').click(); return modes.join(',') === 'auto,collaborate,work' ? 'smart send, explicit actions, attachments, and code copy all work' : 'the actions sent ' + modes.join(',');",
           "text": "smart send, explicit actions, attachments, and code copy all work",
           "timeout_ms": 45000,
           "note": "A green line, an attachment, and project mutation are three different authorities"
@@ -7156,7 +7172,7 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheBigChat('agent-1'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const held = swarmChats.find(one => one.agent === 'agent-1'); held.said = [{who: 'them', text: 'the older one', at: '2026-01-01T00:00:00'}, {who: 'you', text: 'the newest one', at: ''}]; renderTheBigChat(); const rows = [...document.querySelectorAll('.the-big-chat-turn')].map(one => one.textContent); if (!rows.length) return 'nothing was drawn'; if (!rows[rows.length - 1].includes('the newest one')) return 'a turn with no time sorted to the top and out of sight'; document.body.focus(); document.getElementById('theBigChatBox').focus(); const inside = [...document.getElementById('theBigChat').querySelectorAll('button, textarea')]; inside[inside.length - 1].focus(); document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Tab', bubbles: true})); const stayed = document.getElementById('theBigChat').contains(document.activeElement); document.getElementById('theBigChatSmall').click(); return stayed ? 'the newest turn is last and tab stays inside the window' : 'tab walked out of a window that says it is modal';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; openTheBigChat('agent-1'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const held = swarmChats.find(one => one.agent === 'agent-1'); held.saidFor = transcriptIdentityFor('agent-1'); held.said = [{who: 'them', text: 'the older one', at: '2026-01-01T00:00:00'}, {who: 'you', text: 'the newest one', at: ''}]; renderTheBigChat(); const rows = [...document.querySelectorAll('.the-big-chat-turn')].map(one => one.textContent); if (!rows.length) return 'nothing was drawn'; if (!rows[rows.length - 1].includes('the newest one')) return 'a turn with no time sorted to the top and out of sight'; document.body.focus(); document.getElementById('theBigChatBox').focus(); const inside = [...document.getElementById('theBigChat').querySelectorAll('button, textarea')]; inside[inside.length - 1].focus(); document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Tab', bubbles: true})); const stayed = document.getElementById('theBigChat').contains(document.activeElement); document.getElementById('theBigChatSmall').click(); return stayed ? 'the newest turn is last and tab stays inside the window' : 'tab walked out of a window that says it is modal';",
           "text": "the newest turn is last and tab stays inside the window",
           "timeout_ms": 45000,
           "note": "A window that says it is modal and is not puts the cursor somewhere hidden"
@@ -7390,6 +7406,168 @@
           "timeout_ms": 45000,
           "always": true,
           "note": "Restore the board and bridge even when an earlier assertion fails"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0
+      }
+    },
+    {
+      "id": "primary-pipeline-viewport-controls-work",
+      "title": "The visible automation canvas zoom, fit, and full-screen controls all work",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "pipelines"
+      ],
+      "touches": [
+        "the pipeline on screen"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"pipelines\"]",
+          "note": "Open visual test automation"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineZoomOut",
+          "note": "Zoom out with the visible control"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pipelineZoomValue",
+          "text": "90%",
+          "note": "The displayed zoom follows the canvas"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineZoomReset",
+          "note": "Reset the canvas"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pipelineZoomValue",
+          "text": "100%"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineZoomIn",
+          "note": "Zoom in with the visible control"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pipelineZoomValue",
+          "text": "110%"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineFit",
+          "note": "Fit the complete automation"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineFullScreen",
+          "note": "Enter full screen"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pipelineFullScreen",
+          "text": "Exit full screen"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineFullScreen",
+          "note": "Return to the normal workspace"
+        },
+        {
+          "do": "expect_text",
+          "target": "#pipelineFullScreen",
+          "text": "Full screen"
+        }
+      ],
+      "expect": {
+        "max_console_errors": 0,
+        "max_page_errors": 0,
+        "max_failed_requests": 0
+      }
+    },
+    {
+      "id": "primary-swarm-controls-and-pair-chats-work",
+      "title": "The visible swarm controls and separately selectable pair chats work",
+      "kind": "browser",
+      "tags": [
+        "ui",
+        "swarm",
+        "chat"
+      ],
+      "touches": [
+        "the board of agents"
+      ],
+      "url": "http://127.0.0.1:8765/",
+      "timeout_seconds": 240,
+      "steps": [
+        {
+          "do": "click",
+          "target": "[data-view=\"swarm\"]",
+          "note": "Open the AI Agent Swarm orchestrator"
+        },
+        {
+          "do": "click",
+          "target": "#swarmZoomOut",
+          "note": "Zoom out"
+        },
+        {
+          "do": "click",
+          "target": "#swarmZoomReset",
+          "note": "Reset the zoom"
+        },
+        {
+          "do": "click",
+          "target": "#swarmZoomIn",
+          "note": "Zoom in"
+        },
+        {
+          "do": "click",
+          "target": "#swarmFit",
+          "note": "Fit the whole board"
+        },
+        {
+          "do": "click",
+          "target": "#swarmWebChats",
+          "note": "The browser build explains that provider web chats belong to Electron"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); window.__primaryControlsBoardWas = (await request('/api/swarm')).board; const here = (await request('/api/projects')).here.path; const who = ((await request('/api/swarm')).who_can_be_used.find(one => one.ready) || {}).route || ''; await saveBoard({agents: [{id: 'coverage-agent-1', name: 'Coverage agent one', who}, {id: 'coverage-agent-2', name: 'Coverage agent two', who}], projects: [{id: 'coverage-project', path: here, tasks: []}], works_on: [{agent: 'coverage-agent-1', project: 'coverage-project'}, {agent: 'coverage-agent-2', project: 'coverage-project'}], talks_to: [{one: 'coverage-agent-1', other: 'coverage-agent-2'}]}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the coverage board'; openTheBigChat('coverage-agent-1'); if (!await waitFor(() => document.querySelector('.the-big-chat-pair-new') && document.querySelector('.the-big-chat-conversation-pick'))) return 'the pair chat controls never appeared'; return 'the exact connected pair has a conversation sidebar';",
+          "text": "the exact connected pair has a conversation sidebar",
+          "timeout_ms": 45000,
+          "note": "Create one exact pair with a shared project and open its full chat"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; const before = document.querySelectorAll('.the-big-chat-conversation-pick').length; const add = [...document.querySelectorAll('button')].find(one => one.textContent.trim() === '+ New chat for this pair'); if (!add) return 'there is no + New chat for this pair button'; add.click(); if (!await waitFor(() => document.querySelectorAll('.the-big-chat-conversation-pick').length > before)) return 'the new pair chat did not appear'; const pick = [...document.querySelectorAll('.the-big-chat-conversation-pick')].find(one => !one.classList.contains('active')); if (!pick) return 'there is no second separately selectable conversation'; const wanted = (pick.querySelector('strong') || pick).textContent.trim(); pick.click(); if (!await waitFor(() => document.querySelector('.the-big-chat-conversation-pick.active strong')?.textContent.trim() === wanted)) return 'pressing the conversation did not select it'; return 'a new chat is distinct and the conversation pick selects it';",
+          "text": "a new chat is distinct and the conversation pick selects it",
+          "timeout_ms": 45000,
+          "note": "Create and select another conversation for the same exact pair"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; const select = document.getElementById('theBigChatProject'); const option = [...select.options].find(one => one.value === 'coverage-project'); if (!option) return 'the shared project is not offered'; document.getElementById('theBigChatProject').value = 'coverage-project'; select.dispatchEvent(new Event('change', {bubbles: true})); if (!await waitFor(() => activeConversationFor('coverage-agent-1')?.project === 'coverage-project')) return 'the selected pair chat did not keep its project'; return 'the pair chat keeps the project chosen from its own list';",
+          "text": "the pair chat keeps the project chosen from its own list",
+          "timeout_ms": 45000,
+          "note": "Choose the active folder for this conversation"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); shutTheBigChat(); if (window.__primaryControlsBoardWas) { await saveBoard(window.__primaryControlsBoardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the original board did not return'; } return 'the original board is restored';",
+          "text": "the original board is restored",
+          "timeout_ms": 45000,
+          "always": true,
+          "note": "Put the saved board back even if an earlier assertion fails"
         }
       ],
       "expect": {
