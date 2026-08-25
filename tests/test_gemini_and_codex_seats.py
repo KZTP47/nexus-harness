@@ -169,7 +169,12 @@ class WhatTheToolIsHandedTests(unittest.TestCase):
             handed.update(rest.get("also_in_the_environment") or {})
             raise HarnessError("far enough")
 
-        with mock.patch.object(subscription_cli, "_run_bounded", watch), \
+        # This is a transport-contract test, not an installation probe.  A
+        # clean CI runner quite correctly has no Gemini executable, while a
+        # developer machine usually does; make that prerequisite explicit so
+        # the same code path is exercised on both.
+        with mock.patch.object(subscription_cli.shutil, "which", return_value="gemini"), \
+             mock.patch.object(subscription_cli, "_run_bounded", watch), \
              self.assertRaises(HarnessError):
             a_provider("gemini-cli", google_project="a-project").complete(
                 ProviderRequest("", "", [{"role": "user", "content": "hi"}], "",

@@ -204,15 +204,27 @@ class WritingThroughThePanelTests(PanelTestCase):
             ("/api/vault/start", {}),
         ):
             with self.subTest(path=path):
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{self.port}{path}",
-                    data=json.dumps(body).encode("utf-8") if body is not None else None,
-                    headers={"Content-Type": "application/json"},
-                    method="POST" if body is not None else "GET",
-                )
-                with self.assertRaises(urllib.error.HTTPError) as caught:
-                    urllib.request.urlopen(request, timeout=10)
-                self.assertEqual(caught.exception.code, 400)
+                # Windows can occasionally abort one fresh loopback socket
+                # itself (WinError 10053/10054), especially while the full
+                # suite has several short-lived local servers.  That is a
+                # transport interruption, not an authorization answer. Retry
+                # that exact request once, but never retry an HTTP result.
+                for attempt in range(2):
+                    request = urllib.request.Request(
+                        f"http://127.0.0.1:{self.port}{path}",
+                        data=json.dumps(body).encode("utf-8") if body is not None else None,
+                        headers={"Content-Type": "application/json", "Connection": "close"},
+                        method="POST" if body is not None else "GET",
+                    )
+                    try:
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            urllib.request.urlopen(request, timeout=10)
+                    except ConnectionError:
+                        if attempt:
+                            raise
+                        continue
+                    self.assertEqual(caught.exception.code, 400)
+                    break
 
 
 class LearningFromTheRunsThroughThePanelTests(PanelTestCase):
