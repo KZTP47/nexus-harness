@@ -594,6 +594,7 @@ class ResidentDaemon:
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(body)
+                self.wfile.flush()
 
             def _authorized(self) -> bool:
                 try:
@@ -629,22 +630,23 @@ class ResidentDaemon:
                     raise HarnessError("Request body must be a JSON object")
                 return value
 
-            def _mutation(self, route: str, body: dict[str, Any], operation: Any) -> None:
+            def _mutation(self, route: str, body: dict[str, Any], operation: Any) -> bool:
                 client = _single_header(self.headers, "X-Harness-Client-Id")
                 command = _single_header(self.headers, "X-Harness-Command-Id")
                 if client is None or command is None:
                     self._reply(400, {"error": "mutation requires bounded client and command IDs"})
-                    return
+                    return False
                 status, prior = daemon.store.begin_command(client, command, route, body)
                 if status == "complete":
                     self._reply(200, prior)
-                    return
+                    return True
                 if status == "uncertain":
                     self._reply(409, {"error": "command_result_uncertain"})
-                    return
+                    return False
                 result = operation()
                 daemon.store.finish_command(client, command, result)
                 self._reply(200, result)
+                return True
 
             def _dispatch(self, method: str) -> None:
                 if not self._authorized():
@@ -698,7 +700,11 @@ class ResidentDaemon:
                         self._mutation(f"POST /v1/jobs/{job_id}/{action}", body, mutate)
                     elif method == "POST" and parsed.path == "/v1/shutdown":
                         body = self._body()
-                        self._mutation("POST /v1/shutdown", body, daemon.stop)
+                        if self._mutation("POST /v1/shutdown", body, daemon.prepare_stop):
+                            # ThreadingHTTPServer uses daemon request threads. Signal the
+                            # main loop only after the response is on the socket, or the
+                            # process can exit first and reset Windows clients.
+                            daemon.stopping = True
                     else:
                         self._reply(404, {"error": "not_found"})
                 except (HarnessError, ValueError) as exc:
@@ -807,8 +813,7 @@ class ResidentDaemon:
             raise HarnessError("Resident job has no retained resumable checkpoint")
         return self.store.queue_resume(job_id)
 
-    def stop(self) -> dict[str, Any]:
-        self.stopping = True
+    def prepare_stop(self) -> dict[str, Any]:
         if self.worker_tree is not None:
             self.worker_tree.kill()
         return {"stopping": True}

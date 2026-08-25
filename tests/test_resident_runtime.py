@@ -336,6 +336,29 @@ class ResidentAPITests(unittest.TestCase):
         status, body = _request(self.daemon, "GET", "/v1/files")
         self.assertEqual((status, body["error"]), (404, "not_found"))
 
+    def test_shutdown_response_is_written_before_the_daemon_stops(self) -> None:
+        handler = self.daemon.server.RequestHandlerClass
+        original_reply = handler._reply
+        stopping_when_reply_started: list[bool] = []
+
+        def watched_reply(request_handler, status, value):
+            if request_handler.path == "/v1/shutdown":
+                stopping_when_reply_started.append(self.daemon.stopping)
+            return original_reply(request_handler, status, value)
+
+        with patch.object(handler, "_reply", watched_reply):
+            status, body = _request(
+                self.daemon,
+                "POST",
+                "/v1/shutdown",
+                {},
+                command="shutdown-after-reply",
+            )
+
+        self.assertEqual((status, body), (200, {"stopping": True}))
+        self.assertEqual(stopping_when_reply_started, [False])
+        self.assertTrue(self.daemon.stopping)
+
     def test_host_authority_rejects_duplicates_malformed_and_wrong_ports(self) -> None:
         port = int(self.daemon.server.server_address[1])
 
