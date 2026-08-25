@@ -103,6 +103,12 @@ Drag a box to move it, or pick it and use the arrow keys - holding shift moves
 it a small step, for lining two of them up. **Tidy the board** puts every box
 back in rows: agents on top, projects below.
 
+Saved boards are named workspaces. Opening one records that name in the live
+board itself. Nexus therefore returns to the last named board you opened after
+the desktop app closes and starts again, including any edits made after it was
+opened. The current saved board is marked in the list. Deleting that saved board
+clears the marker without deleting the live arrangement still on screen.
+
 **What is not ready** on the left lists everything standing between the board
 and it being any use - an agent with no assistant, a project nobody is on, a
 project with no jobs written down, a folder that is no longer there. It is in
@@ -128,9 +134,74 @@ final answer while finished peer replies are already readable. Once the final
 answer is saved, the temporary live view is replaced by the durable transcript
 with the same named turns.
 
+For confirmed project-file work, planning and execution are separate. Every
+participant first proposes and reviews its contribution. Nexus then gives each
+agent its own execution turn in board order, explicitly names that agent as the
+actor, and applies only the complete file changes returned from that turn. A
+later agent sees the real files produced by earlier turns, so a task such as
+“Claude creates the file, then Codex populates it” is performed by those two
+agents rather than repeatedly sent to whichever agent happened to lead the
+chat. Every participant verifies the final on-disk state. Identical file
+proposals do not count as progress, and two complete no-change team passes stop
+the loop even when provider feedback is paraphrased.
+
+The original user request is sent as the active prompt only for the independent
+first round. After that, it remains authoritative goal context while each model
+receives a new current-turn instruction: discuss the latest exchange, review the
+current plan, execute its assigned contribution, or verify the newest on-disk
+state. Completed informational questions are treated as closed and considered
+silently. This keeps a long collaboration moving forward instead of making each
+agent answer the opening question again on every round.
+
+Each pair-chat composer also exposes its team-round policy. By default it is
+unlimited while progress continues, so a real long-horizon conversation has no
+arbitrary twelve-round ceiling. The user can instead enter an exact maximum;
+that maximum applies independently to each discussion, plan-review, and
+execution/verification phase. “Unlimited” removes only the numeric ceiling.
+Nexus still stops a proven no-progress cycle.
+
+Cycle detection follows actionable state rather than comparing whole replies.
+For every participant it tracks completion, structured remaining work,
+requested files, and whether the provider failed its structured turn. Two
+repeat hits stop both a stable cycle (`A → A → A`) and a two-state oscillation
+(`A → B → A → B`). Cosmetic paraphrasing therefore cannot keep a dead loop
+alive, while a new fact, decision, output, requested file, resolved item, or
+completion change reflected in the structured progress ledger resets the guard
+and permits the conversation to continue.
+
 Inside the maximised view, each connected pair has its own list of saved chats.
 The transcript file name is generated from the stable pair and chat ID, so two
 pair workspaces never read each other's words.
+
+## The live shared collaboration ledger
+
+Every multi-agent run also has a Nexus-owned shared ledger beside its ordinary
+chat transcript under `.harness/chats/`. The append-only JSONL file is the
+canonical record. A Markdown mirror makes the complete live exchange readable
+to people and to desktop agents that can inspect project files. The maximised
+pair chat shows its relative path and can open that readable mirror directly.
+
+Nexus is the only writer. Each entry is numbered and hash-chained, and an
+externally changed or damaged suffix is rejected rather than silently trusted
+or overwritten. Provider text is stored as quoted conversation evidence, not
+as an instruction to Nexus or to another provider. Credentials are redacted
+before any entry reaches disk.
+
+Each participant has an independent cursor. On every later round Nexus supplies
+the current user goal, the latest structured shared state, the ledger paths,
+and only the entries that participant has not seen. File-capable desktop agents
+may additionally read the full Markdown mirror themselves. Web agents receive
+the same projection in their turn because they cannot safely be assumed to
+have local filesystem access. This keeps normal prompts bounded without making
+Nexus the only place where the evolving conversation can be observed.
+Preparing a prompt does not advance its cursor: Nexus commits the new cursor
+only after that provider returns, so a failed call receives the same unseen
+context again on retry.
+
+The ledger is local runtime state and is ignored by Git. Starting a pair chat
+again or deleting it removes its transcript, canonical ledger, readable mirror,
+and cursor file together, so chat identities and retention boundaries remain
+the same across every layer.
 
 
 ## The page they share, and the tray of chats

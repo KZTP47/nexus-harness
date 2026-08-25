@@ -13,6 +13,7 @@ const { _electron: electron } = require("playwright");
 
 const GIVEN_PROJECT = process.argv[2] || "";
 const TIMEOUT_MS = 90000;
+const LAST_BOARD = "Last opened by desktop smoke";
 
 function seedSettings(userData, project) {
   fs.mkdirSync(userData, { recursive: true });
@@ -21,6 +22,18 @@ function seedSettings(userData, project) {
     lastProjectAt: new Date().toISOString(),
   }, null, 2));
   return userData;
+}
+
+function seedConnectedWebChats(userData) {
+  const settingsPath = path.join(userData, "settings.json");
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+  settings.webChats = [
+    {id: "restart-gemini", provider: "gemini", title: "Restart Gemini",
+      url: "https://gemini.google.com/app/restart-smoke"},
+    {id: "restart-chatgpt", provider: "chatgpt", title: "Restart ChatGPT",
+      url: "https://chatgpt.com/c/restart-smoke"},
+  ];
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 }
 
 async function main() {
@@ -115,10 +128,45 @@ ${said || "(nothing)"}`
     );
     check(true, "Work on this changes the current project");
 
+    // A saved board is a named workspace, not merely a snapshot in the side
+    // list. Open the second one, make a further live edit, and prove both its
+    // identity and that edit survive an actual app process restart.
+    await page.click('[data-view="swarm"]');
+    await page.waitForSelector("#swarmView:not([hidden])", { timeout: 30000 });
+    await page.evaluate(async (lastBoard) => {
+      const write = async (url, body) => request(url, {
+        method: "POST", body: JSON.stringify(body),
+      });
+      await write("/api/swarm/save", {board: {
+        agents: [{name: "Earlier smoke board"}], projects: [], works_on: [], talks_to: [],
+      }});
+      await write("/api/swarm/keep", {name: "Earlier opened by desktop smoke"});
+      await write("/api/swarm/save", {board: {
+        agents: [{name: "Restart smoke board"}], projects: [], works_on: [], talks_to: [],
+      }});
+      await write("/api/swarm/keep", {name: lastBoard});
+      const opened = await write("/api/swarm/open-kept", {name: lastBoard});
+      const live = opened.board;
+      live.agents.push({name: "Edit after opening"});
+      await write("/api/swarm/save", {board: live});
+    }, LAST_BOARD);
+    const beforeRestart = await page.evaluate(() => request("/api/swarm"));
+    const beforeRestartAgents = beforeRestart.board.agents.map((one) => one.name);
+    check(
+      beforeRestart.kept.some((one) => one.name === LAST_BOARD && one.active)
+        && beforeRestartAgents.includes("Restart smoke board")
+        && beforeRestartAgents.includes("Edit after opening"),
+      "the last opened saved board and its later edit are durable before closing",
+    );
+
     check(consoleErrors.length === 0, `no browser console errors (${consoleErrors.length})`);
     check(pageErrors.length === 0, `no page script errors (${pageErrors.length})`);
     for (const text of [...consoleErrors, ...pageErrors].slice(0, 5)) console.log(`      ${text}`);
     await app.close();
+    // Recreate the reported startup shape: connected web chats make the
+    // courier run immediately, before anybody opens the board tab.  The
+    // durable board must be loaded before those chats can be materialized.
+    seedConnectedWebChats(userData);
     app = await electron.launch({
       args: launchArguments,
       executablePath, env: environment, timeout: TIMEOUT_MS,
@@ -130,6 +178,22 @@ ${said || "(nothing)"}`
       path.basename(otherProject), { timeout: 30000 }
     );
     check(true, "reopening the app returns to the project last worked on");
+    await reopened.waitForTimeout(2500);
+    await reopened.click('[data-view="swarm"]');
+    await reopened.waitForFunction(
+      (wanted) => {
+        const active = document.querySelector('#swarmKept [aria-current="true"]');
+        const agents = [...document.querySelectorAll(".swarm-box.agent .swarm-box-name")]
+          .map((one) => one.textContent);
+        return active?.textContent.includes(wanted)
+          && agents.includes("Restart smoke board")
+          && agents.includes("Edit after opening")
+          && agents.includes("Restart Gemini")
+          && agents.includes("Restart ChatGPT");
+      },
+      LAST_BOARD, { timeout: 30000 }
+    );
+    check(true, "startup web chats are added only after the last opened saved board and its edits return");
   } finally {
     await app.close().catch(() => {});
     fs.rmSync(smokeHome, { recursive: true, force: true });

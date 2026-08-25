@@ -7,7 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const {
   PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
-  automationScript, submissionScript, answerScript, retryScript, stopScript,
+  automationScript, submissionBaselineScript, submissionScript, answerScript, retryScript, stopScript,
   browserLikeUserAgent, authStorageAccessIsTrusted,
 } = require("./web-chats");
 
@@ -141,6 +141,9 @@ test("the remote-page script contains fixed selectors and safely encoded prompt 
   assert.ok(submissionScript(PROVIDERS.copilot, prompt, {}).includes("beforeUserCount"));
   assert.ok(retryScript(PROVIDERS.chatgpt).includes("data-conversation-recovery-retry"));
   assert.ok(providerReadinessScript(PROVIDERS.claude).includes("secure Nexus browser window"));
+  assert.ok(submissionBaselineScript(PROVIDERS.chatgpt, prompt).includes("needsTrustedInput"));
+  assert.equal(PROVIDERS.chatgpt.trustedInput, true);
+  assert.equal(PROVIDERS.claude.trustedInput, true);
 });
 
 test("Gemini pairs a reformatted long Nexus prompt with the reply after it", () => {
@@ -500,6 +503,33 @@ test("using the current chat identifies it to the board as the selected connecti
   assert.equal(sent[0][0], "harness:webChatsChanged");
   assert.deepEqual(sent[0][1], [selected]);
   assert.deepEqual(sent[0][2], selected);
+});
+
+test("using Claude current chat adopts the selected replacement browser tab first", async () => {
+  let settings = {};
+  let adopted = 0;
+  const contents = {
+    useCurrentPage: async () => { adopted += 1; },
+    isLoading: () => false,
+    executeJavaScript: async () => ({ready: true}),
+    getURL: () => "https://claude.ai/chat/selected-after-oauth",
+    getTitle: async () => "Selected Claude chat",
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => settings,
+    writeSettings: (value) => { settings = value; },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.shellFor = () => ({
+    providerId: "claude", connectionId: "", view: {webContents: contents},
+  });
+
+  const selected = await manager.useCurrent({});
+
+  assert.equal(adopted, 1);
+  assert.equal(selected.provider, "claude");
+  assert.equal(selected.url, "https://claude.ai/chat/selected-after-oauth");
 });
 
 test("a login page cannot be saved as if it were a connected AI chat", async () => {
@@ -993,4 +1023,69 @@ test("a provider with no clickable send control gets one trusted Enter fallback"
   ]);
   assert.ok(answerChecks >= 3);
   assert.deepEqual(focusOrder, ["provider", "board"]);
+});
+
+test("ChatGPT submission uses native text input and a trusted Enter before polling", async () => {
+  const commands = [];
+  let attached = false;
+  let answerChecks = 0;
+  const baseline = {
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0,
+    beforeUserLast: "", beforeError: "", beforeStopping: false,
+  };
+  const contents = {
+    isDestroyed: () => false,
+    focus: () => {},
+    debugger: {
+      isAttached: () => attached,
+      attach: () => { attached = true; },
+      detach: () => { attached = false; },
+      sendCommand: async (method, parameters) => commands.push([method, parameters]),
+    },
+    executeJavaScript: async (script) => {
+      if (script.includes("needsTrustedInput: true")) {
+        return {ok: false, needsTrustedInput: true, error: "not sent", ...baseline};
+      }
+      if (script.includes("for (let tries = 0; tries < 80; tries += 1)")) {
+        return {ok: true, needsTrustedInput: false, error: "", ...baseline};
+      }
+      answerChecks += 1;
+      return {answer: "Native ChatGPT reply", changed: true, stopping: false, error: ""};
+    },
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    answerPollMs: 2, answerDeadlineMs: 1000,
+  });
+  manager.connections.set("chatgpt-example", {
+    id: "chatgpt-example", provider: "chatgpt", title: "ChatGPT",
+    url: "https://chatgpt.com/c/example",
+  });
+  manager.viewFor = () => ({webContents: contents});
+  manager.waitForLoad = async () => {};
+  manager.attachFiles = async () => {};
+  manager.rememberConnectionPage = () => false;
+  manager.showCreatedConversationInOpenShells = () => {};
+
+  const result = await manager.askNow("chatgpt-example", "Please answer natively", []);
+
+  assert.equal(result.answer, "Native ChatGPT reply");
+  assert.equal(attached, false);
+  const inserted = commands.find(([method]) => method === "Input.insertText")?.[1]?.text;
+  assert.match(inserted, /^\[NEXUS TRANSPORT TURN [0-9a-f-]{36}\]/);
+  assert.ok(inserted.endsWith("Please answer natively"));
+  assert.deepEqual(commands.map(([method, parameters]) => [
+    method, parameters.type || "", parameters.key || "",
+  ]), [
+    ["Input.dispatchKeyEvent", "rawKeyDown", "a"],
+    ["Input.dispatchKeyEvent", "keyUp", "a"],
+    ["Input.dispatchKeyEvent", "rawKeyDown", "Backspace"],
+    ["Input.dispatchKeyEvent", "keyUp", "Backspace"],
+    ["Input.insertText", "", ""],
+    ["Input.dispatchKeyEvent", "keyDown", "Enter"],
+    ["Input.dispatchKeyEvent", "keyUp", "Enter"],
+  ]);
+  assert.ok(answerChecks >= 3);
 });

@@ -146,7 +146,6 @@ async function main() {
 
     // What this machine's board holds, so it can be put back whatever happens.
     putBack = await page.evaluate(async () => (await request("/api/swarm")).board);
-    const was = putBack.agents.length;
 
     await page.click("#swarmAddProject", { timeout: 20000 });
     await page.waitForSelector("#askDialog[open]", { timeout: 15000 });
@@ -261,6 +260,72 @@ async function main() {
       throw new Error("the maximised chat does not expose an idle Stop button");
     }
     console.log("pass  the maximised agent chat always exposes Stop");
+
+    // This used to fail in three related ways: at a shorter desktop height the
+    // composer was physically below the viewport, repeated background renders
+    // rebuilt the whole chat, and Electron full-screen reparenting dropped the
+    // caret. Keep one real draft focused while exercising all three paths.
+    await nativeWindow.evaluate((window) => window.setContentSize(1280, 720));
+    await page.waitForFunction(() => innerWidth >= 1200 && innerHeight >= 680,
+      null, {timeout: 20000});
+    const composerCheck = await page.evaluate(() => {
+      const box = document.getElementById("theBigChatBox");
+      box.value = "maximised composer regression";
+      box.dispatchEvent(new Event("input", {bubbles: true}));
+      box.focus();
+      box.setSelectionRange(10, 18, "forward");
+      const side = document.getElementById("theBigChatConversationList").firstElementChild;
+      const destination = document.getElementById("theBigChatDestination").firstElementChild;
+      const turn = document.getElementById("theBigChatSaid").firstElementChild;
+      const started = performance.now();
+      for (let count = 0; count < 50; count += 1) renderTheBigChat();
+      const rect = box.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2,
+        rect.top + rect.height / 2);
+      return {
+        elapsed: performance.now() - started,
+        fullyVisible: rect.top >= 0 && rect.bottom <= innerHeight,
+        hit: hit === box || box.contains(hit),
+        focused: document.activeElement === box,
+        value: box.value,
+        selection: [box.selectionStart, box.selectionEnd],
+        stableNodes:
+          side === document.getElementById("theBigChatConversationList").firstElementChild
+          && destination === document.getElementById("theBigChatDestination").firstElementChild
+          && turn === document.getElementById("theBigChatSaid").firstElementChild,
+      };
+    });
+    if (!composerCheck.fullyVisible || !composerCheck.hit || !composerCheck.focused
+        || composerCheck.value !== "maximised composer regression"
+        || composerCheck.selection.join(",") !== "10,18" || !composerCheck.stableNodes) {
+      throw new Error(`the maximised composer lost its layout or state: ${JSON.stringify(composerCheck)}`);
+    }
+    await page.click("#theBigChatBox");
+    await page.keyboard.press("Control+End");
+    await page.keyboard.type("!");
+    await page.evaluate(() => {
+      const box = document.getElementById("theBigChatBox");
+      box.focus();
+      box.setSelectionRange(4, 12, "forward");
+      box.dispatchEvent(new Event("select", {bubbles: true}));
+    });
+    await page.evaluate(() => toggleTheSwarmFullScreen());
+    await page.waitForFunction(() => document.getElementById("swarmStage")
+      .classList.contains("is-fullscreen"), null, {timeout: 20000});
+    await page.evaluate(() => toggleTheSwarmFullScreen());
+    await page.waitForFunction(() => !document.getElementById("swarmStage")
+      .classList.contains("is-fullscreen"), null, {timeout: 20000});
+    const afterReparent = await page.evaluate(() => {
+      const box = document.getElementById("theBigChatBox");
+      return {focused: document.activeElement === box, value: box.value,
+        selection: [box.selectionStart, box.selectionEnd]};
+    });
+    if (!afterReparent.focused || !afterReparent.value.endsWith("!")
+        || afterReparent.selection.join(",") !== "4,12") {
+      throw new Error(`full-screen reparenting lost the maximised draft: ${JSON.stringify(afterReparent)}`);
+    }
+    await page.fill("#theBigChatBox", "");
+    console.log(`pass  the maximised composer stays visible, clickable, focused, and cheap to refresh (${Math.round(composerCheck.elapsed)}ms/50)`);
 
     // Metadata and transcript arrive through separate HTTP reads. Exercise
     // their real renderer with deliberately crossed responses: a newly
@@ -393,10 +458,24 @@ async function main() {
     console.log("pass  and the chat closes again");
 
     await page.click("#swarmAgentRemove", { timeout: 20000 });
-    await page.waitForFunction(
-      (count) => document.querySelectorAll(".swarm-box.agent").length === count,
-      was, { timeout: 30000 }
-    );
+    try {
+      await page.waitForFunction(
+        (agent) => !document.querySelector(`.swarm-box.agent[data-id="${agent}"]`),
+        which, { timeout: 30000 }
+      );
+      await page.waitForFunction(async (agent) => (
+        !(await request("/api/swarm")).board.agents.some((one) => one.id === agent)
+      ), which, { timeout: 30000 });
+    } catch (error) {
+      const state = await page.evaluate(async () => ({
+        picked: swarmPicked,
+        visibleIds: [...document.querySelectorAll(".swarm-box.agent")]
+          .map((one) => one.dataset.id),
+        savedIds: (await request("/api/swarm")).board.agents.map((one) => one.id),
+        note: document.getElementById("swarmSaid").textContent,
+      }));
+      throw new Error(`agent removal did not settle: ${JSON.stringify(state)}; ${error.message}`);
+    }
     console.log("pass  Remove this agent takes it off again");
   } finally {
     if (putBack) {

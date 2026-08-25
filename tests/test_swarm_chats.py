@@ -88,9 +88,17 @@ class PairScopedChatsTests(unittest.TestCase):
             self.config, "claude", "old unrelated request", "old unrelated answer",
             filed_as=legacy,
         )
+        legacy_source = chat.where_it_is_kept(
+            self.config, "claude", legacy
+        ).name
 
         listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
-        conversation = listed["chats"][0]
+        conversation = next(
+            one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-2"]
+        )
+        recovered = next(
+            one for one in listed["chats"] if one["pair"] == ["agent-1"]
+        )
 
         self.assertTrue(conversation["filed_as"].startswith("pair-chat-"))
         self.assertEqual(chat.read_it(
@@ -99,6 +107,36 @@ class PairScopedChatsTests(unittest.TestCase):
         self.assertEqual(chat.read_it(
             self.config, "claude", legacy
         )[-1].text, "old unrelated answer")
+        self.assertEqual(recovered["name"], "Recovered older chat")
+        self.assertEqual(recovered["legacy_source"], legacy_source)
+        self.assertEqual(chat.read_it(
+            self.config, "claude", recovered["filed_as"]
+        )[-1].text, "old unrelated answer")
+
+        # Recovery is idempotent and never mutates or removes the source.
+        again = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual(len([
+            one for one in again["chats"] if one["legacy_source"]
+        ]), 1)
+        self.assertTrue(chat.where_it_is_kept(
+            self.config, "claude", legacy
+        ).is_file())
+
+    def test_legacy_recovery_uses_stable_filed_name_after_agent_rename(self) -> None:
+        chat.keep_exchange(
+            self.config, "claude", "before rename", "still here", filed_as="Claude"
+        )
+        board = copy.deepcopy(self.board)
+        board["agents"][0]["name"] = "Claude renamed"
+        board["agents"][0]["filed_as"] = "Claude"
+
+        listed = swarm_chats.list_for_agent(self.config, board, "agent-1")
+        recovered = next(one for one in listed["chats"] if one["legacy_source"])
+
+        self.assertEqual(recovered["pair"], ["agent-1"])
+        self.assertEqual(chat.read_it(
+            self.config, "claude", recovered["filed_as"]
+        )[-1].text, "still here")
 
     def test_schema_two_transcript_alias_is_repaired_to_pair_owned_storage(self) -> None:
         listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
@@ -254,7 +292,7 @@ class PairScopedChatsTests(unittest.TestCase):
 
         self.assertEqual(again["active"], projectless["id"])
 
-    def test_delete_removes_only_the_selected_chat_and_its_transcript(self) -> None:
+    def test_archive_and_restore_never_remove_the_selected_transcript(self) -> None:
         listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
         first = listed["chats"][0]
         made = swarm_chats.create(self.config, self.board, "agent-1", "agent-2")
@@ -269,13 +307,47 @@ class PairScopedChatsTests(unittest.TestCase):
         after = swarm_chats.delete(
             self.config, self.board, "agent-1", second["id"]
         )
-        self.assertEqual([one["id"] for one in after["chats"]], [first["id"]])
+        archived = next(one for one in after["chats"] if one["id"] == second["id"])
+        self.assertTrue(archived["archived_at"])
+        self.assertEqual(after["active"], first["id"])
         self.assertTrue(chat.where_it_is_kept(
             self.config, "claude", first["filed_as"]
         ).is_file())
-        self.assertFalse(chat.where_it_is_kept(
+        self.assertTrue(chat.where_it_is_kept(
             self.config, "claude", second["filed_as"]
-        ).exists())
+        ).is_file())
+        self.assertEqual(chat.read_it(
+            self.config, "claude", second["filed_as"]
+        )[-1].text, "removed")
+
+        restored = swarm_chats.restore(
+            self.config, self.board, "agent-1", second["id"]
+        )
+        again = next(one for one in restored["chats"] if one["id"] == second["id"])
+        self.assertFalse(again["archived_at"])
+        self.assertEqual(restored["active"], second["id"])
+
+    def test_corrupt_registry_recovers_from_last_good_copy_without_loss(self) -> None:
+        first = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        made = swarm_chats.create(self.config, self.board, "agent-1", "agent-2")
+        expected = {one["id"] for one in made["chats"]}
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        backup = registry_path.with_name(swarm_chats.BACKUP_NAME)
+        history = registry_path.with_name(swarm_chats.HISTORY_FOLDER)
+        self.assertTrue(backup.is_file())
+        self.assertTrue(any(history.glob("*.json")))
+
+        registry_path.write_text("{broken", encoding="utf-8")
+        recovered = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+
+        self.assertEqual({one["id"] for one in recovered["chats"]}, expected)
+        self.assertEqual(recovered["registry_recovered_from"], swarm_chats.BACKUP_NAME)
+        self.assertEqual(
+            {one["id"] for one in json.loads(
+                registry_path.read_text(encoding="utf-8")
+            )["chats"]},
+            expected,
+        )
 
     def test_disconnected_pair_is_preserved_but_cannot_be_used(self) -> None:
         listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")

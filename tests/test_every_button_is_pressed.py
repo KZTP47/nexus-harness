@@ -122,6 +122,31 @@ ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "image lifecycle is exercised with synthetic bounded image data in the board "
         "tests rather than opening a developer's personal file picker in CI."
     ),
+    "agentRunAutomation": (
+        "Its choices are the saved automations in the developer's current project, "
+        "so neither their names nor a harmless choice exist on every machine. The "
+        "pipeline server tests exercise loading an exact saved automation contract."
+    ),
+    "agentRunCopyContract": (
+        "This writes the selected automation contract into the developer's real "
+        "system clipboard. Browser QA must not replace personal clipboard contents; "
+        "the contract generation and exact automation identity are server-tested."
+    ),
+    "agentRunNow": (
+        "This executes the selected saved automation, whose steps may run commands or "
+        "change external state. Browser QA must not run an arbitrary developer-owned "
+        "automation; the bounded agent-run endpoint is exercised with test pipelines."
+    ),
+    "swarmAgentCheckLogin": (
+        "This deliberately probes the selected provider's real account session. A "
+        "browser check must not spend an authenticated provider request merely to "
+        "exercise the button; provider readiness is covered with bounded fakes."
+    ),
+    "swarmAgentManualLogin": (
+        "This deliberately opens the selected provider's real interactive login or "
+        "signed-in web-chat manager. Browser QA must not alter a developer account; "
+        "the login process and web-chat bridge are exercised with isolated fakes."
+    ),
 }
 
 

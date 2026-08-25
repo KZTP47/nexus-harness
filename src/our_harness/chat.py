@@ -426,6 +426,20 @@ def chat_destination(
     """Say exactly where a chat lives and how its answers are obtained."""
 
     named = str(route or "").strip()
+
+    def shared_files(where: Path) -> dict[str, Any]:
+        from .collaboration_ledger import ledger_paths
+
+        ledger = ledger_paths(config, named, filed_as)
+        return {
+            "transcript_path": where.relative_to(config.project_root).as_posix(),
+            "transcript_exists": where.is_file(),
+            "collaboration_path": ledger.markdown.relative_to(
+                config.project_root
+            ).as_posix(),
+            "collaboration_exists": ledger.markdown.is_file(),
+        }
+
     if named.startswith("web:"):
         # Web-chat routes are deliberately not part of ProviderRegistry: the
         # authenticated browser belongs to Electron and announces itself to
@@ -460,8 +474,7 @@ def chat_destination(
             "provider_app_linked": connected,
             "route": named,
             "model": "consumer web chat",
-            "transcript_path": where.relative_to(config.project_root).as_posix(),
-            "transcript_exists": where.is_file(),
+            **shared_files(where),
             "url": str((found or {}).get("url") or ""),
             "web_chat_id": str((found or {}).get("id") or connection_id),
             "web_conversation_key": str(
@@ -490,6 +503,8 @@ def chat_destination(
             "model": "",
             "transcript_path": "",
             "transcript_exists": False,
+            "collaboration_path": "",
+            "collaboration_exists": False,
             "explanation": "Choose an assistant before this Nexus chat can send a message.",
         }
     try:
@@ -508,8 +523,7 @@ def chat_destination(
             "provider_app_linked": False,
             "route": named,
             "model": "",
-            "transcript_path": where.relative_to(config.project_root).as_posix(),
-            "transcript_exists": where.is_file(),
+            **shared_files(where),
             "explanation": "This Nexus chat is saved here, but its provider route is no longer configured.",
         }
     kind = str(routed.get("provider.name") or "")
@@ -519,7 +533,6 @@ def chat_destination(
         (kind or "Configured provider", "", "Nexus asks the configured provider and keeps the conversation here."),
     )
     where = where_it_is_kept(config, named, filed_as)
-    relative = where.relative_to(config.project_root).as_posix()
     not_linked = (
         f"It is not linked to a chat in {provider_app}; that app will not contain these messages."
         if provider_app
@@ -535,8 +548,7 @@ def chat_destination(
         "provider_app_linked": False,
         "route": named or "project default",
         "model": model,
-        "transcript_path": relative,
-        "transcript_exists": where.is_file(),
+        **shared_files(where),
         "explanation": f"{explanation} {not_linked}",
     }
 
@@ -927,6 +939,9 @@ def start_again(config: LoadedConfig, route: str, filed_as: str = "") -> str:
         where = where_it_is_kept(config, route, filed_as)
         if where.is_file():
             take_the_file_away(where, missing_ok=True)
+        from .collaboration_ledger import remove_ledger
+
+        remove_ledger(config, route, filed_as)
     return "That conversation is gone. Say something and a new one starts."
 
 
@@ -940,6 +955,9 @@ def remove_conversation(config: LoadedConfig, route: str, filed_as: str = "") ->
         where = where_it_is_kept(config, route, filed_as)
         if where.is_file():
             take_the_file_away(where, missing_ok=True)
+        from .collaboration_ledger import remove_ledger
+
+        remove_ledger(config, route, filed_as)
         folder = _attachment_folder(config, route, filed_as)
         if folder.is_dir() and not folder.is_symlink():
             # Attachment folders are flat and contain only Nexus-generated
@@ -1077,7 +1095,7 @@ def _ask_and_keep(
         for one in so_far
         if one.phase not in {
             "agent_reply", "lead_draft", "agent_plan", "lead_plan",
-            "agent_discussion", "agent_plan_review", "lead_execution",
+            "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution",
             "agent_verification",
         }
     ]

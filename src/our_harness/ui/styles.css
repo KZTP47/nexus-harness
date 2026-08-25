@@ -1112,6 +1112,15 @@ body.workspace-is-fullscreen { overflow: hidden; }
   resize: vertical; min-height: 7.5em; }
 .swarm-chat-count { font-size: .72rem; }
 .swarm-chat-open-full { padding: 5px 8px; white-space: nowrap; }
+.chat-round-policy { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px;
+  padding: 7px 9px; border: 1px solid rgba(82, 213, 234, .28); border-radius: 9px;
+  background: rgba(82, 213, 234, .055); }
+.chat-round-policy label { display: inline-flex; align-items: center; gap: 6px;
+  margin: 0; font-size: .76rem; }
+.chat-round-policy input[type="number"] { width: 5.4rem; min-width: 0; padding: 4px 6px; }
+.chat-round-policy input[type="checkbox"] { margin: 0; }
+.chat-round-help { flex-basis: 100%; font-size: .7rem; }
+.the-big-chat-round-policy { margin-bottom: 2px; }
 .chat-activity {
   display: grid; gap: 6px; padding: 10px 12px; overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--cyan, #52d5ea) 65%, transparent);
@@ -1351,6 +1360,13 @@ body.workspace-is-fullscreen { overflow: hidden; }
   border-radius: 10px;
   border-left: 4px solid var(--purple);
 }
+.swarm-kept-pick[aria-current="true"] {
+  border-color: var(--yellow);
+  border-left-color: var(--yellow);
+  background: rgba(255, 216, 106, .12);
+  box-shadow: 0 0 0 2px rgba(255, 216, 106, .2);
+}
+.swarm-kept-active { display: block; color: var(--yellow); font-size: .76rem; font-weight: 800; }
 .swarm-kept-when { display: block; font-size: .76rem; opacity: .72; }
 
 /* Models running on this machine: no seat, no key, nobody to ask. */
@@ -1463,6 +1479,7 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   align-items: center;
   justify-content: center;
   padding: 24px 24px 84px;
+  overflow: hidden;
   background: rgba(3, 12, 18, .72);
 }
 .the-big-chat-sheet {
@@ -1470,6 +1487,8 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   flex-direction: column;
   width: min(1480px, 100%);
   height: 100%;
+  min-height: 0;
+  overflow: hidden;
   gap: 10px;
   padding: 16px;
   border-radius: 16px;
@@ -1486,11 +1505,12 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   min-height: 0;
 }
 .the-big-chat-main {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 10px;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 .the-big-chat-conversations {
   min-height: 0;
@@ -1526,6 +1546,10 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 4px;
 }
+.the-big-chat-conversation-item.archived { opacity: .72; }
+.the-big-chat-conversation-item.archived .the-big-chat-conversation-pick {
+  border-style: dashed;
+}
 .the-big-chat-conversation-pick {
   min-width: 0;
   text-align: left;
@@ -1540,10 +1564,16 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   background: color-mix(in srgb, var(--panel) 70%, var(--cyan, #52d5ea));
   box-shadow: inset 3px 0 0 var(--cyan, #52d5ea);
 }
-.the-big-chat-conversation-delete { padding: 5px 7px; min-width: 34px; }
+.the-big-chat-conversation-delete { padding: 5px 7px; min-width: 68px; }
 #theBigChatDestination .chat-destination { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
 #theBigChatDestination .chat-destination > strong,
 #theBigChatDestination .chat-destination-actions { grid-column: 1 / -1; }
+#theBigChatDestination {
+  max-height: min(220px, 22vh);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .the-big-chat-middle {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 290px;
@@ -1569,6 +1599,13 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
 }
 .the-big-chat-doing-list { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
 .the-big-chat-doing-one { border-left: 3px solid var(--cyan, #52d5ea); padding: 4px 0 4px 8px; }
+.the-big-chat-bottom {
+  min-height: 0;
+  max-height: 42vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 1px 4px 4px 1px;
+}
 .the-big-chat-bottom textarea { width: 100%; }
 .chat-attachments { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
 .chat-attachment {

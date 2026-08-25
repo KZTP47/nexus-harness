@@ -268,6 +268,35 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         swarm.open_this_board("Friday work")
         self.assertEqual([one.name for one in swarm.load().agents], ["The planner"])
 
+    def test_the_last_opened_saved_board_is_remembered_across_a_restart(self) -> None:
+        self.a_board_with("The planner")
+        swarm.keep_this_board("This week")
+        self.a_board_with("The reviewer")
+        swarm.keep_this_board("Fridays")
+
+        swarm.open_this_board("This week")
+        swarm.open_this_board("Fridays")
+
+        restarted = swarm.load()
+        self.assertEqual(restarted.active_saved_board, "Fridays")
+        self.assertEqual([one.name for one in restarted.agents], ["The reviewer"])
+        listed = {one["name"]: one["active"] for one in swarm.every_kept_board()}
+        self.assertEqual(listed, {"This week": False, "Fridays": True})
+
+    def test_edits_to_the_open_saved_board_survive_without_losing_its_identity(self) -> None:
+        self.a_board_with("The planner")
+        swarm.keep_this_board("Friday work")
+        opened = swarm.open_this_board("Friday work")
+        changed = opened.to_dict()
+        changed.pop("active_saved_board")  # as sent by a panel from before this feature
+        changed["agents"].append({"name": "The reviewer"})
+        swarm.save(changed)
+
+        restarted = swarm.load()
+        self.assertEqual(restarted.active_saved_board, "Friday work")
+        self.assertEqual(
+            [one.name for one in restarted.agents], ["The planner", "The reviewer"])
+
     def test_two_boards_are_kept_apart(self) -> None:
         self.a_board_with("The planner")
         swarm.keep_this_board("This week")
@@ -305,6 +334,13 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         swarm.keep_this_board("Friday work")
         swarm.forget_this_board("Friday work")
         self.assertEqual(swarm.every_kept_board(), [])
+
+    def test_deleting_the_open_saved_board_clears_its_identity(self) -> None:
+        self.a_board_with("The planner")
+        swarm.keep_this_board("Friday work")
+        swarm.open_this_board("Friday work")
+        swarm.forget_this_board("Friday work")
+        self.assertEqual(swarm.load().active_saved_board, "")
 
     def test_deleting_one_that_is_not_there_says_so(self) -> None:
         with self.assertRaises(swarm.SwarmError):

@@ -491,6 +491,18 @@
         </div>
       </div>
       <p id="pipelineSaid" class="pipeline-said" role="status">Draw a pipeline, then press Run.</p>
+      <section class="agent-run-panel" aria-labelledby="agentRunTitle">
+        <h3 id="agentRunTitle">Run this from a desktop AI agent</h3>
+        <p class="hint">Choose a saved automation. The contract gives the agent the exact name, endpoint, payload, and completion check, so it never has to guess.</p>
+        <div class="agent-run-controls">
+          <label for="agentRunAutomation">Saved automation</label>
+          <select id="agentRunAutomation"></select>
+          <button id="agentRunCopyContract" type="button">Copy agent instructions</button>
+          <button id="agentRunNow" class="primary" type="button">Run for agent</button>
+        </div>
+        <pre id="agentRunContract" class="agent-run-contract" aria-live="polite">Choose a saved automation to see its exact agent contract.</pre>
+        <p id="agentRunSaid" class="hint" role="status"></p>
+      </section>
       <div id="pipelineAsk" class="pipeline-ask" role="group" aria-label="A step is waiting for you" hidden></div>
       <div class="pipeline-tabs" role="tablist" aria-label="How to look at this pipeline">
         <button type="button" role="tab" data-pipeline-tab="board" aria-selected="true">The picture</button>
@@ -769,9 +781,9 @@
         gear. Nothing reaches an assistant until you press Set them going.</p>
 
       <h3 id="swarmKeptTitle">Saved boards</h3>
-    <p class="hint">The board you are on comes back on its own. These are the
-      ones you meant to keep - a pair of agents for this week's work, another
-      for the project you go back to on Fridays.</p>
+    <p class="hint">The board you have open comes back the next time Nexus starts,
+      with edits intact. These are the ones you meant to keep - a pair of agents
+      for this week's work, another for the project you go back to on Fridays.</p>
     <div class="button-row">
       <button id="swarmKeep" type="button">Save this board</button>
     </div>
@@ -927,6 +939,19 @@
               <select id="theBigChatProject" aria-describedby="theBigChatProjectHelp"></select>
               <span id="theBigChatProjectHelp" class="hint">Both agents must work on the selected project.</span>
             </div>
+            <div class="chat-round-policy the-big-chat-round-policy">
+              <label class="chat-round-maximum" for="theBigChatRoundLimit">Maximum team rounds
+                <input id="theBigChatRoundLimit" type="number" min="1" max="10000" value="12"
+                  aria-describedby="theBigChatRoundHelp" disabled>
+              </label>
+              <label class="chat-round-unlimited" for="theBigChatUnlimited">
+                <input id="theBigChatUnlimited" type="checkbox" checked>
+                Unlimited while progress continues
+              </label>
+              <span id="theBigChatRoundHelp" class="hint chat-round-help">
+                Applies to each team phase. Nexus still stops repeated no-progress cycles.
+              </span>
+            </div>
             <label class="sr-only" for="theBigChatBox">What to say to this agent</label>
             <textarea id="theBigChatBox" rows="3" maxlength="6000"
               placeholder="Type here to talk to this agent."></textarea>
@@ -1005,6 +1030,11 @@
         <select id="swarmAgentWho">
           <option value="">Not chosen yet</option>
         </select>
+        <div class="button-row swarm-agent-session-actions" aria-label="Assistant session actions">
+          <button id="swarmAgentCheckLogin" type="button">Check if logged in</button>
+          <button id="swarmAgentManualLogin" type="button">Log in manually</button>
+        </div>
+        <p id="swarmAgentSessionStatus" class="field-help" role="status" aria-live="polite"></p>
 
         <label for="swarmAgentJob">What it is for</label>
         <input id="swarmAgentJob" type="text" maxlength="300"

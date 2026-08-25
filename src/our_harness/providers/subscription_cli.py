@@ -244,6 +244,10 @@ COPILOT_RECIPE = CliRecipe(
     command=("copilot",),
     arguments=("-p", "--allow-all-tools", "--model", "{model}"),
     text_field="",
+    # GitHub documents `copilot login` as the CLI's interactive authentication
+    # flow. It does not document a non-request status command, so an explicit
+    # check remains honestly unknown rather than spending a model request.
+    interactive_login_arguments=("login",),
     install_hint=(
         "Install the GitHub Copilot command line tool and sign in, then run: "
         "copilot --version. It comes from npm: npm install -g @github/copilot. "
@@ -378,6 +382,11 @@ def available(kind: str, command: list[str] | None = None) -> str:
     # folder. It is still an installed command even when no launcher was put on
     # PATH. Prefer the newest known build for discovery for the same reason the
     # provider prefers it when a request is sent.
+    # A configured route naming an exact command is authority, not a hint.
+    # Looking for another desktop build after somebody named one makes a login
+    # check inspect a different session from the one the agent will actually use.
+    if command is not None:
+        return found or ""
     kept = _every_build_of(recipe.kept_under)
     if kept:
         newest, newest_version = max(kept, key=lambda one: one[1])
@@ -400,6 +409,7 @@ def connection_status(
     *,
     use_cache: bool = False,
     probe: bool = True,
+    command: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Installed and CLI-authenticated are reported as different facts.
 
@@ -410,12 +420,18 @@ def connection_status(
     """
 
     recipe = recipe_for(kind)
-    program = available(kind)
+    configured = list(command) if command is not None else None
+    if configured is not None and (
+        not configured or any(not isinstance(part, str) or not part for part in configured)
+    ):
+        raise HarnessError(f"{recipe.label} command must be a non-empty list of words")
+    program = available(kind, configured)
+    argv = ([program, *configured[1:]] if program and configured is not None else [program])
     try:
         changed = Path(program).stat().st_mtime_ns if program else 0
     except OSError:
         changed = 0
-    cache_key = (kind, program, changed)
+    cache_key = (kind, "\0".join(argv), changed)
     if use_cache:
         with _connection_cache_lock:
             remembered = _connection_cache.get(cache_key)
@@ -443,7 +459,7 @@ def connection_status(
         return dict(base, state="installed")
     try:
         result = _run_bounded(
-            [program, *recipe.signed_in_arguments],
+            [*argv, *recipe.signed_in_arguments],
             cwd=Path.cwd(),
             stdin_text=None,
             timeout_seconds=max(1.0, min(float(timeout_seconds), 15.0)),
@@ -483,7 +499,10 @@ def connection_status(
     ))
 
 
-def start_interactive_login(kind: str) -> dict[str, Any]:
+def start_interactive_login(
+    kind: str,
+    command: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Open the provider's own login flow after an explicit button press.
 
     Credentials stay between the provider CLI and its service.  The harness
@@ -497,10 +516,15 @@ def start_interactive_login(kind: str) -> dict[str, Any]:
             f"{recipe.label} has no login command this app can safely open. "
             "Open its command line yourself and follow its sign-in instructions."
         )
-    program = available(kind)
+    configured = list(command) if command is not None else None
+    if configured is not None and (
+        not configured or any(not isinstance(part, str) or not part for part in configured)
+    ):
+        raise HarnessError(f"{recipe.label} command must be a non-empty list of words")
+    program = available(kind, configured)
     if not program:
         raise HarnessError(f"{recipe.label} is not installed. {recipe.install_hint}")
-    command = [program, *arguments]
+    command = [program, *(configured[1:] if configured is not None else ()), *arguments]
     if os.name != "nt":
         raise HarnessError(
             f"Open a terminal and run {Path(program).name} "
@@ -513,7 +537,11 @@ def start_interactive_login(kind: str) -> dict[str, Any]:
     if Path(program).suffix.lower() in {".cmd", ".bat"}:
         command = [
             os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
-            subprocess.list2cmdline([program, *arguments]),
+            subprocess.list2cmdline([
+                program,
+                *(configured[1:] if configured is not None else ()),
+                *arguments,
+            ]),
         ]
     try:
         process = subprocess.Popen(

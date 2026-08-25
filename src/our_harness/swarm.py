@@ -127,6 +127,10 @@ class Agent:
     profile_picture: str = ""
     picture_zoom: int = DEFAULT_PICTURE_ZOOM
     picture_hue: int = DEFAULT_PICTURE_HUE
+    # Direct chats in early Nexus versions were keyed by the visible name.
+    # Keep that original key when the display name changes so history cannot
+    # become an orphan merely because an agent was renamed.
+    filed_as_name: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,10 +145,7 @@ class Agent:
             "profile_picture": self.profile_picture,
             "picture_zoom": self.picture_zoom,
             "picture_hue": self.picture_hue,
-            # What its conversation is filed under. Worked out from the name
-            # rather than stored, so renaming an agent renames its file too and
-            # nothing is left behind pointing at the old one.
-            "filed_as": filed_as(self.name),
+            "filed_as": self.filed_as_name or filed_as(self.name),
         }
 
 
@@ -192,6 +193,10 @@ class Board:
     # pair that may not: two agents that should not know about each other are
     # two agents that will not hear from each other.
     talks_to: list[dict[str, str]] = field(default_factory=list)
+    # Which named saved board this live board came from. The live board is the
+    # copy that keeps every edit, so this identity belongs beside those edits
+    # rather than in a separate preference that can drift away from them.
+    active_saved_board: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -203,6 +208,7 @@ class Board:
             "projects": [one.to_dict() for one in self.projects],
             "works_on": [dict(one) for one in self.works_on],
             "talks_to": [dict(one) for one in self.talks_to],
+            "active_saved_board": self.active_saved_board,
         }
 
 
@@ -356,11 +362,16 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
                 f"{name!r} is not a name an agent can have. Names hold letters, "
                 "numbers, spaces, dots, dashes and underscores."
             )
-        if filed_as(name).lower() in {filed_as(held.name).lower() for held in agents}:
+        held_filed_as = filed_as(
+            _some_words(one.get("filed_as"), LONGEST_NAME) or name
+        )
+        if held_filed_as.casefold() in {
+            (held.filed_as_name or filed_as(held.name)).casefold()
+            for held in agents
+        }:
             raise SwarmError(
-                f"There is already an agent called {name}. Two with one name "
-                "would share one conversation and each would read the other's "
-                "half of it."
+                f"There is already an agent using the saved chat identity for {name}. "
+                "Two agents cannot share one conversation."
             )
         held_id = str(one.get("id") or "").strip()
         if not held_id or held_id in seen:
@@ -386,6 +397,7 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
             picture_hue=_picture_number(
                 one.get("picture_hue"), DEFAULT_PICTURE_HUE, 0, 360
             ),
+            filed_as_name=held_filed_as,
         ))
     projects: list[OneProject] = []
     for one in _a_list(said.get("projects"))[:MOST_PROJECTS]:
@@ -441,6 +453,9 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
         pair = {"one": min(first, other), "other": max(first, other)}
         if pair not in talks_to:
             talks_to.append(pair)
+    active_saved_board = _some_words(said.get("active_saved_board"), 48)
+    if not A_NAME.fullmatch(active_saved_board):
+        active_saved_board = ""
     return Board(
         version=_how_many_times(said.get("version")),
         made_agents=made_agents,
@@ -449,6 +464,7 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
         projects=projects,
         works_on=works_on,
         talks_to=talks_to,
+        active_saved_board=active_saved_board,
     )
 
 
@@ -502,6 +518,11 @@ def save(said: Any) -> Board:
     # something held around both of them the check below proves nothing.
     now = load()
     board = read_it(said, now.made_agents, now.made_projects)
+    # An older panel knows nothing about the named-board identity. Treat an
+    # omitted field as "leave it alone", not "forget it", so one stale window
+    # cannot make startup lose the board somebody explicitly opened elsewhere.
+    if isinstance(said, dict) and "active_saved_board" not in said:
+        board.active_saved_board = now.active_saved_board
     asked = said.get("version") if isinstance(said, dict) else None
     if asked is not None and not _is_a_count(asked):
         # Refused rather than waved through. Taken as "said nothing", a version
@@ -648,7 +669,7 @@ def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -
         held["assistant_kind"] = (known or {}).get("kind", "")
         held["can_sign_in"] = bool((known or {}).get("can_sign_in"))
         held["chat_destination"] = chat_lab.chat_destination(
-            config, one.who, filed_as(one.name)
+            config, one.who, one.filed_as_name or filed_as(one.name)
         )
         # Which assistant this one would need set up, when that is all that is
         # missing. Somebody had Claude installed and signed in, an agent set to
@@ -666,7 +687,9 @@ def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -
         # without asking after every conversation one at a time. It is read
         # rather than counted from anything kept in memory: a chat that was had
         # yesterday is still a chat.
-        held.update(_how_much_was_said_to(config, one.who, filed_as(one.name)))
+        held.update(_how_much_was_said_to(
+            config, one.who, one.filed_as_name or filed_as(one.name)
+        ))
         agents.append(held)
     return {
         "board": dict(board.to_dict(), agents=agents),
@@ -1338,7 +1361,9 @@ class Running:
             try:
                 answered = chat_lab.say(
                     config, agent["who"], asking,
-                    filed_as=filed_as(filed_as_on_the_board(agent["name"])))
+                    filed_as=filed_as(filed_as_on_the_board(
+                        str(agent.get("filed_as") or agent["name"])
+                    )))
             except HarnessError as exc:
                 turn.state = "went wrong"
                 turn.why_not = str(exc)
@@ -1559,6 +1584,7 @@ def every_kept_board() -> list[dict[str, Any]]:
     """Every board somebody saved, newest first."""
 
     where = where_the_kept_ones_live()
+    active = load().active_saved_board
     found: list[dict[str, Any]] = []
     try:
         files = sorted(where.glob("*.json"))
@@ -1579,6 +1605,7 @@ def every_kept_board() -> list[dict[str, Any]]:
             "saved_at": str(held.get("saved_at") or ""),
             "agents": len(board.get("agents") or []),
             "projects": len(board.get("projects") or []),
+            "active": held["name"] == active,
         })
     return sorted(found, key=lambda one: one["saved_at"], reverse=True)
 
@@ -1620,7 +1647,8 @@ def open_this_board(name: str) -> Board:
     somebody ends up with a board holding both and belonging to neither.
     """
 
-    where = where_the_kept_ones_live() / _filed_under(name)
+    opened_as = " ".join(str(name).split())
+    where = where_the_kept_ones_live() / _filed_under(opened_as)
     try:
         held = json.loads(where.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1630,16 +1658,24 @@ def open_this_board(name: str) -> Board:
         raise SwarmError(f"The board saved as {name} cannot be read.")
     # Through the same door as any other save, so a board saved by an older
     # version is checked and tidied the same way rather than trusted.
-    return save(dict(board, version=None))
+    return save(dict(
+        board,
+        version=None,
+        active_saved_board=opened_as,
+    ))
 
 
 def forget_this_board(name: str) -> None:
     """Throw away one saved board."""
 
-    where = where_the_kept_ones_live() / _filed_under(name)
+    forgotten = " ".join(str(name).split())
+    where = where_the_kept_ones_live() / _filed_under(forgotten)
     try:
         where.unlink()
     except FileNotFoundError as exc:
         raise SwarmError(f"There is no saved board called {name}.") from exc
     except OSError as exc:
         raise SwarmError(f"The board saved as {name} could not be deleted: {exc}") from exc
+    board = load()
+    if board.active_saved_board == forgotten:
+        save(dict(board.to_dict(), active_saved_board=""))

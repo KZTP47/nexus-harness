@@ -22,10 +22,21 @@ Now every open chat is a button along the bottom, the way a taskbar works.
 
 The left pane is the conversation switcher. It groups chats by the canonical
 two-agent pair on the green communication line, shows both agents' names and
-faces, and can create, switch, or delete several durable chats for that pair.
+faces, and can create, switch, archive, or restore several durable chats for
+that pair. Archiving never removes its transcript, attachments, provider-thread
+identity, or shared-agent ledger; archived rows remain visible and reversible.
 A chat under GPT Codex ↔ Claude is not reused by GPT Codex ↔ Gemini, even when
 the same provider route appears in both pairs. A lone agent keeps a direct-chat
 fallback until another agent is connected.
+
+Older Nexus versions stored one transcript under an agent's stable board name
+before pair chats had opaque IDs. The chat index now detects those files and
+adds a clearly labelled **Recovered older chat** under that agent without
+guessing which later pair owned it. The source file stays intact as recovery
+evidence. The registry itself is written atomically, mirrored to a last-known-
+good file, and structurally versioned before chat additions or archives; a
+malformed primary registry is rebuilt from those copies instead of silently
+showing an empty history.
 
 Every chat also stores one **This chat writes to** selection. The dropdown lists
 only projects that both agents work on. Ordinary conversation can continue with

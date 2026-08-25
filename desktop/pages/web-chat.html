@@ -46,7 +46,13 @@
       try {
         const chat = await window.nexusWebChatWindow.useCurrent();
         said.textContent = `${chat.title} was sent to the Nexus board. You can close this window or keep using it here.`;
-      } catch (error) { said.textContent = error.message || String(error); }
+        said.title = "";
+      } catch (error) {
+        const raw = error.message || String(error);
+        const message = raw.replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, "");
+        said.textContent = message;
+        said.title = message;
+      }
     };
     document.getElementById("close").onclick = () => window.nexusWebChatWindow.close();
   </script>

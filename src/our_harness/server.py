@@ -500,7 +500,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
             board = swarm_lab.load()
         one = swarm_lab.the_agent(board, agent_id)
         path, metadata = chat_lab.attachment_path(
-            self.server.config, one.who, swarm_lab.filed_as(one.name), attachment_id
+            self.server.config, one.who,
+            one.filed_as_name or swarm_lab.filed_as(one.name), attachment_id
         )
         raw = path.read_bytes()
         self.send_response(200)
@@ -1037,6 +1038,32 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         self.server.config, query.get("name", [""])[0]
                     )
                 })
+            elif parsed.path == "/api/pipelines/agent-contract":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                wanted = (query.get("name", [""])[0] or "").strip()
+                if not wanted:
+                    raise HarnessError("Name the saved automation the desktop agent must run.")
+                with self.server.pipelines_lock:
+                    drawn = pipeline_lab.load(self.server.config, wanted)
+                self._json({
+                    "protocol": "nexus-harness.pipeline-run.v1",
+                    "purpose": "Run exactly one saved visual test automation.",
+                    "automation": {"name": drawn["name"], "definition": drawn},
+                    "execution": {
+                        "method": "POST", "path": "/api/pipelines/agent-run",
+                        "body": {"automation": drawn["name"], "from_here": "", "only": ""},
+                        "rules": [
+                            "Use the exact automation name returned above.",
+                            "Do not substitute another automation or infer a step.",
+                            "POST /api/pipelines/agent-run returns accepted=true when the run starts.",
+                            "Poll GET /api/pipelines until running=false, then read last_run.passed and last_run.said.",
+                            "On rejection, stop and report the error; do not guess a payload."
+                        ]
+                    },
+                    "standalone": True,
+                    "swarm_interop": "The AI Agent Swarm orchestrator may call this contract, but it is not required and has no shared UI state."
+                })
             elif parsed.path == "/api/projects":
                 self._require_token()
                 config = self.server.config
@@ -1099,7 +1126,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 ) if chat_id else None
                 filed_as = (
                     str(conversation["filed_as"]) if conversation
-                    else swarm_lab.filed_as(one.name)
+                    else one.filed_as_name or swarm_lab.filed_as(one.name)
                 )
                 self._json({
                     "agent": one.to_dict(),
@@ -1658,6 +1685,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 "/api/swarm/chats/activate",
                 "/api/swarm/chats/project",
                 "/api/swarm/chats/delete",
+                "/api/swarm/chats/restore",
             }:
                 agent_id = str(body.get("agent") or "")
                 with self.server.swarm_lock:
@@ -1685,8 +1713,13 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         str(body.get("chat") or ""),
                         str(body.get("project") or ""),
                     )
-                else:
+                elif self.path == "/api/swarm/chats/delete":
                     said = swarm_chats.delete(
+                        self.server.config, standing["board"], agent_id,
+                        str(body.get("chat") or ""),
+                    )
+                else:
+                    said = swarm_chats.restore(
                         self.server.config, standing["board"], agent_id,
                         str(body.get("chat") or ""),
                     )
@@ -1737,7 +1770,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     project_id = str(conversation.get("project") or "") if conversation else ""
                     filed_as = (
                         str(conversation.get("filed_as") or "") if conversation
-                        else swarm_lab.filed_as(one.name)
+                        else one.filed_as_name or swarm_lab.filed_as(one.name)
                     )
                     if not one.who:
                         raise swarm_lab.SwarmError(
@@ -1745,6 +1778,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             "settings and pick which one it uses."
                         )
                     requested_mode = str(body.get("mode") or "auto")
+                    round_limit = swarm_work.user_round_limit(
+                        body.get("round_limit")
+                    )
                     routing = {
                         "requested": requested_mode,
                         "selected": requested_mode,
@@ -1817,6 +1853,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             prefer_existing_conversation=bool(
                                 conversation.get("web_legacy_candidate")
                             ) if conversation else True,
+                            round_limit=round_limit,
                         )
                     elif mode == "work":
                         if conversation and not project_id:
@@ -1834,6 +1871,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             prefer_existing_conversation=bool(
                                 conversation.get("web_legacy_candidate")
                             ) if conversation else True,
+                            round_limit=round_limit,
                         )
                     elif mode == "chat":
                         progress(
@@ -1930,15 +1968,36 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # a route. Connecting settings must never pop up an account
                 # window by surprise. The provider CLI owns the window and the
                 # credentials; the harness captures neither.
-                wanted = str(body.get("kind") or "").strip()
-                if wanted not in seat_setup.KNOWN_SEATS:
-                    raise HarnessError(
-                        f"{wanted or 'that'} is not an assistant this app knows "
-                        "how to sign in."
-                    )
-                from .providers.subscription_cli import start_interactive_login
+                wanted = str(body.get("route") or body.get("kind") or "").strip()
+                if wanted in seat_setup.KNOWN_SEATS:
+                    # Backwards compatibility for the pre-board seat picker,
+                    # which can offer an installed CLI before a route exists.
+                    from .providers.subscription_cli import start_interactive_login
 
-                self._json(start_interactive_login(wanted))
+                    self._json(start_interactive_login(wanted))
+                else:
+                    from .providers.connection import start_interactive_login
+
+                    self._json(start_interactive_login(self.server.config, wanted))
+            elif self.path == "/api/team/check-login":
+                wanted = str(body.get("route") or body.get("kind") or "").strip()
+                if wanted in seat_setup.KNOWN_SEATS:
+                    # Kept for callers of the older kind-oriented endpoint.
+                    from .providers.subscription_cli import connection_status
+
+                    self._json(connection_status(wanted, use_cache=False, probe=True))
+                else:
+                    from .providers.connection import connection_status
+
+                    web_connection = (
+                        self.server.web_chats.route(wanted)
+                        if wanted.startswith("web:") else None
+                    )
+                    self._json(connection_status(
+                        self.server.config,
+                        wanted,
+                        web_connection=web_connection,
+                    ))
             elif self.path == "/api/team/repair-claude":
                 # A separate explicit press, with a confirmation in the panel.
                 # The visible provider terminal owns the update and OAuth flow;
@@ -2106,7 +2165,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "note": chat_lab.start_again(
                         self.server.config, one.who,
                         str(conversation["filed_as"]) if conversation
-                        else swarm_lab.filed_as(one.name)
+                        else one.filed_as_name or swarm_lab.filed_as(one.name)
                     ),
                     "said": [],
                     "conversation": conversation,
@@ -2410,8 +2469,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         else "Stopping there. Nothing after it will run."
                     ),
                 })
-            elif self.path == "/api/pipelines/run":
-                drawn = pipeline_lab.read_it(body.get("pipeline"))
+            elif self.path in ("/api/pipelines/run", "/api/pipelines/agent-run"):
+                if self.path == "/api/pipelines/agent-run":
+                    automation = str(body.get("automation") or "").strip()
+                    if not automation or any(body.get(key) for key in ("from_here", "only")):
+                        raise HarnessError("Agent runs require exactly one saved automation name.")
+                    with self.server.pipelines_lock:
+                        drawn = pipeline_lab.load(self.server.config, automation)
+                else:
+                    drawn = pipeline_lab.read_it(body.get("pipeline"))
                 if not self.server.pipeline_lock.acquire(blocking=False):
                     raise HarnessError(
                         "A pipeline is running already. Wait for it, or press Stop."

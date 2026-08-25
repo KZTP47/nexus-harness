@@ -21,6 +21,7 @@ const PROVIDERS = Object.freeze({
     signedOutPaths: ["/auth/", "/login", "/signup"],
     attach: ["button[aria-label*='Attach']", "button[data-testid*='attach']"],
     pairRepliesToUsers: true, acceptComposerClear: true,
+    trustedInput: true,
   },
   claude: {
     id: "claude", label: "Claude", home: "https://claude.ai/", newChat: "https://claude.ai/new",
@@ -43,6 +44,7 @@ const PROVIDERS = Object.freeze({
     signedOutPaths: ["/login", "/oauth", "/onboarding"],
     attach: ["button[aria-label*='Add content']", "button[aria-label*='Attach']"],
     pairRepliesToUsers: true,
+    trustedInput: true,
   },
   gemini: {
     id: "gemini", label: "Gemini", home: "https://gemini.google.com/app", newChat: "https://gemini.google.com/app",
@@ -328,6 +330,57 @@ function automationScript(provider, prompt, submittedMarker = "") {
     };
     if (!submitted) return {ok: false, needsTrustedEnter: true, error: ${JSON.stringify(notSent)}, ...baseline};
     return {ok: true, ...baseline};
+  })()`;
+}
+
+function submissionBaselineScript(provider, prompt, submittedMarker = "") {
+  const notSent = `Nexus filled ${provider.label}'s message box, but the provider did not accept Send. Open the provider chat and try again.`;
+  return `(() => {
+    const selectors = ${JSON.stringify({
+      composer: provider.composer, users: provider.users || [], replies: provider.replies,
+      errors: provider.errors || [], signedOut: provider.signedOut || [],
+      signedOutPaths: provider.signedOutPaths || [], stop: provider.stop,
+    })};
+    const prompt = ${JSON.stringify(String(prompt || ""))};
+    const submittedMarker = ${JSON.stringify(String(submittedMarker || ""))};
+    const visible = (one) => {
+      if (!one || getComputedStyle(one).visibility === "hidden" || getComputedStyle(one).display === "none") return false;
+      const rect = one.getBoundingClientRect();
+      return rect.width > 1 && rect.height > 1;
+    };
+    const first = (list) => list.flatMap(
+      (selector) => [...document.querySelectorAll(selector)]).find(visible);
+    const values = (list, accessible = false) => {
+      for (const selector of list) {
+        const found = [...document.querySelectorAll(selector)].filter(visible)
+          .map((one) => ((accessible && one.getAttribute("aria-description"))
+            || one.innerText || one.textContent || "").trim()).filter(Boolean);
+        if (found.length) return found;
+      }
+      return [];
+    };
+    const path = location.pathname.toLowerCase();
+    const signedOut = selectors.signedOutPaths.some((one) => path.startsWith(one))
+      || selectors.signedOut.some((selector) => [...document.querySelectorAll(selector)].some(visible));
+    if (signedOut) return {ok: false, error: ${JSON.stringify(
+      provider.externalBrowser
+        ? `Sign in to ${provider.label} in the secure Nexus browser window first.`
+        : `Sign in to ${provider.label} inside this Nexus window first. A login in your normal browser is separate.`)}};
+    const composer = first(selectors.composer);
+    if (!composer) return {ok: false, error: "Nexus could not find this provider's message box. Open a chat, then try again."};
+    const before = values(selectors.replies);
+    const beforeUsers = values(selectors.users);
+    const beforeErrors = values(selectors.errors, true);
+    const beforeStopping = selectors.stop.some(
+      (selector) => [...document.querySelectorAll(selector)].some(visible));
+    composer.focus();
+    return {
+      ok: false, needsTrustedInput: true, error: ${JSON.stringify(notSent)},
+      beforeCount: before.length, beforeLast: before.at(-1) || "",
+      beforeUserCount: beforeUsers.length, beforeUserLast: beforeUsers.at(-1) || "",
+      beforeError: beforeErrors.at(-1) || "", beforeStopping,
+      submittedPrompt: prompt, submittedMarker,
+    };
   })()`;
 }
 
@@ -870,6 +923,9 @@ class WebChatManager {
     const held = this.shellFor(contents);
     if (!held) throw new Error("That web-chat window is no longer open");
     const provider = PROVIDERS[held.providerId];
+    if (typeof held.view.webContents.useCurrentPage === "function") {
+      await held.view.webContents.useCurrentPage();
+    }
     await this.waitForLoad(held.view.webContents);
     const url = held.view.webContents.getURL();
     if (!allowedProviderUrl(provider, url)) throw new Error("Open a chat on the provider site before adding it to Nexus");
@@ -1085,6 +1141,53 @@ class WebChatManager {
     }
   }
 
+  async replaceTextAndSubmit(contents, text) {
+    if (typeof contents.replaceTextAndSubmit === "function") {
+      await contents.replaceTextAndSubmit(text);
+      return true;
+    }
+    // sendInputEvent requires the containing BrowserWindow to be focused.
+    // Relay views intentionally live in a hidden rendering host, which is why
+    // ChatGPT could show DOM-injected text yet reject both Send and the old
+    // key fallback. CDP input targets the focused editor inside that renderer
+    // directly and follows Chromium's real editing pipeline without exposing
+    // or focusing the hidden host window.
+    if (contents.debugger?.attach && contents.debugger?.sendCommand) {
+      const attachedHere = !contents.debugger.isAttached();
+      if (attachedHere) contents.debugger.attach("1.3");
+      const key = (type, value, code, virtualKey, extra = {}) => contents.debugger.sendCommand(
+        "Input.dispatchKeyEvent", {
+          type, key: value, code, windowsVirtualKeyCode: virtualKey,
+          nativeVirtualKeyCode: virtualKey, ...extra,
+        });
+      try {
+        await key("rawKeyDown", "a", "KeyA", 65, {modifiers: 2});
+        await key("keyUp", "a", "KeyA", 65, {modifiers: 2});
+        await key("rawKeyDown", "Backspace", "Backspace", 8);
+        await key("keyUp", "Backspace", "Backspace", 8);
+        await contents.debugger.sendCommand("Input.insertText", {text: String(text || "")});
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        await key("keyDown", "Enter", "Enter", 13, {text: "\r", unmodifiedText: "\r"});
+        await key("keyUp", "Enter", "Enter", 13);
+      } finally {
+        if (attachedHere && contents.debugger.isAttached()) contents.debugger.detach();
+      }
+      return true;
+    }
+    if (typeof contents.insertText !== "function"
+        || typeof contents.sendInputEvent !== "function") return false;
+    const input = (event) => contents.sendInputEvent(event);
+    input({type: "keyDown", keyCode: "A", modifiers: ["control"]});
+    input({type: "keyUp", keyCode: "A", modifiers: ["control"]});
+    input({type: "keyDown", keyCode: "BACKSPACE"});
+    input({type: "keyUp", keyCode: "BACKSPACE"});
+    await contents.insertText(text);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    input({type: "keyDown", keyCode: "ENTER"});
+    input({type: "keyUp", keyCode: "ENTER"});
+    return true;
+  }
+
   async askNow(
     id, prompt, attachments = [], conversationKey = "", preferExisting = false
   ) {
@@ -1112,14 +1215,29 @@ class WebChatManager {
         return {marker, prompt: `[${marker}]\n\n${prompt}`};
       };
       const submitTurn = async (submission) => {
-        // ChatGPT's ProseMirror/React composer ignores programmatic input while
-        // its WebContentsView is parked offscreen unless that web contents owns
-        // focus. Focus it only for the bounded fill/send handshake, then return
-        // focus to the Nexus board before waiting for the remote answer.
+        // Focus the provider editor for the bounded fill/send handshake, then
+        // return focus to the Nexus board before waiting for the remote answer.
         view.webContents.focus?.();
         try {
-          let began = await view.webContents.executeJavaScript(
-            automationScript(provider, submission.prompt, submission.marker), true);
+          const canUseTrustedInput = provider.trustedInput && (
+            typeof view.webContents.replaceTextAndSubmit === "function"
+            || Boolean(view.webContents.debugger?.sendCommand)
+            || (typeof view.webContents.insertText === "function"
+                && typeof view.webContents.sendInputEvent === "function"));
+          let began;
+          if (canUseTrustedInput) {
+            began = await view.webContents.executeJavaScript(
+              submissionBaselineScript(provider, submission.prompt, submission.marker), true);
+            stopped();
+            if (began?.needsTrustedInput) {
+              await this.replaceTextAndSubmit(view.webContents, submission.prompt);
+              began = await view.webContents.executeJavaScript(
+                submissionScript(provider, submission.prompt, began), true);
+            }
+          } else {
+            began = await view.webContents.executeJavaScript(
+              automationScript(provider, submission.prompt, submission.marker), true);
+          }
           stopped();
           if (!began?.ok && began?.needsTrustedEnter
               && (typeof view.webContents.sendInputEvent === "function"
@@ -1253,6 +1371,6 @@ class WebChatManager {
 
 module.exports = {
   PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
-  automationScript, submissionScript, answerScript, retryScript, stopScript,
+  automationScript, submissionBaselineScript, submissionScript, answerScript, retryScript, stopScript,
   browserLikeUserAgent, authStorageAccessIsTrusted,
 };

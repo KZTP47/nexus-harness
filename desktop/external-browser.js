@@ -56,26 +56,13 @@ class ExternalPageContents extends EventEmitter {
     this.closed = false;
     this.loading = true;
     this.page = null;
+    this.boundPages = new WeakSet();
     this.ready = transport.openPage(this.url).then(async (page) => {
       if (this.closed) {
         await page.close().catch(() => {});
         throw new Error(`${transport.provider.label}'s browser page was closed`);
       }
-      this.page = page;
-      this.url = page.url() || this.url;
-      this.title = (await page.title().catch(() => "")) || this.title;
-      this.loading = false;
-      page.on("framenavigated", async (frame) => {
-        if (frame !== page.mainFrame()) return;
-        this.url = frame.url() || this.url;
-        this.title = (await page.title().catch(() => "")) || this.title;
-        this.emit("did-navigate", {}, this.url, 200, "OK");
-        this.emit("page-title-updated", {}, this.title);
-      });
-      page.on("close", () => {
-        this.closed = true;
-        this.emit("destroyed");
-      });
+      await this.bindPage(page);
       this.emit("did-finish-load");
       return page;
     }).catch((error) => {
@@ -90,10 +77,54 @@ class ExternalPageContents extends EventEmitter {
   getURL() { return this.url; }
   getTitle() { return this.title; }
 
+  async bindPage(page) {
+    if (!page || page.isClosed?.()) throw new Error(
+      `${this.transport.provider.label}'s selected browser tab is no longer open`);
+    this.page = page;
+    this.url = page.url() || this.url;
+    this.title = (await page.title().catch(() => "")) || this.title;
+    this.loading = false;
+    if (this.boundPages.has(page)) return page;
+    this.boundPages.add(page);
+    page.on("framenavigated", async (frame) => {
+      if (this.page !== page || frame !== page.mainFrame()) return;
+      this.url = frame.url() || this.url;
+      this.title = (await page.title().catch(() => "")) || this.title;
+      this.emit("did-navigate", {}, this.url, 200, "OK");
+      this.emit("page-title-updated", {}, this.title);
+    });
+    page.on("close", () => {
+      if (this.page !== page || this.closed) return;
+      // OAuth and provider SPAs can finish sign-in in a replacement tab and
+      // close the original one. Keep this logical contents recoverable; the
+      // next operation adopts the currently selected provider tab.
+      this.page = null;
+      this.loading = false;
+    });
+    return page;
+  }
+
+  async pageForOperation({preferCurrent = false} = {}) {
+    await this.ready;
+    if (this.closed) throw new Error(`${this.transport.provider.label}'s browser page was closed`);
+    if (!preferCurrent && this.page && !this.page.isClosed()) return this.page;
+    const page = await this.transport.currentProviderPage();
+    if (!page) throw new Error(
+      `Nexus could not find an open ${this.transport.provider.label} chat tab in its secure browser window.`);
+    return this.bindPage(page);
+  }
+
+  async useCurrentPage() {
+    const page = await this.pageForOperation({preferCurrent: true});
+    this.url = page.url() || this.url;
+    this.title = (await page.title().catch(() => "")) || this.title;
+    return {url: this.url, title: this.title};
+  }
+
   async loadURL(url) {
     this.url = String(url || "about:blank");
     this.loading = true;
-    const page = await this.ready;
+    const page = await this.pageForOperation();
     try {
       await page.goto(this.url, {waitUntil: "domcontentloaded", timeout: 90000});
       this.url = page.url() || this.url;
@@ -107,24 +138,45 @@ class ExternalPageContents extends EventEmitter {
   }
 
   async executeJavaScript(script) {
-    const page = await this.ready;
-    return page.evaluate(String(script));
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const page = await this.pageForOperation();
+      try {
+        return await page.evaluate(String(script));
+      } catch (error) {
+        lastError = error;
+        if (!/execution context was destroyed|cannot find context|target page.*closed/i.test(
+          String(error?.message || error))) throw error;
+        if (page.isClosed?.()) this.page = null;
+        await wait(100);
+      }
+    }
+    throw lastError;
   }
 
   async pressEnter() {
-    const page = await this.ready;
+    const page = await this.pageForOperation();
+    await page.keyboard.press("Enter");
+  }
+
+  async replaceTextAndSubmit(text) {
+    const page = await this.pageForOperation();
+    await page.keyboard.press("Control+A");
+    await page.keyboard.press("Backspace");
+    await page.keyboard.insertText(String(text || ""));
+    await wait(120);
     await page.keyboard.press("Enter");
   }
 
   async setFiles(files) {
-    const page = await this.ready;
+    const page = await this.pageForOperation();
     const input = page.locator("input[type=file]").last();
     await input.waitFor({state: "attached", timeout: 5000});
     await input.setInputFiles(files);
   }
 
   async bringToFront() {
-    const page = await this.ready;
+    const page = await this.pageForOperation();
     await page.bringToFront();
   }
 
@@ -238,6 +290,37 @@ class ExternalBrowserTransport {
     }
     await page.bringToFront();
     return page;
+  }
+
+  async currentProviderPage() {
+    const context = await this.start(this.provider.home);
+    const candidates = context.pages().filter((page) => {
+      if (!page || page.isClosed()) return false;
+      try {
+        const parsed = new URL(page.url());
+        return parsed.protocol === "https:" && (this.provider.hosts || []).some(
+          (host) => parsed.hostname === host || parsed.hostname.endsWith(`.${host}`));
+      } catch (_error) {
+        return false;
+      }
+    });
+    let best = null;
+    let bestScore = -1;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const page = candidates[index];
+      const state = await page.evaluate(() => ({
+        focused: document.hasFocus(), visibility: document.visibilityState,
+      })).catch(() => ({focused: false, visibility: "hidden"}));
+      const url = page.url();
+      const providerHome = String(this.provider.home || "").replace(/\/+$/, "");
+      const score = (state.focused ? 8 : 0) + (state.visibility === "visible" ? 4 : 0)
+        + (url.replace(/\/+$/, "") !== providerHome ? 2 : 0) + index / 1000;
+      if (score >= bestScore) {
+        best = page;
+        bestScore = score;
+      }
+    }
+    return best;
   }
 
   async close() {

@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -26,6 +27,8 @@ from .config import LoadedConfig
 
 
 WHERE_THEY_LIVE = ".harness/chats/_board-conversations.json"
+BACKUP_NAME = "_board-conversations.last-good.json"
+HISTORY_FOLDER = "_board-conversation-history"
 MOST_CHATS = 240
 MOST_PER_PAIR = 40
 _CHAT_ID = re.compile(r"^chat-[0-9a-f]{16}$")
@@ -55,13 +58,33 @@ def _empty() -> dict[str, Any]:
     }
 
 
-def _read(config: LoadedConfig) -> dict[str, Any]:
-    where = _where(config)
+def _read_object(where: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(where.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return _empty()
-    if not isinstance(value, dict):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _read(config: LoadedConfig) -> dict[str, Any]:
+    where = _where(config)
+    value = _read_object(where)
+    recovered_from = ""
+    if value is None:
+        backup = where.with_name(BACKUP_NAME)
+        value = _read_object(backup)
+        if value is not None:
+            recovered_from = backup.name
+        else:
+            history = where.with_name(HISTORY_FOLDER)
+            for candidate in sorted(
+                history.glob("_board-conversations-*.json"), reverse=True
+            ) if history.is_dir() else []:
+                value = _read_object(candidate)
+                if value is not None:
+                    recovered_from = candidate.relative_to(where.parent).as_posix()
+                    break
+    if value is None:
         return _empty()
     chats = []
     seen_ids: set[str] = set()
@@ -101,6 +124,8 @@ def _read(config: LoadedConfig) -> dict[str, Any]:
             "created_at": str(raw.get("created_at") or ""),
             "updated_at": str(raw.get("updated_at") or ""),
             "legacy_recovered": bool(raw.get("legacy_recovered")),
+            "legacy_source": str(raw.get("legacy_source") or "")[:160],
+            "archived_at": str(raw.get("archived_at") or "")[:40],
             "web_legacy_candidate": (
                 raw.get("web_legacy_candidate")
                 if isinstance(raw.get("web_legacy_candidate"), bool) else None
@@ -128,21 +153,45 @@ def _read(config: LoadedConfig) -> dict[str, Any]:
             str(key)[:120]: str(item) for key, item in chosen_active.items()
         },
         "known_pairs": [str(one)[:260] for one in known if isinstance(one, str)],
-        "_needs_rewrite": needs_rewrite,
+        "_needs_rewrite": needs_rewrite or bool(recovered_from),
+        "_recovered_from": recovered_from,
     }
+
+
+def _atomic_text(where: Path, text: str) -> None:
+    where.parent.mkdir(parents=True, exist_ok=True)
+    beside = where.with_name(
+        f"{where.name}.{os.getpid()}-{threading.get_ident()}.part"
+    )
+    beside.write_text(text, encoding="utf-8")
+    os.replace(beside, where)
 
 
 def _write(config: LoadedConfig, value: dict[str, Any]) -> None:
     where = _where(config)
     where.parent.mkdir(parents=True, exist_ok=True)
-    beside = where.with_name(
-        f"{where.name}.{os.getpid()}-{threading.get_ident()}.part"
-    )
     persisted = {
         key: held for key, held in value.items() if not str(key).startswith("_")
     }
-    beside.write_text(json.dumps(persisted, indent=2) + "\n", encoding="utf-8")
-    os.replace(beside, where)
+    written = json.dumps(persisted, indent=2) + "\n"
+
+    # The registry is the only index that gives opaque transcript files their
+    # names and owners. Keep the last known-good complete copy, and keep an
+    # append-only snapshot before every structural chat change. A corrupt or
+    # accidentally shortened registry must never turn existing transcripts
+    # into invisible files on the next write.
+    current = _read_object(where)
+    if current is not None:
+        old_chats = json.dumps(current.get("chats", []), sort_keys=True)
+        new_chats = json.dumps(persisted.get("chats", []), sort_keys=True)
+        if old_chats != new_chats:
+            history = where.with_name(HISTORY_FOLDER)
+            history.mkdir(parents=True, exist_ok=True)
+            snapshot = history / f"_board-conversations-{time.time_ns()}.json"
+            _atomic_text(snapshot, json.dumps(current, indent=2) + "\n")
+
+    _atomic_text(where, written)
+    _atomic_text(where.with_name(BACKUP_NAME), written)
 
 
 def _agents(board: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -236,7 +285,9 @@ def _recover_legacy_history(
     recovered: list[chat_lab.Said] = []
     for member_id in raw["pair"]:
         member = agents.get(member_id) or {}
-        legacy = swarm_lab.filed_as(str(member.get("name") or ""))
+        legacy = str(member.get("filed_as") or "") or swarm_lab.filed_as(
+            str(member.get("name") or "")
+        )
         if not legacy:
             continue
         turns = chat_lab.read_it(
@@ -269,12 +320,88 @@ def _new_chat(
         # Legacy history belongs to Chat 1 only. A second chat is a deliberate
         # fresh workspace and must not repeat recovered history.
         "legacy_recovered": bool(same),
+        "legacy_source": "",
+        "archived_at": "",
         # One pre-isolation provider URL can be adopted by the first Nexus chat
         # for this pair. Every later chat must open a new remote thread.
         "web_legacy_candidate": not bool(same),
     }
     registry["chats"].append(made)
     return made
+
+
+def _legacy_names(member: dict[str, Any]) -> list[str]:
+    """Stable pre-pair transcript names that can belong to this exact agent."""
+
+    names: list[str] = []
+    for candidate in (member.get("filed_as"), member.get("name")):
+        value = " ".join(str(candidate or "").split())
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def _copy_legacy_attachments(
+    config: LoadedConfig, route: str, source: str, destination: str
+) -> None:
+    source_folder = chat_lab._attachment_folder(config, route, source)
+    if not source_folder.is_dir() or source_folder.is_symlink():
+        return
+    destination_folder = chat_lab._attachment_folder(config, route, destination)
+    destination_folder.mkdir(parents=True, exist_ok=True)
+    for item in source_folder.iterdir():
+        if not item.is_file() or item.is_symlink():
+            continue
+        target = destination_folder / item.name
+        if not target.exists():
+            shutil.copy2(item, target)
+
+
+def _recover_direct_legacy_chats(
+    config: LoadedConfig, registry: dict[str, Any], board: dict[str, Any],
+    agent_id: str, agents: dict[str, dict[str, Any]],
+) -> bool:
+    """Index old agent-owned chats without pretending they belonged to a pair.
+
+    Before pair chats existed, one stable board-agent name owned one transcript.
+    Those files were deliberately left untouched by the pair migration, but no
+    UI indexed them afterwards. Copy each one into a canonical single-agent
+    conversation and retain the source as immutable recovery evidence.
+    """
+
+    member = agents.get(agent_id) or {}
+    route = str(member.get("who") or "")
+    changed = False
+    for legacy_name in _legacy_names(member):
+        source = chat_lab.where_it_is_kept(config, route, legacy_name)
+        if not source.is_file():
+            continue
+        source_key = source.name
+        if any(
+            one.get("legacy_source") == source_key and one.get("pair") == [agent_id]
+            for one in registry["chats"]
+        ):
+            continue
+        turns = chat_lab.read_it(config, route, legacy_name)
+        if not turns:
+            continue
+        made = _new_chat(registry, board, [agent_id])
+        made["name"] = "Recovered older chat"
+        made["project"] = ""
+        made["legacy_recovered"] = True
+        made["legacy_source"] = source_key
+        made["web_legacy_candidate"] = False
+        made["created_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(source.stat().st_mtime)
+        )
+        made["updated_at"] = _now()
+        chat_lab.merge_transcript(config, route, made["filed_as"], turns)
+        _copy_legacy_attachments(config, route, legacy_name, made["filed_as"])
+        key = _pair_key([agent_id])
+        if key not in registry["known_pairs"]:
+            registry["known_pairs"].append(key)
+        changed = True
+    return changed
 
 
 def _present(
@@ -322,6 +449,7 @@ def list_for_agent(
     with _lock:
         registry = _read(config)
         changed = bool(registry.pop("_needs_rewrite", False))
+        recovered_from = str(registry.get("_recovered_from") or "")
         agents = _agents(board)
         pairs = _connected_pairs(board, agent_id)
         for pair in pairs:
@@ -334,6 +462,11 @@ def list_for_agent(
             # members of whichever pair happened to be listed first.
             made = _new_chat(registry, board, pair)
             registry["known_pairs"].append(key)
+            changed = True
+
+        if _recover_direct_legacy_chats(
+            config, registry, board, agent_id, agents
+        ):
             changed = True
 
         visible = [
@@ -351,9 +484,9 @@ def list_for_agent(
             one["legacy_recovered"] = True
             one["updated_at"] = _now()
             changed = True
-        visible_ids = {one["id"] for one in visible}
+        usable_ids = {one["id"] for one in visible if not one.get("archived_at")}
         chosen = str(registry["chosen_active"].get(agent_id) or "")
-        if chosen not in visible_ids:
+        if chosen not in usable_ids:
             if chosen:
                 registry["chosen_active"].pop(agent_id, None)
                 changed = True
@@ -371,8 +504,11 @@ def list_for_agent(
             # the chat controls.
             preferred_chat = next((
                 one for one in visible
-                if _shared_projects(board, one["pair"])
-            ), visible[0] if visible else None)
+                if not one.get("archived_at") and not one.get("legacy_source")
+                and _shared_projects(board, one["pair"])
+            ), next((
+                one for one in visible if not one.get("archived_at")
+            ), None))
             preferred = preferred_chat["id"] if preferred_chat else ""
         if active != preferred:
             active = preferred
@@ -392,6 +528,7 @@ def list_for_agent(
         return {
             "agent": agent_id,
             "active": active,
+            "registry_recovered_from": recovered_from,
             "chats": [_present(config, board, agent_id, one, agents) for one in visible],
         }
 
@@ -409,6 +546,8 @@ def resolve(
         agents = _agents(board)
         if raw is None or agent_id not in raw["pair"]:
             raise swarm_lab.SwarmError("That chat does not belong to this agent pair.")
+        if raw.get("archived_at"):
+            raise swarm_lab.SwarmError("Restore this archived chat before using it.")
         if any(one not in agents for one in raw["pair"]):
             raise swarm_lab.SwarmError("One of this chat's agents is no longer on the board.")
         if len(raw["pair"]) == 2 and not swarm_lab.may_they_talk(
@@ -475,11 +614,18 @@ def select_project(
 def delete(
     config: LoadedConfig, board: dict[str, Any], agent_id: str, chat_id: str
 ) -> dict[str, Any]:
-    resolved = resolve(config, board, agent_id, chat_id)
-    current = _agents(board)[agent_id]
+    """Archive one chat without removing any transcript or attachment."""
+
     with _lock:
         registry = _read(config)
-        registry["chats"] = [one for one in registry["chats"] if one["id"] != chat_id]
+        agents = _agents(board)
+        raw = next((one for one in registry["chats"] if one["id"] == chat_id), None)
+        if raw is None or agent_id not in raw["pair"]:
+            raise swarm_lab.SwarmError("That chat does not belong to this agent pair.")
+        if any(one not in agents for one in raw["pair"]):
+            raise swarm_lab.SwarmError("One of this chat's agents is no longer on the board.")
+        raw["archived_at"] = _now()
+        raw["updated_at"] = raw["archived_at"]
         for key, active in list(registry["active"].items()):
             if active == chat_id:
                 registry["active"].pop(key, None)
@@ -487,7 +633,27 @@ def delete(
             if chosen == chat_id:
                 registry["chosen_active"].pop(key, None)
         _write(config, registry)
-    chat_lab.remove_conversation(
-        config, str(current.get("who") or ""), str(resolved["filed_as"])
-    )
+    return list_for_agent(config, board, agent_id)
+
+
+def restore(
+    config: LoadedConfig, board: dict[str, Any], agent_id: str, chat_id: str
+) -> dict[str, Any]:
+    """Restore one archived chat and make it active again."""
+
+    if not _CHAT_ID.fullmatch(str(chat_id or "")):
+        raise swarm_lab.SwarmError("Choose an archived chat first.")
+    with _lock:
+        registry = _read(config)
+        agents = _agents(board)
+        raw = next((one for one in registry["chats"] if one["id"] == chat_id), None)
+        if raw is None or agent_id not in raw["pair"]:
+            raise swarm_lab.SwarmError("That chat does not belong to this agent pair.")
+        if any(one not in agents for one in raw["pair"]):
+            raise swarm_lab.SwarmError("One of this chat's agents is no longer on the board.")
+        raw["archived_at"] = ""
+        raw["updated_at"] = _now()
+        registry["active"][agent_id] = chat_id
+        registry["chosen_active"][agent_id] = chat_id
+        _write(config, registry)
     return list_for_agent(config, board, agent_id)

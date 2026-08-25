@@ -274,12 +274,18 @@ class NamesAreWhereConversationsAreKept(BoardTestCase):
         board = self.a_board(agents=[{"name": "a" * 500}])
         self.assertEqual(len(board.agents[0].name), swarm.LONGEST_NAME)
 
-    def test_what_it_is_filed_under_follows_the_name(self) -> None:
-        """Worked out from the name rather than written down, so renaming an
-        agent renames its conversation and leaves nothing behind."""
+    def test_what_it_is_filed_under_is_stable_when_the_agent_is_renamed(self) -> None:
+        """A display-name edit must not orphan the direct-chat history."""
 
         board = self.a_board(agents=[{"name": " The  reviewer "}])
         self.assertEqual(board.agents[0].to_dict()["filed_as"], "The reviewer")
+        written = board.to_dict()
+        written["agents"][0]["name"] = "Renamed reviewer"
+
+        renamed = swarm.read_it(written)
+
+        self.assertEqual(renamed.agents[0].name, "Renamed reviewer")
+        self.assertEqual(renamed.agents[0].to_dict()["filed_as"], "The reviewer")
 
 
 class ANameIsNeverHandedOutTwice(BoardTestCase):
@@ -1458,6 +1464,28 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('id="swarmRefresh"', stage)
         self.assertIn(".swarm-stage:fullscreen", self.styles)
 
+    def test_the_saved_board_that_returns_next_time_is_visibly_marked(self) -> None:
+        self.assertIn('open.setAttribute("aria-current", "true")', self.script)
+        self.assertIn("Open now · returns next time", self.script)
+        self.assertIn('.swarm-kept-pick[aria-current="true"]', self.styles)
+        self.assertIn("the saved board you used last", self.script)
+
+    def test_login_checks_send_the_route_and_keep_the_answer_visible(self) -> None:
+        check = self.script[
+            self.script.index("async function checkAgentLogin"):
+            self.script.index("async function manuallyLogInAgent")
+        ]
+        self.assertIn("JSON.stringify({route})", check)
+        self.assertIn("said.note", check)
+        self.assertNotIn("refreshSwarm", check)
+
+    def test_pair_chat_exposes_the_live_shared_agent_ledger(self) -> None:
+        self.assertIn("Live shared agent ledger:", self.script)
+        self.assertIn('"Show shared agent ledger"', self.script)
+        self.assertIn("destination.collaboration_path", self.script)
+        self.assertIn("destination.collaboration_exists", self.script)
+        self.assertIn("window.harnessDesktop.showProjectFile", self.script)
+
     def test_every_compact_and_maximised_agent_chat_has_a_real_stop_control(self) -> None:
         self.assertIn('id="talkStop"', self.markup)
         self.assertIn('id="theBigChatStop"', self.markup)
@@ -1531,7 +1559,7 @@ class MovingAroundTheBoard(unittest.TestCase):
         ]
         switched = self.script[
             self.script.index("async function activateConversationFor(agentId, chatId)"):
-            self.script.index("async function deleteConversationFor")
+            self.script.index("async function archiveConversationFor")
         ]
         self.assertIn("held?.saidFor === transcriptIdentityFor(agentId)", kept)
         self.assertIn("before !== held.conversation", applied)
@@ -1563,6 +1591,7 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('request("/api/swarm/chats/activate"', self.script)
         self.assertIn('request("/api/swarm/chats/project"', self.script)
         self.assertIn('request("/api/swarm/chats/delete"', self.script)
+        self.assertIn('request("/api/swarm/chats/restore"', self.script)
         self.assertIn('chat: conversation?.id || ""', self.script)
         self.assertIn(".the-big-chat-workspace", self.styles)
         self.assertIn(".the-big-chat-conversation-pick.active", self.styles)
@@ -1623,12 +1652,22 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('navigator.clipboard?.writeText', self.script)
         self.assertIn(".chat-code-block", self.styles)
 
+    def test_chat_round_policy_is_visible_and_sent_with_both_chat_views(self) -> None:
+        self.assertIn('id="theBigChatRoundLimit"', self.markup)
+        self.assertIn('id="theBigChatUnlimited"', self.markup)
+        self.assertIn("Unlimited while progress continues", self.markup)
+        self.assertIn("function selectedChatRoundLimit(agentId)", self.script)
+        self.assertIn("round_limit: selectedChatRoundLimit(agentId)", self.script)
+        self.assertIn("Repeated no-progress cycles still stop", self.script)
+        self.assertIn(".chat-round-policy", self.styles)
+
     def test_normal_send_confirms_explicit_project_work_and_labels_iterative_turns(self) -> None:
         self.assertIn("function looksLikeProjectWork(words)", self.script)
         self.assertIn("function confirmProjectWork(agent, words, mode)", self.script)
         self.assertIn("allow_project_changes: projectPermission.confirmed", self.script)
         self.assertIn('agent_discussion: "Team discussion"', self.script)
         self.assertIn('agent_plan_review: "Plan review"', self.script)
+        self.assertIn('agent_execution: "Connected-agent execution"', self.script)
         self.assertIn('agent_verification: "Work verification"', self.script)
 
     def test_add_project_dialog_offers_the_electron_folder_picker(self) -> None:
@@ -2087,6 +2126,7 @@ class WhatThePanelIsTold(BoardTestCase):
                 "agent": "agent-1", "chat": conversation["id"],
                 "text": "Inspect the selected project", "mode": "work",
                 "allow_project_changes": True,
+                "round_limit": 37,
             })
         self.assertEqual(status, 200)
         self.assertEqual(work.call_args.kwargs["peer_id"], "agent-2")
@@ -2099,6 +2139,19 @@ class WhatThePanelIsTold(BoardTestCase):
             work.call_args.kwargs["prefer_existing_conversation"],
             conversation["web_legacy_candidate"],
         )
+        self.assertEqual(work.call_args.kwargs["round_limit"], 37)
+
+    def test_invalid_chat_round_limit_is_rejected_before_contacting_an_agent(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "The lead", "who": "claude"}],
+        }})
+        with mock.patch.object(chat, "say") as talked:
+            status, said = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "text": "hello", "round_limit": 0,
+            })
+        self.assertEqual(status, 400)
+        self.assertIn("round limit", said["error"])
+        talked.assert_not_called()
 
     def test_project_work_button_cannot_turn_a_directed_message_into_file_work(self) -> None:
         self.ask("/api/swarm/save", {"board": {
@@ -2354,6 +2407,65 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(caught.exception.code, 400)
         with caught.exception as answer:
             self.assertIn("token", json.loads(answer.read())["error"])
+
+    def test_board_refresh_preserves_chat_draft_and_focus(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(encoding="utf-8")
+        self.assertIn('const composerState = new Map();', script)
+        self.assertIn('document.activeElement === box', script)
+        self.assertIn('box.focus({preventScroll: true})', script)
+        self.assertIn('box.setSelectionRange(state.start, state.end', script)
+
+    def test_chat_draft_remains_editable_while_the_agent_route_is_not_ready(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        controls = script[
+            script.index("function setWhatCanBePressedInAChat"):
+            script.index("function stoppedChatError")
+        ]
+        self.assertIn('card.querySelector(".swarm-chat-box").disabled = !agent;', controls)
+        self.assertIn("waiting || !agent || !agent.ready", controls)
+        self.assertNotIn('swarm-chat-box").disabled = !agent || !agent.ready', controls)
+
+    def test_maximised_composer_is_viewport_bound_and_render_independent(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "src/our_harness/ui/app.js").read_text(encoding="utf-8")
+        styles = (root / "src/our_harness/ui/styles.css").read_text(encoding="utf-8")
+        self.assertIn('const theBigChatComposerDrafts = new Map();', script)
+        self.assertIn('function keepTheBigChatComposerInHand(changeParents)', script)
+        self.assertIn('function bigChatPartChanged(part, value)', script)
+        self.assertIn('if (bigChatPartChanged("turns", turns))', script)
+        self.assertIn('previousKey === legacyKey', script)
+        self.assertIn('$("theBigChatBox").addEventListener("input", rememberTheBigChatComposer)',
+                      script)
+        self.assertIn('max-height: min(220px, 22vh)', styles)
+        self.assertIn('max-height: 42vh', styles)
+        self.assertIn('grid-template-rows: auto minmax(0, 1fr) auto', styles)
+
+    def test_delayed_answer_never_clears_the_next_maximised_draft(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        sent = script[
+            script.index("async function sendFromTheBigChat"):
+            script.index("function wireUpTheTray")
+        ]
+        self.assertLess(sent.index('box.value = ""'), sent.index('await request("/api/swarm/say"'))
+        self.assertNotIn('finishSwarmChatActivity(agentId, true);\n    box.value = ""', sent)
+        self.assertIn('if (theBigOne === agentId && swarmChatKey(agentId) === attachmentKey', sent)
+
+    def test_connected_web_chat_is_materialized_as_a_board_agent(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(encoding="utf-8")
+        heartbeat = script[
+            script.index("async function heartbeatWebChats"):
+            script.index("async function serviceWebChatBridge")
+        ]
+        hydrate = heartbeat.index("if (!swarmBoardHydrated)")
+        materialize = heartbeat.index("for (const chat of webChatConnections)")
+        self.assertLess(hydrate, materialize)
+        self.assertIn("await refreshSwarm(true);", heartbeat[:materialize])
+        self.assertIn("if (!swarmBoardHydrated) return;", heartbeat[:materialize])
+        self.assertIn("const route = `web:${chat.id}`;", script)
+        self.assertIn("board.agents.push({id: \"\", name, who: route", script)
+        self.assertIn("addedToBoard", script)
 
 
 if __name__ == "__main__":

@@ -153,6 +153,164 @@ class SwarmWorkTests(unittest.TestCase):
             "Claude", "Codex", "Claude", "Codex",
         ])
 
+    def test_unlimited_collaboration_stops_reworded_no_progress_cycles(self) -> None:
+        discussion_calls = 0
+        remaining = [
+            "Await the missing provider reply from the connected peer.",
+            "Still await the missing connected provider reply from that peer.",
+            "The connected peer's missing provider reply is still awaited.",
+        ]
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal discussion_calls
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                cycle = discussion_calls // 2
+                discussion_calls += 1
+                value = {
+                    "message": f"Cosmetically different wording {discussion_calls} from {route}.",
+                    "goal_complete": False,
+                    "remaining": [remaining[min(cycle, len(remaining) - 1)]],
+                }
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+            return {"text": f"answer from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Solve this together",
+                round_limit=None,
+            )
+
+        self.assertFalse(result["goal_complete"])
+        self.assertEqual(result["discussion_rounds"], 3)
+        self.assertEqual(result["stopped_because"], "stalled")
+        self.assertIsNone(result["round_limit"])
+        self.assertTrue(any("no-progress cycle" in one for one in result["remaining"]))
+
+    def test_repeated_structured_provider_failure_cannot_keep_its_peer_in_a_loop(self) -> None:
+        discussion_calls = 0
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal discussion_calls
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                discussion_calls += 1
+                if route == "claude":
+                    return {
+                        "text": "I cannot return the Nexus structure; ask me directly.",
+                        "milliseconds": 1, "model": route,
+                    }
+                value = {
+                    "message": "The connected provider still has not supplied a usable turn.",
+                    "goal_complete": False,
+                    "remaining": ["Obtain one valid structured reply from the connected provider."],
+                }
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+            return {"text": f"initial or final answer from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Are you ChatGPT or Gemini?",
+                round_limit=None,
+            )
+
+        self.assertFalse(result["goal_complete"])
+        self.assertEqual(result["discussion_rounds"], 3)
+        self.assertEqual(result["stopped_because"], "stalled")
+        self.assertEqual(discussion_calls, 6)
+        transcript = chat.read_it(self.config, "claude", "Claude")
+        failures = [one.text for one in transcript if "could not continue" in one.text]
+        self.assertEqual(len(failures), 3)
+
+    def test_unlimited_collaboration_stops_a_two_state_oscillation(self) -> None:
+        discussion_calls = 0
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal discussion_calls
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                cycle = discussion_calls // 2
+                discussion_calls += 1
+                blocker = "Choose design alpha." if cycle % 2 == 0 else "Choose design beta."
+                value = {
+                    "message": f"Switched position again on {route}.",
+                    "goal_complete": False, "remaining": [blocker],
+                }
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+            return {"text": f"answer from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Agree on one design",
+                round_limit=None,
+            )
+
+        self.assertFalse(result["goal_complete"])
+        self.assertEqual(result["discussion_rounds"], 4)
+        self.assertEqual(result["stopped_because"], "stalled")
+
+    def test_unlimited_collaboration_can_exceed_the_old_twelve_round_ceiling(self) -> None:
+        discussion_calls = 0
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal discussion_calls
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                cycle = discussion_calls // 2 + 1
+                discussion_calls += 1
+                finished = cycle >= 14
+                value = {
+                    "message": f"Completed distinct checkpoint-{cycle} on {route}.",
+                    "goal_complete": finished,
+                    "remaining": [] if finished else [
+                        f"Produce distinct checkpoint-{cycle + 1}."
+                    ],
+                }
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+            return {"text": f"answer from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Complete fourteen checkpoints",
+                round_limit=None,
+            )
+
+        self.assertTrue(result["goal_complete"])
+        self.assertEqual(result["discussion_rounds"], 14)
+        self.assertEqual(result["stopped_because"], "complete")
+        self.assertEqual(discussion_calls, 28)
+
+    def test_user_round_limit_stops_at_the_exact_selected_round(self) -> None:
+        discussion_calls = 0
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal discussion_calls
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                discussion_calls += 1
+                value = {
+                    "message": f"New work {discussion_calls} from {route}.",
+                    "goal_complete": False,
+                    "remaining": [f"Continue with unique item {discussion_calls}."],
+                }
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+            return {"text": f"answer from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Keep investigating",
+                round_limit=2,
+            )
+
+        self.assertFalse(result["goal_complete"])
+        self.assertEqual(result["discussion_rounds"], 2)
+        self.assertEqual(result["round_limit"], 2)
+        self.assertEqual(result["stopped_because"], "round_limit")
+        self.assertEqual(discussion_calls, 4)
+        self.assertTrue(any("user-set limit of 2" in one for one in result["remaining"]))
+
+    def test_user_round_limit_is_strict_and_unlimited_is_explicit(self) -> None:
+        self.assertIsNone(swarm_work.user_round_limit(None))
+        self.assertEqual(swarm_work.user_round_limit(37), 37)
+        for invalid in (True, 0, -1, 10_001, "12", 1.5):
+            with self.subTest(invalid=invalid), self.assertRaises(Exception):
+                swarm_work.user_round_limit(invalid)
+
     def test_direct_follow_up_keeps_the_group_transcript_without_impersonating_peers(self) -> None:
         def answer(_config, route, _text, **_kwargs):
             if _kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
@@ -197,6 +355,16 @@ class SwarmWorkTests(unittest.TestCase):
         )
         self.assertEqual(decision["mode"], "relay")
 
+    def test_selected_pair_chat_relays_casual_messages_without_keywords(self) -> None:
+        with mock.patch.object(chat, "ask_once") as ask:
+            decision = swarm_work.automatic_mode(
+                self.config, self.board, "agent-1", "Can you tell them hi?",
+                peer_id="agent-2",
+            )
+        self.assertEqual(decision["mode"], "collaborate")
+        self.assertIn("selected pair chat", decision["reason"])
+        ask.assert_not_called()
+
     def test_directed_relay_addresses_the_user_to_the_lead_and_the_relay_to_the_peer(self) -> None:
         calls: list[tuple[str, str, str]] = []
 
@@ -219,6 +387,9 @@ class SwarmWorkTests(unittest.TestCase):
 
         self.assertEqual([one[0] for one in calls], ["claude", "codex", "claude"])
         self.assertEqual(calls[1][1], "Message relayed by Nexus from Claude:\nCodex, please confirm this relay.")
+        self.assertNotEqual(calls[2][1], "Are you Claude? Send a message to Codex.")
+        self.assertIn("NEXUS CURRENT TURN", calls[2][1])
+        self.assertIn("Are you Claude? Send a message to Codex.", calls[2][2])
         self.assertIn("not to Codex", calls[0][2])
         self.assertIn("Reply to Claude", calls[1][2])
         self.assertTrue(result["relay_complete"])
@@ -295,6 +466,7 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual([one.phase for one in transcript], [
             "user_prompt", "lead_plan", "agent_plan",
             "agent_plan_review", "agent_plan_review", "lead_execution",
+            "agent_execution",
             "agent_verification", "agent_verification", "final_answer",
         ])
         self.assertIn("plan by codex", transcript[2].text)
@@ -367,6 +539,228 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual((self.project / "Codex.txt").read_text(), "Codex\n")
         self.assertEqual(result["changed"], ["Claude.txt", "Codex.txt"])
 
+    def test_each_agent_executes_its_own_turn_instead_of_lead_looping_for_itself(self) -> None:
+        work_routes: list[str] = []
+        codex_contexts: list[str] = []
+        final_content = (
+            "Created through Nexus collaboration between Claude and Codex.\n"
+        )
+
+        def answer(_config, route, _text, **kwargs):
+            response_format = kwargs.get("response_format")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {
+                    "contribution": (
+                        "Create task.txt with a placeholder" if route == "claude"
+                        else "Replace the placeholder with the final collaboration note"
+                    ),
+                    "message_to_lead": "I own this contribution.",
+                    "needs_files": [],
+                }
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {
+                    "contribution": (
+                        "Create task.txt with a placeholder" if route == "claude"
+                        else "Replace the placeholder with the final collaboration note"
+                    ),
+                    "message_to_lead": "Ready.", "needs_files": [],
+                    "ready_to_execute": True, "remaining": [],
+                }
+            elif response_format is swarm_work.WORK_FORMAT:
+                work_routes.append(route)
+                if route == "claude":
+                    value = {
+                        "reply": "I created my part.",
+                        "changes": [{
+                            "path": "task.txt", "content": "# awaiting Codex\n",
+                            "reason": "Claude owns file creation",
+                        }],
+                    }
+                else:
+                    codex_contexts.append(kwargs.get("context", ""))
+                    value = {
+                        "reply": "I populated my assigned file.",
+                        "changes": [{
+                            "path": "task.txt", "content": final_content,
+                            "reason": "Codex owns file population",
+                        }],
+                    }
+            else:
+                value = {
+                    "goal_complete": True,
+                    "feedback": "The file contains the final collaboration note.",
+                    "remaining": [],
+                }
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.work_together(
+                self.config, self.board, "agent-1",
+                "Have Claude create a file, then have Codex populate it",
+            )
+
+        self.assertEqual(work_routes, ["claude", "codex"])
+        self.assertEqual((self.project / "task.txt").read_text(), final_content)
+        self.assertEqual(len(result["transaction_ids"]), 2)
+        self.assertEqual(result["work_passes"], 1)
+        self.assertTrue(result["goal_complete"])
+        self.assertIn("EXECUTION TURN — YOU ARE THE ACTING AGENT", codex_contexts[0])
+        self.assertIn("You are Codex", codex_contexts[0])
+        self.assertIn("# awaiting Codex", codex_contexts[0])
+        transcript = chat.read_it(self.config, "claude", "Claude")
+        codex_execution = [one for one in transcript if one.phase == "agent_execution"]
+        self.assertEqual(len(codex_execution), 1)
+        self.assertEqual(codex_execution[0].speaker_name, "Codex")
+        self.assertIn("I populated my assigned file", codex_execution[0].text)
+
+    def test_two_no_change_team_passes_stop_even_when_feedback_is_paraphrased(self) -> None:
+        work_calls = 0
+        verification_calls = 0
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal work_calls, verification_calls
+            response_format = kwargs.get("response_format")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {
+                    "contribution": f"plan by {route}",
+                    "message_to_lead": "ready", "needs_files": [],
+                }
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {
+                    "contribution": f"review by {route}",
+                    "message_to_lead": "ready", "needs_files": [],
+                    "ready_to_execute": True, "remaining": [],
+                }
+            elif response_format is swarm_work.WORK_FORMAT:
+                work_calls += 1
+                value = {"reply": "Waiting for somebody else.", "changes": []}
+            else:
+                verification_calls += 1
+                value = {
+                    "goal_complete": False,
+                    "feedback": f"Different wording number {verification_calls}.",
+                    "remaining": [f"Paraphrased remaining item {verification_calls}."],
+                }
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.work_together(
+                self.config, self.board, "agent-1", "Create stalled.txt",
+            )
+
+        self.assertFalse(result["goal_complete"])
+        self.assertEqual(result["work_passes"], 2)
+        self.assertEqual(work_calls, 4)
+        self.assertEqual(verification_calls, 4)
+        self.assertIn(
+            "Two complete team execution passes made no file changes.",
+            result["remaining"],
+        )
+
+    def test_project_phases_do_not_resend_the_original_question_as_each_new_turn(self) -> None:
+        original = (
+            "ORIGINAL_SENTINEL: are you ChatGPT or Gemini? Then create marker.txt"
+        )
+        calls: list[tuple[object, str, str]] = []
+
+        def answer(_config, route, asked, **kwargs):
+            response_format = kwargs.get("response_format")
+            calls.append((response_format, asked, kwargs.get("context", "")))
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {
+                    "contribution": f"plan by {route}",
+                    "message_to_lead": "ready", "needs_files": [],
+                }
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {
+                    "contribution": f"review by {route}",
+                    "message_to_lead": "ready", "needs_files": [],
+                    "ready_to_execute": True, "remaining": [],
+                }
+            elif response_format is swarm_work.WORK_FORMAT:
+                value = {"reply": "No new change needed.", "changes": []}
+            else:
+                value = {
+                    "goal_complete": True,
+                    "feedback": "Current project state satisfies the goal.",
+                    "remaining": [],
+                }
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.work_together(
+                self.config, self.board, "agent-1", original,
+            )
+
+        self.assertTrue(result["goal_complete"])
+        initial = [asked for format_, asked, _context in calls if format_ is swarm_work.PLAN_FORMAT]
+        later = [
+            (asked, context) for format_, asked, context in calls
+            if format_ is not swarm_work.PLAN_FORMAT
+        ]
+        self.assertEqual(initial, [original, original])
+        self.assertEqual(len(later), 6)
+        for asked, context in later:
+            self.assertNotIn("ORIGINAL_SENTINEL", asked)
+            self.assertIn("NEXUS CURRENT TURN", asked)
+            self.assertIn("not as a question to answer again", asked)
+            self.assertIn("consider them silently", asked)
+            self.assertIn("Do not even state", asked)
+            self.assertIn(original, context)
+            self.assertIn("NEXUS SHARED COLLABORATION LEDGER", context)
+            self.assertIn("Readable full-chat mirror: .harness/chats/", context)
+        self.assertTrue(Path(
+            self.root / result["collaboration_ledger"]["canonical_path"]
+        ).is_file())
+
+    def test_conversation_rounds_continue_instead_of_reasking_the_initial_prompt(self) -> None:
+        original = "ORIGINAL_CONVERSATION_SENTINEL: identify yourself and solve this"
+        calls: list[tuple[object, str, str]] = []
+
+        def answer(_config, route, asked, **kwargs):
+            response_format = kwargs.get("response_format")
+            calls.append((response_format, asked, kwargs.get("context", "")))
+            if response_format is swarm_work.DISCUSSION_FORMAT:
+                value = {
+                    "message": f"New progress from {route}.",
+                    "goal_complete": True, "remaining": [],
+                }
+                text = json.dumps(value)
+            else:
+                text = f"Current response from {route}."
+            return {"text": text, "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", original,
+            )
+
+        self.assertTrue(result["goal_complete"])
+        initial = calls[:2]
+        later = calls[2:]
+        self.assertEqual([asked for _format, asked, _context in initial], [original, original])
+        self.assertEqual(len(later), 3)
+        for _format, asked, context in later:
+            self.assertNotIn("ORIGINAL_CONVERSATION_SENTINEL", asked)
+            self.assertIn("NEXUS CURRENT TURN", asked)
+            self.assertIn(original, context)
+            self.assertIn("NEXUS SHARED COLLABORATION LEDGER", context)
+        # Board-order discussion means Codex's turn sees Claude's immediately
+        # preceding ledger event even though both independent drafts began in
+        # parallel.
+        discussion_contexts = [
+            context for format_, _asked, context in later
+            if format_ is swarm_work.DISCUSSION_FORMAT
+        ]
+        self.assertIn("New progress from claude.", discussion_contexts[1])
+        ledger_path = self.root / result["collaboration_ledger"]["canonical_path"]
+        phases = [
+            json.loads(line)["phase"]
+            for line in ledger_path.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn("agent_discussion", phases)
+        self.assertEqual(phases[-1], "final_state")
+
     def test_invalid_plan_review_stops_before_any_file_transaction(self) -> None:
         review_calls = 0
 
@@ -409,8 +803,8 @@ class SwarmWorkTests(unittest.TestCase):
                 self.config, self.board, "agent-1", "Create marker.txt"
             )
 
-        self.assertEqual(result["plan_rounds"], 2)
-        self.assertEqual(review_calls, 4)
+        self.assertEqual(result["plan_rounds"], 3)
+        self.assertEqual(review_calls, 6)
         self.assertFalse(result["goal_complete"])
         self.assertEqual(result["work_passes"], 0)
         self.assertFalse((self.project / "marker.txt").exists())
