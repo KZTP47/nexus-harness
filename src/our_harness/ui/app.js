@@ -9487,6 +9487,10 @@ async function setThemGoing() {
 
 async function stopThemGoing() {
   try {
+    if (!swarmBoardRunId) {
+      $("swarmDoingSaid").textContent = "There is no exact active board run to stop.";
+      return;
+    }
     const said = await request("/api/swarm/stop", {
       method: "POST", body: JSON.stringify({run_id: swarmBoardRunId}),
     });

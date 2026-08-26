@@ -818,16 +818,33 @@ class AskingEveryone(TalkingTestCase):
     def test_they_are_asked_at_the_same_time(self) -> None:
         """Six one after another is six waits, which nobody sits through."""
 
+        lock = threading.Lock()
+        first_call_is_waiting = threading.Event()
+        calls_overlapped = threading.Event()
+        active = 0
+
         class Slow:
             def complete(self, request):
-                time.sleep(0.4)
+                nonlocal active
+                with lock:
+                    active += 1
+                    if active == 1:
+                        first_call_is_waiting.set()
+                    elif first_call_is_waiting.is_set():
+                        calls_overlapped.set()
+                # Hold the first request briefly so a concurrent request has
+                # a deterministic opportunity to enter. This proves overlap
+                # directly instead of depending on a busy CI runner meeting a
+                # fragile wall-clock deadline.
+                if active == 1:
+                    calls_overlapped.wait(timeout=1.0)
+                with lock:
+                    active -= 1
                 return Back("done")
 
         with mock.patch.object(chat, "create_provider", lambda config: Slow()):
-            began = time.monotonic()
             chat.ask_everyone(self.config, "What do you think?")
-            took = time.monotonic() - began
-        self.assertLess(took, 0.7, "they were asked one after another")
+        self.assertTrue(calls_overlapped.is_set(), "they were asked one after another")
 
     def test_asking_nobody_says_what_to_do(self) -> None:
         self.config.data["providers"] = {}

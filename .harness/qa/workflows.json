@@ -3559,7 +3559,7 @@
         },
         {
           "do": "run",
-          "script": "const before = document.querySelectorAll('.pipeline-node').length; const boxes = [...document.querySelectorAll('.pipeline-node')]; const last = boxes[boxes.length - 1]; [...last.querySelectorAll('button')].find(b => b.textContent === 'Remove').click(); const after = document.querySelectorAll('.pipeline-node').length; return after === before - 1 ? 'Remove really takes a step out' : 'the step stayed'",
+          "script": "const before = document.querySelectorAll('.pipeline-node').length; const boxes = [...document.querySelectorAll('.pipeline-node')]; const last = boxes[boxes.length - 1]; [...last.querySelectorAll('button')].find(b => b.textContent === 'Remove step').click(); const after = document.querySelectorAll('.pipeline-node').length; return after === before - 1 ? 'Remove really takes a step out' : 'the step stayed'",
           "text": "Remove really takes a step out",
           "note": "Remove on a box really takes that step out"
         },
@@ -3705,10 +3705,10 @@
         },
         {
           "do": "run",
-          "script": "const line = document.getElementById('pipelineSaid'); const everySaid = [line.textContent]; const watcher = new MutationObserver(() => everySaid.push(line.textContent)); watcher.observe(line, {childList: true, characterData: true, subtree: true}); document.getElementById('pipelineStop').disabled = false; document.getElementById('pipelineStop').click(); for (let tries = 0; tries < 150; tries += 1) {   everySaid.push(line.textContent);   if (everySaid.some(said => said.includes('will stop')))     { watcher.disconnect(); return 'Stop says the run will stop'; }   await new Promise(r => setTimeout(r, 200)); } watcher.disconnect(); return 'Stop said nothing: ' + everySaid.join(' | ')",
-          "text": "Stop says the run will stop",
+          "script": "const line = document.getElementById('pipelineSaid'); document.getElementById('pipelineStop').disabled = false; document.getElementById('pipelineStop').click(); await new Promise(r => setTimeout(r, 100)); return line.textContent.includes('There is no exact active run to stop') ? 'a finished run cannot be stopped by a stale button' : 'the stale button said: ' + line.textContent",
+          "text": "a finished run cannot be stopped by a stale button",
           "timeout_ms": 60000,
-          "note": "Stop asks the run to stop after the step it is on"
+          "note": "A stale Stop cannot target work after its exact run has finished"
         }
       ],
       "expect": {
@@ -4074,6 +4074,13 @@
           "text": "Delete takes a step out without a pointer",
           "timeout_ms": 30000,
           "note": "And Delete takes a step out"
+        },
+        {
+          "do": "run",
+          "script": "const find = words => [...document.querySelectorAll('button')].find(one => one.textContent.trim() === words); const edgeBefore = pipeline.edges.length; const removeEdge = find('Remove connection'); if (!removeEdge) return 'Remove connection was not available'; removeEdge.click(); await new Promise(r => setTimeout(r, 200)); if (pipeline.edges.length >= edgeBefore) return 'Remove connection did not remove an arrow'; const nodeBefore = pipeline.nodes.length; const removeNode = find('Remove step'); if (!removeNode) return 'Remove step was not available'; removeNode.click(); await new Promise(r => setTimeout(r, 200)); return pipeline.nodes.length === nodeBefore - 1 ? 'the visible remove controls remove one connection and one step' : 'Remove step did not remove a step'",
+          "text": "the visible remove controls remove one connection and one step",
+          "timeout_ms": 30000,
+          "note": "The visible Remove connection and Remove step controls perform the same bounded edits as the keyboard"
         }
       ],
       "expect": {
@@ -4681,7 +4688,37 @@
         },
         {
           "do": "click",
-          "target": "[data-pipeline-tab=\"board\"]",
+          "target": "#pipelineTabBefore",
+          "note": "How the saved automation looked before"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineTabTimer",
+          "note": "When this automation runs on its own"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineTabTelling",
+          "note": "How Nexus tells you when it finishes"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineTabHelp",
+          "note": "Return to the step help with the written control"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineTabTimeline",
+          "note": "Return to the timeline with the written control"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineTabCode",
+          "note": "Return to the text with the written control"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineTabBoard",
           "note": "Back to the picture",
           "always": true
         }
@@ -4771,7 +4808,7 @@
         },
         {
           "do": "run",
-          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) { if (document.querySelectorAll('.pipeline-starter').length) break; await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'A check drew this', nodes: [{id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}}, {id: 'ask', kind: 'wait_for_a_person', label: 'Say yes', settings: {question: 'Shall this go on?'}, at: {x: 320, y: 120}}, {id: 'repo', kind: 'git_repo', label: 'Read the repo', settings: {}, at: {x: 600, y: 120}}], edges: [{from: 'start', to: 'ask'}, {from: 'ask', to: 'repo'}]}; document.getElementById('pipelineName').value = 'A check drew this'; renderPipeline(); window.__pipelineRequestWas = request; window.__pipelineRunBodies = []; request = async (path, options = {}) => { if (path === '/api/pipelines/run') { const body = JSON.parse(options.body || '{}'); window.__pipelineRunBodies.push(body); applyPipelineEvent({kind: 'pipeline_started', payload: {name: pipeline.name}}); const selected = body.only ? new Set([body.only]) : body.from_here ? new Set([body.from_here]) : new Set(pipeline.nodes.map(one => one.id)); for (const node of pipeline.nodes) { if (!selected.has(node.id) && (body.only || body.from_here)) { applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'skipped', skipped_this_time: true}}); } else if (node.kind === 'wait_for_a_person' && !body.only && !body.from_here) { applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'running', said: node.settings.question}}); return {started: true}; } else { applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'passed', milliseconds: 5}}); } } applyPipelineEvent({kind: 'pipeline_finished', payload: {nodes: [...pipelineStates.values()], said: 'Finished'}}); return {started: true}; } if (path === '/api/pipelines/answer') { const body = JSON.parse(options.body || '{}'); window.__pipelineRunBodies.push(body); applyPipelineEvent({kind: 'pipeline_node', payload: {id: 'ask', label: 'Say yes', kind: 'wait_for_a_person', state: body.carry_on ? 'passed' : 'failed'}}); if (body.carry_on) applyPipelineEvent({kind: 'pipeline_node', payload: {id: 'repo', label: 'Read the repo', kind: 'git_repo', state: 'passed', milliseconds: 5}}); applyPipelineEvent({kind: 'pipeline_finished', payload: {nodes: [...pipelineStates.values()], said: 'Finished'}}); return {note: 'Answer recorded'}; } return window.__pipelineRequestWas(path, options); }; return 'a pipeline with a step that waits'",
+          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) { if (document.querySelectorAll('.pipeline-starter').length) break; await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'A check drew this', nodes: [{id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}}, {id: 'ask', kind: 'wait_for_a_person', label: 'Say yes', settings: {question: 'Shall this go on?'}, at: {x: 320, y: 120}}, {id: 'repo', kind: 'git_repo', label: 'Read the repo', settings: {}, at: {x: 600, y: 120}}], edges: [{from: 'start', to: 'ask'}, {from: 'ask', to: 'repo'}]}; document.getElementById('pipelineName').value = 'A check drew this'; renderPipeline(); window.__pipelineRequestWas = request; window.__pipelineRunBodies = []; window.__pipelineFakeRun = 0; request = async (path, options = {}) => { if (path === '/api/pipelines/run') { const body = JSON.parse(options.body || '{}'); const runId = 'qa-pipeline-' + (++window.__pipelineFakeRun); window.__pipelineRunBodies.push(body); setTimeout(() => { applyPipelineEvent({kind: 'pipeline_started', run_id: runId, payload: {run_id: runId, request_id: body.request_id, name: pipeline.name}}); const selected = body.only ? new Set([body.only]) : body.from_here ? new Set([body.from_here]) : new Set(pipeline.nodes.map(one => one.id)); let waiting = false; for (const node of pipeline.nodes) { let result; if (!selected.has(node.id) && (body.only || body.from_here)) result = {id: node.id, label: node.label, kind: node.kind, state: 'skipped', skipped_this_time: true}; else if (node.kind === 'wait_for_a_person' && !body.only && !body.from_here) { result = {id: node.id, label: node.label, kind: node.kind, state: 'running', said: node.settings.question}; waiting = true; } else if (!waiting) result = {id: node.id, label: node.label, kind: node.kind, state: 'passed', milliseconds: 5}; else continue; applyPipelineEvent({kind: 'pipeline_node', run_id: runId, payload: {...result, run_id: runId}}); } if (!waiting) applyPipelineEvent({kind: 'pipeline_finished', run_id: runId, payload: {run_id: runId, nodes: [...pipelineStates.values()], said: 'Finished'}}); }, 0); return {started: true, run_id: runId}; } if (path === '/api/pipelines/answer') { const body = JSON.parse(options.body || '{}'); const runId = body.run_id; window.__pipelineRunBodies.push(body); setTimeout(() => { applyPipelineEvent({kind: 'pipeline_node', run_id: runId, payload: {run_id: runId, id: 'ask', label: 'Say yes', kind: 'wait_for_a_person', state: body.carry_on ? 'passed' : 'failed'}}); if (body.carry_on) applyPipelineEvent({kind: 'pipeline_node', run_id: runId, payload: {run_id: runId, id: 'repo', label: 'Read the repo', kind: 'git_repo', state: 'passed', milliseconds: 5}}); applyPipelineEvent({kind: 'pipeline_finished', run_id: runId, payload: {run_id: runId, nodes: [...pipelineStates.values()], said: 'Finished'}}); }, 0); return {note: 'Answer recorded'}; } return window.__pipelineRequestWas(path, options); }; return 'a pipeline with a step that waits'",
           "text": "a pipeline with a step that waits",
           "timeout_ms": 90000,
           "note": "Draw one with a step that stops and asks"
@@ -4818,7 +4855,7 @@
         },
         {
           "do": "run",
-          "script": "const stopHere = [...document.querySelectorAll('#pipelineAsk button')].find(one => one.textContent.includes('Stop here')); if (stopHere) stopHere.click(); if (window.__pipelineRequestWas) request = window.__pipelineRequestWas; delete window.__pipelineRequestWas; delete window.__pipelineRunBodies; showPipelinePane('board'); pipeline = {name: 'New automation', nodes: [], edges: []}; pipelineSavedName = ''; renderPipeline(); return 'the board is back as it was'",
+          "script": "const stopHere = [...document.querySelectorAll('#pipelineAsk button')].find(one => one.textContent.includes('Stop here')); if (stopHere) stopHere.click(); if (window.__pipelineRequestWas) request = window.__pipelineRequestWas; delete window.__pipelineRequestWas; delete window.__pipelineRunBodies; delete window.__pipelineFakeRun; showPipelinePane('board'); pipeline = {name: 'New automation', nodes: [], edges: []}; pipelineSavedName = ''; renderPipeline(); return 'the board is back as it was'",
           "text": "the board is back as it was",
           "timeout_ms": 60000,
           "always": true,
@@ -4851,7 +4888,7 @@
         },
         {
           "do": "run",
-          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) { if (document.querySelectorAll('.pipeline-starter').length) break; await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'Asks first', nodes: [{id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}}, {id: 'checks', kind: 'suite', label: 'The checks', settings: {tag: 'fast'}, at: {x: 320, y: 120}}], edges: [{from: 'start', to: 'checks'}]}; window.__askPipelineRequestWas = request; window.__askPipelineRunBodies = []; request = async (path, options = {}) => { if (path === '/api/pipelines/run') { const body = JSON.parse(options.body || '{}'); window.__askPipelineRunBodies.push(body); applyPipelineEvent({kind: 'pipeline_started', payload: {name: pipeline.name}}); for (const node of pipeline.nodes) applyPipelineEvent({kind: 'pipeline_node', payload: {id: node.id, label: node.label, kind: node.kind, state: 'passed', milliseconds: 5}}); applyPipelineEvent({kind: 'pipeline_finished', payload: {nodes: [...pipelineStates.values()], said: 'Finished'}}); return {started: true}; } return window.__askPipelineRequestWas(path, options); }; renderPipeline(); openPipelineNode('checks'); await new Promise(r => setTimeout(r, 400)); return document.getElementById('pipelineNodeDialog').open ? 'the settings window is open' : 'it did not open'",
+          "script": "refreshPipelines = async () => {}; for (let tries = 0; tries < 200; tries += 1) { if (document.querySelectorAll('.pipeline-starter').length) break; await new Promise(r => setTimeout(r, 250)); } pipeline = {name: 'Asks first', nodes: [{id: 'start', kind: 'start', label: 'Start', settings: {}, at: {x: 40, y: 120}}, {id: 'checks', kind: 'suite', label: 'The checks', settings: {tag: 'fast'}, at: {x: 320, y: 120}}], edges: [{from: 'start', to: 'checks'}]}; window.__askPipelineRequestWas = request; window.__askPipelineRunBodies = []; request = async (path, options = {}) => { if (path === '/api/pipelines/run') { const body = JSON.parse(options.body || '{}'); const runId = 'qa-asked-pipeline'; window.__askPipelineRunBodies.push(body); setTimeout(() => { applyPipelineEvent({kind: 'pipeline_started', run_id: runId, payload: {run_id: runId, request_id: body.request_id, name: pipeline.name}}); const results = pipeline.nodes.map(node => ({run_id: runId, id: node.id, label: node.label, kind: node.kind, state: 'passed', milliseconds: 5})); for (const result of results) applyPipelineEvent({kind: 'pipeline_node', run_id: runId, payload: result}); applyPipelineEvent({kind: 'pipeline_finished', run_id: runId, payload: {run_id: runId, nodes: results, said: 'Finished'}}); }, 0); return {started: true, run_id: runId}; } return window.__askPipelineRequestWas(path, options); }; renderPipeline(); openPipelineNode('checks'); await new Promise(r => setTimeout(r, 400)); return document.getElementById('pipelineNodeDialog').open ? 'the settings window is open' : 'it did not open'",
           "text": "the settings window is open",
           "timeout_ms": 90000,
           "note": "Open a step's settings"
@@ -6137,7 +6174,7 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; await saveBoard({agents: [], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 0)) return 'Look again did not empty the board'; return 'the board is ready to work on';",
+          "script": "window.__boxBoardRequestWas = request; request = (path, options = {}) => window.__boxBoardRequestWas(path === '/api/swarm' ? '/api/swarm?refresh_providers=false' : path, options); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; await saveBoard({agents: [], projects: [], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 0)) return 'Look again did not empty the board'; return 'the board is ready to work on';",
           "text": "the board is ready to work on",
           "timeout_ms": 45000,
           "note": "Remember what was on this machine's board, and start from an empty one"
@@ -6185,9 +6222,11 @@
           "note": "Nothing is offered that would do nothing, or the wrong thing"
         },
         {
-          "do": "click",
-          "target": "#swarmRemoveAgent",
-          "note": "Remove an agent, from under the board"
+          "do": "run",
+          "script": "const button = document.getElementById('swarmRemoveAgent'); const original = window.confirm; button.focus(); window.confirm = () => false; document.getElementById('swarmRemoveAgent').click(); await new Promise(r => setTimeout(r, 200)); const cancelled = (await request('/api/swarm')).board.agents.length === 1 && document.activeElement === button; window.confirm = () => true; document.getElementById('swarmRemoveAgent').click(); window.confirm = original; return cancelled ? 'cancel keeps the agent and focus, then confirmation removes it' : 'cancel changed the board or lost focus';",
+          "text": "cancel keeps the agent and focus, then confirmation removes it",
+          "timeout_ms": 30000,
+          "note": "Cancellation makes no mutation and restores focus; explicit confirmation performs the removal"
         },
         {
           "do": "run",
@@ -6223,9 +6262,11 @@
           "note": "The same for project folders, from the same row of buttons"
         },
         {
-          "do": "click",
-          "target": "#swarmRemoveProject",
-          "note": "Remove a project folder, from under the board"
+          "do": "run",
+          "script": "const button = document.getElementById('swarmRemoveProject'); const original = window.confirm; button.focus(); window.confirm = () => false; document.getElementById('swarmRemoveProject').click(); await new Promise(r => setTimeout(r, 200)); const cancelled = (await request('/api/swarm')).board.projects.length === 1 && document.activeElement === button; window.confirm = () => true; document.getElementById('swarmRemoveProject').click(); window.confirm = original; return cancelled ? 'cancel keeps the project and focus, then confirmation removes it' : 'cancel changed the board or lost focus';",
+          "text": "cancel keeps the project and focus, then confirmation removes it",
+          "timeout_ms": 30000,
+          "note": "Cancellation makes no mutation and restores focus; explicit confirmation removes only the board reference"
         },
         {
           "do": "run",
@@ -6236,7 +6277,7 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; if (window.__boxBoardRequestWas) request = window.__boxBoardRequestWas; delete window.__boxBoardRequestWas; return 'the board this machine had is back';",
           "text": "the board this machine had is back",
           "timeout_ms": 45000,
           "always": true,
@@ -6294,6 +6335,13 @@
           "text": "the tick on the line panel turns the line on",
           "timeout_ms": 45000,
           "note": "Ticking it is the same as drawing the line, and the line says so"
+        },
+        {
+          "do": "run",
+          "script": "const find = words => [...document.querySelectorAll('#swarmStructure button')].find(one => one.textContent.trim() === words); const assignment = find('Change assignment'); if (!assignment) return 'Change assignment was not in the semantic structure'; assignment.click(); await new Promise(r => setTimeout(r, 200)); if (document.getElementById('swarmPanelTitle').textContent !== 'Works on') return 'Change assignment opened the wrong relationship'; const permission = find('Change permission'); if (!permission) return 'Change permission was not in the semantic structure'; permission.click(); await new Promise(r => setTimeout(r, 200)); return document.getElementById('swarmPanelTitle').textContent === 'Communicates?' ? 'the semantic relationship controls open assignment and permission settings' : 'Change permission opened the wrong relationship'",
+          "text": "the semantic relationship controls open assignment and permission settings",
+          "timeout_ms": 30000,
+          "note": "Screen-reader and reflow users can operate Change assignment and Change permission without the visual graph"
         },
         {
           "do": "click",
@@ -6559,10 +6607,10 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('swarmStop').disabled = false; document.getElementById('swarmStop').click(); if (!await waitFor(() => document.getElementById('swarmDoingSaid').textContent.includes('Nothing is going'))) return 'Stop said nothing'; return 'Stop with nothing going says so rather than falling over';",
-          "text": "Stop with nothing going says so rather than falling over",
+          "script": "document.getElementById('swarmStop').disabled = false; document.getElementById('swarmStop').click(); await new Promise(r => setTimeout(r, 100)); return document.getElementById('swarmDoingSaid').textContent.includes('There is no exact active board run to stop') ? 'Stop refuses to guess which board run to stop' : 'Stop said: ' + document.getElementById('swarmDoingSaid').textContent;",
+          "text": "Stop refuses to guess which board run to stop",
           "timeout_ms": 45000,
-          "note": "Stop is pressed for real, with the guard taken off, to prove it is wired up"
+          "note": "Even a stale enabled control cannot stop anything without an exact run identity"
         },
         {
           "do": "run",
@@ -6599,7 +6647,7 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check settings agent'}], projects: [{id: 'project-1', path: here}], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 2)) return 'the board was not drawn'; theButton(document.querySelector('.swarm-box.agent'), 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'the gear opened nothing'; return 'one agent and one project to work on';",
+          "script": "window.__settingsBoardRequestWas = request; request = (path, options = {}) => window.__settingsBoardRequestWas(path === '/api/swarm' ? '/api/swarm?refresh_providers=false' : path, options); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); if (!await waitFor(() => !document.getElementById('swarmView').hidden)) return 'the board never opened'; window.__boardWas = (await request('/api/swarm')).board; const here = (await request('/api/projects')).here.path; await saveBoard({agents: [{id: 'agent-1', name: 'Check settings agent'}], projects: [{id: 'project-1', path: here}], works_on: [], talks_to: []}); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === 2)) return 'the board was not drawn'; theButton(document.querySelector('.swarm-box.agent'), 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'the gear opened nothing'; return 'one agent and one project to work on';",
           "text": "one agent and one project to work on",
           "timeout_ms": 45000,
           "note": "Remember this machine's board, then start from one known agent and project"
@@ -6646,9 +6694,10 @@
           "note": "Every job has its own Remove, found by the word on it"
         },
         {
-          "do": "click",
-          "target": "#swarmProjectRemove",
-          "note": "Take the project off the board"
+          "do": "run",
+          "script": "const original = window.confirm; window.confirm = () => true; document.getElementById('swarmProjectRemove').click(); window.confirm = original; return 'confirmed removing the project from its settings';",
+          "text": "confirmed removing the project from its settings",
+          "note": "Confirm taking the project off the board from its settings"
         },
         {
           "do": "run",
@@ -6671,14 +6720,14 @@
         },
         {
           "do": "run",
-          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; theButton(document.querySelector('.swarm-box.agent'), 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'the gear opened nothing'; document.getElementById('swarmAgentRemove').click(); if (!await waitFor(async () => ((await request('/api/swarm')).board.agents.length === 0))) return 'the agent stayed on the board'; return 'Remove this agent takes it off the board';",
+          "script": "const theButton = (within, does) => within.querySelector('.swarm-icon-button[data-does=\"' + does + '\"]'); const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; theButton(document.querySelector('.swarm-box.agent'), 'settings').click(); if (!await waitFor(() => !document.getElementById('swarmAgentPanel').hidden)) return 'the gear opened nothing'; const original = window.confirm; window.confirm = () => true; document.getElementById('swarmAgentRemove').click(); window.confirm = original; if (!await waitFor(async () => ((await request('/api/swarm')).board.agents.length === 0))) return 'the agent stayed on the board'; return 'Remove this agent takes it off the board';",
           "text": "Remove this agent takes it off the board",
           "timeout_ms": 45000,
           "note": "And the same for an agent, from its own settings"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; return 'the board this machine had is back';",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const saveBoard = (board) => request('/api/swarm/save', {method: 'POST', body: JSON.stringify({board: Object.assign({}, board, {version: undefined})})}); if (!window.__boardWas) return 'the board this machine had is back'; await saveBoard(window.__boardWas); document.getElementById('swarmRefresh').click(); if (!await waitFor(async () => swarmSaid.board.version === (await request('/api/swarm')).board.version)) return 'the panel never caught up with the board'; if (!await waitFor(() => document.querySelectorAll('.swarm-box').length === (window.__boardWas.agents.length + window.__boardWas.projects.length))) return 'the board was not put back'; if (window.__settingsBoardRequestWas) request = window.__settingsBoardRequestWas; delete window.__settingsBoardRequestWas; return 'the board this machine had is back';",
           "text": "the board this machine had is back",
           "timeout_ms": 45000,
           "always": true,
@@ -7439,6 +7488,11 @@
           "do": "click",
           "target": "[data-view=\"pipelines\"]",
           "note": "Open visual test automation"
+        },
+        {
+          "do": "click",
+          "target": "#pipelineTabBoard",
+          "note": "Open the board pane even when an earlier check left another automation tab selected"
         },
         {
           "do": "click",

@@ -421,7 +421,8 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .colour-blue { background: #cfe0ff; border-color: #8ab0f0; }
 .colour-grey { background: #e6e9ee; border-color: #c2c8d2; }
 
-.pipeline-main { display: flex; flex-direction: column; background: #eef1f5; color: #1f2933; overflow: hidden; }
+.pipeline-main { display: flex; flex-direction: column; background: #eef1f5; color: #1f2933;
+  overflow-x: hidden; overflow-y: auto; }
 .pipeline-bar { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: flex-end; padding: 12px 16px; background: #f7f9fb; border-bottom: 1px solid #d7dce3; }
 .pipeline-bar h2 { margin: 0; font-size: 1.05rem; }
 .pipeline-bar .hint { margin: 2px 0 0; color: #52616b; font-size: .82rem; }
@@ -431,7 +432,7 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .pipeline-bar-fields button { white-space: nowrap; background: #fff; color: #1f2933; border: 1px solid #cbd2db; border-radius: 8px; padding: 6px 10px; font-size: .82rem; }
 .pipeline-said { margin: 0; padding: 8px 16px; background: #fff; border-bottom: 1px solid #e2e6ec; color: #1f2933; font-size: .86rem; }
 
-.pipeline-stage { display: flex; flex: 1; min-height: 0; }
+.pipeline-stage { display: flex; flex: 1 0 360px; min-height: 360px; }
 .pipeline-focus-side { display: none; }
 .pipeline-focus-main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
 .pipeline-view-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 7px;
