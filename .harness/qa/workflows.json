@@ -7144,7 +7144,7 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const pick = [...document.querySelectorAll('.the-chat-tray-one')].find(one => one.textContent.includes('Tray agent one')); if (!(pick.getAttribute('aria-label') || '').includes('Tray agent one')) return 'a tray button does not say what it is when it is read out'; pick.click(); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'pressing it opened nothing'; return document.getElementById('theBigChatTitle').textContent.includes('Tray agent one') ? 'pressing one opens that chat big' : 'it opened ' + document.getElementById('theBigChatTitle').textContent;",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const pick = [...document.querySelectorAll('.the-chat-tray-one')].find(one => one.textContent.includes('Tray agent one')); if (!(pick.getAttribute('aria-label') || '').includes('Tray agent one')) return 'a tray button does not say what it is when it is read out'; pick.focus(); pick.click(); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'pressing it opened nothing'; return document.getElementById('theBigChatTitle').textContent.includes('Tray agent one') ? 'pressing one opens that chat big' : 'it opened ' + document.getElementById('theBigChatTitle').textContent;",
           "text": "pressing one opens that chat big",
           "timeout_ms": 45000,
           "note": "The whole point of the tray: getting to one of five conversations"
@@ -7204,6 +7204,13 @@
           "text": "this conversation has its shared project",
           "timeout_ms": 30000,
           "note": "Choose the shared project before exercising project-authorized actions"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; openTheBigChat('agent-2'); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open'; const agent = theSwarmAgent('agent-2'); agent.ready = true; agent.why_not = ''; const realRequest = window.request; let sent = null; window.request = async (where, how) => { if (where === '/api/swarm/say') { sent = JSON.parse(how.body); return {said: [{who: 'them', text: 'private answer', at: ''}], routing: {requested: 'chat', selected: 'chat', reason: 'explicit solo turn'}, collaborated_with: []}; } return realRequest(where, how); }; const solo = document.getElementById('theBigChatSolo'); if (solo.textContent !== 'Chat with only this agent') { window.request = realRequest; return 'the solo action is not named clearly'; } document.getElementById('theBigChatBox').value = 'answer without involving connected agents'; document.getElementById('theBigChatSolo').click(); const completed = await waitFor(() => sent !== null && !swarmBusy.has('agent-2')); window.request = realRequest; document.getElementById('theBigChatSmall').click(); return completed && sent.mode === 'chat' && sent.allow_project_changes === false ? 'Chat with only this agent sends one isolated agent turn' : 'the solo action sent ' + JSON.stringify(sent);",
+          "text": "Chat with only this agent sends one isolated agent turn",
+          "timeout_ms": 30000,
+          "note": "The always-visible solo action must bypass connected agents without authorizing project changes"
         },
         {
           "do": "run",
