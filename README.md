@@ -1,5 +1,13 @@
 # Nexus Harness
 
+<p>
+  <a href="https://github.com/KZTP47/nexus-harness/actions/workflows/checks.yml"><img alt="Checks status" src="https://img.shields.io/github/actions/workflow/status/KZTP47/nexus-harness/checks.yml?branch=master&amp;style=for-the-badge&amp;logo=githubactions&amp;logoColor=white&amp;label=checks"></a>
+  <a href="#start-here-on-windows"><img alt="Python 3.11 or newer" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&amp;logo=python&amp;logoColor=white"></a>
+  <a href="desktop"><img alt="Desktop app built with Electron 43" src="https://img.shields.io/badge/Desktop-Electron%2043-47848F?style=for-the-badge&amp;logo=electron&amp;logoColor=white"></a>
+  <a href="#install"><img alt="Runs on Windows, macOS, and Linux" src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-2F81F7?style=for-the-badge"></a>
+  <a href="#what-it-knows-about-you"><img alt="Local-first data model" src="https://img.shields.io/badge/data-local--first-2EA043?style=for-the-badge"></a>
+</p>
+
 A local test lab and coding assistant for your project. It writes and runs your
 checks, tells you plainly what broke, and can ask a model to fix it — all on
 your own machine.
