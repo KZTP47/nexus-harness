@@ -51,6 +51,37 @@ Web chats do not always make it clear whether the Send button worked. When
 Nexus cannot be certain, it stops and tells you instead of risking sending the
 same request twice.
 
+### A closer look at what happens
+
+This view shows more of the journey without exposing the machinery underneath.
+The two workspaces can be used separately or together, and both return to the
+same place for checking, safe stopping, and a clear result.
+
+```mermaid
+flowchart TB
+    Start["You choose a project<br/>and describe the job"]
+    Remember["Nexus saves what you asked for<br/>before the work begins"]
+
+    TeamStart["Agent Swarm<br/>Choose which agents may take part"]
+    TeamTalk["Agents see the goal,<br/>the project, and earlier replies"]
+    TeamWork["They discuss, plan, work,<br/>and review each other"]
+
+    AutoStart["Visual automation<br/>Load the saved checklist"]
+    AutoRun["Run steps in order<br/>or side by side"]
+    AutoGuard["Checks, retries, time limits,<br/>and human decisions guide the run"]
+
+    Check["Nexus checks the result<br/>and records each important step"]
+    Safety["If a web chat gives no clear answer,<br/>Nexus pauses instead of sending twice"]
+    Review["You see the outcome, messages,<br/>screenshots, tests, and anything that failed"]
+
+    Start --> Remember
+    Remember --> TeamStart
+    Remember --> AutoStart
+    TeamStart --> TeamTalk --> TeamWork --> Check
+    AutoStart --> AutoRun --> AutoGuard --> Check
+    Check --> Safety --> Review
+```
+
 Developers can find the internal design in
 [NEXUS_WORKSPACE_RUNTIME_V2.md](docs/NEXUS_WORKSPACE_RUNTIME_V2.md). The
 [acceptance criteria](docs/NEXUS_WORKSPACE_RUNTIME_ACCEPTANCE.md) and
