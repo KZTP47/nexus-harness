@@ -9,6 +9,7 @@ or arbitrary browser script cross this boundary.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import threading
 import time
@@ -24,6 +25,23 @@ REQUEST_ID = re.compile(r"^[a-f0-9]{32}$")
 CONVERSATION_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 HEARTBEAT_SECONDS = 15.0
 WEB_WAIT_SECONDS = 420.0
+
+
+def _safe_conversation_key(value: object) -> str:
+    """Return a stable, opaque channel key for every local chat identity.
+
+    Pair registries already use safe ``pair-chat-*`` keys and keep those
+    unchanged. Standalone agent names are user-editable, however; rejecting a
+    valid board chat because its display identity contains spaces, Unicode or
+    is longer than the transport limit makes web agents work only in pairs.
+    The Electron bridge needs an identifier, not the display name, so hash any
+    non-transport-safe value instead of refusing the chat.
+    """
+
+    raw = str(value or "").strip()
+    if not raw or CONVERSATION_KEY.fullmatch(raw):
+        return raw
+    return "conversation-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -182,9 +200,7 @@ class WebChatBroker:
                 "Open Web AI chats on the board and reconnect it."
             )
         prompt = _prompt_for(request)
-        conversation_key = str(request.conversation_key or "").strip()
-        if conversation_key and not CONVERSATION_KEY.fullmatch(conversation_key):
-            raise HarnessError("That Nexus web-chat conversation identity is not valid")
+        conversation_key = _safe_conversation_key(request.conversation_key)
         wanted = WebRequest(
             uuid.uuid4().hex, route, prompt,
             attachments=[

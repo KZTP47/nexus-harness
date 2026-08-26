@@ -7158,15 +7158,22 @@
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('theBigChatSmall').click(); if (!await waitFor(() => document.getElementById('theBigChat').hidden)) return 'minimise did not put it away'; return document.querySelectorAll('.the-chat-tray-one').length === 2 ? 'minimising puts it back in the tray and keeps it open' : 'minimising lost the chat as well';",
-          "text": "minimising puts it back in the tray and keeps it open",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; document.getElementById('theBigChatSmall').click(); if (!await waitFor(() => document.getElementById('theBigChat').hidden)) return 'minimise did not put it away'; const focused = document.activeElement?.dataset.bigChatInvoker === 'agent-1'; return document.querySelectorAll('.the-chat-tray-one').length === 2 && focused ? 'minimising puts it back in the tray, keeps it open, and restores focus' : 'minimising lost the chat or keyboard focus';",
+          "text": "minimising puts it back in the tray, keeps it open, and restores focus",
           "timeout_ms": 45000,
           "note": "Closing would throw away which chats somebody had open"
         },
         {
           "do": "run",
-          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; [...document.querySelectorAll('.the-chat-tray-one')][0].click(); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open again'; document.getElementById('theBigChatShut').click(); if (!await waitFor(() => document.getElementById('theBigChat').hidden)) return 'close did nothing'; return document.querySelectorAll('.the-chat-tray-one').length === 1 ? 'and closing one really closes it' : 'the tray still holds ' + document.querySelectorAll('.the-chat-tray-one').length;",
-          "text": "and closing one really closes it",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 100)); } return false; }; const invoker = [...document.querySelectorAll('.the-chat-tray-one')].find(one => one.dataset.bigChatInvoker === 'agent-1'); invoker.click(); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'the chat did not reopen'; document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); if (!await waitFor(() => document.getElementById('theBigChat').hidden)) return 'Escape did not minimise'; return document.activeElement?.dataset.bigChatInvoker === 'agent-1' ? 'Escape minimises and restores the invoking chat button' : 'Escape lost keyboard focus';",
+          "text": "Escape minimises and restores the invoking chat button",
+          "timeout_ms": 30000,
+          "note": "Escape follows Minimise and returns keyboard focus to the control that opened the modal"
+        },
+        {
+          "do": "run",
+          "script": "const waitFor = async (test) => { for (let tries = 0; tries < 160; tries += 1) { if (await test()) return true; await new Promise(r => setTimeout(r, 250)); } return false; }; const invoker = [...document.querySelectorAll('.the-chat-tray-one')][0]; invoker.click(); if (!await waitFor(() => !document.getElementById('theBigChat').hidden)) return 'it would not open again'; document.getElementById('theBigChatShut').click(); if (!await waitFor(() => document.getElementById('theBigChat').hidden)) return 'close did nothing'; const focused = document.activeElement === document.getElementById('theChatTrayOn'); return document.querySelectorAll('.the-chat-tray-one').length === 1 && focused ? 'closing one really closes it and restores focus' : 'close left the tray or keyboard focus wrong';",
+          "text": "closing one really closes it and restores focus",
           "timeout_ms": 45000,
           "note": "Minimise and close are two different buttons and must do two things"
         },

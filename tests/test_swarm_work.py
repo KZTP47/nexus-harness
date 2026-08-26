@@ -516,7 +516,40 @@ class SwarmWorkTests(unittest.TestCase):
             )
         self.assertEqual(decision["mode"], "collaborate")
         self.assertIn("selected pair chat", decision["reason"])
+        self.assertTrue(decision["pair_chat_implicit_collaboration"])
         ask.assert_not_called()
+
+    def test_implicit_pair_keeps_the_lead_answer_when_a_peer_provider_fails(self) -> None:
+        calls: list[str] = []
+
+        def answer(_config, route, _text, **_kwargs):
+            calls.append(route)
+            if route == "codex":
+                raise swarm_work.HarnessError("temporary provider failure")
+            return {"text": "I am Claude.", "milliseconds": 7, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Who is this?",
+                peer_id="agent-2", filed_as="pair-chat",
+                allow_partial_lead_answer=True,
+            )
+
+        self.assertCountEqual(calls, ["claude", "codex"])
+        self.assertEqual(result["answer"]["text"], "I am Claude.")
+        self.assertEqual(result["stopped_because"], "partial_provider_failure")
+        self.assertEqual(result["provider_failures"], [{
+            "id": "agent-2", "name": "Codex", "route": "codex",
+        }])
+        self.assertIn("Claude answered", result["partial_provider_failure"])
+        self.assertIn("Codex could not join", result["partial_provider_failure"])
+        transcript = chat.read_it(self.config, "claude", "pair-chat")
+        self.assertEqual([one.phase for one in transcript], ["user_prompt", "final_answer"])
+        self.assertEqual(transcript[-1].text, "I am Claude.")
+        ledger = self.root / result["collaboration_ledger"]["canonical_path"]
+        saved = ledger.read_text(encoding="utf-8")
+        self.assertIn("provider_transport_failure", saved)
+        self.assertIn("partial_provider_failure", saved)
 
     def test_directed_relay_addresses_the_user_to_the_lead_and_the_relay_to_the_peer(self) -> None:
         calls: list[tuple[str, str, str]] = []
@@ -1121,6 +1154,30 @@ os._exit(23)
                 {"text": "```json\n{\"contribution\":\"plan\",\"message_to_lead\":\"go\",\"needs_files\":[],\"extra\":true}\n```"},
                 "ChatGPT", swarm_work.PLAN_FORMAT,
             )
+
+    def test_consumer_web_agent_gets_one_strict_format_correction_turn(self) -> None:
+        ledger = mock.Mock()
+        corrected = {"text": json.dumps({
+            "message": "The saved-board relay is verified.",
+            "goal_complete": True,
+            "remaining": [],
+        })}
+        with mock.patch.object(chat, "ask_once", return_value=corrected) as asked:
+            decoded = swarm_work._decode_with_one_web_repair(
+                self.config,
+                {"id": "agent-web", "name": "Claude web", "who": "web:claude-example"},
+                {"text": "not valid json: C:\\Users\\example"},
+                swarm_work.DISCUSSION_FORMAT,
+                ledger,
+                "pair-chat-example",
+                False,
+            )
+
+        self.assertTrue(decoded["goal_complete"])
+        self.assertEqual(decoded["remaining"], [])
+        self.assertIn("STRUCTURED FORMAT CORRECTION", asked.call_args.args[2])
+        self.assertIs(asked.call_args.kwargs["response_format"], swarm_work.DISCUSSION_FORMAT)
+        ledger.acknowledge.assert_called_once_with("agent-web")
 
     def test_project_plans_are_published_as_each_agent_finishes(self) -> None:
         turns: list[dict] = []

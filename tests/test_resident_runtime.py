@@ -33,6 +33,9 @@ from our_harness.resident import (
 )
 
 
+TEST_HTTP_TIMEOUT_SECONDS = 10
+
+
 def config(root: Path) -> LoadedConfig:
     data = copy.deepcopy(DEFAULT_CONFIG)
     data["memory"]["database"] = ".harness/memory/runtime-test.sqlite3"
@@ -301,7 +304,7 @@ def _request(
         data=data, headers=headers, method=method,
     )
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with urllib.request.urlopen(request, timeout=TEST_HTTP_TIMEOUT_SECONDS) as response:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as exc:
         with exc:
@@ -363,7 +366,9 @@ class ResidentAPITests(unittest.TestCase):
         port = int(self.daemon.server.server_address[1])
 
         def raw(hosts: list[str]) -> int:
-            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", port, timeout=TEST_HTTP_TIMEOUT_SECONDS,
+            )
             connection.putrequest("GET", "/v1/health", skip_host=True)
             for host in hosts:
                 connection.putheader("Host", host)

@@ -26,6 +26,30 @@ _FALLBACK_SCHEMA: dict[str, Any] = {
 }
 
 
+def _codex_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return the strict schema shape required by ``codex exec``.
+
+    Harness response formats may intentionally leave properties optional.  The
+    Codex CLI's native structured-output boundary instead requires every
+    declared object property to appear in ``required``.  Adapt a deep copy at
+    that provider boundary so the shared, provider-neutral contract keeps its
+    original optional-field semantics.
+    """
+    def transform(value: Any) -> Any:
+        if isinstance(value, list):
+            return [transform(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        copied = {name: transform(child) for name, child in value.items()}
+        properties = copied.get("properties")
+        if isinstance(properties, dict):
+            copied["required"] = list(properties)
+            copied["additionalProperties"] = False
+        return copied
+
+    return transform(schema)
+
+
 def _load_json(value: str) -> Any:
     def reject_constant(name: str) -> None:
         raise ValueError(f"non-finite JSON constant: {name}")
@@ -387,7 +411,8 @@ class CodexCLIProvider(Provider):
             )
             self._preflight_complete = True
         fallback = request.response_format is None
-        schema = _FALLBACK_SCHEMA if fallback else request.response_format.schema
+        contract_schema = _FALLBACK_SCHEMA if fallback else request.response_format.schema
+        schema = _codex_output_schema(contract_schema)
         with tempfile.TemporaryDirectory(prefix="our-harness-codex-") as temporary:
             cwd = Path(temporary)
             schema_path = cwd / "response.schema.json"
@@ -506,7 +531,11 @@ class CodexCLIProvider(Provider):
                 value = _load_json(raw)
             except (json.JSONDecodeError, ValueError) as exc:
                 raise HarnessError("Codex CLI result is not valid JSON") from exc
+            # Validate against both boundaries.  The native Codex schema
+            # guarantees its stricter transport shape; the unmodified harness
+            # schema remains the provider-neutral application contract.
             _validate_schema(value, schema)
+            _validate_schema(value, contract_schema)
             text = value["text"] if fallback else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
             return ProviderResponse(
                 text=text,

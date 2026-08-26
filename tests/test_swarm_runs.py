@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import json
 import multiprocessing
@@ -15,8 +16,8 @@ from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
-from our_harness import swarm
-from our_harness.swarm_runs import SwarmRunStore
+from our_harness import cancellation, swarm
+from our_harness.swarm_runs import SwarmRunStore, bind, provider_effect
 
 
 def _leave_provider_effect_dispatched(root: str, runtime: str, marker: str) -> None:
@@ -66,6 +67,20 @@ def _own_board_until_stopped(root: str, runtime: str, marker: str) -> None:
         store.fail(run_id, "stopped by another process", stopped=True)
 
 
+def _hold_conversation_turn(
+    root: str, runtime: str, ready_marker: str, release_marker: str,
+) -> None:
+    os.environ["OUR_HARNESS_SWARM_RUN_DIR"] = runtime
+    config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(root), [], {})
+    store = SwarmRunStore(config)
+    accepted, _ = store.accept("cross-process-chat-owner", {"kind": "chat"})
+    with store.conversation_turn(accepted["run_id"], "chat-one"):
+        Path(ready_marker).write_text("ready", encoding="utf-8")
+        limit = time.time() + 10
+        while time.time() < limit and not Path(release_marker).exists():
+            time.sleep(0.02)
+
+
 class SwarmRunStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -89,6 +104,50 @@ class SwarmRunStoreTests(unittest.TestCase):
         store = SwarmRunStore(self.config)
         accepted, _ = store.accept(request, snapshot or {"objective": "test"})
         return store, store.start(accepted["run_id"])["run_id"]
+
+    def test_logical_chat_turn_is_exclusive_across_processes_but_other_chats_run(self) -> None:
+        ready = self.container / "chat-owner-ready"
+        release = self.container / "chat-owner-release"
+        process = multiprocessing.Process(
+            target=_hold_conversation_turn,
+            args=(str(self.root), str(self.runtime), str(ready), str(release)),
+        )
+        process.start()
+        try:
+            limit = time.time() + 5
+            while time.time() < limit and not ready.exists():
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), "the other process did not claim the chat")
+
+            store = SwarmRunStore(self.config)
+            same, _ = store.accept("same-chat-contender", {"kind": "chat"})
+            with self.assertRaisesRegex(HarnessError, "already working"):
+                with store.conversation_turn(same["run_id"], "chat-one", timeout=0):
+                    self.fail("a second process entered the same logical chat")
+
+            other, _ = store.accept("other-chat-contender", {"kind": "chat"})
+            with store.conversation_turn(other["run_id"], "chat-two", timeout=0):
+                pass
+        finally:
+            release.write_text("release", encoding="utf-8")
+            process.join(5)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+        self.assertEqual(process.exitcode, 0)
+
+    def test_integrity_read_uses_one_snapshot_while_another_connection_appends(self) -> None:
+        store, run_id = self._running("snapshot-read")
+        with store._read() as db:
+            before = db.execute(
+                "SELECT event_count FROM runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            store.event(run_id, "concurrent_append", {"from": "another connection"})
+            visible = db.execute(
+                "SELECT COUNT(*) FROM events WHERE run_id=?", (run_id,)
+            ).fetchone()
+            self.assertEqual(int(visible[0]), int(before[0]))
+        self.assertEqual(store.get(run_id)["event_count"], int(before[0]) + 1)
 
     def _standing(self) -> dict:
         return {"board": {
@@ -131,16 +190,18 @@ class SwarmRunStoreTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             store.start(run_id)
         effect = store.begin_effect(run_id, "resource", "digest")
-        with self.assertRaises(HarnessError):
-            store.begin_effect(run_id, "resource", "digest-2")
+        second = store.begin_effect(run_id, "other-resource", "digest-2")
         with self.assertRaises(HarnessError):
             store.finish_effect(run_id, "not-the-effect", True)
         dispatched = store.projection(run_id)["events"]
         self.assertEqual(
-            len([one for one in dispatched if one["kind"] == "provider_dispatched"]), 1
+            len([one for one in dispatched if one["kind"] == "provider_dispatched"]), 2
         )
         self.assertFalse(any(one["kind"] == "acknowledged" for one in dispatched))
         store.finish_effect(run_id, effect, True)
+        with self.assertRaises(HarnessError):
+            store.checkpoint(run_id, "too_early", {})
+        store.finish_effect(run_id, second, True)
         with self.assertRaises(HarnessError):
             store.finish_effect(run_id, effect, True)
         store.checkpoint(run_id, "turn_saved", {"answer": "done"})
@@ -168,6 +229,57 @@ class SwarmRunStoreTests(unittest.TestCase):
             store.begin_effect(run_id, "resource", "digest-two")
         with self.assertRaises(HarnessError):
             store.finish(run_id, {"complete": True})
+        store.fail(run_id, "provider rejected the schema")
+        projected = store.projection(run_id)
+        self.assertEqual(projected["error"], "provider rejected the schema")
+        self.assertEqual(projected["events"][-1]["kind"], "failure_detail")
+
+    def test_one_uncertain_parallel_effect_keeps_the_whole_run_uncertain(self) -> None:
+        store, run_id = self._running("parallel-uncertain")
+        failed = store.begin_effect(run_id, "resource-a", "digest-a")
+        succeeded = store.begin_effect(run_id, "resource-b", "digest-b")
+        store.finish_effect(run_id, failed, False)
+        store.finish_effect(run_id, succeeded, True)
+        projected = store.get(run_id)
+        self.assertEqual(projected["status"], "delivery_unknown")
+        self.assertEqual(projected["effect_status"], "delivery_unknown")
+        with self.assertRaises(HarnessError):
+            store.checkpoint(run_id, "unsafe", {})
+
+    def test_parallel_workers_journal_overlapping_provider_effects_before_final_checkpoint(self) -> None:
+        store, run_id = self._running("parallel-provider-effects")
+        active = 0
+        most_active = 0
+        guard = threading.Lock()
+
+        def ask(route: str) -> None:
+            nonlocal active, most_active
+            with provider_effect(self.config, route, "pair-chat", f"digest-{route}"):
+                with guard:
+                    active += 1
+                    most_active = max(most_active, active)
+                time.sleep(0.03)
+                with guard:
+                    active -= 1
+
+        with bind(store, run_id):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    cancellation.submit(pool, ask, route)
+                    for route in ("web:chatgpt", "web:claude")
+                ]
+                for future in futures:
+                    future.result()
+
+        projected = store.projection(run_id)
+        self.assertEqual(most_active, 2)
+        self.assertEqual(projected["effect_ordinal"], 2)
+        self.assertEqual(projected["checkpoint_ordinal"], 0)
+        self.assertEqual(
+            len([one for one in projected["events"] if one["kind"] == "acknowledged"]), 2
+        )
+        store.checkpoint(run_id, "all_turns_saved", {"agents": 2})
+        store.finish(run_id, {"complete": True})
 
     def test_begin_effect_requires_a_real_running_run(self) -> None:
         store = SwarmRunStore(self.config)

@@ -37,7 +37,18 @@ const PROVIDERS = Object.freeze({
     composer: ["div.ProseMirror[contenteditable='true']", "[contenteditable='true']", "textarea"],
     send: ["button[aria-label='Send message']", "button[aria-label*='Send']", "button[data-testid*='send']"],
     users: ["[data-testid='user-message']", "[data-testid*='user-message']"],
-    replies: ["[data-testid='assistant-message']", "[data-testid*='assistant']", ".font-claude-message", ".prose"],
+    // Claude's August 2026 transcript no longer exposes the old
+    // assistant-message test id or font-claude-message class.  The provider
+    // now gives each assistant turn a semantic streaming boundary and keeps
+    // the final rendered answer in its standard-markdown descendant.  Prefer
+    // that narrow answer node so tool/thinking labels are not returned as the
+    // agent's speech; retain the older contracts for existing rollouts.
+    replies: [
+      "[data-is-streaming] .standard-markdown",
+      "[data-is-streaming] .font-claude-response-body",
+      "[data-testid='assistant-message']", "[data-testid*='assistant']",
+      ".font-claude-message", ".prose",
+    ],
     stop: ["button[aria-label*='Stop']", "button[data-testid*='stop']"],
     errors: ["[role='alert']", "[data-testid*='error']"],
     signedOut: ["form[action*='login']", "a[href*='/login']"],
@@ -189,6 +200,33 @@ function providerReadinessScript(provider) {
     if (signedOut) return {ready: false, reason: reasons.signedOut};
     if (!composer) return {ready: false, reason: reasons.notReady};
     return {ready: true};
+  })()`;
+}
+
+function composerTextSelectionScript(provider) {
+  return `(() => {
+    const selectors = ${JSON.stringify(provider.composer || [])};
+    const visible = (one) => {
+      if (!one || getComputedStyle(one).visibility === "hidden"
+          || getComputedStyle(one).display === "none") return false;
+      const rect = one.getBoundingClientRect();
+      return rect.width > 1 && rect.height > 1;
+    };
+    const composer = selectors.flatMap(
+      (selector) => [...document.querySelectorAll(selector)]).find(visible);
+    if (!composer) return false;
+    composer.focus();
+    if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+      composer.setSelectionRange(0, composer.value.length);
+      return true;
+    }
+    const selection = getSelection();
+    if (!selection) return false;
+    const range = document.createRange();
+    range.selectNodeContents(composer);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
   })()`;
 }
 
@@ -412,8 +450,13 @@ function submitControlScript(provider, prompt) {
     let scope = composer;
     let found = null;
     for (let depth = 0; scope && depth < 10 && !found; depth += 1) {
-      const candidates = selectors.send.flatMap(
-        (selector) => [...scope.querySelectorAll(selector)]).filter(visible);
+      // A single provider button commonly satisfies both an exact selector
+      // and a broad fallback (for example data-testid=send-button and an
+      // aria-label containing Send). Count distinct DOM nodes, not selector
+      // hits, or the safety requirement for one local submit control rejects
+      // the one real button as an apparent ambiguity.
+      const candidates = [...new Set(selectors.send.flatMap(
+        (selector) => [...scope.querySelectorAll(selector)]).filter(visible))];
       if (candidates.length === 1) found = candidates[0];
       scope = scope.parentElement;
     }
@@ -447,8 +490,8 @@ function submitControlScript(provider, prompt) {
 function submissionScript(provider, prompt, began) {
   return `(async () => {
     const selectors = ${JSON.stringify({
-      composer: provider.composer, users: provider.users || [], replies: provider.replies,
-      stop: provider.stop,
+      composer: provider.composer, send: provider.send,
+      users: provider.users || [], replies: provider.replies, stop: provider.stop,
       pairRepliesToUsers: Boolean(provider.pairRepliesToUsers),
     })};
     const prompt = ${JSON.stringify(String(prompt || ""))};
@@ -466,6 +509,8 @@ function submissionScript(provider, prompt, began) {
       }
       return [];
     };
+    const first = (list) => list.flatMap(
+      (selector) => [...document.querySelectorAll(selector)]).find(visible);
     const normal = (value) => String(value || "").replace(/\\s+/g, " ").trim();
     const promptMatches = (value) => {
       const rendered = normal(value);
@@ -495,10 +540,26 @@ function submissionScript(provider, prompt, began) {
         submissionState: "acknowledged",
       };
     }
-    // Once a genuine pointer activation was attempted, absence of the marked
-    // user bubble is not proof that nothing was sent: provider SPAs can delay
-    // or virtualise it. Continue reconciliation in answerScript, but prohibit
-    // an automatic Enter/resend that could duplicate the logical turn.
+    // A pointer dispatch is only an activation attempt. ChatGPT can ignore it
+    // in a hidden new-chat view. Eight seconds later, an unchanged exact draft
+    // plus the still-enabled Send control and no Stop/user turn is affirmative
+    // evidence that the provider did not accept it. Permit one trusted Enter
+    // fallback only in that proven state. If the draft/control no longer gives
+    // that proof, preserve outcome-unknown and never risk a duplicate.
+    const composer = first(selectors.composer);
+    const liveText = normal(composer instanceof HTMLTextAreaElement
+      || composer instanceof HTMLInputElement
+      ? composer.value : (composer?.innerText || composer?.textContent || ""));
+    const send = first(selectors.send);
+    const sendReady = Boolean(send) && !send.disabled
+      && send.getAttribute("aria-disabled") !== "true"
+      && !send.hasAttribute("data-visually-disabled");
+    const stopping = selectors.stop.some(
+      (selector) => [...document.querySelectorAll(selector)].some(visible));
+    if (began.sendActivated && promptMatches(liveText) && sendReady && !stopping) return {
+      ...began, ok: false, needsTrustedEnter: true,
+      submissionState: "not_accepted", failureStage: "pointer_activation",
+    };
     if (began.sendActivated) return {
       ...began, ok: true, needsTrustedEnter: false, error: "",
       submissionState: "outcome_unknown",
@@ -653,6 +714,12 @@ class WebChatManager {
     ));
     this.answerDeadlineMs = Math.max(1000, Number(options.answerDeadlineMs) || 165000);
     this.answerPollMs = Math.max(1, Number(options.answerPollMs) || 900);
+    this.submitReadyChecks = Math.max(2, Number(options.submitReadyChecks) || 50);
+    this.submitAttempts = Math.max(1, Number(options.submitAttempts) || 3);
+    this.submitPollMs = Math.max(1, Number(options.submitPollMs) || 100);
+    this.providerReadyDeadlineMs = Math.max(
+      1000, Number(options.providerReadyDeadlineMs) || 15000);
+    this.providerReadyPollMs = Math.max(1, Number(options.providerReadyPollMs) || 200);
     this.trackedContents = new WeakMap();
     const saved = this.readSettings().webChats;
     for (const raw of Array.isArray(saved) ? saved : []) {
@@ -931,6 +998,19 @@ class WebChatManager {
       // these listeners. Recheck after both listeners are in place.
       if (!contents.isLoading()) finished();
     });
+  }
+
+  async waitForProviderReady(contents, provider) {
+    const deadline = Date.now() + this.providerReadyDeadlineMs;
+    let readiness = null;
+    do {
+      readiness = await contents.executeJavaScript(providerReadinessScript(provider), true);
+      if (readiness?.ready) return readiness;
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, this.providerReadyPollMs));
+    } while (true);
+    throw new Error(
+      readiness?.reason || `${provider.label} is not showing a usable chat yet.`);
   }
 
   openSetup(providerId, connectionId = "", conversationKey = "", preferExisting = false) {
@@ -1229,31 +1309,44 @@ class WebChatManager {
     if (contents.debugger?.attach && contents.debugger?.sendCommand) {
       const attachedHere = !contents.debugger.isAttached();
       if (attachedHere) contents.debugger.attach("1.3");
-      const key = (type, value, code, virtualKey, extra = {}) => contents.debugger.sendCommand(
-        "Input.dispatchKeyEvent", {
-          type, key: value, code, windowsVirtualKeyCode: virtualKey,
-          nativeVirtualKeyCode: virtualKey, ...extra,
-        });
       try {
-        await key("rawKeyDown", "a", "KeyA", 65, {modifiers: 2});
-        await key("keyUp", "a", "KeyA", 65, {modifiers: 2});
-        await key("rawKeyDown", "Backspace", "Backspace", 8);
-        await key("keyUp", "Backspace", "Backspace", 8);
-        await contents.debugger.sendCommand("Input.insertText", {text: String(text || "")});
+        // Ctrl+A is not a reliable whole-editor selection in ChatGPT's
+        // ProseMirror composer.  After one failed send, later Nexus prompts
+        // were appended to the retained draft and the exact-content guard
+        // correctly refused to click Send. Select the verified composer node
+        // itself, then let CDP's trusted text insertion replace that range.
         let previous = null;
         let target = null;
-        for (let tries = 0; tries < 50; tries += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-          const candidate = await contents.executeJavaScript(
-            submitControlScript(provider, text), true);
-          if (candidate?.ready && previous?.ready
-              && candidate.fingerprint === previous.fingerprint
-              && Math.abs(candidate.x - previous.x) < 1
-              && Math.abs(candidate.y - previous.y) < 1) {
-            target = candidate;
-            break;
+        for (let attempt = 0; attempt < this.submitAttempts && !target; attempt += 1) {
+          // ChatGPT restores an unsent draft asynchronously after its compose
+          // page has already reported load complete. If that hydration races
+          // the first trusted insertion it can append the restored draft to
+          // the marked Nexus prompt. Nothing has been submitted yet, so it is
+          // safe to reselect and replace only when the exact-content guard
+          // proves the editor was changed underneath us.
+          if (attempt === 0 || previous?.code === "composer_not_committed") {
+            const selected = await contents.executeJavaScript(
+              composerTextSelectionScript(provider), true);
+            if (!selected) return {
+              activated: false, failureCode: "composer_selection_failed",
+              activationMethod: "none",
+            };
+            await contents.debugger.sendCommand("Input.insertText", {text: String(text || "")});
+            previous = null;
           }
-          previous = candidate;
+          for (let tries = 0; tries < this.submitReadyChecks; tries += 1) {
+            await new Promise((resolve) => setTimeout(resolve, this.submitPollMs));
+            const candidate = await contents.executeJavaScript(
+              submitControlScript(provider, text), true);
+            if (candidate?.ready && previous?.ready
+                && candidate.fingerprint === previous.fingerprint
+                && Math.abs(candidate.x - previous.x) < 1
+                && Math.abs(candidate.y - previous.y) < 1) {
+              target = candidate;
+              break;
+            }
+            previous = candidate;
+          }
         }
         if (!target) return {
           activated: false,
@@ -1325,6 +1418,49 @@ class WebChatManager {
     return {activated: true, sendActivated: true, activationMethod: "trusted_pointer"};
   }
 
+  async pressTrustedEnter(contents, provider) {
+    if (typeof contents.pressEnter === "function") {
+      await contents.pressEnter();
+      return true;
+    }
+    if (contents.debugger?.attach && contents.debugger?.sendCommand) {
+      const attachedHere = !contents.debugger.isAttached();
+      if (attachedHere) contents.debugger.attach("1.3");
+      try {
+        await contents.debugger.sendCommand(
+          "Emulation.setFocusEmulationEnabled", {enabled: true});
+        const focused = await contents.executeJavaScript(`(() => {
+          const selectors = ${JSON.stringify(provider.composer || [])};
+          const visible = (one) => one && one.getClientRects().length
+            && getComputedStyle(one).visibility !== "hidden";
+          const composer = selectors.flatMap(
+            (selector) => [...document.querySelectorAll(selector)]).find(visible);
+          if (!composer) return false;
+          composer.focus();
+          return document.activeElement === composer;
+        })()`, true);
+        if (!focused) return false;
+        const key = {
+          key: "Enter", code: "Enter", windowsVirtualKeyCode: 13,
+          nativeVirtualKeyCode: 13,
+        };
+        await contents.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyDown", ...key, text: "\r", unmodifiedText: "\r",
+        });
+        await contents.debugger.sendCommand("Input.dispatchKeyEvent", {
+          type: "keyUp", ...key,
+        });
+        return true;
+      } finally {
+        if (attachedHere && contents.debugger.isAttached()) contents.debugger.detach();
+      }
+    }
+    if (typeof contents.sendInputEvent !== "function") return false;
+    contents.sendInputEvent({type: "keyDown", keyCode: "ENTER"});
+    contents.sendInputEvent({type: "keyUp", keyCode: "ENTER"});
+    return true;
+  }
+
   async askNow(
     id, prompt, attachments = [], conversationKey = "", preferExisting = false
   ) {
@@ -1339,9 +1475,12 @@ class WebChatManager {
     };
     try {
       const view = this.viewFor(id, key, preferExisting);
-      await this.waitForLoad(view.webContents);
-      stopped();
       const provider = PROVIDERS[one.provider];
+      await this.waitForLoad(view.webContents);
+      if (provider.externalBrowser) {
+        await this.waitForProviderReady(view.webContents, provider);
+      }
+      stopped();
       const priorUrl = String(view.webContents.getURL?.() || (
         this.threadFor(one, key, preferExisting).url
       ));
@@ -1378,15 +1517,12 @@ class WebChatManager {
               automationScript(provider, submission.prompt, submission.marker), true);
           }
           stopped();
-          if (!began?.ok && began?.needsTrustedEnter && !began?.sendActivated
+          if (!began?.ok && began?.needsTrustedEnter
+              && (!began?.sendActivated || began?.submissionState === "not_accepted")
               && (typeof view.webContents.sendInputEvent === "function"
-                  || typeof view.webContents.pressEnter === "function")) {
-            if (typeof view.webContents.pressEnter === "function") {
-              await view.webContents.pressEnter();
-            } else {
-              view.webContents.sendInputEvent({type: "keyDown", keyCode: "ENTER"});
-              view.webContents.sendInputEvent({type: "keyUp", keyCode: "ENTER"});
-            }
+                  || typeof view.webContents.pressEnter === "function"
+                  || Boolean(view.webContents.debugger?.sendCommand))) {
+            await this.pressTrustedEnter(view.webContents, provider);
             began = await view.webContents.executeJavaScript(
               submissionScript(provider, submission.prompt, began), true);
             stopped();
@@ -1467,6 +1603,7 @@ class WebChatManager {
 
 module.exports = {
   PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
+  composerTextSelectionScript,
   automationScript, submissionBaselineScript, submitControlScript, submissionScript,
   answerScript, retryScript, stopScript,
   browserLikeUserAgent, authStorageAccessIsTrusted,

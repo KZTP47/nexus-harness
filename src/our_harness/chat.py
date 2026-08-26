@@ -1499,6 +1499,82 @@ def keep_exchange(
     }
 
 
+def keep_failed_exchange(
+    config: LoadedConfig,
+    route: str,
+    text: str,
+    error: str,
+    *,
+    filed_as: str = "",
+    attachments: list[dict[str, Any]] | None = None,
+    contributions: list[dict[str, Any]] | None = None,
+    run_id: str = "",
+    state: str = "failed",
+) -> dict[str, Any]:
+    """Keep the truth when an accepted chat turn saves no provider answer.
+
+    Provider delivery can be uncertain, especially for consumer web pages. A
+    failed turn previously existed only in the transient progress panel and an
+    internal run journal, so reopening the chat made it look as though Nexus had
+    ignored the user. Record the user's accepted turn and a clearly attributed
+    Nexus outcome without pretending that an AI answered or automatically
+    resending an ambiguous side effect.
+    """
+
+    redactor = CredentialRedactor(config)
+    safe_text = redactor.text(_check_what_was_typed(text))
+    safe_error = redactor.text(str(error or "Nexus did not receive an answer")).strip()
+    safe_state = re.sub(r"[^a-z0-9_-]", "", str(state or "failed").lower())[:40] or "failed"
+    run_note = f" Run {str(run_id)[:64]}." if run_id else ""
+    if safe_state in {"delivery_unknown", "outcome_unknown"}:
+        explanation = (
+            "Nexus could not prove whether the provider accepted or completed this turn, "
+            "so it did not resend it and risk duplicate work. No AI answer was saved."
+        )
+    elif safe_state == "stopped":
+        explanation = "This turn was stopped before an AI answer was saved."
+    else:
+        explanation = "This turn ended before an AI answer was saved."
+    reason = safe_error if safe_error.endswith((".", "!", "?")) else safe_error + "."
+    outcome = f"{explanation}\n\nReason: {reason}{run_note}"
+    with _the_lock_for(_filed_under(filed_as or route)):
+        turns = read_it(config, route, filed_as)
+        now = _now()
+        turns.append(Said(
+            "you", safe_text, now, attachments=list(attachments or []),
+            speaker_name="You", phase="user_prompt",
+        ))
+        for contribution in list(contributions or [])[:16]:
+            if not isinstance(contribution, dict) or not str(
+                contribution.get("text") or ""
+            ).strip():
+                continue
+            turns.append(Said(
+                "them",
+                redactor.text(str(contribution.get("text") or ""))[:LONGEST_ANSWER],
+                now,
+                max(0, int(contribution.get("milliseconds") or 0)),
+                str(contribution.get("model") or "")[:200],
+                speaker_id=str(contribution.get("speaker_id") or "")[:100],
+                speaker_name=str(contribution.get("speaker_name") or "An agent")[:100],
+                speaker_route=str(contribution.get("speaker_route") or "")[:100],
+                recipient_id=str(contribution.get("recipient_id") or "")[:100],
+                recipient_name=str(contribution.get("recipient_name") or "")[:100],
+                phase=str(contribution.get("phase") or "agent_reply")[:40],
+            ))
+        turns.append(Said(
+            "them", outcome[:LONGEST_ANSWER], now,
+            model=f"nexus/{safe_state}", speaker_id="nexus",
+            speaker_name="Nexus", recipient_name="You", phase="nexus_error",
+        ))
+        _keep_it(config, route, turns, filed_as)
+    return {
+        "route": str(route or "").strip(),
+        "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
+        "answer": turns[-1].to_dict(),
+    }
+
+
 def keep_multiparty_exchange(
     config: LoadedConfig,
     route: str,

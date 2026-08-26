@@ -587,6 +587,7 @@ def automatic_mode(
         return {
             "mode": "collaborate",
             "reason": f"This selected pair chat includes {peer_name}, so Nexus relayed the turn to both agents.",
+            "pair_chat_implicit_collaboration": True,
         }
 
     use_team = bool(_IMPLICIT_COLLABORATION.search(asked))
@@ -954,6 +955,48 @@ def _decode(
     return value
 
 
+def _decode_with_one_web_repair(
+    config: LoadedConfig,
+    one: dict[str, Any],
+    answer: dict[str, Any],
+    response_format: ResponseFormat,
+    ledger: CollaborationLedger,
+    conversation_key: str,
+    prefer_existing_conversation: bool,
+) -> dict[str, Any]:
+    """Strictly decode, giving a stateful consumer web model one format-only correction."""
+
+    label = str(one.get("name") or "The agent")
+    try:
+        return _decode(answer, label, response_format)
+    except HarnessError:
+        route = str(one.get("who") or "")
+        if not route.startswith("web:"):
+            raise
+        corrected = chat_lab.ask_once(
+            config,
+            route,
+            _continuation_turn(
+                "STRUCTURED FORMAT CORRECTION",
+                "Correct your immediately preceding answer into the required JSON schema. "
+                "Return only the JSON object, preserve the same substantive answer, escape every "
+                "JSON string correctly, replace embedded double quotation marks inside string "
+                "values with single quotation marks, and use forward slashes for any Windows paths.",
+            ),
+            context=(
+                "FORMAT CORRECTION ONLY\n"
+                "Your immediately preceding provider reply was delivered, but it was not valid "
+                "JSON for the required Nexus schema. Do not redo the task or add commentary. "
+                "Correct that answer once."
+            ),
+            response_format=response_format,
+            conversation_key=conversation_key,
+            prefer_existing_conversation=prefer_existing_conversation,
+        )
+        _ack_shared(ledger, one)
+        return _decode(corrected, label, response_format)
+
+
 def relay(
     config: LoadedConfig,
     board: dict[str, Any],
@@ -1132,6 +1175,7 @@ def collaborate(
     conversation_key: str = "",
     prefer_existing_conversation: bool = False,
     round_limit: int | None = None,
+    allow_partial_lead_answer: bool = False,
 ) -> dict[str, Any]:
     round_limit = user_round_limit(round_limit)
     lead = _agent(board, agent_id)
@@ -1221,9 +1265,16 @@ def collaborate(
             _share_turn(ledger, live, {"stage": "team_discussion"})
     if provider_failures:
         failed_names = [str(one.get("name") or "An agent") for one in provider_failures]
+        lead_result = completed.get(str(lead.get("id") or ""))
+        lead_answer = lead_result[1] if lead_result else {}
+        can_keep_lead = bool(
+            allow_partial_lead_answer
+            and lead_result
+            and not lead_answer.get("_provider_failed")
+        )
         ledger.record_state("provider_transport_failure", {
             "stage": "independent_first_round",
-            "status": "paused",
+            "status": "degraded" if can_keep_lead else "paused",
             "failed_agents": [
                 {
                     "id": str(one.get("id") or ""),
@@ -1238,6 +1289,71 @@ def collaborate(
             f"Reconnect or reconcile {name}'s provider turn before resuming."
             for name in failed_names
         ]
+        if can_keep_lead:
+            # A casual Send in an explicitly selected pair asks both agents, but
+            # the selected/lead agent's real answer is still useful when a peer
+            # has a transient provider failure. The old all-or-nothing path
+            # discarded that successful reply and made the chat look completely
+            # dead. Preserve the truthful lead answer while recording exactly
+            # which peer did not participate; explicit Collaborate actions keep
+            # the stricter all-agents-required behavior below.
+            successful_peer_contributions = [
+                _contribution(
+                    one, draft, "agent_reply", str(draft.get("text") or ""),
+                    recipient_id=str(lead.get("id") or ""),
+                    recipient_name=str(lead.get("name") or "The lead agent"),
+                )
+                for one, draft in completed.values()
+                if one.get("id") != lead.get("id")
+                and not draft.get("_provider_failed")
+            ]
+            kept = chat_lab.keep_multiparty_exchange(
+                config,
+                str(lead.get("who") or ""),
+                text,
+                str(lead_answer.get("text") or ""),
+                filed_as=filed_as or str(lead.get("name") or ""),
+                lead=lead,
+                participants=participants,
+                contributions=successful_peer_contributions,
+                attachments=public,
+                model=str(lead_answer.get("model") or ""),
+                milliseconds=int(lead_answer.get("milliseconds") or 0),
+            )
+            final_turn = _contribution(
+                lead, lead_answer, "final_answer", str(lead_answer.get("text") or ""),
+                recipient_name="User",
+            )
+            _share_turn(ledger, final_turn)
+            partial_note = (
+                f"{lead.get('name') or 'The selected agent'} answered. "
+                + ", ".join(failed_names)
+                + " could not join this turn, so Nexus kept the successful answer instead of discarding it."
+            )
+            ledger.finish(
+                partial_note, complete=True,
+                stopped_because="partial_provider_failure",
+            )
+            return {
+                **kept,
+                "collaboration_ledger": ledger.describe(),
+                "collaborated_with": [
+                    {"id": one.get("id"), "name": one.get("name"), "route": one.get("who")}
+                    for one, draft in completed.values()
+                    if one.get("id") != lead.get("id")
+                    and not draft.get("_provider_failed")
+                ],
+                "provider_failures": [
+                    {"id": one.get("id"), "name": one.get("name"), "route": one.get("who")}
+                    for one in provider_failures
+                ],
+                "partial_provider_failure": partial_note,
+                "goal_complete": True,
+                "discussion_rounds": 0,
+                "round_limit": round_limit,
+                "stopped_because": "partial_provider_failure",
+                "remaining": [],
+            }
         report = (
             "Nexus paused this collaboration because "
             + ", ".join(failed_names)
@@ -1326,7 +1442,10 @@ def collaborate(
                     prefer_existing_conversation=prefer_existing_conversation,
                 )
                 _ack_shared(ledger, one)
-                value = _decode(answer, str(one.get("name")), DISCUSSION_FORMAT)
+                value = _decode_with_one_web_repair(
+                    config, one, answer, DISCUSSION_FORMAT, ledger,
+                    conversation_key, prefer_existing_conversation,
+                )
                 message = str(value.get("message") or "").strip()
                 one_remaining = _remaining(value)
                 one_complete = value.get("goal_complete") is True and not one_remaining
@@ -1709,7 +1828,10 @@ def work_together(
                 prefer_existing_conversation=prefer_existing_conversation,
             )
             _ack_shared(ledger, one)
-            decoded = _decode(answer, str(one.get("name")), PLAN_FORMAT)
+            decoded = _decode_with_one_web_repair(
+                config, one, answer, PLAN_FORMAT, ledger,
+                conversation_key, prefer_existing_conversation,
+            )
         except cancellation.ChatCancelled:
             raise
         except HarnessError:
@@ -1813,7 +1935,10 @@ def work_together(
                     prefer_existing_conversation=prefer_existing_conversation,
                 )
                 _ack_shared(ledger, one)
-                value = _decode(answer, str(one.get("name")), PLAN_REVIEW_FORMAT)
+                value = _decode_with_one_web_repair(
+                    config, one, answer, PLAN_REVIEW_FORMAT, ledger,
+                    conversation_key, prefer_existing_conversation,
+                )
             except cancellation.ChatCancelled:
                 raise
             except HarnessError as exc:
@@ -1977,8 +2102,9 @@ def work_together(
                     prefer_existing_conversation=prefer_existing_conversation,
                 )
                 _ack_shared(ledger, executor)
-                execution = _decode(
-                    execution_answer, executor_name, WORK_FORMAT
+                execution = _decode_with_one_web_repair(
+                    config, executor, execution_answer, WORK_FORMAT, ledger,
+                    conversation_key, prefer_existing_conversation,
                 )
             except cancellation.ChatCancelled:
                 recovery = mutation_saga.compensate("user_cancelled")
@@ -2100,8 +2226,9 @@ def work_together(
                     prefer_existing_conversation=prefer_existing_conversation,
                 )
                 _ack_shared(ledger, one)
-                value = _decode(
-                    answer, str(one.get("name")), WORK_VERIFICATION_FORMAT
+                value = _decode_with_one_web_repair(
+                    config, one, answer, WORK_VERIFICATION_FORMAT, ledger,
+                    conversation_key, prefer_existing_conversation,
                 )
             except cancellation.ChatCancelled:
                 recovery = mutation_saga.compensate("user_cancelled")

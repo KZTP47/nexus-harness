@@ -1963,6 +1963,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "Nexus is checking the selected agent and board connections."
                 )
                 run_id = ""
+                one = None
+                filed_as = ""
                 def progress(stage, detail=""):
                     activity.update(activity_id, stage, detail)
                     if run_id and run_store is not None:
@@ -1980,6 +1982,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 cancel_token = None
                 cancel_scope = None
                 run_scope = None
+                chat_scope = None
+                chat_owned = False
+                answer_saved = False
                 try:
                     with self.server.swarm_lock:
                         # Acceptance and project switching share this lock.  A
@@ -2044,6 +2049,19 @@ class HarnessHandler(BaseHTTPRequestHandler):
                                     "note": "This exact request is already recorded; Nexus did not dispatch it again.",
                                 }, HTTPStatus.ACCEPTED)
                             return
+                        # Claim the whole logical conversation before any
+                        # collaboration ledger can rotate its generation. The
+                        # renderer already prevents a second click in one
+                        # window; this durable lease closes the cross-window and
+                        # cross-process hole that could supersede a live user
+                        # objective. Different chat IDs still proceed in
+                        # parallel.
+                        candidate_chat_scope = run_store.conversation_turn(
+                            run_id, chat_key, timeout=0.0,
+                        )
+                        candidate_chat_scope.__enter__()
+                        chat_scope = candidate_chat_scope
+                        chat_owned = True
                         run_store.start(run_id)
                     cancel_token = cancellations.begin(chat_key, run_id)
                     cancel_scope = cancellation.use(cancel_token)
@@ -2065,6 +2083,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         "reason": "The user chose this action explicitly.",
                     }
                     mode = requested_mode
+                    allow_partial_lead_answer = False
                     if mode == "auto":
                         decision = swarm_work.automatic_mode(
                             config, board_payload, agent_id,
@@ -2077,6 +2096,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             "selected": mode,
                             "reason": decision["reason"],
                         }
+                        allow_partial_lead_answer = bool(
+                            decision.get("pair_chat_implicit_collaboration")
+                        )
                     elif mode == "work" and not swarm_work.mentions_project_scope(
                         str(body.get("text") or "")
                     ):
@@ -2132,6 +2154,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                                 conversation.get("web_legacy_candidate")
                             ) if conversation else True,
                             round_limit=round_limit,
+                            allow_partial_lead_answer=allow_partial_lead_answer,
                         )
                     elif mode == "work":
                         if conversation and not project_id:
@@ -2166,8 +2189,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             ),
                             attachments=body.get("attachments"),
                             speaker=one.to_dict() if conversation else None,
-                            recipients=conversation.get("pair_agents", [])
-                            if conversation else None,
+                            # This explicit action is intentionally isolated:
+                            # the selected agent is the only recipient, even
+                            # when the transcript belongs to a connected pair.
+                            recipients=[one.to_dict()] if conversation else None,
                             conversation_key=str(conversation.get("filed_as") or "")
                             if conversation else filed_as,
                             prefer_existing_conversation=bool(
@@ -2176,6 +2201,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         )
                     else:
                         raise swarm_lab.SwarmError("That chat action is not recognised.")
+                    # Every mode handler returns only after its transcript write
+                    # succeeds. From this point onward an exception belongs to
+                    # the activity/run-journal finalisation path; it must not
+                    # append a false "no answer was saved" turn or duplicate the
+                    # user's prompt.
+                    answer_saved = True
                     activity.update(
                         activity_id, "Answer received",
                         "Nexus saved the conversation and is updating the chat.",
@@ -2205,6 +2236,33 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     )
                     if run_id:
                         run_store.fail(run_id, str(exc), stopped=stopped)
+                    if (
+                        chat_owned and not answer_saved
+                        and config is not None and one is not None
+                    ):
+                        failed_run = run_store.get(run_id) if run_id else {}
+                        try:
+                            chat_lab.keep_failed_exchange(
+                                config,
+                                str(one.who or ""),
+                                str(body.get("text") or ""),
+                                str(exc),
+                                filed_as=filed_as,
+                                attachments=body.get("attachments")
+                                if isinstance(body.get("attachments"), list) else [],
+                                contributions=list(
+                                    activity.read(activity_id).get("turns") or []
+                                ) if activity_id else [],
+                                run_id=run_id,
+                                state=str(failed_run.get("status") or (
+                                    "stopped" if stopped else "failed"
+                                )),
+                            )
+                        except Exception:
+                            # The original failure remains authoritative. A
+                            # secondary transcript-write problem must not hide
+                            # it or turn an uncertain delivery into a resend.
+                            pass
                     raise
                 finally:
                     if run_scope is not None:
@@ -2213,6 +2271,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         cancellations.finish(chat_key, cancel_token)
                     if cancel_scope is not None:
                         cancel_scope.__exit__(None, None, None)
+                    if chat_scope is not None:
+                        chat_scope.__exit__(None, None, None)
             elif self.path == "/api/team/connect":
                 # One press to make an assistant usable. Somebody had Claude
                 # installed and signed in, an agent set to use it, and the board
@@ -2226,30 +2286,36 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         f"{wanted or 'that'} is not an assistant this can set up on its own. "
                         f"It knows: {', '.join(seat_setup.KNOWN_SEATS)}."
                     )
-                with self.server.seats_lock:
-                    settings = self._settings_now()
-                    name = seat_setup.ROUTE_NAMES.get(wanted, wanted)
-                    # One route added, and nothing else touched. Setting a seat
-                    # up the usual way also picks it as the assistant used by
-                    # default, which is right for somebody choosing their first
-                    # one and wrong here: connecting Gemini so one agent can use
-                    # it should not quietly move everything else onto Gemini.
-                    route = seat_setup.routes_for(settings, [wanted])[name]
-                    # Google will not answer a work account until it is told
-                    # which Cloud project to bill. Taken here, at the moment of
-                    # connecting, rather than leaving somebody to find out from
-                    # a refusal and then go looking for the setting.
-                    project = str(body.get("google_project") or "").strip()
-                    if project and wanted == "gemini-cli":
-                        route["google_project"] = project
-                    done = seat_setup.write_one_route(settings, name, route)
-                    # And the panel reads its settings again, or the board goes
-                    # on saying not ready about something that is now ready -
-                    # which reads as the button having done nothing.
-                    self.server.config = self._settings_now()
+                # Route writes already have their own narrow, atomic lock. Do
+                # not queue this behind full seat discovery: version probes can
+                # be slow or stuck in a provider tool, and this button's job is
+                # to write one route immediately.
+                settings = self._settings_now()
+                name = seat_setup.ROUTE_NAMES.get(wanted, wanted)
+                # One route added, and nothing else touched. Setting a seat up
+                # the usual way also picks it as the assistant used by default,
+                # which is right for somebody choosing their first one and
+                # wrong here: connecting Gemini so one agent can use it should
+                # not quietly move everything else onto Gemini.
+                route = seat_setup.routes_for(settings, [wanted])[name]
+                # Google will not answer a work account until it is told which
+                # Cloud project to bill. Taken here, at the moment of connecting,
+                # rather than leaving somebody to find out from a refusal and
+                # then go looking for the setting.
+                project = str(body.get("google_project") or "").strip()
+                if project and wanted == "gemini-cli":
+                    route["google_project"] = project
+                done = seat_setup.write_one_route(settings, name, route)
+                # And the panel reads its settings again, or the board goes on
+                # saying not ready about something that is now ready—which reads
+                # as the button having done nothing.
+                self.server.config = self._settings_now()
                 from .providers.subscription_cli import connection_status
 
-                connection = connection_status(wanted)
+                # Login probing is the separate explicit "check" action. A
+                # connect response must not wait ten seconds—or forever on a
+                # broken third-party CLI—after the route is already written.
+                connection = connection_status(wanted, probe=False)
                 self._json({
                     "route": name,
                     "trusted": done.trusted,

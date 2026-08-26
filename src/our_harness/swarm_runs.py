@@ -34,10 +34,8 @@ _CURRENT: contextvars.ContextVar[tuple["SwarmRunStore", str] | None] = contextva
     "nexus_swarm_run", default=None
 )
 _UNSCOPED_STORES_LOCK = threading.Lock()
-_UNSCOPED_STORES: dict[tuple[str, int], "SwarmRunStore"] = {}
+_UNSCOPED_STORES: dict[str, "_ProviderResourceStore"] = {}
 _MOST_UNSCOPED_STORES = 64
-
-
 def _base() -> Path:
     override = os.environ.get("OUR_HARNESS_SWARM_RUN_DIR", "").strip()
     if override:
@@ -49,6 +47,89 @@ def _base() -> Path:
     state = os.environ.get("XDG_STATE_HOME", "").strip()
     root = Path(state) if state else Path.home() / ".local" / "state"
     return (root / "our-harness" / "swarm-runs").resolve()
+
+
+class _ProviderResourceStore:
+    """Small cross-process lock boundary for chats outside a durable run.
+
+    Opening a full :class:`SwarmRunStore` verifies every signed historical run.
+    That verification belongs at the durable run boundary, but ordinary chat
+    fan-out only needs the unsigned, ephemeral physical-resource lease table.
+    Keeping this boundary small prevents first-use journal verification from
+    delaying every participant in an otherwise parallel ``ask everyone``.
+    """
+
+    def __init__(self, config: LoadedConfig) -> None:
+        self.root = _base()
+        self._validate_location(config)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.database = self.root / "runs.sqlite3"
+        with self._tx() as db:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS resources(
+                  resource_key TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                  owner_pid INTEGER NOT NULL, owner_token TEXT NOT NULL,
+                  acquired_ms INTEGER NOT NULL
+                )
+            """)
+
+    def _validate_location(self, config: LoadedConfig) -> None:
+        project = config.project_root.resolve()
+        runtime = self.root.resolve()
+        if runtime == project or project in runtime.parents or runtime in project.parents:
+            raise HarnessError("Swarm runtime storage must be external to the project authority")
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.database, timeout=30.0, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @contextmanager
+    def resource(
+        self, run_id: str, route: str, conversation_key: str,
+        timeout: float = 180.0,
+    ) -> Iterator[str]:
+        key = hashlib.sha256(f"{route}\0{conversation_key}".encode()).hexdigest()
+        began = time.monotonic()
+        while True:
+            with self._tx() as db:
+                held = db.execute(
+                    "SELECT * FROM resources WHERE resource_key=?", (key,)
+                ).fetchone()
+                if not held or not _owner_is_alive(
+                    int(held["owner_pid"]), str(held["owner_token"])
+                ):
+                    db.execute(
+                        "INSERT OR REPLACE INTO resources(resource_key,run_id,owner_pid,owner_token,acquired_ms) "
+                        "VALUES(?,?,?,?,?)",
+                        (
+                            key, run_id, os.getpid(), _process_token(os.getpid()),
+                            int(time.time() * 1000),
+                        ),
+                    )
+                    break
+            if time.monotonic() - began >= timeout:
+                raise HarnessError("The selected provider conversation is busy in another Swarm run")
+            time.sleep(0.05)
+        try:
+            yield key
+        finally:
+            with self._tx() as db:
+                db.execute(
+                    "DELETE FROM resources WHERE resource_key=? AND run_id=? AND owner_pid=? AND owner_token=?",
+                    (key, run_id, os.getpid(), _process_token(os.getpid())),
+                )
 
 
 def _canonical(value: object) -> str:
@@ -146,7 +227,18 @@ class SwarmRunStore:
     def _read(self) -> Iterator[sqlite3.Connection]:
         connection = self._connect()
         try:
+            # Integrity verification compares the signed run projection with
+            # several event/effect rows. In autocommit mode, a concurrent Nexus
+            # process could append between those SELECTs, making one legitimate
+            # state look like a truncated or reordered journal. A deferred read
+            # transaction pins every SELECT to one WAL snapshot without blocking
+            # writers.
+            connection.execute("BEGIN")
             yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -211,6 +303,16 @@ class SwarmRunStore:
             );
             CREATE INDEX IF NOT EXISTS events_run_kind_seq
               ON events(run_id,kind,seq DESC);
+            CREATE TABLE IF NOT EXISTS provider_effects(
+              effect_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+              ordinal INTEGER NOT NULL, resource_key TEXT NOT NULL,
+              digest TEXT NOT NULL, status TEXT NOT NULL,
+              created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL,
+              integrity_mac TEXT NOT NULL DEFAULT '',
+              UNIQUE(run_id,ordinal), FOREIGN KEY(run_id) REFERENCES runs(run_id)
+            );
+            CREATE INDEX IF NOT EXISTS provider_effects_run_status
+              ON provider_effects(run_id,status,ordinal);
             CREATE TABLE IF NOT EXISTS resources(
               resource_key TEXT PRIMARY KEY, run_id TEXT NOT NULL,
               owner_pid INTEGER NOT NULL, owner_token TEXT NOT NULL, acquired_ms INTEGER NOT NULL
@@ -259,6 +361,24 @@ class SwarmRunStore:
             if "integrity_mac" not in board_columns:
                 db.execute(
                     "ALTER TABLE board_authority ADD COLUMN integrity_mac TEXT NOT NULL DEFAULT ''"
+                )
+            # Upgrade the former single-effect run journal without losing an
+            # in-flight delivery. Old completed runs need no operational rows;
+            # the event chain remains their durable history.
+            now = int(time.time() * 1000)
+            for row in db.execute(
+                "SELECT run_id,effect_id,effect_ordinal,effect_digest,effect_status "
+                "FROM runs WHERE effect_id<>'' AND status IN ('accepted','running','stopping')"
+            ).fetchall():
+                if db.execute(
+                    "SELECT 1 FROM provider_effects WHERE effect_id=?", (row[1],)
+                ).fetchone():
+                    continue
+                material = [row[1], row[0], row[2], "legacy", row[3], row[4], now, now]
+                db.execute(
+                    "INSERT INTO provider_effects(effect_id,run_id,ordinal,resource_key,digest,status,created_ms,updated_ms,integrity_mac) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (*material, mac("swarm-provider-effect-v1", material)),
                 )
             legacy = db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='runs_global_request_legacy'"
@@ -394,6 +514,35 @@ class SwarmRunStore:
             "mutation_owner_token", "updated_ms",
         )]
 
+    @staticmethod
+    def _effect_material(row: sqlite3.Row) -> list[Any]:
+        return [row[name] for name in (
+            "effect_id", "run_id", "ordinal", "resource_key", "digest",
+            "status", "created_ms", "updated_ms",
+        )]
+
+    def _seal_effect(self, db: sqlite3.Connection, effect_id: str) -> None:
+        row = db.execute(
+            "SELECT * FROM provider_effects WHERE effect_id=?", (effect_id,)
+        ).fetchone()
+        if row is None:
+            raise HarnessError("That provider effect does not exist")
+        db.execute(
+            "UPDATE provider_effects SET integrity_mac=? WHERE effect_id=?",
+            (mac("swarm-provider-effect-v1", self._effect_material(row)), effect_id),
+        )
+
+    def _verify_effect(self, row: sqlite3.Row | None) -> None:
+        if row is None:
+            return
+        expected = mac("swarm-provider-effect-v1", self._effect_material(row))
+        if not row["integrity_mac"] or not hmac.compare_digest(
+            str(row["integrity_mac"]), expected
+        ):
+            self._integrity_failure(
+                "The durable provider-effect journal failed keyed integrity."
+            )
+
     def _seal_run(self, db: sqlite3.Connection, run_id: str) -> None:
         row = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
@@ -512,6 +661,10 @@ class SwarmRunStore:
                 )
             expected_by_run[run_id] = expected
             previous_by_run[run_id] = str(event["integrity_mac"])
+        for effect in db.execute(
+            "SELECT * FROM provider_effects ORDER BY run_id,ordinal"
+        ).fetchall():
+            self._verify_effect(effect)
 
     @staticmethod
     def _row(row: sqlite3.Row) -> dict[str, Any]:
@@ -737,15 +890,22 @@ class SwarmRunStore:
             self._verify_run(db, row)
             if not row or row["status"] != "running":
                 raise HarnessError("A provider effect requires this project's running Swarm run")
-            if row["effect_status"] not in {"", "acknowledged"} or int(row["effect_ordinal"]) != int(row["checkpoint_ordinal"]):
+            if row["effect_status"] == "delivery_unknown":
                 raise HarnessError(
-                    "The prior provider outcome is not durably checkpointed; Nexus will not dispatch another"
+                    "A prior provider delivery is uncertain; Nexus will not dispatch another"
                 )
             ordinal = int(row["effect_ordinal"]) + 1
             effect_id = hashlib.sha256(f"{run_id}:{ordinal}:{resource_key}:{digest}".encode()).hexdigest()
+            now = int(time.time() * 1000)
+            db.execute(
+                "INSERT INTO provider_effects(effect_id,run_id,ordinal,resource_key,digest,status,created_ms,updated_ms) "
+                "VALUES(?,?,?,?,?,'dispatched',?,?)",
+                (effect_id, run_id, ordinal, resource_key, digest, now, now),
+            )
+            self._seal_effect(db, effect_id)
             db.execute(
                 "UPDATE runs SET effect_status='dispatched',effect_id=?,effect_ordinal=?,effect_digest=?,updated_ms=? WHERE run_id=?",
-                (effect_id, ordinal, digest, int(time.time()*1000), run_id),
+                (effect_id, ordinal, digest, now, run_id),
             )
             self._append(db, run_id, "provider_dispatched", {"effect_id": effect_id, "ordinal": ordinal, "resource": resource_key, "digest": digest})
             return effect_id
@@ -758,13 +918,38 @@ class SwarmRunStore:
                 (run_id, self.authority),
             ).fetchone()
             self._verify_run(db, before)
+            effect = db.execute(
+                "SELECT * FROM provider_effects WHERE effect_id=? AND run_id=?",
+                (effect_id, run_id),
+            ).fetchone()
+            self._verify_effect(effect)
+            if effect is None or effect["status"] != "dispatched":
+                raise HarnessError("That provider acknowledgement does not own an active Swarm effect")
+            now = int(time.time() * 1000)
             changed = db.execute(
-                "UPDATE runs SET effect_status=?,status=CASE WHEN ? THEN status ELSE 'delivery_unknown' END,updated_ms=? "
-                "WHERE run_id=? AND effect_id=? AND effect_status='dispatched' AND project_authority=?",
-                (status, 1 if accepted else 0, int(time.time()*1000), run_id, effect_id, self.authority),
+                "UPDATE provider_effects SET status=?,updated_ms=? "
+                "WHERE effect_id=? AND run_id=? AND status='dispatched'",
+                (status, now, effect_id, run_id),
             ).rowcount
             if changed != 1:
                 raise HarnessError("That provider acknowledgement does not own the active Swarm effect")
+            self._seal_effect(db, effect_id)
+            remaining = int(db.execute(
+                "SELECT COUNT(*) FROM provider_effects WHERE run_id=? AND status='dispatched'",
+                (run_id,),
+            ).fetchone()[0])
+            uncertain = int(db.execute(
+                "SELECT COUNT(*) FROM provider_effects WHERE run_id=? AND status='delivery_unknown'",
+                (run_id,),
+            ).fetchone()[0])
+            summary = "delivery_unknown" if uncertain else (
+                "dispatched" if remaining else "acknowledged"
+            )
+            db.execute(
+                "UPDATE runs SET effect_status=?,status=CASE WHEN ? THEN status ELSE 'delivery_unknown' END,updated_ms=? "
+                "WHERE run_id=? AND project_authority=?",
+                (summary, 1 if accepted else 0, now, run_id, self.authority),
+            )
             self._append(db, run_id, status, {"effect_id": effect_id})
             if not accepted:
                 self._release_board_lease(db, run_id)
@@ -793,7 +978,20 @@ class SwarmRunStore:
         with self._tx() as db:
             row = db.execute("SELECT * FROM runs WHERE run_id=? AND project_authority=?", (run_id, self.authority)).fetchone()
             self._verify_run(db, row)
-            if not row or row["status"] in TERMINAL:
+            if not row:
+                return
+            if row["status"] in TERMINAL:
+                # A provider-effect context records uncertainty first, before
+                # the orchestration layer converts the concrete exception to a
+                # safe user-facing failure. Preserve that later detail on the
+                # already-terminal row; otherwise every delivery_unknown run
+                # has an empty error and cannot be diagnosed or judged.
+                if clean_message and not str(row["error"] or ""):
+                    db.execute(
+                        "UPDATE runs SET error=?,updated_ms=? WHERE run_id=? AND project_authority=?",
+                        (clean_message, int(time.time() * 1000), run_id, self.authority),
+                    )
+                    self._append(db, run_id, "failure_detail", {"error": clean_message})
                 return
             status = (
                 "delivery_unknown" if row["effect_status"] in {"dispatched", "delivery_unknown"}
@@ -1010,6 +1208,40 @@ class SwarmRunStore:
                     (key, run_id, os.getpid(), _process_token(os.getpid())),
                 )
 
+    @contextmanager
+    def conversation_turn(
+        self, run_id: str, conversation_key: str, timeout: float = 0.0,
+    ) -> Iterator[str]:
+        """Own one logical chat turn across every Nexus server process.
+
+        The renderer and :class:`ChatCancellationRegistry` prevent duplicate
+        sends inside one window/process. They cannot protect a conversation
+        from a second Nexus server (for example a diagnostic runner) using the
+        same project at the same time. Collaboration ledgers deliberately fence
+        older generations, so that race used to let a newer request erase the
+        user's in-flight objective. Hold a distinct whole-turn lease before any
+        collaboration ledger is opened. Provider calls retain their narrower
+        route/conversation leases and unrelated chats remain parallel.
+        """
+
+        logical_key = f"{self.authority}\0{str(conversation_key or '').strip()}"
+        scope = self.resource(
+            run_id, "nexus-logical-chat-turn", logical_key, timeout=timeout,
+        )
+        try:
+            resource_key = scope.__enter__()
+        except HarnessError as exc:
+            if "provider conversation is busy" not in str(exc):
+                raise
+            raise HarnessError(
+                "This chat is already working on another request in a Nexus window or process. "
+                "The existing turn was left running; stop it explicitly before starting a replacement."
+            ) from exc
+        try:
+            yield resource_key
+        finally:
+            scope.__exit__(None, None, None)
+
 
 @contextmanager
 def bind(store: SwarmRunStore, run_id: str) -> Iterator[None]:
@@ -1020,28 +1252,28 @@ def bind(store: SwarmRunStore, run_id: str) -> Iterator[None]:
         _CURRENT.reset(token)
 
 
-def _unscoped_store(config: LoadedConfig) -> SwarmRunStore:
-    """Reuse the validated authority store for ordinary chats in one project."""
+def _unscoped_store(config: LoadedConfig) -> _ProviderResourceStore:
+    """Reuse a lightweight cross-process resource store for ordinary chats."""
 
-    key = (str(config.project_root.resolve()), id(config))
+    key = str(_base())
     with _UNSCOPED_STORES_LOCK:
         held = _UNSCOPED_STORES.get(key)
         if held is None:
             if len(_UNSCOPED_STORES) >= _MOST_UNSCOPED_STORES:
                 _UNSCOPED_STORES.pop(next(iter(_UNSCOPED_STORES)))
-            held = SwarmRunStore(config)
+            held = _ProviderResourceStore(config)
             _UNSCOPED_STORES[key] = held
+        else:
+            held._validate_location(config)
         return held
 
 
 @contextmanager
 def provider_effect(config: LoadedConfig, route: str, conversation_key: str, digest: str) -> Iterator[None]:
     current = _CURRENT.get()
-    # Store construction validates/migrates the signed journal.  Doing that
-    # separately in every parallel "ask everyone" worker serialized setup and
-    # made the first multi-agent question take roughly one store-open per agent.
-    # A loaded config gets one bounded cached store; a replacement config (and
-    # therefore possibly different redaction settings) gets a different entry.
+    # Durable runs use their already-validated signed store. Ordinary chats use
+    # only the shared ephemeral resource-lease boundary; validating every
+    # historical run here would turn first-use fan-out into serialized setup.
     store = current[0] if current else _unscoped_store(config)
     run_id = current[1] if current else f"unscoped-{os.getpid()}-{uuid.uuid4().hex}"
     with store.resource(run_id, route, conversation_key):

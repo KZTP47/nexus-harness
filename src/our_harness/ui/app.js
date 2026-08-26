@@ -6305,16 +6305,24 @@ function anAgentFace(agent, className = "", iconSize = 24) {
 }
 
 function agentForChatTurn(one, fallback) {
+  if (one?.speaker_id === "nexus") return null;
   return theSwarmAgent(one?.speaker_id) || fallback || null;
 }
 
 function chatTurnsWhileWorking(agentId, saved = []) {
   const activity = swarmChatActivity.get(agentId);
   if (!activity) return saved;
-  return [
-    ...saved,
+  const identity = (one) => JSON.stringify([
+    one?.who || "", one?.speaker_id || "", one?.phase || "", one?.text || "",
+  ]);
+  const alreadySaved = new Set(saved.map(identity));
+  const live = [
     ...(activity.localTurns || []),
     ...(activity.remoteTurns || []),
+  ].filter((one) => !alreadySaved.has(identity(one)));
+  return [
+    ...saved,
+    ...live,
   ];
 }
 
@@ -6576,11 +6584,18 @@ function finishSwarmChatActivity(agentId, succeeded, detail = "") {
     : "The request ended before an answer was saved.");
   renderSwarmChatActivity(agentId);
   renderTurnsThatArrived(agentId);
-  activity.finishTimer = window.setTimeout(() => {
-    if (swarmChatActivity.get(agentId) !== activity) return;
-    swarmChatActivity.delete(agentId);
-    renderSwarmChatActivity(agentId);
-  }, succeeded ? 1600 : 3000);
+  // A completed activity may collapse after the saved answer appears in the
+  // transcript. A failure has no provider answer to replace it, so keep the
+  // exact reason visible until this chat starts another request or is closed.
+  // Hiding it after three seconds made a failed turn look like Nexus had simply
+  // ignored the user.
+  if (succeeded) {
+    activity.finishTimer = window.setTimeout(() => {
+      if (swarmChatActivity.get(agentId) !== activity) return;
+      swarmChatActivity.delete(agentId);
+      renderSwarmChatActivity(agentId);
+    }, 1600);
+  }
 }
 
 function markSwarmChatActivityStopping(agentId) {
@@ -7875,7 +7890,10 @@ function setWhatCanBePressedInSwarm() {
     const busy = swarmBusy.has(theBigOne);
     const waiting = busy || swarmConversationSwitching.has(theBigOne);
     const stopping = swarmStopping.has(theBigOne);
-    for (const id of ["theBigChatSend", "theBigChatAttach", "theBigChatCollaborate", "theBigChatWork"]) {
+    for (const id of [
+      "theBigChatSend", "theBigChatSolo", "theBigChatAttach",
+      "theBigChatCollaborate", "theBigChatWork",
+    ]) {
       const button = $(id);
       if (button) button.disabled = waiting;
     }
@@ -8879,6 +8897,11 @@ function oneSwarmChatCard(held) {
   send.type = "submit";
   send.title = "Send directly or automatically involve connected agents when useful";
   row.append(send);
+  const solo = make("button", "swarm-chat-solo", "Chat with only this agent");
+  solo.type = "button";
+  solo.title = "Send only to this agent; connected agents will not join this turn";
+  solo.addEventListener("click", () => sendWhatIsTypedTo(held.agent, "chat"));
+  row.append(solo);
   const stop = make("button", "danger swarm-chat-stop", "Stop");
   stop.type = "button";
   stop.title = "Stop only this chat's current request";
@@ -8988,6 +9011,7 @@ function setWhatCanBePressedInAChat(card) {
   // send yet" and "cannot compose", and made restored draft state unusable.
   card.querySelector(".swarm-chat-box").disabled = !agent;
   card.querySelector(".swarm-chat-send").disabled = waiting || !agent || !agent.ready;
+  card.querySelector(".swarm-chat-solo").disabled = waiting || !agent || !agent.ready;
   const stop = card.querySelector(".swarm-chat-stop");
   stop.disabled = !busy || swarmStopping.has(card.dataset.agent);
   stop.textContent = swarmStopping.has(card.dataset.agent) ? "Stopping…" : "Stop";
@@ -9132,6 +9156,7 @@ const chatPhaseNames = {
   agent_execution: "Connected-agent execution",
   agent_verification: "Work verification",
   final_answer: "Final answer",
+  nexus_error: "Nexus failure",
 };
 
 function chatPhaseName(phase) { return chatPhaseNames[phase] || ""; }
@@ -9306,7 +9331,7 @@ async function sendWhatIsTypedTo(agentId) {
     renderChatAttachments(agentId);
     countWhatIsTypedTo(agentId);
     keepWhatWasSaidTo(agentId, said.said || [], conversation?.id || "");
-    sayInTheChatFor(agentId, automaticRoundStopWords(said) || (said.changed?.length
+    sayInTheChatFor(agentId, said.partial_provider_failure || automaticRoundStopWords(said) || (said.changed?.length
       ? `${agent.name} answered. Nexus applied ${said.changed.length} file change(s).`
       : said.routing?.requested === "auto" && said.routing?.selected === "collaborate"
         ? `${agent.name} answered after Nexus automatically involved ${said.collaborated_with?.length || 0} connected agent(s).`
@@ -11076,7 +11101,10 @@ async function sendFromTheBigChat(mode = "auto") {
   swarmStopping.delete(agentId);
   nextSwarmChatRevision(agentId);
   setWhatCanBePressedInSwarm();
-  const buttons = ["theBigChatSend", "theBigChatAttach", "theBigChatCollaborate", "theBigChatWork"]
+  const buttons = [
+    "theBigChatSend", "theBigChatSolo", "theBigChatAttach",
+    "theBigChatCollaborate", "theBigChatWork",
+  ]
     .map($).filter(Boolean);
   buttons.forEach((button) => { button.disabled = true; });
   const attachmentKey = swarmChatKey(agentId);
@@ -11107,7 +11135,7 @@ async function sendFromTheBigChat(mode = "auto") {
     swarmChatAttachments.delete(attachmentKey);
     renderChatAttachments(agentId);
     keepWhatWasSaidTo(agentId, answered.said || [], conversation?.id || "");
-    $("theBigChatSaidBack").textContent = automaticRoundStopWords(answered) || (answered.changed?.length
+    $("theBigChatSaidBack").textContent = answered.partial_provider_failure || automaticRoundStopWords(answered) || (answered.changed?.length
       ? `Applied ${answered.changed.length} file change(s).`
       : answered.routing?.requested === "auto" && answered.routing?.selected === "collaborate"
         ? `Automatically involved ${answered.collaborated_with?.length || 0} connected agent(s).`
@@ -11151,6 +11179,7 @@ function wireUpTheTray() {
   window.addEventListener("pointercancel", finishTheBigChatResize);
   window.addEventListener("resize", applyTheBigChatLayout);
   $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("auto"));
+  $("theBigChatSolo").addEventListener("click", () => sendFromTheBigChat("chat"));
   $("theBigChatStop").addEventListener("click", () => stopChatFor(theBigOne));
   $("theBigChatAttach").addEventListener("click", () => $("theBigChatFiles").click());
   $("theBigChatFiles").addEventListener("change", async () => {
@@ -11302,10 +11331,23 @@ async function heartbeatWebChats(refreshBoard = false) {
 async function serviceWebChatBridge() {
   if (!canUseWebChats() || !token || webChatBridgeBusy) return;
   webChatBridgeBusy = true;
+  let claimed = [];
   try {
     await heartbeatWebChats();
     const pending = await request("/api/web-chats/pending");
-    await Promise.all((pending.requests || []).map(async (one) => {
+    claimed = pending.requests || [];
+  } catch (error) {
+    // The ordinary app still works in a browser, where there is deliberately
+    // no Electron bridge. A transient server restart is retried at the next
+    // heartbeat and should not cover the whole app with an unrelated error.
+    if ($("webChatDialog").open) $("webChatSaid").textContent = error.message;
+  } finally {
+    // Only serialize claiming pending work. Provider turns can take minutes,
+    // and holding this lock while one runs would leave every other parallel
+    // web-chat turn unclaimed until its server-side timeout.
+    webChatBridgeBusy = false;
+  }
+  await Promise.allSettled(claimed.map(async (one) => {
       const started = performance.now();
       let answer = "";
       let error = "";
@@ -11327,14 +11369,6 @@ async function serviceWebChatBridge() {
       $("webChatSaid").textContent = error
         ? `The web relay stopped: ${error}` : `${one.route} returned its visible reply to Nexus.`;
     }));
-  } catch (error) {
-    // The ordinary app still works in a browser, where there is deliberately
-    // no Electron bridge. A transient server restart is retried at the next
-    // heartbeat and should not cover the whole app with an unrelated error.
-    if ($("webChatDialog").open) $("webChatSaid").textContent = error.message;
-  } finally {
-    webChatBridgeBusy = false;
-  }
 }
 
 function startWebChatBridge() {

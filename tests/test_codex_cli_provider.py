@@ -98,6 +98,30 @@ else:
 
 
 class CodexCLIProviderTests(unittest.TestCase):
+    def test_codex_native_schema_requires_optional_properties_without_mutating_contract(self) -> None:
+        contract = {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string"},
+                "detail": {
+                    "type": "object",
+                    "properties": {"note": {"type": "string"}},
+                    "required": [],
+                },
+            },
+            "required": ["answer"],
+        }
+
+        native = codex_cli._codex_output_schema(contract)
+
+        self.assertEqual(native["required"], ["answer", "detail"])
+        self.assertFalse(native["additionalProperties"])
+        self.assertEqual(native["properties"]["detail"]["required"], ["note"])
+        self.assertFalse(native["properties"]["detail"]["additionalProperties"])
+        self.assertEqual(contract["required"], ["answer"])
+        self.assertNotIn("additionalProperties", contract)
+        self.assertEqual(contract["properties"]["detail"]["required"], [])
+
     def test_stop_terminates_the_active_cli_process_tree(self) -> None:
         token = cancellation.Cancellation()
         errors: list[Exception] = []

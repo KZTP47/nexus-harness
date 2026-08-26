@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import unittest
+from dataclasses import replace
 
 from our_harness import cancellation
 from our_harness.models import ProviderRequest, ResponseFormat
@@ -54,6 +55,26 @@ class WebChatBrokerTests(unittest.TestCase):
         self.broker.complete(pending[0]["request_id"], answer="The visible provider reply")
         thread.join(2)
         self.assertEqual(result, ["The visible provider reply"])
+
+    def test_standalone_display_identity_is_mapped_to_a_safe_stable_channel(self) -> None:
+        request = replace(
+            self.request(),
+            conversation_key="New chat - Claude / personal subscription",
+        )
+        thread = threading.Thread(target=lambda: (
+            self.broker.provider("web:claude-abcdef123456").complete(request)
+        ))
+        thread.start()
+        for _ in range(100):
+            pending = self.broker.pending()
+            if pending:
+                break
+            time.sleep(0.01)
+        key = pending[0]["conversation_key"]
+        self.assertTrue(key.startswith("conversation-"))
+        self.assertLessEqual(len(key), 160)
+        self.broker.complete(pending[0]["request_id"], answer="standalone works")
+        thread.join(2)
 
     def test_attachment_paths_are_forwarded_to_the_electron_courier(self) -> None:
         thread = threading.Thread(target=lambda: (

@@ -79,6 +79,32 @@ test("the external transport starts a normal loopback-controlled browser without
   assert.equal(contents.isDestroyed(), true);
 });
 
+test("the first restored provider tab navigates to the requested saved conversation", async () => {
+  const navigations = [];
+  const page = {
+    url: () => "https://claude.ai/new",
+    isClosed: () => false,
+    goto: async (url, options) => navigations.push([url, options]),
+    bringToFront: async () => {},
+  };
+  const transport = Object.create(ExternalBrowserTransport.prototype);
+  transport.provider = {
+    home: "https://claude.ai/", newChat: "https://claude.ai/new",
+  };
+  transport.initialClaimed = false;
+  transport.initialPage = page;
+  transport.start = async () => ({newPage: async () => { throw new Error("unexpected page"); }});
+
+  const requested = "https://claude.ai/chat/saved-conversation";
+  const opened = await transport.openPage(requested);
+
+  assert.equal(opened, page);
+  assert.equal(transport.initialClaimed, true);
+  assert.deepEqual(navigations, [[requested, {
+    waitUntil: "domcontentloaded", timeout: 90000,
+  }]]);
+});
+
 test("a Claude sign-in replacement tab is adopted as the current provider chat", async () => {
   const oldPage = Object.assign(new EventEmitter(), {
     url: () => "https://claude.ai/login",
@@ -138,6 +164,7 @@ test("current Claude tab selection prefers the visible provider conversation", a
 test("external provider submission uses real keyboard input and pointer activation", async () => {
   const keys = [];
   const clicks = [];
+  const evaluations = [];
   const page = Object.assign(new EventEmitter(), {
     url: () => "https://claude.ai/new", title: async () => "Claude",
     mainFrame() { return this; }, isClosed: () => false,
@@ -145,7 +172,11 @@ test("external provider submission uses real keyboard input and pointer activati
       press: async (key) => keys.push(["press", key]),
       insertText: async (text) => keys.push(["text", text]),
     },
-    evaluate: async () => ({x: 500, y: 400, fingerprint: "BUTTON|send"}),
+    evaluate: async (script) => {
+      evaluations.push(String(script));
+      return evaluations.length === 1
+        ? true : {x: 500, y: 400, fingerprint: "BUTTON|send"};
+    },
     mouse: {click: async (x, y) => clicks.push([x, y])},
   });
   const transport = {
@@ -159,10 +190,8 @@ test("external provider submission uses real keyboard input and pointer activati
     composer: ["[contenteditable='true']"], send: ["button[aria-label*='Send']"],
   });
 
-  assert.deepEqual(keys, [
-    ["press", "Control+A"], ["press", "Backspace"],
-    ["text", "NEXUS_NATIVE_INPUT"],
-  ]);
+  assert.deepEqual(keys, [["text", "NEXUS_NATIVE_INPUT"]]);
+  assert.ok(evaluations[0].includes("selectNodeContents"));
   assert.deepEqual(clicks, [[500, 400]]);
   assert.equal(activated.sendActivated, true);
 });

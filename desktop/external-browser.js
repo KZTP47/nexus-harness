@@ -161,8 +161,34 @@ class ExternalPageContents extends EventEmitter {
 
   async replaceTextAndSubmit(text, selectors = {}) {
     const page = await this.pageForOperation();
-    await page.keyboard.press("Control+A");
-    await page.keyboard.press("Backspace");
+    const selected = await page.evaluate((contract) => {
+      const visible = (one) => {
+        if (!one) return false;
+        const style = getComputedStyle(one);
+        const rect = one.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none"
+          && rect.width > 1 && rect.height > 1;
+      };
+      const composer = (contract.composer || []).flatMap(
+        (selector) => [...document.querySelectorAll(selector)]).find(visible);
+      if (!composer) return false;
+      composer.focus();
+      if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+        composer.setSelectionRange(0, composer.value.length);
+        return true;
+      }
+      const selection = getSelection();
+      if (!selection) return false;
+      const range = document.createRange();
+      range.selectNodeContents(composer);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      return true;
+    }, selectors);
+    if (!selected) return {
+      activated: false, failureCode: "composer_selection_failed",
+      activationMethod: "none",
+    };
     await page.keyboard.insertText(String(text || ""));
     let previous = null;
     let target = null;
@@ -186,8 +212,8 @@ class ExternalPageContents extends EventEmitter {
         let scope = composer;
         let found = null;
         for (let depth = 0; scope && depth < 10 && !found; depth += 1) {
-          const candidates = (contract.send || []).flatMap(
-            (selector) => [...scope.querySelectorAll(selector)]).filter(visible);
+          const candidates = [...new Set((contract.send || []).flatMap(
+            (selector) => [...scope.querySelectorAll(selector)]).filter(visible))];
           if (candidates.length === 1) found = candidates[0];
           scope = scope.parentElement;
         }
@@ -341,7 +367,13 @@ class ExternalBrowserTransport {
       page = await context.newPage();
       await page.goto(initialUrl, {waitUntil: "domcontentloaded", timeout: 90000});
     }
-    if (page.url() === "about:blank") {
+    // An installed browser can reuse or restore the Nexus profile's generic
+    // provider tab instead of honoring the requested saved-conversation URL.
+    // Always put the first claimed tab on the exact logical thread requested
+    // by this contents object before it is allowed to submit anything.
+    const savedConversation = initialUrl !== this.provider.home
+      && initialUrl !== this.provider.newChat;
+    if (page.url() === "about:blank" || (savedConversation && page.url() !== initialUrl)) {
       await page.goto(initialUrl, {waitUntil: "domcontentloaded", timeout: 90000});
     }
     await page.bringToFront();

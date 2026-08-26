@@ -7,6 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const {
   PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
+  composerTextSelectionScript,
   automationScript, submissionBaselineScript, submitControlScript, submissionScript,
   answerScript, retryScript, stopScript,
   browserLikeUserAgent, authStorageAccessIsTrusted,
@@ -140,6 +141,7 @@ test("the remote-page script contains fixed selectors and safely encoded prompt 
   assert.ok(submissionScript(PROVIDERS.copilot, prompt, {}).includes("beforeUserCount"));
   assert.ok(retryScript(PROVIDERS.chatgpt).includes("data-conversation-recovery-retry"));
   assert.ok(providerReadinessScript(PROVIDERS.claude).includes("secure Nexus browser window"));
+  assert.ok(composerTextSelectionScript(PROVIDERS.chatgpt).includes("selectNodeContents"));
   assert.ok(submissionBaselineScript(PROVIDERS.chatgpt, prompt).includes("needsTrustedInput"));
   assert.ok(submitControlScript(PROVIDERS.chatgpt, prompt).includes("elementsFromPoint"));
   assert.ok(submitControlScript(PROVIDERS.chatgpt, prompt).includes("scope.parentElement"));
@@ -147,6 +149,76 @@ test("the remote-page script contains fixed selectors and safely encoded prompt 
   assert.equal(PROVIDERS.claude.trustedInput, true);
   assert.equal(PROVIDERS.gemini.trustedInput, true);
   assert.equal(PROVIDERS.copilot.trustedInput, true);
+});
+
+test("Claude's current streaming transcript boundary yields the completed marked-turn reply", () => {
+  const element = (text) => ({
+    innerText: text, textContent: text, getClientRects: () => [1],
+    getAttribute: () => "",
+  });
+  const user = element("[NEXUS TRANSPORT TURN current-claude] who is this?");
+  const answer = element("CLAUDE_CURRENT_TRANSCRIPT_OK");
+  user.compareDocumentPosition = (node) => node === answer ? 4 : 2;
+  const began = {
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0, beforeUserLast: "",
+    beforeError: "",
+    submittedPrompt: user.innerText,
+    submittedMarker: "NEXUS TRANSPORT TURN current-claude",
+  };
+  const context = {
+    document: {querySelectorAll: (selector) => {
+      if (selector === "[data-is-streaming] .standard-markdown") return [answer];
+      if (PROVIDERS.claude.users.includes(selector)) return [user];
+      return [];
+    }},
+    getComputedStyle: () => ({visibility: "visible"}),
+  };
+
+  const state = vm.runInNewContext(answerScript(PROVIDERS.claude, began), context);
+
+  assert.equal(PROVIDERS.claude.replies[0], "[data-is-streaming] .standard-markdown");
+  assert.equal(state.changed, true);
+  assert.equal(state.answer, "CLAUDE_CURRENT_TRANSCRIPT_OK");
+});
+
+test("one Send button matching exact and fallback selectors remains one safe target", () => {
+  const visible = {
+    getBoundingClientRect: () => ({left: 20, top: 30, width: 40, height: 40}),
+  };
+  const send = {
+    ...visible, tagName: "BUTTON", id: "composer-submit-button", className: "composer-submit-btn",
+    disabled: false, hasAttribute: () => false,
+    getAttribute: (name) => ({
+      "data-testid": "send-button", "aria-label": "Send prompt", role: "button",
+    })[name] || null,
+    matches: () => true, contains: (one) => one === send,
+  };
+  const scope = {
+    querySelectorAll: (selector) => PROVIDERS.chatgpt.send.includes(selector) ? [send] : [],
+    parentElement: null,
+  };
+  const composer = {
+    ...visible, tagName: "DIV", innerText: "a long Nexus collaboration prompt",
+    textContent: "a long Nexus collaboration prompt", className: "ProseMirror",
+    querySelectorAll: () => [], parentElement: scope,
+  };
+  const context = {
+    document: {
+      querySelectorAll: (selector) => PROVIDERS.chatgpt.composer.includes(selector)
+        ? [composer] : [],
+      elementsFromPoint: () => [send],
+    },
+    getComputedStyle: () => ({visibility: "visible", display: "block"}),
+    HTMLTextAreaElement: class {}, HTMLInputElement: class {},
+    Set,
+  };
+
+  const state = vm.runInNewContext(submitControlScript(
+    PROVIDERS.chatgpt, composer.innerText), context);
+
+  assert.equal(state.ready, true);
+  assert.equal(state.code, "ready");
+  assert.equal(state.fingerprint.includes("send-button"), true);
 });
 
 test("Gemini pairs a reformatted long Nexus prompt with the reply after it", () => {
@@ -332,6 +404,7 @@ test("Gemini trusted Enter confirmation requires the exact new user turn", async
       return [];
     }},
     getComputedStyle: () => ({visibility: "visible", display: "block"}),
+    HTMLTextAreaElement: class {}, HTMLInputElement: class {},
     setTimeout: (callback) => { callback(); return 1; },
   };
 
@@ -787,6 +860,26 @@ test("the provider load wait cannot miss a just-finished load", async () => {
   assert.equal(checks, 2);
 });
 
+test("an external provider waits for its hydrated composer before submission", async () => {
+  let checks = 0;
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    providerReadyDeadlineMs: 1000, providerReadyPollMs: 1,
+  });
+  const contents = {
+    executeJavaScript: async () => ({
+      ready: ++checks >= 3, reason: "Claude is still mounting its editor",
+    }),
+  };
+
+  const readiness = await manager.waitForProviderReady(contents, PROVIDERS.claude);
+
+  assert.equal(readiness.ready, true);
+  assert.equal(checks, 3);
+});
+
 test("stopping a web turn marks only that chat cancelled and clicks the provider stop control", async () => {
   const scripts = [];
   const manager = new WebChatManager({
@@ -914,6 +1007,70 @@ test("an activated turn with delayed acknowledgement becomes outcome-unknown wit
   assert.equal(state.submissionState, "outcome_unknown");
 });
 
+test("an activated pointer with the exact enabled draft proves not-accepted and permits one Enter", async () => {
+  const visible = {
+    getBoundingClientRect: () => ({width: 10, height: 10}), getClientRects: () => [1],
+  };
+  const composer = {
+    ...visible, innerText: "marked long prompt", textContent: "marked long prompt",
+  };
+  const send = {
+    ...visible, disabled: false, hasAttribute: () => false,
+    getAttribute: () => "false",
+  };
+  const began = {
+    ok: false, sendActivated: true, needsTrustedEnter: false,
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0, beforeUserLast: "",
+  };
+  const context = {
+    document: {querySelectorAll: (selector) => {
+      if (PROVIDERS.chatgpt.composer.includes(selector)) return [composer];
+      if (PROVIDERS.chatgpt.send.includes(selector)) return [send];
+      return [];
+    }},
+    getComputedStyle: () => ({visibility: "visible", display: "block"}),
+    HTMLTextAreaElement: class {}, HTMLInputElement: class {},
+    setTimeout: (callback) => { callback(); return 1; },
+  };
+
+  const state = await vm.runInNewContext(submissionScript(
+    PROVIDERS.chatgpt, "marked long prompt", began), context);
+
+  assert.equal(state.ok, false);
+  assert.equal(state.needsTrustedEnter, true);
+  assert.equal(state.submissionState, "not_accepted");
+});
+
+test("the embedded trusted Enter fallback focuses the composer and sends key text through CDP", async () => {
+  let attached = false;
+  const commands = [];
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  const contents = {
+    debugger: {
+      isAttached: () => attached, attach: () => { attached = true; },
+      detach: () => { attached = false; },
+      sendCommand: async (method, parameters) => commands.push([method, parameters]),
+    },
+    executeJavaScript: async (script) => {
+      assert.ok(script.includes("document.activeElement === composer"));
+      return true;
+    },
+  };
+
+  assert.equal(await manager.pressTrustedEnter(contents, PROVIDERS.chatgpt), true);
+  assert.equal(attached, false);
+  assert.deepEqual(commands.map(([method]) => method), [
+    "Emulation.setFocusEmulationEnabled", "Input.dispatchKeyEvent", "Input.dispatchKeyEvent",
+  ]);
+  assert.equal(commands[1][1].type, "keyDown");
+  assert.equal(commands[1][1].text, "\r");
+  assert.equal(commands[2][1].type, "keyUp");
+});
+
 test("a stable partial Gemini reply is not committed while its Stop control stays stuck", async () => {
   let stoppedRemote = false;
   let stops = 0;
@@ -969,7 +1126,7 @@ test("a provider with no clickable send control gets one trusted Enter fallback"
     focus: () => focusOrder.push("provider"),
     sendInputEvent: (event) => inputEvents.push(event),
     executeJavaScript: async (script) => {
-      if (script.includes("const composer = first")) {
+      if (script.includes("const before = values(selectors.replies)")) {
         return {ok: false, needsTrustedEnter: true, error: "not sent", ...baseline};
       }
       if (script.includes("needsTrustedEnter: false")) {
@@ -1010,6 +1167,7 @@ test("a provider with no clickable send control gets one trusted Enter fallback"
 
 test("ChatGPT submission uses native text input and a trusted pointer before polling", async () => {
   const commands = [];
+  const scripts = [];
   let attached = false;
   let answerChecks = 0;
   const baseline = {
@@ -1026,9 +1184,11 @@ test("ChatGPT submission uses native text input and a trusted pointer before pol
       sendCommand: async (method, parameters) => commands.push([method, parameters]),
     },
     executeJavaScript: async (script) => {
+      scripts.push(script);
       if (script.includes("needsTrustedInput: true")) {
         return {ok: false, needsTrustedInput: true, error: "not sent", ...baseline};
       }
+      if (script.includes("selectNodeContents")) return true;
       if (script.includes("submit_control_missing")) {
         return {ready: true, x: 320, y: 240, fingerprint: "BUTTON|composer-submit"};
       }
@@ -1062,17 +1222,75 @@ test("ChatGPT submission uses native text input and a trusted pointer before pol
   const inserted = commands.find(([method]) => method === "Input.insertText")?.[1]?.text;
   assert.match(inserted, /^\[NEXUS TRANSPORT TURN [0-9a-f-]{36}\]/);
   assert.ok(inserted.endsWith("Please answer natively"));
+  assert.ok(scripts.some((script) => script.includes("setSelectionRange")));
   assert.deepEqual(commands.map(([method, parameters]) => [
     method, parameters.type || "", parameters.key || "",
   ]), [
-    ["Input.dispatchKeyEvent", "rawKeyDown", "a"],
-    ["Input.dispatchKeyEvent", "keyUp", "a"],
-    ["Input.dispatchKeyEvent", "rawKeyDown", "Backspace"],
-    ["Input.dispatchKeyEvent", "keyUp", "Backspace"],
     ["Input.insertText", "", ""],
     ["Input.dispatchMouseEvent", "mouseMoved", ""],
     ["Input.dispatchMouseEvent", "mousePressed", ""],
     ["Input.dispatchMouseEvent", "mouseReleased", ""],
   ]);
+  assert.ok(answerChecks >= 3);
+});
+
+test("ChatGPT replaces a late-restored draft before any Send activation", async () => {
+  const commands = [];
+  let attached = false;
+  let insertions = 0;
+  let answerChecks = 0;
+  const baseline = {
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0,
+    beforeUserLast: "", beforeError: "", beforeStopping: false,
+  };
+  const contents = {
+    isDestroyed: () => false, focus: () => {},
+    debugger: {
+      isAttached: () => attached, attach: () => { attached = true; },
+      detach: () => { attached = false; },
+      sendCommand: async (method, parameters) => {
+        commands.push([method, parameters]);
+        if (method === "Input.insertText") insertions += 1;
+      },
+    },
+    executeJavaScript: async (script) => {
+      if (script.includes("needsTrustedInput: true")) {
+        return {ok: false, needsTrustedInput: true, error: "not sent", ...baseline};
+      }
+      if (script.includes("selectNodeContents")) return true;
+      if (script.includes("submit_control_missing")) {
+        return insertions === 1
+          ? {ready: false, code: "composer_not_committed"}
+          : {ready: true, x: 320, y: 240, fingerprint: "BUTTON|send-button"};
+      }
+      if (script.includes("for (let tries = 0; tries < 80; tries += 1)")) {
+        return {ok: true, needsTrustedInput: false, error: "", ...baseline};
+      }
+      answerChecks += 1;
+      return {answer: "HYDRATED_DRAFT_RECOVERED", changed: true, stopping: false, error: ""};
+    },
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    answerPollMs: 1, answerDeadlineMs: 1000,
+    submitReadyChecks: 2, submitAttempts: 2, submitPollMs: 1,
+  });
+  manager.connections.set("chatgpt-hydration", {
+    id: "chatgpt-hydration", provider: "chatgpt", title: "ChatGPT",
+    url: "https://chatgpt.com/",
+  });
+  manager.viewFor = () => ({webContents: contents});
+  manager.waitForLoad = async () => {};
+  manager.attachFiles = async () => {};
+  manager.rememberConnectionPage = () => false;
+  manager.showCreatedConversationInOpenShells = () => {};
+
+  const result = await manager.askNow("chatgpt-hydration", "long marked Nexus prompt", []);
+
+  assert.equal(result.answer, "HYDRATED_DRAFT_RECOVERED");
+  assert.equal(insertions, 2);
+  assert.equal(commands.filter(([method]) => method === "Input.dispatchMouseEvent").length, 3);
   assert.ok(answerChecks >= 3);
 });
