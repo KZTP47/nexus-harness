@@ -44,9 +44,6 @@ class PanelTestCase(unittest.TestCase):
         (self.root / ".harness").mkdir()
         config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
         self.panel = server.HarnessHTTPServer(("127.0.0.1", 0), config)
-        # Test teardown must wait for request handlers to finish their final
-        # durable-store cleanup before TemporaryDirectory removes the runtime.
-        self.panel.daemon_threads = False
         self.addCleanup(self.panel.server_close)
         self.port = self.panel.server_address[1]
         thread = threading.Thread(target=self.panel.serve_forever, daemon=True)

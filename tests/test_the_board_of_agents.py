@@ -24,6 +24,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1960,15 +1961,13 @@ class MovingAroundTheBoard(unittest.TestCase):
 
 
 class WhatThePanelIsTold(BoardTestCase):
+    HTTP_TIMEOUT_SECONDS = 30
+
     def setUp(self) -> None:
         super().setUp()
         self.where = self.a_project()
         config = load_config(self.where)
         self.panel = server.HarnessHTTPServer(("127.0.0.1", 0), config)
-        # A response can arrive just before the handler releases its durable
-        # conversation lease. Join request handlers before the temporary
-        # SQLite runtime is removed so Windows teardown cannot race that lease.
-        self.panel.daemon_threads = False
         self.addCleanup(self.panel.server_close)
         self.port = self.panel.server_address[1]
         thread = threading.Thread(target=self.panel.serve_forever, daemon=True)
@@ -1986,7 +1985,9 @@ class WhatThePanelIsTold(BoardTestCase):
             method="POST" if body is not None else "GET",
         )
         try:
-            with urllib.request.urlopen(asked, timeout=15) as answer:
+            with urllib.request.urlopen(
+                asked, timeout=self.HTTP_TIMEOUT_SECONDS,
+            ) as answer:
                 return answer.status, json.loads(answer.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             # Closed, not merely read. A turned-down answer holds a temporary
@@ -2746,6 +2747,21 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(said["routing"]["selected"], "chat")
         recipients = talked.call_args.kwargs["recipients"]
         self.assertEqual([one["id"] for one in recipients], ["agent-1"])
+        # The response is written immediately before the request handler's
+        # finally block releases the cross-process conversation lease. Wait
+        # for that exact durable cleanup before Windows removes the temporary
+        # SQLite database at test teardown.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self.panel.swarm_runs._read() as database:
+                outstanding = database.execute(
+                    "SELECT COUNT(*) FROM resources"
+                ).fetchone()[0]
+            if not outstanding:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("the solo chat did not release its durable resource lease")
 
     def test_asking_about_an_agent_that_is_gone(self) -> None:
         status, said = self.ask("/api/swarm/said?agent=agent-9")
