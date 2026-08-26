@@ -1997,6 +1997,20 @@ class WhatThePanelIsTold(BoardTestCase):
             with exc:
                 return exc.code, json.loads(exc.read().decode("utf-8"))
 
+    def wait_for_chat_resource_release(self, subject: str) -> None:
+        """Bound the response/finally race before Windows removes the test DB."""
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self.panel.swarm_runs._read() as database:
+                outstanding = database.execute(
+                    "SELECT COUNT(*) FROM resources"
+                ).fetchone()[0]
+            if not outstanding:
+                return
+            time.sleep(0.01)
+        self.fail(f"{subject} did not release its durable resource lease")
+
     def test_an_empty_board_is_still_an_answer(self) -> None:
         status, said = self.ask("/api/swarm")
         self.assertEqual(status, 200)
@@ -2340,6 +2354,7 @@ class WhatThePanelIsTold(BoardTestCase):
         first_id, second_id = by_name["First"], by_name["Second"]
         entered = {"first": threading.Event(), "second": threading.Event()}
         release_second = threading.Event()
+        self.addCleanup(release_second.set)
         results: dict[str, tuple[int, dict]] = {}
 
         def slow_answer(_config, _route, _text, filed_as="", **_kwargs):
@@ -2680,6 +2695,7 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(
             talked.call_args.kwargs["conversation_key"], conversation["filed_as"]
         )
+        self.wait_for_chat_resource_release("the pair chat")
 
     def test_casual_pair_send_allows_the_selected_agents_answer_to_survive_peer_failure(self) -> None:
         self.ask("/api/swarm/save", {"board": {
@@ -2751,17 +2767,7 @@ class WhatThePanelIsTold(BoardTestCase):
         # finally block releases the cross-process conversation lease. Wait
         # for that exact durable cleanup before Windows removes the temporary
         # SQLite database at test teardown.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            with self.panel.swarm_runs._read() as database:
-                outstanding = database.execute(
-                    "SELECT COUNT(*) FROM resources"
-                ).fetchone()[0]
-            if not outstanding:
-                break
-            time.sleep(0.01)
-        else:
-            self.fail("the solo chat did not release its durable resource lease")
+        self.wait_for_chat_resource_release("the solo chat")
 
     def test_asking_about_an_agent_that_is_gone(self) -> None:
         status, said = self.ask("/api/swarm/said?agent=agent-9")
