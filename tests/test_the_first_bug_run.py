@@ -109,9 +109,11 @@ class TheEvidenceStepTests(ProjectTestCase):
             "edges": [{"from": "start", "to": "evidence"}],
         })
         pipelines.run_it(self.config, pipeline)
-        kept = json.loads(
-            (self.root / ".harness" / "pipelines" / "last-run.json").read_text(encoding="utf-8")
+        evidence = list(
+            (self.root / ".harness" / "pipelines" / "evidence").rglob("*.json")
         )
+        self.assertEqual(len(evidence), 1, "the run wrote one immutable evidence file")
+        kept = json.loads(evidence[0].read_text(encoding="utf-8"))
         states = {one["id"]: one["state"] for one in kept}
         self.assertNotIn(
             "evidence", states,

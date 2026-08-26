@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import gc
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -52,6 +53,15 @@ class TimerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        self.runtime_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.runtime_temporary.cleanup)
+        prior_runtime = os.environ.get("OUR_HARNESS_PIPELINE_RUN_DIR")
+        os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = self.runtime_temporary.name
+        self.addCleanup(
+            lambda: os.environ.pop("OUR_HARNESS_PIPELINE_RUN_DIR", None)
+            if prior_runtime is None
+            else os.environ.__setitem__("OUR_HARNESS_PIPELINE_RUN_DIR", prior_runtime)
+        )
         self.root = Path(self.temporary.name).resolve()
         (self.root / ".harness").mkdir()
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
@@ -428,7 +438,15 @@ class NothingPrintedGivesAKeyAway(TimerTestCase):
 
         self.a_timer()
         timer.looked_just_now(self.config, datetime.now() - timedelta(days=1))
-        with self.a_run_that_says(f"it failed: Bearer {self.A_KEY}"),                 mock.patch.object(timer, "in_safe_words", lambda config, said: said):
+        # The durable run store is a second mandatory sink boundary now. Turn
+        # off both boundaries so this sentinel still proves the assertion can
+        # detect a complete redaction regression.
+        with self.a_run_that_says(f"it failed: Bearer {self.A_KEY}"), \
+                mock.patch.object(timer, "in_safe_words", lambda config, said: said), \
+                mock.patch(
+                    "our_harness.pipeline_runs.CredentialRedactor.value",
+                    lambda redactor, value: value,
+                ):
             said = timer.run_what_is_due(self.config)
         self.assertIn(self.A_KEY, json.dumps(said))
 
@@ -571,6 +589,8 @@ class WhatHappensWhenItRuns(TimerTestCase):
         self.assertEqual(len(kept.runs), 1)
         self.assertTrue(kept.runs[-1]["passed"])
         self.assertIn("passed", kept.runs[-1]["said"])
+        self.assertTrue(said["ran"][0]["run_id"])
+        self.assertEqual(kept.runs[-1]["run_id"], said["ran"][0]["run_id"])
 
     def test_a_run_that_failed_is_written_down_as_one(self) -> None:
         self.a_timer()

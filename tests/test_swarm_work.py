@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -10,8 +13,11 @@ from pathlib import Path
 from unittest import mock
 
 from our_harness import chat, swarm_work
+from our_harness import cancellation
+from our_harness.changes import FileTransaction, file_sha256
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
-from our_harness.models import ProviderRequest, ProviderResponse
+from our_harness.models import ChangePlan, ProviderRequest, ProviderResponse
+from our_harness.collaboration_ledger import CollaborationLedger, _event_hash
 from our_harness.providers.base import AnthropicProvider, OllamaProvider, OpenAIProvider
 from our_harness.providers.gemini import GeminiProvider
 
@@ -48,6 +54,42 @@ class SwarmWorkTests(unittest.TestCase):
         context = swarm_work.board_context(self.board, "agent-1")
         self.assertIn("Codex (route codex)", context)
         self.assertIn("No relay has happened", context)
+
+    def test_publicly_rehashed_collaboration_rewrite_fails_keyed_authorship(self) -> None:
+        ledger = CollaborationLedger(
+            self.config, "claude", "keyed-ledger", session_id="keyed-session"
+        ).begin(
+            "Keep the private evidence intact",
+            self.board["agents"],
+            mode="collaborate",
+        )
+        ledger.record_contribution({
+            "speaker_id": "agent-1", "recipient_id": "agent-2",
+            "recipient_name": "Codex", "text": "original private evidence",
+            "phase": "agent_discussion",
+        })
+        records = [
+            json.loads(line)
+            for line in ledger.paths.jsonl.read_text(encoding="utf-8").splitlines()
+        ]
+        records[-1]["text"] = "forged private evidence"
+        previous = ""
+        for event in records:
+            event["previous_hash"] = previous
+            event["hash"] = _event_hash(event)
+            previous = event["hash"]
+        rewritten = "".join(
+            json.dumps(one, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+            for one in records
+        )
+        ledger.paths.jsonl.write_text(rewritten, encoding="utf-8")
+
+        reopened = CollaborationLedger(
+            self.config, "claude", "keyed-ledger", session_id="keyed-session"
+        )
+        with self.assertRaisesRegex(Exception, "failed keyed integrity"):
+            reopened.projection_for("agent-2")
+        self.assertEqual(ledger.paths.jsonl.read_text(encoding="utf-8"), rewritten)
 
     def test_collaboration_relays_the_real_peer_answer_to_the_lead(self) -> None:
         contexts: list[tuple[str, str]] = []
@@ -186,7 +228,87 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertIsNone(result["round_limit"])
         self.assertTrue(any("no-progress cycle" in one for one in result["remaining"]))
 
-    def test_repeated_structured_provider_failure_cannot_keep_its_peer_in_a_loop(self) -> None:
+    def test_incident_rewording_cannot_hide_the_same_file_capability_blocker(self) -> None:
+        discussion_calls = 0
+        rounds = [
+            [
+                [
+                    "GPT Codex to create `arrayStats.js` via Nexus Work together action.",
+                    "Verify `arrayStats([1,2,3,4,5])` returns `{ sum: 15, average: 3, count: 5 }`.",
+                    "Verify `arrayStats([])` returns `{ sum: 0, average: 0, count: 0 }`.",
+                    "Verify `arrayStats([10])` returns `{ sum: 10, average: 10, count: 1 }`.",
+                ],
+                [
+                    "Nexus Work together must apply creation of `arrayStats.js` in the active project root.",
+                    "Verify `arrayStats([1,2,3,4,5])` returns `{ sum: 15, average: 3, count: 5 }`.",
+                    "Verify `arrayStats([])` returns `{ sum: 0, average: 0, count: 0 }`.",
+                    "Verify `arrayStats([10])` returns `{ sum: 10, average: 10, count: 1 }`.",
+                ],
+            ],
+            [
+                [
+                    "Nexus Work together action to create `arrayStats.js` in project root with GPT Codex's prepared implementation.",
+                    "Verify `arrayStats([1,2,3,4,5])` returns `{ sum: 15, average: 3, count: 5 }`.",
+                    "Verify `arrayStats([])` returns `{ sum: 0, average: 0, count: 0 }`.",
+                    "Verify `arrayStats([10])` returns `{ sum: 10, average: 10, count: 1 }`.",
+                ],
+                [
+                    "Nexus Work together action to create `arrayStats.js` in the active project root with the prepared implementation.",
+                    "Verify `arrayStats([1,2,3,4,5])` returns `{ sum: 15, average: 3, count: 5 }`.",
+                    "Verify `arrayStats([])` returns `{ sum: 0, average: 0, count: 0 }`.",
+                    "Verify `arrayStats([10])` returns `{ sum: 10, average: 10, count: 1 }`.",
+                ],
+            ],
+            [
+                [
+                    "Nexus Work together action needed to allow GPT Codex to write `arrayStats.js` to project root.",
+                    "Verify arrayStats([1,2,3,4,5]) returns correct values after file creation.",
+                    "Verify arrayStats([]) returns all zeros.",
+                    "Verify arrayStats([10]) returns correct values.",
+                ],
+                [
+                    "Nexus Work together action to create `arrayStats.js` in the active project root with GPT Codex's prepared implementation.",
+                    "Verify `arrayStats([1,2,3,4,5])` returns `{ sum: 15, average: 3, count: 5 }`.",
+                    "Verify `arrayStats([])` returns `{ sum: 0, average: 0, count: 0 }`.",
+                    "Verify `arrayStats([10])` returns `{ sum: 10, average: 10, count: 1 }`.",
+                ],
+            ],
+        ]
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal discussion_calls
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                round_index, agent_index = divmod(discussion_calls, 2)
+                discussion_calls += 1
+                value = {
+                    "message": f"The unchanged file-write blocker was reworded by {route}.",
+                    "goal_complete": False,
+                    "remaining": rounds[min(round_index, len(rounds) - 1)][agent_index],
+                }
+                return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+            return {"text": f"answer from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1",
+                "Claude, delegate a small verifiable task to GPT Codex.",
+                round_limit=None,
+            )
+
+        self.assertEqual(result["discussion_rounds"], 3)
+        self.assertEqual(result["stopped_because"], "stalled")
+        self.assertEqual(discussion_calls, 6)
+
+    def test_ask_once_preserves_user_cancellation_for_the_collaboration_engine(self) -> None:
+        class StoppedProvider:
+            def complete(self, _request):
+                raise cancellation.ChatCancelled(cancellation.STOPPED_MESSAGE)
+
+        with mock.patch.object(chat, "create_provider", return_value=StoppedProvider()):
+            with self.assertRaisesRegex(cancellation.ChatCancelled, "Stopped by you"):
+                chat.ask_once(self.config, "claude", "continue")
+
+    def test_structured_provider_failure_pauses_without_becoming_agent_speech(self) -> None:
         discussion_calls = 0
 
         def answer(_config, route, _text, **kwargs):
@@ -207,18 +329,44 @@ class SwarmWorkTests(unittest.TestCase):
             return {"text": f"initial or final answer from {route}", "milliseconds": 1, "model": route}
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
-            result = swarm_work.collaborate(
-                self.config, self.board, "agent-1", "Are you ChatGPT or Gemini?",
-                round_limit=None,
-            )
+            with self.assertRaisesRegex(
+                swarm_work.SwarmError, "paused this collaboration"
+            ):
+                swarm_work.collaborate(
+                    self.config, self.board, "agent-1", "Are you ChatGPT or Gemini?",
+                    round_limit=None,
+                )
 
-        self.assertFalse(result["goal_complete"])
-        self.assertEqual(result["discussion_rounds"], 3)
-        self.assertEqual(result["stopped_because"], "stalled")
-        self.assertEqual(discussion_calls, 6)
-        transcript = chat.read_it(self.config, "claude", "Claude")
-        failures = [one.text for one in transcript if "could not continue" in one.text]
-        self.assertEqual(len(failures), 3)
+        self.assertEqual(discussion_calls, 1)
+        ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.md"))
+        saved = ledger.read_text(encoding="utf-8")
+        self.assertIn("provider_transport_failure", saved)
+        self.assertNotIn("This agent could not continue", saved)
+
+    def test_initial_provider_failure_does_not_start_a_reasoning_round(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        def answer(_config, route, _text, **kwargs):
+            calls.append((route, kwargs.get("response_format")))
+            if route == "codex":
+                raise swarm_work.HarnessError("the web submit control rejected the turn")
+            return {"text": "lead draft", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            with self.assertRaisesRegex(
+                swarm_work.SwarmError, "not counted as an agent reply or a discussion round"
+            ):
+                swarm_work.collaborate(
+                    self.config, self.board, "agent-1", "Investigate together",
+                    round_limit=None,
+                )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(response_format is None for _route, response_format in calls))
+        ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.md"))
+        saved = ledger.read_text(encoding="utf-8")
+        self.assertIn("provider_unavailable", saved)
+        self.assertNotIn("the web submit control rejected the turn", saved)
 
     def test_unlimited_collaboration_stops_a_two_state_oscillation(self) -> None:
         discussion_calls = 0
@@ -243,7 +391,7 @@ class SwarmWorkTests(unittest.TestCase):
             )
 
         self.assertFalse(result["goal_complete"])
-        self.assertEqual(result["discussion_rounds"], 4)
+        self.assertEqual(result["discussion_rounds"], 3)
         self.assertEqual(result["stopped_because"], "stalled")
 
     def test_unlimited_collaboration_can_exceed_the_old_twelve_round_ceiling(self) -> None:
@@ -261,6 +409,11 @@ class SwarmWorkTests(unittest.TestCase):
                     "remaining": [] if finished else [
                         f"Produce distinct checkpoint-{cycle + 1}."
                     ],
+                    "progress": [{
+                        "id": "checkpoint",
+                        "state": str(cycle),
+                        "evidence": f"checkpoint-{cycle} completed",
+                    }],
                 }
                 return {"text": json.dumps(value), "milliseconds": 1, "model": route}
             return {"text": f"answer from {route}", "milliseconds": 1, "model": route}
@@ -462,6 +615,8 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual((self.project / "made-by-team.txt").read_text(), "claude + codex\n")
         self.assertEqual(result["changed"], ["made-by-team.txt"])
         self.assertTrue(result["transaction_id"])
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["verification_status"], "provider_consensus_unverified")
         transcript = chat.read_it(self.config, "claude", "Claude")
         self.assertEqual([one.phase for one in transcript], [
             "user_prompt", "lead_plan", "agent_plan",
@@ -471,6 +626,135 @@ class SwarmWorkTests(unittest.TestCase):
         ])
         self.assertIn("plan by codex", transcript[2].text)
         self.assertIn("made-by-team.txt", transcript[-1].text)
+        self.assertIn("not independently verified", transcript[-1].text)
+
+    def test_incomplete_run_rolls_back_all_applied_transactions(self) -> None:
+        target = self.project / "existing.txt"
+        target.write_text("original\n", encoding="utf-8")
+
+        def answer(_config, route, _text, **kwargs):
+            response_format = kwargs.get("response_format")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {"contribution": "edit", "message_to_lead": "edit", "needs_files": []}
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {
+                    "contribution": "edit", "message_to_lead": "ready",
+                    "needs_files": [], "ready_to_execute": True, "remaining": [],
+                }
+            elif response_format is swarm_work.WORK_VERIFICATION_FORMAT:
+                value = {
+                    "goal_complete": False, "feedback": "still incomplete",
+                    "remaining": ["A deterministic acceptance check is missing."],
+                }
+            else:
+                value = {
+                    "reply": "edited", "changes": [{
+                        "path": "existing.txt", "content": f"changed by {route}\n",
+                        "reason": "requested",
+                    }],
+                }
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.work_together(
+                self.config, self.board, "agent-1", "Edit existing.txt", round_limit=1,
+            )
+        self.assertEqual(target.read_text(encoding="utf-8"), "original\n")
+        self.assertEqual(result["changed"], [])
+        self.assertEqual(result["mutation_recovery"]["status"], "rolled_back")
+        self.assertFalse(result["goal_complete"])
+
+    def test_rollback_conflict_preserves_external_content_and_reports_uncertainty(self) -> None:
+        target = self.project / "conflict.txt"
+        target.write_text("before\n", encoding="utf-8")
+        manifest = FileTransaction(self.project).apply([ChangePlan(
+            "conflict.txt", file_sha256(target), "after\n", reason="test"
+        )])
+        target.write_text("external\n", encoding="utf-8")
+        result = swarm_work._rollback_transactions(
+            self.project, [str(manifest["transaction_id"])]
+        )
+        self.assertEqual(result["status"], "rollback_conflict")
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+
+    def test_cancellation_after_a_partial_execution_rolls_back_before_propagating(self) -> None:
+        work_calls = 0
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal work_calls
+            response_format = kwargs.get("response_format")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {"contribution": "edit", "message_to_lead": "edit", "needs_files": []}
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {
+                    "contribution": "edit", "message_to_lead": "ready",
+                    "needs_files": [], "ready_to_execute": True, "remaining": [],
+                }
+            elif response_format is swarm_work.WORK_FORMAT:
+                work_calls += 1
+                if work_calls == 2:
+                    raise cancellation.ChatCancelled(cancellation.STOPPED_MESSAGE)
+                value = {
+                    "reply": "partial", "changes": [{
+                        "path": "partial.txt", "content": "partial\n", "reason": "requested",
+                    }],
+                }
+            else:
+                raise AssertionError(f"unexpected response format for {route}")
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            with self.assertRaises(cancellation.ChatCancelled):
+                swarm_work.work_together(
+                    self.config, self.board, "agent-1", "Create partial.txt"
+                )
+        self.assertFalse((self.project / "partial.txt").exists())
+
+    def test_crashed_process_saga_is_compensated_before_the_next_run(self) -> None:
+        target = self.project / "crash.txt"
+        target.write_text("before\n", encoding="utf-8")
+        script = r'''import os, sys
+from pathlib import Path
+from our_harness.changes import FileTransaction, file_sha256
+from our_harness.models import ChangePlan
+from our_harness.swarm_work import _MutationSaga
+root = Path(sys.argv[1]).resolve(); target = root / "crash.txt"
+saga = _MutationSaga(root, "crash-injection")
+txid = FileTransaction.new_transaction_id(); saga.prepare(txid)
+FileTransaction(root).apply([ChangePlan("crash.txt", file_sha256(target), "after\n", reason="crash test")], transaction_id=txid)
+saga.applied(txid)
+os._exit(23)
+'''
+        env = dict(os.environ, PYTHONPATH=str(Path.cwd() / "src"))
+        process = subprocess.run(
+            [sys.executable, "-c", script, str(self.project)], env=env, check=False,
+        )
+        self.assertEqual(process.returncode, 23)
+        self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
+        recovered = swarm_work._MutationSaga.recover_orphans(self.project)
+        self.assertEqual(recovered[0]["status"], "rolled_back")
+        self.assertEqual(target.read_text(encoding="utf-8"), "before\n")
+        journal = json.loads(next(
+            (self.project / ".harness" / "swarm-mutation-sagas").glob("*.json")
+        ).read_text(encoding="utf-8"))
+        self.assertEqual(journal["phase"], "compensated")
+
+    def test_saga_conflict_is_durable_and_blocks_later_mutation_recovery(self) -> None:
+        target = self.project / "saga-conflict.txt"
+        target.write_text("before\n", encoding="utf-8")
+        saga = swarm_work._MutationSaga(self.project, "durable-conflict")
+        transaction_id = FileTransaction.new_transaction_id()
+        saga.prepare(transaction_id)
+        FileTransaction(self.project).apply([ChangePlan(
+            "saga-conflict.txt", file_sha256(target), "after\n", reason="test"
+        )], transaction_id=transaction_id)
+        saga.applied(transaction_id)
+        target.write_text("external\n", encoding="utf-8")
+        result = saga.compensate("test_conflict")
+        self.assertEqual(result["status"], "rollback_conflict")
+        self.assertEqual(target.read_text(encoding="utf-8"), "external\n")
+        blocked = swarm_work._MutationSaga.recover_orphans(self.project)
+        self.assertEqual(blocked[0]["status"], "rollback_conflict")
 
     def test_project_work_reports_planning_validation_and_application(self) -> None:
         stages: list[str] = []
@@ -799,25 +1083,33 @@ class SwarmWorkTests(unittest.TestCase):
             return {"text": json.dumps(value), "milliseconds": 1, "model": route}
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
-            result = swarm_work.work_together(
-                self.config, self.board, "agent-1", "Create marker.txt"
-            )
+            with self.assertRaisesRegex(
+                swarm_work.SwarmError,
+                "paused this collaboration.*not counted as agent speech",
+            ):
+                swarm_work.work_together(
+                    self.config, self.board, "agent-1", "Create marker.txt"
+                )
 
-        self.assertEqual(result["plan_rounds"], 3)
-        self.assertEqual(review_calls, 6)
-        self.assertFalse(result["goal_complete"])
-        self.assertEqual(result["work_passes"], 0)
+        self.assertEqual(review_calls, 1)
         self.assertFalse((self.project / "marker.txt").exists())
-        transcript = chat.read_it(self.config, "claude", "Claude")
-        reviews = [one.text for one in transcript if one.phase == "agent_plan_review"]
+        ledger_paths = list(
+            (self.root / ".harness" / "chats").glob("*.collaboration.jsonl")
+        )
+        self.assertEqual(len(ledger_paths), 1)
+        events = [
+            json.loads(line)
+            for line in ledger_paths[0].read_text(encoding="utf-8").splitlines()
+        ]
         self.assertTrue(any(
-            "invalid nexus_board_plan_review_v1" in text
-            and "missing ready_to_execute, remaining" in text
-            for text in reviews
-        ), reviews)
-        self.assertTrue(any("Execution readiness: ready" in text for text in reviews))
-        self.assertFalse(any(one.phase == "lead_execution" for one in transcript))
-        self.assertIn("stopped before opening a project-file transaction", transcript[-1].text)
+            event.get("phase") == "provider_transport_failure"
+            and event.get("state", {}).get("stage") == "plan_review"
+            and event.get("state", {}).get("round") == 1
+            for event in events
+        ))
+        rendered = "\n".join(str(event.get("text") or "") for event in events)
+        self.assertNotIn("invalid nexus_board_plan_review_v1", rendered)
+        self.assertNotIn("Plan review failed", rendered)
 
     def test_structured_web_style_json_fence_is_accepted_but_schema_stays_strict(self) -> None:
         answer = {"text": "```json\n{\"contribution\":\"plan\",\"message_to_lead\":\"go\",\"needs_files\":[]}\n```"}

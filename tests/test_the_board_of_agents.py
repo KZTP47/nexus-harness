@@ -44,12 +44,16 @@ class BoardTestCase(unittest.TestCase):
         # test never touches the real one.
         self.somewhere_else = self.root / "settings"
         self.somewhere_else.mkdir()
+        (self.root / "authority-project").mkdir()
         patched = mock.patch.dict(os.environ, {
             "APPDATA": str(self.somewhere_else),
             "XDG_CONFIG_HOME": str(self.somewhere_else),
+            "OUR_HARNESS_SWARM_RUN_DIR": str(self.root / "runtime"),
         })
         patched.start()
         self.addCleanup(patched.stop)
+        self.config = LoadedConfig(
+            copy.deepcopy(DEFAULT_CONFIG), self.root / "authority-project", [], {})
 
     def a_project(self, name: str = "alpha") -> Path:
         where = self.root / name
@@ -77,7 +81,7 @@ class BoardTestCase(unittest.TestCase):
             "projects": named("project", kept.get("projects", [])),
             "works_on": kept.get("works_on", []),
             "talks_to": kept.get("talks_to", []),
-        })
+        }, self.config)
 
 
 class WhatABoardIs(BoardTestCase):
@@ -152,7 +156,7 @@ class WhatABoardIs(BoardTestCase):
         # Ids are handed out while it is being read, so they have to be looked
         # up rather than guessed at.
         board = swarm.load()
-        again = swarm.save(json.loads(json.dumps(board.to_dict())))
+        again = swarm.save(json.loads(json.dumps(board.to_dict())), self.config)
         self.assertEqual(
             [one.id for one in again.agents], [one.id for one in board.agents])
         self.assertEqual(again.projects[0].tasks, ["Do it"])
@@ -202,28 +206,30 @@ class TwoWindowsOnOneBoard(BoardTestCase):
 
     def test_a_save_built_from_the_board_that_is_there_goes_through(self) -> None:
         board = self.a_board(agents=[{"name": "One"}])
-        again = swarm.save({"version": board.version, "agents": [{"name": "Two"}]})
+        again = swarm.save(
+            {"version": board.version, "agents": [{"name": "Two"}]}, self.config)
         self.assertEqual([one.name for one in again.agents], ["Two"])
 
     def test_a_save_built_from_an_older_board_is_refused(self) -> None:
         self.a_board(agents=[{"name": "One"}])
         self.a_board(agents=[{"name": "Two"}])
         with self.assertRaises(swarm.SwarmError) as caught:
-            swarm.save({"version": 1, "agents": [{"name": "Three"}]})
+            swarm.save({"version": 1, "agents": [{"name": "Three"}]}, self.config)
         self.assertIn("another window", str(caught.exception))
 
     def test_the_refused_one_changed_nothing(self) -> None:
         self.a_board(agents=[{"name": "One"}])
         self.a_board(agents=[{"name": "Two"}])
         with self.assertRaises(swarm.SwarmError):
-            swarm.save({"version": 1, "agents": [{"name": "Three"}]})
+            swarm.save({"version": 1, "agents": [{"name": "Three"}]}, self.config)
         self.assertEqual([one.name for one in swarm.load().agents], ["Two"])
 
     def test_a_board_that_says_nothing_about_versions_is_taken_as_is(self) -> None:
         """A test, or the very first write, or anything that never read one."""
 
         self.a_board(agents=[{"name": "One"}])
-        self.assertEqual(swarm.save({"agents": [{"name": "Two"}]}).version, 2)
+        self.assertEqual(
+            swarm.save({"agents": [{"name": "Two"}]}, self.config).version, 2)
 
     def test_something_that_only_looks_like_a_version_is_refused(self) -> None:
         """Taken as "said nothing", a version written as 3.0 or as "3" would
@@ -232,7 +238,8 @@ class TwoWindowsOnOneBoard(BoardTestCase):
         self.a_board(agents=[{"name": "One"}])
         for said in (1.0, "1", True, -1, [1]):
             with self.subTest(said=said), self.assertRaises(swarm.SwarmError) as caught:
-                swarm.save({"version": said, "agents": [{"name": "Two"}]})
+                swarm.save(
+                    {"version": said, "agents": [{"name": "Two"}]}, self.config)
             self.assertIn("not a version", str(caught.exception))
         self.assertEqual([one.name for one in swarm.load().agents], ["One"])
 
@@ -312,7 +319,7 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
         board = swarm.save({
             "agents": [{"name": "One"}, {"name": "Two"}],
             "projects": [{"path": str(self.a_project())}],
-        })
+        }, self.config)
         self.assertEqual([one.id for one in board.agents], ["agent-1", "agent-2"])
         self.assertEqual([one.id for one in board.projects], ["project-1"])
         self.assertEqual((board.made_agents, board.made_projects), (2, 1))
@@ -322,7 +329,7 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
         said = board.to_dict()
         said["agents"] = [one for one in said["agents"] if one["name"] != "One"]
         said["agents"].append({"name": "Replacement"})
-        again = swarm.save(said)
+        again = swarm.save(said, self.config)
         self.assertEqual(
             [(one.id, one.name) for one in again.agents],
             [("agent-2", "Two"), ("agent-3", "Replacement")],
@@ -333,7 +340,7 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
         board = self.a_board(projects=[{"path": str(first)}])
         said = board.to_dict()
         said["projects"] = [{"path": str(self.a_project("beta"))}]
-        again = swarm.save(said)
+        again = swarm.save(said, self.config)
         self.assertEqual([one.id for one in again.projects], ["project-2"])
 
     def test_the_count_only_ever_goes_up(self) -> None:
@@ -341,7 +348,7 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
         self.assertEqual(board.made_agents, 4)
         said = board.to_dict()
         said["agents"] = []
-        self.assertEqual(swarm.save(said).made_agents, 4)
+        self.assertEqual(swarm.save(said, self.config).made_agents, 4)
 
     def test_a_caller_that_says_nothing_about_the_count_cannot_turn_it_back(self) -> None:
         """The one that matters. Somebody replacing the whole roster with fresh
@@ -350,7 +357,7 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
         box a name a removed one used to have."""
 
         self.a_board(agents=[{"name": f"Agent {n}"} for n in range(5)])
-        board = swarm.save({"agents": [{"name": "Replacement"}]})
+        board = swarm.save({"agents": [{"name": "Replacement"}]}, self.config)
         self.assertEqual(board.made_agents, 6)
         self.assertEqual([one.id for one in board.agents], ["agent-6"])
 
@@ -358,7 +365,8 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
         self.a_board(projects=[
             {"path": str(self.a_project(f"one-{n}"))} for n in range(3)
         ])
-        board = swarm.save({"projects": [{"path": str(self.a_project("later"))}]})
+        board = swarm.save(
+            {"projects": [{"path": str(self.a_project("later"))}]}, self.config)
         self.assertEqual([one.id for one in board.projects], ["project-4"])
 
     def test_an_id_asked_for_on_purpose_is_still_honoured(self) -> None:
@@ -367,7 +375,8 @@ class ANameIsNeverHandedOutTwice(BoardTestCase):
         works on what."""
 
         self.a_board(agents=[{"name": f"Agent {n}"} for n in range(5)])
-        board = swarm.save({"agents": [{"id": "agent-1", "name": "Pinned"}]})
+        board = swarm.save(
+            {"agents": [{"id": "agent-1", "name": "Pinned"}]}, self.config)
         self.assertEqual([one.id for one in board.agents], ["agent-1"])
 
     def test_an_older_board_keeps_the_names_its_boxes_have(self) -> None:
@@ -1225,9 +1234,9 @@ class WhatEachChatHoldsTests(BoardTestCase):
         kept.parent.mkdir(parents=True, exist_ok=True)
 
         def put(text: str) -> None:
-            kept.write_text(json.dumps(
-                [{"who": "them", "text": text, "at": "2026-01-01T00:00:00"}]),
-                encoding="utf-8")
+            chat._keep_it(self.config, "claude", [
+                chat.Said("them", text, "2026-01-01T00:00:00")
+            ], "The reviewer", replace_projection=True)
 
         put("the first line")
         # The time of the first write, kept before the second one happens. Put
@@ -1330,15 +1339,15 @@ class WhatEachChatHoldsTests(BoardTestCase):
         self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
         kept = chat.where_it_is_kept(self.config, "claude", "The reviewer")
         kept.parent.mkdir(parents=True, exist_ok=True)
-        kept.write_text(json.dumps([
-            {"who": "them", "text": "The first answer", "at": "2026-01-01T00:00:00"},
-        ]), encoding="utf-8")
+        chat._keep_it(self.config, "claude", [
+            chat.Said("them", "The first answer", "2026-01-01T00:00:00")
+        ], "The reviewer", replace_projection=True)
         swarm.how_it_stands(self.config)
 
-        kept.write_text(json.dumps([
-            {"who": "them", "text": "The first answer", "at": "2026-01-01T00:00:00"},
-            {"who": "them", "text": "And the next one", "at": "2026-01-01T00:00:20"},
-        ]), encoding="utf-8")
+        chat._keep_it(self.config, "claude", [
+            chat.Said("them", "The first answer", "2026-01-01T00:00:00"),
+            chat.Said("them", "And the next one", "2026-01-01T00:00:20"),
+        ], "The reviewer")
         agent = swarm.how_it_stands(self.config)["board"]["agents"][0]
         self.assertEqual((agent["said"], agent["last_said"]), (2, "And the next one"))
 
@@ -1464,11 +1473,43 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('id="swarmRefresh"', stage)
         self.assertIn(".swarm-stage:fullscreen", self.styles)
 
+    def test_board_has_a_semantic_structure_scope_and_named_destructive_actions(self) -> None:
+        self.assertIn('id="swarmStructure"', self.markup)
+        self.assertIn('id="swarmScopePreview"', self.markup)
+        self.assertIn('class="danger" type="button">Remove selected agent', self.markup)
+        self.assertIn('function renderSwarmStructure()', self.script)
+        self.assertIn('Change talk permission between ${agent.name}', self.script)
+
+    def test_board_refresh_restores_the_focused_control_not_only_chat_text(self) -> None:
+        self.assertIn('const focusedBoardBox = document.activeElement?.closest?.(".swarm-box")',
+                      self.script)
+        self.assertIn('const focusedBoardControl = focusedBoardBox ?', self.script)
+        self.assertIn('pick.dataset.does = "pick"', self.script)
+        self.assertIn('restored.focus({preventScroll: true})', self.script)
+
+    def test_phone_and_zoom_layout_keep_fullscreen_controls_in_view(self) -> None:
+        self.assertIn('@media (max-width: 380px)', self.styles)
+        self.assertIn('.swarm-stage:fullscreen, .swarm-stage.is-fullscreen {', self.styles)
+        self.assertIn('grid-template-columns: minmax(0, 1fr)', self.styles)
+
     def test_the_saved_board_that_returns_next_time_is_visibly_marked(self) -> None:
         self.assertIn('open.setAttribute("aria-current", "true")', self.script)
         self.assertIn("Open now · returns next time", self.script)
         self.assertIn('.swarm-kept-pick[aria-current="true"]', self.styles)
         self.assertIn("the saved board you used last", self.script)
+
+    def test_startup_draws_saved_boards_before_refreshing_provider_status(self) -> None:
+        refresh = self.script[
+            self.script.index("async function refreshSwarm"):
+            self.script.index("function keepTheSwarmPick")
+        ]
+        fast_read = refresh.index('"/api/swarm?refresh_providers=false"')
+        draw = refresh.index("renderTheKeptBoards();")
+        background_probe = refresh.index("void refreshSwarm(true);")
+        self.assertLess(fast_read, draw)
+        self.assertLess(draw, background_probe)
+        self.assertIn("const firstHydration = !swarmBoardHydrated;", refresh)
+        self.assertIn("if (said.provider_status_stale", refresh)
 
     def test_login_checks_send_the_route_and_keep_the_answer_visible(self) -> None:
         check = self.script[
@@ -1492,6 +1533,15 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('"danger swarm-chat-stop", "Stop"', self.script)
         self.assertIn('request("/api/chat/stop"', self.script)
         self.assertIn('request("/api/swarm/stop-chat"', self.script)
+
+    def test_board_runs_reuse_ambiguous_request_identity_and_poll_by_cursor(self) -> None:
+        self.assertIn('localStorage.getItem("nexus.swarm.board-request")', self.script)
+        self.assertIn("swarmBoardRequestId || crypto.randomUUID()", self.script)
+        self.assertIn('localStorage.setItem("nexus.swarm.board-request", requestId)', self.script)
+        self.assertIn("readSwarmBoardRun(swarmBoardRunId, swarmBoardCursor)", self.script)
+        self.assertIn("doing.next_cursor ?? doing.cursor", self.script)
+        self.assertIn("if (!doing.has_more || next === cursor) return doing", self.script)
+        self.assertIn('JSON.stringify({run_id: swarmBoardRunId})', self.script)
         self.assertIn("window.harnessDesktop.stopWebChat(", self.script)
         self.assertIn('agent.who, conversation?.filed_as || ""', self.script)
 
@@ -1595,6 +1645,53 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('chat: conversation?.id || ""', self.script)
         self.assertIn(".the-big-chat-workspace", self.styles)
         self.assertIn(".the-big-chat-conversation-pick.active", self.styles)
+
+    def test_maximised_chat_stacks_at_phone_width_and_exposes_live_layout_evidence(self) -> None:
+        self.assertIn("@media (max-width: 520px)", self.styles)
+        self.assertIn("grid-template-columns: minmax(0, 1fr)", self.styles)
+        self.assertIn("grid-template-rows: minmax(72px, 112px) minmax(0, 1fr)", self.styles)
+        self.assertIn(".the-big-chat-sheet {\n    display: grid;", self.styles)
+        self.assertIn(".the-big-chat-top {\n    position: relative; z-index: 5", self.styles)
+        self.assertIn('id="theBigChatActions"', self.markup)
+        self.assertIn("#theBigChatActions", self.styles)
+        self.assertIn("function theBigChatLayoutEvidence()", self.script)
+        for metric in ("documentHasHorizontalOverflow", "mainPaneClippedHorizontally",
+                       "mainInsideSheetAndViewport", "headerInsideSheetAndViewport",
+                       "titleInsideSheetAndViewport", "closeInsideSheetAndViewport",
+                       "textboxInsideSheetAndViewport", "sendInsideSheetAndViewport",
+                       "headerReachable", "boundedInternalScrolling", "stacked"):
+            self.assertIn(metric, self.script)
+        self.assertIn('$("theBigChatBox").focus({preventScroll: true})', self.script)
+        self.assertIn("function revealTheBigChatComposer()", self.script)
+
+    def test_maximised_chat_restores_its_invoker_for_every_dismiss_path(self) -> None:
+        self.assertIn("let theBigChatInvoker = null", self.script)
+        self.assertIn("theBigChatInvoker = document.activeElement", self.script)
+        self.assertIn("function restoreTheBigChatFocus()", self.script)
+        minimised = self.script[self.script.index("function minimiseTheBigChat"):
+                                self.script.index("function shutTheBigChat")]
+        self.assertIn("restoreTheBigChatFocus()", minimised)
+        self.assertIn('event.key === "Escape" && theBigOne', self.script)
+
+    def test_removing_agents_and_projects_confirms_impact_before_mutating(self) -> None:
+        agent = self.script[self.script.index("async function removeTheSwarmAgent"):
+                            self.script.index("async function removeTheSwarmProject")]
+        project = self.script[self.script.index("async function removeTheSwarmProject"):
+                              self.script.index("async function addOneSwarmTask")]
+        self.assertLess(agent.index("window.confirm"), agent.index("discardSwarmAgentSettings"))
+        self.assertIn("project assignment", agent)
+        self.assertIn("agent connection", agent)
+        self.assertLess(project.index("window.confirm"), project.index("changeTheSwarmBoard"))
+        self.assertIn("board task", project)
+        self.assertIn("Nothing in the project folder is changed", project)
+        self.assertIn("invoker?.focus?", agent + project)
+
+    def test_start_again_does_not_read_a_nonexistent_acceptance_response(self) -> None:
+        start_again = self.script[self.script.index("async function startTalkingAgain"):
+                                  self.script.index("/* ==========================================================================",
+                                                    self.script.index("async function startTalkingAgain"))]
+        self.assertNotIn("accepted", start_again)
+        self.assertIn("said.web_chat_id", start_again)
 
     def test_every_major_maximised_chat_pane_is_resizable_and_persisted(self) -> None:
         for identity in (
@@ -1885,6 +1982,27 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertIn("agents", said["most"])
         self.assertIn("no agents yet", " ".join(said["what_is_not_ready"]))
 
+    def test_first_board_hydration_does_not_wait_for_provider_discovery(self) -> None:
+        self.ask("/api/swarm/save", {"board": {"agents": [{
+            "name": "The reviewer", "who": "claude",
+        }]}})
+        self.panel.swarm_known_routes = None
+        with mock.patch.object(chat, "who_can_talk") as discover:
+            status, said = self.ask("/api/swarm?refresh_providers=false")
+        self.assertEqual(status, 200)
+        self.assertEqual(said["board"]["agents"][0]["name"], "The reviewer")
+        self.assertTrue(said["provider_status_stale"])
+        discover.assert_not_called()
+
+    def test_normal_board_refresh_discovers_and_caches_provider_status(self) -> None:
+        routes = [{"route": "claude", "label": "Claude", "ready": True}]
+        with mock.patch.object(chat, "who_can_talk", return_value=routes) as discover:
+            status, said = self.ask("/api/swarm")
+        self.assertEqual(status, 200)
+        self.assertFalse(said["provider_status_stale"])
+        self.assertEqual(self.panel.swarm_known_routes, routes)
+        discover.assert_called_once()
+
     def test_chat_activity_feed_returns_current_or_waiting_stage(self) -> None:
         activity_id = "activity-test-123"
         status, waiting = self.ask(f"/api/swarm/activity?activity={activity_id}")
@@ -1961,6 +2079,86 @@ class WhatThePanelIsTold(BoardTestCase):
             thread.join(5)
         self.assertEqual(result[0][0], 200)
 
+    def test_chat_acceptance_pins_project_config_and_store_until_finish(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "The reviewer", "who": "claude"},
+        ]}})
+        self.assertEqual(status, 200)
+        agent_id = saved["board"]["agents"][0]["id"]
+        old_config = self.panel.config
+        old_store = self.panel.swarm_runs
+        other = self.a_project("switch-target")
+        entered = threading.Event()
+        release = threading.Event()
+        seen: dict[str, object] = {}
+        result: list[tuple[int, dict]] = []
+
+        def slow_answer(config, *_args, **_kwargs):
+            seen["config"] = config
+            entered.set()
+            self.assertTrue(release.wait(5), "project switch race did not release provider")
+            return {"said": []}
+
+        def send() -> None:
+            result.append(self.ask("/api/swarm/say", {
+                "agent": agent_id, "text": "hello", "mode": "chat",
+                "activity": "activity-project-pin-123",
+                "request_id": "request-project-pin-123",
+            }))
+
+        with mock.patch.object(chat, "say", side_effect=slow_answer):
+            thread = threading.Thread(target=send)
+            thread.start()
+            self.assertTrue(entered.wait(5), "accepted chat did not reach provider")
+            active = old_store.active()
+            self.assertIsNotNone(active)
+            status, refused = self.ask("/api/projects/open", {"path": str(other)})
+            self.assertGreaterEqual(status, 400)
+            self.assertIn("swarm board or chat command is active", json.dumps(refused).lower())
+            self.assertIs(self.panel.config, old_config)
+            self.assertIs(self.panel.swarm_runs, old_store)
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result[0][0], 200, result[0][1])
+        self.assertIs(seen["config"], old_config)
+        self.assertEqual(
+            old_store.get("request-project-pin-123")["status"], "complete"
+        )
+
+    def test_board_acceptance_and_project_switch_are_one_lock_boundary(self) -> None:
+        old_config = self.panel.config
+        other = self.a_project("board-switch-target")
+        entered = threading.Event()
+        release = threading.Event()
+        result: list[tuple[int, dict]] = []
+
+        def slow_start(config, _standing, request_id):
+            self.assertIs(config, old_config)
+            entered.set()
+            self.assertTrue(release.wait(5), "project switch race did not release board start")
+            return {"run_id": "board-lock-run", "request_id": request_id}
+
+        def start_board() -> None:
+            result.append(self.ask(
+                "/api/swarm/start", {"request_id": "board-lock-request"}
+            ))
+
+        standing = {"board": {"agents": [], "projects": [], "works_on": [], "talks_to": []}}
+        with mock.patch.object(self.panel, "swarm_standing", return_value=standing), \
+                mock.patch.object(self.panel.swarm_runner, "start", side_effect=slow_start):
+            thread = threading.Thread(target=start_board)
+            thread.start()
+            self.assertTrue(entered.wait(5), "board start did not enter acceptance")
+            status, refused = self.ask("/api/projects/open", {"path": str(other)})
+            self.assertGreaterEqual(status, 400)
+            self.assertIn("swarm board or chat command is being accepted", json.dumps(refused).lower())
+            self.assertIs(self.panel.config, old_config)
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result[0][0], 200, result[0][1])
+
     def test_stopping_one_chat_cancels_it_without_stopping_another_chat(self) -> None:
         status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
             {"name": "First", "who": "claude"},
@@ -1994,12 +2192,23 @@ class WhatThePanelIsTold(BoardTestCase):
             second.start()
             self.assertTrue(entered["first"].wait(5))
             self.assertTrue(entered["second"].wait(5))
+            first_run = self.panel.swarm_runs.get("activity-first-123")
+            self.assertEqual(first_run["status"], "running")
+
+            refused_status, refused = self.ask("/api/swarm/stop-chat", {
+                "agent": first_id,
+                "activity": "activity-first-123",
+                "run_id": "stale-run-id",
+            })
+            self.assertEqual(refused_status, 400)
+            self.assertIn("does not exist", refused["error"])
+            self.assertTrue(first.is_alive(), "a stale run ID stopped the current chat")
 
             status, stopped = self.ask("/api/swarm/stop-chat", {
                 "agent": first_id, "activity": "activity-first-123",
             })
             self.assertEqual(status, 200)
-            self.assertTrue(stopped["stopped"])
+            self.assertTrue(stopped["stopped"], stopped)
             first.join(2)
             self.assertFalse(first.is_alive())
             self.assertTrue(second.is_alive(), "another chat was stopped too")
@@ -2137,6 +2346,45 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertTrue(all(
             "known_routes" in call.kwargs for call in how.call_args_list
         ), how.call_args_list)
+
+    def test_pair_chat_archive_and_restore_api_preserves_the_transcript(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        conversation = listed["chats"][0]
+        chat.keep_exchange(
+            self.panel.config, "claude", "remember this", "still saved",
+            filed_as=conversation["filed_as"],
+        )
+
+        status, archived = self.ask("/api/swarm/chats/delete", {
+            "agent": "agent-1", "chat": conversation["id"],
+        })
+        self.assertEqual(status, 200)
+        row = next(one for one in archived["chats"] if one["id"] == conversation["id"])
+        self.assertTrue(row["archived_at"])
+        self.assertTrue(chat.where_it_is_kept(
+            self.panel.config, "claude", conversation["filed_as"]
+        ).is_file())
+        status, refused = self.ask("/api/swarm/chats/activate", {
+            "agent": "agent-1", "chat": conversation["id"],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("Restore", refused["error"])
+
+        status, restored = self.ask("/api/swarm/chats/restore", {
+            "agent": "agent-1", "chat": conversation["id"],
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(restored["active"], conversation["id"])
+        self.assertEqual(chat.read_it(
+            self.panel.config, "claude", conversation["filed_as"]
+        )[-1].text, "still saved")
 
     def test_pair_chat_request_routes_only_its_peer_project_and_transcript(self) -> None:
         self.ask("/api/swarm/save", {"board": {
@@ -2403,10 +2651,10 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(status, 400)
         self.assertIn("nothing to set going", said["error"])
 
-    def test_stopping_when_nothing_is_going_says_so(self) -> None:
+    def test_stopping_without_an_exact_run_id_fails_closed(self) -> None:
         status, said = self.ask("/api/swarm/stop", {})
-        self.assertEqual(status, 200)
-        self.assertIn("Nothing is going", said["note"])
+        self.assertEqual(status, 400)
+        self.assertIn("exact Swarm run ID", said["error"])
 
     def test_a_save_from_a_window_that_is_behind_is_refused(self) -> None:
         status, said = self.ask("/api/swarm/save", {"board": {

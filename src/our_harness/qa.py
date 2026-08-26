@@ -1792,6 +1792,7 @@ class QaRunner:
         workers: int | None = None,
         run_id: str | None = None,
         write_artifacts: bool = True,
+        immutable_artifacts: bool = False,
         part: tuple[int, int] = (0, 0),
     ) -> QaRunResult:
         selected = self.select(suite, tags=tags, ids=ids, part=part)
@@ -1807,7 +1808,12 @@ class QaRunner:
                 self.root,
                 f"{str(self.config.get('qa.artifacts_dir', '.harness/qa/runs')).rstrip('/')}/{identifier}",
             )
-            artifacts_root.mkdir(parents=True, exist_ok=True)
+            try:
+                artifacts_root.mkdir(parents=True, exist_ok=not immutable_artifacts)
+            except FileExistsError as exc:
+                raise QaError(
+                    f"The immutable QA artifact run {identifier} already exists; it was not overwritten."
+                ) from exc
         started = self.clock()
         results: dict[str, QaCaseResult] = {}
         # One lock for each thing any check says it touches. Checks still run
@@ -1845,10 +1851,15 @@ class QaRunner:
             ),
         )
         if artifacts_root is not None:
-            (artifacts_root / "result.json").write_text(
-                json.dumps(result.to_dict(), indent=2, sort_keys=True), encoding="utf-8"
+            result_body = json.dumps(
+                CredentialRedactor(self.config).value(result.to_dict()),
+                indent=2, sort_keys=True,
             )
-            self._trim_runs()
+            mode = "x" if immutable_artifacts else "w"
+            with (artifacts_root / "result.json").open(mode, encoding="utf-8") as stream:
+                stream.write(result_body)
+            if not immutable_artifacts:
+                self._trim_runs()
         return result
 
     def _trim_runs(self) -> None:
@@ -1907,7 +1918,10 @@ class QaRunner:
             if case_folder is not None and evidence_text:
                 case_folder.mkdir(parents=True, exist_ok=True)
                 name = f"attempt-{number}.txt"
-                (case_folder / name).write_text(evidence_text, encoding="utf-8", errors="replace")
+                (case_folder / name).write_text(
+                    CredentialRedactor(self.config).text(evidence_text),
+                    encoding="utf-8", errors="replace",
+                )
                 artifacts.append(f"{case.id}/{name}")
             if attempt.passed:
                 break

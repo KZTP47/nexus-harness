@@ -209,6 +209,65 @@ def _pair_key(pair: list[str]) -> str:
     return "|".join(pair)
 
 
+def fence_for_board_change(
+    config: LoadedConfig, before: dict[str, Any], after: dict[str, Any]
+) -> int:
+    """Fence saved chats when any authority-bearing board binding changes."""
+
+    def authority(board: dict[str, Any]) -> str:
+        agents = sorted(
+            (
+                str(one.get("id") or ""), str(one.get("name") or ""),
+                str(one.get("who") or ""), str(one.get("filed_as") or ""),
+            )
+            for one in board.get("agents", []) if isinstance(one, dict)
+        )
+        projects = sorted(
+            (str(one.get("id") or ""), str(one.get("path") or ""))
+            for one in board.get("projects", []) if isinstance(one, dict)
+        )
+        payload = {
+            "agents": agents,
+            "projects": projects,
+            "works_on": sorted(
+                (str(one.get("agent") or ""), str(one.get("project") or ""))
+                for one in board.get("works_on", []) if isinstance(one, dict)
+            ),
+            "talks_to": sorted(
+                tuple(sorted((str(one.get("one") or ""), str(one.get("other") or ""))))
+                for one in board.get("talks_to", []) if isinstance(one, dict)
+            ),
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    if authority(before) == authority(after):
+        return 0
+    from .collaboration_ledger import fence_ledger
+
+    with _lock:
+        registry = _read(config)
+        routes = {
+            str(one.get("id") or ""): str(one.get("who") or "")
+            for one in after.get("agents", []) if isinstance(one, dict)
+        }
+        old_routes = {
+            str(one.get("id") or ""): str(one.get("who") or "")
+            for one in before.get("agents", []) if isinstance(one, dict)
+        }
+        fenced = 0
+        for conversation in registry.get("chats", []):
+            if not isinstance(conversation, dict):
+                continue
+            pair = conversation.get("pair", [])
+            first = str(pair[0]) if isinstance(pair, list) and pair else ""
+            fence_ledger(
+                config, routes.get(first, old_routes.get(first, "")),
+                str(conversation.get("filed_as") or ""),
+            )
+            fenced += 1
+        return fenced
+
+
 def _connected_pairs(board: dict[str, Any], agent_id: str) -> list[list[str]]:
     agents = _agents(board)
     if agent_id not in agents:
@@ -603,6 +662,13 @@ def select_project(
     with _lock:
         registry = _read(config)
         raw = next(one for one in registry["chats"] if one["id"] == chat_id)
+        if str(raw.get("project") or "") != project_id:
+            from .collaboration_ledger import fence_ledger
+
+            current = _agents(board).get(agent_id) or {}
+            fence_ledger(
+                config, str(current.get("who") or ""), str(raw.get("filed_as") or "")
+            )
         raw["project"] = project_id
         raw["updated_at"] = _now()
         registry["active"][agent_id] = chat_id
@@ -626,6 +692,15 @@ def delete(
             raise swarm_lab.SwarmError("One of this chat's agents is no longer on the board.")
         raw["archived_at"] = _now()
         raw["updated_at"] = raw["archived_at"]
+        # Archiving is an authority revocation. Fence the exact transcript
+        # before changing discoverability so late provider replies cannot
+        # append to an archived conversation.
+        from .collaboration_ledger import fence_ledger
+
+        lead = agents.get(raw["pair"][0]) or {}
+        fence_ledger(
+            config, str(lead.get("who") or ""), str(raw.get("filed_as") or "")
+        )
         for key, active in list(registry["active"].items()):
             if active == chat_id:
                 registry["active"].pop(key, None)

@@ -612,6 +612,7 @@ def command_automation(args: argparse.Namespace) -> int:
     """
 
     from . import pipelines as pipeline_lab
+    from .pipeline_runs import PipelineRunStore
 
     config = _config(args)
     if args.automation_command == "list":
@@ -625,7 +626,15 @@ def command_automation(args: argparse.Namespace) -> int:
         return 0
     said_so_far: list[str] = []
 
+    frozen = pipeline_lab.freeze_definition(config, held)
+    store = PipelineRunStore(config)
+    accepted, _created = store.accept(frozen, source="cli")
+    run_id = accepted["run_id"]
+    attempt_id = accepted["attempt_id"]
+    store.start(run_id, attempt_id)
+
     def tell(event: dict[str, Any]) -> None:
+        store.append_event(run_id, attempt_id, event)
         payload = event.get("payload") or {}
         if payload.get("state") in ("passed", "failed", "skipped"):
             line = f"{payload.get('label')}: {payload.get('state')} - {payload.get('said')}"
@@ -633,8 +642,20 @@ def command_automation(args: argparse.Namespace) -> int:
             if not args.quiet:
                 print(line)
 
-    run = pipeline_lab.run_it(config, held, tell=tell, from_here=args.from_here or "",
-                              only=args.only or "")
+    try:
+        run = pipeline_lab.run_it(
+            config, held, tell=tell, from_here=args.from_here or "",
+            only=args.only or "", stopping=lambda: store.should_stop(run_id),
+            run_id=run_id, frozen=frozen,
+            decision_nonce=attempt_id,
+        )
+        store.finish(run_id, attempt_id, run.to_dict())
+    except BaseException as exc:
+        try:
+            store.fail(run_id, attempt_id, str(exc))
+        except HarnessError:
+            pass
+        raise
     print(run.said)
     if args.json:
         print(json.dumps(run.to_dict(), indent=2))

@@ -135,8 +135,9 @@ test("current Claude tab selection prefers the visible provider conversation", a
   assert.equal(await transport.currentProviderPage(), conversation);
 });
 
-test("external provider submission uses real keyboard input instead of DOM mutation", async () => {
+test("external provider submission uses real keyboard input and pointer activation", async () => {
   const keys = [];
+  const clicks = [];
   const page = Object.assign(new EventEmitter(), {
     url: () => "https://claude.ai/new", title: async () => "Claude",
     mainFrame() { return this; }, isClosed: () => false,
@@ -144,6 +145,8 @@ test("external provider submission uses real keyboard input instead of DOM mutat
       press: async (key) => keys.push(["press", key]),
       insertText: async (text) => keys.push(["text", text]),
     },
+    evaluate: async () => ({x: 500, y: 400, fingerprint: "BUTTON|send"}),
+    mouse: {click: async (x, y) => clicks.push([x, y])},
   });
   const transport = {
     provider: {label: "Claude"}, openPage: async () => page,
@@ -152,10 +155,14 @@ test("external provider submission uses real keyboard input instead of DOM mutat
   const contents = new ExternalPageContents(transport, page.url());
   await contents.ready;
 
-  await contents.replaceTextAndSubmit("NEXUS_NATIVE_INPUT");
+  const activated = await contents.replaceTextAndSubmit("NEXUS_NATIVE_INPUT", {
+    composer: ["[contenteditable='true']"], send: ["button[aria-label*='Send']"],
+  });
 
   assert.deepEqual(keys, [
     ["press", "Control+A"], ["press", "Backspace"],
-    ["text", "NEXUS_NATIVE_INPUT"], ["press", "Enter"],
+    ["text", "NEXUS_NATIVE_INPUT"],
   ]);
+  assert.deepEqual(clicks, [[500, 400]]);
+  assert.equal(activated.sendActivated, true);
 });

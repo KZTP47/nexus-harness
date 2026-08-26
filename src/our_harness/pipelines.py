@@ -24,18 +24,21 @@ What it will not do
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .config import LoadedConfig
 from .models import HarnessError
+from .redaction import CredentialRedactor
 from .safety import confined_path, take_the_file_away
 
 WAITING = "waiting"
@@ -43,6 +46,19 @@ RUNNING = "running"
 PASSED = "passed"
 FAILED = "failed"
 SKIPPED = "skipped"
+CANCELLED = "cancelled"
+TIMED_OUT = "timed_out"
+
+OUTCOME_PASS = "pass"
+OUTCOME_WARNING = "warning"
+OUTCOME_INCOMPLETE = "incomplete"
+OUTCOME_FAIL = "fail"
+OUTCOME_CANCELLED = "cancelled"
+OUTCOME_TIMED_OUT = "timed_out"
+CANONICAL_OUTCOMES = frozenset({
+    OUTCOME_PASS, OUTCOME_WARNING, OUTCOME_INCOMPLETE, OUTCOME_FAIL,
+    OUTCOME_CANCELLED, OUTCOME_TIMED_OUT,
+})
 
 # A pipeline is a picture as much as a program, so a name has to survive being
 # a file name on any machine.
@@ -229,6 +245,12 @@ class NodeResult:
     # When it started, counted from the beginning of the run. This is what the
     # timeline is drawn from.
     started_after: int = 0
+    # One canonical result used by dependencies, gates, and final aggregation.
+    # The display state remains for compatibility with the visual editor.
+    effective_outcome: str = OUTCOME_INCOMPLETE
+    # Exact human-decision occurrence. Unlike ``id``, this includes the
+    # accepted worker attempt and the complete nested execution path.
+    decision_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -242,6 +264,8 @@ class NodeResult:
             "milliseconds": self.milliseconds,
             "skipped_this_time": self.skipped_this_time,
             "started_after": self.started_after,
+            "effective_outcome": self.effective_outcome,
+            "decision_id": self.decision_id,
         }
 
 
@@ -254,6 +278,9 @@ class Run:
     passed: bool = False
     said: str = ""
     milliseconds: int = 0
+    run_id: str = ""
+    outcome: str = OUTCOME_INCOMPLETE
+    definition_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -262,6 +289,9 @@ class Run:
             "passed": self.passed,
             "said": self.said,
             "milliseconds": self.milliseconds,
+            "run_id": self.run_id,
+            "outcome": self.outcome,
+            "definition_digest": self.definition_digest,
         }
 
 
@@ -551,6 +581,50 @@ def load(config: LoadedConfig, name: str) -> dict[str, Any]:
     return _the_one_called(config, name)[1]
 
 
+def freeze_definition(
+    config: LoadedConfig,
+    pipeline: Any,
+    *,
+    depth: int = 0,
+    seen: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Resolve every nested automation before a run is accepted.
+
+    The returned object is execution-only and is never written back as the
+    user's editable pipeline.  A saved child changing after acceptance cannot
+    change the active run.
+    """
+
+    tidy = read_it(pipeline)
+    if depth > DEEPEST_NESTING:
+        raise PipelineError(
+            f"Pipelines are only followed {DEEPEST_NESTING} deep."
+        )
+    name = tidy["name"]
+    if name in seen:
+        raise PipelineError(
+            f"Pipelines are only followed {DEEPEST_NESTING} deep; the nested "
+            f"automation cycle reaches {name} again."
+        )
+    children: dict[str, dict[str, Any]] = {}
+    for node in tidy["nodes"]:
+        if node["kind"] != "another_pipeline":
+            continue
+        child_name = str(node["settings"].get("pipeline") or "").strip()
+        if not child_name:
+            raise PipelineError(f"{node['label']} does not name an automation to run.")
+        try:
+            child = load(config, child_name)
+            children[node["id"]] = freeze_definition(
+                config, child, depth=depth + 1, seen=seen | {name}
+            )
+        except PipelineError as exc:
+            # Freeze the exact admission-time failure too. A child created or
+            # repaired after acceptance must not silently change this run.
+            children[node["id"]] = {"error": str(exc)}
+    return {"pipeline": tidy, "nested": children}
+
+
 def _the_one_called(config: LoadedConfig, name: str) -> tuple[Path, dict[str, Any]]:
     """The file a pipeline lives in, and what is in it.
 
@@ -798,23 +872,52 @@ def _how_long(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
-def _run_a_suite(config: LoadedConfig, node: dict[str, Any], check_kinds) -> tuple[bool, str, str]:
+def _run_a_suite(
+    config: LoadedConfig, node: dict[str, Any], check_kinds
+) -> tuple[bool, str, str, str]:
     from . import qa as qalab
 
     settings = node["settings"]
     suite = qalab.load_suite(config, settings.get("suite") or None, check_kinds)
     tags = [settings["tag"]] if settings.get("tag") else []
     ids = [settings["case"]] if settings.get("case") else []
+    occurrence = hashlib.sha256(json.dumps(
+        {"path": tuple(node.get("_execution_path") or (node["id"],))},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:12]
+    qa_run_id = (
+        f"pipeline-{str(node.get('_run_id') or uuid.uuid4().hex)}-"
+        f"{occurrence}-attempt-{int(node.get('_step_attempt') or 1):02d}"
+    )
     result = qalab.QaRunner(config, extra_kinds=check_kinds).run(
-        suite, tags=tags, ids=ids, write_artifacts=False
+        suite, tags=tags, ids=ids, run_id=qa_run_id,
+        write_artifacts=True, immutable_artifacts=True,
     )
     counts = result.counts
-    said = f"{counts.get('passed', 0)} of {counts.get('total', 0)} checks passed"
+    said = (
+        f"{counts.get('passed', 0)} of {counts.get('total', 0)} checks passed; "
+        f"immutable evidence: {result.artifacts_dir}"
+    )
     trouble = [case.title for case in result.cases if not case.passed]
-    return result.passed, said, "; ".join(trouble[:5])
+    if counts.get("total", 0) == 0:
+        return False, "No checks matched, so nothing was verified", "", OUTCOME_INCOMPLETE
+    if counts.get("failed", 0):
+        return False, said, "; ".join(trouble[:5]), OUTCOME_FAIL
+    if counts.get("skipped", 0):
+        return False, (
+            f"{said}; {counts['skipped']} check(s) were skipped, so verification is incomplete"
+        ), "; ".join(trouble[:5]), OUTCOME_INCOMPLETE
+    if counts.get("flaky", 0):
+        return True, (
+            f"{said}; {counts['flaky']} check(s) were flaky"
+        ), "; ".join(trouble[:5]), OUTCOME_WARNING
+    return True, said, "; ".join(trouble[:5]), OUTCOME_PASS
 
 
-def _run_one_off_check(config: LoadedConfig, case: dict[str, Any], check_kinds) -> tuple[bool, str, str]:
+def _run_one_off_check(
+    config: LoadedConfig, case: dict[str, Any], check_kinds,
+    run_context: dict[str, Any] | None = None,
+) -> tuple[bool, str, str, str]:
     """Run a single check this node made up, without saving it anywhere."""
 
     from . import qa as qalab
@@ -822,7 +925,18 @@ def _run_one_off_check(config: LoadedConfig, case: dict[str, Any], check_kinds) 
     suite = qalab.parse_suite(
         {"schema_version": 1, "name": "pipeline", "cases": [case]}, extra_kinds=check_kinds
     )
-    result = qalab.QaRunner(config, extra_kinds=check_kinds).run(suite, write_artifacts=False)
+    context = run_context or {}
+    occurrence = hashlib.sha256(json.dumps(
+        {"path": tuple(context.get("_execution_path") or (case["id"],))},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()[:12]
+    qa_run_id = (
+        f"pipeline-{str(context.get('_run_id') or uuid.uuid4().hex)}-"
+        f"{occurrence}-attempt-{int(context.get('_step_attempt') or 1):02d}"
+    )
+    result = qalab.QaRunner(config, extra_kinds=check_kinds).run(
+        suite, run_id=qa_run_id, write_artifacts=True, immutable_artifacts=True,
+    )
     only = result.cases[0]
     # A check says why in its reasons, and each attempt keeps what it saw.
     # There is no summary field on a result: reaching for one turned every step
@@ -833,10 +947,20 @@ def _run_one_off_check(config: LoadedConfig, case: dict[str, Any], check_kinds) 
     # With nothing wrong, what the check saw says more than "as expected".
     first_line = saw.splitlines()[0][:120] if saw.strip() else ""
     said = why or first_line or ("As expected" if only.passed else "It did not pass")
-    return only.passed, said, why or saw[:400]
+    detail = why or saw[:400]
+    evidence = f"Immutable evidence: {result.artifacts_dir}"
+    outcome = (
+        OUTCOME_WARNING if only.status == "flaky" else
+        OUTCOME_INCOMPLETE if only.status == "skipped" else
+        OUTCOME_PASS if only.passed else OUTCOME_FAIL
+    )
+    passed = bool(only.passed and outcome != OUTCOME_INCOMPLETE)
+    return passed, f"{said}; {evidence}", f"{detail}\n{evidence}".strip(), outcome
 
 
-def _run_security_scan(config: LoadedConfig, node: dict[str, Any], check_kinds) -> tuple[bool, str, str]:
+def _run_security_scan(
+    config: LoadedConfig, node: dict[str, Any], check_kinds
+) -> tuple[bool, str, str, str]:
     paths = node["settings"].get("paths")
     if isinstance(paths, str):
         paths = [part.strip() for part in paths.split(",") if part.strip()]
@@ -847,10 +971,12 @@ def _run_security_scan(config: LoadedConfig, node: dict[str, Any], check_kinds) 
     }
     if paths:
         case["paths"] = paths
-    return _run_one_off_check(config, case, check_kinds)
+    return _run_one_off_check(config, case, check_kinds, node)
 
 
-def _run_unit_test(config: LoadedConfig, node: dict[str, Any], check_kinds) -> tuple[bool, str, str]:
+def _run_unit_test(
+    config: LoadedConfig, node: dict[str, Any], check_kinds
+) -> tuple[bool, str, str, str]:
     from .detect import combined_commands, detect_project
 
     which = node["settings"].get("command_kind") or "test"
@@ -862,11 +988,12 @@ def _run_unit_test(config: LoadedConfig, node: dict[str, Any], check_kinds) -> t
     if not commands:
         return False, f"This project has no {which} command set", (
             f"Set project.{which}_commands in your settings, or let the harness find it."
-        )
+        ), OUTCOME_INCOMPLETE
     said: list[str] = []
+    outcome = OUTCOME_PASS
     for command in commands:
         parts = list(command) if isinstance(command, (list, tuple)) else [str(command)]
-        passed, one, detail = _run_one_off_check(
+        passed, one, detail, one_outcome = _run_one_off_check(
             config,
             {
                 "id": f"pipeline-{node['id']}-{len(said)}",
@@ -875,12 +1002,14 @@ def _run_unit_test(config: LoadedConfig, node: dict[str, Any], check_kinds) -> t
                 "command": parts,
                 "expect": {"exit_code": 0},
             },
-            check_kinds,
+            check_kinds, node,
         )
         said.append(f"{' '.join(parts)[:60]}: {one}")
         if not passed:
-            return False, one, detail or "; ".join(said)
-    return True, f"{len(commands)} command(s) finished", "; ".join(said)
+            return False, one, detail or "; ".join(said), one_outcome
+        if one_outcome == OUTCOME_WARNING:
+            outcome = OUTCOME_WARNING
+    return True, f"{len(commands)} command(s) finished", "; ".join(said), outcome
 
 
 def _run_git_repo(config: LoadedConfig, node: dict[str, Any], _kinds) -> tuple[bool, str, str]:
@@ -922,6 +1051,10 @@ def _run_ai_unit_test(config: LoadedConfig, node: dict[str, Any], _kinds) -> tup
     write_to = str(settings.get("write_to") or "").strip()
     if not write_to:
         return False, "Nowhere to write it", "Give the draft a file name."
+    if CredentialRedactor(config).text(write_to) != write_to:
+        return False, "That draft filename looks like it contains a credential", (
+            "Choose a non-secret filename; credential-shaped names are never written."
+        )
     # A pipeline is a file people pass around, and this step writes whatever a
     # model says. So it writes into a drafts folder of its own, and nowhere
     # else.
@@ -963,7 +1096,9 @@ def _run_ai_unit_test(config: LoadedConfig, node: dict[str, Any], _kinds) -> tup
         answer = provider.complete(asked)
     except HarnessError as exc:
         return False, "The model could not be reached", str(exc)
-    written = str(getattr(answer, "text", "") or "").strip()
+    written = CredentialRedactor(config).text(
+        str(getattr(answer, "text", "") or "").strip()
+    )
     if not written:
         return False, "The model wrote nothing", "Try again, or say more about what you want."
     # A model can wrap its answer in a fence however plainly it is asked not to.
@@ -972,7 +1107,13 @@ def _run_ai_unit_test(config: LoadedConfig, node: dict[str, Any], _kinds) -> tup
         keep = lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]
         written = "\n".join(keep)
     where.parent.mkdir(parents=True, exist_ok=True)
-    where.write_text(written.strip() + "\n", encoding="utf-8")
+    try:
+        with where.open("x", encoding="utf-8") as output:
+            output.write(written.strip() + "\n")
+    except FileExistsError:
+        return False, "There is already a draft with that name", (
+            f"{where.name} appeared while the model was answering; it was not overwritten."
+        )
     return True, (
         f"Wrote {DRAFTS}/{where.name}, {len(written.splitlines())} lines. "
         "Read it, then move it into your tests yourself. Nothing runs it where it is."
@@ -981,6 +1122,11 @@ def _run_ai_unit_test(config: LoadedConfig, node: dict[str, Any], _kinds) -> tup
 
 def _run_artifact(config: LoadedConfig, node: dict[str, Any], _kinds, so_far=None) -> tuple[bool, str, str]:
     asked = str(node["settings"].get("write_to") or "").strip()
+    redactor = CredentialRedactor(config)
+    if asked and redactor.text(asked) != asked:
+        return False, "That evidence filename looks like it contains a credential", (
+            "Choose a non-secret filename; credential-shaped names are never written."
+        )
     # Where it goes by default is the harness's own folder. A place somebody
     # types in is an ordinary project path, and may not be one of the folders
     # the harness and git keep their workings in.
@@ -988,13 +1134,34 @@ def _run_artifact(config: LoadedConfig, node: dict[str, Any], _kinds, so_far=Non
         confined_path(config.project_root, asked, allow_missing=True)
         if asked
         else confined_path(
-            config.project_root, f"{WHERE_THEY_LIVE}/last-run.json",
+            config.project_root,
+            (
+                f"{WHERE_THEY_LIVE}/evidence/{str(node.get('_run_id') or 'direct')}/"
+                f"{hashlib.sha256(json.dumps(tuple(node.get('_execution_path') or (node['id'],))).encode('utf-8')).hexdigest()[:16]}.json"
+            ),
             allow_missing=True, allow_control=True,
         )
     )
     where.parent.mkdir(parents=True, exist_ok=True)
-    body = json.dumps([result.to_dict() for result in (so_far or [])], indent=2) + "\n"
-    where.write_text(body, encoding="utf-8")
+    safe = redactor.value(
+        [result.to_dict() for result in (so_far or [])]
+    )
+    body = json.dumps(safe, indent=2) + "\n"
+    try:
+        with where.open("x", encoding="utf-8") as output:
+            output.write(body)
+    except FileExistsError:
+        if not asked:
+            try:
+                if where.read_text(encoding="utf-8") == body:
+                    return True, f"Evidence already recorded at {where.name}", (
+                        f"{len(so_far or [])} step(s) recorded"
+                    )
+            except OSError:
+                pass
+        return False, f"{where.name} already exists", (
+            "Evidence files are no-clobber. Choose a new name or explicitly remove the old file."
+        )
     return True, f"Wrote {where.name}", f"{len(so_far or [])} step(s) recorded"
 
 
@@ -1037,6 +1204,22 @@ def _was_not_needed(item: "NodeResult") -> bool:
     return item.state == SKIPPED and item.skipped_this_time
 
 
+def _effective(item: NodeResult) -> str:
+    """Read the canonical outcome, including results made by older callers."""
+
+    if item.effective_outcome != OUTCOME_INCOMPLETE:
+        return item.effective_outcome
+    if item.state == PASSED:
+        return OUTCOME_PASS
+    if item.state == FAILED:
+        return OUTCOME_FAIL
+    if item.state == CANCELLED:
+        return OUTCOME_CANCELLED
+    if item.state == TIMED_OUT:
+        return OUTCOME_TIMED_OUT
+    return OUTCOME_INCOMPLETE
+
+
 def _decide_a_gate(node: dict[str, Any], before: list[NodeResult]) -> tuple[bool, str, str]:
     needs = str(node["settings"].get("needs") or "all").lower()
     if needs not in ("all", "any"):
@@ -1047,14 +1230,20 @@ def _decide_a_gate(node: dict[str, Any], before: list[NodeResult]) -> tuple[bool
     before = [item for item in before if not _was_not_needed(item)]
     if not before:
         return True, "Nothing came before this gate", ""
-    good = [item for item in before if item.state == PASSED]
+    # Allowed failures and successful retries are warnings. They are treated
+    # identically here and in final aggregation, rather than passing at one
+    # boundary and failing at the other.
+    good = [item for item in before if _effective(item) in (OUTCOME_PASS, OUTCOME_WARNING)]
     if needs == "any":
         passed = bool(good)
         said = f"{len(good)} of {len(before)} passed, and this gate needs one"
     else:
         passed = len(good) == len(before)
         said = f"{len(good)} of {len(before)} passed, and this gate needs all"
-    trouble = ", ".join(item.label for item in before if item.state != PASSED)
+    trouble = ", ".join(
+        item.label for item in before
+        if _effective(item) not in (OUTCOME_PASS, OUTCOME_WARNING)
+    )
     return passed, said, trouble
 
 
@@ -1070,6 +1259,10 @@ def run_it(
     answers: dict[str, Any] | None = None,
     waiting_on: Callable[[str], bool] | None = None,
     depth: int = 0,
+    run_id: str = "",
+    frozen: dict[str, Any] | None = None,
+    decision_nonce: str = "",
+    execution_path: tuple[str, ...] = (),
 ) -> Run:
     """Run a whole pipeline, in order, and say what happened at each step.
 
@@ -1087,7 +1280,15 @@ def run_it(
         saved pipeline can serve two jobs without being copied.
     """
 
-    tidy = read_it(pipeline)
+    frozen = frozen or freeze_definition(config, pipeline, depth=depth)
+    tidy = read_it(frozen.get("pipeline"))
+    if not tidy["nodes"]:
+        raise PipelineError("This automation has no steps, so nothing was run or checked.")
+    run_id = run_id or uuid.uuid4().hex
+    decision_nonce = decision_nonce or run_id
+    from .pipeline_runs import canonical_definition, definition_digest
+    accepted_digest = definition_digest(frozen)
+    redactor = CredentialRedactor(config)
     order = in_running_order(tidy)
     if from_here and from_here not in {node["id"] for node in tidy["nodes"]}:
         raise PipelineError(f"There is no step called {from_here} in this pipeline")
@@ -1107,8 +1308,14 @@ def run_it(
     started_everything = time.monotonic()
 
     def say(result: NodeResult) -> None:
+        result.label = redactor.text(result.label)
+        result.said = redactor.text(result.said)
+        result.detail = redactor.text(result.detail)
         if tell:
-            tell({"kind": "pipeline_node", "node": result.id, "payload": result.to_dict()})
+            tell({
+                "kind": "pipeline_node", "node": result.id, "run_id": run_id,
+                "payload": {**result.to_dict(), "run_id": run_id},
+            })
 
     # Which steps this run is really doing. The rest are marked as already
     # done, so a picture of the run says plainly what was and was not tried.
@@ -1119,6 +1326,12 @@ def run_it(
         doing = _from_here_on(order, coming_from, from_here)
     for node_id in order:
         node = by_id[node_id]
+        occurrence_path = (*execution_path, node_id)
+        node["_execution_path"] = occurrence_path
+        node["_decision_nonce"] = decision_nonce
+        node["_run_id"] = run_id
+        if node_id in (frozen.get("nested") or {}):
+            node["_frozen_pipeline"] = frozen["nested"][node_id]
         result = results[node_id]
         before = [results[other] for other in coming_from[node_id]]
         # When the run reached this step, stamped whatever happens to it next.
@@ -1129,6 +1342,7 @@ def run_it(
         result.started_after = int((time.monotonic() - started_everything) * 1000)
         if node_id not in doing:
             result.state = PASSED
+            result.effective_outcome = OUTCOME_PASS
             result.said = "Left as it was, from an earlier run"
             result.skipped_this_time = True
             say(result)
@@ -1143,6 +1357,7 @@ def run_it(
                     node["settings"][name] = answers[key]
         if stopping and stopping():
             result.state = SKIPPED
+            result.effective_outcome = OUTCOME_CANCELLED
             result.said = "The run was stopped"
             say(result)
             continue
@@ -1157,12 +1372,17 @@ def run_it(
         # pass" - one line under that step saying nothing went wrong.
         blocked = [
             item for item in before
-            if item.state in (FAILED, SKIPPED)
-            and not _was_not_needed(item) and not _was_allowed_to_fail(pipeline, item)
+            if _effective(item) in (
+                OUTCOME_FAIL, OUTCOME_INCOMPLETE, OUTCOME_CANCELLED, OUTCOME_TIMED_OUT
+            )
+            and not _was_not_needed(item) and not _was_allowed_to_fail(tidy, item)
         ]
         anything_wrong = any(
-            item.state in (FAILED, SKIPPED)
-            and not _was_not_needed(item) and not _was_allowed_to_fail(pipeline, item)
+            _effective(item) in (
+                OUTCOME_FAIL, OUTCOME_INCOMPLETE, OUTCOME_CANCELLED, OUTCOME_TIMED_OUT
+            )
+            and item.state not in (WAITING, RUNNING)
+            and not _was_not_needed(item) and not _was_allowed_to_fail(tidy, item)
             for item in results.values()
         )
         # Somebody who pressed "run only this" on a step, or "carry on from
@@ -1171,12 +1391,14 @@ def run_it(
         asked_for = node_id in (only, from_here)
         if when == "when-something-failed" and not anything_wrong and not asked_for:
             result.state = SKIPPED
+            result.effective_outcome = OUTCOME_INCOMPLETE
             result.said = "Nothing went wrong, so this was not needed"
             result.skipped_this_time = True
             say(result)
             continue
         if blocked and node["kind"] not in GATES and when == "when-all-is-well":
             result.state = SKIPPED
+            result.effective_outcome = OUTCOME_INCOMPLETE
             result.said = f"Skipped, because {blocked[0].label} did not pass"
             say(result)
             continue
@@ -1189,20 +1411,31 @@ def run_it(
             # The one step that is meant to take as long as a person takes.
             # Everything before it has run, nothing after it has, and it says
             # so while it waits.
+            result.decision_id = "decision:" + hashlib.sha256(
+                canonical_definition({
+                    "attempt": decision_nonce,
+                    "path": occurrence_path,
+                }).encode("utf-8")
+            ).hexdigest()
             result.said = str(node["settings"].get("question") or "").strip() or (
                 "Waiting for somebody to say carry on."
             )
             say(result)
-            answered = _wait_for_a_person(node_id, waiting_on, stopping, started)
+            answered = _wait_for_a_person(result.decision_id, waiting_on, stopping, started)
             result.milliseconds = int((time.monotonic() - started) * 1000)
             if answered is True:
                 result.state = PASSED
+                result.effective_outcome = OUTCOME_PASS
                 result.said = "Somebody said carry on."
             elif answered is False:
                 result.state = FAILED
+                result.effective_outcome = OUTCOME_FAIL
                 result.said = "Somebody said no, so the rest was not run."
             else:
                 result.state = SKIPPED
+                result.effective_outcome = (
+                    OUTCOME_CANCELLED if stopping and stopping() else OUTCOME_INCOMPLETE
+                )
                 result.said = (
                     "Nobody answered, so the rest was not run. Nothing after this ran."
                 )
@@ -1210,6 +1443,7 @@ def run_it(
             continue
         tries = int(node["settings"].get("tries", 1))
         passed, said, detail = False, "", ""
+        handler_outcome = ""
         # How long this step may take, when somebody said. A step with nothing
         # to say for itself otherwise holds the whole run up until the run's own
         # limit runs out, which on a long automation is the rest of the
@@ -1217,10 +1451,15 @@ def run_it(
         its_own_limit = int(node["settings"].get("longest", 0) or 0)
         for attempt in range(1, tries + 1):
             result.tries = attempt
+            node["_step_attempt"] = attempt
             try:
-                passed, said, detail = _do_one(
+                answer = _do_one(
                     config, node, before, results, order, check_kinds, depth,
                     _also_stopping_after(stopping, started, its_own_limit), waiting_on,
+                )
+                passed, said, detail = answer[:3]
+                handler_outcome = (
+                    str(answer[3]) if len(answer) > 3 and answer[3] in CANONICAL_OUTCOMES else ""
                 )
                 if (not passed and its_own_limit
                         and time.monotonic() - started >= its_own_limit):
@@ -1260,7 +1499,35 @@ def run_it(
             if stopping and stopping():
                 said = f"{said} The run was stopped, so it was not tried again."
                 break
-        result.state = PASSED if passed else FAILED
+        timed_out = bool(its_own_limit and time.monotonic() - started >= its_own_limit)
+        stopped = bool(stopping and stopping())
+        if timed_out:
+            result.state = TIMED_OUT
+            result.effective_outcome = OUTCOME_TIMED_OUT
+            passed = False
+            said = (
+                f"This step exceeded its {its_own_limit}-second deadline; "
+                "a late result was not accepted as passed."
+            )
+        elif stopped:
+            result.state = CANCELLED
+            result.effective_outcome = OUTCOME_CANCELLED
+            passed = False
+            said = "The run was stopped; a late result was not accepted as passed."
+        elif passed:
+            result.state = PASSED
+            result.effective_outcome = (
+                OUTCOME_WARNING
+                if result.tries > 1 or handler_outcome == OUTCOME_WARNING
+                else OUTCOME_PASS
+            )
+        else:
+            result.state = SKIPPED if handler_outcome == OUTCOME_INCOMPLETE else FAILED
+            result.effective_outcome = (
+                OUTCOME_WARNING if _was_allowed_to_fail(tidy, result)
+                else OUTCOME_INCOMPLETE if handler_outcome == OUTCOME_INCOMPLETE
+                else OUTCOME_FAIL
+            )
         result.said = said
         result.detail = detail
         result.milliseconds = _how_long(started)
@@ -1271,10 +1538,7 @@ def run_it(
     # Some steps are the point of the whole thing and some are a nice-to-have -
     # posting a note, tidying up afterwards - and one nice-to-have failing
     # should not throw away work that already passed.
-    failed = [
-        item for item in ordered
-        if item.state == FAILED and not _was_allowed_to_fail(pipeline, item)
-    ]
+    failed = [item for item in ordered if _effective(item) == OUTCOME_FAIL]
     # A step that never ran is not a step that passed. Being stopped part way,
     # or nobody answering, leaves work undone, and a run with work left undone
     # must not read like one that finished. The only steps that do not count
@@ -1282,8 +1546,12 @@ def run_it(
     # earlier run already did, and the ones that were only ever there for when
     # something goes wrong.
     skipped = [
-        item for item in ordered if item.state == SKIPPED and not item.skipped_this_time
+        item for item in ordered
+        if _effective(item) == OUTCOME_INCOMPLETE and not item.skipped_this_time
     ]
+    cancelled = [item for item in ordered if _effective(item) == OUTCOME_CANCELLED]
+    timed_out = [item for item in ordered if _effective(item) == OUTCOME_TIMED_OUT]
+    warnings = [item for item in ordered if _effective(item) == OUTCOME_WARNING]
     not_needed = [item for item in ordered if _was_not_needed(item)]
     left_alone = [
         item for item in ordered if item.state == PASSED and item.skipped_this_time
@@ -1291,10 +1559,23 @@ def run_it(
     run = Run(
         name=tidy["name"],
         nodes=ordered,
-        passed=not failed and not skipped,
+        passed=not failed and not skipped and not cancelled and not timed_out,
         milliseconds=_how_long(started_everything),
+        run_id=run_id,
+        outcome=(
+            OUTCOME_TIMED_OUT if timed_out else
+            OUTCOME_CANCELLED if cancelled else
+            OUTCOME_FAIL if failed else
+            OUTCOME_INCOMPLETE if skipped else
+            OUTCOME_WARNING if warnings else OUTCOME_PASS
+        ),
+        definition_digest=accepted_digest,
     )
-    if failed:
+    if timed_out:
+        run.said = f"{len(timed_out)} step(s) timed out; late results were rejected."
+    elif cancelled:
+        run.said = "The automation was stopped; one or more steps never ran."
+    elif failed:
         run.said = f"{len(failed)} step(s) did not pass: " + ", ".join(
             item.label for item in failed[:4]
         )
@@ -1303,7 +1584,7 @@ def run_it(
             f"Everything that ran passed, and {len(skipped)} step(s) never ran: "
             + ", ".join(item.label for item in skipped[:4])
         )
-    elif left_alone or not_needed:
+    elif left_alone or not_needed or warnings:
         ran = len(ordered) - len(left_alone) - len(not_needed)
         said = [f"Every one of the {ran} step(s) this run covered passed."]
         if left_alone:
@@ -1313,9 +1594,14 @@ def run_it(
                 f"{len(not_needed)} were only for when something goes wrong, "
                 "and nothing did."
             )
+        if warnings:
+            said.append(
+                f"{len(warnings)} step(s) completed with warnings (allowed failure or retry)."
+            )
         run.said = " ".join(said)
     else:
         run.said = f"Every one of the {len(ordered)} steps passed."
+    run.said = redactor.text(run.said)
     return run
 
 
@@ -1404,23 +1690,31 @@ def _ask_for_help(config, node) -> tuple[bool, str, str]:
 
 def _run_another_pipeline(
     config, node, check_kinds, depth: int, stopping=None, waiting_on=None
-) -> tuple[bool, str, str]:
+) -> tuple[bool, str, str, str]:
     """Run one saved pipeline as a single step of this one."""
 
     name = str(node["settings"].get("pipeline") or "").strip()
     if not name:
-        return False, "This step does not say which pipeline to run.", ""
+        return False, "This step does not say which pipeline to run.", "", OUTCOME_FAIL
     if depth + 1 > DEEPEST_NESTING:
         return (
             False,
             f"Pipelines are only followed {DEEPEST_NESTING} deep. One of them is calling "
             "another that calls it back, or the chain is simply too long to follow.",
             "",
+            OUTCOME_FAIL,
         )
+    frozen = node.get("_frozen_pipeline")
+    if isinstance(frozen, dict) and frozen.get("error"):
+        return False, str(frozen["error"]), "", OUTCOME_FAIL
     try:
-        held = load(config, name)
+        held = (
+            frozen.get("pipeline")
+            if isinstance(frozen, dict) and isinstance(frozen.get("pipeline"), dict)
+            else load(config, name)
+        )
     except PipelineError as exc:
-        return False, str(exc), ""
+        return False, str(exc), "", OUTCOME_FAIL
     # Stop is handed down. Without it, a pipeline inside a pipeline carried on
     # to the end after somebody pressed Stop, which is the one place the button
     # could be pressed and nothing happen.
@@ -1430,6 +1724,10 @@ def _run_another_pipeline(
     run = run_it(
         config, held, check_kinds=check_kinds, depth=depth + 1,
         stopping=stopping, waiting_on=waiting_on,
+        frozen=frozen if isinstance(frozen, dict) else None,
+        run_id=str(node.get("_run_id") or ""),
+        decision_nonce=str(node.get("_decision_nonce") or ""),
+        execution_path=tuple(node.get("_execution_path") or ()),
     )
     # Why it failed, not only that it did. Without this the reason is buried a
     # pipeline down, where nobody reading the outer one will find it.
@@ -1440,7 +1738,7 @@ def _run_another_pipeline(
     detail = "\n".join(
         f"{one.label}: {one.state}" for one in run.nodes if not one.skipped_this_time
     )
-    return run.passed, said, detail
+    return run.passed, said, detail, run.outcome
 
 
 def _do_one(

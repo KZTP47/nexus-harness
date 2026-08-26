@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import threading
 import time
@@ -28,6 +29,15 @@ class PanelTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
+        self.runtime_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.runtime_temporary.cleanup)
+        prior_runtime = os.environ.get("OUR_HARNESS_PIPELINE_RUN_DIR")
+        os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = self.runtime_temporary.name
+        self.addCleanup(
+            lambda: os.environ.pop("OUR_HARNESS_PIPELINE_RUN_DIR", None)
+            if prior_runtime is None
+            else os.environ.__setitem__("OUR_HARNESS_PIPELINE_RUN_DIR", prior_runtime)
+        )
         self.root = Path(self.temporary.name).resolve()
         (self.root / ".harness").mkdir()
         config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
@@ -72,6 +82,32 @@ class RunningOneThroughThePanelTests(PanelTestCase):
         self.wait_until_free()
         self.assertTrue(self.panel.pipeline_run["passed"], self.panel.pipeline_run)
 
+    def test_agent_follows_the_exact_accepted_run_and_its_event_cursor(self) -> None:
+        drawn = {
+            "name": "Agent saved", "edges": [],
+            "nodes": [{"id": "start", "kind": "start", "label": "Start", "settings": {}}],
+        }
+        self.assertEqual(self.ask("/api/pipelines/save", {"pipeline": drawn})[0], 200)
+        status, accepted = self.ask(
+            "/api/pipelines/agent-run",
+            {"automation": "Agent saved", "request_id": "agent-request-1"},
+        )
+        self.assertEqual(status, 202)
+        run_id = accepted["run_id"]
+        self.assertTrue(run_id)
+        self.wait_until_free()
+        status, exact = self.ask(f"/api/pipeline-runs/{run_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(exact["run_id"], run_id)
+        self.assertFalse(exact["running"])
+        self.assertTrue(exact["result"]["passed"])
+        status, events = self.ask(f"/api/pipeline-runs/{run_id}/events?after=0")
+        self.assertEqual(status, 200)
+        self.assertTrue(events["events"])
+        self.assertTrue(all(one["run_id"] == run_id for one in events["events"]))
+        stale, _ = self.ask("/api/pipelines/stop", {"run_id": "not-the-agent-run"})
+        self.assertEqual(stale, 400)
+
     def test_only_one_runs_at_a_time(self) -> None:
         holding = threading.Event()
 
@@ -95,6 +131,97 @@ class RunningOneThroughThePanelTests(PanelTestCase):
         again, _ = self.ask("/api/pipelines/run", {"pipeline": drawn})
         self.assertEqual(again, 202)
         self.wait_until_free()
+
+    def test_same_request_replays_while_its_worker_is_still_running(self) -> None:
+        holding = threading.Event()
+
+        def slow(config, pipeline, **kwargs):
+            holding.wait(5)
+            return pipelines.Run(name="Replay", passed=True, said="done")
+
+        drawn = {
+            "name": "Replay", "edges": [],
+            "nodes": [{"id": "start", "kind": "start", "label": "Start", "settings": {}}],
+        }
+        with mock.patch.object(pipelines, "run_it", slow):
+            first_status, first = self.ask(
+                "/api/pipelines/run", {"pipeline": drawn, "request_id": "same-panel-request"}
+            )
+            replay_status, replay = self.ask(
+                "/api/pipelines/run", {"pipeline": drawn, "request_id": "same-panel-request"}
+            )
+            self.assertEqual((first_status, replay_status), (202, 202))
+            self.assertEqual(replay["run_id"], first["run_id"])
+            self.assertTrue(replay["replayed"])
+            holding.set()
+            self.wait_until_free()
+
+    def test_completed_latest_run_reconciles_an_ambiguous_post_by_request_id(self) -> None:
+        drawn = {
+            "name": "Reconcile", "edges": [],
+            "nodes": [{"id": "start", "kind": "start", "label": "Start", "settings": {}}],
+        }
+        request_id = "ambiguous-post-1"
+        status, accepted = self.ask(
+            "/api/pipelines/run", {"pipeline": drawn, "request_id": request_id}
+        )
+        self.assertEqual(status, 202)
+        self.wait_until_free()
+        status, projection = self.ask("/api/pipelines")
+        self.assertEqual(status, 200)
+        latest = projection["latest_run"]
+        self.assertEqual(latest["request_id"], request_id)
+        self.assertEqual(latest["run_id"], accepted["run_id"])
+        self.assertFalse(latest["running"])
+        self.assertIn("definition", latest)
+        self.assertNotIn("attempt_id", latest)
+        status, found = self.ask(
+            f"/api/pipeline-runs/by-request?request_id={request_id}"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(found["run_id"], accepted["run_id"])
+        self.assertEqual(found["project_authority_id"], projection["project_authority_id"])
+        status, exact = self.ask(f"/api/pipeline-runs/{found['run_id']}")
+        self.assertEqual(status, 200)
+        self.assertEqual(exact["project_authority_id"], found["project_authority_id"])
+
+    def test_request_lookup_cannot_cross_project_authorities(self) -> None:
+        drawn = {
+            "name": "Scoped", "edges": [],
+            "nodes": [{"id": "start", "kind": "start", "label": "Start", "settings": {}}],
+        }
+        request_id = "same-words-different-authority"
+        status, accepted = self.ask(
+            "/api/pipelines/run", {"pipeline": drawn, "request_id": request_id}
+        )
+        self.assertEqual(status, 202)
+        self.wait_until_free()
+
+        other_root = self.root / "other-project"
+        (other_root / ".harness").mkdir(parents=True)
+        other = server.HarnessHTTPServer(
+            ("127.0.0.1", 0), LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), other_root, [], {})
+        )
+        thread = threading.Thread(target=other.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{other.server_address[1]}/api/pipeline-runs/by-request"
+                f"?request_id={request_id}",
+                headers={"X-Harness-Token": other.token},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(request, timeout=10)
+            self.assertEqual(caught.exception.code, 400)
+            status, found = self.ask(
+                f"/api/pipeline-runs/by-request?request_id={request_id}"
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(found["run_id"], accepted["run_id"])
+            self.assertNotEqual(found["project_authority_id"], other.pipeline_store.authority_id)
+        finally:
+            other.shutdown()
+            other.server_close()
 
     def test_a_run_that_falls_over_lets_go_of_the_lock(self) -> None:
         # The one that would hurt most: a run that throws leaving the panel

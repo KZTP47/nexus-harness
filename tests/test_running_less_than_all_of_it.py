@@ -122,27 +122,45 @@ class WaitingForAPersonTests(PipelineTestCase):
 
     def test_saying_carry_on_lets_the_rest_run(self) -> None:
         answers: dict[str, bool] = {}
+        asked: list[str] = []
+
+        def answer_for(decision_id: str) -> bool | None:
+            if decision_id not in asked:
+                asked.append(decision_id)
+            return answers.get(decision_id)
 
         def answer_soon() -> None:
-            time.sleep(0.3)
-            answers["ask"] = True
+            deadline = time.monotonic() + 2.0
+            while not asked and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if asked:
+                answers[asked[0]] = True
 
         threading.Thread(target=answer_soon).start()
         with self.stand_in({}):
             run = pipelines.run_it(
-                self.config, self.waiting_pipeline(), waiting_on=answers.get
+                self.config, self.waiting_pipeline(), waiting_on=answer_for
             )
+        self.assertEqual(len(asked), 1)
+        self.assertRegex(asked[0], r"^decision:[0-9a-f]{64}$")
         by_id = {one.id: one for one in run.nodes}
         self.assertEqual(by_id["ask"].state, pipelines.PASSED)
         self.assertEqual(by_id["after"].state, pipelines.PASSED)
         self.assertTrue(run.passed)
 
     def test_saying_no_stops_everything_after_it(self) -> None:
-        answers = {"ask": False}
+        asked: list[str] = []
+
+        def say_no(decision_id: str) -> bool:
+            asked.append(decision_id)
+            return False
+
         with self.stand_in({}):
             run = pipelines.run_it(
-                self.config, self.waiting_pipeline(), waiting_on=answers.get
+                self.config, self.waiting_pipeline(), waiting_on=say_no
             )
+        self.assertEqual(len(asked), 1)
+        self.assertRegex(asked[0], r"^decision:[0-9a-f]{64}$")
         by_id = {one.id: one for one in run.nodes}
         self.assertEqual(by_id["ask"].state, pipelines.FAILED)
         self.assertEqual(by_id["after"].state, pipelines.SKIPPED)
@@ -237,7 +255,13 @@ class RunningAnotherPipelineTests(PipelineTestCase):
                 self.config, self.calling("It asks first"), waiting_on=somebody
             )
         inner = next(one for one in run.nodes if one.id == "inner")
-        self.assertEqual(asked, ["ask"], "the step inside was never asked")
+        self.assertEqual(len(asked), 1, "the step inside was never asked")
+        self.assertRegex(asked[0], r"^decision:[0-9a-f]{64}$")
+        self.assertNotEqual(
+            asked[0],
+            "ask",
+            "nested approvals need an occurrence identity, not a reusable step id",
+        )
         self.assertEqual(inner.state, pipelines.PASSED, inner.said)
         self.assertTrue(run.passed, run.said)
 

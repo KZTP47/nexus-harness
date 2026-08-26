@@ -137,6 +137,17 @@ ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "change external state. Browser QA must not run an arbitrary developer-owned "
         "automation; the bounded agent-run endpoint is exercised with test pipelines."
     ),
+    "pipelineOpenActiveRun": (
+        "This exists only after the server acknowledges an exact durable run. Creating a "
+        "real run in browser QA could execute arbitrary commands from the developer's saved "
+        "automation; focused UI tests exercise exact-run bootstrap and immutable snapshot "
+        "adoption with bounded responses instead."
+    ),
+    "pipelineStopActive": (
+        "This is enabled only for a server-confirmed live durable run. Browser QA must not "
+        "start and cancel arbitrary developer-owned work for button coverage; focused UI and "
+        "pipeline server tests exercise its exact run-id stop path with bounded fakes."
+    ),
     "swarmAgentCheckLogin": (
         "This deliberately probes the selected provider's real account session. A "
         "browser check must not spend an authenticated provider request merely to "

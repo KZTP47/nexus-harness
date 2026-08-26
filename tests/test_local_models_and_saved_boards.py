@@ -8,7 +8,9 @@ ever the one. A step could be told to try again and could not be told to stop.
 
 from __future__ import annotations
 
+import copy
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -17,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from our_harness import local_models, pipelines, swarm
+from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
 
 
@@ -241,6 +244,14 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.home = Path(self.temporary.name)
+        (self.home / "project").mkdir()
+        self.config = LoadedConfig(
+            copy.deepcopy(DEFAULT_CONFIG), self.home / "project", [], {})
+        runtime = mock.patch.dict(os.environ, {
+            "OUR_HARNESS_SWARM_RUN_DIR": str(self.home / "runtime")
+        })
+        runtime.start()
+        self.addCleanup(runtime.stop)
         held = mock.patch.object(
             swarm, "where_the_kept_ones_live", lambda: self.home / "swarms")
         held.start()
@@ -251,31 +262,31 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
 
     def a_board_with(self, *names: str) -> None:
         swarm.save({"agents": [{"name": one} for one in names],
-                    "projects": [], "works_on": [], "talks_to": []})
+                    "projects": [], "works_on": [], "talks_to": []}, self.config)
 
     def test_a_board_can_be_saved_and_listed(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
         listed = swarm.every_kept_board()
         self.assertEqual([one["name"] for one in listed], ["Friday work"])
         self.assertEqual(listed[0]["agents"], 1)
 
     def test_opening_one_puts_it_back_on_the_board(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
         self.a_board_with("Somebody else")
         self.assertEqual([one.name for one in swarm.load().agents], ["Somebody else"])
-        swarm.open_this_board("Friday work")
+        swarm.open_this_board("Friday work", self.config)
         self.assertEqual([one.name for one in swarm.load().agents], ["The planner"])
 
     def test_the_last_opened_saved_board_is_remembered_across_a_restart(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("This week")
+        swarm.keep_this_board("This week", self.config)
         self.a_board_with("The reviewer")
-        swarm.keep_this_board("Fridays")
+        swarm.keep_this_board("Fridays", self.config)
 
-        swarm.open_this_board("This week")
-        swarm.open_this_board("Fridays")
+        swarm.open_this_board("This week", self.config)
+        swarm.open_this_board("Fridays", self.config)
 
         restarted = swarm.load()
         self.assertEqual(restarted.active_saved_board, "Fridays")
@@ -285,12 +296,12 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
 
     def test_edits_to_the_open_saved_board_survive_without_losing_its_identity(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday work")
-        opened = swarm.open_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
+        opened = swarm.open_this_board("Friday work", self.config)
         changed = opened.to_dict()
         changed.pop("active_saved_board")  # as sent by a panel from before this feature
         changed["agents"].append({"name": "The reviewer"})
-        swarm.save(changed)
+        swarm.save(changed, self.config)
 
         restarted = swarm.load()
         self.assertEqual(restarted.active_saved_board, "Friday work")
@@ -299,13 +310,13 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
 
     def test_two_boards_are_kept_apart(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("This week")
+        swarm.keep_this_board("This week", self.config)
         self.a_board_with("The reviewer", "The writer")
-        swarm.keep_this_board("Fridays")
+        swarm.keep_this_board("Fridays", self.config)
         self.assertEqual(
             sorted(one["name"] for one in swarm.every_kept_board()),
             ["Fridays", "This week"])
-        swarm.open_this_board("This week")
+        swarm.open_this_board("This week", self.config)
         self.assertEqual([one.name for one in swarm.load().agents], ["The planner"])
 
     def test_names_that_differ_only_in_capitals_stay_apart(self) -> None:
@@ -314,50 +325,50 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         quietly become the other."""
 
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday")
+        swarm.keep_this_board("Friday", self.config)
         self.a_board_with("The reviewer")
-        swarm.keep_this_board("friday")
+        swarm.keep_this_board("friday", self.config)
         self.assertEqual(len(swarm.every_kept_board()), 2)
 
     def test_a_name_cannot_reach_out_of_the_folder_it_belongs_in(self) -> None:
         self.a_board_with("The planner")
         for awkward in ("../elsewhere", "a/b", "..", "with\\backslash"):
             with self.subTest(name=awkward), self.assertRaises(swarm.SwarmError):
-                swarm.keep_this_board(awkward)
+                swarm.keep_this_board(awkward, self.config)
 
     def test_an_empty_name_is_refused(self) -> None:
         with self.assertRaises(swarm.SwarmError):
-            swarm.keep_this_board("   ")
+            swarm.keep_this_board("   ", self.config)
 
     def test_one_can_be_deleted(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday work")
-        swarm.forget_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
+        swarm.forget_this_board("Friday work", self.config)
         self.assertEqual(swarm.every_kept_board(), [])
 
     def test_deleting_the_open_saved_board_clears_its_identity(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday work")
-        swarm.open_this_board("Friday work")
-        swarm.forget_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
+        swarm.open_this_board("Friday work", self.config)
+        swarm.forget_this_board("Friday work", self.config)
         self.assertEqual(swarm.load().active_saved_board, "")
 
     def test_deleting_one_that_is_not_there_says_so(self) -> None:
         with self.assertRaises(swarm.SwarmError):
-            swarm.forget_this_board("Never existed")
+            swarm.forget_this_board("Never existed", self.config)
 
     def test_opening_one_that_is_not_there_says_so(self) -> None:
         with self.assertRaises(swarm.SwarmError):
-            swarm.open_this_board("Never existed")
+            swarm.open_this_board("Never existed", self.config)
 
     def test_saving_over_one_replaces_it_rather_than_making_a_second(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
         self.a_board_with("The reviewer")
-        swarm.keep_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
         listed = swarm.every_kept_board()
         self.assertEqual(len(listed), 1)
-        swarm.open_this_board("Friday work")
+        swarm.open_this_board("Friday work", self.config)
         self.assertEqual([one.name for one in swarm.load().agents], ["The reviewer"])
 
     def test_there_is_a_lid_on_how_many_are_kept(self) -> None:
@@ -366,14 +377,14 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
 
         self.a_board_with("The planner")
         for number in range(swarm.MOST_KEPT_BOARDS):
-            swarm.keep_this_board(f"Board {number}")
+            swarm.keep_this_board(f"Board {number}", self.config)
         with self.assertRaises(swarm.SwarmError) as caught:
-            swarm.keep_this_board("One too many")
+            swarm.keep_this_board("One too many", self.config)
         self.assertIn("which is the most", str(caught.exception))
 
     def test_a_saved_board_that_cannot_be_read_does_not_hide_the_others(self) -> None:
         self.a_board_with("The planner")
-        swarm.keep_this_board("A good one")
+        swarm.keep_this_board("A good one", self.config)
         (swarm.where_the_kept_ones_live() / "rubbish.json").write_text(
             "not json at all", encoding="utf-8")
         self.assertEqual([one["name"] for one in swarm.every_kept_board()], ["A good one"])
@@ -383,14 +394,14 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         as anything else rather than being trusted."""
 
         self.a_board_with("The planner")
-        swarm.keep_this_board("Friday work")
+        swarm.keep_this_board("Friday work", self.config)
         where = swarm.where_the_kept_ones_live()
         one = next(iter(where.glob("*.json")))
         held = json.loads(one.read_text(encoding="utf-8"))
         held["board"]["agents"].append({"name": "The planner"})   # the same name twice
         one.write_text(json.dumps(held), encoding="utf-8")
         with self.assertRaises(swarm.SwarmError):
-            swarm.open_this_board("Friday work")
+            swarm.open_this_board("Friday work", self.config)
 
 
 class TheBoardSurvivesTheChecksTests(unittest.TestCase):

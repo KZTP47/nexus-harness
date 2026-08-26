@@ -57,8 +57,8 @@ const PROVIDERS = Object.freeze({
     stop: ["button[aria-label*='Stop']", ".stop-button"],
     errors: ["[role='alert']", ".error-message"],
     attach: ["button[aria-label*='Upload']", "button[aria-label*='Add file']"],
-    retryStalledReply: true, maxStallRetries: 3, settleWhileStoppingMs: 8000,
     pairRepliesToUsers: true, acceptComposerClear: true,
+    trustedInput: true,
   },
   copilot: {
     id: "copilot", label: "Microsoft Copilot", home: "https://copilot.microsoft.com/", newChat: "https://copilot.microsoft.com/",
@@ -74,6 +74,7 @@ const PROVIDERS = Object.freeze({
     signedOut: ["[data-testid='anonymous-block-page-title']", "a[href*='login.live.com']"],
     attach: ["button[aria-label*='Attach']", "button[aria-label*='Add']"],
     pairRepliesToUsers: true,
+    trustedInput: true,
   },
 });
 
@@ -202,7 +203,6 @@ function automationScript(provider, prompt, submittedMarker = "") {
       errors: provider.errors || [], signedOut: provider.signedOut || [],
       signedOutPaths: provider.signedOutPaths || [],
       pairRepliesToUsers: Boolean(provider.pairRepliesToUsers),
-      acceptComposerClear: Boolean(provider.acceptComposerClear),
     })};
     const prompt = ${JSON.stringify(String(prompt || ""))};
     const submittedMarker = ${JSON.stringify(String(submittedMarker || ""))};
@@ -306,20 +306,11 @@ function automationScript(provider, prompt, submittedMarker = "") {
         || (after.at(-1) && after.at(-1) !== before.at(-1));
       const stoppingNow = selectors.stop.some(
         (selector) => [...document.querySelectorAll(selector)].some(visible));
-      const composerText = normal(
-        composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
-          ? composer.value : (composer.innerText || composer.textContent || ""));
-      // Gemini's custom send component clears its Quill editor as soon as the
-      // turn is accepted, while the virtualised user-query node can mount more
-      // than eight seconds later. This signal is scoped to providers that
-      // explicitly guarantee clear-on-submit; answerScript still pairs the
-      // eventual reply to the exact user bubble before returning any text.
-      const composerAccepted = selectors.acceptComposerClear && sendActivated && !composerText;
       // Gemini exposes a Stop control for a previous turn while its UI is
       // settling. That old control is not acknowledgement of this prompt.
       // Pair-aware providers must render a new user turn; other providers may
       // also acknowledge through a new reply or a newly appearing Stop.
-      submitted = userAdvanced || composerAccepted || (!selectors.pairRepliesToUsers
+      submitted = userAdvanced || (!selectors.pairRepliesToUsers
         && (replyAdvanced || (!beforeStopping && stoppingNow)));
     }
     const baseline = {
@@ -327,6 +318,9 @@ function automationScript(provider, prompt, submittedMarker = "") {
       beforeUserCount: beforeUsers.length, beforeUserLast: beforeUsers.at(-1) || "",
       beforeError: beforeErrors.at(-1) || "", beforeStopping, sendActivated,
       submittedPrompt: prompt, submittedMarker,
+    };
+    if (!submitted && sendActivated) return {
+      ok: true, needsTrustedEnter: false, error: "", submissionState: "outcome_unknown", ...baseline,
     };
     if (!submitted) return {ok: false, needsTrustedEnter: true, error: ${JSON.stringify(notSent)}, ...baseline};
     return {ok: true, ...baseline};
@@ -384,10 +378,77 @@ function submissionBaselineScript(provider, prompt, submittedMarker = "") {
   })()`;
 }
 
+function submitControlScript(provider, prompt) {
+  return `(() => {
+    const selectors = ${JSON.stringify({
+      composer: provider.composer, send: provider.send,
+    })};
+    const prompt = ${JSON.stringify(String(prompt || ""))};
+    const visible = (one) => {
+      if (!one || getComputedStyle(one).visibility === "hidden"
+          || getComputedStyle(one).display === "none") return false;
+      const rect = one.getBoundingClientRect();
+      return rect.width > 1 && rect.height > 1;
+    };
+    const first = (list) => list.flatMap(
+      (selector) => [...document.querySelectorAll(selector)]).find(visible);
+    const normal = (value) => String(value || "").replace(/\\s+/g, " ").trim();
+    const submitted = normal(prompt);
+    const composer = first(selectors.composer);
+    const rendered = normal(
+      composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+        ? composer.value : (composer?.innerText || composer?.textContent || ""));
+    if (!composer || !rendered || rendered !== submitted) {
+      return {
+        ready: false, code: "composer_not_committed",
+        observedLength: rendered.length, expectedLength: submitted.length,
+      };
+    }
+    // A transcript can contain arbitrary HTML and labels supplied by another
+    // party. Search upward from the verified composer and accept a submit
+    // control only inside the first local composer container that owns one.
+    // This prevents a visible "Send" control elsewhere on the page from
+    // becoming an activation target.
+    let scope = composer;
+    let found = null;
+    for (let depth = 0; scope && depth < 10 && !found; depth += 1) {
+      const candidates = selectors.send.flatMap(
+        (selector) => [...scope.querySelectorAll(selector)]).filter(visible);
+      if (candidates.length === 1) found = candidates[0];
+      scope = scope.parentElement;
+    }
+    if (!found) return {ready: false, code: "submit_control_missing"};
+    const target = found?.matches("button, [role='button']")
+      ? found : found?.querySelector("button, [role='button']") || found;
+    if (!target || !visible(target)) return {ready: false, code: "submit_control_missing"};
+    const disabled = target.disabled || found?.getAttribute("aria-disabled") === "true"
+      || target.getAttribute("aria-disabled") === "true"
+      || found?.hasAttribute("data-visually-disabled")
+      || target.hasAttribute("data-visually-disabled");
+    if (disabled) return {ready: false, code: "submit_control_disabled"};
+    const rect = target.getBoundingClientRect();
+    const topmost = document.elementsFromPoint(
+      rect.left + rect.width / 2, rect.top + rect.height / 2);
+    if (!topmost.some((one) => one === target || target.contains(one))) {
+      return {ready: false, code: "submit_control_obscured"};
+    }
+    const fingerprint = [
+      target.tagName, target.id, target.getAttribute("data-testid"),
+      target.getAttribute("data-test-id"), target.getAttribute("role"),
+      String(target.className || ""),
+    ].join("|");
+    return {
+      ready: true, code: "ready", x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2, tag: target.tagName, fingerprint,
+    };
+  })()`;
+}
+
 function submissionScript(provider, prompt, began) {
   return `(async () => {
     const selectors = ${JSON.stringify({
-      users: provider.users || [], replies: provider.replies, stop: provider.stop,
+      composer: provider.composer, users: provider.users || [], replies: provider.replies,
+      stop: provider.stop,
       pairRepliesToUsers: Boolean(provider.pairRepliesToUsers),
     })};
     const prompt = ${JSON.stringify(String(prompt || ""))};
@@ -429,9 +490,24 @@ function submissionScript(provider, prompt, began) {
         || users.length > began.beforeUserCount
         || (users.at(-1) && users.at(-1) !== began.beforeUserLast && users.at(-1).includes(prompt))
         || selectors.stop.some((selector) => [...document.querySelectorAll(selector)].some(visible)));
-      if (submitted) return {...began, ok: true, needsTrustedEnter: false, error: ""};
+      if (submitted) return {
+        ...began, ok: true, needsTrustedEnter: false, error: "",
+        submissionState: "acknowledged",
+      };
     }
-    return began;
+    // Once a genuine pointer activation was attempted, absence of the marked
+    // user bubble is not proof that nothing was sent: provider SPAs can delay
+    // or virtualise it. Continue reconciliation in answerScript, but prohibit
+    // an automatic Enter/resend that could duplicate the logical turn.
+    if (began.sendActivated) return {
+      ...began, ok: true, needsTrustedEnter: false, error: "",
+      submissionState: "outcome_unknown",
+    };
+    return {
+      ...began, ok: false, needsTrustedEnter: !began.sendActivated,
+      failureCode: began.failureCode || "submit_control_unavailable",
+      failureStage: "activation",
+    };
   })()`;
 }
 
@@ -576,10 +652,7 @@ class WebChatManager {
       new ExternalBrowserTransport(transportOptions)
     ));
     this.answerDeadlineMs = Math.max(1000, Number(options.answerDeadlineMs) || 165000);
-    this.stalledReplyMs = Math.max(0, Number(options.stalledReplyMs) || 30000);
     this.answerPollMs = Math.max(1, Number(options.answerPollMs) || 900);
-    this.stoppingSettleMs = options.stoppingSettleMs == null
-      ? null : Math.max(1, Number(options.stoppingSettleMs) || 1);
     this.trackedContents = new WeakMap();
     const saved = this.readSettings().webChats;
     for (const raw of Array.isArray(saved) ? saved : []) {
@@ -1141,10 +1214,11 @@ class WebChatManager {
     }
   }
 
-  async replaceTextAndSubmit(contents, text) {
+  async replaceTextAndSubmit(contents, provider, text) {
     if (typeof contents.replaceTextAndSubmit === "function") {
-      await contents.replaceTextAndSubmit(text);
-      return true;
+      return contents.replaceTextAndSubmit(text, {
+        composer: provider.composer || [], send: provider.send || [],
+      });
     }
     // sendInputEvent requires the containing BrowserWindow to be focused.
     // Relay views intentionally live in a hidden rendering host, which is why
@@ -1166,26 +1240,89 @@ class WebChatManager {
         await key("rawKeyDown", "Backspace", "Backspace", 8);
         await key("keyUp", "Backspace", "Backspace", 8);
         await contents.debugger.sendCommand("Input.insertText", {text: String(text || "")});
-        await new Promise((resolve) => setTimeout(resolve, 120));
-        await key("keyDown", "Enter", "Enter", 13, {text: "\r", unmodifiedText: "\r"});
-        await key("keyUp", "Enter", "Enter", 13);
+        let previous = null;
+        let target = null;
+        for (let tries = 0; tries < 50; tries += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          const candidate = await contents.executeJavaScript(
+            submitControlScript(provider, text), true);
+          if (candidate?.ready && previous?.ready
+              && candidate.fingerprint === previous.fingerprint
+              && Math.abs(candidate.x - previous.x) < 1
+              && Math.abs(candidate.y - previous.y) < 1) {
+            target = candidate;
+            break;
+          }
+          previous = candidate;
+        }
+        if (!target) return {
+          activated: false,
+          failureCode: previous?.code || "submit_control_unavailable",
+          activationMethod: "none",
+        };
+        await contents.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseMoved", x: target.x, y: target.y,
+        });
+        // Revalidate immediately before the external side effect. A provider
+        // animation or SPA remount between discovery and click must fail safe.
+        const current = await contents.executeJavaScript(
+          submitControlScript(provider, text), true);
+        if (!current?.ready || current.fingerprint !== target.fingerprint
+            || Math.abs(current.x - target.x) >= 1
+            || Math.abs(current.y - target.y) >= 1) {
+          return {
+            activated: false, failureCode: "submit_control_changed",
+            activationMethod: "none",
+          };
+        }
+        await contents.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mousePressed", x: current.x, y: current.y,
+          button: "left", clickCount: 1,
+        });
+        await contents.debugger.sendCommand("Input.dispatchMouseEvent", {
+          type: "mouseReleased", x: current.x, y: current.y,
+          button: "left", clickCount: 1,
+        });
+        return {
+          activated: true, sendActivated: true,
+          activationMethod: "trusted_pointer",
+        };
       } finally {
         if (attachedHere && contents.debugger.isAttached()) contents.debugger.detach();
       }
-      return true;
     }
     if (typeof contents.insertText !== "function"
-        || typeof contents.sendInputEvent !== "function") return false;
+        || typeof contents.sendInputEvent !== "function") return {
+      activated: false, failureCode: "trusted_input_unavailable", activationMethod: "none",
+    };
     const input = (event) => contents.sendInputEvent(event);
     input({type: "keyDown", keyCode: "A", modifiers: ["control"]});
     input({type: "keyUp", keyCode: "A", modifiers: ["control"]});
     input({type: "keyDown", keyCode: "BACKSPACE"});
     input({type: "keyUp", keyCode: "BACKSPACE"});
     await contents.insertText(text);
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    input({type: "keyDown", keyCode: "ENTER"});
-    input({type: "keyUp", keyCode: "ENTER"});
-    return true;
+    let previous = null;
+    let target = null;
+    for (let tries = 0; tries < 50; tries += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      const candidate = await contents.executeJavaScript(
+        submitControlScript(provider, text), true);
+      if (candidate?.ready && previous?.ready
+          && candidate.fingerprint === previous.fingerprint
+          && Math.abs(candidate.x - previous.x) < 1
+          && Math.abs(candidate.y - previous.y) < 1) {
+        target = candidate;
+        break;
+      }
+      previous = candidate;
+    }
+    if (!target) return {
+      activated: false, failureCode: previous?.code || "submit_control_unavailable",
+      activationMethod: "none",
+    };
+    input({type: "mouseDown", x: target.x, y: target.y, button: "left", clickCount: 1});
+    input({type: "mouseUp", x: target.x, y: target.y, button: "left", clickCount: 1});
+    return {activated: true, sendActivated: true, activationMethod: "trusted_pointer"};
   }
 
   async askNow(
@@ -1230,7 +1367,9 @@ class WebChatManager {
               submissionBaselineScript(provider, submission.prompt, submission.marker), true);
             stopped();
             if (began?.needsTrustedInput) {
-              await this.replaceTextAndSubmit(view.webContents, submission.prompt);
+              const activation = await this.replaceTextAndSubmit(
+                view.webContents, provider, submission.prompt);
+              began = {...began, ...activation};
               began = await view.webContents.executeJavaScript(
                 submissionScript(provider, submission.prompt, began), true);
             }
@@ -1239,7 +1378,7 @@ class WebChatManager {
               automationScript(provider, submission.prompt, submission.marker), true);
           }
           stopped();
-          if (!began?.ok && began?.needsTrustedEnter
+          if (!began?.ok && began?.needsTrustedEnter && !began?.sendActivated
               && (typeof view.webContents.sendInputEvent === "function"
                   || typeof view.webContents.pressEnter === "function")) {
             if (typeof view.webContents.pressEnter === "function") {
@@ -1261,10 +1400,7 @@ class WebChatManager {
       let began = await submitTurn(submission);
       if (!began?.ok) throw new Error(began?.error || "The provider web chat could not be sent a message");
       const started = Date.now();
-      let attemptStarted = started;
-      let stallRetries = 0;
       let retriedVisibleError = false;
-      let replyChanged = false;
       let stable = 0;
       let previous = "";
       while (Date.now() - started < this.answerDeadlineMs) {
@@ -1278,7 +1414,6 @@ class WebChatManager {
             stopped();
             if (retried) {
               retriedVisibleError = true;
-              attemptStarted = Date.now();
               stable = 0;
               previous = "";
               continue;
@@ -1286,46 +1421,14 @@ class WebChatManager {
           }
           throw new Error(`${provider.label} reported: ${state.error}`);
         }
-        replyChanged ||= Boolean(state?.changed && state.answer);
-        if (
-          provider.retryStalledReply && !attachments.length
-          && stallRetries < (provider.maxStallRetries || 1)
-          && !replyChanged && state?.stopping
-          && Date.now() - attemptStarted >= this.stalledReplyMs
-        ) {
-          const stoppedRemote = await view.webContents.executeJavaScript(stopScript(provider), true);
-          stopped();
-          if (stoppedRemote) {
-            stallRetries += 1;
-            stable = 0;
-            previous = "";
-            await new Promise((resolve) => setTimeout(resolve, Math.min(1200, this.answerPollMs)));
-            stopped();
-            submission = nextSubmission();
-            began = await submitTurn(submission);
-            stopped();
-            if (!began?.ok) throw new Error(
-              began?.error || `${provider.label} could not retry its stalled reply`);
-            attemptStarted = Date.now();
-            continue;
-          }
-        }
         if (!state?.changed || !state.answer) { stable = 0; continue; }
         if (state.answer === previous) stable += 1; else stable = 0;
         previous = state.answer;
-        if (state.stopping) {
-          const settleMs = this.stoppingSettleMs ?? provider.settleWhileStoppingMs ?? 0;
-          if (!settleMs || stable * this.answerPollMs < settleMs) continue;
-          await view.webContents.executeJavaScript(stopScript(provider), true);
-          await new Promise((resolve) => setTimeout(resolve, Math.min(700, this.answerPollMs)));
-          stopped();
-          const committed = await view.webContents.executeJavaScript(answerScript(provider, began), true);
-          const answer = committed?.changed && committed.answer ? committed.answer : state.answer;
-          this.rememberConnectionPage(id, view.webContents, key);
-          this.showCreatedConversationInOpenShells(
-            id, key, view.webContents, priorUrl);
-          return {answer, milliseconds: Date.now() - started, model: `${provider.label} web chat`};
-        }
+        // A visible Stop control means generation is still in progress. Text
+        // stability is not a completion receipt: providers can pause while
+        // reasoning, using tools, or waiting on their own backend. Never stop
+        // and commit a partial response merely because its DOM stayed still.
+        if (state.stopping) continue;
         if (stable >= 2) {
           this.rememberConnectionPage(id, view.webContents, key);
           this.showCreatedConversationInOpenShells(
@@ -1334,24 +1437,17 @@ class WebChatManager {
         }
       }
       // Do not leave a provider generation running after the local broker has
-      // stopped waiting. Stopping also gives providers one last chance to
-      // commit a reply that was already visible but still marked as streaming.
+      // stopped waiting. Any text still accompanied by a Stop control is
+      // incomplete and must never be committed as agent speech.
       try {
         await view.webContents.executeJavaScript(stopScript(provider), true);
-        await new Promise((resolve) => setTimeout(resolve, Math.min(700, this.answerPollMs)));
-        stopped();
-        const finalState = await view.webContents.executeJavaScript(answerScript(provider, began), true);
-        if (finalState?.changed && finalState.answer) {
-          this.rememberConnectionPage(id, view.webContents, key);
-          this.showCreatedConversationInOpenShells(
-            id, key, view.webContents, priorUrl);
-          return {answer: finalState.answer, milliseconds: Date.now() - started, model: `${provider.label} web chat`};
-        }
       } catch (error) {
         if (active.cancelled) throw error;
       }
       throw new Error(
-        `${provider.label} did not finish a visible reply before the Nexus chat wait ended`);
+        began?.submissionState === "outcome_unknown"
+          ? `${provider.label} may have accepted this message, but Nexus could not match its marked turn and reply. Nexus did not resend it, to prevent a duplicate. Open the provider chat to reconcile or start this chat again.`
+          : `${provider.label} did not finish a visible reply before the Nexus chat wait ended`);
     } finally {
       if (this.activeAsks.get(channel) === active) this.activeAsks.delete(channel);
     }
@@ -1371,6 +1467,7 @@ class WebChatManager {
 
 module.exports = {
   PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
-  automationScript, submissionBaselineScript, submissionScript, answerScript, retryScript, stopScript,
+  automationScript, submissionBaselineScript, submitControlScript, submissionScript,
+  answerScript, retryScript, stopScript,
   browserLikeUserAgent, authStorageAccessIsTrusted,
 };

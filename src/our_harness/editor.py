@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
@@ -197,11 +198,33 @@ def _list_the_automations(config: LoadedConfig, _given: dict[str, Any]) -> str:
 
 def _run_an_automation(config: LoadedConfig, given: dict[str, Any]) -> str:
     from . import pipelines
+    from .pipeline_runs import PipelineRunStore
 
     name = _text(given.get("name"), "name")
     if not name:
         raise EditorError("Say which automation to run.")
-    run = pipelines.run_it(config, pipelines.load(config, name))
+    definition = pipelines.load(config, name)
+    frozen = pipelines.freeze_definition(config, definition)
+    store = PipelineRunStore(config)
+    accepted, _created = store.accept(frozen, source="editor")
+    run_id = accepted["run_id"]
+    attempt_id = accepted["attempt_id"]
+    store.start(run_id, attempt_id)
+    try:
+        run = pipelines.run_it(
+            config, definition,
+            tell=lambda event: store.append_event(run_id, attempt_id, event),
+            stopping=lambda: store.should_stop(run_id),
+            run_id=run_id, frozen=frozen,
+            decision_nonce=attempt_id,
+        )
+        store.finish(run_id, attempt_id, run.to_dict())
+    except BaseException as exc:
+        try:
+            store.fail(run_id, attempt_id, str(exc))
+        except HarnessError:
+            pass
+        raise
     return f"{'Passed' if run.passed else 'Did not pass'}: {run.said}"
 
 
@@ -216,9 +239,12 @@ def _run_the_checks(config: LoadedConfig, given: dict[str, Any]) -> str:
         suite,
         ids=(only,) if only else (),
         workers=1,
-        # Nothing is kept: the editor asked a question and wants an answer, and
-        # a run folder per question fills a project up with nobody looking.
-        write_artifacts=False,
+        run_id=f"editor-{uuid.uuid4().hex}",
+        # Editor-triggered checks are still real executions. Keep their
+        # immutable run-scoped evidence so a later report cannot silently
+        # refer to overwritten or missing visual/command evidence.
+        write_artifacts=True,
+        immutable_artifacts=True,
     )
     # The same report the terminal prints, cleaned the same way, because it is
     # about to be handed to somebody else's program.

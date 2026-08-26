@@ -1,4 +1,5 @@
 config.local.json
+project-authority.json
 memory/
 runs/
 backups/

@@ -41,6 +41,7 @@ import hashlib
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -487,7 +488,22 @@ def load() -> Board:
         return Board()
 
 
-def save(said: Any) -> Board:
+def save(said: Any, config: Any) -> Board:
+    """Persist a board through the process-wide board authority.
+
+    The authority lives outside every project and is shared with durable board
+    runs.  Keeping this gate here (rather than only in the HTTP handler) means
+    CLI and named-board callers cannot accidentally mutate the global board
+    while another process is executing a snapshot of it.
+    """
+
+    from .swarm_runs import SwarmRunStore
+
+    with SwarmRunStore(config).board_mutation():
+        return _save_while_board_authority_is_held(said, config)
+
+
+def _save_while_board_authority_is_held(said: Any, config: Any) -> Board:
     """Write the whole board down, if it is still the board that was read.
 
     A whole board at a time, because it is one small picture and saving it
@@ -539,6 +555,11 @@ def save(said: Any) -> Board:
             "change on top of theirs."
         )
     board.version = now.version + 1
+    from . import swarm_chats as swarm_chats_lab
+
+    swarm_chats_lab.fence_for_board_change(
+        config, now.to_dict(), board.to_dict()
+    )
     where = where_it_lives()
     where.parent.mkdir(parents=True, exist_ok=True)
     put_this_file_in_place(where, json.dumps(board.to_dict(), indent=2) + "\n")
@@ -956,9 +977,13 @@ class Doing:
     # dropped: a list that has been cut short and does not say so reads like the
     # whole of it.
     dropped: int = 0
+    run_id: str = ""
+    request_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "run_id": self.run_id,
+            "request_id": self.request_id,
             "going": self.going,
             "stopped": self.stopped,
             "note": self.note,
@@ -1076,8 +1101,10 @@ class Running:
     while reading half of somebody else's.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, run_store=None) -> None:
         self._lock = threading.Lock()
+        self._run_store = run_store
+        self._run_id = ""
         self._doing: Doing | None = None
         self._stop = False
         self._thread: threading.Thread | None = None
@@ -1103,7 +1130,46 @@ class Running:
             "a conversation nothing points at any more. Press Stop first."
         )
 
-    def how_it_is_going(self) -> dict[str, Any] | None:
+    def how_it_is_going(
+        self, run_id: str = "", after: int = 0
+    ) -> dict[str, Any] | None:
+        identity = str(run_id or "").strip()
+        if self._run_store is not None and (identity or self._run_id):
+            identity = identity or self._run_id
+            full = self._run_store.get(identity)
+            delta = self._run_store.projection(identity, after)
+            doing = None
+            if isinstance(full.get("result"), dict):
+                doing = full["result"].get("doing")
+            if not isinstance(doing, dict):
+                event = self._run_store.latest_event(identity, "board_progress")
+                if event is not None and isinstance(event["payload"], dict):
+                    doing = event["payload"]
+            if not isinstance(doing, dict):
+                doing = {
+                    "run_id": full["run_id"], "request_id": full["request_id"],
+                    "going": full["status"] in {"accepted", "running", "stopping"},
+                    "stopped": full["status"] == "stopped", "note": full["error"],
+                    "turns": [], "done": 0, "of": 0, "went_wrong": 0,
+                }
+            answer = dict(doing)
+            answer.update({
+                "run_id": full["run_id"], "request_id": full["request_id"],
+                "status": full["status"], "cursor": delta["cursor"],
+                "next_cursor": delta["next_cursor"],
+                "has_more": delta["has_more"],
+                "events": delta["events"],
+                "going": full["status"] in {"accepted", "running", "stopping"},
+                "resumable": bool(full.get("resumable")),
+                "recovery_action": str(full.get("recovery_action") or ""),
+            })
+            if full["status"] in {
+                "failed", "stopped", "interrupted", "delivery_unknown", "outcome_unknown"
+            } and full.get("error"):
+                # A stale board_progress projection is useful for counts, but
+                # it must not hide the terminal recovery instruction.
+                answer["note"] = str(full["error"])
+            return answer
         with self._lock:
             return self._doing.to_dict() if self._doing else None
 
@@ -1137,9 +1203,28 @@ class Running:
             delivery=delivery,
         )
 
-    def stop(self) -> str:
+    def stop(self, run_id: str = "") -> str:
+        wanted = str(run_id or "").strip()
+        if self._run_store is not None and not wanted:
+            raise SwarmError("The exact Swarm run ID is required to stop a board run.")
+        durable = None
+        if self._run_store is not None:
+            # The journal is the authority, not this server process. Another
+            # Nexus process can therefore stop the exact board run it can see;
+            # the owning worker observes this barrier before its next effect.
+            durable = self._run_store.request_stop(wanted)
+            if durable["status"] != "stopping":
+                raise SwarmError("That Swarm run is already over; nothing was stopped.")
         with self._lock:
-            if not (self._doing and self._doing.going):
+            locally_owned = bool(
+                self._doing and self._doing.going
+                and (self._run_store is None or wanted == self._run_id)
+            )
+            if not locally_owned:
+                if self._run_store is not None:
+                    return (
+                        "Stopping. The owning Nexus process will observe the durable Stop barrier before another effect."
+                    )
                 return "Nothing is going, so there is nothing to stop."
             self._stop = True
             self._doing.note = "Stopping after the turn that is going now."
@@ -1148,7 +1233,10 @@ class Running:
             "no way to un-ask it, and nothing after it will be asked."
         )
 
-    def start(self, config, standing: dict[str, Any] | None = None) -> dict[str, Any]:
+    def start(
+        self, config, standing: dict[str, Any] | None = None,
+        request_id: str = "",
+    ) -> dict[str, Any]:
         # Electron decorates the ordinary board view with live consumer-web
         # routes.  A server-started run must use that same view or a web agent
         # appears ready in its settings and then vanishes from the run plan.
@@ -1171,26 +1259,119 @@ class Running:
                 raise SwarmError(
                     "The board is already going. Wait for it, or press Stop."
                 )
+            run_id = ""
+            accepted = None
+            if self._run_store is not None:
+                snapshot = {
+                    "kind": "board_order",
+                    "board": said["board"],
+                    "objective_generations": {
+                        str(project.get("id") or ""): shared_goal_id(project)
+                        for project in said["board"].get("projects", [])
+                    },
+                }
+                accepted, created = self._run_store.accept(request_id, snapshot)
+                run_id = str(accepted["run_id"])
+                if not created:
+                    return self.how_it_is_going(run_id) or {
+                        "run_id": run_id, "request_id": accepted["request_id"],
+                        "going": accepted["status"] in {"accepted", "running", "stopping"},
+                    }
             self._stop = False
             self._doing = Doing(
-                note="Asking each of them on their own first.", turns=turns)
+                note="Asking each of them on their own first.", turns=turns,
+                run_id=run_id,
+                request_id=str(accepted["request_id"] if accepted else request_id),
+            )
             doing = self._doing
+            self._run_id = run_id
+        if self._run_store is not None:
+            try:
+                self._run_store.start(run_id)
+                self._record_progress(doing)
+            except BaseException as exc:
+                doing.going = False
+                self._run_store.fail(run_id, f"The board run could not start: {exc}")
+                raise
 
         def work() -> None:
+            run_scope = None
             try:
+                if self._run_store is not None:
+                    from . import swarm_runs as swarm_runtime
+
+                    run_scope = swarm_runtime.bind(self._run_store, run_id)
+                    run_scope.__enter__()
                 self._do_it(config, said, doing)
             except BaseException as exc:  # noqa: BLE001 - nothing may leave it going
                 doing.note = f"This stopped in a way nobody expected: {exc}"
+                if self._run_store is not None:
+                    self._run_store.fail(run_id, str(exc), stopped=doing.stopped)
             finally:
                 # However this ends, the run stops being one that is going. One
                 # that says it is still going refuses every later press, and the
                 # only way out would be restarting the panel.
                 doing.going = False
+                if self._run_store is not None:
+                    try:
+                        if doing.stopped:
+                            self._run_store.fail(run_id, doing.note, stopped=True)
+                        else:
+                            durable_status = self._run_store.get(run_id)["status"]
+                            if durable_status == "stopping":
+                                doing.stopped = True
+                                doing.note = "Stopped after the in-flight provider turn."
+                                self._run_store.fail(run_id, doing.note, stopped=True)
+                            elif durable_status == "running":
+                                self._run_store.finish(run_id, {"doing": doing.to_dict()})
+                    finally:
+                        if run_scope is not None:
+                            run_scope.__exit__(None, None, None)
 
         thread = threading.Thread(target=work, name="the-board", daemon=True)
         self._thread = thread
-        thread.start()
+        try:
+            thread.start()
+        except BaseException as exc:
+            doing.going = False
+            if self._run_store is not None:
+                self._run_store.fail(run_id, f"The board worker could not start: {exc}")
+            raise
         return doing.to_dict()
+
+    def _record_progress(self, doing: Doing) -> None:
+        if self._run_store is not None and doing.run_id:
+            self._run_store.checkpoint(doing.run_id, "board_progress", doing.to_dict())
+
+    def _stop_was_requested(self, doing: Doing) -> bool:
+        with self._lock:
+            if self._stop:
+                return True
+        if self._run_store is None or not doing.run_id:
+            return False
+        try:
+            return self._run_store.should_stop(doing.run_id)
+        except HarnessError:
+            # Losing the authority record is never permission to keep causing
+            # effects. The final error path preserves the failure evidence.
+            return True
+
+    @contextmanager
+    def _post_provider_mutation(self, doing: Doing):
+        """Linearize an external write against the exact Stop command."""
+
+        if self._run_store is not None and doing.run_id:
+            with self._run_store.post_provider_mutation(doing.run_id):
+                yield
+            return
+        # Legacy in-process callers use the same lock as stop(). Stop either
+        # waits for this mutation to finish or is observed before it begins.
+        with self._lock:
+            if self._stop:
+                raise HarnessError(
+                    "Stop was accepted before this post-provider mutation."
+                )
+            yield
 
     def wait(self, seconds: float = 5.0) -> None:
         """Only used by tests, so they never depend on how fast a machine is."""
@@ -1251,12 +1432,12 @@ class Running:
         # shown only the notes that agent is allowed to see.
         heard: dict[tuple[str, str], str] = {}
         for turn in doing.turns:
-            with self._lock:
-                stopping = self._stop
+            stopping = self._stop_was_requested(doing)
             if stopping:
                 turn.state = "not done"
                 turn.why_not = "Stopped before this one was asked."
                 doing.stopped = True
+                self._record_progress(doing)
                 continue
             agent = agents[turn.agent]
             project = projects[turn.project]
@@ -1294,6 +1475,7 @@ class Running:
                 if not notes:
                     turn.state = "not done"
                     turn.why_not = "Nobody it may talk to had anything to show it."
+                    self._record_progress(doing)
                     continue
                 # The page itself, rather than the notes gathered above. Read
                 # here, so what goes in front of this agent is the page as it
@@ -1357,6 +1539,7 @@ class Running:
                         del doing.notes[:len(doing.notes) - MOST_NOTES]
             turn.state = "asking"
             doing.note = f"Asking {turn.name} about {turn.where}, {turn.round}."
+            self._record_progress(doing)
             started = time.monotonic()
             try:
                 answered = chat_lab.say(
@@ -1367,30 +1550,51 @@ class Running:
             except HarnessError as exc:
                 turn.state = "went wrong"
                 turn.why_not = str(exc)
-                if incoming:
+                if incoming and not self._stop_was_requested(doing):
                     try:
-                        mailbox.attempted(
-                            where_the_mailbox_lives(),
-                            [one.message_id for one in incoming],
-                            str(exc),
-                        )
+                        with self._post_provider_mutation(doing):
+                            mailbox.attempted(
+                                where_the_mailbox_lives(),
+                                [one.message_id for one in incoming],
+                                str(exc),
+                            )
                     except (OSError, HarnessError):
                         pass
             else:
                 turn.state = "done"
                 turn.said = str(answered.get("answer", {}).get("text") or "")
+                if self._stop_was_requested(doing):
+                    # The in-flight provider answer is evidence and is kept in
+                    # this turn, but Stop is an effect barrier: no page write,
+                    # inbox acknowledgement, or new handoff may follow it.
+                    doing.stopped = True
+                    turn.why_not = (
+                        "It answered after Stop. The answer was kept, but Nexus did not write it to the shared page or create another handoff."
+                    )
+                    turn.milliseconds = int((time.monotonic() - started) * 1000)
+                    self._record_progress(doing)
+                    continue
                 if incoming:
                     try:
-                        mailbox.acknowledge(
-                            where_the_mailbox_lives(),
-                            [one.message_id for one in incoming],
-                        )
+                        with self._post_provider_mutation(doing):
+                            mailbox.acknowledge(
+                                where_the_mailbox_lives(),
+                                [one.message_id for one in incoming],
+                            )
                         acknowledged = {one.message_id for one in incoming}
                         for note in doing.notes:
                             if note.message_id in acknowledged:
                                 note.status = "acknowledged"
                                 note.attempts += 1
                     except (OSError, HarnessError) as exc:
+                        if self._stop_was_requested(doing):
+                            doing.stopped = True
+                            turn.why_not = (
+                                "It answered after Stop. The answer was kept, but its inbox was not acknowledged."
+                            )
+                            turn.milliseconds = int((time.monotonic() - started) * 1000)
+                            self._record_progress(doing)
+                            continue
                         turn.why_not = (
                             f"It answered, but its inbox acknowledgement could not be "
                             f"written: {exc}"
@@ -1401,21 +1605,22 @@ class Running:
                 # to interrupt.
                 if turn.said and project.get("path"):
                     try:
-                        landed = pages_lab.add_to_the_page(
-                            config, project["path"],
-                            who=agent["name"],
-                            text=turn.said,
-                            # Compared against the round itself rather than a
-                            # sentence typed out again here. Written twice, the
-                            # two drifted apart and every part on the page said
-                            # "after reading the page", including the first
-                            # round where nobody had read anything.
-                            what_they_were_doing=(
-                                ON_ITS_OWN if turn.round == ON_ITS_OWN
-                                else "after reading the page"),
-                            after=turn.after,
-                            name=project["name"],
-                        )
+                        with self._post_provider_mutation(doing):
+                            landed = pages_lab.add_to_the_page(
+                                config, project["path"],
+                                who=agent["name"],
+                                text=turn.said,
+                                # Compared against the round itself rather than a
+                                # sentence typed out again here. Written twice, the
+                                # two drifted apart and every part on the page said
+                                # "after reading the page", including the first
+                                # round where nobody had read anything.
+                                what_they_were_doing=(
+                                    ON_ITS_OWN if turn.round == ON_ITS_OWN
+                                    else "after reading the page"),
+                                after=turn.after,
+                                name=project["name"],
+                            )
                         turn.part = int(landed.get("number") or 0)
                         # Said out loud when somebody got there first, because
                         # that is the moment a person wants to know two of them
@@ -1423,6 +1628,14 @@ class Running:
                         if landed.get("note"):
                             doing.note = str(landed["note"])
                     except HarnessError as exc:
+                        if self._stop_was_requested(doing):
+                            doing.stopped = True
+                            turn.why_not = (
+                                "It answered after Stop. The answer was kept, but Nexus refused the shared-page write."
+                            )
+                            turn.milliseconds = int((time.monotonic() - started) * 1000)
+                            self._record_progress(doing)
+                            continue
                         # The answer is not lost over this. It is in the turn,
                         # it is on the screen, and the page is a record rather
                         # than the only copy.
@@ -1440,26 +1653,35 @@ class Running:
                                     board, turn.agent, receiver["id"])):
                             continue
                         try:
-                            queued = mailbox.enqueue(
-                                where_the_mailbox_lives(),
-                                shared_goal_id=turn.shared_goal,
-                                sender=turn.agent,
-                                sender_name=agent["name"],
-                                receiver=receiver["id"],
-                                receiver_name=receiver["name"],
-                                project=turn.project,
-                                project_name=project["name"],
-                                body=turn.said,
-                                expects_reply=True,
-                                thread_id=thread_id,
-                            )
+                            with self._post_provider_mutation(doing):
+                                queued = mailbox.enqueue(
+                                    where_the_mailbox_lives(),
+                                    shared_goal_id=turn.shared_goal,
+                                    sender=turn.agent,
+                                    sender_name=agent["name"],
+                                    receiver=receiver["id"],
+                                    receiver_name=receiver["name"],
+                                    project=turn.project,
+                                    project_name=project["name"],
+                                    body=turn.said,
+                                    expects_reply=True,
+                                    thread_id=thread_id,
+                                )
                             thread_id = queued.thread_id
                         except (OSError, HarnessError) as exc:
+                            if self._stop_was_requested(doing):
+                                doing.stopped = True
+                                turn.why_not = (
+                                    "It answered after Stop. The answer was kept, but Nexus refused a new handoff."
+                                )
+                                break
                             warning = f"Its answer was kept, but one handoff was not queued: {exc}"
                             turn.why_not = f"{turn.why_not} {warning}".strip()
             turn.milliseconds = int((time.monotonic() - started) * 1000)
+            self._record_progress(doing)
         doing.note = _how_it_went(doing)
         _keep_what_they_said(doing)
+        self._record_progress(doing)
 
 
 def _the_time_now() -> str:
@@ -1610,36 +1832,39 @@ def every_kept_board() -> list[dict[str, Any]]:
     return sorted(found, key=lambda one: one["saved_at"], reverse=True)
 
 
-def keep_this_board(name: str) -> dict[str, Any]:
+def keep_this_board(name: str, config: Any) -> dict[str, Any]:
     """Save the board as it stands now, under a name.
 
     What is saved is what is on the board this moment, not what was last set
     going. Somebody pressing save has just finished arranging it.
     """
 
-    filed = _filed_under(name)
-    where = where_the_kept_ones_live()
-    where.mkdir(parents=True, exist_ok=True)
-    already = every_kept_board()
-    if len(already) >= MOST_KEPT_BOARDS and not (where / filed).is_file():
-        raise SwarmError(
-            f"There are already {MOST_KEPT_BOARDS} saved boards, which is the most. "
-            "Delete one you no longer want first."
-        )
-    held = {
-        "name": " ".join(str(name).split()),
-        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "board": load().to_dict(),
-    }
-    # Written beside and moved into place, so a panel reading the list never
-    # catches a board half written.
-    beside = where / f"{filed}.{os.getpid()}.part"
-    beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
-    os.replace(beside, where / filed)
-    return {"name": held["name"], "saved_at": held["saved_at"]}
+    from .swarm_runs import SwarmRunStore
+
+    with SwarmRunStore(config).board_mutation():
+        filed = _filed_under(name)
+        where = where_the_kept_ones_live()
+        where.mkdir(parents=True, exist_ok=True)
+        already = every_kept_board()
+        if len(already) >= MOST_KEPT_BOARDS and not (where / filed).is_file():
+            raise SwarmError(
+                f"There are already {MOST_KEPT_BOARDS} saved boards, which is the most. "
+                "Delete one you no longer want first."
+            )
+        held = {
+            "name": " ".join(str(name).split()),
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "board": load().to_dict(),
+        }
+        # Written beside and moved into place, so a panel reading the list never
+        # catches a board half written.
+        beside = where / f"{filed}.{os.getpid()}.part"
+        beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+        os.replace(beside, where / filed)
+        return {"name": held["name"], "saved_at": held["saved_at"]}
 
 
-def open_this_board(name: str) -> Board:
+def open_this_board(name: str, config: Any) -> Board:
     """Put a saved board back on the screen, as the one being worked on.
 
     The board it replaces is not lost by accident: it can be saved first, and
@@ -1647,35 +1872,43 @@ def open_this_board(name: str) -> Board:
     somebody ends up with a board holding both and belonging to neither.
     """
 
-    opened_as = " ".join(str(name).split())
-    where = where_the_kept_ones_live() / _filed_under(opened_as)
-    try:
-        held = json.loads(where.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SwarmError(f"There is no saved board called {name}.") from exc
-    board = held.get("board") if isinstance(held, dict) else None
-    if not isinstance(board, dict):
-        raise SwarmError(f"The board saved as {name} cannot be read.")
-    # Through the same door as any other save, so a board saved by an older
-    # version is checked and tidied the same way rather than trusted.
-    return save(dict(
-        board,
-        version=None,
-        active_saved_board=opened_as,
-    ))
+    from .swarm_runs import SwarmRunStore
+
+    with SwarmRunStore(config).board_mutation():
+        opened_as = " ".join(str(name).split())
+        where = where_the_kept_ones_live() / _filed_under(opened_as)
+        try:
+            held = json.loads(where.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SwarmError(f"There is no saved board called {name}.") from exc
+        board = held.get("board") if isinstance(held, dict) else None
+        if not isinstance(board, dict):
+            raise SwarmError(f"The board saved as {name} cannot be read.")
+        # The global authority is already held, so do the validated file write
+        # directly instead of trying to acquire the non-reentrant lease twice.
+        return _save_while_board_authority_is_held(dict(
+            board,
+            version=None,
+            active_saved_board=opened_as,
+        ), config)
 
 
-def forget_this_board(name: str) -> None:
+def forget_this_board(name: str, config: Any) -> None:
     """Throw away one saved board."""
 
-    forgotten = " ".join(str(name).split())
-    where = where_the_kept_ones_live() / _filed_under(forgotten)
-    try:
-        where.unlink()
-    except FileNotFoundError as exc:
-        raise SwarmError(f"There is no saved board called {name}.") from exc
-    except OSError as exc:
-        raise SwarmError(f"The board saved as {name} could not be deleted: {exc}") from exc
-    board = load()
-    if board.active_saved_board == forgotten:
-        save(dict(board.to_dict(), active_saved_board=""))
+    from .swarm_runs import SwarmRunStore
+
+    with SwarmRunStore(config).board_mutation():
+        forgotten = " ".join(str(name).split())
+        where = where_the_kept_ones_live() / _filed_under(forgotten)
+        try:
+            where.unlink()
+        except FileNotFoundError as exc:
+            raise SwarmError(f"There is no saved board called {name}.") from exc
+        except OSError as exc:
+            raise SwarmError(f"The board saved as {name} could not be deleted: {exc}") from exc
+        board = load()
+        if board.active_saved_board == forgotten:
+            _save_while_board_authority_is_held(
+                dict(board.to_dict(), active_saved_board=""), config
+            )

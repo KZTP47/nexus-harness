@@ -9,17 +9,19 @@ transaction boundary owned by Nexus.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
 from . import chat as chat_lab
 from . import cancellation
-from .changes import FileTransaction, file_sha256, sha256_bytes
+from .changes import FileTransaction, atomic_write, file_sha256, sha256_bytes
 from .collaboration_ledger import CollaborationLedger
 from .config import LoadedConfig
 from .models import ChangePlan, HarnessError, ResponseFormat
@@ -29,6 +31,7 @@ from .swarm import SwarmError, may_they_talk
 
 Progress = Callable[[str, str], None]
 LiveTurn = Callable[[dict[str, Any]], None]
+_active_mutation_sagas: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
 
 
 def _report(progress: Progress | None, stage: str, detail: str = "") -> None:
@@ -39,6 +42,61 @@ def _report(progress: Progress | None, stage: str, detail: str = "") -> None:
 def _show_turn(live_turn: LiveTurn | None, turn: dict[str, Any]) -> None:
     if live_turn:
         live_turn(turn)
+
+
+def _pause_provider_failure(
+    ledger: CollaborationLedger,
+    failed: dict[str, Any] | list[dict[str, Any]],
+    stage: str,
+    *,
+    checkpoint: dict[str, Any] | None = None,
+    cause: Exception | None = None,
+    mutation_root: Path | None = None,
+    transaction_ids: list[str] | None = None,
+    mutation_saga: _MutationSaga | None = None,
+) -> None:
+    """Stop orchestration without turning a transport failure into agent speech."""
+
+    failed_agents = failed if isinstance(failed, list) else [failed]
+    names = [str(one.get("name") or "An agent") for one in failed_agents]
+    state: dict[str, Any] = {
+        "stage": stage,
+        "status": "paused",
+        "failed_agents": [
+            {
+                "id": str(one.get("id") or ""),
+                "name": str(one.get("name") or "An agent"),
+                "route": str(one.get("who") or ""),
+                "failure_code": "provider_turn_failed",
+            }
+            for one in failed_agents
+        ],
+    }
+    state.update(checkpoint or {})
+    if mutation_saga is not None:
+        state["mutation_recovery"] = mutation_saga.compensate("provider_failure")
+    elif mutation_root is not None and transaction_ids:
+        state["mutation_recovery"] = _rollback_transactions(mutation_root, transaction_ids)
+    ledger.record_state("provider_transport_failure", state)
+    remaining = [
+        f"Reconnect or reconcile {name}'s provider turn before resuming."
+        for name in names
+    ]
+    report = (
+        "Nexus paused this collaboration because "
+        + ", ".join(names)
+        + " could not complete a provider turn. The failure was not counted as "
+          "agent speech, reasoning progress, or a completed round."
+    )
+    ledger.finish(
+        report,
+        complete=False,
+        stopped_because="provider_unavailable",
+        remaining=remaining,
+    )
+    if cause is not None:
+        raise SwarmError(report) from cause
+    raise SwarmError(report)
 
 
 def _continuation_turn(label: str, instruction: str) -> str:
@@ -109,6 +167,19 @@ DISCUSSION_FORMAT = ResponseFormat("nexus_board_goal_discussion_v1", {
             "type": "array", "maxItems": 12,
             "items": {"type": "string", "maxLength": 500},
         },
+        "progress": {
+            "type": "array", "maxItems": 24,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "maxLength": 160},
+                    "state": {"type": "string", "maxLength": 160},
+                    "evidence": {"type": "string", "maxLength": 500},
+                },
+                "required": ["id", "state", "evidence"],
+                "additionalProperties": False,
+            },
+        },
     },
     "required": ["message", "goal_complete", "remaining"],
     "additionalProperties": False,
@@ -127,6 +198,19 @@ PLAN_REVIEW_FORMAT = ResponseFormat("nexus_board_plan_review_v1", {
         "remaining": {
             "type": "array", "maxItems": 12,
             "items": {"type": "string", "maxLength": 500},
+        },
+        "progress": {
+            "type": "array", "maxItems": 24,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "maxLength": 160},
+                    "state": {"type": "string", "maxLength": 160},
+                    "evidence": {"type": "string", "maxLength": 500},
+                },
+                "required": ["id", "state", "evidence"],
+                "additionalProperties": False,
+            },
         },
     },
     "required": [
@@ -158,6 +242,38 @@ _PROGRESS_STOP_WORDS = frozenset({
     "of", "on", "or", "our", "so", "that", "the", "their", "them", "then",
     "there", "this", "to", "was", "we", "were", "will", "with", "you", "your",
 })
+_PROGRESS_ALIASES = {
+    # Providers naturally alternate nouns and verbs for the same unresolved
+    # action.  Canonicalize those forms before measuring overlap.  Concrete
+    # anchors such as filenames, checkpoint numbers, and issue identifiers are
+    # deliberately left untouched, so real work advancing to a new target is
+    # still a new state.
+    **{
+        word: "change"
+        for word in (
+            "apply", "applied", "applying", "create", "created", "creating",
+            "creation", "implement", "implemented", "implementing",
+            "implementation", "make", "made", "modify", "modified",
+            "modifying", "write", "writing", "written",
+        )
+    },
+    **{
+        word: "verify"
+        for word in (
+            "check", "checked", "checking", "correct", "return", "returned",
+            "returns", "test", "tested", "testing", "tests", "validate",
+            "validated", "validating", "validation", "value", "values",
+        )
+    },
+    **{
+        word: "required"
+        for word in (
+            "allow", "allowed", "allows", "must", "need", "needed", "needs",
+            "require", "required", "requires", "requiring",
+        )
+    },
+    **{word: "file" for word in ("files", "js", "script", "scripts")},
+}
 
 
 def user_round_limit(value: object) -> int | None:
@@ -191,7 +307,8 @@ def _progress_terms(values: object) -> frozenset[str]:
     else:
         text = str(values or "")
     return frozenset(
-        word for word in _PROGRESS_WORDS.findall(text.casefold())
+        _PROGRESS_ALIASES.get(word, word)
+        for word in _PROGRESS_WORDS.findall(text.casefold())
         if (len(word) > 1 or word.isdigit()) and word not in _PROGRESS_STOP_WORDS
     )
 
@@ -206,24 +323,45 @@ def _progress_terms_match(left: frozenset[str], right: frozenset[str]) -> bool:
     return overlap >= 0.78
 
 
-def _progress_states_match(
-    left: tuple[tuple[str, bool, bool, frozenset[str], frozenset[str]], ...],
-    right: tuple[tuple[str, bool, bool, frozenset[str], frozenset[str]], ...],
-) -> bool:
-    if len(left) != len(right):
-        return False
-    for before, now in zip(left, right):
-        before_id, before_complete, before_failed, before_remaining, before_files = before
-        now_id, now_complete, now_failed, now_remaining, now_files = now
-        if (
-            before_id != now_id
-            or before_complete != now_complete
-            or before_failed != now_failed
-            or before_files != now_files
-            or not _progress_terms_match(before_remaining, now_remaining)
-        ):
-            return False
-    return True
+def _canonical_progress_state(
+    agent_id: str,
+    complete: bool,
+    failed: bool,
+    value: dict[str, Any],
+    files: object = None,
+) -> tuple[str, str]:
+    """Return engine-owned canonical state, never a similarity score over prose.
+
+    Provider wording is deliberately excluded. Until providers supply durable
+    structured evidence IDs, only completion state and exact confined file
+    identities can prove movement between rounds.
+    """
+
+    canonical_files = sorted({
+        str(path).strip().replace("\\", "/").casefold()
+        for path in (files if isinstance(files, list) else [])
+        if isinstance(path, str) and path.strip()
+    })
+    state = {
+        "complete": bool(complete),
+        "failed": bool(failed),
+        "files": canonical_files,
+        "progress": sorted(
+            [
+                {
+                    "id": str(item.get("id") or ""),
+                    "state": str(item.get("state") or ""),
+                    "evidence": str(item.get("evidence") or ""),
+                }
+                for item in value.get("progress", [])
+                if isinstance(item, dict) and str(item.get("id") or "")
+            ],
+            key=lambda item: (item["id"], item["state"], item["evidence"]),
+        ),
+    }
+    return agent_id, hashlib.sha256(
+        json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 class _ProgressGuard:
@@ -231,16 +369,16 @@ class _ProgressGuard:
 
     def __init__(self) -> None:
         self.recent: list[
-            tuple[tuple[str, bool, bool, frozenset[str], frozenset[str]], ...]
+            tuple[tuple[str, str], ...]
         ] = []
         self.repeat_hits = 0
 
     def stalled(
         self,
-        state: tuple[tuple[str, bool, bool, frozenset[str], frozenset[str]], ...],
+        state: tuple[tuple[str, str], ...],
     ) -> bool:
         repeated = any(
-            _progress_states_match(previous, state)
+            previous == state
             for previous in self.recent[-3:]
         )
         self.repeat_hits = self.repeat_hits + 1 if repeated else 0
@@ -498,6 +636,223 @@ def _actual_conversation(contributions: list[dict[str, Any]]) -> str:
         for one in contributions
     )
     return transcript[-160_000:]
+
+
+class _MutationSaga:
+    """Durable coordinator journal over the legacy per-change transactions."""
+
+    FOLDER = Path(".harness") / "swarm-mutation-sagas"
+
+    def __init__(self, root: Path, saga_id: str) -> None:
+        self.root = root.resolve()
+        self.path = confined_path(
+            self.root, self.FOLDER / f"{saga_id}.json", allow_control=True
+        )
+        self.value: dict[str, Any] = {
+            "schema_version": 1,
+            "saga_id": saga_id,
+            "owner_pid": os.getpid(),
+            "owner_identity": self._owner_identity(os.getpid()),
+            "phase": "active",
+            "transactions": [],
+            "created_at": int(time.time()),
+        }
+        _active_mutation_sagas[saga_id] = self
+        self._write()
+
+    def _write(self) -> None:
+        atomic_write(
+            self.path,
+            (json.dumps(self.value, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+
+    def prepare(self, transaction_id: str) -> None:
+        self.value["transactions"].append({
+            "transaction_id": transaction_id, "phase": "prepared"
+        })
+        self.value["updated_at"] = int(time.time())
+        self._write()
+
+    def applied(self, transaction_id: str) -> None:
+        entry = next(
+            one for one in self.value["transactions"]
+            if one["transaction_id"] == transaction_id
+        )
+        entry["phase"] = "applied"
+        self.value["updated_at"] = int(time.time())
+        self._write()
+
+    def compensate(self, reason: str) -> dict[str, Any]:
+        self.value["phase"] = "compensating"
+        self.value["compensation_reason"] = reason
+        self.value["updated_at"] = int(time.time())
+        self._write()
+        rolled_back: list[str] = []
+        for entry in reversed(self.value["transactions"]):
+            transaction_id = str(entry["transaction_id"])
+            manifest_path = confined_path(
+                self.root,
+                Path(".harness") / "backups" / transaction_id / "manifest.json",
+                allow_missing=True,
+                allow_control=True,
+            )
+            if not manifest_path.is_file() and entry.get("phase") == "prepared":
+                entry["phase"] = "compensated"
+                entry["reason"] = "transaction_manifest_was_never_created"
+                rolled_back.append(transaction_id)
+                self.value["updated_at"] = int(time.time())
+                self._write()
+                continue
+            try:
+                FileTransaction(self.root).rollback(transaction_id)
+            except HarnessError as exc:
+                entry["phase"] = "conflict"
+                entry["reason"] = str(exc)
+                self.value["phase"] = "rollback_conflict"
+                self.value["updated_at"] = int(time.time())
+                self._write()
+                _active_mutation_sagas.pop(str(self.value["saga_id"]), None)
+                return {
+                    "status": "rollback_conflict",
+                    "rolled_back_transaction_ids": rolled_back,
+                    "conflict_transaction_id": transaction_id,
+                    "reason": str(exc),
+                    "saga_id": self.value["saga_id"],
+                }
+            entry["phase"] = "compensated"
+            rolled_back.append(transaction_id)
+            self.value["updated_at"] = int(time.time())
+            self._write()
+        self.value["phase"] = "compensated"
+        self.value["completed_at"] = int(time.time())
+        self._write()
+        _active_mutation_sagas.pop(str(self.value["saga_id"]), None)
+        return {
+            "status": "rolled_back",
+            "rolled_back_transaction_ids": rolled_back,
+            "saga_id": self.value["saga_id"],
+        }
+
+    def complete(self, verification_status: str) -> None:
+        self.value["phase"] = "committed"
+        self.value["verification_status"] = verification_status
+        self.value["completed_at"] = int(time.time())
+        self._write()
+        _active_mutation_sagas.pop(str(self.value["saga_id"]), None)
+
+    @staticmethod
+    def _owner_identity(pid: int) -> str:
+        if os.name == "nt":
+            import ctypes
+
+            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not process:
+                return ""
+            try:
+                times = [(ctypes.c_ulong * 2)() for _ in range(4)]
+                if not ctypes.windll.kernel32.GetProcessTimes(
+                    process, *(ctypes.byref(one) for one in times)
+                ):
+                    return ""
+                return str((int(times[0][1]) << 32) | int(times[0][0]))
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process)
+        try:
+            fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()
+            return fields[21]
+        except (OSError, IndexError):
+            return ""
+
+    @classmethod
+    def _owner_alive(cls, pid: object, expected_identity: object = "") -> bool:
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+
+            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not process:
+                return False
+            try:
+                exit_code = ctypes.c_ulong()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(
+                    process, ctypes.byref(exit_code)
+                ):
+                    return False
+                alive = exit_code.value == 259  # STILL_ACTIVE
+                return alive and (
+                    not expected_identity
+                    or cls._owner_identity(pid) == str(expected_identity)
+                )
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process)
+        try:
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            return False
+        return not expected_identity or cls._owner_identity(pid) == str(expected_identity)
+
+    @classmethod
+    def recover_orphans(cls, root: Path) -> list[dict[str, Any]]:
+        folder = confined_path(root.resolve(), cls.FOLDER, allow_control=True)
+        if not folder.is_dir():
+            return []
+        recovered: list[dict[str, Any]] = []
+        for path in sorted(folder.glob("*.json")):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                recovered.append({"status": "journal_damaged", "path": path.name})
+                continue
+            if not isinstance(value, dict):
+                continue
+            if value.get("phase") == "rollback_conflict":
+                recovered.append({
+                    "status": "rollback_conflict",
+                    "saga_id": str(value.get("saga_id") or path.stem),
+                    "reason": "A prior compensation conflict still requires reconciliation.",
+                })
+                continue
+            if value.get("phase") not in {"active", "compensating"}:
+                continue
+            saga_id = str(value.get("saga_id") or "")
+            owner_pid = value.get("owner_pid")
+            locally_active = (
+                owner_pid == os.getpid() and saga_id in _active_mutation_sagas
+            )
+            remotely_active = (
+                owner_pid != os.getpid()
+                and cls._owner_alive(owner_pid, value.get("owner_identity"))
+            )
+            if locally_active or remotely_active:
+                continue
+            saga = object.__new__(cls)
+            saga.root = root.resolve()
+            saga.path = path
+            saga.value = value
+            recovered.append(saga.compensate("process_crash_recovery"))
+        return recovered
+
+
+def _rollback_transactions(root: Path, transaction_ids: list[str]) -> dict[str, Any]:
+    """Compensate a legacy multi-transaction run without overwriting conflicts."""
+
+    rolled_back: list[str] = []
+    for transaction_id in reversed(list(transaction_ids)):
+        try:
+            FileTransaction(root).rollback(transaction_id)
+        except HarnessError as exc:
+            return {
+                "status": "rollback_conflict",
+                "rolled_back_transaction_ids": rolled_back,
+                "conflict_transaction_id": transaction_id,
+                "reason": str(exc),
+            }
+        rolled_back.append(transaction_id)
+    return {
+        "status": "rolled_back",
+        "rolled_back_transaction_ids": rolled_back,
+    }
 
 
 def _shared_context(
@@ -834,15 +1189,22 @@ def collaborate(
             return one, answer
         except cancellation.ChatCancelled:
             raise
-        except HarnessError as exc:
-            return one, {"text": f"[This agent could not answer: {exc}]", "milliseconds": 0, "model": ""}
+        except HarnessError:
+            return one, {
+                "text": "", "milliseconds": 0, "model": "",
+                "_provider_failed": True,
+            }
 
     completed: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    provider_failures: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=len(participants)) as pool:
         futures = [cancellation.submit(pool, first_round, one) for one in participants]
         for future in as_completed(futures):
             one, answer = future.result()
             completed[str(one.get("id"))] = (one, answer)
+            if answer.get("_provider_failed"):
+                provider_failures.append(one)
+                continue
             live = {
                 "who": "them",
                 "speaker_id": one.get("id"),
@@ -857,6 +1219,36 @@ def collaborate(
             }
             _show_turn(live_turn, live)
             _share_turn(ledger, live, {"stage": "team_discussion"})
+    if provider_failures:
+        failed_names = [str(one.get("name") or "An agent") for one in provider_failures]
+        ledger.record_state("provider_transport_failure", {
+            "stage": "independent_first_round",
+            "status": "paused",
+            "failed_agents": [
+                {
+                    "id": str(one.get("id") or ""),
+                    "name": str(one.get("name") or "An agent"),
+                    "route": str(one.get("who") or ""),
+                    "failure_code": "provider_turn_failed",
+                }
+                for one in provider_failures
+            ],
+        })
+        remaining = [
+            f"Reconnect or reconcile {name}'s provider turn before resuming."
+            for name in failed_names
+        ]
+        report = (
+            "Nexus paused this collaboration because "
+            + ", ".join(failed_names)
+            + " could not complete a provider turn. The failure was not counted as "
+              "an agent reply or a discussion round."
+        )
+        ledger.finish(
+            report, complete=False, stopped_because="provider_unavailable",
+            remaining=remaining,
+        )
+        raise SwarmError(report)
     # The screen shows actual completion order. The lead receives stable board
     # order so provider timing does not make otherwise identical runs drift.
     drafts = [completed[str(one.get("id"))] for one in participants]
@@ -883,9 +1275,7 @@ def collaborate(
         discussion_rounds = round_number
         cycle_complete = True
         cycle_remaining: list[str] = []
-        cycle_state: list[
-            tuple[str, bool, bool, frozenset[str], frozenset[str]]
-        ] = []
+        cycle_state: list[tuple[str, str]] = []
         _report(
             progress, f"Team discussion round {round_number}",
             "Agents are responding in board order, so every later reply sees every earlier reply."
@@ -913,6 +1303,7 @@ def collaborate(
                   "Set goal_complete false and list concrete remaining work whenever anything is unfinished. "
                   "The remaining list is Nexus's progress ledger: name the current unresolved facts, decisions, or outputs precisely, remove resolved items, "
                   "and change an item when real progress changes its state. Do not disguise an unchanged blocker with new prose."
+                  " When a canonical checkpoint really changes, include progress entries with stable IDs, exact states, and concrete evidence; keep the same ID for the same checkpoint."
                 + "\n" + turn_role
                 + ("\n\n" + attachment_text if attachment_text else "")
                 + _shared_context(ledger, one, {
@@ -942,11 +1333,31 @@ def collaborate(
             except cancellation.ChatCancelled:
                 raise
             except HarnessError as exc:
-                failed = True
-                answer = {"milliseconds": 0, "model": ""}
-                message = f"[This agent could not continue the discussion: {exc}]"
-                one_remaining = [f"{one.get('name')} could not complete its turn."]
-                one_complete = False
+                failed_name = str(one.get("name") or "An agent")
+                report = (
+                    f"Nexus paused this collaboration because {failed_name} could not "
+                    "complete its provider turn. The failure was not counted as agent "
+                    "speech or reasoning progress."
+                )
+                one_remaining = [
+                    f"Reconnect or reconcile {failed_name}'s provider turn before resuming."
+                ]
+                ledger.record_state("provider_transport_failure", {
+                    "stage": "team_discussion",
+                    "round": round_number,
+                    "status": "paused",
+                    "failed_agent": {
+                        "id": str(one.get("id") or ""),
+                        "name": failed_name,
+                        "route": str(one.get("who") or ""),
+                    },
+                    "failure_code": "provider_turn_failed",
+                })
+                ledger.finish(
+                    report, complete=False, stopped_because="provider_unavailable",
+                    remaining=one_remaining,
+                )
+                raise SwarmError(report) from exc
             contribution = _contribution(
                 one, answer, "agent_discussion", message,
                 recipient_name="Team deliberation",
@@ -961,9 +1372,8 @@ def collaborate(
             })
             cycle_remaining.extend(one_remaining)
             cycle_complete = cycle_complete and one_complete
-            cycle_state.append((
-                str(one.get("id") or ""), one_complete, failed,
-                _progress_terms(one_remaining), frozenset(),
+            cycle_state.append(_canonical_progress_state(
+                str(one.get("id") or ""), one_complete, failed, value
             ))
         remaining = list(dict.fromkeys(cycle_remaining))
         ledger.record_state("discussion_round_state", {
@@ -1232,6 +1642,15 @@ def work_together(
     lead = _agent(board, agent_id)
     project = _one_project(board, lead, project_id)
     root = Path(str(project.get("path"))).resolve()
+    orphan_recovery = _MutationSaga.recover_orphans(root)
+    unresolved_orphans = [
+        one for one in orphan_recovery if one.get("status") != "rolled_back"
+    ]
+    if unresolved_orphans:
+        raise SwarmError(
+            "Nexus found an interrupted mutation saga that could not be safely compensated: "
+            + json.dumps(unresolved_orphans, sort_keys=True)
+        )
     participants = _project_participants(
         board, lead, str(project.get("id")), peer_id
     )
@@ -1293,23 +1712,26 @@ def work_together(
             decoded = _decode(answer, str(one.get("name")), PLAN_FORMAT)
         except cancellation.ChatCancelled:
             raise
-        except HarnessError as exc:
-            answer = {"milliseconds": 0, "model": ""}
-            decoded = {
-                "contribution": f"[Initial plan failed: {exc}]",
-                "message_to_lead": "Retry my planning turn during team review.",
-                "needs_files": [],
+        except HarnessError:
+            return one, {
+                "_provider_failed": True,
+                "_milliseconds": 0,
+                "_model": "",
             }
         decoded["_milliseconds"] = int(answer.get("milliseconds") or 0)
         decoded["_model"] = str(answer.get("model") or "")
         return one, decoded
 
     completed: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    provider_failures: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=len(participants)) as pool:
         futures = [cancellation.submit(pool, plan, one) for one in participants]
         for future in as_completed(futures):
             one, value = future.result()
             completed[str(one.get("id"))] = (one, value)
+            if value.get("_provider_failed"):
+                provider_failures.append(one)
+                continue
             live_text = (
                 f"Contribution: {value.get('contribution') or '(none)'}\n"
                 f"Message to lead: {value.get('message_to_lead') or '(none)'}\n"
@@ -1330,6 +1752,10 @@ def work_together(
             }
             _show_turn(live_turn, live)
             _share_turn(ledger, live, {"stage": "plan_review"})
+    if provider_failures:
+        _pause_provider_failure(
+            ledger, provider_failures, "independent_planning"
+        )
     plans = [completed[str(one.get("id"))] for one in participants]
     contributions = [
         _contribution(
@@ -1351,9 +1777,7 @@ def work_together(
         plan_rounds = round_number
         everyone_ready = True
         cycle_remaining: list[str] = []
-        cycle_state: list[
-            tuple[str, bool, bool, frozenset[str], frozenset[str]]
-        ] = []
+        cycle_state: list[tuple[str, str]] = []
         _report(
             progress, f"Team plan review round {round_number}",
             "Agents are reviewing one another's real messages in order before any files change."
@@ -1375,7 +1799,8 @@ def work_together(
                           "request any existing files still needed, and set ready_to_execute only when this plan can actually fulfill the user's goal. "
                           "ready_to_execute means no more planning or input is needed before Nexus starts the file transaction; it does not mean the files already exist. "
                           "Execution and post-transaction verification steps belong in the plan and are not remaining planning work. "
-                          "When the plan already specifies the requested changes and how to verify them, set ready_to_execute true and remaining to an empty list."
+                          "When the plan already specifies the requested changes and how to verify them, set ready_to_execute true and remaining to an empty list. "
+                          "When a canonical planning checkpoint really changes, include progress entries with stable IDs, exact states, and concrete evidence; keep the same ID for the same checkpoint."
                         + _shared_context(ledger, one, {
                             "stage": "plan_review",
                             "round": round_number,
@@ -1392,14 +1817,13 @@ def work_together(
             except cancellation.ChatCancelled:
                 raise
             except HarnessError as exc:
-                failed = True
-                answer = {"milliseconds": 0, "model": ""}
-                value = {
-                    "contribution": f"[Plan review failed: {exc}]",
-                    "message_to_lead": "My planning turn is still incomplete.",
-                    "needs_files": [], "ready_to_execute": False,
-                    "remaining": [f"Retry the plan review with {one.get('name')}."],
-                }
+                _pause_provider_failure(
+                    ledger,
+                    one,
+                    "plan_review",
+                    checkpoint={"round": round_number},
+                    cause=exc,
+                )
             value["_milliseconds"] = int(answer.get("milliseconds") or 0)
             value["_model"] = str(answer.get("model") or "")
             latest[str(one.get("id"))] = (one, value)
@@ -1407,14 +1831,9 @@ def work_together(
             one_ready = value.get("ready_to_execute") is True and not one_remaining
             everyone_ready = everyone_ready and one_ready
             cycle_remaining.extend(one_remaining)
-            cycle_state.append((
-                str(one.get("id") or ""), one_ready, failed,
-                _progress_terms(one_remaining),
-                frozenset(
-                    str(path).strip().replace("\\", "/").casefold()
-                    for path in value.get("needs_files", [])
-                    if isinstance(path, str) and path.strip()
-                ),
+            cycle_state.append(_canonical_progress_state(
+                str(one.get("id") or ""), one_ready, failed, value,
+                value.get("needs_files", []),
             ))
             words = _plan_words(value)
             contribution = _contribution(one, value, "agent_plan_review", words)
@@ -1496,6 +1915,7 @@ def work_together(
     )
     all_changed: list[str] = []
     transaction_ids: list[str] = []
+    mutation_saga = _MutationSaga(root, ledger.session_id)
     work_passes = 0
     goal_complete = False
     remaining = plan_remaining
@@ -1561,13 +1981,26 @@ def work_together(
                     execution_answer, executor_name, WORK_FORMAT
                 )
             except cancellation.ChatCancelled:
+                recovery = mutation_saga.compensate("user_cancelled")
+                try:
+                    ledger.record_state("cancelled", {
+                        "stage": "execution", "pass": pass_number,
+                        "status": "cancelled", "mutation_recovery": recovery,
+                    })
+                except HarnessError:
+                    pass
                 raise
             except HarnessError as exc:
-                execution_answer = {"milliseconds": 0, "model": ""}
-                execution = {
-                    "reply": f"My execution turn could not produce a valid file proposal: {exc}",
-                    "changes": [],
-                }
+                _pause_provider_failure(
+                    ledger,
+                    executor,
+                    "execution",
+                    checkpoint={"pass": pass_number},
+                    cause=exc,
+                    mutation_root=root,
+                    transaction_ids=transaction_ids,
+                    mutation_saga=mutation_saga,
+                )
             changes = _validated_changes(root, execution.get("changes"))
             executor_changed: list[str] = []
             if changes:
@@ -1575,9 +2008,24 @@ def work_together(
                     progress, f"Applying {executor_name}'s proposed changes",
                     "Nexus is checking paths and fresh baselines before opening the atomic transaction."
                 )
-                manifest = FileTransaction(
-                    root, max_files=12, max_bytes=2_000_000
-                ).apply(changes)
+                try:
+                    transaction_id = FileTransaction.new_transaction_id()
+                    mutation_saga.prepare(transaction_id)
+                    manifest = FileTransaction(
+                        root, max_files=12, max_bytes=2_000_000
+                    ).apply(changes, transaction_id=transaction_id)
+                    mutation_saga.applied(transaction_id)
+                except HarnessError as exc:
+                    recovery = mutation_saga.compensate("transaction_failed")
+                    ledger.record_state("mutation_failed", {
+                        "stage": "execution", "pass": pass_number,
+                        "status": "paused", "failure": str(exc),
+                        "mutation_recovery": recovery,
+                    })
+                    raise SwarmError(
+                        "Nexus stopped because the project transaction conflicted or failed; "
+                        f"mutation recovery is {recovery['status']}."
+                    ) from exc
                 transaction_id = str(manifest.get("transaction_id") or "")
                 if transaction_id:
                     transaction_ids.append(transaction_id)
@@ -1656,14 +2104,26 @@ def work_together(
                     answer, str(one.get("name")), WORK_VERIFICATION_FORMAT
                 )
             except cancellation.ChatCancelled:
+                recovery = mutation_saga.compensate("user_cancelled")
+                try:
+                    ledger.record_state("cancelled", {
+                        "stage": "verification", "pass": pass_number,
+                        "status": "cancelled", "mutation_recovery": recovery,
+                    })
+                except HarnessError:
+                    pass
                 raise
             except HarnessError as exc:
-                answer = {"milliseconds": 0, "model": ""}
-                value = {
-                    "goal_complete": False,
-                    "feedback": f"[Verification failed: {exc}]",
-                    "remaining": [f"Retry verification with {one.get('name')}."],
-                }
+                _pause_provider_failure(
+                    ledger,
+                    one,
+                    "verification",
+                    checkpoint={"pass": pass_number},
+                    cause=exc,
+                    mutation_root=root,
+                    transaction_ids=transaction_ids,
+                    mutation_saga=mutation_saga,
+                )
             one_remaining = _remaining(value)
             one_complete = value.get("goal_complete") is True and not one_remaining
             words = str(value.get("feedback") or "").strip()
@@ -1689,6 +2149,8 @@ def work_together(
             "all_agents_complete": pass_complete,
             "changed": all_changed,
             "remaining": remaining,
+            "verification_basis": "provider_claims_only",
+            "deterministically_verified": False,
         })
         if pass_complete:
             goal_complete = True
@@ -1710,15 +2172,32 @@ def work_together(
             f"The user-set limit of {round_limit} project execution/verification round(s) was reached."
         )
         work_stopped_because = "round_limit"
+    mutation_recovery = {"status": "not_needed", "rolled_back_transaction_ids": []}
+    if not goal_complete and transaction_ids:
+        mutation_recovery = mutation_saga.compensate("incomplete")
+        if mutation_recovery["status"] == "rolled_back":
+            all_changed = []
+        else:
+            remaining.append(
+                "Automatic rollback stopped at a project-file conflict; inspect the transaction manifests before retrying."
+            )
+            work_stopped_because = "rollback_conflict"
+    elif goal_complete:
+        mutation_saga.complete("provider_consensus_unverified")
+    else:
+        mutation_saga.complete("no_mutations")
     reply = (
         "The connected agents completed their assigned execution turns."
         if goal_complete else
         "The connected agents stopped without completing every assigned execution turn."
     )
     if goal_complete:
-        reply += "\n\nNexus verification: every participating agent marked the requested goal complete."
+        reply += (
+            "\n\nProvider review: every participating agent marked the requested goal complete. "
+            "Nexus did not run deterministic tests, so this is not independently verified."
+        )
     else:
-        reply += "\n\nNexus verification: the requested goal is still incomplete."
+        reply += "\n\nNexus state: the requested goal is still incomplete."
         if remaining:
             reply += "\nRemaining: " + "; ".join(remaining)
     if all_changed:
@@ -1755,6 +2234,9 @@ def work_together(
         "transaction_ids": transaction_ids,
         "changed": all_changed,
         "goal_complete": goal_complete,
+        "verified": False,
+        "verification_status": "provider_consensus_unverified" if goal_complete else "incomplete",
+        "mutation_recovery": mutation_recovery,
         "plan_rounds": plan_rounds,
         "work_passes": work_passes,
         "round_limit": round_limit,

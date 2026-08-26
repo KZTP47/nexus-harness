@@ -7,7 +7,8 @@ const path = require("node:path");
 const vm = require("node:vm");
 const {
   PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
-  automationScript, submissionBaselineScript, submissionScript, answerScript, retryScript, stopScript,
+  automationScript, submissionBaselineScript, submitControlScript, submissionScript,
+  answerScript, retryScript, stopScript,
   browserLikeUserAgent, authStorageAccessIsTrusted,
 } = require("./web-chats");
 
@@ -124,11 +125,9 @@ test("the remote-page script contains fixed selectors and safely encoded prompt 
   assert.ok(automationScript(PROVIDERS.gemini, prompt).includes('send?.tagName?.includes("-")'));
   assert.ok(script.includes("provider did not accept Send"));
   assert.ok(script.includes("for (const selector of list)"));
-  assert.ok(script.includes('"acceptComposerClear":true'));
   const geminiSubmission = automationScript(PROVIDERS.gemini, prompt);
-  assert.ok(geminiSubmission.includes("acceptComposerClear"));
-  assert.ok(geminiSubmission.includes('"acceptComposerClear":true'));
-  assert.ok(geminiSubmission.includes("composerAccepted"));
+  assert.ok(geminiSubmission.includes('submissionState: "outcome_unknown"'));
+  assert.ok(!geminiSubmission.includes("composerAccepted"));
   assert.ok(!script.includes("ipcRenderer"));
   const answer = answerScript(PROVIDERS.gemini, {beforeCount: 0, beforeLast: ""});
   assert.ok(answer.includes("model-response-text"));
@@ -142,8 +141,12 @@ test("the remote-page script contains fixed selectors and safely encoded prompt 
   assert.ok(retryScript(PROVIDERS.chatgpt).includes("data-conversation-recovery-retry"));
   assert.ok(providerReadinessScript(PROVIDERS.claude).includes("secure Nexus browser window"));
   assert.ok(submissionBaselineScript(PROVIDERS.chatgpt, prompt).includes("needsTrustedInput"));
+  assert.ok(submitControlScript(PROVIDERS.chatgpt, prompt).includes("elementsFromPoint"));
+  assert.ok(submitControlScript(PROVIDERS.chatgpt, prompt).includes("scope.parentElement"));
   assert.equal(PROVIDERS.chatgpt.trustedInput, true);
   assert.equal(PROVIDERS.claude.trustedInput, true);
+  assert.equal(PROVIDERS.gemini.trustedInput, true);
+  assert.equal(PROVIDERS.copilot.trustedInput, true);
 });
 
 test("Gemini pairs a reformatted long Nexus prompt with the reply after it", () => {
@@ -340,7 +343,7 @@ test("Gemini trusted Enter confirmation requires the exact new user turn", async
   assert.equal(state.needsTrustedEnter, true);
 });
 
-test("Gemini does not treat a stale Stop control as acknowledgement of a new prompt", async () => {
+test("Gemini treats a clicked turn with only a stale Stop control as outcome-unknown", async () => {
   let sendClicks = 0;
   const visible = {
     getBoundingClientRect: () => ({width: 10, height: 10}),
@@ -383,12 +386,13 @@ test("Gemini does not treat a stale Stop control as acknowledgement of a new pro
     automationScript(PROVIDERS.gemini, "new direct prompt"), context);
 
   assert.equal(sendClicks, 1);
-  assert.equal(result.ok, false);
-  assert.equal(result.needsTrustedEnter, true);
+  assert.equal(result.ok, true);
+  assert.equal(result.needsTrustedEnter, false);
+  assert.equal(result.submissionState, "outcome_unknown");
   assert.equal(result.beforeStopping, true);
 });
 
-test("Gemini accepts its custom send host clearing the composer before the user bubble mounts", async () => {
+test("Gemini composer clearing alone remains outcome-unknown", async () => {
   const visible = {
     getBoundingClientRect: () => ({width: 10, height: 10}),
     getClientRects: () => [1],
@@ -426,9 +430,10 @@ test("Gemini accepts its custom send host clearing the composer before the user 
   assert.equal(hostClicks, 1);
   assert.equal(result.ok, true);
   assert.equal(result.sendActivated, true);
+  assert.equal(result.submissionState, "outcome_unknown");
 });
 
-test("ChatGPT accepts composer clearing but still defers the answer to exact turn pairing", async () => {
+test("ChatGPT composer clearing alone remains outcome-unknown", async () => {
   const visible = {
     getBoundingClientRect: () => ({width: 10, height: 10}),
     getClientRects: () => [1],
@@ -466,6 +471,7 @@ test("ChatGPT accepts composer clearing but still defers the answer to exact tur
 
   assert.equal(result.ok, true);
   assert.equal(result.sendActivated, true);
+  assert.equal(result.submissionState, "outcome_unknown");
   assert.equal(result.submittedMarker, "NEXUS TRANSPORT TURN fresh-chatgpt");
   assert.equal(PROVIDERS.chatgpt.pairRepliesToUsers, true);
 });
@@ -807,10 +813,9 @@ test("stopping a web turn marks only that chat cancelled and clicks the provider
   assert.ok(stopScript(PROVIDERS.chatgpt).includes("stop-button"));
 });
 
-test("a Gemini generation with no reply progress is stopped and retried once", async () => {
+test("an accepted Gemini turn with no reply progress is never resubmitted", async () => {
   let submissions = 0;
   let stops = 0;
-  let answersAfterRetry = 0;
   const transportMarkers = [];
   const contents = {
     isDestroyed: () => false,
@@ -821,9 +826,7 @@ test("a Gemini generation with no reply progress is stopped and retried once", a
         return {ok: true, beforeCount: 0, beforeLast: ""};
       }
       if (script.includes("const began =")) {
-        if (submissions === 1) return {answer: "", changed: false, stopping: true};
-        answersAfterRetry += 1;
-        return {answer: "Recovered reply", changed: true, stopping: false};
+        return {answer: "", changed: false, stopping: true};
       }
       stops += 1;
       return true;
@@ -833,7 +836,7 @@ test("a Gemini generation with no reply progress is stopped and retried once", a
     electron: {}, owner: null,
     readSettings: () => ({}), writeSettings: () => {},
     shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
-    stalledReplyMs: 1, answerPollMs: 2, answerDeadlineMs: 1000,
+    answerPollMs: 2, answerDeadlineMs: 1000,
   });
   manager.connections.set("gemini-example", {
     id: "gemini-example", provider: "gemini", title: "Gemini", url: PROVIDERS.gemini.home,
@@ -844,14 +847,13 @@ test("a Gemini generation with no reply progress is stopped and retried once", a
   manager.rememberConnectionPage = () => false;
   manager.showCreatedConversationInOpenShells = () => {};
 
-  const result = await manager.askNow("gemini-example", "Please answer", []);
-
-  assert.equal(result.answer, "Recovered reply");
-  assert.equal(submissions, 2);
-  assert.equal(stops, 1);
-  assert.ok(answersAfterRetry >= 3);
+  await assert.rejects(
+    () => manager.askNow("gemini-example", "Please answer", []),
+    /did not finish a visible reply/,
+  );
+  assert.equal(submissions, 1);
+  assert.ok(stops >= 1);
   assert.ok(transportMarkers.every(Boolean));
-  assert.notEqual(transportMarkers[0], transportMarkers[1]);
 });
 
 test("Gemini is never retried after any visible reply progress", async () => {
@@ -874,7 +876,7 @@ test("Gemini is never retried after any visible reply progress", async () => {
     electron: {}, owner: null,
     readSettings: () => ({}), writeSettings: () => {},
     shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
-    stalledReplyMs: 1, answerPollMs: 2, answerDeadlineMs: 1000,
+    answerPollMs: 2, answerDeadlineMs: 1000,
   });
   manager.connections.set("gemini-example", {
     id: "gemini-example", provider: "gemini", title: "Gemini", url: PROVIDERS.gemini.home,
@@ -891,48 +893,28 @@ test("Gemini is never retried after any visible reply progress", async () => {
   assert.equal(submissions, 1);
 });
 
-test("Gemini can recover from three consecutive accepted turns with no reply progress", async () => {
-  let submissions = 0;
-  let stops = 0;
-  const contents = {
-    isDestroyed: () => false,
-    executeJavaScript: async (script) => {
-      if (script.includes("const prompt =")) {
-        submissions += 1;
-        return {ok: true, beforeCount: 0, beforeLast: "", beforeError: ""};
-      }
-      if (script.includes("const began =")) {
-        return submissions < 4
-          ? {answer: "", changed: false, stopping: true, error: ""}
-          : {answer: "Recovered after repeated stalls", changed: true, stopping: false, error: ""};
-      }
-      stops += 1;
-      return true;
-    },
+test("an activated turn with delayed acknowledgement becomes outcome-unknown without Enter", async () => {
+  const began = {
+    ok: false, sendActivated: true, needsTrustedEnter: true,
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0, beforeUserLast: "",
   };
-  const manager = new WebChatManager({
-    electron: {}, owner: null,
-    readSettings: () => ({}), writeSettings: () => {},
-    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
-    stalledReplyMs: 1, answerPollMs: 2, answerDeadlineMs: 1000,
-  });
-  manager.connections.set("gemini-example", {
-    id: "gemini-example", provider: "gemini", title: "Gemini", url: PROVIDERS.gemini.home,
-  });
-  manager.viewFor = () => ({webContents: contents});
-  manager.waitForLoad = async () => {};
-  manager.attachFiles = async () => {};
-  manager.rememberConnectionPage = () => false;
-  manager.showCreatedConversationInOpenShells = () => {};
+  const context = {
+    document: {querySelectorAll: () => []},
+    getComputedStyle: () => ({visibility: "visible", display: "block"}),
+    HTMLTextAreaElement: class {}, HTMLInputElement: class {},
+    setTimeout: (callback) => { callback(); return 1; },
+  };
 
-  const result = await manager.askNow("gemini-example", "Please answer", []);
+  const state = await vm.runInNewContext(submissionScript(
+    PROVIDERS.chatgpt, "marked prompt", began
+  ), context);
 
-  assert.equal(result.answer, "Recovered after repeated stalls");
-  assert.equal(submissions, 4);
-  assert.equal(stops, 3);
+  assert.equal(state.ok, true);
+  assert.equal(state.needsTrustedEnter, false);
+  assert.equal(state.submissionState, "outcome_unknown");
 });
 
-test("a stable Gemini reply is committed when its Stop control stays stuck", async () => {
+test("a stable partial Gemini reply is not committed while its Stop control stays stuck", async () => {
   let stoppedRemote = false;
   let stops = 0;
   const contents = {
@@ -956,7 +938,7 @@ test("a stable Gemini reply is committed when its Stop control stays stuck", asy
     electron: {}, owner: null,
     readSettings: () => ({}), writeSettings: () => {},
     shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
-    stalledReplyMs: 100, stoppingSettleMs: 5, answerPollMs: 2, answerDeadlineMs: 1000,
+    answerPollMs: 2, answerDeadlineMs: 1000,
   });
   manager.connections.set("gemini-example", {
     id: "gemini-example", provider: "gemini", title: "Gemini", url: PROVIDERS.gemini.home,
@@ -967,9 +949,10 @@ test("a stable Gemini reply is committed when its Stop control stays stuck", asy
   manager.rememberConnectionPage = () => false;
   manager.showCreatedConversationInOpenShells = () => {};
 
-  const result = await manager.askNow("gemini-example", "Please answer", []);
-
-  assert.equal(result.answer, "Complete but still marked streaming");
+  await assert.rejects(
+    () => manager.askNow("gemini-example", "Please answer", []),
+    /did not finish a visible reply/,
+  );
   assert.equal(stops, 1);
 });
 
@@ -1025,7 +1008,7 @@ test("a provider with no clickable send control gets one trusted Enter fallback"
   assert.deepEqual(focusOrder, ["provider", "board"]);
 });
 
-test("ChatGPT submission uses native text input and a trusted Enter before polling", async () => {
+test("ChatGPT submission uses native text input and a trusted pointer before polling", async () => {
   const commands = [];
   let attached = false;
   let answerChecks = 0;
@@ -1045,6 +1028,9 @@ test("ChatGPT submission uses native text input and a trusted Enter before polli
     executeJavaScript: async (script) => {
       if (script.includes("needsTrustedInput: true")) {
         return {ok: false, needsTrustedInput: true, error: "not sent", ...baseline};
+      }
+      if (script.includes("submit_control_missing")) {
+        return {ready: true, x: 320, y: 240, fingerprint: "BUTTON|composer-submit"};
       }
       if (script.includes("for (let tries = 0; tries < 80; tries += 1)")) {
         return {ok: true, needsTrustedInput: false, error: "", ...baseline};
@@ -1084,8 +1070,9 @@ test("ChatGPT submission uses native text input and a trusted Enter before polli
     ["Input.dispatchKeyEvent", "rawKeyDown", "Backspace"],
     ["Input.dispatchKeyEvent", "keyUp", "Backspace"],
     ["Input.insertText", "", ""],
-    ["Input.dispatchKeyEvent", "keyDown", "Enter"],
-    ["Input.dispatchKeyEvent", "keyUp", "Enter"],
+    ["Input.dispatchMouseEvent", "mouseMoved", ""],
+    ["Input.dispatchMouseEvent", "mousePressed", ""],
+    ["Input.dispatchMouseEvent", "mouseReleased", ""],
   ]);
   assert.ok(answerChecks >= 3);
 });

@@ -12,6 +12,9 @@ from __future__ import annotations
 import copy
 import json
 import pathlib
+import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -47,8 +50,15 @@ class TalkingTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name).resolve()
+        self.container = Path(self.temporary.name).resolve()
+        self.root = self.container / "project"
+        self.root.mkdir()
         (self.root / ".harness").mkdir()
+        runtime = mock.patch.dict(os.environ, {
+            "OUR_HARNESS_SWARM_RUN_DIR": str(self.container / "runtime")
+        })
+        runtime.start()
+        self.addCleanup(runtime.stop)
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
 
     def standing_in(self, answering: Answering):
@@ -86,6 +96,112 @@ class OneConversation(TalkingTestCase):
         kept = chat.read_it(again, "")
         self.assertEqual([one.who for one in kept], ["you", "them"])
         self.assertEqual(kept[0].text, "Remember this")
+
+    def test_full_transcript_survives_while_provider_and_ui_views_stay_bounded(self) -> None:
+        turns = [
+            chat.Said(
+                who="you" if number % 2 == 0 else "them",
+                text=f"historical-{number}", at=f"2026-01-01T00:00:{number:02d}Z",
+            )
+            for number in range(chat.MOST_KEPT + 10)
+        ]
+        chat._keep_it(self.config, "", turns)
+        answering = Answering("new answer")
+        with self.standing_in(answering):
+            result = chat.say(self.config, "", "new question")
+
+        saved = chat.read_it(self.config, "")
+        self.assertEqual(len(saved), chat.MOST_KEPT + 12)
+        self.assertEqual(saved[0].text, "historical-0")
+        self.assertEqual(saved[-1].text, "new answer")
+        self.assertEqual(len(answering.asked[-1].messages), chat.MOST_KEPT + 1)
+        self.assertEqual(
+            answering.asked[-1].messages[0]["content"], "historical-10"
+        )
+        self.assertEqual(len(result["said"]), chat.MOST_KEPT)
+
+    def test_legacy_snapshot_migrates_to_a_physically_append_only_hash_chain(self) -> None:
+        where = chat.where_it_is_kept(self.config, "")
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps([
+            chat.Said("you", "legacy", "2026-01-01T00:00:00Z").to_dict()
+        ]), encoding="utf-8")
+        self.assertEqual(chat.read_it(self.config, "")[0].text, "legacy")
+        events = where.with_suffix(".events.jsonl")
+        first = events.read_bytes()
+        with self.standing_in(Answering("new")):
+            chat.say(self.config, "", "question")
+        after = events.read_bytes()
+        self.assertTrue(after.startswith(first))
+        self.assertGreater(len(after.splitlines()), len(first.splitlines()))
+        self.assertEqual([one.text for one in chat.read_it(self.config, "")], [
+            "legacy", "question", "new",
+        ])
+
+    def test_rehashed_transcript_rewrite_fails_keyed_integrity_without_repair(self) -> None:
+        with self.standing_in(Answering("answer")):
+            chat.say(self.config, "", "original")
+        events = chat.where_it_is_kept(self.config, "").with_suffix(".events.jsonl")
+        records = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
+        records[0]["turns"][0]["text"] = "attacker rewrite"
+        previous = ""
+        for event in records:
+            event["previous_hash"] = previous
+            event["hash"] = chat._transcript_event_hash(event)
+            previous = event["hash"]
+        rewritten = "".join(
+            json.dumps(one, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+            for one in records
+        )
+        events.write_text(rewritten, encoding="utf-8")
+
+        with self.assertRaisesRegex(chat.ChatError, "keyed integrity"):
+            chat.read_it(self.config, "")
+        self.assertEqual(events.read_text(encoding="utf-8"), rewritten)
+        self.assertTrue(any((self.container / "runtime" / "quarantine").glob("*.json")))
+
+    def test_cross_process_writers_do_not_lose_transcript_turns(self) -> None:
+        script = r'''import copy, sys
+from pathlib import Path
+from our_harness import chat
+from our_harness.config import DEFAULT_CONFIG, LoadedConfig
+root = Path(sys.argv[1]).resolve()
+config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), root, [], {})
+for n in range(8):
+    chat.keep_exchange(config, "", f"p{sys.argv[2]}-{n}", f"a{sys.argv[2]}-{n}")
+'''
+        env = dict(os.environ, PYTHONPATH=str(Path.cwd() / "src"))
+        stop_reading = threading.Event()
+        reader_errors: list[BaseException] = []
+        reads = [0]
+
+        def read_repeatedly() -> None:
+            while not stop_reading.is_set():
+                try:
+                    chat.read_it(self.config, "")
+                    reads[0] += 1
+                except BaseException as exc:  # captured: thread failures must fail the test
+                    reader_errors.append(exc)
+                    stop_reading.set()
+
+        readers = [threading.Thread(target=read_repeatedly) for _ in range(3)]
+        for reader in readers:
+            reader.start()
+        processes = [
+            subprocess.Popen([sys.executable, "-c", script, str(self.root), str(index)], env=env)
+            for index in range(3)
+        ]
+        try:
+            self.assertTrue(all(process.wait(timeout=30) == 0 for process in processes))
+        finally:
+            stop_reading.set()
+            for reader in readers:
+                reader.join(5)
+        self.assertGreater(reads[0], 3)
+        self.assertEqual(reader_errors, [])
+        turns = chat.read_it(self.config, "")
+        self.assertEqual(len(turns), 48)
+        self.assertEqual(len({one.text for one in turns}), 48)
 
     def test_starting_again_throws_it_away(self) -> None:
         with self.standing_in(Answering()):
@@ -180,15 +296,16 @@ class OneConversation(TalkingTestCase):
         self.assertEqual(destination["owner"], "nexus")
         self.assertTrue(destination["transcript_path"].endswith("the-usual-one.json"))
 
-    def test_only_the_last_few_dozen_turns_are_kept(self) -> None:
-        """A conversation is the thread of thought, not everything ever said."""
+    def test_all_turns_are_kept_but_only_recent_turns_are_prompted(self) -> None:
+        """Durable history is lossless while a model prompt remains bounded."""
 
-        with self.standing_in(Answering()):
+        answering = Answering()
+        with self.standing_in(answering):
             for number in range(chat.MOST_KEPT):
                 chat.say(self.config, "", f"Message {number}")
         kept = chat.read_it(self.config, "")
-        self.assertEqual(len(kept), chat.MOST_KEPT)
-        # And the ones kept are the recent ones.
+        self.assertEqual(len(kept), chat.MOST_KEPT * 2)
+        self.assertEqual(len(answering.asked[-1].messages), chat.MOST_KEPT + 1)
         self.assertIn(f"Message {chat.MOST_KEPT - 1}", kept[-2].text)
 
     def test_it_is_told_it_cannot_do_anything(self) -> None:

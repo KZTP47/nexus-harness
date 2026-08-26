@@ -839,18 +839,39 @@ def read_it(config: LoadedConfig, route: str, filed_as: str = "") -> list[Said]:
     """The conversation with one of them, oldest first."""
 
     where = where_it_is_kept(config, route, filed_as)
-    if not where.is_file():
-        return []
-    try:
-        held = json.loads(where.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        # A conversation is worth keeping and not worth failing over. One that
-        # cannot be read is one that starts again.
-        return []
-    if not isinstance(held, list):
-        return []
+    events = where.with_suffix(".events.jsonl")
+    from .safety import ProjectTransactionLock
+
+    # JSONL and its external anchor are one authority. A reader must not see
+    # the append after it lands but before the matching atomic anchor replace,
+    # or the reverse. The same cross-process project lock used by _keep_it
+    # covers the whole read, verification and legacy migration.
+    with ProjectTransactionLock(config.project_root).held(30.0):
+        if events.is_file():
+            return _read_transcript_events(events)
+        if not where.is_file():
+            return []
+        try:
+            held = json.loads(where.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # A legacy projection is recreatable. A damaged canonical JSONL,
+            # by contrast, fails closed in _read_transcript_event_records.
+            return []
+        if not isinstance(held, list):
+            return []
+        kept = _said_from_dicts(held)
+        # First read migrates the legacy snapshot while still holding the same
+        # authority as an append.
+        if not events.exists():
+            _append_transcript_event(events, [], "snapshot", kept)
+        else:
+            kept = _read_transcript_events(events)
+        return kept
+
+
+def _said_from_dicts(held: object) -> list[Said]:
     kept: list[Said] = []
-    for one in held[-MOST_KEPT:]:
+    for one in held if isinstance(held, list) else []:
         if not isinstance(one, dict):
             continue
         who = str(one.get("who") or "")
@@ -877,23 +898,204 @@ def read_it(config: LoadedConfig, route: str, filed_as: str = "") -> list[Said]:
     return kept
 
 
+def _transcript_event_hash(event: dict[str, Any]) -> str:
+    unsigned = {
+        key: value for key, value in event.items()
+        if key not in {"hash", "integrity_mac"}
+    }
+    return hashlib.sha256(json.dumps(
+        unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+
+
+def _transcript_anchor_path(path: Path) -> Path:
+    from .runtime_integrity import runtime_root
+
+    identity = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+    return runtime_root() / "transcript-anchors" / f"{identity}.json"
+
+
+def _transcript_event_integrity(event: dict[str, Any]) -> str:
+    from .runtime_integrity import mac
+
+    unsigned = {key: value for key, value in event.items() if key != "integrity_mac"}
+    return mac("conversation-transcript-event-v1", unsigned)
+
+
+def _write_transcript_anchor(path: Path, records: list[dict[str, Any]]) -> None:
+    from .runtime_integrity import atomic_text, mac
+
+    value = {
+        "schema_version": 1,
+        "transcript": hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest(),
+        "count": len(records),
+        "head": str(records[-1].get("integrity_mac") or "") if records else "",
+    }
+    held = dict(value, integrity_mac=mac("conversation-transcript-anchor-v1", value))
+    atomic_text(
+        _transcript_anchor_path(path),
+        json.dumps(held, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+    )
+
+
+def _transcript_integrity_failure(path: Path, reason: str) -> None:
+    from .runtime_integrity import quarantine_marker
+
+    quarantine_marker(f"conversation-transcript:{path.resolve()}", path, reason)
+    raise ChatError(
+        "The append-only conversation record failed keyed integrity; Nexus "
+        "quarantined it and preserved the evidence without rewriting it."
+    )
+
+
+def _read_transcript_event_records(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    previous = ""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            break
+        if (
+            not isinstance(event, dict)
+            or event.get("schema_version") != 1
+            or event.get("seq") != len(records) + 1
+            or event.get("previous_hash") != previous
+            or event.get("hash") != _transcript_event_hash(event)
+        ):
+            break
+        records.append(event)
+        previous = str(event["hash"])
+    if len(records) != len([line for line in lines if line.strip()]):
+        raise ChatError("The append-only conversation record is damaged; Nexus refused to hide or extend its suffix.")
+    anchor_path = _transcript_anchor_path(path)
+    if anchor_path.exists():
+        from .runtime_integrity import compare
+
+        try:
+            anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            _transcript_integrity_failure(path, "The external transcript anchor is unreadable.")
+        value = {key: anchor.get(key) for key in ("schema_version", "transcript", "count", "head")}
+        expected_identity = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+        if (
+            value["schema_version"] != 1
+            or value["transcript"] != expected_identity
+            or value["count"] != len(records)
+            or value["head"] != (str(records[-1].get("integrity_mac") or "") if records else "")
+            or not compare("conversation-transcript-anchor-v1", value, anchor.get("integrity_mac"))
+        ):
+            _transcript_integrity_failure(path, "The transcript no longer matches its external anchor.")
+        for event in records:
+            if event.get("integrity_mac") != _transcript_event_integrity(event):
+                _transcript_integrity_failure(path, f"Transcript event {event.get('seq')} was rewritten.")
+    elif records:
+        # One-time migration of a valid legacy public hash chain. Once the
+        # external anchor exists, missing keyed fields are corruption and this
+        # migration can never be used to bless a later rewrite.
+        have = [bool(one.get("integrity_mac")) for one in records]
+        if any(have) and not all(have):
+            _transcript_integrity_failure(path, "The transcript has a partial keyed chain.")
+        if all(have):
+            for event in records:
+                if event.get("integrity_mac") != _transcript_event_integrity(event):
+                    _transcript_integrity_failure(path, "A keyed transcript event is invalid.")
+        else:
+            for event in records:
+                event["integrity_mac"] = _transcript_event_integrity(event)
+            from .runtime_integrity import atomic_text
+
+            atomic_text(path, "".join(
+                json.dumps(one, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                for one in records
+            ))
+        _write_transcript_anchor(path, records)
+    return records
+
+
+def _read_transcript_events(path: Path) -> list[Said]:
+    projection: list[Said] = []
+    for event in _read_transcript_event_records(path):
+        payload = event.get("turns")
+        turns = _said_from_dicts(payload)
+        if event.get("kind") == "snapshot":
+            projection = turns
+        elif event.get("kind") == "append":
+            projection.extend(turns)
+    return projection
+
+
+def _append_transcript_event(
+    path: Path, records: list[dict[str, Any]], kind: str, turns: list[Said]
+) -> None:
+    event: dict[str, Any] = {
+        "schema_version": 1,
+        "seq": len(records) + 1,
+        "at": _now(),
+        "kind": kind,
+        "turns": [one.to_dict() for one in turns],
+        "previous_hash": str(records[-1]["hash"]) if records else "",
+    }
+    event["hash"] = _transcript_event_hash(event)
+    event["integrity_mac"] = _transcript_event_integrity(event)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    _write_transcript_anchor(path, [*records, event])
+
+
 def _keep_it(
-    config: LoadedConfig, route: str, turns: list[Said], filed_as: str = ""
+    config: LoadedConfig, route: str, turns: list[Said], filed_as: str = "",
+    *, replace_projection: bool = False,
 ) -> None:
     where = where_it_is_kept(config, route, filed_as)
     where.parent.mkdir(parents=True, exist_ok=True)
-    written = json.dumps([one.to_dict() for one in turns[-MOST_KEPT:]], indent=2) + "\n"
+    event_path = where.with_suffix(".events.jsonl")
+    from .safety import ProjectTransactionLock
+
+    with ProjectTransactionLock(config.project_root).held(30.0):
+        records = _read_transcript_event_records(event_path) if event_path.exists() else []
+        existing = _read_transcript_events(event_path) if records else []
+        existing_dicts = [one.to_dict() for one in existing]
+        requested = [one.to_dict() for one in turns]
+        if requested[:len(existing_dicts)] == existing_dicts:
+            delta = turns[len(existing_dicts):]
+            if delta:
+                _append_transcript_event(event_path, records, "append", delta)
+        elif requested != existing_dicts and not replace_projection:
+            common = 0
+            for before, after in zip(existing_dicts, requested):
+                if before != after:
+                    break
+                common += 1
+            delta = turns[common:]
+            if delta:
+                _append_transcript_event(event_path, records, "append", delta)
+            turns = [*existing, *delta]
+            requested = [one.to_dict() for one in turns]
+        elif requested != existing_dicts:
+            # Historical migration can insert proven older blocks. Preserve
+            # every prior event and append a replacement projection rather
+            # than rewriting canonical history.
+            _append_transcript_event(event_path, records, "snapshot", turns)
+        written = json.dumps(requested, indent=2) + "\n"
     # Written beside and moved into place, so a panel reading it never sees
     # half a conversation.
-    beside = where.with_name(f"{where.name}.{os.getpid()}-{threading.get_ident()}.part")
-    beside.write_text(written, encoding="utf-8")
-    for wait in (0.02, 0.05, 0.1, 0.2, 0.4):
-        try:
-            os.replace(beside, where)
-            return
-        except PermissionError:
-            time.sleep(wait)
-    os.replace(beside, where)
+        beside = where.with_name(f"{where.name}.{os.getpid()}-{threading.get_ident()}.part")
+        beside.write_text(written, encoding="utf-8")
+        for wait in (0.02, 0.05, 0.1, 0.2, 0.4):
+            try:
+                os.replace(beside, where)
+                return
+            except PermissionError:
+                time.sleep(wait)
+        os.replace(beside, where)
 
 
 def merge_transcript(
@@ -926,7 +1128,9 @@ def merge_transcript(
             return 0
         combined = added + existing
         combined.sort(key=lambda one: str(one.at or ""))
-        _keep_it(config, route, combined, filed_as)
+        _keep_it(
+            config, route, combined, filed_as, replace_projection=True
+        )
         return len(added)
 
 
@@ -937,8 +1141,12 @@ def start_again(config: LoadedConfig, route: str, filed_as: str = "") -> str:
 
     with _the_lock_for(_filed_under(filed_as or route)):
         where = where_it_is_kept(config, route, filed_as)
-        if where.is_file():
-            take_the_file_away(where, missing_ok=True)
+        from .safety import ProjectTransactionLock
+
+        with ProjectTransactionLock(config.project_root).held(30.0):
+            for path in (where, where.with_suffix(".events.jsonl")):
+                if path.is_file():
+                    take_the_file_away(path, missing_ok=True)
         from .collaboration_ledger import remove_ledger
 
         remove_ledger(config, route, filed_as)
@@ -953,8 +1161,12 @@ def remove_conversation(config: LoadedConfig, route: str, filed_as: str = "") ->
     filed = _filed_under(filed_as or route)
     with _the_lock_for(filed):
         where = where_it_is_kept(config, route, filed_as)
-        if where.is_file():
-            take_the_file_away(where, missing_ok=True)
+        from .safety import ProjectTransactionLock
+
+        with ProjectTransactionLock(config.project_root).held(30.0):
+            for path in (where, where.with_suffix(".events.jsonl")):
+                if path.is_file():
+                    take_the_file_away(path, missing_ok=True)
         from .collaboration_ledger import remove_ledger
 
         remove_ledger(config, route, filed_as)
@@ -1084,6 +1296,14 @@ def _ask_and_keep(
     prefer_existing_conversation=False,
 ) -> dict[str, Any]:
     so_far = read_it(config, route, filed_as)
+    eligible = [
+        one for one in so_far
+        if one.phase not in {
+            "agent_reply", "lead_draft", "agent_plan", "lead_plan",
+            "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution",
+            "agent_verification",
+        }
+    ]
     messages = [
         {
             "role": "user" if one.who == "you" else "assistant",
@@ -1092,12 +1312,7 @@ def _ask_and_keep(
                 if speaker and one.who == "them" and one.speaker_name else one.text
             ),
         }
-        for one in so_far
-        if one.phase not in {
-            "agent_reply", "lead_draft", "agent_plan", "lead_plan",
-            "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution",
-            "agent_verification",
-        }
+        for one in eligible[-MOST_KEPT:]
     ]
     messages.append({"role": "user", "content": redactor.text(asked)})
     # Built here rather than passed in, so everything that goes to an assistant
@@ -1118,7 +1333,19 @@ def _ask_and_keep(
     )
     started = time.monotonic()
     try:
-        answered = provider.complete(request)
+        from .swarm_runs import provider_effect
+
+        effect_digest = hashlib.sha256(json.dumps({
+            "route": route, "conversation_key": request.conversation_key,
+            "messages": request.messages, "response_format": bool(request.response_format),
+        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        with provider_effect(config, route, request.conversation_key, effect_digest):
+            answered = provider.complete(request)
+    except cancellation.ChatCancelled:
+        # Stop is control flow, not a provider refusal.  Turning it into a
+        # ChatError makes multi-round collaboration treat the user's stop as a
+        # recoverable failed turn and immediately ask the agents again.
+        raise
     except HarnessError as exc:  # noqa: PERF203 - one shape of failure, one sentence
         # Remembered against the route, so the board can say this before the
         # next person types rather than after.
@@ -1213,7 +1440,19 @@ def ask_once(
             prefer_existing_conversation=bool(prefer_existing_conversation),
         )
         started = time.monotonic()
-        response = provider.complete(request)
+        from .swarm_runs import provider_effect
+
+        effect_digest = hashlib.sha256(json.dumps({
+            "route": named, "conversation_key": request.conversation_key,
+            "messages": request.messages, "response_format": bool(response_format),
+        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        with provider_effect(config, named, request.conversation_key, effect_digest):
+            response = provider.complete(request)
+    except cancellation.ChatCancelled:
+        # Collaboration catches this exact type and aborts the whole request.
+        # Do not flatten it into an ordinary per-agent failure that the next
+        # discussion round will retry.
+        raise
     except HarnessError as exc:
         raise ChatError(
             _without_personal_account_details(

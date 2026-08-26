@@ -46,6 +46,7 @@ class ProjectTestCase(unittest.TestCase):
         patched = mock.patch.dict(os.environ, {
             "APPDATA": str(self.somewhere_else),
             "XDG_CONFIG_HOME": str(self.somewhere_else),
+            "OUR_HARNESS_SWARM_RUN_DIR": str(self.root / "swarm-runtime"),
         })
         patched.start()
         self.addCleanup(patched.stop)
@@ -346,6 +347,42 @@ class MovingToAnotherOne(ProjectTestCase):
             self.panel.release_qa()
         self.assertGreaterEqual(status, 400)
         self.assertIn("checks are running", json.dumps(said).lower())
+
+    def test_it_will_not_move_while_a_durable_board_command_is_active(self) -> None:
+        store = self.panel.swarm_runs
+        accepted, created = store.accept(
+            "active-board-switch", {"kind": "board_order", "objective": "wait"}
+        )
+        self.assertTrue(created)
+        run_id = str(accepted["run_id"])
+        store.start(run_id)
+        status, said = self.ask(
+            "/api/projects/open", {"path": str(self.second)}
+        )
+        self.assertGreaterEqual(status, 400)
+        self.assertIn("swarm board or chat command is active", json.dumps(said).lower())
+        self.assertEqual(self.panel.config.project_root, self.first)
+        # Refusing the switch keeps the old project's exact durable Stop
+        # authority reachable.
+        self.assertEqual(store.request_stop(run_id)["status"], "stopping")
+        store.fail(run_id, "stopped for test", stopped=True)
+
+    def test_it_will_not_move_while_a_durable_chat_command_is_active(self) -> None:
+        store = self.panel.swarm_runs
+        accepted, created = store.accept(
+            "active-chat-switch", {"kind": "chat_order", "objective": "wait"}
+        )
+        self.assertTrue(created)
+        run_id = str(accepted["run_id"])
+        store.start(run_id)
+        status, said = self.ask(
+            "/api/projects/open", {"path": str(self.second)}
+        )
+        self.assertGreaterEqual(status, 400)
+        self.assertIn("swarm board or chat command is active", json.dumps(said).lower())
+        self.assertEqual(self.panel.config.project_root, self.first)
+        self.assertEqual(store.request_stop(run_id)["status"], "stopping")
+        store.fail(run_id, "stopped for test", stopped=True)
 
     def test_what_is_kept_out_of_the_news_moves_with_the_project(self) -> None:
         """It is worked out from a project's own settings, so a run in the new

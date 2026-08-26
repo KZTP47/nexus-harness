@@ -40,8 +40,18 @@ async function request(path, options = {}) {
   if (token && path !== "/api/bootstrap") headers["X-Harness-Token"] = token;
   const response = await fetch(path, {...options, headers});
   let value;
-  try { value = await response.json(); } catch (_) { throw new Error(`HTTP ${response.status}`); }
-  if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`);
+  try { value = await response.json(); } catch (_) {
+    const error = new Error(`HTTP ${response.status}`);
+    error.status = response.status;
+    error.responseReceived = true;
+    throw error;
+  }
+  if (!response.ok) {
+    const error = new Error(value.error || `HTTP ${response.status}`);
+    error.status = response.status;
+    error.responseReceived = true;
+    throw error;
+  }
   return value;
 }
 
@@ -669,7 +679,33 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) { document.querySelectorAll("[data-view]").forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.view === name))); document.querySelectorAll("[data-view-panel]").forEach((panel) => { panel.hidden = panel.dataset.viewPanel !== name; }); $("workflowActions").hidden = name !== "workflow"; if (name === "memory") refreshMemory(); if (name === "prompts") refreshPrompts(); if (name === "start") { refreshCheckup(); refreshHowItWorks(); } if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; } if (name === "workflow") { fitGraph(); refreshTeamNotes(); renderWhatItIsDoing(); refreshWorkflows(); } if (name === "history") refreshHistory(); if (name === "pipelines") refreshPipelines(); if (name === "settings") refreshSettings(); if (name === "vault") refreshVault(vaultOpen); if (name === "team") refreshTeam(teamOpen); if (name === "lookup") refreshLookup(); if (name === "talk") refreshTalk(); if (name === "swarm") refreshSwarm(); }
+function switchView(name) {
+  document.querySelectorAll("[data-view]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.view === name));
+  });
+  let activePanel = null;
+  document.querySelectorAll("[data-view-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.viewPanel !== name;
+    if (!panel.hidden) activePanel = panel;
+  });
+  // The skip link follows the selected workspace. A fixed target sent keyboard
+  // users into the hidden Start view after another tab had been selected.
+  if (activePanel?.id) $("skipToWorkspace").href = `#${activePanel.id}`;
+  $("workflowActions").hidden = name !== "workflow";
+  if (name === "memory") refreshMemory();
+  if (name === "prompts") refreshPrompts();
+  if (name === "start") { refreshCheckup(); refreshHowItWorks(); }
+  if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; }
+  if (name === "workflow") { fitGraph(); refreshTeamNotes(); renderWhatItIsDoing(); refreshWorkflows(); }
+  if (name === "history") refreshHistory();
+  if (name === "pipelines") refreshPipelines();
+  if (name === "settings") refreshSettings();
+  if (name === "vault") refreshVault(vaultOpen);
+  if (name === "team") refreshTeam(teamOpen);
+  if (name === "lookup") refreshLookup();
+  if (name === "talk") refreshTalk();
+  if (name === "swarm") refreshSwarm();
+}
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
 
@@ -2592,6 +2628,12 @@ let pipelineWaits = [];   // how long it waits before trying again
 // Which saved pipeline is on the board, if it came from one. Older versions
 // belong to a saved name, so without this there is nothing to look back at.
 let pipelineSavedName = "";
+// Live state and every control bind to the immutable server run identity.
+let pipelineActiveRunName = "";
+let pipelineActiveRunId = "";
+let pipelineProjectionRunId = "";
+let pipelineExactRun = null;
+let pipelineNewestRefresh = 0;
 let pipelineJoining = "";      // the node an arrow is being drawn from
 let pipelineDragging = null;
 let pipelineEditing = "";
@@ -2601,6 +2643,139 @@ const PIPELINE_ZOOM_MAX = 1.8;
 let pipelineZoom = 1;
 let pipelineIsFullScreen = false;
 let pipelineFullScreenHomes = [];
+const PIPELINE_PENDING_KEY_PREFIX = "nexus.pipeline.pending.v2:";
+let pipelineAuthorityId = "";
+let pipelinePendingRequest = null;
+
+function pipelinePendingKey(authorityId = pipelineAuthorityId) {
+  return `${PIPELINE_PENDING_KEY_PREFIX}${authorityId}`;
+}
+
+function readPipelinePendingRequest(authorityId) {
+  if (!authorityId) return null;
+  try {
+    const value = JSON.parse(localStorage.getItem(pipelinePendingKey(authorityId)) || "null");
+    return value && value.request_id && value.project_authority_id === authorityId ? value : null;
+  } catch (_) { return null; }
+}
+
+function usePipelineAuthority(authorityId) {
+  const next = String(authorityId || "");
+  if (!next) throw new Error("The server did not identify this project's automation authority.");
+  if (pipelineAuthorityId === next) return;
+  pipelineAuthorityId = next;
+  pipelinePendingRequest = readPipelinePendingRequest(next);
+  // Version 1 was not authority-scoped and can never be safely adopted.
+  try { localStorage.removeItem("nexus.pipeline.pending.v1"); } catch (_) { /* optional cleanup */ }
+}
+
+function rememberPipelinePendingRequest(value) {
+  if (value && value.project_authority_id !== pipelineAuthorityId) {
+    throw new Error("An automation request cannot move between project authorities.");
+  }
+  pipelinePendingRequest = value;
+  try {
+    if (value) localStorage.setItem(pipelinePendingKey(), JSON.stringify(value));
+    else if (pipelineAuthorityId) localStorage.removeItem(pipelinePendingKey());
+  } catch (_) { /* Private browsing can deny storage; in-memory recovery remains. */ }
+}
+
+function newPipelineRequestId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `pipeline-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function pipelineRequestFor(mode, name) {
+  const pending = pipelinePendingRequest;
+  if (pending && !pending.terminal && pending.mode === mode && pending.name === name) return pending;
+  if (!pipelineAuthorityId) throw new Error("Wait for this project's automation authority to load.");
+  const made = {request_id: newPipelineRequestId(), run_id: "", mode, name,
+    project_authority_id: pipelineAuthorityId,
+    created_at: new Date().toISOString()};
+  rememberPipelinePendingRequest(made);
+  return made;
+}
+
+function pipelineRequestWasDefinitelyRejected(error) {
+  const status = Number(error?.status);
+  return Boolean(error?.responseReceived && status >= 400 && status < 500
+    && ![408, 409, 425, 429].includes(status));
+}
+
+function pipelineRunIsTerminal(run) {
+  return Boolean(run && !run.running
+    && ["passed", "warning", "failed", "incomplete", "cancelled", "timed_out", "interrupted"]
+      .includes(String(run.state || "").toLowerCase()));
+}
+
+function showPipelineActiveRun(run, pending = pipelinePendingRequest) {
+  const box = $("pipelineActiveRun");
+  if (!box) return;
+  const runId = String(run?.run_id || pending?.run_id || "");
+  const requestId = String(run?.request_id || pending?.request_id || "");
+  const name = String(run?.name || pending?.name || "Automation");
+  const state = String(run?.state || (runId ? "accepted" : "awaiting acknowledgement"));
+  box.hidden = !(runId || requestId);
+  if (box.hidden) return;
+  $("pipelineActiveRunSaid").textContent = `${name}: ${state}.`;
+  $("pipelineActiveRunIdentity").textContent = `${runId ? `Run ${runId}` : "Run identity not acknowledged yet"}${requestId ? ` · Request ${requestId}` : ""}`;
+  $("pipelineOpenActiveRun").disabled = !runId;
+  $("pipelineStopActive").disabled = !runId || !run?.running;
+}
+
+async function fetchExactPipelineRun(runId) {
+  if (!runId) return null;
+  const run = await request(`/api/pipeline-runs/${encodeURIComponent(runId)}`);
+  if (String(run.run_id || "") !== String(runId)) throw new Error("The server returned a different automation run.");
+  if (String(run.project_authority_id || "") !== pipelineAuthorityId) {
+    throw new Error("That automation run belongs to a different project authority.");
+  }
+  pipelineExactRun = run;
+  pipelineActiveRunId = run.running ? String(run.run_id) : "";
+  pipelineActiveRunName = run.running ? String(run.name || "") : "";
+  showPipelineActiveRun(run);
+  if (pipelineRunIsTerminal(run) && pipelinePendingRequest?.run_id === String(run.run_id)) {
+    rememberPipelinePendingRequest(null);
+  }
+  return run;
+}
+
+async function lookupPipelineRunByRequest() {
+  const pending = pipelinePendingRequest;
+  if (!pending) return null;
+  if (pending.project_authority_id !== pipelineAuthorityId) {
+    throw new Error("The pending automation request belongs to a different project authority.");
+  }
+  const found = await request(`/api/pipeline-runs/by-request?request_id=${encodeURIComponent(pending.request_id)}`);
+  if (String(found.request_id || "") !== pending.request_id
+      || String(found.project_authority_id || "") !== pipelineAuthorityId) {
+    throw new Error("The request lookup returned a different project or request identity.");
+  }
+  const runId = String(found.run_id || "");
+  if (!runId) throw new Error("The request lookup did not return an exact run identity.");
+  rememberPipelinePendingRequest({...pending, run_id: runId});
+  return fetchExactPipelineRun(runId);
+}
+
+async function openExactPipelineRun() {
+  const runId = String(pipelineExactRun?.run_id || pipelinePendingRequest?.run_id || pipelineActiveRunId || "");
+  const run = await fetchExactPipelineRun(runId);
+  if (!run) return;
+  const snapshot = run.definition || run.snapshot || run.frozen_definition;
+  if (!snapshot) {
+    say(`Run ${runId} is ${run.state || "known"}, but this server did not provide its immutable automation snapshot.`);
+    return;
+  }
+  pipeline = structuredClone(snapshot);
+  pipelineSavedName = "";
+  pipelineProjectionRunId = runId;
+  pipelineStates = new Map();
+  $("pipelineLog").replaceChildren();
+  $("pipelineName").value = pipeline.name || run.name || "Automation run";
+  renderPipeline();
+  if (run.result) showPipelineRun(run.result);
+  say(`Showing immutable snapshot for run ${runId}. Saving creates or updates a separate automation; it cannot change this run.`);
+}
 
 function sizeThePipelineCanvas() {
   const canvas = $("pipelineCanvas");
@@ -2694,21 +2869,49 @@ async function toggleThePipelineFullScreen() {
 }
 
 async function refreshPipelines(name) {
+  const mine = ++pipelineNewestRefresh;
+  const requestedName = name === undefined ? pipelineSavedName : name;
+  const previousName = pipelineSavedName;
   try {
-    const said = await request(`/api/pipelines${name ? `?name=${encodeURIComponent(name)}` : ""}`);
+    const said = await request(`/api/pipelines${requestedName ? `?name=${encodeURIComponent(requestedName)}` : ""}`);
+    if (mine !== pipelineNewestRefresh) return;
+    usePipelineAuthority(said.project_authority_id);
     pipelineKinds = said.kinds || [];
     pipelineSaved = said.saved || [];
     pipelineStarters = said.starters || [];
     pipelineWhens = said.when_it_runs || [];
     pipelineWaits = said.waits || [];
     pipeline = said.pipeline;
+    const resolvedName = requestedName
+      || (pipelineSaved.includes(pipeline?.name) ? pipeline.name : "");
+    const priorAgentChoice = $("agentRunAutomation").value;
     fillOneChoice("agentRunAutomation", pipelineSaved.map((one) => ({name: one, label: one})),
-                  name || pipelineSaved[0] || "");
-    pipelineStates = new Map();
-    pipelineSavedName = name || "";
+                  "name", resolvedName || priorAgentChoice || pipelineSaved[0] || "");
+    const activeRunId = String(said.active_run?.run_id || "");
+    const activeRunName = String(said.active_run?.name || "");
+    const hadPendingRequest = Boolean(pipelinePendingRequest);
+    let reconciledRun = null;
+    let reconciliationError = null;
+    if (hadPendingRequest) {
+      try { reconciledRun = await lookupPipelineRunByRequest(); }
+      catch (error) { reconciliationError = error; }
+    }
+    const exactRunId = String(
+      (reconciledRun?.running ? reconciledRun.run_id : "")
+      || (!hadPendingRequest ? activeRunId : "")
+    );
+    const projectionRunId = String(reconciledRun?.run_id || exactRunId);
+    const preservingLiveProjection = Boolean(projectionRunId
+      && pipelineProjectionRunId === projectionRunId && previousName === resolvedName);
+    if (!preservingLiveProjection) pipelineStates = new Map();
+    pipelineSavedName = resolvedName;
+    pipelineActiveRunId = exactRunId;
+    pipelineActiveRunName = reconciledRun?.running
+      ? String(reconciledRun.name || pipelinePendingRequest?.name || "")
+      : (!hadPendingRequest ? activeRunName : "");
     pipelineOlderOnes = said.older_ones || [];
     $("pipelineName").value = pipeline.name || "";
-    $("pipelineStop").disabled = !said.running;
+    $("pipelineStop").disabled = !exactRunId;
     renderPipelinePalette();
     renderPipelineStarters();
     renderPipelineSaved();
@@ -2718,10 +2921,31 @@ async function refreshPipelines(name) {
       $("agentRunAutomation").addEventListener("change", refreshAgentContract);
       $("agentRunCopyContract").addEventListener("click", async () => { const said = await refreshAgentContract(); if (said) await navigator.clipboard.writeText(JSON.stringify(said, null, 2)); });
       $("agentRunNow").addEventListener("click", runAgentAutomation);
+      $("pipelineStopActive").addEventListener("click", stopPipeline);
+      $("pipelineOpenActiveRun").addEventListener("click", openExactPipelineRun);
     }
     refreshAgentContract();
-    if (said.last_run) showPipelineRun(said.last_run);
-  } catch (error) { showError(error.message); }
+    if (!reconciledRun && exactRunId) {
+      try { reconciledRun = await fetchExactPipelineRun(exactRunId); }
+      catch (error) {
+        showPipelineActiveRun(null);
+        say(`Run ${exactRunId} is still remembered, but its current status could not be loaded: ${error.message}`);
+      }
+    } else if (!reconciledRun) showPipelineActiveRun(null, pipelinePendingRequest);
+    if (reconciliationError) {
+      showPipelineActiveRun(null, pipelinePendingRequest);
+      say(`This project's pending request is still remembered, but its exact run is not available yet: ${reconciliationError.message}`);
+    }
+    else if (reconciledRun && pipelineRunIsTerminal(reconciledRun)) {
+      say(`${reconciledRun.name || "Automation"} finished with ${reconciledRun.state}. Open this run to view its immutable automation and results; the current editor is unchanged.`);
+    }
+    else if (pipelineActiveRunId && pipelineProjectionRunId !== pipelineActiveRunId) {
+      say("An exact automation run is active. Open its immutable snapshot to project its step updates on this board.");
+    }
+  } catch (error) {
+    if (mine !== pipelineNewestRefresh) return;
+    showError(error.message);
+  }
 }
 
 async function refreshAgentContract() {
@@ -2737,11 +2961,24 @@ async function refreshAgentContract() {
 async function runAgentAutomation() {
   const name = $("agentRunAutomation").value;
   if (!name) { $("agentRunSaid").textContent = "Choose a saved automation first."; return; }
+  const pending = pipelineRequestFor("agent", name);
   try {
-    await request("/api/pipelines/agent-run", {method: "POST", body: JSON.stringify({automation: name})});
+    const accepted = await request("/api/pipelines/agent-run", {method: "POST", body: JSON.stringify({
+      automation: name, request_id: pending.request_id,
+    })});
+    pipelineActiveRunName = accepted.name || name;
+    pipelineActiveRunId = accepted.run_id || "";
+    pipelineProjectionRunId = "";
+    rememberPipelinePendingRequest({...pending, run_id: pipelineActiveRunId});
     $("agentRunSaid").textContent = `Started exactly “${name}”. Watch the run status above for completion.`;
     await refreshPipelines(name);
-  } catch (error) { $("agentRunSaid").textContent = error.message; }
+  } catch (error) {
+    if (pipelineRequestWasDefinitelyRejected(error)) rememberPipelinePendingRequest(null);
+    $("agentRunSaid").textContent = pipelineRequestWasDefinitelyRejected(error)
+      ? error.message
+      : `${error.message} The outcome is unknown; Retry reuses request ${pending.request_id} and cannot start a duplicate.`;
+    showPipelineActiveRun(null, pipelinePendingRequest);
+  }
 }
 
 function renderPipelineSaved() {
@@ -2853,6 +3090,9 @@ function say(words) {
 }
 
 function renderPipeline() {
+  const focused = document.activeElement?.closest?.(".pipeline-node");
+  const focusNodeId = focused?.dataset.node || "";
+  const focusAction = document.activeElement?.dataset.pipelineAction || "card";
   const box = $("pipelineNodes");
   const wires = $("pipelineWires");
   box.replaceChildren(wires);
@@ -2860,6 +3100,7 @@ function renderPipeline() {
     const kind = kindOf(node.kind);
     const card = make("div", `pipeline-node colour-${kind.colour}`);
     card.dataset.node = node.id;
+    card.dataset.pipelineAction = "card";
     card.style.left = `${node.at?.x || 0}px`;
     card.style.top = `${node.at?.y || 0}px`;
     const state = pipelineStates.get(node.id);
@@ -2897,13 +3138,16 @@ function renderPipeline() {
     const buttons = make("div", "pipeline-node-buttons");
     const join = make("button", "pipeline-node-button", pipelineJoining === node.id ? "Joining" : "Connect");
     join.type = "button";
+    join.dataset.pipelineAction = "connect";
     join.title = "Draw an arrow from this step to another";
     join.addEventListener("click", (event) => { event.stopPropagation(); joinPipelineNodes(node.id); });
     const settings = make("button", "pipeline-node-button", "Settings");
     settings.type = "button";
+    settings.dataset.pipelineAction = "settings";
     settings.addEventListener("click", (event) => { event.stopPropagation(); openPipelineNode(node.id); });
     const alone = make("button", "pipeline-node-button", "Run only this");
     alone.type = "button";
+    alone.dataset.pipelineAction = "run-only";
     alone.title = "Run this one step and nothing else, while you are building it";
     alone.addEventListener("click", (event) => {
       event.stopPropagation();
@@ -2911,13 +3155,15 @@ function renderPipeline() {
     });
     const onward = make("button", "pipeline-node-button", "Carry on from here");
     onward.type = "button";
+    onward.dataset.pipelineAction = "run-from";
     onward.title = "Run this step and everything after it, leaving the earlier ones alone";
     onward.addEventListener("click", (event) => {
       event.stopPropagation();
       runPipeline({from_here: node.id});
     });
-    const remove = make("button", "pipeline-node-button", "Remove");
+    const remove = make("button", "pipeline-node-button danger", "Remove step");
     remove.type = "button";
+    remove.dataset.pipelineAction = "remove";
     remove.addEventListener("click", (event) => { event.stopPropagation(); removePipelineNode(node.id); });
     buttons.append(join, settings, alone, onward, remove);
     card.append(buttons);
@@ -2936,6 +3182,66 @@ function renderPipeline() {
   }
   sizeThePipelineCanvas();
   drawPipelineWires();
+  renderPipelineStructure();
+  $("pipelineScopePreview").textContent = pipelineSavedName
+    ? `Selected saved automation: “${pipelineSavedName}”. A run and its status are shown here only when that exact name matches.`
+    : `Unsaved drawing: ${pipeline.nodes.length} step${pipeline.nodes.length === 1 ? "" : "s"} and ${pipeline.edges.length} connection${pipeline.edges.length === 1 ? "" : "s"}. Run uses exactly this drawing.`;
+  if (focusNodeId) {
+    const restoredCard = box.querySelector(`[data-node="${CSS.escape(focusNodeId)}"]`);
+    const restored = focusAction === "card"
+      ? restoredCard
+      : restoredCard?.querySelector(`[data-pipeline-action="${CSS.escape(focusAction)}"]`);
+    if (restored) restored.focus({preventScroll: true});
+  }
+}
+
+function pipelineNodeName(nodeId) {
+  const node = pipeline.nodes.find((one) => one.id === nodeId);
+  return node?.label || node?.id || nodeId;
+}
+
+function removePipelineEdge(edge) {
+  const cameFromStructure = Boolean(document.activeElement?.closest?.("#pipelineStructure"));
+  pipeline.edges = pipeline.edges.filter(
+    (item) => !(item.from === edge.from && item.to === edge.to));
+  renderPipeline();
+  if (cameFromStructure) {
+    $("pipelineStructure").closest("details")?.querySelector("summary")?.focus({preventScroll: true});
+  }
+  say(`Removed the connection from ${pipelineNodeName(edge.from)} to ${pipelineNodeName(edge.to)}.`);
+}
+
+function renderPipelineStructure() {
+  const held = $("pipelineStructure");
+  held.replaceChildren();
+  if (!pipeline.nodes.length) {
+    held.append(make("p", "hint", "No steps or connections yet."));
+    return;
+  }
+  const list = make("ol", "semantic-list");
+  for (const node of pipeline.nodes) {
+    const item = make("li", "semantic-item");
+    item.append(make("strong", "", pipelineNodeName(node.id)),
+      make("span", "", ` — ${kindOf(node.kind).label}`));
+    const outgoing = pipeline.edges.filter((edge) => edge.from === node.id);
+    if (outgoing.length) {
+      const edges = make("ul", "semantic-edge-list");
+      for (const edge of outgoing) {
+        const row = make("li", "semantic-edge");
+        row.append(make("span", "", `Then ${pipelineNodeName(edge.to)}. `));
+        const remove = make("button", "danger compact", "Remove connection");
+        remove.type = "button";
+        remove.setAttribute("aria-label",
+          `Remove connection from ${pipelineNodeName(edge.from)} to ${pipelineNodeName(edge.to)}`);
+        remove.addEventListener("click", () => removePipelineEdge(edge));
+        row.append(remove);
+        edges.append(row);
+      }
+      item.append(edges);
+    } else item.append(make("p", "hint", "No following step."));
+    list.append(item);
+  }
+  held.append(list);
 }
 
 function drawPipelineWires() {
@@ -2959,11 +3265,7 @@ function drawPipelineWires() {
     cut.setAttribute("cy", String((y1 + y2) / 2));
     cut.setAttribute("r", "9");
     cut.setAttribute("class", "pipeline-cut");
-    cut.addEventListener("click", () => {
-      pipeline.edges = pipeline.edges.filter((item) => !(item.from === edge.from && item.to === edge.to));
-      renderPipeline();
-      say(`Took the arrow from ${edge.from} to ${edge.to} out.`);
-    });
+    cut.addEventListener("click", () => removePipelineEdge(edge));
     const cross = document.createElementNS("http://www.w3.org/2000/svg", "text");
     cross.setAttribute("x", String(middle));
     cross.setAttribute("y", String((y1 + y2) / 2 + 4));
@@ -3336,15 +3638,20 @@ async function newPipeline() {
 }
 
 async function runPipeline(options = {}) {
+  const definition = pipelineOnScreen();
+  const pending = pipelineRequestFor("panel", definition.name);
   try {
+    pipelineActiveRunName = definition.name;
+    pipelineActiveRunId = pending.run_id || "";
     pipelineStates = new Map();
     showWhatIsBeingAsked("");
     $("pipelineLog").replaceChildren();
     renderPipeline();
-    await request("/api/pipelines/run", {
+    const accepted = await request("/api/pipelines/run", {
       method: "POST",
       body: JSON.stringify({
-        pipeline: pipelineOnScreen(),
+        pipeline: definition,
+        request_id: pending.request_id,
         // Three ways to run less than the whole thing. Left out when not
         // asked for, so an ordinary Run is exactly what it always was.
         ...(options.from_here ? {from_here: options.from_here} : {}),
@@ -3352,18 +3659,41 @@ async function runPipeline(options = {}) {
         ...(options.answers ? {answers: options.answers} : {}),
       }),
     });
+    pipelineActiveRunId = accepted.run_id || "";
+    pipelineProjectionRunId = pipelineActiveRunId;
+    rememberPipelinePendingRequest({...pending, run_id: pipelineActiveRunId});
     $("pipelineStop").disabled = false;
+    showPipelineActiveRun({run_id: pipelineActiveRunId, request_id: pending.request_id,
+      name: pipelineActiveRunName, state: "accepted", running: true});
     say(options.only
       ? "Running that one step on its own."
       : options.from_here
         ? "Carrying on from that step. The ones before it are left as they were."
         : "Running. Each step lights up as it goes.");
-  } catch (error) { say(error.message); showError(error.message); }
+  } catch (error) {
+    if (pipelineRequestWasDefinitelyRejected(error)) {
+      rememberPipelinePendingRequest(null);
+      pipelineActiveRunName = "";
+      pipelineActiveRunId = "";
+      pipelineProjectionRunId = "";
+    }
+    $("pipelineStop").disabled = !pipelineActiveRunId;
+    say(pipelineRequestWasDefinitelyRejected(error) ? error.message
+      : `${error.message} The outcome is unknown; Retry reuses request ${pending.request_id} and cannot start a duplicate.`);
+    showPipelineActiveRun(null, pipelinePendingRequest);
+    showError(error.message);
+  }
 }
 
 async function stopPipeline() {
   try {
-    const said = await request("/api/pipelines/stop", {method: "POST", body: "{}"});
+    if (!pipelineActiveRunId) {
+      say("There is no exact active run to stop.");
+      return;
+    }
+    const said = await request("/api/pipelines/stop", {
+      method: "POST", body: JSON.stringify({run_id: pipelineActiveRunId}),
+    });
     say(said.note);
   } catch (error) { showError(error.message); }
 }
@@ -3371,11 +3701,25 @@ async function stopPipeline() {
 // News from a run, arriving while it happens.
 function applyPipelineEvent(event) {
   if (event.kind === "pipeline_started") {
-    $("pipelineStop").disabled = false;
-    say(`Running ${event.payload?.name || "the pipeline"}.`);
+    const startedRunId = String(event.run_id || event.payload?.run_id || "");
+    if (pipelineActiveRunId && startedRunId !== pipelineActiveRunId) return;
+    pipelineActiveRunName = event.payload?.name || "";
+    pipelineActiveRunId = startedRunId;
+    if (pipelinePendingRequest?.request_id === event.payload?.request_id) {
+      rememberPipelinePendingRequest({...pipelinePendingRequest, run_id: startedRunId});
+    }
+    const visible = startedRunId && pipelineProjectionRunId === startedRunId;
+    $("pipelineStop").disabled = !startedRunId;
+    showPipelineActiveRun({run_id: startedRunId, request_id: event.payload?.request_id,
+      name: pipelineActiveRunName, state: "running", running: true});
+    say(visible
+      ? `Running ${pipelineActiveRunName}.`
+      : `Running ${pipelineActiveRunName || "an automation"}. Open its immutable snapshot to show step updates here.`);
     return;
   }
   if (event.kind === "pipeline_node") {
+    const eventRunId = String(event.run_id || event.payload?.run_id || "");
+    if (!pipelineProjectionRunId || eventRunId !== pipelineProjectionRunId) return;
     const result = event.payload || {};
     pipelineStates.set(String(result.id), result);
     renderPipeline();
@@ -3389,9 +3733,28 @@ function applyPipelineEvent(event) {
     return;
   }
   if (event.kind === "pipeline_finished") {
+    const finished = event.payload || {};
+    const finishedRunId = String(event.run_id || finished.run_id || "");
+    if (!finishedRunId || finishedRunId !== pipelineProjectionRunId) {
+      if (finishedRunId && finishedRunId === pipelineActiveRunId) {
+        if (pipelinePendingRequest?.run_id === finishedRunId) rememberPipelinePendingRequest(null);
+        showPipelineActiveRun({...finished, run_id: finishedRunId, running: false,
+          state: finished.state || "completed"}, null);
+        pipelineActiveRunName = "";
+        pipelineActiveRunId = "";
+      }
+      say(`${finished.name || "Another automation"} finished. This board stayed unchanged.`);
+      return;
+    }
     $("pipelineStop").disabled = true;
     showWhatIsBeingAsked("");
-    showPipelineRun(event.payload || {});
+    showPipelineRun(finished);
+    if (pipelinePendingRequest?.run_id === finishedRunId) rememberPipelinePendingRequest(null);
+    showPipelineActiveRun({...finished, run_id: finishedRunId, running: false,
+      state: finished.state || "completed"}, null);
+    pipelineActiveRunName = "";
+    pipelineActiveRunId = "";
+    pipelineProjectionRunId = "";
     if (pipelineLooking === "timeline") drawThePipelineTimeline();
   }
 }
@@ -3967,6 +4330,7 @@ function bindEvents() {
   $("teamRemove").addEventListener("click", removeTheTeam);
   document.querySelectorAll("[data-pipeline-tab]").forEach((tab) => {
     tab.addEventListener("click", () => showPipelinePane(tab.dataset.pipelineTab));
+    tab.addEventListener("keydown", moveBetweenPipelineTabs);
   });
   $("pipelineNodeWhen").addEventListener("change", sayWhatTheStepChoicesMean);
   $("pipelineNodeWait").addEventListener("change", sayWhatTheStepChoicesMean);
@@ -4756,7 +5120,9 @@ let pipelineWaitingAt = "";        // the step that has stopped to ask
 function showPipelinePane(which) {
   pipelineLooking = which;
   document.querySelectorAll("[data-pipeline-tab]").forEach((tab) => {
-    tab.setAttribute("aria-selected", String(tab.dataset.pipelineTab === which));
+    const selected = tab.dataset.pipelineTab === which;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
   });
   document.querySelectorAll("[data-pipeline-pane]").forEach((pane) => {
     pane.hidden = pane.dataset.pipelinePane !== which;
@@ -4767,6 +5133,21 @@ function showPipelinePane(which) {
   if (which === "before") listHowItLookedBefore();
   if (which === "timer") refreshTimers();
   if (which === "telling") refreshTelling();
+}
+
+function moveBetweenPipelineTabs(event) {
+  const tabs = [...document.querySelectorAll("[data-pipeline-tab]")];
+  const at = tabs.indexOf(event.currentTarget);
+  let next = at;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (at + 1) % tabs.length;
+  else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (at - 1 + tabs.length) % tabs.length;
+  else if (event.key === "Home") next = 0;
+  else if (event.key === "End") next = tabs.length - 1;
+  else return;
+  event.preventDefault();
+  const target = tabs[next];
+  showPipelinePane(target.dataset.pipelineTab);
+  target.focus();
 }
 
 /* ---- the same thing as text ---- */
@@ -5020,9 +5401,12 @@ function showWhatIsBeingAsked(step) {
 
 async function answerTheStep(step, carryOn) {
   try {
+    if (!pipelineActiveRunId || pipelineProjectionRunId !== pipelineActiveRunId) {
+      throw new Error("This question no longer belongs to the exact run shown here. Refresh before answering.");
+    }
     const said = await request("/api/pipelines/answer", {
       method: "POST",
-      body: JSON.stringify({step, carry_on: carryOn}),
+      body: JSON.stringify({run_id: pipelineActiveRunId, step, carry_on: carryOn}),
     });
     showWhatIsBeingAsked("");
     say(said.note || "Answered.");
@@ -6354,7 +6738,15 @@ async function refreshSwarm(quietly) {
   const mine = ++swarmNewestRefresh;
   const changesThen = howManyChangesLanded;
   try {
-    const said = await request("/api/swarm");
+    // The board and saved-board list are local files; provider discovery runs
+    // several installed CLIs and is orders of magnitude slower. On the first
+    // read, ask for the local state only so there is something useful on
+    // screen immediately. Once it is drawn, refresh provider status in the
+    // background. Later presses of Look again still perform a full refresh.
+    const firstHydration = !swarmBoardHydrated;
+    const said = await request(
+      firstHydration ? "/api/swarm?refresh_providers=false" : "/api/swarm"
+    );
     if (mine !== swarmNewestRefresh) return;
     if (changesThen !== howManyChangesLanded) return;
     swarmSaid = said;
@@ -6373,10 +6765,20 @@ async function refreshSwarm(quietly) {
     // small, and without it the list is half a list until somebody opens the
     // fold at the bottom of the board.
     await refreshWhatTheySaidToEachOther();
-    const doing = (await request("/api/swarm/how-it-is-going")).doing;
+    const doing = await readSwarmBoardRun(swarmBoardRunId, swarmBoardCursor);
+    swarmBoardCursor = Number((doing || {}).next_cursor ?? (doing || {}).cursor ?? swarmBoardCursor);
+    if (doing && !doing.going) {
+      swarmBoardRequestId = "";
+      localStorage.removeItem("nexus.swarm.board-request");
+    }
     renderWhatTheyAreDoing(doing);
     if (doing && doing.going) watchWhatTheyAreDoing();
     if (!quietly) sayInSwarm(whatTheBoardSays());
+    if (said.provider_status_stale && mine === swarmNewestRefresh) {
+      // Do not await this: the durable board is already interactive. This
+      // second pass only decorates it with newly discovered provider status.
+      void refreshSwarm(true);
+    }
   } catch (error) {
     if (mine !== swarmNewestRefresh) return;
     showError(error.message);
@@ -6490,6 +6892,13 @@ function renderSwarmBoard() {
   // doing so; otherwise a refresh that happens after paste/copy destroys the
   // focused textarea and leaves the user typing into a detached element.
   const composerState = new Map();
+  const focusedBoardBox = document.activeElement?.closest?.(".swarm-box");
+  const focusedBoardControl = focusedBoardBox ? {
+    kind: focusedBoardBox.dataset.kind,
+    id: focusedBoardBox.dataset.id,
+    does: document.activeElement?.dataset.does || "pick",
+  } : null;
+  const focusedLineKey = document.activeElement?.closest?.(".swarm-line-tools")?.dataset.focusKey || "";
   let focusedComposer = null;
   for (const box of document.querySelectorAll(".swarm-chat-card .swarm-chat-box")) {
     const agentId = box.closest(".swarm-chat-card")?.dataset.agent;
@@ -6535,6 +6944,19 @@ function renderSwarmBoard() {
     if (focusedComposer === agentId) box.focus({preventScroll: true});
   }
   drawSwarmLines();
+  renderSwarmStructure();
+  if (focusedBoardControl) {
+    const restoredBox = canvas.querySelector(
+      `.swarm-box[data-kind="${CSS.escape(focusedBoardControl.kind)}"]`
+      + `[data-id="${CSS.escape(focusedBoardControl.id)}"]`);
+    const restored = restoredBox?.querySelector(
+      `[data-does="${CSS.escape(focusedBoardControl.does)}"]`);
+    if (restored) restored.focus({preventScroll: true});
+  } else if (focusedLineKey) {
+    canvas.querySelector(
+      `.swarm-line-tools[data-focus-key="${CSS.escape(focusedLineKey)}"] button`,
+    )?.focus({preventScroll: true});
+  }
 }
 
 function oneSwarmBox(kind, one) {
@@ -6559,6 +6981,7 @@ function oneSwarmBox(kind, one) {
   pick.type = "button";
   pick.dataset.kind = kind;
   pick.dataset.id = one.id;
+  pick.dataset.does = "pick";
   pick.setAttribute("aria-pressed", String(Boolean(picked)));
   pick.setAttribute("aria-label", kind === "agent"
     ? `${one.name}, an agent on the board. Pick it, or move it with the arrow keys`
@@ -6753,6 +7176,7 @@ function theToolsOnALine(where, words, on, whenPressed, what) {
     y: (where.start.y + where.end.y) / 2,
   };
   const held = make("div", `swarm-line-tools ${on ? "on" : "off"}`);
+  held.dataset.focusKey = what;
   held.style.left = `${Math.round(middle.x)}px`;
   held.style.top = `${Math.round(middle.y)}px`;
   held.append(aSwarmButton("swarm-icon-button", "gear", "settings", whenPressed,
@@ -6765,6 +7189,18 @@ function renderSwarmNotReady() {
   const list = $("swarmNotReady");
   list.replaceChildren();
   const said = swarmSaid.what_is_not_ready || [];
+  const board = theSwarmBoard();
+  const runnableProjects = new Set((board.projects || [])
+    .filter((project) => project.is_there && (project.tasks || []).length)
+    .map((project) => project.id));
+  const includedIds = new Set((board.works_on || [])
+    .filter((line) => runnableProjects.has(line.project)
+      && board.agents.some((agent) => agent.id === line.agent && agent.ready))
+    .map((line) => line.agent));
+  const excluded = Math.max(0, (board.agents || []).length - includedIds.size);
+  $("swarmScopePreview").textContent = includedIds.size
+    ? `${includedIds.size} agent${includedIds.size === 1 ? "" : "s"} will be asked across ${runnableProjects.size} ready project${runnableProjects.size === 1 ? "" : "s"}; ${excluded} agent${excluded === 1 ? " is" : "s are"} excluded. ${said.length} readiness issue${said.length === 1 ? "" : "s"} ${said.length === 1 ? "is" : "are"} listed below.`
+    : `No agent will be asked: there is no ready agent assigned to a project folder that exists and has jobs. ${said.length} readiness issue${said.length === 1 ? "" : "s"} ${said.length === 1 ? "is" : "are"} listed below.`;
   if (!said.length) {
     list.append(make("li", "all-well",
       "Everything on the board is ready: every agent has an assistant, and every "
@@ -6907,6 +7343,58 @@ function pickSwarmBox(kind, id) {
   showTheSwarmPanel();
   renderSwarmBoard();
   renderSwarmPanel();
+}
+
+function renderSwarmStructure() {
+  const held = $("swarmStructure");
+  held.replaceChildren();
+  const board = theSwarmBoard();
+  const heading = make("p", "scope-preview",
+    `${board.agents.length} agent${board.agents.length === 1 ? "" : "s"}, `
+    + `${board.projects.length} project${board.projects.length === 1 ? "" : "s"}, `
+    + `${board.works_on.length} work assignment${board.works_on.length === 1 ? "" : "s"}, `
+    + `${board.talks_to.length} talk permission${board.talks_to.length === 1 ? "" : "s"}.`);
+  held.append(heading);
+  const agents = make("ul", "semantic-list");
+  for (const agent of board.agents) {
+    const row = make("li", "semantic-item");
+    row.append(make("strong", "", agent.name), make("span", "",
+      agent.ready ? ` — ready via ${agent.who || "the selected assistant"}` : " — excluded: assistant not ready"));
+    const edit = make("button", "compact", `Open ${agent.name} settings`);
+    edit.type = "button";
+    edit.addEventListener("click", () => pickSwarmBox("agent", agent.id));
+    row.append(edit);
+    const assignments = board.works_on.filter((line) => line.agent === agent.id);
+    const talks = board.talks_to.filter((line) => line.one === agent.id || line.other === agent.id);
+    const facts = make("ul", "semantic-edge-list");
+    for (const line of assignments) {
+      const project = board.projects.find((one) => one.id === line.project);
+      const item = make("li", "semantic-edge", `Works on ${project?.name || line.project}. `);
+      const settings = make("button", "compact", "Change assignment");
+      settings.type = "button";
+      settings.setAttribute("aria-label", `Change whether ${agent.name} works on ${project?.name || line.project}`);
+      settings.addEventListener("click", () => pickSwarmLine(
+        {kind: "works", agent: line.agent, project: line.project}));
+      item.append(settings);
+      facts.append(item);
+    }
+    for (const line of talks) {
+      const otherId = line.one === agent.id ? line.other : line.one;
+      const other = board.agents.find((one) => one.id === otherId);
+      const item = make("li", "semantic-edge", `May talk with ${other?.name || otherId}. `);
+      const settings = make("button", "compact", "Change permission");
+      settings.type = "button";
+      settings.setAttribute("aria-label", `Change talk permission between ${agent.name} and ${other?.name || otherId}`);
+      settings.addEventListener("click", () => pickSwarmLine(
+        {kind: "talks", one: line.one, other: line.other}));
+      item.append(settings);
+      facts.append(item);
+    }
+    if (facts.childElementCount) row.append(facts);
+    agents.append(row);
+  }
+  if (agents.childElementCount) held.append(agents);
+  else held.append(make("p", "hint", "No agents are on the board yet."));
 }
 
 function pickSwarmLine(which) {
@@ -7557,9 +8045,17 @@ async function saveTheSwarmAgent() {
 async function removeTheSwarmAgent() {
   const agent = thePickedAgent();
   if (!agent) { sayInSwarm("Press the gear on an agent first."); return; }
+  const invoker = document.activeElement;
+  const projects = theSwarmBoard().works_on.filter((line) => line.agent === agent.id).length;
+  const connections = theSwarmBoard().talks_to.filter(
+    (line) => line.one === agent.id || line.other === agent.id).length;
+  if (!window.confirm(`Remove ${agent.name} from this board? This also removes ${projects} project assignment${projects === 1 ? "" : "s"} and ${connections} agent connection${connections === 1 ? "" : "s"}. Saved chat transcripts and project files are kept.`)) {
+    invoker?.focus?.({preventScroll: true});
+    return;
+  }
   // Removal is an explicit decision to discard the form as well as the agent.
   discardSwarmAgentSettings(agent.id);
-  await changeTheSwarmBoard((board) => {
+  const changed = await changeTheSwarmBoard((board) => {
     board.agents = board.agents.filter((one) => one.id !== agent.id);
     board.works_on = board.works_on.filter((line) => line.agent !== agent.id);
     board.talks_to = board.talks_to.filter(
@@ -7567,16 +8063,25 @@ async function removeTheSwarmAgent() {
     swarmChats = swarmChats.filter((one) => one.agent !== agent.id);
     swarmPicked = null;
   }, `${agent.name} is off the board. What it said is kept.`);
+  (changed ? $("swarmAddAgent") : invoker)?.focus?.({preventScroll: true});
 }
 
 async function removeTheSwarmProject() {
   const project = thePickedProject();
   if (!project) { sayInSwarm("Press the gear on a project folder first."); return; }
-  await changeTheSwarmBoard((board) => {
+  const invoker = document.activeElement;
+  const assignments = theSwarmBoard().works_on.filter((line) => line.project === project.id).length;
+  const tasks = project.tasks?.length || 0;
+  if (!window.confirm(`Remove ${project.name} from this board? This removes ${assignments} agent assignment${assignments === 1 ? "" : "s"} and ${tasks} board task${tasks === 1 ? "" : "s"}. Nothing in the project folder is changed.`)) {
+    invoker?.focus?.({preventScroll: true});
+    return;
+  }
+  const changed = await changeTheSwarmBoard((board) => {
     board.projects = board.projects.filter((one) => one.id !== project.id);
     board.works_on = board.works_on.filter((line) => line.project !== project.id);
     swarmPicked = null;
   }, `${project.name} is off the board. Nothing in the folder was changed.`);
+  (changed ? $("swarmAddProject") : invoker)?.focus?.({preventScroll: true});
 }
 
 async function addOneSwarmTask() {
@@ -8166,6 +8671,7 @@ function aChatDestination(agent, {offerFullChat = false, conversation = null} = 
   if (offerFullChat && agent) {
     const open = make("button", "", "Open full Nexus chat");
     open.type = "button";
+    open.dataset.bigChatInvoker = agent.id;
     open.addEventListener("click", () => openTheBigChat(agent.id));
     actions.append(open);
   }
@@ -8930,12 +9436,44 @@ function renderWhatTheySaidToEachOther(said) {
 
 let swarmGoing = false;      // a run is on
 let swarmWatching = 0;       // the timer that keeps asking how it is going
+let swarmBoardRunId = localStorage.getItem("nexus.swarm.board-run") || "";
+let swarmBoardRequestId = localStorage.getItem("nexus.swarm.board-request") || "";
+let swarmBoardCursor = 0;
+
+async function readSwarmBoardRun(runId, after = 0) {
+  let identity = String(runId || "");
+  let cursor = Math.max(0, Number(after) || 0);
+  let doing = null;
+  // Drain bounded server pages immediately after reload/reconnect. The cap
+  // keeps one refresh fair; a later poll continues from the durable cursor.
+  for (let page = 0; page < 100; page += 1) {
+    const query = identity
+      ? `?run_id=${encodeURIComponent(identity)}&after=${cursor}`
+      : "";
+    doing = (await request(`/api/swarm/how-it-is-going${query}`)).doing;
+    if (!doing) return null;
+    identity = String(doing.run_id || identity);
+    const next = Math.max(cursor, Number(doing.next_cursor ?? doing.cursor) || 0);
+    if (!doing.has_more || next === cursor) return doing;
+    cursor = next;
+  }
+  return doing;
+}
 
 async function setThemGoing() {
   try {
+    // Reuse an ambiguous request. A disconnected renderer cannot know whether
+    // Start reached the server, so changing this identity on retry could ask
+    // every agent twice.
+    const requestId = swarmBoardRequestId || crypto.randomUUID();
+    swarmBoardRequestId = requestId;
+    localStorage.setItem("nexus.swarm.board-request", requestId);
     const said = await request("/api/swarm/start", {
-      method: "POST", body: JSON.stringify({}),
+      method: "POST", body: JSON.stringify({request_id: requestId}),
     });
+    swarmBoardRunId = said.run_id || requestId;
+    swarmBoardCursor = Number((said.doing || {}).cursor || 0);
+    localStorage.setItem("nexus.swarm.board-run", swarmBoardRunId);
     swarmDoing = said.doing || null;
     renderWhatTheyAreDoing(said.doing);
     watchWhatTheyAreDoing();
@@ -8950,7 +9488,7 @@ async function setThemGoing() {
 async function stopThemGoing() {
   try {
     const said = await request("/api/swarm/stop", {
-      method: "POST", body: JSON.stringify({}),
+      method: "POST", body: JSON.stringify({run_id: swarmBoardRunId}),
     });
     swarmDoing = said.doing || null;
     renderWhatTheyAreDoing(said.doing);
@@ -8967,10 +9505,13 @@ function watchWhatTheyAreDoing() {
   if (swarmWatching) return;
   swarmWatching = window.setInterval(async () => {
     try {
-      const said = await request("/api/swarm/how-it-is-going");
-      swarmDoing = said.doing || null;
-    renderWhatTheyAreDoing(said.doing);
-      if (!said.doing || !said.doing.going) {
+      const doing = await readSwarmBoardRun(swarmBoardRunId, swarmBoardCursor);
+      swarmBoardCursor = Number((doing || {}).next_cursor ?? (doing || {}).cursor ?? swarmBoardCursor);
+      swarmDoing = doing || null;
+      renderWhatTheyAreDoing(doing);
+      if (!doing || !doing.going) {
+        swarmBoardRequestId = "";
+        localStorage.removeItem("nexus.swarm.board-request");
         window.clearInterval(swarmWatching);
         swarmWatching = 0;
         // What they said is in their chats now, and a chat that was open while
@@ -9611,6 +10152,8 @@ async function connectThisAssistant(kind, button) {
 // Which chat is open big, by agent id. Empty means none, and the board is
 // showing.
 let theBigOne = "";
+let theBigChatInvoker = null;
+let theBigChatInvokerAgent = "";
 let theBigChatRenderIdentity = "";
 const theBigChatRenderSignatures = new Map();
 const BIG_CHAT_LAYOUT_KEY = "nexus-big-chat-layout-v1";
@@ -9922,6 +10465,7 @@ function renderTheChatTray() {
       `${one.name} — Nexus chat via ${destination.provider_label || one.who || "nobody yet"}`));
     pick.addEventListener("focus", () => pointAtTheBox(one.id));
     pick.addEventListener("blur", stopPointing);
+    pick.dataset.bigChatInvoker = one.id;
     pick.addEventListener("click", () => openTheBigChat(one.id));
     row.append(pick);
     list.append(row);
@@ -9970,9 +10514,69 @@ function stopPointing() {
 
 // ---- one chat, opened big -------------------------------------------------
 
+function theBigChatLayoutEvidence() {
+  const sheet = $("theBigChat")?.querySelector(".the-big-chat-sheet");
+  const main = $("theBigChat")?.querySelector(".the-big-chat-main");
+  const header = $("theBigChat")?.querySelector(".the-big-chat-top");
+  const title = $("theBigChatTitle");
+  const close = $("theBigChatShut");
+  const textbox = $("theBigChatBox");
+  const send = $("theBigChatSend");
+  if (!sheet || !main || !header || !title || !close || !textbox || !send
+      || $("theBigChat").hidden) return {open: false};
+  const sheetRect = sheet.getBoundingClientRect();
+  const mainRect = main.getBoundingClientRect();
+  const headerRect = header.getBoundingClientRect();
+  const titleRect = title.getBoundingClientRect();
+  const closeRect = close.getBoundingClientRect();
+  const textboxRect = textbox.getBoundingClientRect();
+  const sendRect = send.getBoundingClientRect();
+  const inside = (rect, outer) => rect.width > 0 && rect.height > 0
+    && rect.left >= outer.left - 1 && rect.top >= outer.top - 1
+    && rect.right <= outer.right + 1 && rect.bottom <= outer.bottom + 1;
+  const viewport = {left: 0, top: 0, right: innerWidth, bottom: innerHeight};
+  const insideSheetAndViewport = (rect) => inside(rect, sheetRect) && inside(rect, viewport);
+  const bottom = $("theBigChat")?.querySelector(".the-big-chat-bottom");
+  const said = $("theBigChatSaid");
+  const conversations = $("theBigChat")?.querySelector(".the-big-chat-conversations");
+  return {
+    open: true,
+    viewportWidth: document.documentElement.clientWidth,
+    documentHasHorizontalOverflow:
+      document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+    mainPaneClippedHorizontally:
+      mainRect.left < sheetRect.left - 1 || mainRect.right > sheetRect.right + 1,
+    mainInsideSheetAndViewport: insideSheetAndViewport(mainRect),
+    headerInsideSheetAndViewport: insideSheetAndViewport(headerRect),
+    titleInsideSheetAndViewport: insideSheetAndViewport(titleRect),
+    closeInsideSheetAndViewport: insideSheetAndViewport(closeRect),
+    textboxInsideSheetAndViewport: insideSheetAndViewport(textboxRect),
+    sendInsideSheetAndViewport: insideSheetAndViewport(sendRect),
+    headerReachable: headerRect.top >= 0 && closeRect.top >= headerRect.top - 1,
+    boundedInternalScrolling: [bottom, said, conversations].every((one) => {
+      const overflow = getComputedStyle(one).overflowY;
+      return one.clientHeight <= sheet.clientHeight && ["auto", "scroll"].includes(overflow);
+    }),
+    sendVisible: insideSheetAndViewport(sendRect),
+    stacked: getComputedStyle($("theBigChat").querySelector(".the-big-chat-workspace"))
+      .gridTemplateColumns.split(" ").length === 1,
+  };
+}
+window.harnessUiLayoutEvidence = () => ({bigChat: theBigChatLayoutEvidence()});
+
+function revealTheBigChatComposer() {
+  const bottom = $("theBigChat")?.querySelector(".the-big-chat-bottom");
+  if (!bottom) return;
+  bottom.scrollTop = bottom.scrollHeight;
+}
+
 function openTheBigChat(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
+  if ($("theBigChat").hidden) {
+    theBigChatInvoker = document.activeElement;
+    theBigChatInvokerAgent = agentId;
+  }
   const alreadyOpen = swarmChats.some((one) => one.agent === agentId);
   if (!alreadyOpen) openTheChatFor(agentId);
   theBigOne = agentId;
@@ -9984,7 +10588,8 @@ function openTheBigChat(agentId) {
   // Opening the compact chat already started this read. Starting it twice made
   // two independent active-chat snapshots race each other on first open.
   if (alreadyOpen) loadConversationsFor(agentId);
-  $("theBigChatBox").focus();
+  revealTheBigChatComposer();
+  $("theBigChatBox").focus({preventScroll: true});
 }
 
 function keepTabInsideTheBigChat(event) {
@@ -10009,20 +10614,32 @@ function keepTabInsideTheBigChat(event) {
   }
 }
 
-function minimiseTheBigChat() {
+function restoreTheBigChatFocus() {
+  const target = theBigChatInvoker?.isConnected
+    ? theBigChatInvoker
+    : document.querySelector(`[data-big-chat-invoker="${CSS.escape(theBigChatInvokerAgent)}"]`)
+      || $("theChatTrayOn") || $("swarmTitle");
+  theBigChatInvoker = null;
+  theBigChatInvokerAgent = "";
+  target?.focus?.({preventScroll: true});
+}
+
+function minimiseTheBigChat(restoreFocus = true) {
   // Back to the tray, not closed. The conversation is still open; it is just
   // not the one on screen.
   rememberTheBigChatComposer();
   theBigOne = "";
   $("theBigChat").hidden = true;
   renderTheChatTray();
+  if (restoreFocus !== false) restoreTheBigChatFocus();
 }
 
 function shutTheBigChat() {
   const was = theBigOne;
-  minimiseTheBigChat();
+  minimiseTheBigChat(false);
   if (was) closeTheChatFor(was);
   renderTheChatTray();
+  restoreTheBigChatFocus();
 }
 
 function aFaceFor(kind, agent = null) {

@@ -23,6 +23,76 @@ and where**, while **visual test automation controls what runs, in which order,
 and what must pass before work continues**. They can be used independently, or
 together as the human-facing control layer for a local project.
 
+### Runtime architecture
+
+Both workspaces use the same durable runtime model. The browser UI is a
+projection, not the source of truth: every accepted command receives an exact
+request and run identity, and the loopback server records it before work is
+dispatched. Swarm conversations and automation pipelines then use separate
+authority stores while sharing integrity checks, bounded event streams, exact
+Stop semantics, and explicit handling for provider outcomes that cannot be
+proved.
+
+```mermaid
+flowchart TB
+    Person["Person using Nexus Harness"]
+    UI["Accessible desktop / browser UI"]
+    API["Authenticated loopback command API"]
+
+    subgraph Authority["Durable local authority"]
+        Command["Request identity and immutable snapshot"]
+        SwarmStore["Swarm runs, effects, transcripts and cursors"]
+        PipelineStore["Pipeline runs, attempts, decisions and evidence"]
+        Integrity["Project binding, integrity anchors and mutation fences"]
+    end
+
+    subgraph Engines["Execution engines"]
+        Swarm["AI Agent Swarm orchestrator"]
+        Pipeline["Visual test automation"]
+        Stop["Exact run-scoped Stop and cancellation"]
+    end
+
+    subgraph Providers["Effect boundary"]
+        Desktop["CLI / API agents<br/>Typed response or process result"]
+        Web["Signed-in web AI adapters<br/>Marked turn and matched reply"]
+        Unknown["delivery_unknown / outcome_unknown<br/>Reconcile; never blind-resend"]
+    end
+
+    Evidence["Bounded live events and immutable evidence"]
+
+    Person --> UI --> API --> Command
+    Command --> SwarmStore --> Swarm
+    Command --> PipelineStore --> Pipeline
+    Integrity --- SwarmStore
+    Integrity --- PipelineStore
+    Stop --> SwarmStore
+    Stop --> PipelineStore
+    Swarm --> Desktop
+    Swarm --> Web
+    Pipeline --> Desktop
+    Web --> Unknown
+    Desktop --> Evidence
+    Web --> Evidence
+    Unknown --> Evidence
+    SwarmStore --> Evidence
+    PipelineStore --> Evidence
+    Evidence --> UI
+```
+
+Web providers do not expose a machine receipt equivalent to an API response.
+Nexus therefore correlates an exact marked user turn with the reply after it.
+If a click may have reached the provider but acceptance cannot be proved, the
+effect becomes `outcome_unknown`: the UI explains the uncertainty and the
+engine does not resend automatically. This prevents a delayed or remounted web
+page from silently duplicating a long-running agent task.
+
+See [NEXUS_WORKSPACE_RUNTIME_V2.md](docs/NEXUS_WORKSPACE_RUNTIME_V2.md) for the
+full runtime architecture, its crash boundaries, and the deliberately explicit
+limits of restart recovery. The corresponding
+[acceptance criteria](docs/NEXUS_WORKSPACE_RUNTIME_ACCEPTANCE.md) and
+[independent judge specification](docs/NEXUS_WORKSPACE_RUNTIME_JUDGE.md) define
+the evidence required before a runtime change is accepted.
+
 ### AI Agent Swarm orchestrator
 
 The swarm board is a live map of agents, projects, and permission boundaries.

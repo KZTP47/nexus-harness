@@ -159,13 +159,69 @@ class ExternalPageContents extends EventEmitter {
     await page.keyboard.press("Enter");
   }
 
-  async replaceTextAndSubmit(text) {
+  async replaceTextAndSubmit(text, selectors = {}) {
     const page = await this.pageForOperation();
     await page.keyboard.press("Control+A");
     await page.keyboard.press("Backspace");
     await page.keyboard.insertText(String(text || ""));
-    await wait(120);
-    await page.keyboard.press("Enter");
+    let previous = null;
+    let target = null;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      await wait(100);
+      const candidate = await page.evaluate(({selectors: contract, expected}) => {
+        const visible = (one) => {
+          if (!one) return false;
+          const style = getComputedStyle(one);
+          const rect = one.getBoundingClientRect();
+          return style.visibility !== "hidden" && style.display !== "none"
+            && rect.width > 1 && rect.height > 1;
+        };
+        const composer = (contract.composer || []).flatMap(
+          (selector) => [...document.querySelectorAll(selector)]).find(visible);
+        const normal = (value) => String(value || "").replace(/\s+/g, " ").trim();
+        const actual = normal(
+          composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+            ? composer.value : (composer?.innerText || composer?.textContent || ""));
+        if (!composer || actual !== normal(expected)) return null;
+        let scope = composer;
+        let found = null;
+        for (let depth = 0; scope && depth < 10 && !found; depth += 1) {
+          const candidates = (contract.send || []).flatMap(
+            (selector) => [...scope.querySelectorAll(selector)]).filter(visible);
+          if (candidates.length === 1) found = candidates[0];
+          scope = scope.parentElement;
+        }
+        const button = found?.matches("button, [role='button']")
+          ? found : found?.querySelector("button, [role='button']") || found;
+        if (!button || !visible(button)) return null;
+        if (button.disabled || button.getAttribute("aria-disabled") === "true") return null;
+        const rect = button.getBoundingClientRect();
+        const topmost = document.elementsFromPoint(
+          rect.left + rect.width / 2, rect.top + rect.height / 2);
+        if (!topmost.some((one) => one === button || button.contains(one))) return null;
+        return {
+          x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
+          fingerprint: [
+            button.tagName, button.id, button.getAttribute("data-testid"),
+            button.getAttribute("data-test-id"), String(button.className || ""),
+          ].join("|"),
+        };
+      }, {selectors, expected: String(text || "")});
+      if (candidate && previous
+          && candidate.fingerprint === previous.fingerprint
+          && Math.abs(candidate.x - previous.x) < 1
+          && Math.abs(candidate.y - previous.y) < 1) {
+        target = candidate;
+        break;
+      }
+      previous = candidate;
+    }
+    if (!target) return {
+      activated: false, failureCode: "submit_control_unavailable",
+      activationMethod: "none",
+    };
+    await page.mouse.click(target.x, target.y);
+    return {activated: true, sendActivated: true, activationMethod: "trusted_pointer"};
   }
 
   async setFiles(files) {

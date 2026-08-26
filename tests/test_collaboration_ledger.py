@@ -3,6 +3,9 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -80,6 +83,26 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         self.assertIn('"speaker": "User"', codex)
         self.assertIn("The new tokenizer tests pass.", codex)
 
+    def test_recipient_privacy_uses_a_nonleaking_cursor_tombstone(self) -> None:
+        ledger = self.ledger()
+        ledger.record_contribution({
+            "speaker_id": "agent-2", "phase": "private",
+            "recipient_id": "agent-1", "recipient_name": "Claude",
+            "text": "SECRET-FOR-CLAUDE-ONLY",
+        }, state={"private_marker": "STATE-FOR-CLAUDE-ONLY"})
+
+        for_codex = ledger.projection_for("agent-2")
+        self.assertNotIn("SECRET-FOR-CLAUDE-ONLY", for_codex)
+        self.assertNotIn("STATE-FOR-CLAUDE-ONLY", for_codex)
+        self.assertNotIn('"recipient', for_codex)
+        self.assertIn("not_addressed_to_this_agent", for_codex)
+        ledger.acknowledge("agent-2")
+        self.assertIn("[No new entries.", ledger.projection_for("agent-2"))
+
+        for_claude = ledger.projection_for("agent-1")
+        self.assertIn("SECRET-FOR-CLAUDE-ONLY", for_claude)
+        self.assertIn("STATE-FOR-CLAUDE-ONLY", for_claude)
+
     def test_stale_session_cursors_are_bounded(self) -> None:
         ledger = self.ledger()
         for number in range(300):
@@ -121,7 +144,7 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
 
         def append(number: int) -> None:
             ledger.record_contribution({
-                "speaker_id": f"agent-{number}", "speaker_name": f"Agent {number}",
+                "speaker_id": "agent-1", "speaker_name": f"Untrusted name {number}",
                 "phase": "agent_reply", "text": f"turn {number}",
             })
 
@@ -178,11 +201,12 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
     def test_markdown_mirror_does_not_render_agent_supplied_html(self) -> None:
         ledger = self.ledger()
         ledger.record_contribution({
-            "speaker_name": "Agent <script>", "phase": "reply",
+            "speaker_id": "agent-1", "speaker_name": "Agent <script>", "phase": "reply",
             "text": "<script>alert('no')</script>",
         })
         mirror = ledger.paths.markdown.read_text(encoding="utf-8")
-        self.assertIn("Agent &lt;script&gt;", mirror)
+        self.assertIn("Claude (claude)", mirror)
+        self.assertNotIn("Agent &lt;script&gt;", mirror)
         self.assertIn("    <script>alert('no')</script>", mirror)
         self.assertNotIn("\n<script>alert", mirror)
 
@@ -195,3 +219,90 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         self.assertIn("nexus-ledger-seq:1", mirror)
         self.assertIn("nexus-ledger-seq:2", mirror)
         self.assertNotIn("partial write", mirror)
+
+    def test_projection_acknowledges_only_the_contiguous_chunk_actually_delivered(self) -> None:
+        ledger = self.ledger()
+        first_marker = "FIRST-ENTRY-START"
+        second_marker = "SECOND-ENTRY-END"
+        ledger.record_contribution({
+            "speaker_id": "agent-1", "phase": "reply",
+            "text": first_marker + ("a" * 79_000),
+        })
+        ledger.record_contribution({
+            "speaker_id": "agent-2", "phase": "reply",
+            "text": ("b" * 79_000) + second_marker,
+        })
+        seen = []
+        for _ in range(8):
+            projection = ledger.projection_for("agent-1")
+            seen.append(projection)
+            ledger.acknowledge("agent-1")
+            if "[No new entries." in ledger.projection_for("agent-1"):
+                break
+        combined = "\n".join(seen)
+        self.assertIn(first_marker, combined)
+        self.assertIn(second_marker, combined)
+        self.assertLess(combined.index(first_marker), combined.index(second_marker))
+
+    def test_one_oversized_event_is_resent_then_delivered_in_ordered_fragments(self) -> None:
+        ledger = self.ledger()
+        text = "START-OF-LARGE-ENTRY" + ("0123456789" * 15_000) + "END-OF-LARGE-ENTRY"
+        ledger.record_contribution({
+            "speaker_id": "agent-1", "phase": "reply", "text": text,
+        })
+        first = ledger.projection_for("agent-2")
+        self.assertEqual(first, ledger.projection_for("agent-2"))
+        offsets: list[int] = []
+        for _ in range(8):
+            projection = ledger.projection_for("agent-2")
+            match = re.search(r'"chunk_offset": (\d+)', projection)
+            if match:
+                offsets.append(int(match.group(1)))
+            ledger.acknowledge("agent-2")
+            if "[No new entries." in ledger.projection_for("agent-2"):
+                break
+        self.assertEqual(offsets, sorted(set(offsets)))
+        self.assertGreaterEqual(len(offsets), 2)
+
+    def test_new_objective_and_reset_fence_late_writers(self) -> None:
+        stale = self.ledger()
+        fresh = CollaborationLedger(
+            self.config, "claude", "pair-chat-1", session_id="session-two"
+        ).begin("A newer goal", self.participants, mode="discussion")
+        with self.assertRaisesRegex(HarnessError, "no longer current"):
+            stale.record_state("late", {"status": "wrong"})
+        chat.start_again(self.config, "claude", "pair-chat-1")
+        with self.assertRaisesRegex(HarnessError, "no longer current"):
+            fresh.record_state("late", {"status": "wrong"})
+
+    def test_contribution_author_and_goal_provenance_are_immutable(self) -> None:
+        ledger = self.ledger()
+        event = ledger.record_contribution({
+            "speaker_id": "agent-1", "speaker_name": "Mallory",
+            "speaker_route": "other", "phase": "reply", "text": "hello",
+        })
+        self.assertEqual(event["speaker_name"], "Claude")
+        self.assertEqual(event["speaker_route"], "claude")
+        self.assertEqual(event["state"]["goal_id"], "session-one")
+        self.assertEqual(event["state"]["author_snapshot"]["id"], "agent-1")
+
+    def test_cross_process_appends_share_one_authority_lock_and_hash_chain(self) -> None:
+        ledger = self.ledger()
+        script = r'''import copy, sys
+from pathlib import Path
+from our_harness.collaboration_ledger import CollaborationLedger
+from our_harness.config import DEFAULT_CONFIG, LoadedConfig
+root = Path(sys.argv[1]).resolve()
+config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), root, [], {})
+ledger = CollaborationLedger(config, "claude", "pair-chat-1", session_id="session-one")
+for n in range(12): ledger.record_state("child", {"worker": sys.argv[2], "n": n})
+'''
+        env = dict(os.environ, PYTHONPATH=str(Path.cwd() / "src"))
+        processes = [
+            subprocess.Popen([sys.executable, "-c", script, str(self.root), str(index)], env=env)
+            for index in range(3)
+        ]
+        self.assertTrue(all(process.wait(timeout=30) == 0 for process in processes))
+        events = self.events(ledger)
+        self.assertEqual(len(events), 37)
+        self.assertEqual([one["seq"] for one in events], list(range(1, 38)))

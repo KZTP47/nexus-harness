@@ -83,6 +83,79 @@ class PipelineFullScreenViewTests(unittest.TestCase):
         self.assertIn("function makePipelineCanvasPannable()", self.script)
         self.assertIn("nodes.style.transform = `scale(${pipelineZoom})`", self.script)
 
+    def test_agent_choice_and_live_projection_are_bound_to_an_exact_automation(self) -> None:
+        self.assertIn('"name", resolvedName || priorAgentChoice', self.script)
+        self.assertIn('eventRunId !== pipelineProjectionRunId', self.script)
+        self.assertIn('JSON.stringify({run_id: pipelineActiveRunId})', self.script)
+        self.assertIn('JSON.stringify({run_id: pipelineActiveRunId, step, carry_on: carryOn})',
+                      self.script)
+        self.assertIn('/api/pipeline-runs/${encodeURIComponent(runId)}', self.script)
+        self.assertIn('if (mine !== pipelineNewestRefresh) return;', self.script)
+
+    def test_run_requests_keep_idempotency_identity_until_the_outcome_is_known(self) -> None:
+        self.assertIn('const PIPELINE_PENDING_KEY_PREFIX = "nexus.pipeline.pending.v2:"', self.script)
+        self.assertIn("project_authority_id: pipelineAuthorityId", self.script)
+        self.assertIn('request_id: pending.request_id', self.script)
+        self.assertIn('if (pipelineRequestWasDefinitelyRejected(error))', self.script)
+        self.assertIn('Retry reuses request ${pending.request_id}', self.script)
+        for state in ("passed", "warning", "failed", "incomplete", "cancelled",
+                      "timed_out", "interrupted"):
+            self.assertIn(f'"{state}"', self.script)
+
+    def test_an_exact_run_can_be_adopted_after_reload_without_matching_a_mutable_name(self) -> None:
+        for element in ("pipelineActiveRun", "pipelineOpenActiveRun", "pipelineStopActive"):
+            self.assertIn(f'id="{element}"', self.markup)
+        self.assertIn('run.definition || run.snapshot || run.frozen_definition', self.script)
+        self.assertIn('pipelineProjectionRunId = runId', self.script)
+        self.assertIn('pipelineSavedName = ""', self.script)
+        self.assertIn('Open its immutable snapshot', self.script)
+
+    def test_terminal_reconciliation_never_paints_the_mutable_editor_before_exact_open(self) -> None:
+        refresh = self.script[self.script.index("async function refreshPipelines"):
+                              self.script.index("async function refreshAgentContract")]
+        terminal = refresh[refresh.index("pipelineRunIsTerminal(reconciledRun)"):
+                           refresh.index("else if (pipelineActiveRunId")]
+        self.assertNotIn("showPipelineRun", terminal)
+        self.assertIn("the current editor is unchanged", terminal)
+
+        opened = self.script[self.script.index("async function openExactPipelineRun"):
+                             self.script.index("function sizeThePipelineCanvas")]
+        adopts_definition = opened.index("pipeline = structuredClone(snapshot)")
+        binds_run = opened.index("pipelineProjectionRunId = runId")
+        paints_result = opened.index("showPipelineRun(run.result)")
+        self.assertLess(adopts_definition, paints_result)
+        self.assertLess(binds_run, paints_result)
+        self.assertIn('$("pipelineLog").replaceChildren()', opened)
+
+    def test_ambiguous_run_reconciliation_is_authority_scoped_and_request_first(self) -> None:
+        self.assertIn("function usePipelineAuthority(authorityId)", self.script)
+        self.assertIn("value.project_authority_id === authorityId", self.script)
+        self.assertIn('/api/pipeline-runs/by-request?request_id=${encodeURIComponent(pending.request_id)}',
+                      self.script)
+        lookup = self.script[self.script.index("async function lookupPipelineRunByRequest"):
+                             self.script.index("async function openExactPipelineRun")]
+        self.assertLess(lookup.index("by-request?request_id"),
+                        lookup.index("fetchExactPipelineRun(runId)"))
+        refresh = self.script[self.script.index("async function refreshPipelines"):
+                              self.script.index("async function refreshAgentContract")]
+        self.assertNotIn("said.latest_run?.request_id", refresh)
+        self.assertNotIn("said.active_run?.request_id", refresh)
+
+    def test_pipeline_tabs_and_connections_have_complete_keyboard_semantics(self) -> None:
+        self.assertIn('role="tab" data-pipeline-tab="board" aria-controls="pipelineStage"',
+                      self.markup)
+        self.assertIn('role="tabpanel" aria-labelledby="pipelineTabBoard"', self.markup)
+        self.assertIn('tab.addEventListener("keydown", moveBetweenPipelineTabs)', self.script)
+        for key in ("ArrowRight", "ArrowLeft", "Home", "End"):
+            self.assertIn(f'event.key === "{key}"', self.script)
+        self.assertIn('id="pipelineStructure"', self.markup)
+        self.assertIn('Remove connection from ${pipelineNodeName(edge.from)}', self.script)
+
+    def test_pipeline_reflows_without_making_the_document_a_wide_canvas(self) -> None:
+        self.assertIn('html, body { max-width: 100%; overflow-x: clip; }', self.styles)
+        self.assertIn('@media (max-width: 380px)', self.styles)
+        self.assertIn('.pipeline-tabs { flex-wrap: nowrap; overflow-x: auto;', self.styles)
+
 
 class ReadingOneTests(PipelineTestCase):
     def test_the_one_it_ships_with_is_a_good_one(self) -> None:
@@ -276,6 +349,153 @@ class RunningThemTests(PipelineTestCase):
         self.assertEqual(len(tries), 2)
         self.assertEqual(by_id["tests"].state, pipelines.PASSED)
         self.assertEqual(by_id["tests"].tries, 2)
+        self.assertEqual(by_id["tests"].effective_outcome, pipelines.OUTCOME_WARNING)
+        self.assertEqual(run.outcome, pipelines.OUTCOME_WARNING)
+        self.assertTrue(run.passed)
+
+    def test_an_allowed_failure_is_a_truthful_warning_and_does_not_block_a_gate(self) -> None:
+        drawn = {
+            "name": "Allowed", "nodes": [
+                {"id": "start", "kind": "start", "label": "Start", "settings": {}},
+                {"id": "optional", "kind": "git_repo", "label": "Optional",
+                 "settings": {"even_if_it_fails": True}},
+                {"id": "gate", "kind": "gate", "label": "Gate", "settings": {"needs": "all"}},
+            ],
+            "edges": [{"from": "start", "to": "optional"}, {"from": "optional", "to": "gate"}],
+        }
+        with self.stand_in({"optional": (False, "optional failed", "")}):
+            run = pipelines.run_it(self.config, drawn)
+        by_id = {node.id: node for node in run.nodes}
+        self.assertEqual(by_id["optional"].state, pipelines.FAILED)
+        self.assertEqual(by_id["optional"].effective_outcome, pipelines.OUTCOME_WARNING)
+        self.assertEqual(by_id["gate"].state, pipelines.PASSED)
+        self.assertTrue(run.passed)
+        self.assertEqual(run.outcome, pipelines.OUTCOME_WARNING)
+
+    def test_stop_after_a_handler_returns_fences_its_late_success(self) -> None:
+        stopped = False
+
+        def finishes_late(*args, **kwargs):
+            nonlocal stopped
+            stopped = True
+            return True, "late success", ""
+
+        with mock.patch.object(pipelines, "_do_one", finishes_late):
+            run = pipelines.run_it(
+                self.config, a_line("start"), stopping=lambda: stopped
+            )
+        self.assertFalse(run.passed)
+        self.assertEqual(run.outcome, pipelines.OUTCOME_CANCELLED)
+        self.assertEqual(run.nodes[0].state, pipelines.CANCELLED)
+
+    def test_deadline_after_a_handler_returns_fences_its_late_success(self) -> None:
+        clock = [0.0]
+        drawn = a_line("start")
+        drawn["nodes"][0]["settings"] = {"longest": 1}
+
+        def finishes_late(*args, **kwargs):
+            clock[0] = 2.0
+            return True, "late success", ""
+
+        with mock.patch.object(pipelines.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(pipelines, "_do_one", finishes_late):
+            run = pipelines.run_it(self.config, drawn)
+        self.assertFalse(run.passed)
+        self.assertEqual(run.outcome, pipelines.OUTCOME_TIMED_OUT)
+        self.assertEqual(run.nodes[0].state, pipelines.TIMED_OUT)
+
+    def test_an_empty_automation_cannot_report_a_pass(self) -> None:
+        with self.assertRaises(pipelines.PipelineError):
+            pipelines.run_it(self.config, {"name": "Empty", "nodes": [], "edges": []})
+
+    def test_a_skipped_suite_is_incomplete_and_a_flaky_suite_is_a_warning(self) -> None:
+        drawn = a_line("start")
+        with mock.patch.object(
+            pipelines, "_do_one",
+            return_value=(False, "one check was skipped", "", pipelines.OUTCOME_INCOMPLETE),
+        ):
+            skipped = pipelines.run_it(self.config, drawn)
+        self.assertFalse(skipped.passed)
+        self.assertEqual(skipped.outcome, pipelines.OUTCOME_INCOMPLETE)
+        with mock.patch.object(
+            pipelines, "_do_one",
+            return_value=(True, "one check was flaky", "", pipelines.OUTCOME_WARNING),
+        ):
+            flaky = pipelines.run_it(self.config, drawn)
+        self.assertTrue(flaky.passed)
+        self.assertEqual(flaky.outcome, pipelines.OUTCOME_WARNING)
+
+    def test_a_nested_definition_is_frozen_before_a_later_edit(self) -> None:
+        child = {
+            "name": "Child", "nodes": [
+                {"id": "old", "kind": "start", "label": "Old child", "settings": {}}
+            ], "edges": [],
+        }
+        pipelines.save(self.config, child)
+        parent = {
+            "name": "Parent", "nodes": [
+                {"id": "child", "kind": "another_pipeline", "label": "Child run",
+                 "settings": {"pipeline": "Child"}}
+            ], "edges": [],
+        }
+        frozen = pipelines.freeze_definition(self.config, parent)
+        child["nodes"][0]["label"] = "New child"
+        pipelines.save(self.config, child)
+        run = pipelines.run_it(self.config, parent, frozen=frozen)
+        self.assertIn("Old child", run.nodes[0].detail)
+        self.assertNotIn("New child", run.nodes[0].detail)
+
+    def test_repeated_nested_human_gates_have_distinct_occurrence_decisions(self) -> None:
+        child = {
+            "name": "Approval child", "edges": [],
+            "nodes": [{
+                "id": "approve", "kind": "wait_for_a_person", "label": "Approve",
+                "settings": {"question": "Carry on?"},
+            }],
+        }
+        pipelines.save(self.config, child)
+        parent = {
+            "name": "Twice", "edges": [],
+            "nodes": [
+                {"id": "first", "kind": "another_pipeline", "label": "First",
+                 "settings": {"pipeline": "Approval child"}},
+                {"id": "second", "kind": "another_pipeline", "label": "Second",
+                 "settings": {"pipeline": "Approval child"}},
+            ],
+        }
+        seen: list[str] = []
+
+        def answer(decision_id: str) -> bool:
+            seen.append(decision_id)
+            return True
+
+        run = pipelines.run_it(
+            self.config, parent, run_id="nested-run", decision_nonce="attempt-one",
+            waiting_on=answer,
+        )
+        self.assertTrue(run.passed, run.said)
+        self.assertEqual(len(seen), 2)
+        self.assertNotEqual(seen[0], seen[1])
+
+    def test_nested_warning_remains_a_warning_in_the_parent(self) -> None:
+        child = {
+            "name": "Warning child", "edges": [],
+            "nodes": [{"id": "optional", "kind": "git_repo", "label": "Optional",
+                       "settings": {"even_if_it_fails": True}}],
+        }
+        pipelines.save(self.config, child)
+        parent = {
+            "name": "Parent", "edges": [],
+            "nodes": [{"id": "child", "kind": "another_pipeline", "label": "Child",
+                       "settings": {"pipeline": "Warning child"}}],
+        }
+        with mock.patch.object(
+            pipelines, "_run_git_repo", return_value=(False, "allowed failure", "")
+        ):
+            run = pipelines.run_it(self.config, parent)
+        self.assertTrue(run.passed)
+        self.assertEqual(run.outcome, pipelines.OUTCOME_WARNING)
+        self.assertEqual(run.nodes[0].effective_outcome, pipelines.OUTCOME_WARNING)
 
     def test_a_step_that_throws_does_not_end_the_run(self) -> None:
         def explodes(config, node, before, results, order, check_kinds, depth=0, stopping=None, waiting_on=None):
@@ -343,7 +563,7 @@ class ARealCheckReallyRunsTests(PipelineTestCase):
     def test_a_check_that_passes_comes_back_as_passed(self) -> None:
         (self.root / "README.md").write_text("# Hello\n", encoding="utf-8")
         node = {"id": "scan", "label": "Security scan", "settings": {"paths": ["README.md"]}}
-        passed, said, _detail = pipelines._run_security_scan(self.config, node, None)
+        passed, said, _detail, _outcome = pipelines._run_security_scan(self.config, node, None)
         self.assertTrue(passed, said)
         self.assertTrue(said, "a step that says nothing tells nobody anything")
         self.assertNotIn("went wrong", said)
@@ -353,7 +573,7 @@ class ARealCheckReallyRunsTests(PipelineTestCase):
         # than the scanner's opinion of made-up text.
         (self.root / "keys.txt").write_text("AKIA" + "Q" * 16 + "\n", encoding="utf-8")
         node = {"id": "scan", "label": "Security scan", "settings": {"paths": ["keys.txt"]}}
-        passed, said, detail = pipelines._run_security_scan(self.config, node, None)
+        passed, said, detail, _outcome = pipelines._run_security_scan(self.config, node, None)
         self.assertFalse(passed)
         self.assertTrue(said)
         self.assertNotIn("went wrong", said, "a real failure, not an error inside the harness")
@@ -384,8 +604,10 @@ class ARealCheckReallyRunsTests(PipelineTestCase):
             with self.subTest(node=node.id):
                 self.assertEqual(node.state, pipelines.PASSED)
                 self.assertNotIn("went wrong", node.said)
-        kept = self.root / ".harness" / "pipelines" / "last-run.json"
-        self.assertTrue(kept.is_file(), "the evidence node really wrote its file")
+        kept = list((self.root / ".harness" / "pipelines" / "evidence").rglob("*.json"))
+        self.assertEqual(len(kept), 1, "the evidence node wrote one run-scoped file")
+        qa_results = list((self.root / ".harness" / "qa" / "runs").rglob("result.json"))
+        self.assertEqual(len(qa_results), 1, "the one-off scan kept immutable run evidence")
 
 
 class WhatEachKindDoesTests(PipelineTestCase):
@@ -547,10 +769,31 @@ class WhatEachKindDoesTests(PipelineTestCase):
             self.config, {"id": "e", "label": "Evidence", "settings": {}}, None, so_far=done
         )
         self.assertTrue(passed, said)
-        written = json.loads(
-            (self.root / ".harness" / "pipelines" / "last-run.json").read_text(encoding="utf-8")
-        )
+        evidence = list((self.root / ".harness" / "pipelines" / "evidence").rglob("*.json"))
+        self.assertEqual(len(evidence), 1)
+        written = json.loads(evidence[0].read_text(encoding="utf-8"))
         self.assertEqual(written[0]["label"], "Checks")
+
+    def test_evidence_is_redacted_and_never_clobbered(self) -> None:
+        secret = "sk-abcdefghijklmnop"
+        done = [pipelines.NodeResult(
+            id="a", kind="suite", label=secret, state=pipelines.FAILED, said=f"token={secret}"
+        )]
+        node = {"id": "e", "label": "Evidence", "settings": {"write_to": "evidence.json"}}
+        first, _said, _detail = pipelines._run_artifact(
+            self.config, node, None, so_far=done
+        )
+        where = self.root / "evidence.json"
+        first_body = where.read_text(encoding="utf-8")
+        second, said, _detail = pipelines._run_artifact(
+            self.config, node, None, so_far=[]
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertIn("already exists", said)
+        self.assertEqual(where.read_text(encoding="utf-8"), first_body)
+        self.assertNotIn(secret, first_body)
+        self.assertIn("[REDACTED]", first_body)
 
     def test_the_evidence_node_will_not_write_outside_the_project(self) -> None:
         with self.assertRaises(HarnessError):
@@ -561,7 +804,7 @@ class WhatEachKindDoesTests(PipelineTestCase):
             )
 
     def test_a_unit_test_node_with_no_command_says_what_to_do(self) -> None:
-        passed, said, detail = pipelines._run_unit_test(
+        passed, said, detail, _outcome = pipelines._run_unit_test(
             self.config, {"id": "u", "label": "Tests", "settings": {"command_kind": "test"}}, None
         )
         self.assertFalse(passed)

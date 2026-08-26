@@ -39,6 +39,7 @@ What it will not do
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -51,6 +52,7 @@ from typing import Any
 
 from .config import LoadedConfig
 from .models import HarnessError
+from .pipeline_runs import PipelineRunConflict, PipelineRunStore
 from .safety import confined_path, take_the_file_away
 
 WHERE_THEY_LIVE = ".harness/timers"
@@ -476,7 +478,7 @@ def looked_just_now(config: LoadedConfig, now: datetime | None = None) -> None:
 
 def write_down_a_run(
     config: LoadedConfig, timer: Timer, said: str, passed: bool, missed: int = 0,
-    when: datetime | None = None, *, by_hand: bool = False,
+    when: datetime | None = None, *, by_hand: bool = False, run_id: str = "",
 ) -> None:
     """Keep what one run did.
 
@@ -497,6 +499,7 @@ def write_down_a_run(
     said = in_safe_words(config, said)
     ran = {
         "at": _in_words(when),
+        "run_id": run_id,
         "passed": passed,
         "said": said[:400],
         "missed": missed,
@@ -552,7 +555,6 @@ def does_it_stop_to_ask_a_person(config: LoadedConfig, automation: str) -> str:
     """
 
     from . import pipelines as pipeline_lab
-
     try:
         pipeline_lab.load(config, automation)
     except HarnessError:
@@ -746,6 +748,7 @@ def run_what_is_due(
             ),
         }
     ran: list[dict[str, Any]] = []
+    run_store = PipelineRunStore(config)
     still_going = threading.Event()
     keep_touching = threading.Thread(
         target=_keep_saying_it_is_alive, args=(held, still_going), daemon=True
@@ -754,24 +757,108 @@ def run_what_is_due(
     try:
         for timer, missed in due:
             began = time.monotonic()
+            run_id = ""
+            attempt_id = ""
             try:
                 automation = pipeline_lab.load(config, timer.automation)
-                run = pipeline_lab.run_it(
-                    config,
-                    automation,
-                    check_kinds=check_kinds,
-                    stopping=lambda: time.monotonic() - began > LONGEST_RUN_SECONDS,
+                frozen = pipeline_lab.freeze_definition(config, automation)
+                history = _what_happened(config).get(timer.name, {})
+                since = _from_words(history.get("last_looked", ""))
+                occurrence = (
+                    when_it_runs_next(timer, since + timedelta(seconds=1))
+                    if since is not None else now
                 )
-                passed, said = run.passed, run.said
+                timer_digest = hashlib.sha256(
+                    json.dumps(timer.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()[:16]
+                timer_name_digest = hashlib.sha256(timer.name.encode("utf-8")).hexdigest()[:16]
+                try:
+                    accepted, created = run_store.accept(
+                        frozen,
+                        source=f"timer:{timer.name}",
+                        request_id=(
+                            f"timer:{timer_name_digest}:{timer_digest}:"
+                            f"{occurrence.isoformat(timespec='seconds')}"
+                        ),
+                    )
+                except PipelineRunConflict as exc:
+                    ran.append({
+                        "timer": timer.name,
+                        "automation": timer.automation,
+                        "run_id": "",
+                        "passed": False,
+                        "said": in_safe_words(config, str(exc)),
+                        "missed": missed,
+                        "deferred": True,
+                        "told": [],
+                    })
+                    continue
+                run_id = accepted["run_id"]
+                attempt_id = accepted["attempt_id"]
+                if not created:
+                    prior = accepted.get("result")
+                    if not isinstance(prior, dict):
+                        ran.append({
+                            "timer": timer.name, "automation": timer.automation,
+                            "run_id": run_id, "passed": False,
+                            "said": f"Occurrence is already {accepted['state']}; it was not duplicated.",
+                            "missed": missed, "deferred": True, "told": [],
+                        })
+                        continue
+                    passed = bool(prior.get("passed"))
+                    said = str(prior.get("said") or "")
+                else:
+                    run_store.start(run_id, attempt_id)
+                    run = pipeline_lab.run_it(
+                        config,
+                        automation,
+                        check_kinds=check_kinds,
+                        stopping=lambda: (
+                            run_store.should_stop(run_id)
+                            or time.monotonic() - began > LONGEST_RUN_SECONDS
+                        ),
+                        run_id=run_id,
+                        frozen=frozen,
+                        decision_nonce=attempt_id,
+                    )
+                    run_result = (
+                        run.to_dict() if callable(getattr(run, "to_dict", None))
+                        else {
+                            "passed": bool(getattr(run, "passed", False)),
+                            "outcome": "passed" if getattr(run, "passed", False) else "failed",
+                            "said": str(getattr(run, "said", "")),
+                            "nodes": [],
+                        }
+                    )
+                    finished = run_store.finish(run_id, attempt_id, run_result)
+                    prior = finished.get("result") or run_result
+                    passed, said = bool(prior.get("passed")), str(prior.get("said") or "")
             except HarnessError as exc:
                 passed, said = False, str(exc)
+                if run_id:
+                    try:
+                        run_store.fail(run_id, attempt_id, said)
+                    except HarnessError:
+                        pass
+            except BaseException as exc:  # one occurrence must be closed even on thread death
+                passed, said = False, f"The timer run stopped unexpectedly: {exc}"
+                if run_id:
+                    try:
+                        run_store.fail(run_id, attempt_id, said)
+                    except HarnessError:
+                        pass
+                # Process/thread control exceptions retain their semantics,
+                # but only after the durable run has been terminalized.
+                if not isinstance(exc, Exception):
+                    raise
             # Cleaned here, before it goes anywhere: this same text is written
             # down, printed in a terminal, and put on the panel.
             said = in_safe_words(config, said)
-            write_down_a_run(config, timer, said, passed, missed, now)
+            write_down_a_run(config, timer, said, passed, missed, now, run_id=run_id)
             ran.append({
                 "timer": timer.name,
                 "automation": timer.automation,
+                "run_id": run_id,
                 "passed": passed,
                 "said": said,
                 "missed": missed,
@@ -781,7 +868,12 @@ def run_what_is_due(
         still_going.set()
         keep_touching.join(timeout=5)
         take_the_file_away(held, missing_ok=True)
-    return {"ran": ran, "note": f"{len(ran)} ran."}
+    deferred = sum(1 for item in ran if item.get("deferred"))
+    completed = len(ran) - deferred
+    note = f"{completed} ran."
+    if deferred:
+        note += f" {deferred} deferred without advancing its occurrence."
+    return {"ran": ran, "note": note}
 
 
 def _who_left_it(where: Path) -> dict[str, Any]:

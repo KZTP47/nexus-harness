@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from our_harness import chat, swarm_chats
+from our_harness import chat, swarm, swarm_chats
+from our_harness.collaboration_ledger import CollaborationLedger
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import ProviderResponse
 
@@ -326,6 +327,45 @@ class PairScopedChatsTests(unittest.TestCase):
         again = next(one for one in restored["chats"] if one["id"] == second["id"])
         self.assertFalse(again["archived_at"])
         self.assertEqual(restored["active"], second["id"])
+
+    def test_archive_and_project_rebind_fence_inflight_collaboration_writers(self) -> None:
+        listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        conversation = listed["chats"][0]
+        participants = self.board["agents"]
+        stale = CollaborationLedger(
+            self.config, "claude", conversation["filed_as"], session_id="old"
+        ).begin("old goal", participants, mode="project_work")
+        swarm_chats.select_project(
+            self.config, self.board, "agent-1", conversation["id"], "project-2"
+        )
+        with self.assertRaisesRegex(Exception, "no longer current"):
+            stale.record_state("late", {"status": "wrong"})
+
+        stale = CollaborationLedger(
+            self.config, "claude", conversation["filed_as"], session_id="old-2"
+        ).begin("another old goal", participants, mode="project_work")
+        swarm_chats.delete(
+            self.config, self.board, "agent-1", conversation["id"]
+        )
+        with self.assertRaisesRegex(Exception, "no longer current"):
+            stale.record_state("late", {"status": "wrong"})
+
+    def test_swarm_save_fences_chats_when_provider_binding_changes(self) -> None:
+        board_path = self.root / "swarm.json"
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_path):
+            saved = swarm.save(self.board, self.config)
+            listed = swarm_chats.list_for_agent(
+                self.config, saved.to_dict(), "agent-1"
+            )
+            conversation = listed["chats"][0]
+            stale = CollaborationLedger(
+                self.config, "claude", conversation["filed_as"], session_id="binding-old"
+            ).begin("old binding", saved.to_dict()["agents"], mode="discussion")
+            changed = saved.to_dict()
+            changed["agents"][0]["who"] = "codex"
+            swarm.save(changed, self.config)
+        with self.assertRaisesRegex(Exception, "no longer current"):
+            stale.record_state("late", {"status": "wrong"})
 
     def test_corrupt_registry_recovers_from_last_good_copy_without_loss(self) -> None:
         first = swarm_chats.list_for_agent(self.config, self.board, "agent-1")

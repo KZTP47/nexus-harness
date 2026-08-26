@@ -28,6 +28,7 @@ from typing import Any
 from .config import LoadedConfig
 from .models import HarnessError
 from .redaction import CredentialRedactor
+from .safety import ProjectTransactionLock
 
 
 SCHEMA_VERSION = 1
@@ -35,6 +36,7 @@ MAX_EVENT_TEXT = 160_000
 MAX_PROJECTION_TEXT = 120_000
 MAX_CURSOR_ENTRIES = 256
 _lock = threading.RLock()
+_authority_locks: dict[str, ProjectTransactionLock] = {}
 _MIRROR_MARKER = re.compile(
     rb"<!-- nexus-ledger-seq:(\d+) hash:([0-9a-f]{64}) -->"
 )
@@ -44,13 +46,66 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _authority_lock(config: LoadedConfig) -> ProjectTransactionLock:
+    key = str(config.project_root.resolve())
+    with _lock:
+        return _authority_locks.setdefault(key, ProjectTransactionLock(config.project_root))
+
+
 def _canonical(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _event_hash(value: dict[str, Any]) -> str:
-    unsigned = {key: child for key, child in value.items() if key != "hash"}
+    unsigned = {
+        key: child for key, child in value.items()
+        if key not in {"hash", "previous_mac", "integrity_mac"}
+    }
     return hashlib.sha256(_canonical(unsigned).encode("utf-8")).hexdigest()
+
+
+def _ledger_anchor_path(path: Path) -> Path:
+    from .runtime_integrity import runtime_root
+
+    identity = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
+    return runtime_root() / "collaboration-anchors" / f"{identity}.json"
+
+
+def _event_integrity(event: dict[str, Any]) -> str:
+    from .runtime_integrity import mac
+
+    unsigned = {key: value for key, value in event.items() if key != "integrity_mac"}
+    return mac("collaboration-ledger-event-v1", unsigned)
+
+
+def _write_ledger_anchor(path: Path, events: list[dict[str, Any]]) -> None:
+    from .runtime_integrity import atomic_text, mac
+
+    value = {
+        "schema_version": 1,
+        "ledger": hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest(),
+        "count": len(events),
+        "head": str(events[-1].get("integrity_mac") or "") if events else "",
+    }
+    held = {
+        "value": value,
+        "integrity_mac": mac("collaboration-ledger-anchor-v1", value),
+    }
+    atomic_text(
+        _ledger_anchor_path(path),
+        json.dumps(held, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+    )
+
+
+def _ledger_integrity_failure(path: Path, reason: str) -> None:
+    from .runtime_integrity import quarantine_marker
+
+    quarantine_marker(f"collaboration-ledger:{path.resolve()}", path, reason)
+    raise HarnessError(
+        "The shared collaboration ledger failed keyed integrity; Nexus "
+        "quarantined it without rewriting the evidence."
+    )
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -76,6 +131,7 @@ class LedgerPaths:
     jsonl: Path
     markdown: Path
     cursors: Path
+    generation: Path
 
 
 def ledger_paths(
@@ -91,19 +147,43 @@ def ledger_paths(
         stem.with_name(f"{stem.name}.collaboration.jsonl"),
         stem.with_name(f"{stem.name}.collaboration.md"),
         stem.with_name(f"{stem.name}.collaboration-cursors.json"),
+        stem.with_name(f"{stem.name}.collaboration-generation.json"),
     )
 
 
+def _rotate_generation(paths: LedgerPaths) -> str:
+    token = uuid.uuid4().hex
+    _write_atomic(
+        paths.generation,
+        json.dumps({"schema_version": 1, "generation": token}, sort_keys=True) + "\n",
+    )
+    return token
+
+
+def fence_ledger(config: LoadedConfig, route: str, filed_as: str = "") -> None:
+    """Invalidate every in-flight writer for one exact conversation."""
+
+    paths = ledger_paths(config, route, filed_as)
+    with _lock, _authority_lock(config).held(30.0):
+        _rotate_generation(paths)
+
+
 def remove_ledger(config: LoadedConfig, route: str, filed_as: str = "") -> None:
-    """Remove only the three ledger artifacts belonging to one exact chat."""
+    """Fence one exact chat, then remove its recreatable ledger artifacts."""
 
     from .safety import take_the_file_away
 
     paths = ledger_paths(config, route, filed_as)
-    with _lock:
+    with _lock, _authority_lock(config).held(30.0):
+        # The generation artifact intentionally survives reset. A late provider
+        # response holding the old generation must not recreate deleted state.
+        _rotate_generation(paths)
         for path in (paths.jsonl, paths.markdown, paths.cursors):
             if path.is_file():
                 take_the_file_away(path, missing_ok=True)
+        anchor = _ledger_anchor_path(paths.jsonl)
+        if anchor.is_file():
+            take_the_file_away(anchor, missing_ok=True)
 
 
 class CollaborationLedger:
@@ -124,9 +204,24 @@ class CollaborationLedger:
         self.session_id = str(session_id or uuid.uuid4().hex)
         self.redactor = CredentialRedactor(config)
         self._events_cache: list[dict[str, Any]] = []
-        self._cache_signature: tuple[int, int] | None = None
+        self._cache_signature: tuple[int, int, int, int] | None = None
         self._chain_complete = True
-        self._pending_cursors: dict[str, int] = {}
+        self._pending_cursors: dict[str, dict[str, int]] = {}
+        self._generation = self._read_generation()
+
+    def _read_generation(self) -> str:
+        try:
+            value = json.loads(self.paths.generation.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return str(value.get("generation") or "") if isinstance(value, dict) else ""
+
+    def _assert_generation(self) -> None:
+        current = self._read_generation()
+        if not self._generation or current != self._generation:
+            raise HarnessError(
+                "This collaboration run is no longer current. Its late result was fenced after a reset, archive, or newer objective."
+            )
 
     def _relative(self, path: Path) -> str:
         return path.relative_to(self.config.project_root).as_posix()
@@ -143,7 +238,13 @@ class CollaborationLedger:
             return []
         try:
             stat = self.paths.jsonl.stat()
-            signature = (stat.st_size, stat.st_mtime_ns)
+            anchor = _ledger_anchor_path(self.paths.jsonl)
+            anchor_stat = anchor.stat() if anchor.is_file() else None
+            signature = (
+                stat.st_size, stat.st_mtime_ns,
+                anchor_stat.st_size if anchor_stat else 0,
+                anchor_stat.st_mtime_ns if anchor_stat else 0,
+            )
         except OSError as exc:
             self._chain_complete = False
             raise HarnessError(
@@ -178,6 +279,88 @@ class CollaborationLedger:
                 break
             events.append(event)
             previous = str(event["hash"])
+        if len(events) == len([line for line in lines if line.strip()]):
+            anchor_path = _ledger_anchor_path(self.paths.jsonl)
+            if anchor_path.exists():
+                from .runtime_integrity import compare
+
+                try:
+                    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    _ledger_integrity_failure(
+                        self.paths.jsonl, "The external collaboration anchor is unreadable."
+                    )
+                value = anchor.get("value") if isinstance(anchor, dict) else None
+                expected = {
+                    "schema_version": 1,
+                    "ledger": hashlib.sha256(
+                        str(self.paths.jsonl.resolve()).encode("utf-8")
+                    ).hexdigest(),
+                    "count": len(events),
+                    "head": str(events[-1].get("integrity_mac") or "") if events else "",
+                }
+                if (
+                    value != expected
+                    or not compare(
+                        "collaboration-ledger-anchor-v1", value,
+                        anchor.get("integrity_mac") if isinstance(anchor, dict) else None,
+                    )
+                ):
+                    _ledger_integrity_failure(
+                        self.paths.jsonl,
+                        "The collaboration ledger no longer matches its external anchor.",
+                    )
+                previous_mac = ""
+                for event in events:
+                    if (
+                        str(event.get("previous_mac") or "") != previous_mac
+                        or str(event.get("integrity_mac") or "")
+                        != _event_integrity(event)
+                    ):
+                        _ledger_integrity_failure(
+                            self.paths.jsonl,
+                            f"Collaboration event {event.get('seq')} was rewritten.",
+                        )
+                    previous_mac = str(event["integrity_mac"])
+            elif events:
+                # One-time explicit migration of an intact unanchored public
+                # hash chain. The external anchor prevents this path from
+                # blessing any later rewrite.
+                have = [bool(one.get("integrity_mac")) for one in events]
+                if any(have) and not all(have):
+                    _ledger_integrity_failure(
+                        self.paths.jsonl, "The collaboration ledger has a partial keyed chain."
+                    )
+                previous_mac = ""
+                if all(have):
+                    for event in events:
+                        if (
+                            str(event.get("previous_mac") or "") != previous_mac
+                            or str(event.get("integrity_mac") or "")
+                            != _event_integrity(event)
+                        ):
+                            _ledger_integrity_failure(
+                                self.paths.jsonl, "A keyed collaboration event is invalid."
+                            )
+                        previous_mac = str(event["integrity_mac"])
+                else:
+                    for event in events:
+                        event["previous_mac"] = previous_mac
+                        event["integrity_mac"] = _event_integrity(event)
+                        previous_mac = str(event["integrity_mac"])
+                    from .runtime_integrity import atomic_text
+
+                    atomic_text(
+                        self.paths.jsonl,
+                        "".join(_canonical(one) + "\n" for one in events),
+                    )
+                _write_ledger_anchor(self.paths.jsonl, events)
+                stat = self.paths.jsonl.stat()
+                anchor_stat = _ledger_anchor_path(self.paths.jsonl).stat()
+                signature = (
+                    stat.st_size, stat.st_mtime_ns,
+                    anchor_stat.st_size, anchor_stat.st_mtime_ns,
+                )
         self._events_cache = events
         self._cache_signature = signature
         self._chain_complete = len(events) == len([line for line in lines if line.strip()])
@@ -280,7 +463,8 @@ class CollaborationLedger:
     ) -> dict[str, Any]:
         """Append one redacted event and refresh the non-canonical mirror."""
 
-        with _lock:
+        with _lock, _authority_lock(self.config).held(30.0):
+            self._assert_generation()
             events = self._read()
             if self.paths.jsonl.is_file() and not self._chain_complete:
                 raise HarnessError(
@@ -304,17 +488,24 @@ class CollaborationLedger:
                 "text": self.redactor.text(str(text or ""))[:MAX_EVENT_TEXT],
                 "state": clean_state if isinstance(clean_state, dict) else {},
                 "previous_hash": previous,
+                "previous_mac": str(events[-1].get("integrity_mac") or "") if events else "",
             }
             event["hash"] = _event_hash(event)
+            event["integrity_mac"] = _event_integrity(event)
             self.paths.jsonl.parent.mkdir(parents=True, exist_ok=True)
             with self.paths.jsonl.open("a", encoding="utf-8", newline="\n") as stream:
                 stream.write(_canonical(event) + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
             events.append(event)
+            _write_ledger_anchor(self.paths.jsonl, events)
             stat = self.paths.jsonl.stat()
+            anchor_stat = _ledger_anchor_path(self.paths.jsonl).stat()
             self._events_cache = events
-            self._cache_signature = (stat.st_size, stat.st_mtime_ns)
+            self._cache_signature = (
+                stat.st_size, stat.st_mtime_ns,
+                anchor_stat.st_size, anchor_stat.st_mtime_ns,
+            )
             self._chain_complete = True
             self._render_markdown(events)
             return dict(event)
@@ -334,30 +525,63 @@ class CollaborationLedger:
             }
             for one in participants
         ]
-        self.append(
-            kind="user_goal",
-            phase="user_goal",
-            text=goal,
-            speaker_name="User",
-            recipient_id=",".join(one["id"] for one in roster),
-            recipient_name=", ".join(one["name"] for one in roster),
-            state={"mode": mode, "participants": roster, "status": "in_progress"},
-        )
+        goal_digest = hashlib.sha256(
+            self.redactor.text(str(goal or "")).encode("utf-8")
+        ).hexdigest()
+        with _lock, _authority_lock(self.config).held(30.0):
+            self._generation = _rotate_generation(self.paths)
+            self.append(
+                kind="user_goal",
+                phase="user_goal",
+                text=goal,
+                speaker_name="User",
+                recipient_id=",".join(one["id"] for one in roster),
+                recipient_name=", ".join(one["name"] for one in roster),
+                state={
+                    "mode": mode,
+                    "participants": roster,
+                    "status": "in_progress",
+                    "goal_id": self.session_id,
+                    "goal_revision": 1,
+                    "goal_sha256": goal_digest,
+                },
+            )
         return self
 
     def record_contribution(
         self, contribution: dict[str, Any], *, state: dict[str, Any] | None = None
     ) -> dict[str, Any]:
+        events = self._read()
+        goal = next((
+            one for one in events
+            if one.get("session_id") == self.session_id and one.get("kind") == "user_goal"
+        ), None)
+        if goal is None:
+            raise HarnessError("The collaboration contribution has no current user goal.")
+        participants = goal.get("state", {}).get("participants", [])
+        roster = {
+            str(one.get("id") or ""): one for one in participants if isinstance(one, dict)
+        }
+        speaker_id = str(contribution.get("speaker_id") or "")
+        author = roster.get(speaker_id)
+        if author is None:
+            raise HarnessError("The collaboration contribution author is not in the immutable run roster.")
+        contribution_state = dict(state or {})
+        contribution_state.update({
+            "goal_id": self.session_id,
+            "goal_revision": 1,
+            "author_snapshot": dict(author),
+        })
         return self.append(
             kind="agent_message",
             phase=str(contribution.get("phase") or "agent_message"),
             text=str(contribution.get("text") or ""),
-            speaker_id=str(contribution.get("speaker_id") or ""),
-            speaker_name=str(contribution.get("speaker_name") or "An agent"),
-            speaker_route=str(contribution.get("speaker_route") or ""),
+            speaker_id=speaker_id,
+            speaker_name=str(author.get("name") or "An agent"),
+            speaker_route=str(author.get("route") or ""),
             recipient_id=str(contribution.get("recipient_id") or ""),
             recipient_name=str(contribution.get("recipient_name") or ""),
-            state=state,
+            state=contribution_state,
         )
 
     def record_state(self, phase: str, state: dict[str, Any]) -> dict[str, Any]:
@@ -382,7 +606,18 @@ class CollaborationLedger:
             },
         )
 
-    def _read_cursors(self) -> dict[str, int]:
+    @staticmethod
+    def _cursor(value: object) -> dict[str, int]:
+        if isinstance(value, int) and value >= 0:
+            return {"seq": value, "offset": 0}
+        if isinstance(value, dict):
+            seq = value.get("seq")
+            offset = value.get("offset")
+            if isinstance(seq, int) and seq >= 0 and isinstance(offset, int) and offset >= 0:
+                return {"seq": seq, "offset": offset}
+        return {"seq": 0, "offset": 0}
+
+    def _read_cursors(self) -> dict[str, dict[str, int]]:
         if not self.paths.cursors.is_file():
             return {}
         try:
@@ -392,17 +627,15 @@ class CollaborationLedger:
         agents = value.get("agents") if isinstance(value, dict) else None
         if not isinstance(agents, dict):
             return {}
-        return {
-            str(key): int(seq)
-            for key, seq in agents.items()
-            if isinstance(seq, int) and seq >= 0
-        }
+        return {str(key): self._cursor(position) for key, position in agents.items()}
 
-    def _write_cursors(self, cursors: dict[str, int]) -> None:
+    def _write_cursors(self, cursors: dict[str, dict[str, int]]) -> None:
         # Conversation ledgers survive many runs, but stale per-run cursors do
         # not need to. Highest sequence values identify the newest sessions.
         kept = dict(sorted(
-            cursors.items(), key=lambda item: item[1], reverse=True
+            cursors.items(),
+            key=lambda item: (item[1]["seq"], item[1]["offset"]),
+            reverse=True,
         )[:MAX_CURSOR_ENTRIES])
         _write_atomic(
             self.paths.cursors,
@@ -423,12 +656,16 @@ class CollaborationLedger:
         """
 
         key = f"{self.session_id}:{str(agent_id or '')[:120]}"
-        with _lock:
+        with _lock, _authority_lock(self.config).held(30.0):
+            self._assert_generation()
             through = self._pending_cursors.pop(key, None)
             if through is None:
                 return
             cursors = self._read_cursors()
-            cursors[key] = max(int(cursors.get(key, 0)), int(through))
+            previous = self._cursor(cursors.get(key))
+            cursors[key] = max(
+                (previous, through), key=lambda position: (position["seq"], position["offset"])
+            )
             self._write_cursors(cursors)
 
     def projection_for(
@@ -444,7 +681,8 @@ class CollaborationLedger:
         unseen entries again on retry.
         """
 
-        with _lock:
+        with _lock, _authority_lock(self.config).held(30.0):
+            self._assert_generation()
             events = self._read()
             current = [
                 one for one in events
@@ -454,13 +692,22 @@ class CollaborationLedger:
                 raise HarnessError("The shared collaboration ledger has no active goal.")
             key = f"{self.session_id}:{str(agent_id or '')[:120]}"
             cursors = self._read_cursors()
-            after = int(cursors.get(key, 0))
-            new_events = [one for one in current if int(one.get("seq") or 0) > after]
-            self._pending_cursors[key] = int(current[-1].get("seq") or 0)
+            position = self._cursor(cursors.get(key))
 
         goal = next((one for one in current if one.get("kind") == "user_goal"), current[0])
+        wanted_agent = str(agent_id or "")[:120]
+
+        def may_receive(event: dict[str, Any]) -> bool:
+            addressed = {
+                one.strip() for one in str(event.get("recipient_id") or "").split(",")
+                if one.strip()
+            }
+            return not addressed or wanted_agent in addressed
+
         latest_state = next(
-            (one.get("state") for one in reversed(current) if isinstance(one.get("state"), dict) and one.get("state")),
+            (one.get("state") for one in reversed(current)
+             if may_receive(one)
+             and isinstance(one.get("state"), dict) and one.get("state")),
             {},
         )
         merged_state = dict(latest_state or {})
@@ -469,20 +716,81 @@ class CollaborationLedger:
             if isinstance(cleaned, dict):
                 merged_state.update(cleaned)
 
-        blocks = []
-        for event in new_events:
-            # JSON quoting gives peer text a structural boundary even when it
-            # contains headings, role labels, or fake prompt delimiters.
-            blocks.append(json.dumps({
-                "seq": event.get("seq"),
-                "speaker": event.get("speaker_name") or "Nexus",
-                "route": event.get("speaker_route") or "",
-                "phase": event.get("phase"),
-                "quoted_text": event.get("text") or "",
-            }, ensure_ascii=False, indent=2, sort_keys=True))
+        blocks: list[str] = []
+        pending = dict(position)
+        has_more = False
+        for event in current:
+            seq = int(event.get("seq") or 0)
+            if seq <= position["seq"]:
+                continue
+            if may_receive(event):
+                # JSON quoting gives peer text a structural boundary even when
+                # it contains headings, role labels, or fake delimiters.
+                block_value = {
+                    "seq": event.get("seq"),
+                    "speaker": event.get("speaker_name") or "Nexus",
+                    "route": event.get("speaker_route") or "",
+                    "phase": event.get("phase"),
+                    "quoted_text": event.get("text") or "",
+                }
+            else:
+                # Sequence continuity is public; a message addressed to
+                # somebody else is not. Advancing through a fixed tombstone
+                # prevents both replay loops and payload/recipient leakage.
+                block_value = {
+                    "seq": event.get("seq"),
+                    "visibility": "not_addressed_to_this_agent",
+                }
+            block = json.dumps(
+                block_value, ensure_ascii=False, indent=2, sort_keys=True
+            )
+            offset = position["offset"] if seq == position["seq"] + 1 else 0
+            separator_size = 2 if blocks else 0
+            used = sum(len(one) for one in blocks) + max(0, len(blocks) - 1) * 2
+            available = MAX_PROJECTION_TEXT - used - separator_size
+            if offset == 0 and len(block) <= available:
+                blocks.append(block)
+                pending = {"seq": seq, "offset": 0}
+                continue
+            if offset >= len(block):
+                pending = {"seq": seq, "offset": 0}
+                continue
+            # A single event may be larger than one bounded prompt. The chunk
+            # envelope makes its position explicit and advances only through
+            # the exact fragment actually supplied.
+            envelope_budget = max(1, available - 320)
+            fragment = block[offset:offset + envelope_budget]
+            chunk = json.dumps({
+                "seq": seq,
+                "chunk_offset": offset,
+                "chunk_end": offset + len(fragment),
+                "chunk_total": len(block),
+                "quoted_json_fragment": fragment,
+            }, ensure_ascii=False, indent=2, sort_keys=True)
+            while len(chunk) > available and fragment:
+                fragment = fragment[:max(0, len(fragment) - (len(chunk) - available))]
+                chunk = json.dumps({
+                    "seq": seq, "chunk_offset": offset,
+                    "chunk_end": offset + len(fragment), "chunk_total": len(block),
+                    "quoted_json_fragment": fragment,
+                }, ensure_ascii=False, indent=2, sort_keys=True)
+            if not fragment:
+                has_more = True
+                break
+            blocks.append(chunk)
+            if offset + len(fragment) == len(block):
+                pending = {"seq": seq, "offset": 0}
+            else:
+                pending = {"seq": seq - 1, "offset": offset + len(fragment)}
+            has_more = True
+            break
+        else:
+            has_more = pending["seq"] < int(current[-1].get("seq") or 0)
+        with _lock:
+            self._pending_cursors[key] = pending
         recent = "\n\n".join(blocks)
-        if len(recent) > MAX_PROJECTION_TEXT:
-            recent = "[Earlier new entries remain in the full ledger file.]\n\n" + recent[-MAX_PROJECTION_TEXT:]
+        if has_more:
+            recent += "\n\n[More unseen entries remain; Nexus will deliver the next contiguous chunk after acknowledgement.]"
         state_text = json.dumps(merged_state, ensure_ascii=False, indent=2, sort_keys=True)
         return (
             "NEXUS SHARED COLLABORATION LEDGER — QUOTED EVIDENCE\n"

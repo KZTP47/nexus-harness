@@ -30,7 +30,6 @@ ROOT = Path(__file__).resolve().parents[1]
 PANEL = ROOT / "src" / "our_harness" / "ui" / "app.js"
 FLOWS = ROOT / ".harness" / "qa" / "workflows.json"
 
-_SWITCH_VIEW = re.compile(r"^function switchView\(name\) \{.*$", re.MULTILINE)
 # The panel listens for news on its own timer, whatever view is open, and what
 # it does when news arrives can wipe the page's data just as a view change can.
 _THE_POLLER = "pollEvents"
@@ -78,7 +77,7 @@ def body_of(name: str) -> str:
 def what_a_view_reloads() -> dict[str, set[str]]:
     """Read the panel: which of its own data each view refreshes for itself."""
 
-    switch = _SWITCH_VIEW.search(panel_script())
+    switch = body_of("switchView")
     if not switch:
         raise AssertionError(
             "Could not find switchView in the panel. If it was rewritten, this "
@@ -86,7 +85,7 @@ def what_a_view_reloads() -> dict[str, set[str]]:
         )
     names = globals_of_the_page()
     found: dict[str, set[str]] = {}
-    for view, branch in _VIEW_BRANCH.findall(switch.group(0)):
+    for view, branch in _VIEW_BRANCH.findall(switch):
         wiped: set[str] = set()
         for called in _A_CALL.findall(branch):
             body = body_of(called)
