@@ -31,24 +31,21 @@ keeps a clear record of what happened.
 
 ```mermaid
 flowchart TB
-    Ask["1. You describe the goal"]
-    Project["2. Nexus keeps the work<br/>with the right project"]
-    Team["Agent Swarm<br/>Agents discuss and work together"]
-    Steps["Visual automation<br/>A saved checklist runs each step"]
-    Check["3. Nexus checks the result<br/>and records what happened"]
-    Result["4. You review the outcome<br/>and can stop the work at any time"]
+    Ask["You choose a project<br/>and describe the goal"]
+    Team["Agent Swarm<br/>Agents work together"]
+    Steps["Visual automation<br/>A saved checklist runs"]
+    Result["Nexus checks the work<br/>and shows you what happened"]
 
-    Ask --> Project
-    Project --> Team
-    Project --> Steps
-    Team --> Check
-    Steps --> Check
-    Check --> Result
+    Ask --> Team
+    Ask --> Steps
+    Team --> Result
+    Steps --> Result
 ```
 
 The two middle boxes are choices, not required stages. Use **Agent Swarm** when
 several assistants should solve something together. Use **visual automation**
 when the same steps should run reliably each time. A task can also use both.
+You can follow the progress and stop the work at any time.
 
 Web chats do not always make it clear whether the Send button worked. When
 Nexus cannot be certain, it stops and tells you instead of risking sending the
