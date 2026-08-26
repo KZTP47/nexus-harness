@@ -1167,11 +1167,20 @@ class WebChatManager {
   }
 
   hideEmbedded() {
-    if (!this.activeEmbedded || !this.owner || this.owner.isDestroyed()) return false;
-    const view = this.views.get(this.activeEmbedded);
-    if (view) this.parkBackgroundView(view);
-    this.activeEmbedded = "";
-    return true;
+    if (!this.owner || this.owner.isDestroyed()) return false;
+    const wasEmbedded = Boolean(this.activeEmbedded);
+    if (this.activeEmbedded) {
+      const view = this.views.get(this.activeEmbedded);
+      if (view) this.parkBackgroundView(view);
+      this.activeEmbedded = "";
+    }
+    // Moving a focused WebContentsView to a hidden BrowserWindow does not
+    // reliably move Chromium's native keyboard target with it. The board can
+    // then paint a caret while keystrokes continue going to the hidden
+    // provider editor. Always hand native focus back to the owner renderer.
+    this.owner.focus?.();
+    this.owner.webContents?.focus?.();
+    return wasEmbedded;
   }
 
   remove(id) {

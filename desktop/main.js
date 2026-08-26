@@ -376,6 +376,12 @@ ipcMain.handle("harness:setFullScreen", (_event, on) => {
 ipcMain.handle("harness:webChatProviders", (event) => (
   fromHarnessWindow(event) && webChatManager ? webChatManager.providers() : []
 ));
+ipcMain.handle("harness:focusHarness", (event) => {
+  if (!fromHarnessWindow(event) || !window || window.isDestroyed()) return false;
+  window.focus();
+  window.webContents.focus();
+  return true;
+});
 ipcMain.handle("harness:webChats", (event) => (
   fromHarnessWindow(event) && webChatManager ? webChatManager.list() : []
 ));

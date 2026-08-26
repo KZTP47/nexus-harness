@@ -308,7 +308,11 @@ def _prompt_for(request: ProviderRequest) -> str:
         parts.append(f"Authoritative role and turn instructions from Nexus:\n{request.dynamic_context}")
     if request.response_format is not None:
         parts.append(
-            "Return only JSON matching this schema (no Markdown fence):\n"
+            "Return only JSON matching this schema. Put the entire JSON object inside "
+            "one fenced ```json code block. This fence is a transport boundary: it prevents "
+            "the provider page's Markdown renderer from consuming literal characters such "
+            "as *, _, <, and > inside proposed source files. Do not put any text before or "
+            "after the code block:\n"
             + json.dumps(request.response_format.schema, ensure_ascii=False)
         )
     return "\n\n".join(one for one in parts if one).strip()

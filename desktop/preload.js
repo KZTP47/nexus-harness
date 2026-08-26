@@ -18,6 +18,7 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   showHelp: () => ipcRenderer.invoke("harness:help"),
   showProjectFile: (relativePath) => ipcRenderer.invoke(
     "harness:showProjectFile", String(relativePath || "")),
+  focusHarness: () => ipcRenderer.invoke("harness:focusHarness"),
   setFullScreen: (on) => ipcRenderer.invoke("harness:setFullScreen", Boolean(on)),
   webChatProviders: () => ipcRenderer.invoke("harness:webChatProviders"),
   webChats: () => ipcRenderer.invoke("harness:webChats"),

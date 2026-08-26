@@ -9152,8 +9152,8 @@ const chatPhaseNames = {
   lead_plan: "Lead agent's plan",
   agent_discussion: "Team discussion",
   agent_plan_review: "Plan review",
-  lead_execution: "Applied execution pass",
-  agent_execution: "Connected-agent execution",
+  lead_execution: "Provisional execution pass",
+  agent_execution: "Connected-agent provisional execution",
   agent_verification: "Work verification",
   final_answer: "Final answer",
   nexus_error: "Nexus failure",
@@ -11199,6 +11199,15 @@ function wireUpTheTray() {
   ));
   $("theBigChatCollaborate").addEventListener("click", () => sendFromTheBigChat("collaborate"));
   $("theBigChatWork").addEventListener("click", () => sendFromTheBigChat("work"));
+  // A provider WebContentsView can retain Electron's native keyboard target
+  // after its visible view is moved back to the hidden relay host. In that
+  // state this textarea has a DOM caret but typed keys still go to the hidden
+  // provider page. Clicking the composer explicitly returns native keyboard
+  // ownership to the board; the pointer's normal behavior still chooses the
+  // caret position.
+  $("theBigChatBox").addEventListener("pointerdown", () => {
+    Promise.resolve(window.harnessDesktop?.focusHarness?.()).catch(() => {});
+  });
   $("theBigChatBox").addEventListener("input", rememberTheBigChatComposer);
   $("theBigChatBox").addEventListener("select", rememberTheBigChatComposer);
   // Escape puts it back in the tray rather than closing it, because closing

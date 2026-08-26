@@ -743,6 +743,50 @@ class SwarmWorkTests(unittest.TestCase):
                 )
         self.assertFalse((self.project / "partial.txt").exists())
 
+    def test_provider_failure_after_staging_names_the_rolled_back_file_truthfully(self) -> None:
+        work_calls = 0
+        live_turns: list[dict[str, object]] = []
+
+        def answer(_config, route, _text, **kwargs):
+            nonlocal work_calls
+            response_format = kwargs.get("response_format")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {"contribution": "create", "message_to_lead": "create", "needs_files": []}
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {
+                    "contribution": "create", "message_to_lead": "ready",
+                    "needs_files": [], "ready_to_execute": True, "remaining": [],
+                }
+            elif response_format is swarm_work.WORK_FORMAT:
+                work_calls += 1
+                if work_calls == 2:
+                    raise chat.ChatError("provider unavailable")
+                value = {
+                    "reply": "Created the requested file.",
+                    "changes": [{
+                        "path": "index.html", "content": "<p>complete</p>\n",
+                        "reason": "requested",
+                    }],
+                }
+            else:
+                raise AssertionError(f"unexpected response format for {route}")
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            with self.assertRaisesRegex(
+                swarm_work.SwarmError,
+                r"rolled back.*index\.html.*provisional changes are not applied",
+            ):
+                swarm_work.work_together(
+                    self.config, self.board, "agent-1", "Create index.html",
+                    live_turn=live_turns.append,
+                )
+
+        self.assertFalse((self.project / "index.html").exists())
+        staged = "\n".join(str(one.get("text") or "") for one in live_turns)
+        self.assertIn("Staged provisionally", staged)
+        self.assertNotIn("Applied in this turn", staged)
+
     def test_crashed_process_saga_is_compensated_before_the_next_run(self) -> None:
         target = self.project / "crash.txt"
         target.write_text("before\n", encoding="utf-8")
@@ -1154,6 +1198,18 @@ os._exit(23)
                 {"text": "```json\n{\"contribution\":\"plan\",\"message_to_lead\":\"go\",\"needs_files\":[],\"extra\":true}\n```"},
                 "ChatGPT", swarm_work.PLAN_FORMAT,
             )
+
+    def test_fenced_web_file_payload_preserves_source_operators_exactly(self) -> None:
+        source = "const width = Math.round(canvas.width * dpr);\nbody{height:100vh}"
+        answer = {"text": "```json\n" + json.dumps({
+            "reply": "Created the requested file.",
+            "changes": [{"path": "index.html", "content": source, "reason": "requested"}],
+        }) + "\n```"}
+
+        decoded = swarm_work._decode(answer, "Claude web", swarm_work.WORK_FORMAT)
+
+        self.assertEqual(decoded["changes"][0]["content"], source)
+        self.assertIn(" * ", decoded["changes"][0]["content"])
 
     def test_consumer_web_agent_gets_one_strict_format_correction_turn(self) -> None:
         ledger = mock.Mock()

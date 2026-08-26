@@ -73,10 +73,14 @@ def _pause_provider_failure(
         ],
     }
     state.update(checkpoint or {})
+    provisional_paths = _transaction_paths(mutation_root, transaction_ids or [])
     if mutation_saga is not None:
         state["mutation_recovery"] = mutation_saga.compensate("provider_failure")
     elif mutation_root is not None and transaction_ids:
         state["mutation_recovery"] = _rollback_transactions(mutation_root, transaction_ids)
+    recovery = state.get("mutation_recovery")
+    if provisional_paths:
+        state["provisional_paths"] = provisional_paths
     ledger.record_state("provider_transport_failure", state)
     remaining = [
         f"Reconnect or reconcile {name}'s provider turn before resuming."
@@ -88,6 +92,17 @@ def _pause_provider_failure(
         + " could not complete a provider turn. The failure was not counted as "
           "agent speech, reasoning progress, or a completed round."
     )
+    if isinstance(recovery, dict) and recovery.get("status") == "rolled_back":
+        report += (
+            " Nexus rolled back the provisional project changes from this interrupted run"
+            + (": " + ", ".join(provisional_paths) if provisional_paths else "")
+            + ". Those provisional changes are not applied."
+        )
+    elif isinstance(recovery, dict) and recovery.get("status") == "rollback_conflict":
+        report += (
+            " Nexus could not safely roll back every provisional project change because "
+            "the files changed again outside this run; reconcile the recorded mutation conflict before continuing."
+        )
     ledger.finish(
         report,
         complete=False,
@@ -979,7 +994,8 @@ def _decode_with_one_web_repair(
             _continuation_turn(
                 "STRUCTURED FORMAT CORRECTION",
                 "Correct your immediately preceding answer into the required JSON schema. "
-                "Return only the JSON object, preserve the same substantive answer, escape every "
+                "Return only one fenced ```json code block containing the JSON object, preserve "
+                "the same substantive answer, escape every "
                 "JSON string correctly, replace embedded double quotation marks inside string "
                 "values with single quotation marks, and use forward slashes for any Windows paths.",
             ),
@@ -1724,6 +1740,32 @@ def _validated_changes(root: Path, raw_changes: object) -> list[ChangePlan]:
     return changes
 
 
+def _transaction_paths(root: Path | None, transaction_ids: list[str]) -> list[str]:
+    """List paths named by already-applied transactions for truthful recovery UI."""
+
+    if root is None:
+        return []
+    paths: list[str] = []
+    for transaction_id in transaction_ids:
+        try:
+            manifest_path = confined_path(
+                root,
+                Path(".harness") / "backups" / transaction_id / "manifest.json",
+                allow_missing=True,
+                allow_control=True,
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (HarnessError, OSError, json.JSONDecodeError):
+            continue
+        for change in manifest.get("changes", []):
+            if not isinstance(change, dict):
+                continue
+            relative = str(change.get("path") or "").strip()
+            if relative and relative not in paths:
+                paths.append(relative)
+    return paths
+
+
 def _file_snapshot(root: Path, paths: list[str]) -> str:
     blocks: list[str] = []
     used = 0
@@ -2168,7 +2210,7 @@ def work_together(
             execution_words = str(
                 execution.get("reply") or "Execution turn finished."
             ).strip()
-            execution_words += "\nApplied in this turn: " + (
+            execution_words += "\nStaged provisionally in this run (team verification pending): " + (
                 ", ".join(executor_changed) or "none"
             )
             execution_turn = _contribution(

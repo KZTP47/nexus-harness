@@ -1823,7 +1823,7 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("allow_project_changes: projectPermission.confirmed", self.script)
         self.assertIn('agent_discussion: "Team discussion"', self.script)
         self.assertIn('agent_plan_review: "Plan review"', self.script)
-        self.assertIn('agent_execution: "Connected-agent execution"', self.script)
+        self.assertIn('agent_execution: "Connected-agent provisional execution"', self.script)
         self.assertIn('agent_verification: "Work verification"', self.script)
 
     def test_add_project_dialog_offers_the_electron_folder_picker(self) -> None:

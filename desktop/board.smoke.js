@@ -457,6 +457,11 @@ async function main() {
     );
     console.log("pass  and the chat closes again");
 
+    // Removing an agent deliberately asks for confirmation. Accept the native
+    // Electron dialog just as this smoke check does for automation deletion;
+    // otherwise Playwright dismisses it and the temporary agent is left on
+    // the restored board until the finally block repairs the saved snapshot.
+    page.once("dialog", (dialog) => dialog.accept());
     await page.click("#swarmAgentRemove", { timeout: 20000 });
     try {
       await page.waitForFunction(

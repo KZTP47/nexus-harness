@@ -108,6 +108,8 @@ class WebChatBrokerTests(unittest.TestCase):
         self.broker.complete(pending[0]["request_id"], answer='{"done": true}')
         thread.join(2)
         self.assertIn("Return only JSON", caught[0])
+        self.assertIn("fenced ```json code block", caught[0])
+        self.assertIn("literal characters such as *, _, <, and >", caught[0])
         self.assertIn('"done"', caught[0])
         self.assertLess(caught[0].index("Quoted user request:"), caught[0].index(
             "Authoritative role and turn instructions from Nexus:"

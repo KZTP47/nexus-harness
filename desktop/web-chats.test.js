@@ -845,6 +845,33 @@ test("a background provider view gets a real hidden rendering host", () => {
   assert.equal(closed, 1);
 });
 
+test("hiding an embedded provider always returns native keyboard focus to the board", () => {
+  const focusOrder = [];
+  const moved = [];
+  const view = {webContents: {isDestroyed: () => false}};
+  const manager = new WebChatManager({
+    electron: {},
+    owner: {
+      isDestroyed: () => false,
+      focus: () => focusOrder.push("window"),
+      webContents: {focus: () => focusOrder.push("board")},
+    },
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.views.set("gemini-example", view);
+  manager.activeEmbedded = "gemini-example";
+  manager.parkBackgroundView = (one) => moved.push(one);
+
+  assert.equal(manager.hideEmbedded(), true);
+  assert.deepEqual(moved, [view]);
+  assert.deepEqual(focusOrder, ["window", "board"]);
+  assert.equal(manager.activeEmbedded, "");
+
+  assert.equal(manager.hideEmbedded(), false);
+  assert.deepEqual(focusOrder, ["window", "board", "window", "board"]);
+});
+
 test("the provider load wait cannot miss a just-finished load", async () => {
   const contents = new EventEmitter();
   let checks = 0;
