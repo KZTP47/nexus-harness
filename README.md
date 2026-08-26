@@ -23,75 +23,42 @@ and where**, while **visual test automation controls what runs, in which order,
 and what must pass before work continues**. They can be used independently, or
 together as the human-facing control layer for a local project.
 
-### Runtime architecture
+### How the two workspaces fit together
 
-Both workspaces use the same durable runtime model. The browser UI is a
-projection, not the source of truth: every accepted command receives an exact
-request and run identity, and the loopback server records it before work is
-dispatched. Swarm conversations and automation pipelines then use separate
-authority stores while sharing integrity checks, bounded event streams, exact
-Stop semantics, and explicit handling for provider outcomes that cannot be
-proved.
+Both workspaces follow the same simple path. You choose a project and describe
+what you want. Nexus keeps the work with that project, shows its progress, and
+keeps a clear record of what happened.
 
 ```mermaid
 flowchart TB
-    Person["Person using Nexus Harness"]
-    UI["Accessible desktop / browser UI"]
-    API["Authenticated loopback command API"]
+    Ask["1. You describe the goal"]
+    Project["2. Nexus keeps the work<br/>with the right project"]
+    Team["Agent Swarm<br/>Agents discuss and work together"]
+    Steps["Visual automation<br/>A saved checklist runs each step"]
+    Check["3. Nexus checks the result<br/>and records what happened"]
+    Result["4. You review the outcome<br/>and can stop the work at any time"]
 
-    subgraph Authority["Durable local authority"]
-        Command["Request identity and immutable snapshot"]
-        SwarmStore["Swarm runs, effects, transcripts and cursors"]
-        PipelineStore["Pipeline runs, attempts, decisions and evidence"]
-        Integrity["Project binding, integrity anchors and mutation fences"]
-    end
-
-    subgraph Engines["Execution engines"]
-        Swarm["AI Agent Swarm orchestrator"]
-        Pipeline["Visual test automation"]
-        Stop["Exact run-scoped Stop and cancellation"]
-    end
-
-    subgraph Providers["Effect boundary"]
-        Desktop["CLI / API agents<br/>Typed response or process result"]
-        Web["Signed-in web AI adapters<br/>Marked turn and matched reply"]
-        Unknown["delivery_unknown / outcome_unknown<br/>Reconcile; never blind-resend"]
-    end
-
-    Evidence["Bounded live events and immutable evidence"]
-
-    Person --> UI --> API --> Command
-    Command --> SwarmStore --> Swarm
-    Command --> PipelineStore --> Pipeline
-    Integrity --- SwarmStore
-    Integrity --- PipelineStore
-    Stop --> SwarmStore
-    Stop --> PipelineStore
-    Swarm --> Desktop
-    Swarm --> Web
-    Pipeline --> Desktop
-    Web --> Unknown
-    Desktop --> Evidence
-    Web --> Evidence
-    Unknown --> Evidence
-    SwarmStore --> Evidence
-    PipelineStore --> Evidence
-    Evidence --> UI
+    Ask --> Project
+    Project --> Team
+    Project --> Steps
+    Team --> Check
+    Steps --> Check
+    Check --> Result
 ```
 
-Web providers do not expose a machine receipt equivalent to an API response.
-Nexus therefore correlates an exact marked user turn with the reply after it.
-If a click may have reached the provider but acceptance cannot be proved, the
-effect becomes `outcome_unknown`: the UI explains the uncertainty and the
-engine does not resend automatically. This prevents a delayed or remounted web
-page from silently duplicating a long-running agent task.
+The two middle boxes are choices, not required stages. Use **Agent Swarm** when
+several assistants should solve something together. Use **visual automation**
+when the same steps should run reliably each time. A task can also use both.
 
-See [NEXUS_WORKSPACE_RUNTIME_V2.md](docs/NEXUS_WORKSPACE_RUNTIME_V2.md) for the
-full runtime architecture, its crash boundaries, and the deliberately explicit
-limits of restart recovery. The corresponding
+Web chats do not always make it clear whether the Send button worked. When
+Nexus cannot be certain, it stops and tells you instead of risking sending the
+same request twice.
+
+Developers can find the internal design in
+[NEXUS_WORKSPACE_RUNTIME_V2.md](docs/NEXUS_WORKSPACE_RUNTIME_V2.md). The
 [acceptance criteria](docs/NEXUS_WORKSPACE_RUNTIME_ACCEPTANCE.md) and
 [independent judge specification](docs/NEXUS_WORKSPACE_RUNTIME_JUDGE.md) define
-the evidence required before a runtime change is accepted.
+what must be proven before those internals are changed.
 
 ### AI Agent Swarm orchestrator
 
