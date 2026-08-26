@@ -571,6 +571,135 @@ class SomebodyCanFindItTests(unittest.TestCase):
         self.assertIn("Install Nexus Harness.cmd", said)
 
 
+class TheUninstallerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.script = ROOT / "Uninstall Nexus Harness.bat"
+        self.said = self.script.read_text(encoding="utf-8")
+
+    def test_it_is_a_top_level_file_somebody_can_download_and_double_click(self) -> None:
+        self.assertTrue(self.script.is_file())
+        self.assertEqual(self.script.parent, ROOT)
+        self.assertIn("choice /C YN", self.said)
+        self.assertIn("pause", self.said)
+
+    def test_it_has_no_person_or_version_baked_into_its_paths(self) -> None:
+        self.assertNotRegex(self.said, r"(?i)C:\\Users\\[^%\"]+")
+        self.assertNotRegex(self.said, r"Nexus Harness Setup \d")
+        self.assertIn("%LOCALAPPDATA%", self.said)
+        self.assertIn("%APPDATA%", self.said)
+        self.assertIn("%USERPROFILE%", self.said)
+        self.assertIn("GetFolderPath('Desktop')", self.said)
+
+    def test_it_covers_every_supported_windows_install_shape(self) -> None:
+        self.assertIn(r"Programs\our-harness-desktop", self.said)
+        self.assertIn("Uninstall*.exe", self.said)
+        self.assertIn(r"Programs\OurHarness", self.said)
+        self.assertIn("Nexus Harness.lnk", self.said)
+        self.assertIn("Start Menu", self.said)
+
+    def test_it_preserves_the_things_that_belong_to_the_person(self) -> None:
+        lowered = self.said.lower()
+        self.assertIn("projects, settings, transcripts, and evidence were preserved", lowered)
+        self.assertNotIn(r"rmdir /s /q \"%appdata%", lowered)
+        self.assertNotIn(r"rmdir /s /q \"%userprofile%", lowered)
+
+    def test_it_has_silent_and_non_destructive_preview_modes(self) -> None:
+        self.assertIn('"/S"', self.said)
+        self.assertIn('"/DRY-RUN"', self.said)
+        self.assertIn("DRY RUN: nothing will be changed", self.said)
+
+    @unittest.skipUnless(os.name == "nt", "Windows batch file")
+    def test_dry_run_succeeds_without_changing_an_isolated_fake_install(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "O'Brien & Team!"
+            root.mkdir()
+            local = root / "local"
+            profile = root / "profile"
+            roaming = root / "roaming"
+            desktop = profile / "Desktop"
+            cli = local / "Programs" / "OurHarness"
+            shortcut = desktop / "Nexus Harness.lnk"
+            (cli / "bin").mkdir(parents=True)
+            desktop.mkdir(parents=True)
+            roaming.mkdir(parents=True)
+            (cli / "bin" / "harness.cmd").write_text("@echo off\n", encoding="ascii")
+            shortcut.write_bytes(b"stand-in shortcut")
+            environment = {
+                **os.environ,
+                "LOCALAPPDATA": str(local),
+                "APPDATA": str(roaming),
+                "USERPROFILE": str(profile),
+                "OneDrive": str(root / "one-drive"),
+                "OneDriveCommercial": "",
+                "OneDriveConsumer": "",
+            }
+            done = subprocess.run(
+                ["cmd.exe", "/d", "/c", str(self.script), "/S", "/DRY-RUN"],
+                cwd=root, env=environment, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("DRY RUN", done.stdout)
+            self.assertTrue(shortcut.is_file(), "dry-run removed the shortcut")
+            self.assertTrue(cli.is_dir(), "dry-run removed the CLI installation")
+
+    @unittest.skipUnless(os.name == "nt", "Windows batch file")
+    def test_it_really_removes_only_the_isolated_default_cli_and_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "O'Brien & Team!"
+            root.mkdir()
+            local = root / "local"
+            profile = root / "profile"
+            roaming = root / "roaming"
+            one_drive = root / "one drive"
+            cli = local / "Programs" / "OurHarness"
+            shortcuts = [
+                profile / "Desktop" / "Nexus Harness.lnk",
+                one_drive / "Desktop" / "Nexus Harness.lnk",
+                roaming / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+                / "Nexus Harness.lnk",
+            ]
+            (cli / "bin").mkdir(parents=True)
+            (cli / "app").mkdir(parents=True)
+            (cli / "bin" / "harness.cmd").write_text("@echo off\n", encoding="ascii")
+            (cli / "app" / "harness.pyz").write_bytes(b"stand-in")
+            for shortcut in shortcuts:
+                shortcut.parent.mkdir(parents=True, exist_ok=True)
+                shortcut.write_bytes(b"stand-in shortcut")
+            unrelated = root / "project" / "keep-me.txt"
+            unrelated.parent.mkdir()
+            unrelated.write_text("person's work", encoding="utf-8")
+
+            # With PowerShell absent from PATH the Known Folder probe has no
+            # answer, which keeps this destructive integration check entirely
+            # inside its fake account tree. All cmd built-ins still work.
+            empty_path = root / "empty-path"
+            empty_path.mkdir()
+            environment = {
+                **os.environ,
+                "PATH": str(empty_path),
+                "LOCALAPPDATA": str(local),
+                "APPDATA": str(roaming),
+                "USERPROFILE": str(profile),
+                "OneDrive": str(one_drive),
+                "OneDriveCommercial": "",
+                "OneDriveConsumer": "",
+            }
+            command = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
+            done = subprocess.run(
+                [command, "/d", "/c", str(self.script), "/S"],
+                cwd=root, env=environment, capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertFalse(cli.exists(), "default CLI installation remained")
+            self.assertTrue(all(not one.exists() for one in shortcuts))
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "person's work")
+
+    def test_the_readme_explains_uninstall_and_data_preservation(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Uninstall Nexus Harness.bat", readme)
+        self.assertIn("Project folders", readme)
+
+
 class MakingTheShortcutWithoutPowerShellTests(unittest.TestCase):
     """On plenty of company machines PowerShell is gone - scripts turned off, or
     held in a mode where it cannot make one of these at all - and none of that

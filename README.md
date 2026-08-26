@@ -265,6 +265,20 @@ The icon opens the best thing on your machine: the desktop app if you have it,
 and otherwise the panel in your browser, started by Python straight out of this
 folder. It says which one you got.
 
+### Uninstall on Windows
+
+Double-click **`Uninstall Nexus Harness.bat`**. The same file works for every
+Nexus Harness version and every Windows user because it asks Windows for that
+user's own app-data, Desktop, OneDrive Desktop, and Start menu locations; it
+contains no username or versioned path.
+
+It removes the installed desktop app, the default command-line installation,
+and Nexus Harness shortcuts. It is safe to run more than once. Project folders,
+settings, transcripts, evidence, and signed-in provider sessions are preserved.
+For unattended deployment use `Uninstall Nexus Harness.bat /S`; to inspect what
+it would remove without changing anything, use
+`Uninstall Nexus Harness.bat /DRY-RUN`.
+
 ### The other ways
 
 ```bash
