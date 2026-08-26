@@ -26,6 +26,8 @@ from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 
 
 class PanelTestCase(unittest.TestCase):
+    HTTP_TIMEOUT_SECONDS = 30
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -42,6 +44,9 @@ class PanelTestCase(unittest.TestCase):
         (self.root / ".harness").mkdir()
         config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
         self.panel = server.HarnessHTTPServer(("127.0.0.1", 0), config)
+        # Test teardown must wait for request handlers to finish their final
+        # durable-store cleanup before TemporaryDirectory removes the runtime.
+        self.panel.daemon_threads = False
         self.addCleanup(self.panel.server_close)
         self.port = self.panel.server_address[1]
         thread = threading.Thread(target=self.panel.serve_forever, daemon=True)
@@ -59,7 +64,9 @@ class PanelTestCase(unittest.TestCase):
             method="POST" if body is not None else "GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=10) as answer:
+            with urllib.request.urlopen(
+                request, timeout=self.HTTP_TIMEOUT_SECONDS,
+            ) as answer:
                 return answer.status, json.loads(answer.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read().decode("utf-8"))

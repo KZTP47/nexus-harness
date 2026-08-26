@@ -1965,6 +1965,10 @@ class WhatThePanelIsTold(BoardTestCase):
         self.where = self.a_project()
         config = load_config(self.where)
         self.panel = server.HarnessHTTPServer(("127.0.0.1", 0), config)
+        # A response can arrive just before the handler releases its durable
+        # conversation lease. Join request handlers before the temporary
+        # SQLite runtime is removed so Windows teardown cannot race that lease.
+        self.panel.daemon_threads = False
         self.addCleanup(self.panel.server_close)
         self.port = self.panel.server_address[1]
         thread = threading.Thread(target=self.panel.serve_forever, daemon=True)
