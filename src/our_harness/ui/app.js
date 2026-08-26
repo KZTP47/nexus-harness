@@ -9613,6 +9613,217 @@ async function connectThisAssistant(kind, button) {
 let theBigOne = "";
 let theBigChatRenderIdentity = "";
 const theBigChatRenderSignatures = new Map();
+const BIG_CHAT_LAYOUT_KEY = "nexus-big-chat-layout-v1";
+const BIG_CHAT_LAYOUT_DEFAULTS = Object.freeze({
+  width: null,
+  height: null,
+  sidebar: 270,
+  activity: 290,
+  destination: 180,
+  composer: 320,
+});
+let theBigChatLayout = readTheBigChatLayout();
+let theBigChatResize = null;
+
+function aSavedBigChatSize(value, otherwise = null) {
+  if (value === null || value === undefined || value === "") return otherwise;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 && number <= 10000 ? number : otherwise;
+}
+
+function readTheBigChatLayout() {
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(BIG_CHAT_LAYOUT_KEY) || "null");
+    if (!saved || typeof saved !== "object") return {...BIG_CHAT_LAYOUT_DEFAULTS};
+    return {
+      width: aSavedBigChatSize(saved.width),
+      height: aSavedBigChatSize(saved.height),
+      sidebar: aSavedBigChatSize(saved.sidebar, BIG_CHAT_LAYOUT_DEFAULTS.sidebar),
+      activity: aSavedBigChatSize(saved.activity, BIG_CHAT_LAYOUT_DEFAULTS.activity),
+      destination: aSavedBigChatSize(saved.destination, BIG_CHAT_LAYOUT_DEFAULTS.destination),
+      composer: aSavedBigChatSize(saved.composer, BIG_CHAT_LAYOUT_DEFAULTS.composer),
+    };
+  } catch (_) {
+    return {...BIG_CHAT_LAYOUT_DEFAULTS};
+  }
+}
+
+function saveTheBigChatLayout() {
+  try { window.localStorage.setItem(BIG_CHAT_LAYOUT_KEY, JSON.stringify(theBigChatLayout)); }
+  catch (_) { /* The layout still works for this window when storage is unavailable. */ }
+}
+
+function boundedBigChatSize(value, least, most) {
+  return Math.max(Math.min(least, most), Math.min(most, Number(value) || least));
+}
+
+function theBigChatSheetBounds() {
+  const overlay = $("theBigChat");
+  const style = window.getComputedStyle(overlay);
+  const horizontal = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+  const vertical = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+  const mostWidth = Math.max(320, overlay.clientWidth - horizontal);
+  const mostHeight = Math.max(320, overlay.clientHeight - vertical);
+  return {
+    minWidth: Math.min(640, mostWidth),
+    maxWidth: mostWidth,
+    minHeight: Math.min(460, mostHeight),
+    maxHeight: mostHeight,
+  };
+}
+
+function setBigChatSeparatorValue(id, value, least, most) {
+  const separator = $(id);
+  if (!separator) return;
+  separator.setAttribute("aria-valuemin", String(Math.round(least)));
+  separator.setAttribute("aria-valuemax", String(Math.round(most)));
+  separator.setAttribute("aria-valuenow", String(Math.round(value)));
+}
+
+function applyTheBigChatLayout() {
+  const sheet = document.querySelector(".the-big-chat-sheet");
+  if (!sheet) return;
+  const bounds = theBigChatSheetBounds();
+  sheet.style.width = theBigChatLayout.width == null ? ""
+    : `${boundedBigChatSize(theBigChatLayout.width, bounds.minWidth, bounds.maxWidth)}px`;
+  sheet.style.height = theBigChatLayout.height == null ? ""
+    : `${boundedBigChatSize(theBigChatLayout.height, bounds.minHeight, bounds.maxHeight)}px`;
+
+  const sheetWidth = sheet.getBoundingClientRect().width;
+  const sidebarMax = Math.max(160, sheetWidth - 430);
+  const sidebar = boundedBigChatSize(theBigChatLayout.sidebar, 160, sidebarMax);
+  sheet.style.setProperty("--big-chat-sidebar-width", `${sidebar}px`);
+  setBigChatSeparatorValue("theBigChatSidebarResize", sidebar, 160, sidebarMax);
+
+  const main = document.querySelector(".the-big-chat-main");
+  const mainWidth = main?.getBoundingClientRect().width || 620;
+  const activityMax = Math.max(160, mainWidth - 280);
+  const activity = boundedBigChatSize(theBigChatLayout.activity, 160, activityMax);
+  sheet.style.setProperty("--big-chat-activity-width", `${activity}px`);
+  setBigChatSeparatorValue("theBigChatActivityResize", activity, 160, activityMax);
+
+  const mainHeight = main?.getBoundingClientRect().height || 560;
+  const shared = Math.max(222, mainHeight - 24 - 96);
+  const destinationMax = Math.max(72, shared - 150);
+  const destination = boundedBigChatSize(theBigChatLayout.destination, 72, destinationMax);
+  const composerMax = Math.max(150, shared - destination);
+  const composer = boundedBigChatSize(theBigChatLayout.composer, 150, composerMax);
+  sheet.style.setProperty("--big-chat-destination-height", `${destination}px`);
+  sheet.style.setProperty("--big-chat-composer-height", `${composer}px`);
+  setBigChatSeparatorValue("theBigChatDestinationResize", destination, 72, destinationMax);
+  setBigChatSeparatorValue("theBigChatComposerResize", composer, 150, composerMax);
+}
+
+function resetTheBigChatLayout(part = "all") {
+  if (part === "all" || part === "window") {
+    theBigChatLayout.width = null;
+    theBigChatLayout.height = null;
+  }
+  for (const name of ["sidebar", "activity", "destination", "composer"]) {
+    if (part === "all" || part === name) theBigChatLayout[name] = BIG_CHAT_LAYOUT_DEFAULTS[name];
+  }
+  applyTheBigChatLayout();
+  saveTheBigChatLayout();
+  if (theBigOne) {
+    $("theBigChatSaidBack").textContent = part === "all"
+      ? "Default chat sizes restored." : "Default pane size restored.";
+  }
+}
+
+function beginTheBigChatResize(kind, event) {
+  if (event.button !== 0) return;
+  const sheet = document.querySelector(".the-big-chat-sheet");
+  const destination = $("theBigChatDestination");
+  const bottom = document.querySelector(".the-big-chat-bottom");
+  const sidebar = document.querySelector(".the-big-chat-conversations");
+  const activity = document.querySelector(".the-big-chat-doing");
+  if (!sheet || !destination || !bottom || !sidebar || !activity) return;
+  event.preventDefault();
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  theBigChatResize = {
+    kind,
+    x: event.clientX,
+    y: event.clientY,
+    width: sheet.getBoundingClientRect().width,
+    height: sheet.getBoundingClientRect().height,
+    sidebar: sidebar.getBoundingClientRect().width,
+    activity: activity.getBoundingClientRect().width,
+    destination: destination.getBoundingClientRect().height,
+    composer: bottom.getBoundingClientRect().height,
+  };
+  const axis = kind === "window" ? "both"
+    : ["sidebar", "activity"].includes(kind) ? "vertical" : "horizontal";
+  document.body.classList.add("big-chat-resizing");
+  document.body.dataset.bigChatResizeAxis = axis;
+}
+
+function moveTheBigChatResize(event) {
+  if (!theBigChatResize) return;
+  const dx = event.clientX - theBigChatResize.x;
+  const dy = event.clientY - theBigChatResize.y;
+  if (theBigChatResize.kind === "window") {
+    // The sheet is centred, so both edges move by half of a width change.
+    theBigChatLayout.width = theBigChatResize.width + (dx * 2);
+    theBigChatLayout.height = theBigChatResize.height + (dy * 2);
+  } else if (theBigChatResize.kind === "sidebar") {
+    theBigChatLayout.sidebar = theBigChatResize.sidebar + dx;
+  } else if (theBigChatResize.kind === "activity") {
+    theBigChatLayout.activity = theBigChatResize.activity - dx;
+  } else if (theBigChatResize.kind === "destination") {
+    theBigChatLayout.destination = theBigChatResize.destination + dy;
+  } else if (theBigChatResize.kind === "composer") {
+    theBigChatLayout.composer = theBigChatResize.composer - dy;
+  }
+  applyTheBigChatLayout();
+}
+
+function finishTheBigChatResize() {
+  if (!theBigChatResize) return;
+  theBigChatResize = null;
+  document.body.classList.remove("big-chat-resizing");
+  delete document.body.dataset.bigChatResizeAxis;
+  saveTheBigChatLayout();
+}
+
+function resizeTheBigChatWithKeys(kind, event) {
+  if (event.key === "Home") {
+    event.preventDefault();
+    resetTheBigChatLayout(kind);
+    return;
+  }
+  const step = event.shiftKey ? 48 : 16;
+  let changed = false;
+  if (kind === "window" && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
+    const current = document.querySelector(".the-big-chat-sheet").getBoundingClientRect().width;
+    theBigChatLayout.width = current + (event.key === "ArrowRight" ? step : -step);
+    changed = true;
+  } else if (kind === "window" && ["ArrowUp", "ArrowDown"].includes(event.key)) {
+    const current = document.querySelector(".the-big-chat-sheet").getBoundingClientRect().height;
+    theBigChatLayout.height = current + (event.key === "ArrowDown" ? step : -step);
+    changed = true;
+  } else if (["sidebar", "activity"].includes(kind)
+      && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
+    const direction = event.key === "ArrowRight" ? step : -step;
+    theBigChatLayout[kind] += kind === "activity" ? -direction : direction;
+    changed = true;
+  } else if (["destination", "composer"].includes(kind)
+      && ["ArrowUp", "ArrowDown"].includes(event.key)) {
+    const direction = event.key === "ArrowDown" ? step : -step;
+    theBigChatLayout[kind] += kind === "composer" ? -direction : direction;
+    changed = true;
+  }
+  if (!changed) return;
+  event.preventDefault();
+  applyTheBigChatLayout();
+  saveTheBigChatLayout();
+}
+
+function wireTheBigChatResizer(id, kind) {
+  const control = $(id);
+  control.addEventListener("pointerdown", (event) => beginTheBigChatResize(kind, event));
+  control.addEventListener("keydown", (event) => resizeTheBigChatWithKeys(kind, event));
+  control.addEventListener("dblclick", () => resetTheBigChatLayout(kind));
+}
 
 function rememberTheBigChatComposer() {
   const box = $("theBigChatBox");
@@ -9767,6 +9978,7 @@ function openTheBigChat(agentId) {
   theBigOne = agentId;
   $("theBigChatTitle").textContent = `${agent.name} — Nexus chat`;
   $("theBigChat").hidden = false;
+  applyTheBigChatLayout();
   renderTheChatTray();
   renderTheBigChat();
   // Opening the compact chat already started this read. Starting it twice made
@@ -10307,6 +10519,16 @@ function wireUpTheTray() {
   $("theChatTrayOn").addEventListener("click", () => scrollTheTray(320));
   $("theBigChatSmall").addEventListener("click", minimiseTheBigChat);
   $("theBigChatShut").addEventListener("click", shutTheBigChat);
+  $("theBigChatResetLayout").addEventListener("click", () => resetTheBigChatLayout());
+  wireTheBigChatResizer("theBigChatWindowResize", "window");
+  wireTheBigChatResizer("theBigChatSidebarResize", "sidebar");
+  wireTheBigChatResizer("theBigChatActivityResize", "activity");
+  wireTheBigChatResizer("theBigChatDestinationResize", "destination");
+  wireTheBigChatResizer("theBigChatComposerResize", "composer");
+  window.addEventListener("pointermove", moveTheBigChatResize);
+  window.addEventListener("pointerup", finishTheBigChatResize);
+  window.addEventListener("pointercancel", finishTheBigChatResize);
+  window.addEventListener("resize", applyTheBigChatLayout);
   $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("auto"));
   $("theBigChatStop").addEventListener("click", () => stopChatFor(theBigOne));
   $("theBigChatAttach").addEventListener("click", () => $("theBigChatFiles").click());

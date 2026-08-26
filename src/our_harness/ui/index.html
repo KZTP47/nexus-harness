@@ -898,6 +898,8 @@
           <div class="the-big-chat-top">
             <h3 id="theBigChatTitle">Chat</h3>
             <div class="button-row">
+              <button id="theBigChatResetLayout" type="button"
+                title="Restore the default chat window and pane sizes">Reset sizes</button>
               <button id="theBigChatSmall" type="button">Minimise</button>
               <button id="theBigChatShut" type="button">Close this chat</button>
             </div>
@@ -913,16 +915,32 @@
               <div id="theBigChatConversationList" class="the-big-chat-conversation-list"></div>
               <p id="theBigChatConversationSaid" class="hint" role="status" aria-live="polite"></p>
             </aside>
+            <button id="theBigChatSidebarResize" class="the-big-chat-resizer vertical" type="button"
+              role="separator" aria-orientation="vertical"
+              aria-label="Resize the agent chats list" aria-controls="theBigChatConversationList"
+              title="Drag left or right. Double-click to reset this pane."><span aria-hidden="true"></span></button>
             <div class="the-big-chat-main">
               <div id="theBigChatDestination"></div>
+              <button id="theBigChatDestinationResize" class="the-big-chat-resizer horizontal" type="button"
+                role="separator" aria-orientation="horizontal"
+                aria-label="Resize where this chat happens" aria-controls="theBigChatDestination"
+                title="Drag up or down. Double-click to reset this pane."><span aria-hidden="true"></span></button>
               <div class="the-big-chat-middle">
                 <ol id="theBigChatSaid" class="the-big-chat-said"
                   aria-labelledby="theBigChatTitle"></ol>
+                <button id="theBigChatActivityResize" class="the-big-chat-resizer vertical" type="button"
+                  role="separator" aria-orientation="vertical"
+                  aria-label="Resize the activity pane" aria-controls="theBigChatSaid theBigChatDoing"
+                  title="Drag left or right. Double-click to reset this pane."><span aria-hidden="true"></span></button>
                 <aside class="the-big-chat-doing" aria-labelledby="theBigChatDoingTitle">
                   <h4 id="theBigChatDoingTitle">What it has going on</h4>
                   <ul id="theBigChatDoing" class="the-big-chat-doing-list"></ul>
                 </aside>
               </div>
+              <button id="theBigChatComposerResize" class="the-big-chat-resizer horizontal" type="button"
+                role="separator" aria-orientation="horizontal"
+                aria-label="Resize the message composer and controls" aria-controls="theBigChatBox"
+                title="Drag up or down. Double-click to reset this pane."><span aria-hidden="true"></span></button>
               <div class="the-big-chat-bottom">
             <section id="theBigChatActivity" class="chat-activity" hidden
               role="status" aria-live="polite" aria-atomic="true">
@@ -974,6 +992,9 @@
               </div>
             </div>
           </div>
+          <button id="theBigChatWindowResize" class="the-big-chat-window-resize" type="button"
+            aria-label="Resize the whole chat window"
+            title="Drag to resize the whole chat window. Double-click to reset it."></button>
         </div>
       </div>
 

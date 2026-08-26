@@ -1596,6 +1596,47 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn(".the-big-chat-workspace", self.styles)
         self.assertIn(".the-big-chat-conversation-pick.active", self.styles)
 
+    def test_every_major_maximised_chat_pane_is_resizable_and_persisted(self) -> None:
+        for identity in (
+            'id="theBigChatWindowResize"',
+            'id="theBigChatSidebarResize"',
+            'id="theBigChatActivityResize"',
+            'id="theBigChatDestinationResize"',
+            'id="theBigChatComposerResize"',
+            'id="theBigChatResetLayout"',
+        ):
+            self.assertIn(identity, self.markup)
+        self.assertGreaterEqual(self.markup.count('role="separator"'), 4)
+        self.assertIn('aria-orientation="vertical"', self.markup)
+        self.assertIn('aria-orientation="horizontal"', self.markup)
+
+        for contract in (
+            "--big-chat-sidebar-width",
+            "--big-chat-activity-width",
+            "--big-chat-destination-height",
+            "--big-chat-composer-height",
+            "cursor: col-resize",
+            "cursor: row-resize",
+            "cursor: nwse-resize",
+            "@container big-chat",
+        ):
+            self.assertIn(contract, self.styles)
+
+        for contract in (
+            'BIG_CHAT_LAYOUT_KEY = "nexus-big-chat-layout-v1"',
+            "window.localStorage.getItem(BIG_CHAT_LAYOUT_KEY)",
+            "window.localStorage.setItem(BIG_CHAT_LAYOUT_KEY",
+            "function applyTheBigChatLayout()",
+            "function beginTheBigChatResize(kind, event)",
+            "function moveTheBigChatResize(event)",
+            "function resizeTheBigChatWithKeys(kind, event)",
+            'control.addEventListener("dblclick"',
+            'window.addEventListener("resize", applyTheBigChatLayout)',
+        ):
+            self.assertIn(contract, self.script)
+        self.assertIn("minWidth: Math.min(640, mostWidth)", self.script)
+        self.assertIn("minHeight: Math.min(460, mostHeight)", self.script)
+
     def test_every_chat_plainly_names_where_it_lives_and_opens_full(self) -> None:
         self.assertIn('id="theBigChatDestination"', self.markup)
         self.assertIn('"Where this chat happens"', self.script)
@@ -2437,9 +2478,11 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertIn('previousKey === legacyKey', script)
         self.assertIn('$("theBigChatBox").addEventListener("input", rememberTheBigChatComposer)',
                       script)
-        self.assertIn('max-height: min(220px, 22vh)', styles)
-        self.assertIn('max-height: 42vh', styles)
-        self.assertIn('grid-template-rows: auto minmax(0, 1fr) auto', styles)
+        self.assertIn('--big-chat-destination-height:', styles)
+        self.assertIn('--big-chat-composer-height:', styles)
+        self.assertIn('minmax(96px, 1fr)', styles)
+        self.assertIn('minmax(150px, var(--big-chat-composer-height))', styles)
+        self.assertIn('overflow-y: auto', styles)
 
     def test_delayed_answer_never_clears_the_next_maximised_draft(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(

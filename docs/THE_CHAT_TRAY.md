@@ -29,6 +29,22 @@ A chat under GPT Codex ↔ Claude is not reused by GPT Codex ↔ Gemini, even wh
 the same provider route appears in both pairs. A lone agent keeps a direct-chat
 fallback until another agent is connected.
 
+### Resize it to fit the work
+
+The maximised chat is not a fixed dashboard. Five visible resize controls let
+somebody change the whole window, the agent-chat list, the **Where this chat
+happens** section, the transcript/activity split, and the composer/control
+section. Drag a handle with a mouse or touch input. When a handle has keyboard
+focus, use the arrow keys for 16-pixel steps or Shift+Arrow for 48-pixel steps.
+Home or a double-click restores that one boundary; **Reset sizes** restores the
+entire layout.
+
+Sizes are kept in the browser/Electron profile and return after the app is
+reopened. They are clamped to the current viewport and to functional pane
+minimums, so moving from a large monitor to a small one cannot strand the close,
+send, or reset controls off-screen. Narrow chat windows collapse the optional
+activity pane while leaving the transcript and composer usable.
+
 Older Nexus versions stored one transcript under an agent's stable board name
 before pair chats had opaque IDs. The chat index now detects those files and
 adds a clearly labelled **Recovered older chat** under that agent without
