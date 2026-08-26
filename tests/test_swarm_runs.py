@@ -251,6 +251,7 @@ class SwarmRunStoreTests(unittest.TestCase):
         active = 0
         most_active = 0
         guard = threading.Lock()
+        both_effects_entered = threading.Barrier(2)
 
         def ask(route: str) -> None:
             nonlocal active, most_active
@@ -258,7 +259,7 @@ class SwarmRunStoreTests(unittest.TestCase):
                 with guard:
                     active += 1
                     most_active = max(most_active, active)
-                time.sleep(0.03)
+                both_effects_entered.wait(timeout=10)
                 with guard:
                     active -= 1
 
