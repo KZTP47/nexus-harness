@@ -624,8 +624,15 @@ class TheUninstallerTests(unittest.TestCase):
             roaming.mkdir(parents=True)
             (cli / "bin" / "harness.cmd").write_text("@echo off\n", encoding="ascii")
             shortcut.write_bytes(b"stand-in shortcut")
+            # A dry run against a fake account must not probe this machine's
+            # real Known Folder through PowerShell.  Besides escaping the
+            # isolation boundary, that external process can stall under CI
+            # load.  cmd built-ins still exercise every fake path below.
+            empty_path = root / "empty-path"
+            empty_path.mkdir()
             environment = {
                 **os.environ,
+                "PATH": str(empty_path),
                 "LOCALAPPDATA": str(local),
                 "APPDATA": str(roaming),
                 "USERPROFILE": str(profile),
@@ -633,8 +640,9 @@ class TheUninstallerTests(unittest.TestCase):
                 "OneDriveCommercial": "",
                 "OneDriveConsumer": "",
             }
+            command = os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe")
             done = subprocess.run(
-                ["cmd.exe", "/d", "/c", str(self.script), "/S", "/DRY-RUN"],
+                [command, "/d", "/c", str(self.script), "/S", "/DRY-RUN"],
                 cwd=root, env=environment, capture_output=True, text=True, timeout=30,
             )
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
