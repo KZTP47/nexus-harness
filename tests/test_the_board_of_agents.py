@@ -1960,6 +1960,46 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('who: route', adding)
 
 
+class _BoundedTestHTTPServer(server.HarnessHTTPServer):
+    """Track daemon request workers so fixture teardown can wait, but not hang."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        self._request_condition = threading.Condition()
+        self._active_requests = 0
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address) -> None:
+        # Count before ThreadingMixIn starts the worker.  Counting only inside
+        # process_request_thread leaves a small spawn/start race at teardown.
+        with self._request_condition:
+            self._active_requests += 1
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._request_condition:
+                self._active_requests -= 1
+                self._request_condition.notify_all()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._request_condition:
+                self._active_requests -= 1
+                self._request_condition.notify_all()
+
+    def wait_for_request_workers(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._request_condition:
+            while self._active_requests:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self._request_condition.wait(left)
+            return True
+
+
 class WhatThePanelIsTold(BoardTestCase):
     HTTP_TIMEOUT_SECONDS = 30
 
@@ -1967,12 +2007,19 @@ class WhatThePanelIsTold(BoardTestCase):
         super().setUp()
         self.where = self.a_project()
         config = load_config(self.where)
-        self.panel = server.HarnessHTTPServer(("127.0.0.1", 0), config)
+        self.panel = _BoundedTestHTTPServer(("127.0.0.1", 0), config)
         self.addCleanup(self.panel.server_close)
+        self.addCleanup(self.assert_panel_requests_finished)
         self.port = self.panel.server_address[1]
         thread = threading.Thread(target=self.panel.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(self.panel.shutdown)
+
+    def assert_panel_requests_finished(self) -> None:
+        self.assertTrue(
+            self.panel.wait_for_request_workers(5),
+            "the panel test left an HTTP request worker running after shutdown",
+        )
 
     def ask(self, path: str, body: dict | None = None) -> tuple[int, dict]:
         asked = urllib.request.Request(
@@ -1996,20 +2043,6 @@ class WhatThePanelIsTold(BoardTestCase):
             # noise that hides a real one.
             with exc:
                 return exc.code, json.loads(exc.read().decode("utf-8"))
-
-    def wait_for_chat_resource_release(self, subject: str) -> None:
-        """Bound the response/finally race before Windows removes the test DB."""
-
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            with self.panel.swarm_runs._read() as database:
-                outstanding = database.execute(
-                    "SELECT COUNT(*) FROM resources"
-                ).fetchone()[0]
-            if not outstanding:
-                return
-            time.sleep(0.01)
-        self.fail(f"{subject} did not release its durable resource lease")
 
     def test_an_empty_board_is_still_an_answer(self) -> None:
         status, said = self.ask("/api/swarm")
@@ -2237,6 +2270,7 @@ class WhatThePanelIsTold(BoardTestCase):
         ]}})
         entered = threading.Event()
         release = threading.Event()
+        self.addCleanup(release.set)
         result: list[tuple[int, dict]] = []
 
         def slow_answer(*_args, **_kwargs):
@@ -2275,6 +2309,7 @@ class WhatThePanelIsTold(BoardTestCase):
         other = self.a_project("switch-target")
         entered = threading.Event()
         release = threading.Event()
+        self.addCleanup(release.set)
         seen: dict[str, object] = {}
         result: list[tuple[int, dict]] = []
 
@@ -2316,6 +2351,7 @@ class WhatThePanelIsTold(BoardTestCase):
         other = self.a_project("board-switch-target")
         entered = threading.Event()
         release = threading.Event()
+        self.addCleanup(release.set)
         result: list[tuple[int, dict]] = []
 
         def slow_start(config, _standing, request_id):
@@ -2695,7 +2731,6 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(
             talked.call_args.kwargs["conversation_key"], conversation["filed_as"]
         )
-        self.wait_for_chat_resource_release("the pair chat")
 
     def test_casual_pair_send_allows_the_selected_agents_answer_to_survive_peer_failure(self) -> None:
         self.ask("/api/swarm/save", {"board": {
@@ -2763,11 +2798,6 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(said["routing"]["selected"], "chat")
         recipients = talked.call_args.kwargs["recipients"]
         self.assertEqual([one["id"] for one in recipients], ["agent-1"])
-        # The response is written immediately before the request handler's
-        # finally block releases the cross-process conversation lease. Wait
-        # for that exact durable cleanup before Windows removes the temporary
-        # SQLite database at test teardown.
-        self.wait_for_chat_resource_release("the solo chat")
 
     def test_asking_about_an_agent_that_is_gone(self) -> None:
         status, said = self.ask("/api/swarm/said?agent=agent-9")
