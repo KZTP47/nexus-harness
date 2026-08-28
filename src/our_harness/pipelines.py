@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -64,6 +65,13 @@ CANONICAL_OUTCOMES = frozenset({
 # a file name on any machine.
 NAME_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$")
 WHERE_THEY_LIVE = ".harness/pipelines"
+AUTOMATION_DOCUMENT_SCHEMA = "nexus-harness.visual-automation"
+AUTOMATION_DOCUMENT_VERSION = 1
+# Imported and saved definitions stay below the 12 MB transport/native-export
+# ceiling with room for the version envelope and JSON formatting. The UI says
+# this limit before a file is chosen; it is a portability bound, not a hidden
+# prompt or model-context limit.
+MAX_AUTOMATION_DOCUMENT_BYTES = 10_000_000
 # Where a model's writing goes. Deliberately somewhere no test runner looks:
 # what a model wrote is a draft for a person to read, not something the next
 # step of the same run should be able to execute.
@@ -562,19 +570,41 @@ def file_for(config: LoadedConfig, name: str) -> Path:
     )
 
 
-def saved_ones(config: LoadedConfig) -> list[str]:
+def saved_inventory(config: LoadedConfig) -> tuple[list[str], list[str]]:
+    """Return visible automations and honest, non-fatal file problems.
+
+    Older releases silently omitted a saved file when it was malformed.  That
+    made a damaged automation look exactly like one which had never been
+    saved.  Healthy files remain usable, but the panel can now say which file
+    needs attention.
+    """
+
     where = folder(config)
     if not where.is_dir():
-        return []
-    found = []
+        return [], []
+    found: list[str] = []
+    problems: list[str] = []
     for path in sorted(where.glob("*.json")):
+        # Run state is deliberately beside the definitions, but is not one.
+        if path.name == "last-run.json":
+            continue
         try:
             held = _read_it_whole(path)
-        except (OSError, json.JSONDecodeError):
+            tidy = read_it(held)
+        except (
+            OSError, UnicodeDecodeError, json.JSONDecodeError,
+            RecursionError, PipelineError,
+        ) as exc:
+            problems.append(f"{path.name}: {exc}")
             continue
-        if isinstance(held, dict) and isinstance(held.get("name"), str):
-            found.append(held["name"])
-    return found
+        found.append(tidy["name"])
+    return sorted(found, key=str.casefold), problems
+
+
+def saved_ones(config: LoadedConfig) -> list[str]:
+    """Names kept for callers written before inventory warnings existed."""
+
+    return saved_inventory(config)[0]
 
 
 def load(config: LoadedConfig, name: str) -> dict[str, Any]:
@@ -639,7 +669,7 @@ def _the_one_called(config: LoadedConfig, name: str) -> tuple[Path, dict[str, An
         raise PipelineError(f"There is no pipeline called {name}")
     try:
         held = _read_it_whole(path)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise PipelineError(f"{path.name} cannot be read: {exc}") from exc
     there = str(held.get("name") or "") if isinstance(held, dict) else ""
     if there and there.strip().lower() != str(name).strip().lower():
@@ -687,6 +717,26 @@ def _write_it_whole(path: Path, written: str) -> None:
             f"{path.name} is held open by something else, so it could not be "
             "saved. Close whatever has it open and try again."
         ) from None
+
+
+def _write_new_whole(path: Path, written: str, *, what: str) -> None:
+    """Atomically create one complete file, refusing any concurrent winner."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    beside = path.with_name(
+        f".{path.name}.{os.getpid()}-{threading.get_ident()}-{time.time_ns()}.part"
+    )
+    try:
+        beside.write_text(written, encoding="utf-8")
+        try:
+            os.link(beside, path)
+        except FileExistsError as exc:
+            raise PipelineError(
+                f"There is already an automation called {what}. "
+                "Choose a different name; nothing was overwritten."
+            ) from exc
+    finally:
+        beside.unlink(missing_ok=True)
 
 
 def _read_it_whole(path: Path) -> Any:
@@ -784,6 +834,7 @@ def _what_changed(was: dict[str, Any], now: dict[str, Any]) -> str:
 
 def save(config: LoadedConfig, pipeline: Any) -> dict[str, Any]:
     tidy = read_it(pipeline)
+    _definition_json(tidy)
     path = file_for(config, tidy["name"])
     # "Nightly build" and "Nightly Build" become the same file name. Writing
     # anyway would throw one of them away without a word.
@@ -821,7 +872,190 @@ def create_blank(config: LoadedConfig, name: str) -> dict[str, Any]:
         raise PipelineError(
             f"There is already an automation called {tidy['name']}. Choose a different name."
         )
-    _write_it_whole(path, json.dumps(tidy, indent=2) + "\n")
+    _write_new_whole(
+        path, json.dumps(tidy, indent=2) + "\n", what=tidy["name"]
+    )
+    return tidy
+
+
+def export_document(config: LoadedConfig, name: str) -> dict[str, Any]:
+    """A portable, versioned document containing one saved automation."""
+
+    tidy = load(config, name)
+    document = {
+        "schema": AUTOMATION_DOCUMENT_SCHEMA,
+        "version": AUTOMATION_DOCUMENT_VERSION,
+        "automation": tidy,
+    }
+    _portable_document_json(tidy)
+    return document
+
+
+def _automation_from_document(document: Any) -> dict[str, Any]:
+    """Read both the new exchange envelope and legacy raw saved JSON."""
+
+    if not isinstance(document, dict):
+        raise PipelineError("The imported JSON root must be an object.")
+    if "schema" not in document and "automation" not in document:
+        return read_it(document)
+    if set(document) - {"schema", "version", "automation"}:
+        raise PipelineError(
+            "The imported automation file contains unsupported envelope fields. "
+            "Nothing was imported."
+        )
+    if document.get("schema") != AUTOMATION_DOCUMENT_SCHEMA:
+        raise PipelineError("That JSON is not a Nexus Harness visual automation.")
+    if document.get("version") != AUTOMATION_DOCUMENT_VERSION:
+        raise PipelineError(
+            "That visual automation uses an import version this Nexus Harness does not support."
+        )
+    return read_it(document.get("automation"))
+
+
+def _raw_automation_from_document(document: dict[str, Any]) -> Any:
+    if "schema" not in document and "automation" not in document:
+        return document
+    return document.get("automation")
+
+
+def _definition_json(tidy: dict[str, Any]) -> str:
+    """Serialize one accepted definition and keep all exchange paths aligned."""
+
+    written = json.dumps(tidy, indent=2) + "\n"
+    _portable_document_json(tidy)
+    return written
+
+
+def _portable_document_json(tidy: dict[str, Any]) -> str:
+    """Serialize the file users export, not merely its smaller inner value.
+
+    The visible 10 MB boundary belongs to the portable JSON file.  Checking
+    only the saved definition allowed a definition at the exact boundary even
+    though adding the schema envelope made its own export impossible to import.
+    ``ensure_ascii=False`` matches ``JSON.stringify`` in the renderer.
+    """
+
+    written = json.dumps(
+        {
+            "schema": AUTOMATION_DOCUMENT_SCHEMA,
+            "version": AUTOMATION_DOCUMENT_VERSION,
+            "automation": tidy,
+        },
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n"
+    if len(written.encode("utf-8")) > MAX_AUTOMATION_DOCUMENT_BYTES:
+        raise PipelineError(
+            "This automation is larger than the visible 10 MB saved-automation limit. "
+            "Split very large embedded instructions across steps or project files."
+        )
+    return written
+
+
+def _check_import_is_canonical(raw: Any, tidy: dict[str, Any]) -> None:
+    """Reject imported values the editor's tolerant reader would change."""
+
+    if not isinstance(raw, dict):
+        return  # read_it already gives the precise root error
+    if set(raw) - {"name", "nodes", "edges"}:
+        raise PipelineError("The imported automation contains unsupported top-level fields.")
+    if "name" in raw and raw["name"] != tidy["name"]:
+        raise PipelineError("The imported automation name would be changed. Nothing was imported.")
+    raw_nodes = raw.get("nodes")
+    raw_edges = raw.get("edges", [])
+    if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list):
+        return  # read_it reports this shape
+    if len(raw_nodes) != len(tidy["nodes"]):
+        raise PipelineError("The imported automation would lose a step. Nothing was imported.")
+    for raw_node, node in zip(raw_nodes, tidy["nodes"]):
+        if not isinstance(raw_node, dict):
+            continue
+        if set(raw_node) - {"id", "kind", "label", "settings", "at"}:
+            raise PipelineError(
+                f"Imported step {node['id']} contains unsupported fields. Nothing was imported."
+            )
+        for key in ("id", "kind"):
+            if raw_node.get(key) != node[key]:
+                raise PipelineError(
+                    f"Imported step {node['id']} has a {key} that would be changed. "
+                    "Nothing was imported."
+                )
+        if "label" in raw_node and raw_node.get("label") != node["label"]:
+            raise PipelineError(
+                f"Imported step {node['id']} has a label longer than 80 characters or "
+                "one that would be changed. Nothing was imported."
+            )
+        if "settings" in raw_node and raw_node.get("settings") != node["settings"]:
+            raise PipelineError(
+                f"Imported step {node['id']} has settings that would be changed. "
+                "Nothing was imported."
+            )
+        if "at" in raw_node:
+            at = raw_node.get("at")
+            if not isinstance(at, dict) or set(at) - {"x", "y"}:
+                raise PipelineError(
+                    f"Imported step {node['id']} has an invalid position. Nothing was imported."
+                )
+            for axis in ("x", "y"):
+                value = at.get(axis, 0)
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or not float(value) == node["at"][axis]):
+                    raise PipelineError(
+                        f"Imported step {node['id']} has an invalid {axis} position. "
+                        "Nothing was imported."
+                    )
+    if len(raw_edges) != len(tidy["edges"]):
+        raise PipelineError(
+            "The imported automation contains a duplicate arrow that would be discarded. "
+            "Nothing was imported."
+        )
+    for raw_edge, edge in zip(raw_edges, tidy["edges"]):
+        if raw_edge != edge:
+            raise PipelineError(
+                "An imported automation arrow would be changed. Nothing was imported."
+            )
+
+
+def import_document(config: LoadedConfig, written: Any, *, name: str = "") -> dict[str, Any]:
+    """Validate and no-clobber import a JSON automation.
+
+    Parsing and validation finish before a directory or file is created.  A
+    bad import therefore cannot alter the saved list, and importing a duplicate
+    can never quietly replace the person's working automation.
+    """
+
+    if not isinstance(written, str):
+        raise PipelineError("The imported automation has to be JSON text.")
+    try:
+        raw = written.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise PipelineError("The imported automation is not valid UTF-8 text.") from exc
+    if not raw or len(raw) > MAX_AUTOMATION_DOCUMENT_BYTES:
+        raise PipelineError(
+            f"An imported automation must contain 1 to {MAX_AUTOMATION_DOCUMENT_BYTES} UTF-8 bytes."
+        )
+    try:
+        document = json.loads(written)
+    except json.JSONDecodeError as exc:
+        raise PipelineError(f"The imported automation is not valid JSON: {exc.msg}.") from exc
+    except RecursionError as exc:
+        raise PipelineError("The imported automation is nested too deeply to read.") from exc
+    raw_automation = _raw_automation_from_document(document)
+    tidy = _automation_from_document(document)
+    _check_import_is_canonical(raw_automation, tidy)
+    if name != "":
+        if not isinstance(name, str):
+            raise PipelineError("The imported automation name has to be text.")
+        if name.strip():
+            tidy = read_it({**tidy, "name": name})
+    path = file_for(config, tidy["name"])
+    if path.exists():
+        raise PipelineError(
+            f"There is already an automation called {tidy['name']}. "
+            "Import it with a different name; nothing was overwritten."
+        )
+    _write_new_whole(path, _definition_json(tidy), what=tidy["name"])
     return tidy
 
 

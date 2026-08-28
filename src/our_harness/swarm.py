@@ -712,12 +712,14 @@ def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -
             config, one.who, one.filed_as_name or filed_as(one.name)
         ))
         agents.append(held)
+    kept, kept_problems = kept_board_inventory()
     return {
         "board": dict(board.to_dict(), agents=agents),
         # The boards somebody saved under a name. Sent with the board itself, so
         # opening the panel shows what is kept without pressing anything - and
         # so anything that changes the list has the new one in its answer.
-        "kept": every_kept_board(),
+        "kept": kept,
+        "kept_problems": kept_problems,
         "who_can_be_used": can_talk,
         "projects_on_this_machine": [
             one.to_dict() for one in projects_lab.every_one(config.project_root)
@@ -1774,6 +1776,38 @@ def _how_it_went(doing: Doing) -> str:
 MOST_KEPT_BOARDS = 60
 # How long a name may be, so it fits on a row and in a file name.
 LONGEST_BOARD_NAME = 48
+SAVED_BOARD_DOCUMENT = "nexus-harness.saved-board.v1"
+# A full board may contain 24 resized profile pictures of up to 400 kB each.
+# Keep the exchange boundary aligned with the server's ordinary request limit
+# so every valid board can be backed up instead of discovering a smaller,
+# hidden import/export limit later.
+MAX_SAVED_BOARD_DOCUMENT_BYTES = 10_000_000
+
+
+def _portable_board_document(
+    name: str, saved_at: str, board: Board
+) -> dict[str, Any]:
+    """Build and size the exact portable file shown to the user.
+
+    A tolerant board read may derive display fields such as a project's name.
+    Those fields can make the canonical export larger than the uploaded input,
+    so the exported envelope itself is the boundary that matters.
+    """
+
+    document = {
+        "format": SAVED_BOARD_DOCUMENT,
+        "name": name,
+        "saved_at": saved_at,
+        "board": board.to_dict(),
+    }
+    written = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+    if len(written.encode("utf-8")) > MAX_SAVED_BOARD_DOCUMENT_BYTES:
+        raise SwarmError(
+            "This board is larger than the visible 10 MB saved-board limit after "
+            "Nexus prepares its portable JSON. Shorten an unusually long project "
+            "path or use smaller profile pictures; nothing was saved."
+        )
+    return document
 
 
 def where_the_kept_ones_live() -> Path:
@@ -1808,34 +1842,379 @@ def _filed_under(name: str) -> str:
     return f"{tidy}-{marked}.json"
 
 
-def every_kept_board() -> list[dict[str, Any]]:
-    """Every board somebody saved, newest first."""
+def kept_board_inventory() -> tuple[list[dict[str, Any]], list[str]]:
+    """Return healthy saved boards and honest, non-fatal file problems.
+
+    A damaged file is still the person's data. Silently omitting it makes the
+    panel say it vanished, so disclose its filename while leaving every healthy
+    board available.
+    """
 
     where = where_the_kept_ones_live()
     active = load().active_saved_board
     found: list[dict[str, Any]] = []
+    problems: list[str] = []
     try:
         files = sorted(where.glob("*.json"))
-    except OSError:
-        return []
+    except OSError as exc:
+        return [], [f"Saved-board folder cannot be read: {exc}"]
     for one in files:
         try:
             held = json.loads(one.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # A board that cannot be read is one that is not offered. It is not
-            # worth stopping the list of all the others over.
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            problems.append(f"{one.name}: {exc}")
             continue
         if not isinstance(held, dict) or not isinstance(held.get("name"), str):
+            problems.append(f"{one.name}: saved board root or name is invalid")
             continue
-        board = held.get("board") if isinstance(held.get("board"), dict) else {}
+        if not isinstance(held.get("board"), dict):
+            problems.append(f"{one.name}: saved board content is missing or invalid")
+            continue
+        board = held["board"]
+        try:
+            checked = read_it(board)
+        except SwarmError as exc:
+            problems.append(f"{held['name']} ({one.name}): {exc}")
+            continue
         found.append({
             "name": held["name"],
             "saved_at": str(held.get("saved_at") or ""),
-            "agents": len(board.get("agents") or []),
-            "projects": len(board.get("projects") or []),
+            "agents": len(checked.agents),
+            "projects": len(checked.projects),
             "active": held["name"] == active,
         })
-    return sorted(found, key=lambda one: one["saved_at"], reverse=True)
+    return sorted(found, key=lambda one: one["saved_at"], reverse=True), problems
+
+
+def every_kept_board() -> list[dict[str, Any]]:
+    """Every healthy board somebody saved, newest first."""
+
+    return kept_board_inventory()[0]
+
+
+def export_kept_board(name: str) -> dict[str, Any]:
+    """Return one validated, portable saved-board document."""
+
+    opened_as = " ".join(str(name).split())
+    where = where_the_kept_ones_live() / _filed_under(opened_as)
+    try:
+        written = where.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise SwarmError(f"There is no saved board called {name}.") from exc
+    except OSError as exc:
+        raise SwarmError(
+            f"The saved board called {name} is still on disk but cannot be read: {exc}"
+        ) from exc
+    try:
+        held = json.loads(written)
+    except json.JSONDecodeError as exc:
+        raise SwarmError(
+            f"The saved board called {name} is still on disk but its JSON is damaged: {exc.msg}."
+        ) from exc
+    except RecursionError as exc:
+        raise SwarmError(
+            f"The saved board called {name} is nested too deeply to read."
+        ) from exc
+    board = held.get("board") if isinstance(held, dict) else None
+    if not isinstance(board, dict):
+        raise SwarmError(f"The board saved as {name} cannot be read.")
+    # Export only a board that this version can actually open. This prevents a
+    # damaged local file becoming a convincing-looking backup that cannot be
+    # restored on the next computer.
+    checked = read_it(board)
+    return _portable_board_document(
+        opened_as, str(held.get("saved_at") or ""), checked
+    )
+
+
+def import_kept_board(document: Any, name: str = "") -> dict[str, Any]:
+    """Validate and save one portable board without opening it.
+
+    Importing a named snapshot is deliberately independent of project run
+    authority. A copied project's automation may be paused, but that must not
+    hide or hold hostage the user's own backup files. Opening or changing the
+    live board still goes through the run-aware mutation authority.
+    """
+
+    if not isinstance(document, dict):
+        raise SwarmError("That JSON file is not a saved Nexus board.")
+    if set(document) - {"format", "name", "saved_at", "board"}:
+        raise SwarmError(
+            "That saved-board file contains unsupported top-level fields. "
+            "Nothing was imported."
+        )
+    if "format" in document and document.get("format") != SAVED_BOARD_DOCUMENT:
+        raise SwarmError("That JSON file is not a saved Nexus board.")
+    board_value = document.get("board")
+    if not isinstance(board_value, dict):
+        raise SwarmError("That JSON file does not contain a board.")
+    _check_import_shape(board_value)
+    wanted = " ".join(str(name or document.get("name") or "").split())
+    filed = _filed_under(wanted)
+    checked = read_it(board_value)
+    # A board imported as a saved snapshot is not silently made the active
+    # board. The person chooses when to replace the canvas by opening it.
+    checked.active_saved_board = ""
+    where = where_the_kept_ones_live()
+    where.mkdir(parents=True, exist_ok=True)
+    from .safety import ProjectTransactionLock
+
+    # The target filename contains the display-name hash, so Friday and friday
+    # are different targets. Serialize the casefolded inventory check across
+    # processes as well as using a no-clobber final link.
+    with ProjectTransactionLock(where.parent).held(timeout_seconds=10):
+        target = where / filed
+        if target.exists() or any(
+            one["name"].casefold() == wanted.casefold() for one in every_kept_board()
+        ):
+            raise SwarmError(
+                f'There is already a saved board called "{wanted}". Choose another name.'
+            )
+        if len(every_kept_board()) >= MOST_KEPT_BOARDS:
+            raise SwarmError(
+                f"There are already {MOST_KEPT_BOARDS} saved boards, which is the most. "
+                "Delete one you no longer want first."
+            )
+        held = {
+            "name": wanted,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "board": checked.to_dict(),
+        }
+        _portable_board_document(wanted, held["saved_at"], checked)
+        beside = where / f".{filed}.{os.getpid()}.{time.time_ns()}.part"
+        try:
+            beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+            try:
+                os.link(beside, target)
+            except FileExistsError as exc:
+                raise SwarmError(
+                    f'There is already a saved board called "{wanted}". Choose another name.'
+                ) from exc
+        finally:
+            beside.unlink(missing_ok=True)
+    return {"name": wanted, "saved_at": held["saved_at"]}
+
+
+def _check_import_shape(board: dict[str, Any]) -> None:
+    """Reject exchange files that the ordinary tolerant loader would trim."""
+
+    if set(board) - {
+        "schema_version", "version", "made_agents", "made_projects", "agents",
+        "projects", "works_on", "talks_to", "active_saved_board",
+    }:
+        raise SwarmError(
+            "The imported board contains unsupported board fields. Nothing was imported."
+        )
+    if "schema_version" in board and board["schema_version"] != 1:
+        raise SwarmError("The imported board uses an unsupported schema version.")
+    for key in ("version", "made_agents", "made_projects"):
+        if key in board and not _is_a_count(board[key]):
+            raise SwarmError(
+                f"The imported board's {key} must be a non-negative whole number. "
+                "Nothing was imported."
+            )
+
+    limits = {
+        "agents": MOST_AGENTS,
+        "projects": MOST_PROJECTS,
+        "works_on": MOST_AGENTS * MOST_PROJECTS,
+        "talks_to": MOST_AGENTS * (MOST_AGENTS - 1) // 2,
+    }
+    for key, maximum in limits.items():
+        value = board.get(key, [])
+        if not isinstance(value, list) or any(not isinstance(one, dict) for one in value):
+            raise SwarmError(f"The imported board's {key} must be a list of objects.")
+        if len(value) > maximum:
+            raise SwarmError(
+                f"The imported board has {len(value)} {key}; {maximum} is the most. "
+                "Nothing was imported."
+            )
+    for project in board.get("projects", []):
+        tasks = project.get("tasks", [])
+        if not isinstance(tasks, list) or any(not isinstance(task, str) for task in tasks):
+            raise SwarmError("Every imported project task must be a line of text.")
+        if len(tasks) > MOST_TASKS:
+            raise SwarmError(
+                f"An imported project has {len(tasks)} tasks; {MOST_TASKS} is the most. "
+                "Nothing was imported."
+            )
+    explicit_ids: set[str] = set()
+
+    def explicit_id(item: dict[str, Any], kind: str) -> str:
+        if "id" not in item:
+            return ""
+        value = item.get("id")
+        if not isinstance(value, str) or not value or value.strip() != value:
+            raise SwarmError(
+                f"Every explicit imported {kind} id must be non-empty text. "
+                "Nothing was imported."
+            )
+        if value in explicit_ids:
+            raise SwarmError(
+                f"The imported board uses id {value!r} more than once. Nothing was imported."
+            )
+        explicit_ids.add(value)
+        return value
+
+    def exact_place(item: dict[str, Any], kind: str) -> None:
+        if "at" not in item:
+            return
+        at = item.get("at")
+        if not isinstance(at, dict):
+            raise SwarmError(f"Every imported {kind} position must be an object.")
+        if set(at) - {"x", "y"}:
+            raise SwarmError(
+                f"An imported {kind} position contains unsupported fields. "
+                "Nothing was imported."
+            )
+        for axis in ("x", "y"):
+            value = at.get(axis)
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 4000:
+                raise SwarmError(
+                    f"Every imported {kind} {axis} position must be a whole number "
+                    "from 0 to 4000. Nothing was imported."
+                )
+
+    agent_ids: set[str] = set()
+    for agent in board.get("agents", []):
+        if set(agent) - {
+            "id", "name", "who", "job", "at", "colour", "icon",
+            "bubble_colour", "profile_picture", "picture_zoom", "picture_hue",
+            "filed_as",
+        }:
+            raise SwarmError(
+                "An imported agent contains unsupported fields. Nothing was imported."
+            )
+        held_id = explicit_id(agent, "agent")
+        if held_id:
+            agent_ids.add(held_id)
+        exact_place(agent, "agent")
+        for key, maximum in {
+            "name": LONGEST_NAME,
+            "filed_as": LONGEST_NAME,
+            "who": 64,
+            "job": LONGEST_JOB,
+        }.items():
+            value = agent.get(key, "")
+            if value is not None and not isinstance(value, str):
+                raise SwarmError(f"Every imported agent {key} must be text.")
+            if len(str(value or "").strip()) > maximum:
+                raise SwarmError(
+                    f"An imported agent {key} is longer than {maximum} characters. "
+                    "Nothing was imported."
+                )
+            if isinstance(value, str) and " ".join(value.split()) != value:
+                raise SwarmError(
+                    f"An imported agent {key} contains leading or repeated whitespace. "
+                    "Nothing was imported."
+                )
+        for key in ("colour", "bubble_colour"):
+            if key in agent and (
+                not isinstance(agent[key], str)
+                or not AN_AGENT_COLOUR.fullmatch(agent[key])
+                or agent[key] != agent[key].lower()
+            ):
+                raise SwarmError(
+                    f"An imported agent {key} must be a six-digit #RRGGBB colour. "
+                    "Nothing was imported."
+                )
+        if "icon" in agent and (
+            not isinstance(agent["icon"], str)
+            or agent["icon"] not in AGENT_ICONS
+        ):
+            raise SwarmError("An imported agent icon is not supported. Nothing was imported.")
+        picture = agent.get("profile_picture", "")
+        if picture is not None and not isinstance(picture, str):
+            raise SwarmError("Every imported agent profile picture must be text.")
+        if len(str(picture or "").strip()) > LONGEST_PROFILE_PICTURE:
+            raise SwarmError(
+                f"An imported profile picture is larger than {LONGEST_PROFILE_PICTURE} "
+                "characters. Nothing was imported."
+            )
+        if isinstance(picture, str) and picture.strip() != picture:
+            raise SwarmError(
+                "An imported profile picture has surrounding whitespace. Nothing was imported."
+            )
+        if picture and not AN_AGENT_PICTURE.fullmatch(picture.strip()):
+            raise SwarmError("An imported profile picture is invalid. Nothing was imported.")
+        for key, least, most in (
+            ("picture_zoom", 100, 300), ("picture_hue", 0, 360)
+        ):
+            if key in agent:
+                value = agent[key]
+                if isinstance(value, bool) or not isinstance(value, int) or not least <= value <= most:
+                    raise SwarmError(
+                        f"An imported agent {key} must be a whole number from {least} to {most}. "
+                        "Nothing was imported."
+                    )
+    project_ids: set[str] = set()
+    for project in board.get("projects", []):
+        if set(project) - {"id", "path", "name", "is_there", "tasks", "at"}:
+            raise SwarmError(
+                "An imported project contains unsupported fields. Nothing was imported."
+            )
+        held_id = explicit_id(project, "project")
+        if held_id:
+            project_ids.add(held_id)
+        exact_place(project, "project")
+        path = project.get("path")
+        if not isinstance(path, str) or not path or path.strip() != path:
+            raise SwarmError(
+                "Every imported project path must be non-empty text without surrounding whitespace. "
+                "Nothing was imported."
+            )
+        for task in project.get("tasks", []):
+            if not task.strip() or " ".join(task.split()) != task:
+                raise SwarmError(
+                    "Every imported project task must be non-empty text without repeated whitespace. "
+                    "Nothing was imported."
+                )
+            if len(task) > LONGEST_TASK:
+                raise SwarmError(
+                    f"An imported project task is longer than {LONGEST_TASK} characters. "
+                    "Nothing was imported."
+                )
+    seen_work: set[tuple[str, str]] = set()
+    for link in board.get("works_on", []):
+        if set(link) - {"agent", "project"}:
+            raise SwarmError(
+                "An imported work line contains unsupported fields. Nothing was imported."
+            )
+        agent = link.get("agent")
+        project = link.get("project")
+        if not isinstance(agent, str) or not isinstance(project, str):
+            raise SwarmError("Every imported work line must name text ids.")
+        pair = (agent, project)
+        if agent not in agent_ids or project not in project_ids:
+            raise SwarmError(
+                "An imported work line points to an agent or project that is not on the board. "
+                "Nothing was imported."
+            )
+        if pair in seen_work:
+            raise SwarmError("The imported board contains a duplicate work line. Nothing was imported.")
+        seen_work.add(pair)
+    seen_talk: set[tuple[str, str]] = set()
+    for link in board.get("talks_to", []):
+        if set(link) - {"one", "other"}:
+            raise SwarmError(
+                "An imported talk line contains unsupported fields. Nothing was imported."
+            )
+        first = link.get("one")
+        other = link.get("other")
+        if not isinstance(first, str) or not isinstance(other, str):
+            raise SwarmError("Every imported talk line must name text ids.")
+        if first == other or first not in agent_ids or other not in agent_ids:
+            raise SwarmError(
+                "An imported talk line points to a missing agent or to itself. Nothing was imported."
+            )
+        pair = tuple(sorted((first, other)))
+        if (first, other) != pair:
+            raise SwarmError(
+                "An imported talk line is not in canonical id order. Nothing was imported."
+            )
+        if pair in seen_talk:
+            raise SwarmError("The imported board contains a duplicate talk line. Nothing was imported.")
+        seen_talk.add(pair)
 
 
 def keep_this_board(name: str, config: Any) -> dict[str, Any]:
@@ -1862,6 +2241,9 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "board": load().to_dict(),
         }
+        _portable_board_document(
+            held["name"], held["saved_at"], read_it(held["board"])
+        )
         # Written beside and moved into place, so a panel reading the list never
         # catches a board half written.
         beside = where / f"{filed}.{os.getpid()}.part"

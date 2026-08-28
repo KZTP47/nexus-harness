@@ -112,6 +112,82 @@ class RuntimePreparationTests(unittest.TestCase):
             self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
             self.assertFalse(any(desktop.glob(".runtime-stage-*")))
 
+    def test_atomic_runtime_publication_waits_for_active_consumers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("old", encoding="utf-8")
+            timeouts: dict[str, float] = {}
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("new", encoding="utf-8")
+
+            real_retry = runtime.retry_owned_windows_operation
+
+            def record_timeout(operation, description: str, timeout_seconds: float = 30.0):
+                timeouts[description] = timeout_seconds
+                return real_retry(operation, description, timeout_seconds)
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=record_timeout
+            ):
+                runtime.prepare(output)
+
+            self.assertEqual(
+                timeouts["preserve previous private runtime"],
+                runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                timeouts["publish validated private runtime"],
+                runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                timeouts["remove previous private runtime"],
+                runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+            )
+            self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "new")
+
+    def test_failed_publication_uses_full_timeout_for_restore_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("old", encoding="utf-8")
+            timeouts: dict[str, float] = {}
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("new", encoding="utf-8")
+
+            def fail_publish(operation, description: str, timeout_seconds: float = 30.0):
+                timeouts[description] = timeout_seconds
+                if description == "publish validated private runtime":
+                    raise PermissionError("injected publish failure")
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=fail_publish
+            ):
+                with self.assertRaisesRegex(PermissionError, "injected publish failure"):
+                    runtime.prepare(output)
+
+            self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
+            for operation in (
+                "preserve previous private runtime",
+                "publish validated private runtime",
+                "restore previous private runtime",
+                "remove private-runtime staging tree",
+            ):
+                self.assertEqual(
+                    timeouts[operation], runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS, operation
+                )
+
     def test_locked_prepare_removes_abandoned_stage_and_rollback_trees(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             desktop = Path(temporary) / "desktop"
@@ -130,14 +206,28 @@ class RuntimePreparationTests(unittest.TestCase):
                 destination.mkdir(parents=True)
                 (destination / "identity.txt").write_text("new", encoding="utf-8")
 
+            timeouts: list[float] = []
+            real_retry = runtime.retry_owned_windows_operation
+
+            def record_timeout(operation, description: str, timeout_seconds: float = 30.0):
+                if description == "remove abandoned private-runtime tree":
+                    timeouts.append(timeout_seconds)
+                return real_retry(operation, description, timeout_seconds)
+
             with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
                 runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
-            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage):
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=record_timeout
+            ):
                 runtime.prepare(output)
 
             self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "new")
             self.assertFalse(any(desktop.glob(".runtime-stage-*")))
             self.assertFalse(any(desktop.glob(".runtime-previous-*")))
+            self.assertEqual(
+                timeouts,
+                [runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS, runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS],
+            )
 
 
 if __name__ == "__main__":

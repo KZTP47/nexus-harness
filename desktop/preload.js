@@ -21,6 +21,9 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   trustProject: () => ipcRenderer.invoke("harness:trustProject"),
   showProjectFile: (relativePath) => ipcRenderer.invoke(
     "harness:showProjectFile", String(relativePath || "")),
+  saveJsonFile: (suggestedName, contents) => ipcRenderer.invoke(
+    "harness:saveJsonFile", String(suggestedName || "nexus-export.json"),
+    String(contents || "")),
   focusHarness: () => ipcRenderer.invoke("harness:focusHarness"),
   setFullScreen: (on) => ipcRenderer.invoke("harness:setFullScreen", Boolean(on)),
   webChatProviders: () => ipcRenderer.invoke("harness:webChatProviders"),

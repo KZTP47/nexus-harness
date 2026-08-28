@@ -512,7 +512,7 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual(result["discussion_rounds"], 14)
         self.assertEqual(result["stopped_because"], "stalled")
 
-    def test_unlimited_collaboration_can_exceed_the_old_twelve_round_ceiling(self) -> None:
+    def test_unlimited_collaboration_can_reach_eighteen_advancing_checkpoints(self) -> None:
         discussion_calls = 0
 
         def answer(_config, route, _text, **kwargs):
@@ -520,7 +520,7 @@ class SwarmWorkTests(unittest.TestCase):
             if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
                 cycle = discussion_calls // 2 + 1
                 discussion_calls += 1
-                finished = cycle >= 14
+                finished = cycle >= 18
                 value = {
                     "message": f"Completed distinct checkpoint-{cycle} on {route}.",
                     "goal_complete": finished,
@@ -538,14 +538,14 @@ class SwarmWorkTests(unittest.TestCase):
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
             result = swarm_work.collaborate(
-                self.config, self.board, "agent-1", "Complete fourteen checkpoints",
+                self.config, self.board, "agent-1", "Complete eighteen checkpoints",
                 round_limit=None,
             )
 
         self.assertTrue(result["goal_complete"])
-        self.assertEqual(result["discussion_rounds"], 14)
+        self.assertEqual(result["discussion_rounds"], 18)
         self.assertEqual(result["stopped_because"], "complete")
-        self.assertEqual(discussion_calls, 28)
+        self.assertEqual(discussion_calls, 36)
 
     def test_user_round_limit_stops_at_the_exact_selected_round(self) -> None:
         discussion_calls = 0
@@ -2389,6 +2389,13 @@ os._exit(23)
                 self.config, self.board, "agent-1", "Create output/target.txt",
                 allowed_write_roots=["output"],
             )
+            with self.assertRaisesRegex(
+                swarm_work.SwarmError, "Answer the paused questions"
+            ):
+                swarm_work.work_together(
+                    self.config, self.board, "agent-1", "ignored on resume",
+                    resume_session_id=paused["resume_token"],
+                )
             resumed = True
             done = swarm_work.work_together(
                 self.config, self.board, "agent-1", "ignored on resume",
@@ -2402,6 +2409,75 @@ os._exit(23)
         self.assertTrue(done["goal_complete"])
         self.assertEqual(done["allowed_write_roots"], ["output"])
         self.assertEqual((self.project / "output" / "target.txt").read_text(), "windows\n")
+
+    def test_provider_pause_resumes_same_session_without_a_user_answer(self) -> None:
+        provider_available = False
+
+        def answer(_config, route, _text, **kwargs):
+            response_format = kwargs.get("response_format")
+            if (
+                response_format is swarm_work.PLAN_FORMAT
+                and route == "codex" and not provider_available
+            ):
+                raise HarnessError("provider temporarily unavailable")
+            if response_format is swarm_work.PLAN_FORMAT:
+                value = {
+                    "contribution": "create the requested file",
+                    "message_to_lead": "ready", "needs_files": [],
+                    "effect_paths": ["provider-retry.txt"],
+                }
+            elif response_format is swarm_work.PLAN_REVIEW_FORMAT:
+                value = {
+                    "contribution": "reviewed", "message_to_lead": "ready",
+                    "needs_files": [], "effect_paths": ["provider-retry.txt"],
+                    "ready_to_execute": True, "remaining": [],
+                }
+            elif response_format is swarm_work.WORK_FORMAT:
+                value = {
+                    "reply": "created", "changes": ([{
+                        "path": "provider-retry.txt", "content": "recovered\n",
+                        "reason": "requested",
+                    }] if route == "claude" else []),
+                }
+            else:
+                value = {"goal_complete": True, "feedback": "verified", "remaining": []}
+            return {"text": json.dumps(value), "milliseconds": 1, "model": route}
+
+        verification = {
+            "status": "passed", "basis": "selected_project", "commands": [],
+            "reason": "test fixture", "requirement_evidence": {"execution": {"unmet": []}},
+        }
+        with mock.patch.object(chat, "ask_once", side_effect=answer), mock.patch.object(
+            swarm_work, "_run_selected_project_verification", return_value=verification,
+        ):
+            with self.assertRaises(swarm_work.ResumableSwarmError) as stopped:
+                swarm_work.work_together(
+                    self.config, self.board, "agent-1", "Create provider-retry.txt"
+                )
+            self.assertEqual(stopped.exception.payload["status"], "paused_provider")
+            token = stopped.exception.payload["resume_token"]
+            provider_available = True
+            resumed = swarm_work.work_together(
+                self.config, self.board, "agent-1", "ignored on resume",
+                resume_session_id=token,
+            )
+
+        self.assertTrue(resumed["goal_complete"], resumed)
+        self.assertEqual(resumed["collaboration_ledger"]["session_id"], token)
+        self.assertEqual(
+            (self.project / "provider-retry.txt").read_text(encoding="utf-8"),
+            "recovered\n",
+        )
+        events = CollaborationLedger(
+            self.config, "claude", "Claude", session_id=token,
+        )._read()
+        self.assertTrue(any(
+            event.get("phase") == "provider_recovery_resume" for event in events
+        ))
+        self.assertFalse(any(
+            event.get("kind") == "user_answer" and not str(event.get("text") or "").strip()
+            for event in events
+        ))
 
     def test_same_route_and_model_reviewers_are_disclosed_as_correlated(self) -> None:
         result = swarm_work._review_correlation([
@@ -2629,7 +2705,13 @@ os._exit(23)
 
     def test_prompt_summary_is_bounded_while_canonical_history_stays_full(self) -> None:
         contributions = [
-            {"speaker_name": "Agent", "speaker_route": "route", "phase": "work", "text": str(index) + ("x" * 20_000)}
+            {
+                "speaker_name": "Agent", "speaker_route": "route", "phase": "work",
+                "text": (
+                    "EARLY SEMANTIC SENTINEL: E2E browser coverage must remain a requirement. "
+                    if index == 0 else str(index)
+                ) + ("x" * 20_000),
+            }
             for index in range(20)
         ]
         canonical = swarm_work._actual_conversation(contributions)
@@ -2637,6 +2719,36 @@ os._exit(23)
         self.assertGreater(len(canonical), 400_000)
         self.assertLessEqual(len(prompt), swarm_work.PROMPT_TRANSCRIPT_CHARACTERS)
         self.assertIn("canonical_sha256", prompt)
+        self.assertIn("EARLY SEMANTIC SENTINEL", prompt)
+        self.assertIn("E2E browser coverage must remain a requirement", prompt)
+        limits = chat.effective_limits(self.config, "")
+        self.assertEqual(
+            limits["long_horizon_context"],
+            {
+                **chat.LONG_HORIZON_CONTEXT_POLICY,
+                "phases": list(chat.LONG_HORIZON_CONTEXT_POLICY["phases"]),
+                "note": limits["long_horizon_context"]["note"],
+            },
+        )
+        self.assertEqual(
+            limits["long_horizon_context"]["prompt_transcript_characters"],
+            swarm_work.PROMPT_TRANSCRIPT_CHARACTERS,
+        )
+        checkpoint = swarm_work._prompt_summary_state(contributions)
+        self.assertEqual(
+            checkpoint["context_policy"], chat.LONG_HORIZON_CONTEXT_POLICY,
+        )
+
+    def test_every_long_horizon_phase_uses_the_disclosed_projection(self) -> None:
+        source = Path(swarm_work.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("+ _actual_conversation(contributions)", source)
+        self.assertGreaterEqual(
+            source.count("+ _prompt_conversation(contributions)"), 5,
+        )
+        self.assertEqual(chat.LONG_HORIZON_CONTEXT_POLICY["phases"], [
+            "team_discussion", "planning", "execution", "verification",
+            "final_synthesis",
+        ])
 
     def test_execution_snapshot_discloses_path_cap_and_invalid_utf8(self) -> None:
         paths = []
@@ -3455,6 +3567,34 @@ os._exit(23)
             for index in range(20)
         ]
         self.assertEqual([False] * 13 + [True] * 7, evidence_results)
+
+    def test_arbitrary_novel_checkpoint_state_churn_cannot_buy_rounds(self) -> None:
+        guard = swarm_work._ProgressGuard()
+        results = [
+            guard.stalled((swarm_work._canonical_progress_state(
+                "agent", False, False,
+                {
+                    "remaining": ["same unresolved requirement"],
+                    "progress": [{
+                        "id": "stable-checkpoint",
+                        "state": f"nonce-{index}",
+                        "evidence": f"provider claim {index}",
+                    }],
+                },
+            ),))
+            for index in range(1, 41)
+        ]
+        self.assertEqual([False] * 13 + [True] * 27, results)
+        self.assertFalse(swarm_work._meaningful_checkpoint_advance(
+            "nonce-1", "nonce-2",
+        ))
+        self.assertTrue(swarm_work._meaningful_checkpoint_advance("17", "18"))
+        self.assertTrue(swarm_work._meaningful_checkpoint_advance(
+            "tested", "verified",
+        ))
+        self.assertFalse(swarm_work._meaningful_checkpoint_advance(
+            "verified", "working",
+        ))
 
     def test_loop14_exact_operation_capabilities_and_passive_requests(self) -> None:
         actions = (

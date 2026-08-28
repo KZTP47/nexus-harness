@@ -142,6 +142,31 @@ test("the private Python runtime and harness source are packaged together", () =
     "a release must prove its bundled browser in AppContainer before packaging");
 });
 
+test("the packaged Electron app carries the visual automation exchange UI", () => {
+  const html = fs.readFileSync(
+    path.join(__dirname, "..", "src", "our_harness", "ui", "index.html"), "utf8"
+  );
+  const script = fs.readFileSync(
+    path.join(__dirname, "..", "src", "our_harness", "ui", "app.js"), "utf8"
+  );
+  for (const id of ["pipelineList", "pipelineImport", "pipelineExport", "pipelineImportFile"]) {
+    assert.match(html, new RegExp(`id=["']${id}["']`));
+  }
+  assert.match(script, /\/api\/pipelines\/import/);
+  assert.match(script, /\/api\/pipelines\/export\?name=/);
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.match(preload, /saveJsonFile:/);
+  assert.match(preload, /harness:saveJsonFile/);
+  assert.match(main, /ipcMain\.handle\("harness:saveJsonFile"/);
+  assert.match(main, /12_000_000/);
+  assert.match(main, /fs\.renameSync\(beside, chosen\)/);
+  assert.ok(
+    PACKAGE.build.extraResources.some((item) => item.from === "../src" && item.to === "harness/src"),
+    "the Electron package must carry the Python-served UI source",
+  );
+});
+
 test("the private runtime lock includes exact Node, Playwright, and Chromium identities", () => {
   const locked = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "runtime-playwright.lock.json"), "utf8"));
   assert.strictEqual(locked.schema_version, 1);
@@ -160,7 +185,8 @@ test("the private runtime lock includes exact Node, Playwright, and Chromium ide
 });
 
 test("test and smoke files stay out of the installer", () => {
-  for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js"]) {
+  for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js",
+                      "automations.smoke.js"]) {
     assert.ok(!shipped(name), `${name} should not be shipped`);
   }
 });

@@ -28,6 +28,7 @@ let promptRecords = [];
 let nodeStatuses = new Map();
 let lastRunAnnouncementAt = 0;
 let lastLiveDataRefreshAt = 0;
+let nexusProjectName = "this project";
 
 function announce(message, urgent = false) {
   const target = urgent ? $("liveAlert") : $("liveStatus");
@@ -2657,6 +2658,7 @@ async function resetSetting(key) {
 let pipeline = {name: "First pipeline", nodes: [], edges: []};
 let pipelineKinds = [];
 let pipelineSaved = [];
+let pipelineSavedProblems = [];
 let pipelineStarters = [];
 let pipelineWhens = [];   // when a step runs: always, only on failure, either way
 let pipelineWaits = [];   // how long it waits before trying again
@@ -2681,6 +2683,7 @@ let pipelineFullScreenHomes = [];
 const PIPELINE_PENDING_KEY_PREFIX = "nexus.pipeline.pending.v2:";
 let pipelineAuthorityId = "";
 let pipelinePendingRequest = null;
+let pipelineCannotRun = "";
 
 function pipelinePendingKey(authorityId = pipelineAuthorityId) {
   return `${PIPELINE_PENDING_KEY_PREFIX}${authorityId}`;
@@ -2910,14 +2913,20 @@ async function refreshPipelines(name) {
   try {
     const said = await request(`/api/pipelines${requestedName ? `?name=${encodeURIComponent(requestedName)}` : ""}`);
     if (mine !== pipelineNewestRefresh) return;
-    usePipelineAuthority(said.project_authority_id);
+    pipelineCannotRun = String(said.cannot_run || "");
+    if (said.project_authority_id) usePipelineAuthority(said.project_authority_id);
+    else {
+      pipelineAuthorityId = "";
+      pipelinePendingRequest = null;
+    }
     pipelineKinds = said.kinds || [];
     pipelineSaved = said.saved || [];
+    pipelineSavedProblems = said.saved_problems || [];
     pipelineStarters = said.starters || [];
     pipelineWhens = said.when_it_runs || [];
     pipelineWaits = said.waits || [];
     pipeline = said.pipeline;
-    const resolvedName = requestedName
+    const resolvedName = said.selected_name || requestedName
       || (pipelineSaved.includes(pipeline?.name) ? pipeline.name : "");
     const priorAgentChoice = $("agentRunAutomation").value;
     fillOneChoice("agentRunAutomation", pipelineSaved.map((one) => ({name: one, label: one})),
@@ -2994,6 +3003,10 @@ async function refreshAgentContract() {
 }
 
 async function runAgentAutomation() {
+  if (pipelineCannotRun) {
+    $("agentRunSaid").textContent = `Automation is paused: ${pipelineCannotRun}`;
+    return;
+  }
   const name = $("agentRunAutomation").value;
   if (!name) { $("agentRunSaid").textContent = "Choose a saved automation first."; return; }
   const pending = pipelineRequestFor("agent", name);
@@ -3019,13 +3032,26 @@ async function runAgentAutomation() {
 function renderPipelineSaved() {
   const list = $("pipelineList");
   list.replaceChildren();
+  $("pipelineSavedCount").textContent = pipelineSaved.length
+    ? `${pipelineSaved.length} saved automation${pipelineSaved.length === 1 ? "" : "s"} in ${nexusProjectName}`
+    : `No saved automations in ${nexusProjectName}. Automations are kept with each project.`;
+  const problems = $("pipelineSavedProblems");
+  problems.hidden = !pipelineSavedProblems.length;
+  problems.textContent = pipelineSavedProblems.length
+    ? `${pipelineSavedProblems.length} saved JSON file${pipelineSavedProblems.length === 1 ? "" : "s"} could not be shown: ${pipelineSavedProblems.join("; ")}`
+    : "";
+  $("pipelineExport").disabled = !pipelineSavedName || !pipelineSaved.includes(pipelineSavedName);
+  $("pipelineRun").disabled = Boolean(pipelineCannotRun);
+  $("pipelineRun").title = pipelineCannotRun;
+  $("agentRunNow").disabled = Boolean(pipelineCannotRun) || !pipelineSaved.length;
+  $("agentRunNow").title = pipelineCannotRun;
   if (!pipelineSaved.length) {
     list.append(make("li", "hint", "None saved yet. Draw one and press Save."));
     return;
   }
   for (const name of pipelineSaved) {
     const item = make("li", "");
-    const button = make("button", `pipeline-saved-one${name === pipeline.name ? " chosen" : ""}`, name);
+    const button = make("button", `pipeline-saved-one${name === pipelineSavedName ? " chosen" : ""}`, name);
     button.type = "button";
     button.addEventListener("click", () => refreshPipelines(name));
     item.append(button);
@@ -3184,6 +3210,8 @@ function renderPipeline() {
     alone.type = "button";
     alone.dataset.pipelineAction = "run-only";
     alone.title = "Run this one step and nothing else, while you are building it";
+    alone.disabled = Boolean(pipelineCannotRun);
+    if (pipelineCannotRun) alone.title = pipelineCannotRun;
     alone.addEventListener("click", (event) => {
       event.stopPropagation();
       runPipeline({only: node.id});
@@ -3192,6 +3220,8 @@ function renderPipeline() {
     onward.type = "button";
     onward.dataset.pipelineAction = "run-from";
     onward.title = "Run this step and everything after it, leaving the earlier ones alone";
+    onward.disabled = Boolean(pipelineCannotRun);
+    if (pipelineCannotRun) onward.title = pipelineCannotRun;
     onward.addEventListener("click", (event) => {
       event.stopPropagation();
       runPipeline({from_here: node.id});
@@ -3624,6 +3654,7 @@ async function savePipeline() {
     say(`Saved ${pipeline.name}.`);
     const list = await request(`/api/pipelines?name=${encodeURIComponent(pipeline.name)}`);
     pipelineSaved = list.saved || [];
+    pipelineSavedProblems = list.saved_problems || [];
     pipelineOlderOnes = list.older_ones || [];
     renderPipelineSaved();
     if (pipelineLooking === "before") listHowItLookedBefore();
@@ -3646,6 +3677,7 @@ async function deletePipeline() {
   try {
     const said = await request("/api/pipelines/delete", {method: "POST", body: JSON.stringify({name})});
     pipelineSaved = said.saved || [];
+    pipelineSavedProblems = said.saved_problems || [];
     renderPipelineSaved();
     say(said.note);
   } catch (error) { say(error.message); showError(error.message); }
@@ -3662,6 +3694,7 @@ async function newPipeline() {
     pipeline = said.pipeline;
     pipelineSavedName = pipeline.name;
     pipelineSaved = said.saved || [];
+    pipelineSavedProblems = said.saved_problems || [];
     pipelineOlderOnes = [];
     pipelineStates = new Map();
     $("pipelineName").value = pipeline.name;
@@ -3672,7 +3705,103 @@ async function newPipeline() {
   } catch (error) { say(error.message); showError(error.message); }
 }
 
+function pipelineImportName(document, file) {
+  const imported = document?.schema === "nexus-harness.visual-automation"
+    ? document.automation : document;
+  const fromDocument = typeof imported?.name === "string" ? imported.name.trim() : "";
+  const fromFile = String(file?.name || "Imported automation").replace(/\.json$/i, "");
+  return fromDocument || fromFile || "Imported automation";
+}
+
+function unusedPipelineName(wanted) {
+  if (!pipelineSaved.some((one) => one.toLowerCase() === wanted.toLowerCase())) return wanted;
+  let number = 1;
+  let candidate = `${wanted} copy`;
+  while (pipelineSaved.some((one) => one.toLowerCase() === candidate.toLowerCase())) {
+    number += 1;
+    candidate = `${wanted} copy ${number}`;
+  }
+  return candidate;
+}
+
+async function importPipeline(file) {
+  if (!file) return;
+  try {
+    if (file.size > 10_000_000) {
+      throw new Error("That JSON file is larger than 10 MB. Nothing was imported.");
+    }
+    const written = await file.text();
+    let document;
+    try { document = JSON.parse(written); }
+    catch (_) { throw new Error("That file is not valid JSON. Nothing was imported."); }
+    const originalName = pipelineImportName(document, file);
+    let name = originalName;
+    if (pipelineSaved.some((one) => one.toLowerCase() === originalName.toLowerCase())) {
+      name = await askForOneLine(
+        "Import as a new automation",
+        `“${originalName}” is already saved. Choose a name for the imported copy.`,
+        unusedPipelineName(originalName),
+      );
+      if (!name) return;
+    }
+    const said = await request("/api/pipelines/import", {
+      method: "POST", body: JSON.stringify({document, name}),
+    });
+    pipeline = said.pipeline;
+    pipelineSavedName = pipeline.name;
+    pipelineSaved = said.saved || [];
+    pipelineSavedProblems = said.saved_problems || [];
+    pipelineOlderOnes = [];
+    pipelineStates = new Map();
+    $("pipelineName").value = pipeline.name;
+    $("pipelineLog").replaceChildren();
+    renderPipeline();
+    renderPipelineSaved();
+    say(said.note || `Imported and saved ${pipeline.name}.`);
+  } catch (error) {
+    say(error.message);
+    showError(error.message);
+  } finally {
+    $("pipelineImportFile").value = "";
+  }
+}
+
+async function exportPipeline() {
+  if (!pipelineSavedName || !pipelineSaved.includes(pipelineSavedName)) {
+    say("Choose or save an automation before exporting it.");
+    return;
+  }
+  try {
+    const said = await request(
+      `/api/pipelines/export?name=${encodeURIComponent(pipelineSavedName)}`
+    );
+    const written = JSON.stringify(said.document, null, 2) + "\n";
+    if (window.harnessDesktop?.saveJsonFile) {
+      const saved = await window.harnessDesktop.saveJsonFile(
+        said.filename || "visual-automation.json", written
+      );
+      say(saved?.saved
+        ? `Exported ${pipelineSavedName} as ${saved.filename || "JSON"}.`
+        : "Export cancelled; nothing was written.");
+      return;
+    }
+    const blob = new Blob([written], {
+      type: "application/json",
+    });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = said.filename || "visual-automation.json";
+    link.click();
+    URL.revokeObjectURL(link.href);
+    say(`Exported ${pipelineSavedName} as JSON.`);
+  } catch (error) { say(error.message); showError(error.message); }
+}
+
 async function runPipeline(options = {}) {
+  if (pipelineCannotRun) {
+    say(`Automation is paused: ${pipelineCannotRun}`);
+    return;
+  }
   const definition = pipelineOnScreen();
   const pending = pipelineRequestFor("panel", definition.name);
   try {
@@ -4342,7 +4471,7 @@ function bindEvents() {
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickBootstrap").addEventListener("change", updateQuickReadiness); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
-  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("moreOptionsEnabled").addEventListener("change", changeMoreOptionsPreference); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
+  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("moreOptionsEnabled").addEventListener("change", changeMoreOptionsPreference); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineImport").addEventListener("click", () => $("pipelineImportFile").click()); $("pipelineImportFile").addEventListener("change", (event) => importPipeline(event.target.files?.[0])); $("pipelineExport").addEventListener("click", exportPipeline); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
   $("teamSetUp").addEventListener("click", setUpTheTeam);
   // This one says what went wrong. Without it, a request that failed threw
@@ -4417,6 +4546,9 @@ function bindEvents() {
     $("thePage").addEventListener("toggle", () => $("thePage").open && refreshThePage());
   }
   $("swarmKeep").addEventListener("click", keepThisBoard);
+  $("swarmImport").addEventListener("click", () => $("swarmImportFile").click());
+  $("swarmImportFile").addEventListener(
+    "change", (event) => importKeptBoard(event.target.files?.[0]));
   $("talkStartAgain").addEventListener("click", startTalkingAgain);
   $("talkAskEveryone").addEventListener("click", askEveryone);
   $("talkStop").addEventListener("click", stopTalking);
@@ -5842,6 +5974,12 @@ function captureBudgetFact(limits) {
   }
   return `${Number(limits.provider_capture_bytes || 100000000).toLocaleString()}-byte provider transport capture`;
 }
+
+function longHorizonContextFact(limits) {
+  const policy = limits?.long_horizon_context;
+  if (!policy) return "";
+  return `${Number(policy.prompt_transcript_characters || 120000).toLocaleString()}-character conversation-history projection per long-horizon phase with deterministic older-turn semantic summaries; surrounding goal, project, and turn instructions are additional; full history stays in the paged ledger`;
+}
 // Which refresh is the newest. Looking over the machine runs each assistant's
 // own tool, which takes about a second, so an old one can land long after
 // somebody has moved on - and used to write its words over theirs.
@@ -6241,6 +6379,7 @@ async function boot() {
     const value = await request("/api/bootstrap");
     token = value.token;
     startedId = value.started_id || "";
+    nexusProjectName = String(value.project || "this project");
     if (value.runtime) {
       $("runtimeIdentity").textContent = `Nexus ${value.runtime.version} · ${value.runtime.commit || "unknown commit"} · Python ${value.runtime.python_version} · local port ${value.runtime.port} · process ${value.runtime.process_id}`;
       $("runtimeIdentity").title = `Build: ${value.runtime.build_kind || "unknown"}\nProject root: ${value.runtime.project_root}\nRuntime: ${value.runtime.python_executable}`;
@@ -6332,9 +6471,11 @@ const DEFAULT_FINITE_TEAM_ROUNDS = 12;
 // reloading the panel cannot strand work which the server says is resumable.
 const SWARM_WORK_RECOVERIES_KEY = "nexus.swarm.work-recoveries.v1";
 const SWARM_RECOVERABLE_WORK_STATUSES = new Set([
-  "paused_for_user", "applied_unverified", "needs_verification",
+  "paused_provider", "paused_for_user", "incomplete",
+  "applied_unverified", "needs_verification",
 ]);
 const swarmWorkRecoveries = loadSwarmWorkRecoveries();
+let swarmWorkRecoveryRefreshRevision = 0;
 // A long provider request remains one HTTP call, but its truthful Nexus stages
 // arrive through a second, lightweight activity feed.  This map lets both the
 // movable and maximised views show the same live state.
@@ -6500,6 +6641,34 @@ function saveSwarmWorkRecoveries() {
   } catch (_) { /* local persistence may be unavailable */ }
 }
 
+async function refreshDurableSwarmWorkRecoveries() {
+  // localStorage keeps the card fast inside one renderer, but the signed
+  // backend journal is what survives a desktop restart or a cleared browser
+  // cache. This inventory contains recovery metadata only, not transcripts.
+  const mine = ++swarmWorkRecoveryRefreshRevision;
+  try {
+    const saved = await request("/api/swarm/recoveries");
+    if (mine !== swarmWorkRecoveryRefreshRevision) return;
+    for (const key of saved.resolved_recovery_keys || []) {
+      swarmWorkRecoveries.delete(String(key));
+    }
+    for (const one of saved.recoveries || []) {
+      const key = String(one.recovery_key || "");
+      if (!key) continue;
+      rememberWorkRecoveryForKey(
+        key, one, String(one.objective || ""),
+        {project: one.project?.id || ""},
+      );
+    }
+    saveSwarmWorkRecoveries();
+    for (const held of swarmChats) renderWorkRecovery(held.agent);
+    setWhatCanBePressedInSwarm();
+  } catch (_) {
+    // A recovery inventory failure must not hide the saved board. The local
+    // cache remains visible and the normal server error path can be retried.
+  }
+}
+
 function workRecoveryFor(agentId) {
   return swarmWorkRecoveries.get(swarmChatKey(agentId)) || null;
 }
@@ -6560,9 +6729,13 @@ function updateWorkRecoveryAnswer(agentId, answer, source) {
 function workRecoveryTitle(status) {
   return status === "paused_for_user"
     ? "Project work paused for your answer"
+    : status === "paused_provider"
+      ? "Provider connection interrupted"
     : status === "needs_verification"
       ? "Applied changes need verification"
-      : "Applied changes are not verified yet";
+      : status === "incomplete"
+        ? "Project work is not finished yet"
+        : "Applied changes are not verified yet";
 }
 
 function fillWorkRecoveryPanel(panel, agentId) {
@@ -6573,9 +6746,14 @@ function fillWorkRecoveryPanel(panel, agentId) {
   if (!recovery) return;
   panel.dataset.status = recovery.status;
   panel.append(make("h4", "work-recovery-title", workRecoveryTitle(recovery.status)));
-  panel.append(make("p", "work-recovery-status", recovery.status === "paused_for_user"
+  const recoveryWords = recovery.status === "paused_for_user"
     ? "Nexus changed no files. Answer below to continue this exact saved run."
-    : "Nexus has not claimed completion. Resume the same run so the team can verify or revise what was applied."));
+    : recovery.status === "paused_provider"
+      ? "Nexus saved the exact run after a provider failed to answer. Reconnect that provider, then resume; no user answer is required."
+      : recovery.status === "incomplete"
+        ? "Nexus saved the unfinished run and has not claimed completion. Resume the same run so the team can continue."
+        : "Nexus has not claimed completion. Resume the same run so the team can verify or revise what was applied.";
+  panel.append(make("p", "work-recovery-status", recoveryWords));
   const needs = recovery.questions.length ? recovery.questions : recovery.remaining;
   if (needs.length) {
     const heading = make("strong", "", recovery.questions.length
@@ -6601,19 +6779,21 @@ function fillWorkRecoveryPanel(panel, agentId) {
   }
   panel.append(scope);
   const label = make("label", "work-recovery-answer-label",
-    recovery.status === "paused_for_user" ? "Your answer" : "Optional verification note");
+    recovery.status === "paused_for_user" ? "Your answer" : "Optional resume note");
   const answer = make("textarea", "work-recovery-answer");
   answer.rows = recovery.status === "paused_for_user" ? 3 : 2;
   answer.value = recovery.answerDraft;
   answer.placeholder = recovery.status === "paused_for_user"
     ? "Answer the team's questions to resume"
-    : "Add context for the verification pass, or resume without a note";
+    : "Add useful context, or resume without a note";
   answer.addEventListener("input", () => updateWorkRecoveryAnswer(agentId, answer.value, answer));
   label.append(answer);
   panel.append(label);
   const row = make("div", "button-row work-recovery-actions");
   const resume = make("button", "primary work-recovery-resume",
-    recovery.status === "paused_for_user" ? "Answer and resume" : "Resume verification");
+    recovery.status === "paused_for_user" ? "Answer and resume"
+      : recovery.status === "paused_provider" ? "Retry provider and resume"
+        : recovery.status === "incomplete" ? "Resume project work" : "Resume verification");
   resume.type = "button";
   resume.addEventListener("click", () => resumeSwarmWork(agentId));
   row.append(resume);
@@ -7055,7 +7235,7 @@ async function refreshSwarm(quietly) {
     if (changesThen !== howManyChangesLanded) return;
     swarmSaid = said;
     swarmBoardHydrated = true;
-    swarmKept = said.kept || swarmKept;
+    acceptKeptInventory(said, true);
     keepTheSwarmPick();
     renderSwarmBoard();
     renderSwarmNotReady();
@@ -7064,6 +7244,10 @@ async function refreshSwarm(quietly) {
     renderTheKeptBoards();
     renderTheChatTray();
     if (theBigOne) renderTheBigChat();
+    // The signed run journal can contain substantial history and its first
+    // open performs integrity verification. Draw the saved board immediately;
+    // recovery cards hydrate independently a moment later.
+    void refreshDurableSwarmWorkRecoveries();
     // What the agents passed to each other, so the list down the side holds
     // those conversations too rather than only the ones you have had. It is
     // small, and without it the list is half a list until somebody opens the
@@ -8136,6 +8320,7 @@ function setWhatCanBePressedInSwarm() {
   // chat nothing points at any more. The server turns those saves down as
   // well; this is so nobody is offered a button that will be refused.
   const held = Boolean(whyTheBoardIsHeld());
+  $("swarmKeep").disabled = held;
   $("swarmAddAgent").disabled = held || board.agents.length >= (most.agents || 24);
   $("swarmAddProject").disabled = held || board.projects.length >= (most.projects || 12);
   $("swarmRemoveAgent").disabled = held || !agent;
@@ -8170,7 +8355,7 @@ function setWhatCanBePressedInSwarm() {
   $("swarmLineRemove").disabled = held || !line || !$("swarmLineOn").checked;
   for (const tick of $("swarmWorksOn").querySelectorAll("input")) tick.disabled = held;
   for (const tick of $("swarmTalksTo").querySelectorAll("input")) tick.disabled = held;
-  $("swarmStart").disabled = swarmGoing;
+  $("swarmStart").disabled = held || swarmGoing;
   $("swarmStop").disabled = !swarmGoing;
   for (const card of $("swarmBoard").querySelectorAll(".swarm-chat-card")) {
     setWhatCanBePressedInAChat(card);
@@ -8257,7 +8442,7 @@ async function applyOneChangeToTheBoard(change, note) {
     // that was already in flight knows to throw its own answer away.
     howManyChangesLanded += 1;
     swarmSaid = said;
-    swarmKept = said.kept || swarmKept;
+    acceptKeptInventory(said, true);
     keepTheSwarmPick();
     renderSwarmBoard();
     renderSwarmNotReady();
@@ -9560,7 +9745,8 @@ function countWhatIsTypedInBigChat() {
   const outputFact = outputBudgetFact(limits);
   counter.textContent = typed > limit
     ? `${(typed - limit).toLocaleString()} characters over ${limit.toLocaleString()} — Nexus will not truncate or send it`
-    : `${typed.toLocaleString()} / ${limit.toLocaleString()} characters · answer hard cap ${Number(limits.answer_characters || 8000000).toLocaleString()} characters · ${outputFact} · ${captureBudgetFact(limits)}`;
+    : `${typed.toLocaleString()} / ${limit.toLocaleString()} characters · answer hard cap ${Number(limits.answer_characters || 8000000).toLocaleString()} characters · ${outputFact} · ${captureBudgetFact(limits)}`
+      + (longHorizonContextFact(limits) ? ` · ${longHorizonContextFact(limits)}` : "");
 }
 
 function looksLikeProjectWork(words) {
@@ -9611,6 +9797,12 @@ function workResponseWords(answered, agentName = "The team", ordinaryWords = "")
   if (status === "paused_for_user") {
     return "Project work paused safely. Answer the questions in the saved run card to continue." + budget;
   }
+  if (status === "paused_provider") {
+    return "A provider did not answer. Nexus saved the exact run; reconnect it and use Retry provider and resume. No user answer is required." + budget;
+  }
+  if (status === "incomplete") {
+    return "The long-horizon goal is still incomplete. Nexus saved the exact run so the team can continue instead of starting over." + budget;
+  }
   if (status === "needs_verification") {
     return "Changes were applied, but deterministic verification failed. Resume the saved run to verify or revise them." + budget;
   }
@@ -9658,7 +9850,11 @@ async function resumeSwarmWork(agentId) {
   const activity = beginSwarmChatActivity(agentId, "work", agent);
   sayInTheChatFor(agentId, recovery.status === "paused_for_user"
     ? "Resuming the saved run with your answer..."
-    : "Resuming deterministic verification for the saved run...");
+    : recovery.status === "paused_provider"
+      ? "Retrying the provider and resuming the exact saved run..."
+      : recovery.status === "incomplete"
+        ? "Resuming the unfinished long-horizon run..."
+        : "Resuming deterministic verification for the saved run...");
   if (theBigOne === agentId) $("theBigChatSaidBack").textContent =
     "Resuming the exact saved project-work session...";
   setWhatCanBePressedInSwarm();
@@ -9675,7 +9871,7 @@ async function resumeSwarmWork(agentId) {
         allow_project_changes: true,
         round_limit: selectedChatRoundLimit(agentId),
         resume_session_id: recovery.resumeToken,
-        user_answers: answers,
+        ...(answers ? {user_answers: answers} : {}),
         // Clone the frozen authority for JSON serialization. It came from the
         // original server response and has no editable UI path.
         ...(recovery.writeScopeRestricted
@@ -10255,12 +10451,26 @@ function wireUpMicrosoft() {
 // want two, and then the second one means taking the first apart and building
 // it again from memory on Monday.
 
+const MAX_SAVED_BOARD_IMPORT_BYTES = 10_000_000;
 let swarmKept = [];
+let swarmKeptProblems = [];
+
+function acceptKeptInventory(said, keepOld = false) {
+  swarmKept = said.kept || (keepOld ? swarmKept : []);
+  swarmKeptProblems = said.kept_problems || [];
+}
 
 function renderTheKeptBoards() {
   const list = $("swarmKept");
   if (!list) return;
   list.replaceChildren();
+  const problems = $("swarmKeptProblems");
+  problems.hidden = !swarmKeptProblems.length;
+  problems.textContent = swarmKeptProblems.length
+    ? `${swarmKeptProblems.length} saved board file${swarmKeptProblems.length === 1 ? "" : "s"} `
+      + `could not be read. The file${swarmKeptProblems.length === 1 ? " is" : "s are"} still on disk:\n`
+      + swarmKeptProblems.join("\n")
+    : "";
   if (!swarmKept.length) {
     list.append(make("li", "hint", "None saved yet."));
     return;
@@ -10274,6 +10484,9 @@ function renderTheKeptBoards() {
       open.setAttribute("aria-current", "true");
       open.setAttribute("aria-label", `${one.name}, the board currently open`);
     }
+    const held = Boolean(whyTheBoardIsHeld());
+    open.disabled = held;
+    if (held) open.title = `This board is safe, but cannot be opened yet. ${whyTheBoardIsHeld()}`;
     open.append(make("span", "", one.name));
     if (one.active) open.append(make("span", "swarm-kept-active", "Open now · returns next time"));
     open.append(make("span", "swarm-kept-when",
@@ -10281,9 +10494,16 @@ function renderTheKeptBoards() {
       + `${one.projects} project${one.projects === 1 ? "" : "s"}`));
     open.addEventListener("click", () => openTheKeptBoard(one.name));
     row.append(open);
+    const save = make("button", "swarm-icon-button", "Export");
+    save.type = "button";
+    save.setAttribute("aria-label", `Export the saved board called ${one.name} as JSON`);
+    save.addEventListener("click", () => exportKeptBoard(one.name));
+    row.append(save);
     const drop = make("button", "swarm-icon-button", "Delete");
     drop.type = "button";
     drop.setAttribute("aria-label", `Delete the saved board called ${one.name}`);
+    drop.disabled = held;
+    if (held) drop.title = `This board is safe, but cannot be deleted yet. ${whyTheBoardIsHeld()}`;
     drop.addEventListener("click", () => forgetTheKeptBoard(one.name));
     row.append(drop);
     list.append(row);
@@ -10298,7 +10518,7 @@ async function keepThisBoard() {
     const said = await request("/api/swarm/keep", {
       method: "POST", body: JSON.stringify({name}),
     });
-    swarmKept = said.kept || [];
+    acceptKeptInventory(said);
     renderTheKeptBoards();
     sayInSwarm(`Saved this board as ${said.name}.`);
   } catch (trouble) {
@@ -10319,7 +10539,7 @@ async function openTheKeptBoard(name) {
       method: "POST", body: JSON.stringify({name}),
     });
     swarmSaid = said;
-    swarmKept = said.kept || [];
+    acceptKeptInventory(said);
     keepTheSwarmPick();
     renderSwarmBoard();
     renderSwarmNotReady();
@@ -10338,7 +10558,7 @@ async function forgetTheKeptBoard(name) {
     const said = await request("/api/swarm/forget-kept", {
       method: "POST", body: JSON.stringify({name}),
     });
-    swarmKept = said.kept || [];
+    acceptKeptInventory(said);
     renderTheKeptBoards();
     sayInSwarm(`Deleted the saved board ${name}.`);
   } catch (trouble) {
@@ -10645,6 +10865,79 @@ function aSavedBigChatSize(value, otherwise = null) {
   if (value === null || value === undefined || value === "") return otherwise;
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 && number <= 10000 ? number : otherwise;
+}
+
+function unusedKeptBoardName(wanted) {
+  let candidate = `${wanted} copy`;
+  let number = 2;
+  const used = new Set(swarmKept.map((one) => one.name.toLowerCase()));
+  while (used.has(candidate.toLowerCase())) {
+    candidate = `${wanted} copy ${number}`;
+    number += 1;
+  }
+  return candidate;
+}
+
+async function importKeptBoard(file) {
+  if (!file) return;
+  try {
+    if (file.size > MAX_SAVED_BOARD_IMPORT_BYTES) {
+      throw new Error("That saved-board JSON file is larger than 10 MB. Nothing was imported.");
+    }
+    const written = await file.text();
+    let document;
+    try { document = JSON.parse(written); }
+    catch (_) { throw new Error("That file is not valid JSON. Nothing was imported."); }
+    const original = String(document?.name || file.name.replace(/\.json$/i, "") || "Imported board");
+    let name = original;
+    if (swarmKept.some((one) => one.name.toLowerCase() === original.toLowerCase())) {
+      name = await askForOneLine(
+        "Import as a new saved board",
+        `“${original}” is already saved. Choose a name for the imported copy.`,
+        unusedKeptBoardName(original),
+      );
+      if (!name) return;
+    }
+    const said = await request("/api/swarm/import-kept", {
+      method: "POST", body: JSON.stringify({document, name}),
+    });
+    acceptKeptInventory(said);
+    renderTheKeptBoards();
+    sayInSwarm(`Imported and saved ${said.name}. It has not replaced the board on screen.`);
+  } catch (trouble) {
+    sayInSwarm(String(trouble.message || trouble));
+  } finally {
+    $("swarmImportFile").value = "";
+  }
+}
+
+async function exportKeptBoard(name) {
+  try {
+    const said = await request(
+      `/api/swarm/export-kept?name=${encodeURIComponent(name)}`
+    );
+    const written = JSON.stringify(said.document, null, 2) + "\n";
+    if (window.harnessDesktop?.saveJsonFile) {
+      const saved = await window.harnessDesktop.saveJsonFile(
+        said.filename || "nexus-saved-board.json", written
+      );
+      sayInSwarm(saved?.saved
+        ? `Exported ${name} as ${saved.filename || "JSON"}.`
+        : "Export cancelled; nothing was written.");
+      return;
+    }
+    const blob = new Blob([written], {
+      type: "application/json",
+    });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = said.filename || "nexus-saved-board.json";
+    link.click();
+    URL.revokeObjectURL(link.href);
+    sayInSwarm(`Exported ${name} as JSON.`);
+  } catch (trouble) {
+    sayInSwarm(String(trouble.message || trouble));
+  }
 }
 
 function readTheBigChatLayout() {

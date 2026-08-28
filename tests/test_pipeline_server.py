@@ -293,6 +293,101 @@ class KeepingThemThroughThePanelTests(PanelTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(gone["saved"], [])
 
+    def test_reopening_the_panel_selects_and_loads_a_real_saved_automation(self) -> None:
+        existing = pipelines.a_starting_pipeline()
+        existing["name"] = "Already on disk"
+        existing["nodes"] = existing["nodes"][:2]
+        existing["edges"] = existing["edges"][:1]
+        existing = pipelines.save(self.panel.config, existing)
+
+        status, reopened = self.ask("/api/pipelines")
+        self.assertEqual(status, 200)
+        self.assertEqual(reopened["saved"], ["Already on disk"])
+        self.assertEqual(reopened["selected_name"], "Already on disk")
+        self.assertEqual(reopened["pipeline"], existing)
+
+    def test_authority_pause_does_not_hide_saved_automations(self) -> None:
+        existing = pipelines.a_starting_pipeline()
+        existing["name"] = "Still here"
+        pipelines.save(self.panel.config, existing)
+        with mock.patch.object(
+            server.pipeline_runtime, "PipelineRunStore",
+            side_effect=pipelines.PipelineError(
+                "The project authority descriptor was copied or substituted; automation is paused."
+            ),
+        ):
+            status, listed = self.ask("/api/pipelines")
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["saved"], ["Still here"])
+        self.assertEqual(listed["pipeline"]["name"], "Still here")
+        self.assertEqual(listed["project_authority_id"], "")
+        self.assertIn("automation is paused", listed["cannot_run"])
+
+    def test_export_import_duplicate_naming_and_restart_persistence(self) -> None:
+        original = pipelines.a_starting_pipeline()
+        original["name"] = "Portable automation"
+        self.assertEqual(self.ask("/api/pipelines/save", {"pipeline": original})[0], 200)
+        status, exported = self.ask("/api/pipelines/export?name=Portable%20automation")
+        self.assertEqual(status, 200)
+        self.assertEqual(exported["filename"], "portable-automation.json")
+        self.assertEqual(
+            exported["document"]["schema"], pipelines.AUTOMATION_DOCUMENT_SCHEMA
+        )
+        written = json.dumps(exported["document"])
+
+        duplicate_status, duplicate = self.ask(
+            "/api/pipelines/import", {"json": written}
+        )
+        self.assertEqual(duplicate_status, 400)
+        self.assertIn("nothing was overwritten", duplicate["error"])
+        imported_status, imported = self.ask(
+            "/api/pipelines/import",
+            {"document": exported["document"], "name": "Portable automation copy"},
+        )
+        self.assertEqual(imported_status, 200)
+        self.assertEqual(imported["pipeline"]["name"], "Portable automation copy")
+        self.assertEqual(
+            imported["saved"], ["Portable automation", "Portable automation copy"]
+        )
+
+        reopened = server.HarnessHTTPServer(
+            ("127.0.0.1", 0),
+            LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {}),
+        )
+        thread = threading.Thread(target=reopened.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{reopened.server_address[1]}/api/pipelines",
+                headers={"X-Harness-Token": reopened.token},
+            )
+            with urllib.request.urlopen(request, timeout=10) as answer:
+                after_restart = json.loads(answer.read().decode("utf-8"))
+            self.assertEqual(after_restart["selected_name"], "Portable automation")
+            self.assertEqual(after_restart["pipeline"]["name"], "Portable automation")
+            self.assertIn("Portable automation copy", after_restart["saved"])
+        finally:
+            reopened.shutdown()
+            reopened.server_close()
+
+    def test_invalid_import_json_is_fail_closed_and_bad_saved_files_are_disclosed(self) -> None:
+        before = list((self.root / ".harness").rglob("*"))
+        status, invalid = self.ask(
+            "/api/pipelines/import", {"json": '{"name": "unfinished"'}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("not valid JSON", invalid["error"])
+        self.assertEqual(list((self.root / ".harness").rglob("*")), before)
+
+        folder = pipelines.folder(self.panel.config)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "damaged.json").write_text("{ nope", encoding="utf-8")
+        status, listed = self.ask("/api/pipelines")
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["saved"], [])
+        self.assertEqual(len(listed["saved_problems"]), 1)
+        self.assertIn("damaged.json", listed["saved_problems"][0])
+
     def test_asking_for_one_that_is_not_there_is_refused_plainly(self) -> None:
         status, said = self.ask("/api/pipelines?name=Nothing")
         self.assertEqual(status, 400)
@@ -317,7 +412,9 @@ class KeepingThemThroughThePanelTests(PanelTestCase):
     def test_everything_here_needs_the_token(self) -> None:
         for path, body in (
             ("/api/pipelines", None),
+            ("/api/pipelines/export?name=First%20pipeline", None),
             ("/api/pipelines/create", {"name": "Fresh automation"}),
+            ("/api/pipelines/import", {"json": "{}"}),
             ("/api/pipelines/save", {"pipeline": pipelines.a_starting_pipeline()}),
             ("/api/pipelines/run", {"pipeline": pipelines.a_starting_pipeline()}),
             ("/api/pipelines/delete", {"name": "First pipeline"}),

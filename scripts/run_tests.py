@@ -77,6 +77,11 @@ def main(argv: list[str] | None = None) -> int:
             print(name)
         return 0
 
+    # Running this file directly makes ``scripts`` (rather than the repository
+    # root) Python's first import location.  Some tests intentionally exercise
+    # release scripts as importable modules, so every invocation mode needs the
+    # same repository-root import semantics as ``python -m unittest``.
+    sys.path.insert(0, str(ROOT))
     sys.path.insert(0, str(ROOT / "src"))
     sys.path.insert(0, str(TESTS))
     if part[1]:

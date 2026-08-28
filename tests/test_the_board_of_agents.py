@@ -1499,6 +1499,19 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('.swarm-kept-pick[aria-current="true"]', self.styles)
         self.assertIn("the saved board you used last", self.script)
 
+    def test_saved_boards_have_visible_json_import_and_per_board_export(self) -> None:
+        for element in ("swarmImport", "swarmImportFile"):
+            self.assertIn(f'id="{element}"', self.markup)
+        self.assertIn("async function importKeptBoard(file)", self.script)
+        self.assertIn("async function exportKeptBoard(name)", self.script)
+        self.assertIn('request("/api/swarm/import-kept"', self.script)
+        self.assertIn("/api/swarm/export-kept?name=", self.script)
+        self.assertIn("It has not replaced the board on screen", self.script)
+        self.assertIn('id="swarmKeptProblems"', self.markup)
+        self.assertIn("MAX_SAVED_BOARD_IMPORT_BYTES = 10_000_000", self.script)
+        self.assertIn('$("swarmStart").disabled = held || swarmGoing', self.script)
+        self.assertIn("swarmKeptProblems = said.kept_problems || []", self.script)
+
     def test_startup_draws_saved_boards_before_refreshing_provider_status(self) -> None:
         refresh = self.script[
             self.script.index("async function refreshSwarm"):
@@ -1836,8 +1849,10 @@ class MovingAroundTheBoard(unittest.TestCase):
 
         self.assertIn('id="theBigChatWorkRecovery"', self.markup)
         self.assertIn('"nexus.swarm.work-recoveries.v1"', self.script)
-        self.assertIn('"paused_for_user", "applied_unverified", "needs_verification"',
+        self.assertIn('"paused_provider", "paused_for_user", "incomplete"',
                       self.script)
+        self.assertIn('request("/api/swarm/recoveries")', self.script)
+        self.assertIn("resolved_recovery_keys", self.script)
         self.assertIn("swarmWorkRecoveries.get(swarmChatKey(agentId))", self.script)
         self.assertIn('make("section", "work-recovery swarm-chat-work-recovery")',
                       self.script)
@@ -1863,6 +1878,8 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('mode: "work"', resume)
         self.assertIn('resume_session_id: recovery.resumeToken', resume)
         self.assertIn('user_answers: answers', resume)
+        self.assertIn('...(answers ? {user_answers: answers} : {})', resume)
+        self.assertNotIn('\n        user_answers: answers,', resume)
         self.assertIn('? {allowed_write_roots: [...recovery.allowedWriteRoots]} : {}', resume)
         self.assertIn("recovery.writeScopeRestricted", resume)
         self.assertIn('conversation.project !== recovery.projectId', resume)
@@ -1875,9 +1892,21 @@ class MovingAroundTheBoard(unittest.TestCase):
         ]
         self.assertIn('status === "needs_verification"', reporting)
         self.assertIn('status === "applied_unverified"', reporting)
+        self.assertIn('status === "paused_provider"', reporting)
+        self.assertIn('status === "incomplete"', reporting)
         self.assertIn("Nexus has not claimed completion", self.script)
         self.assertLess(reporting.index('status === "applied_unverified"'),
                         reporting.index("answered?.changed?.length"))
+
+    def test_long_horizon_budget_is_disclosed_as_transcript_not_whole_prompt(self) -> None:
+        self.assertIn(
+            "conversation-history projection per long-horizon phase", self.script,
+        )
+        self.assertIn(
+            "surrounding goal, project, and turn instructions are additional",
+            self.script,
+        )
+        self.assertNotIn("long-horizon phase context with", self.script)
 
     def test_add_project_dialog_offers_the_electron_folder_picker(self) -> None:
         self.assertIn('id="askDialogBrowse"', self.markup)
@@ -2103,6 +2132,103 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(said["board"]["agents"], [])
         self.assertIn("agents", said["most"])
         self.assertIn("no agents yet", " ".join(said["what_is_not_ready"]))
+
+    def test_recoverable_work_inventory_survives_backend_restart_and_is_bounded(self) -> None:
+        def finish_recovery(chat_id: str, status: str, token: str, objective: str) -> None:
+            snapshot = {
+                "schema_version": 1,
+                "project_root": str(self.panel.config.project_root),
+                "board": {},
+                "conversation": {
+                    "id": chat_id, "project": "project-1",
+                    "projects": [{"id": "project-1", "name": "Chosen"}],
+                },
+                "agent_id": "agent-1", "chat_key": chat_id,
+                "filed_as": "pair", "requested_mode": "work",
+                "objective": objective, "objective_generation": "fixture",
+            }
+            run, created = self.panel.swarm_runs.accept(
+                f"recovery-{chat_id}", snapshot,
+            )
+            self.assertTrue(created)
+            self.panel.swarm_runs.start(run["run_id"])
+            self.panel.swarm_runs.finish(run["run_id"], {
+                "status": status, "verification_status": status,
+                "resume_token": token, "goal_complete": False,
+                "allowed_write_roots": "not-a-list" if status == "incomplete" else ["output"],
+                "write_scope_restricted": True,
+                "questions": ["valid question", 42],
+                "remaining": ["valid remaining", {"not": "text"}],
+                "context_tool_budget": {
+                    "epoch": 2, "summary": "bounded", "unknown": "x" * 100_000,
+                },
+                "project": {"id": "project-1", "name": "Chosen"},
+            })
+
+        finish_recovery(
+            "provider-chat", "paused_provider", "provider-resume-123",
+            "Create provider result " + ("x" * 10_000),
+        )
+        finish_recovery(
+            "incomplete-chat", "incomplete", "incomplete-resume-123",
+            "Continue the unfinished goal",
+        )
+        # A new store performs full integrity verification, as a restarted
+        # desktop backend does, before serving the recovery projection.
+        self.panel._swarm_runs = None
+        status, saved = self.ask("/api/swarm/recoveries")
+        self.assertEqual(status, 200, saved)
+        by_status = {one["status"]: one for one in saved["recoveries"]}
+        self.assertEqual(set(by_status), {"paused_provider", "incomplete"}, saved)
+        self.assertTrue(by_status["paused_provider"]["objective_truncated"])
+        self.assertLessEqual(len(by_status["paused_provider"]["objective"]), 2_000)
+        self.assertEqual(by_status["incomplete"]["allowed_write_roots"], [])
+        self.assertEqual(by_status["incomplete"]["questions"], ["valid question"])
+        self.assertEqual(by_status["incomplete"]["remaining"], ["valid remaining"])
+        self.assertEqual(by_status["incomplete"]["context_tool_budget"], {
+            "epoch": 2, "summary": "bounded",
+        })
+        self.assertLessEqual(
+            saved["projection_bytes"], saved["projection_limit_bytes"],
+        )
+
+    def test_authority_pause_does_not_hide_live_or_saved_boards(self) -> None:
+        swarm.import_kept_board({
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Still mine",
+            "board": {"agents": [{"name": "The planner"}]},
+        })
+        with mock.patch.object(
+            swarm_runs, "SwarmRunStore",
+            side_effect=swarm.SwarmError(
+                "The project authority descriptor was copied or substituted; automation is paused."
+            ),
+        ):
+            status, said = self.ask("/api/swarm?refresh_providers=false")
+        self.assertEqual(status, 200)
+        self.assertEqual([one["name"] for one in said["kept"]], ["Still mine"])
+        self.assertIn("automation is paused", said["cannot_be_changed"])
+
+    def test_saved_board_json_api_imports_lists_and_exports(self) -> None:
+        document = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Portable",
+            "board": {"agents": [{"name": "The planner"}]},
+        }
+        status, imported = self.ask(
+            "/api/swarm/import-kept", {"document": document, "name": "Portable"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([one["name"] for one in imported["kept"]], ["Portable"])
+        status, exported = self.ask("/api/swarm/export-kept?name=Portable")
+        self.assertEqual(status, 200)
+        self.assertEqual(exported["document"]["format"], swarm.SAVED_BOARD_DOCUMENT)
+        self.assertEqual(exported["document"]["board"]["agents"][0]["name"], "The planner")
+        duplicate, refused = self.ask(
+            "/api/swarm/import-kept", {"json": json.dumps(document), "name": "Portable"}
+        )
+        self.assertEqual(duplicate, 400)
+        self.assertIn("already", refused["error"])
 
     def test_first_board_hydration_does_not_wait_for_provider_discovery(self) -> None:
         self.ask("/api/swarm/save", {"board": {"agents": [{

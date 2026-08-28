@@ -11,6 +11,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -388,6 +390,167 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         (swarm.where_the_kept_ones_live() / "rubbish.json").write_text(
             "not json at all", encoding="utf-8")
         self.assertEqual([one["name"] for one in swarm.every_kept_board()], ["A good one"])
+        healthy, problems = swarm.kept_board_inventory()
+        self.assertEqual([one["name"] for one in healthy], ["A good one"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("rubbish.json", problems[0])
+
+    def test_invalid_utf8_and_semantic_corruption_are_disclosed_not_crashes(self) -> None:
+        self.a_board_with("The planner")
+        swarm.keep_this_board("A good one", self.config)
+        where = swarm.where_the_kept_ones_live()
+        (where / "invalid-utf8.json").write_bytes(b"\xff\xfe")
+        (where / "semantic.json").write_text(json.dumps({
+            "name": "Looks healthy",
+            "board": {"agents": [{"id": "agent-1", "name": "Bad/Name"}]},
+        }), encoding="utf-8")
+
+        healthy, problems = swarm.kept_board_inventory()
+
+        self.assertEqual([one["name"] for one in healthy], ["A good one"])
+        self.assertEqual(len(problems), 2)
+        self.assertIn("invalid-utf8.json", "\n".join(problems))
+        self.assertIn("semantic.json", "\n".join(problems))
+
+    def test_import_rejects_any_shape_the_loader_would_silently_trim(self) -> None:
+        too_many = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Too many",
+            "board": {"agents": [
+                {"name": f"Agent {number}"}
+                for number in range(swarm.MOST_AGENTS + 1)
+            ]},
+        }
+        with self.assertRaisesRegex(swarm.SwarmError, "24 is the most"):
+            swarm.import_kept_board(too_many)
+        too_long = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Too long",
+            "board": {"agents": [{"name": "A", "job": "x" * (swarm.LONGEST_JOB + 1)}]},
+        }
+        with self.assertRaisesRegex(swarm.SwarmError, "longer than"):
+            swarm.import_kept_board(too_long)
+        duplicate_ids = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Duplicate ids",
+            "board": {"agents": [
+                {"id": "agent-1", "name": "One"},
+                {"id": "agent-1", "name": "Two"},
+            ]},
+        }
+        with self.assertRaisesRegex(swarm.SwarmError, "more than once"):
+            swarm.import_kept_board(duplicate_ids)
+        invalid_colour = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Bad colour",
+            "board": {"agents": [{"id": "agent-1", "name": "One", "colour": "red"}]},
+        }
+        with self.assertRaisesRegex(swarm.SwarmError, "#RRGGBB"):
+            swarm.import_kept_board(invalid_colour)
+        dangling = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Dangling",
+            "board": {
+                "agents": [{"id": "agent-1", "name": "One"}],
+                "projects": [],
+                "works_on": [{"agent": "agent-1", "project": "project-404"}],
+            },
+        }
+        with self.assertRaisesRegex(swarm.SwarmError, "not on the board"):
+            swarm.import_kept_board(dangling)
+        self.assertEqual(swarm.every_kept_board(), [])
+
+    def test_import_rejects_unknown_fields_instead_of_silently_losing_them(self) -> None:
+        examples = (
+            {
+                "format": swarm.SAVED_BOARD_DOCUMENT,
+                "name": "Outer surprise",
+                "future": True,
+                "board": {},
+            },
+            {
+                "format": swarm.SAVED_BOARD_DOCUMENT,
+                "name": "Board surprise",
+                "board": {"future": True},
+            },
+            {
+                "format": swarm.SAVED_BOARD_DOCUMENT,
+                "name": "Agent surprise",
+                "board": {"agents": [{"id": "agent-1", "name": "Planner", "future": True}]},
+            },
+        )
+        for document in examples:
+            with self.subTest(name=document["name"]):
+                with self.assertRaisesRegex(swarm.SwarmError, "unsupported"):
+                    swarm.import_kept_board(document)
+        self.assertEqual(swarm.every_kept_board(), [])
+
+    def test_import_sizes_the_canonical_export_not_only_the_smaller_input(self) -> None:
+        document = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Expands",
+            "board": {
+                "projects": [{"id": "project-1", "path": "x" * 400, "tasks": []}],
+            },
+        }
+        compact_size = len(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+        checked = swarm.read_it(document["board"])
+        portable_size = len((json.dumps({
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Expands",
+            "saved_at": "2026-08-28T00:00:00Z",
+            "board": checked.to_dict(),
+        }, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        self.assertGreater(portable_size, compact_size)
+        with mock.patch.object(
+            swarm, "MAX_SAVED_BOARD_DOCUMENT_BYTES", portable_size - 1
+        ):
+            with self.assertRaisesRegex(swarm.SwarmError, "portable JSON"):
+                swarm.import_kept_board(document)
+        self.assertEqual(swarm.every_kept_board(), [])
+
+    def test_import_refuses_case_only_duplicate_names(self) -> None:
+        document = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Friday",
+            "board": {"agents": [{"name": "Planner"}]},
+        }
+        swarm.import_kept_board(document)
+        with self.assertRaisesRegex(swarm.SwarmError, "already"):
+            swarm.import_kept_board(dict(document, name="friday"))
+
+    def test_case_only_duplicate_imports_have_one_cross_process_winner(self) -> None:
+        gate = self.home / "go"
+        code = (
+            "import os,time\n"
+            "from pathlib import Path\n"
+            "from our_harness import swarm\n"
+            "while not Path(os.environ['BOARD_GATE']).exists(): time.sleep(.01)\n"
+            "doc={'format':swarm.SAVED_BOARD_DOCUMENT,'name':os.environ['BOARD_NAME'],"
+            "'board':{'agents':[{'name':'Planner'}]}}\n"
+            "try:\n swarm.import_kept_board(doc); print('saved')\n"
+            "except swarm.SwarmError:\n print('refused')\n"
+        )
+        processes = []
+        for name in ("Friday", "friday"):
+            environment = dict(os.environ)
+            environment.update({
+                "APPDATA": str(self.home / "appdata"),
+                "BOARD_GATE": str(gate),
+                "BOARD_NAME": name,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            })
+            processes.append(subprocess.Popen(
+                [sys.executable, "-c", code], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ))
+        gate.write_text("go", encoding="utf-8")
+        outcomes = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=15)
+            self.assertEqual(process.returncode, 0, stderr)
+            outcomes.append(stdout.strip())
+        self.assertEqual(sorted(outcomes), ["refused", "saved"])
 
     def test_what_is_saved_is_checked_the_way_any_board_is(self) -> None:
         """A board saved by an older version goes back in through the same door
@@ -402,6 +565,38 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         one.write_text(json.dumps(held), encoding="utf-8")
         with self.assertRaises(swarm.SwarmError):
             swarm.open_this_board("Friday work", self.config)
+
+    def test_a_saved_board_round_trips_as_portable_json_without_opening_it(self) -> None:
+        self.a_board_with("The planner")
+        swarm.keep_this_board("Friday work", self.config)
+        document = swarm.export_kept_board("Friday work")
+        self.assertEqual(document["format"], swarm.SAVED_BOARD_DOCUMENT)
+        self.assertEqual(document["board"]["agents"][0]["name"], "The planner")
+
+        swarm.import_kept_board(document, "Friday work copy")
+        self.assertEqual(
+            sorted(one["name"] for one in swarm.every_kept_board()),
+            ["Friday work", "Friday work copy"],
+        )
+        self.assertEqual(swarm.load().active_saved_board, "")
+
+    def test_import_refuses_wrong_json_duplicate_names_and_invalid_boards(self) -> None:
+        valid = {
+            "format": swarm.SAVED_BOARD_DOCUMENT,
+            "name": "Portable",
+            "board": {"agents": [{"name": "The planner"}]},
+        }
+        swarm.import_kept_board(valid)
+        with self.assertRaisesRegex(swarm.SwarmError, "already"):
+            swarm.import_kept_board(valid)
+        with self.assertRaisesRegex(swarm.SwarmError, "not a saved Nexus board"):
+            swarm.import_kept_board({"format": "somebody-else.v1", "board": {}})
+        broken = dict(valid, name="Broken", board={"agents": [
+            {"name": "Same"}, {"name": "same"},
+        ]})
+        with self.assertRaises(swarm.SwarmError):
+            swarm.import_kept_board(broken)
+        self.assertEqual([one["name"] for one in swarm.every_kept_board()], ["Portable"])
 
 
 class TheBoardSurvivesTheChecksTests(unittest.TestCase):

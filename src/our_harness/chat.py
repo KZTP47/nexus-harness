@@ -75,6 +75,26 @@ MOST_KEPT = 40
 # answer to this size: exceeding it is a visible transport failure so Nexus can
 # resume/retry without recording a plausible-looking fragment as complete.
 LONGEST_ANSWER = 8_000_000
+
+# One machine-readable policy owns every long-horizon conversation projection,
+# from team discussion through final synthesis. The canonical collaboration
+# ledger is never clipped; provider prompts get newest complete turns plus a
+# deterministic semantic projection of older turns. Keep this here rather than
+# in ``swarm_work`` so ``effective_limits`` and the orchestration engine cannot
+# drift into two different, partly hidden policies.
+LONG_HORIZON_CONTEXT_POLICY: dict[str, Any] = {
+    "schema_version": 1,
+    "phases": [
+        "team_discussion", "planning", "execution", "verification",
+        "final_synthesis",
+    ],
+    "prompt_transcript_characters": 120_000,
+    "semantic_summary_characters": 40_000,
+    "canonical_history": "append_only_paged_collaboration_ledger",
+    "older_turns": "deterministic_semantic_summary",
+    "newer_turns": "newest_complete_turns",
+    "overflow_policy": "summarize_semantics_without_mid_turn_clipping",
+}
 LONGEST_WAIT_SECONDS = 600.0
 # Non-interactive CLI adapters use this as their minimum capture budget.  The
 # execution command limit is a different concern and used to truncate provider
@@ -1311,10 +1331,24 @@ def effective_limits(
             "total_bytes": MOST_ATTACHMENTS_BYTES,
             "text_characters_each": MOST_ATTACHMENT_TEXT,
         },
+        "long_horizon_context": {
+            **LONG_HORIZON_CONTEXT_POLICY,
+            "phases": list(LONG_HORIZON_CONTEXT_POLICY["phases"]),
+            "note": (
+                "Team discussion, planning, execution, verification, and final "
+                "synthesis use this same policy. "
+                "Older requirements, decisions, facts, blockers, paths, and structured "
+                "checkpoints are retained in a deterministic semantic summary; the full "
+                "canonical history remains in the paged collaboration ledger."
+            ),
+        },
         "overflow_policy": "reject_without_truncation",
         "note": (
-            "Nexus never clips prompts or answers. A provider can have a smaller "
-            "model-specific context window; its redacted reason will be shown if so."
+            "Nexus rejects oversized user-submitted prompt and answer payloads instead "
+            "of silently truncating them. Long-horizon conversation history uses the "
+            "disclosed semantic projection above while the full canonical history remains "
+            "in the paged collaboration ledger. A provider can have a smaller model-specific "
+            "context window; its redacted reason will be shown if so."
         ),
     }
 

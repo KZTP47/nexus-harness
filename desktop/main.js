@@ -473,6 +473,34 @@ ipcMain.handle("harness:showProjectFile", (_event, relativePath) => {
   shell.showItemInFolder(target);
   return true;
 });
+ipcMain.handle("harness:saveJsonFile", (event, suggestedName, contents) => {
+  if (!fromHarnessWindow(event)) throw new Error("Only the Nexus Harness window may save an export.");
+  const written = String(contents || "");
+  if (!written || Buffer.byteLength(written, "utf8") > 12_000_000) {
+    throw new Error("A JSON export must contain 1 to 12000000 UTF-8 bytes.");
+  }
+  let safe = path.basename(String(suggestedName || "visual-automation.json"))
+    .replace(/[^A-Za-z0-9._ -]/g, "-");
+  if (!safe.toLowerCase().endsWith(".json")) safe += ".json";
+  const chosen = dialog.showSaveDialogSync(window || undefined, {
+    title: "Export Nexus JSON",
+    defaultPath: path.join(app.getPath("downloads"), safe),
+    buttonLabel: "Export JSON",
+    filters: [{name: "JSON files", extensions: ["json"]}],
+    properties: ["showOverwriteConfirmation", "createDirectory"],
+  });
+  if (!chosen) return {saved: false};
+  const beside = `${chosen}.${process.pid}-${Date.now()}.part`;
+  try {
+    fs.writeFileSync(beside, written, {encoding: "utf8"});
+    fs.renameSync(beside, chosen);
+  } finally {
+    try { fs.unlinkSync(beside); } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return {saved: true, filename: path.basename(chosen)};
+});
 ipcMain.handle("harness:setFullScreen", (_event, on) => {
   if (!window || window.isDestroyed()) return false;
   window.setFullScreen(Boolean(on));

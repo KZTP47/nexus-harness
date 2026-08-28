@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
@@ -30,6 +31,7 @@ INTEGRITY_VERSION = "1"
 INTEGRITY_ANCHOR = "swarm-runs.integrity-anchor.json"
 MAX_EVENT_PAGE_ROWS = 200
 MAX_EVENT_PAGE_BYTES = 256_000
+MAX_RECOVERY_PROJECTION_BYTES = 256_000
 _CURRENT: contextvars.ContextVar[tuple["SwarmRunStore", str] | None] = contextvars.ContextVar(
     "nexus_swarm_run", default=None
 )
@@ -956,6 +958,18 @@ class SwarmRunStore:
 
     def finish(self, run_id: str, result: dict[str, Any]) -> None:
         clean_result = self.redactor.value(result)
+        # ``resume_token`` is an opaque collaboration-ledger session ID, not a
+        # provider/API credential. The generic credential redactor quite
+        # correctly hides keys containing "token", so restore this one tightly
+        # validated recovery identity after redaction; otherwise a desktop
+        # restart irreversibly turns every resumable run into "[REDACTED]".
+        resume_token = result.get("resume_token")
+        if (
+            isinstance(clean_result, dict)
+            and isinstance(resume_token, str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{8,128}", resume_token)
+        ):
+            clean_result["resume_token"] = resume_token
         with self._tx() as db:
             before = db.execute(
                 "SELECT * FROM runs WHERE run_id=? AND project_authority=?",
@@ -1087,6 +1101,150 @@ class SwarmRunStore:
                 self._verify_run(db, row)
                 return self._row(row)
         return None
+
+    def recoverable_work(self, limit: int = 50) -> dict[str, Any]:
+        """Return the newest durable project-work outcome for each pair chat.
+
+        Renderer localStorage is only a convenience cache.  The signed run
+        journal is the restart authority, so a new desktop process can rebuild
+        recovery cards without replaying a provider turn or exposing the full
+        provider transcript through this small inventory endpoint.
+        """
+
+        maximum = max(1, min(200, int(limit)))
+        with self._read() as db:
+            rows = db.execute(
+                "SELECT * FROM runs WHERE project_authority=? AND result_json IS NOT NULL "
+                "ORDER BY updated_ms DESC LIMIT ?",
+                (self.authority, maximum * 10),
+            ).fetchall()
+            for row in rows:
+                self._verify_run(db, row)
+        def strings(value: object, maximum_items: int, maximum_chars: int) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            return [
+                one[:maximum_chars]
+                for one in value[:maximum_items]
+                if isinstance(one, str) and one.strip()
+            ]
+
+        def budget(value: object) -> dict[str, Any]:
+            if not isinstance(value, dict):
+                return {}
+            projected: dict[str, Any] = {}
+            for key in (
+                "epoch", "epoch_call_limit", "epoch_calls_used",
+                "epoch_calls_remaining", "lifetime_calls_used",
+                "absolute_call_limit",
+            ):
+                held = value.get(key)
+                if isinstance(held, int) and not isinstance(held, bool):
+                    projected[key] = held
+            for key, bound in (("renewal_policy", 1_000), ("summary", 2_000)):
+                held = value.get(key)
+                if isinstance(held, str):
+                    projected[key] = held[:bound]
+            return projected
+
+        recoverable = {
+            "paused_provider", "paused_for_user", "incomplete",
+            "applied_unverified", "needs_verification",
+        }
+        seen: set[str] = set()
+        found: list[dict[str, Any]] = []
+        resolved: list[str] = []
+        projection_bytes = len(_canonical({
+            "recoveries": [], "resolved_recovery_keys": [],
+        }).encode("utf-8"))
+        omitted = 0
+        for row in rows:
+            value = self._row(row)
+            snapshot = value.get("snapshot")
+            result = value.get("result")
+            if not isinstance(snapshot, dict) or not isinstance(result, dict):
+                continue
+            if str(snapshot.get("requested_mode") or "") != "work":
+                continue
+            conversation = snapshot.get("conversation")
+            conversation = conversation if isinstance(conversation, dict) else {}
+            agent_id = str(snapshot.get("agent_id") or "")
+            chat_id = str(conversation.get("id") or "legacy")
+            key = f"{agent_id}:{chat_id}"
+            if not agent_id or key in seen:
+                continue
+            seen.add(key)
+            status = str(result.get("status") or result.get("verification_status") or "")
+            token = str(result.get("resume_token") or "")
+            if (
+                status not in recoverable
+                or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", token)
+            ):
+                resolved.append(key)
+                continue
+            project = result.get("project")
+            project = project if isinstance(project, dict) else {}
+            project_id = str(project.get("id") or conversation.get("project") or "")
+            project_name = str(project.get("name") or "")
+            if not project_name:
+                projects = conversation.get("projects")
+                if isinstance(projects, list):
+                    selected = next((
+                        one for one in projects
+                        if isinstance(one, dict) and str(one.get("id") or "") == project_id
+                    ), None)
+                    if isinstance(selected, dict):
+                        project_name = str(selected.get("name") or "")
+            objective = str(snapshot.get("objective") or "")
+            record = {
+                "recovery_key": key,
+                "agent_id": agent_id,
+                "chat_id": chat_id,
+                "status": status,
+                "resume_token": token,
+                "objective": objective[:2_000],
+                "objective_truncated": len(objective) > 2_000,
+                "allowed_write_roots": strings(
+                    result.get("allowed_write_roots"), 24, 240,
+                ),
+                "write_scope_restricted": bool(result.get("write_scope_restricted")),
+                "context_tool_budget": budget(result.get("context_tool_budget")),
+                "questions": strings(result.get("questions"), 6, 500),
+                "remaining": strings(result.get("remaining"), 12, 500),
+                "project": {
+                    "id": project_id[:160],
+                    "name": (project_name or "the selected project")[:200],
+                },
+                "updated_ms": int(value.get("updated_ms") or 0),
+            }
+            encoded = len(_canonical(record).encode("utf-8"))
+            if projection_bytes + encoded > MAX_RECOVERY_PROJECTION_BYTES - 4_096:
+                omitted += 1
+                continue
+            found.append(record)
+            projection_bytes += encoded
+            if len(found) >= maximum:
+                break
+        bounded_resolved: list[str] = []
+        omitted_resolved = 0
+        for key in resolved[: maximum * 10]:
+            held = key[:360]
+            encoded = len(_canonical(held).encode("utf-8"))
+            if projection_bytes + encoded > MAX_RECOVERY_PROJECTION_BYTES - 2_048:
+                omitted_resolved += 1
+                continue
+            bounded_resolved.append(held)
+            projection_bytes += encoded
+        omitted_resolved += max(0, len(resolved) - maximum * 10)
+        response = {
+            "recoveries": found,
+            "resolved_recovery_keys": bounded_resolved,
+            "omitted_recoveries": omitted,
+            "omitted_resolved_recovery_keys": omitted_resolved,
+            "projection_limit_bytes": MAX_RECOVERY_PROJECTION_BYTES,
+        }
+        response["projection_bytes"] = len(_canonical(response).encode("utf-8"))
+        return response
 
     def projection(self, identity: str, after: int = 0) -> dict[str, Any]:
         run = self.get(identity)

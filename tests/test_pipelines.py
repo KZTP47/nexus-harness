@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -65,6 +66,26 @@ class PipelineFullScreenViewTests(unittest.TestCase):
         self.assertIn('request("/api/pipelines/create"', self.script)
         self.assertIn("pipelineSavedName = pipeline.name", self.script)
         self.assertIn("pipelineSaved = said.saved || []", self.script)
+
+    def test_saved_automations_restore_visibly_and_disclose_unreadable_files(self) -> None:
+        for element in ("pipelineSavedCount", "pipelineSavedProblems", "pipelineList"):
+            self.assertIn(f'id="{element}"', self.markup)
+        self.assertIn("said.selected_name || requestedName", self.script)
+        self.assertIn("pipelineSavedProblems = said.saved_problems || []", self.script)
+        self.assertIn("saved JSON file", self.script)
+        self.assertIn("name === pipelineSavedName", self.script)
+        self.assertIn("pipelineCannotRun = String(said.cannot_run", self.script)
+        self.assertIn('$("pipelineRun").disabled = Boolean(pipelineCannotRun)', self.script)
+
+    def test_visual_automations_have_intuitive_json_import_and_export_controls(self) -> None:
+        for element in ("pipelineImport", "pipelineExport", "pipelineImportFile"):
+            self.assertIn(f'id="{element}"', self.markup)
+        self.assertIn('accept="application/json,.json"', self.markup)
+        self.assertIn('request("/api/pipelines/import"', self.script)
+        self.assertIn("/api/pipelines/export?name=", self.script)
+        self.assertIn("nexus-harness.visual-automation", self.script)
+        self.assertIn("is already saved. Choose a name for the imported copy", self.script)
+        self.assertIn("Nothing was imported", self.script)
 
     def test_pipeline_full_screen_uses_the_native_window_and_is_a_toggle(self) -> None:
         self.assertIn("window.harnessDesktop?.setFullScreen", self.script)
@@ -267,6 +288,10 @@ class KeepingThemTests(PipelineTestCase):
         broken = pipelines.folder(self.config) / "broken.json"
         broken.write_text("{ not json", encoding="utf-8")
         self.assertEqual(pipelines.saved_ones(self.config), ["First pipeline"])
+        saved, problems = pipelines.saved_inventory(self.config)
+        self.assertEqual(saved, ["First pipeline"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("broken.json", problems[0])
 
     def test_two_names_that_share_one_file_name_are_refused(self) -> None:
         # "Nightly build" and "Nightly Build" become the same file. Saving the
@@ -292,6 +317,163 @@ class KeepingThemTests(PipelineTestCase):
     def test_the_file_name_stays_inside_the_folder(self) -> None:
         where = pipelines.file_for(self.config, "First pipeline")
         self.assertTrue(where.as_posix().endswith(".harness/pipelines/first-pipeline.json"))
+
+
+class MovingSavedAutomationsTests(PipelineTestCase):
+    def test_export_is_versioned_and_import_accepts_legacy_saved_json(self) -> None:
+        original = pipelines.a_starting_pipeline()
+        original["name"] = "Portable checks"
+        original = pipelines.save(self.config, original)
+        exported = pipelines.export_document(self.config, original["name"])
+        self.assertEqual(exported["schema"], pipelines.AUTOMATION_DOCUMENT_SCHEMA)
+        self.assertEqual(exported["version"], pipelines.AUTOMATION_DOCUMENT_VERSION)
+        self.assertEqual(exported["automation"], original)
+
+        pipelines.remove(self.config, original["name"])
+        imported = pipelines.import_document(self.config, json.dumps(original))
+        self.assertEqual(imported, original)
+        self.assertEqual(pipelines.load(self.config, original["name"]), original)
+
+    def test_a_versioned_export_round_trips_after_a_restart(self) -> None:
+        original = pipelines.a_starting_pipeline()
+        original["name"] = "Restart survivor"
+        original = pipelines.save(self.config, original)
+        exported = json.dumps(pipelines.export_document(self.config, original["name"]))
+        pipelines.remove(self.config, original["name"])
+        pipelines.import_document(self.config, exported)
+
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        self.assertEqual(pipelines.saved_ones(reopened), ["Restart survivor"])
+        self.assertEqual(pipelines.load(reopened, "Restart survivor"), original)
+
+    def test_invalid_json_changes_nothing(self) -> None:
+        before = list(self.root.rglob("*"))
+        with self.assertRaisesRegex(pipelines.PipelineError, "not valid JSON"):
+            pipelines.import_document(self.config, '{"name": "Half written"')
+        self.assertEqual(list(self.root.rglob("*")), before)
+        self.assertEqual(pipelines.saved_ones(self.config), [])
+
+    def test_duplicate_import_never_overwrites_and_an_explicit_new_name_works(self) -> None:
+        original = pipelines.a_starting_pipeline()
+        original["name"] = "Daily checks"
+        original = pipelines.save(self.config, original)
+        changed = copy.deepcopy(original)
+        changed["nodes"] = []
+        changed["edges"] = []
+        document = json.dumps({
+            "schema": pipelines.AUTOMATION_DOCUMENT_SCHEMA,
+            "version": pipelines.AUTOMATION_DOCUMENT_VERSION,
+            "automation": changed,
+        })
+        with self.assertRaisesRegex(pipelines.PipelineError, "nothing was overwritten"):
+            pipelines.import_document(self.config, document)
+        self.assertEqual(pipelines.load(self.config, "Daily checks"), original)
+
+        imported = pipelines.import_document(self.config, document, name="Daily checks copy")
+        self.assertEqual(imported["name"], "Daily checks copy")
+        self.assertEqual(pipelines.saved_ones(self.config), ["Daily checks", "Daily checks copy"])
+
+    def test_two_concurrent_imports_have_exactly_one_winner(self) -> None:
+        document = pipelines.a_starting_pipeline()
+        document["name"] = "Race winner"
+        written = json.dumps(document)
+        barrier = threading.Barrier(2)
+        original_link = pipelines.os.link
+        outcomes: list[str] = []
+
+        def linked(source, target):
+            barrier.wait(timeout=5)
+            return original_link(source, target)
+
+        def importing() -> None:
+            try:
+                pipelines.import_document(self.config, written)
+                outcomes.append("saved")
+            except pipelines.PipelineError:
+                outcomes.append("refused")
+
+        with mock.patch.object(pipelines.os, "link", side_effect=linked):
+            threads = [threading.Thread(target=importing) for _ in range(2)]
+            for one in threads:
+                one.start()
+            for one in threads:
+                one.join(timeout=10)
+        self.assertEqual(sorted(outcomes), ["refused", "saved"])
+        self.assertEqual(pipelines.saved_ones(self.config), ["Race winner"])
+
+    def test_unknown_exchange_versions_and_invalid_automations_fail_closed(self) -> None:
+        for document in (
+            {"schema": pipelines.AUTOMATION_DOCUMENT_SCHEMA, "version": 99,
+             "automation": pipelines.a_starting_pipeline()},
+            {"schema": "some.other.file", "version": 1,
+             "automation": pipelines.a_starting_pipeline()},
+            {"schema": pipelines.AUTOMATION_DOCUMENT_SCHEMA, "version": 1,
+             "future_envelope": {"must": "survive-or-reject"},
+             "automation": pipelines.a_starting_pipeline()},
+            {"name": "Bad", "nodes": "not a list", "edges": []},
+        ):
+            with self.subTest(document=document):
+                with self.assertRaises(pipelines.PipelineError):
+                    pipelines.import_document(self.config, json.dumps(document))
+        self.assertEqual(pipelines.saved_ones(self.config), [])
+
+    def test_import_refuses_values_the_editor_reader_would_change(self) -> None:
+        overlong = pipelines.a_starting_pipeline()
+        overlong["name"] = "Overlong label"
+        overlong["nodes"][0]["label"] = "x" * 81
+        duplicate_arrow = pipelines.a_starting_pipeline()
+        duplicate_arrow["name"] = "Duplicate arrow"
+        duplicate_arrow["edges"].append(copy.deepcopy(duplicate_arrow["edges"][0]))
+        spaced_id = pipelines.a_starting_pipeline()
+        spaced_id["name"] = "Spaced id"
+        spaced_id["nodes"][0]["id"] = " start "
+        spaced_id["edges"][0]["from"] = " start "
+        for document, message in (
+            (overlong, "Nothing was imported"),
+            (duplicate_arrow, "Nothing was imported"),
+            (spaced_id, "not here"),
+        ):
+            with self.subTest(name=document["name"]):
+                with self.assertRaisesRegex(pipelines.PipelineError, message):
+                    pipelines.import_document(self.config, json.dumps(document))
+        self.assertEqual(pipelines.saved_ones(self.config), [])
+
+    def test_invalid_utf8_saved_file_does_not_hide_healthy_automations(self) -> None:
+        good = pipelines.a_starting_pipeline()
+        good["name"] = "Healthy"
+        pipelines.save(self.config, good)
+        (pipelines.folder(self.config) / "invalid-utf8.json").write_bytes(b"\xff\xfe")
+        saved, problems = pipelines.saved_inventory(self.config)
+        self.assertEqual(saved, ["Healthy"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("invalid-utf8.json", problems[0])
+
+    def test_saved_and_imported_definitions_share_one_visible_size_boundary(self) -> None:
+        definition = pipelines.a_starting_pipeline()
+        definition["name"] = "Bounded"
+        written = json.dumps(definition)
+        with mock.patch.object(pipelines, "MAX_AUTOMATION_DOCUMENT_BYTES", 400):
+            with self.assertRaisesRegex(pipelines.PipelineError, "visible .* limit"):
+                pipelines.save(self.config, definition)
+            with self.assertRaisesRegex(pipelines.PipelineError, "1 to 400"):
+                pipelines.import_document(self.config, written)
+        self.assertEqual(pipelines.saved_ones(self.config), [])
+
+    def test_the_size_boundary_includes_the_portable_export_envelope(self) -> None:
+        definition = pipelines.read_it(pipelines.a_starting_pipeline())
+        inner_size = len((json.dumps(definition, indent=2) + "\n").encode("utf-8"))
+        portable_size = len((json.dumps({
+            "schema": pipelines.AUTOMATION_DOCUMENT_SCHEMA,
+            "version": pipelines.AUTOMATION_DOCUMENT_VERSION,
+            "automation": definition,
+        }, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        self.assertGreater(portable_size, inner_size)
+        with mock.patch.object(
+            pipelines, "MAX_AUTOMATION_DOCUMENT_BYTES", portable_size - 1
+        ):
+            with self.assertRaisesRegex(pipelines.PipelineError, "visible 10 MB"):
+                pipelines.save(self.config, definition)
+        self.assertEqual(pipelines.saved_ones(self.config), [])
 
 
 class RunningThemTests(PipelineTestCase):

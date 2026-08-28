@@ -28,6 +28,7 @@ PYTHON_VERSION = "3.11.9"
 PYTHON_URL = f"https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-embed-amd64.zip"
 PYTHON_SHA256 = "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b"
 RUNTIME_LOCK = DESKTOP / ".runtime-build.lock"
+RUNTIME_PUBLISH_TIMEOUT_SECONDS = 300.0
 
 
 def retry_owned_windows_operation(operation, description: str, timeout_seconds: float = 30.0):
@@ -356,6 +357,7 @@ def _remove_abandoned_runtime_trees() -> None:
             retry_owned_windows_operation(
                 lambda target=resolved: shutil.rmtree(target),
                 "remove abandoned private-runtime tree",
+                timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
             )
 
 
@@ -377,29 +379,35 @@ def prepare(output: Path) -> Path:
             if had_previous:
                 retry_owned_windows_operation(
                     lambda: output.replace(previous), "preserve previous private runtime",
+                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
                 )
             try:
                 retry_owned_windows_operation(
                     lambda: staging.replace(output), "publish validated private runtime",
+                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
                 )
             except BaseException:
                 if had_previous and previous.exists() and not output.exists():
                     retry_owned_windows_operation(
                         lambda: previous.replace(output), "restore previous private runtime",
+                        timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
                     )
                 raise
             if previous.exists():
                 retry_owned_windows_operation(
                     lambda: shutil.rmtree(previous), "remove previous private runtime",
+                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
                 )
         finally:
             if staging.exists():
                 retry_owned_windows_operation(
                     lambda: shutil.rmtree(staging), "remove private-runtime staging tree",
+                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
                 )
             if previous.exists() and output.exists():
                 retry_owned_windows_operation(
                     lambda: shutil.rmtree(previous), "remove private-runtime rollback tree",
+                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
                 )
     return output
 

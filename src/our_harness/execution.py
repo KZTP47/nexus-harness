@@ -26,6 +26,39 @@ ALWAYS_DENIED = frozenset({
 })
 
 
+def _windows_process_cwd(working: Path) -> Path:
+    """Return a CreateProcess-compatible spelling of an existing cwd.
+
+    Windows still limits ``lpCurrentDirectory`` to ``MAX_PATH`` even when the
+    executable and Python runtime are long-path aware.  The path has already
+    passed project confinement before this helper is called, so using the
+    filesystem's own short alias changes only how the same directory is handed
+    to CreateProcess; it does not change command authority or reporting.
+    """
+
+    if os.name != "nt" or len(os.fspath(working)) < 260:
+        return working
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(32_768)
+        copied = ctypes.windll.kernel32.GetShortPathNameW(
+            os.fspath(working), buffer, len(buffer),
+        )
+        short = Path(buffer.value) if 0 < copied < len(buffer) else None
+        if (
+            short is None or len(os.fspath(short)) >= 260
+            or not short.is_dir() or not working.samefile(short)
+        ):
+            raise OSError("no usable short path")
+        return short
+    except (AttributeError, OSError, ValueError) as exc:
+        raise HarnessError(
+            "Command cwd exceeds the Windows process path limit and this volume "
+            "did not provide a usable 8.3 alias for the same directory."
+        ) from exc
+
+
 def _said_as(word: str) -> tuple[str, set[str]]:
     """One word of a command, as either a plain word or the switches it holds.
 
@@ -195,7 +228,12 @@ class CommandRunner:
         working = confined_path(self.root, cwd, allow_missing=False)
         if not working.is_dir():
             raise HarnessError(f"Command cwd is not a directory: {cwd}")
-        relative_cwd = working.relative_to(self.root).as_posix() or "."
+        # ``confined_path`` has already validated this user-supplied relative
+        # path.  Keep that spelling rather than deriving it from two resolved
+        # Windows paths: GitHub runners can return the same temporary folder as
+        # both RUNNER~1 and runneradmin, and pathlib quite correctly refuses to
+        # compare those strings even though Windows opens the same directory.
+        relative_cwd = Path(*re.split(r"[\\/]", os.fspath(cwd))).as_posix() or "."
         actual = list(argv)
         if self.config.get("execution.mode") == "docker":
             if not shutil.which("docker"):
@@ -207,6 +245,7 @@ class CommandRunner:
                 self.config.get("execution.docker_image"), *argv,
             ]
             working = self.root
+        process_cwd = _windows_process_cwd(working)
         environment = safe_environment(self.config.get("execution.inherit_environment", []))
         if environment_overrides:
             if not all(
@@ -233,7 +272,7 @@ class CommandRunner:
         deadline = started + timeout_seconds
         process = subprocess.Popen(
             actual,
-            cwd=working,
+            cwd=process_cwd,
             env=environment,
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,

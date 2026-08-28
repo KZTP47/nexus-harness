@@ -88,6 +88,20 @@ class OneConversation(TalkingTestCase):
         self.assertEqual(cli["provider_capture_bytes"], 2_000_000)
         self.assertEqual(cli["structured_capture_policy"], "schema_derived")
 
+    def test_effective_limits_disclose_one_long_horizon_context_policy(self) -> None:
+        limits = chat.effective_limits(self.config, "")
+        policy = limits["long_horizon_context"]
+        for key, value in chat.LONG_HORIZON_CONTEXT_POLICY.items():
+            self.assertEqual(policy[key], value)
+        self.assertEqual(policy["prompt_transcript_characters"], 120_000)
+        self.assertEqual(policy["semantic_summary_characters"], 40_000)
+        self.assertEqual(policy["phases"], [
+            "team_discussion", "planning", "execution", "verification",
+            "final_synthesis",
+        ])
+        self.assertIn("semantic projection", limits["note"])
+        self.assertNotIn("never clips prompts", limits["note"].casefold())
+
     def test_saying_something_gets_an_answer_back(self) -> None:
         answering = Answering()
         with self.standing_in(answering):

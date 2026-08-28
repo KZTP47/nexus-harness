@@ -434,14 +434,21 @@
       <div id="pipelineLibraryControls" class="pipeline-library-controls">
         <h2 id="pipelineSideTitle">Your automations</h2>
         <button id="pipelineNew" class="pipeline-create" type="button">Create new automation</button>
+        <p id="pipelineSavedCount" class="pipeline-saved-count" aria-live="polite"></p>
         <ul id="pipelineList" class="pipeline-saved"></ul>
+        <p id="pipelineSavedProblems" class="pipeline-saved-problems" role="status" hidden></p>
         <div class="pipeline-side-buttons">
           <button id="pipelineSave" type="button">Save</button>
           <button id="pipelineSaveAs" type="button">Save as</button>
+          <button id="pipelineImport" type="button">Import JSON</button>
+          <button id="pipelineExport" type="button">Export JSON</button>
+          <input id="pipelineImportFile" class="sr-only" type="file"
+                 accept="application/json,.json" tabindex="-1" aria-hidden="true">
           <button id="pipelineRun" class="primary" type="button">Run</button>
           <button id="pipelineStop" type="button" disabled>Stop</button>
           <button id="pipelineDelete" class="danger" type="button">Delete saved automation</button>
         </div>
+        <p class="hint">Automation JSON files can be up to 10 MB.</p>
       </div>
       <h3 id="pipelineStartersTitle">Start from a ready-made one</h3>
       <label class="sr-only" for="pipelineStarterSearch">Search the ready-made pipelines</label>
@@ -806,11 +813,17 @@
       <h3 id="swarmKeptTitle">Saved boards</h3>
     <p class="hint">The board you have open comes back the next time Nexus starts,
       with edits intact. These are the ones you meant to keep - a pair of agents
-      for this week's work, another for the project you go back to on Fridays.</p>
+      for this week's work, another for the project you go back to on Fridays.
+      Saved boards belong to your Windows account and stay visible when you switch projects.</p>
     <div class="button-row">
       <button id="swarmKeep" type="button">Save this board</button>
+      <button id="swarmImport" type="button">Import JSON</button>
+      <input id="swarmImportFile" class="sr-only" type="file"
+             accept="application/json,.json" tabindex="-1" aria-hidden="true">
     </div>
     <ul id="swarmKept" class="swarm-kept" aria-labelledby="swarmKeptTitle"></ul>
+    <p id="swarmKeptProblems" class="swarm-kept-problems" role="status" hidden></p>
+    <p class="hint">Board JSON files can be up to 10 MB.</p>
 
     <h3 id="swarmChatsTitle">Chats</h3>
       <p class="hint">Every conversation on this board: yours with each agent, and

@@ -17,6 +17,7 @@
     "smoke:built": "node built.smoke.js",
     "smoke:asking": "node asking.smoke.js",
     "smoke:board": "node board.smoke.js",
+    "smoke:automations": "node automations.smoke.js",
     "smoke:web-chat": "node web-chat.smoke.js",
     "smoke:claude-browser": "node claude-browser.smoke.js"
   },

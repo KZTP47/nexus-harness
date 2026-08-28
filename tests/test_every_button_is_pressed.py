@@ -42,6 +42,21 @@ _BUILT_BY_CLASS = re.compile(r'make\("button",\s*"([a-z][a-z -]*)"\)')
 # A control that is deliberately not pressed, and why. Nothing may sit here
 # without a real sentence.
 ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
+    "pipelineImport": (
+        "This opens the operating system file picker. Browser QA cannot choose a "
+        "portable user file safely; pipeline server, UI contract, and real Electron "
+        "smoke tests exercise validation, selection, persistence, and restart restore."
+    ),
+    "pipelineExport": (
+        "This opens Electron's native Save dialog or leaves a browser download. "
+        "Browser QA must not write an arbitrary file; desktop and pipeline tests "
+        "exercise the native bridge, versioned document, and round trip."
+    ),
+    "swarmImport": (
+        "This opens the operating system file picker. Browser QA cannot select a "
+        "personal board file; board API and UI contract tests exercise strict import "
+        "validation and persistence without touching user data."
+    ),
     "teamSetUp": (
         "It asks the server to do exactly what #setUpSeats asks, and that one is "
         "already pressed and put back again by a check on the first view. Pressing "
@@ -256,6 +271,11 @@ class WrittenButtonTests(unittest.TestCase):
 # The same thing for the buttons the panel builds while it runs, keyed by the
 # words on them rather than by a name in the page.
 BUILT_ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
+    "Export": (
+        "This per-board action opens a native Save dialog or leaves a browser download. "
+        "Browser QA must not write arbitrary user files; board API, UI contract, and "
+        "desktop bridge tests exercise the exact exported document and safe write path."
+    ),
     "Put it back": (
         "Pressing it takes a setting out of this project's own settings file. "
         "On a project whose settings file writes everything out - like this one "

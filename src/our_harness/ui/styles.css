@@ -394,6 +394,12 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .pipeline-side h4.pipeline-group { margin: 12px 0 6px; font-size: .74rem; text-transform: uppercase; letter-spacing: .08em; color: #64748b; }
 .pipeline-library-controls { display: grid; gap: 8px; }
 .pipeline-library-controls .pipeline-saved { margin-top: 2px; }
+.pipeline-saved-count { margin: 0; color: #475569; font-size: .8rem; }
+.pipeline-saved-problems { margin: 0; border: 1px solid #d97706; border-radius: 8px;
+  padding: 7px 9px; background: #fff7ed; color: #7c2d12; font-size: .78rem; }
+.swarm-kept-problems { margin: 7px 0; border: 1px solid #f59e0b; border-radius: 8px;
+  padding: 7px 9px; background: #422006; color: #fef3c7; font-size: .78rem;
+  white-space: pre-wrap; }
 .pipeline-create { width: 100%; background: #fff; color: #1d4ed8; border: 1px solid #2563eb;
   border-radius: 8px; padding: 8px 10px; font-size: .84rem; font-weight: 700; }
 .pipeline-create:hover { background: #eff6ff; }

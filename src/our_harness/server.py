@@ -1126,6 +1126,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self._json({**self.server.events.snapshot_after(after), "started_id": self.server.started_id})
                 else:
                     self._json({"events": self.server.events.after(after), "started_id": self.server.started_id})
+            elif parsed.path == "/api/swarm/recoveries":
+                self._require_token()
+                self._json(self.server.swarm_runs.recoverable_work())
             elif parsed.path == "/api/swarm/activity":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -1268,23 +1271,42 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # Reading takes the lock as well. A read that does not wait for
                 # a write is a read that can see half of one.
                 with self.server.pipelines_lock:
-                    saved_now = pipeline_lab.saved_ones(config)
-                    kept_now = pipeline_lab.older_ones(config, wanted) if wanted else []
+                    saved_now, saved_problems = pipeline_lab.saved_inventory(config)
+                    selected_name = wanted or (saved_now[0] if saved_now else "")
+                    kept_now = (
+                        pipeline_lab.older_ones(config, selected_name)
+                        if selected_name else []
+                    )
                     on_screen = (
-                        pipeline_lab.load(config, wanted)
-                        if wanted
+                        pipeline_lab.load(config, selected_name)
+                        if selected_name
                         else pipeline_lab.a_starting_pipeline()
                     )
-                active_run = self.server.pipeline_store.active()
-                latest_run = self.server.pipeline_store.latest()
-                authority_id = self.server.pipeline_store.authority_id
+                cannot_run = ""
+                try:
+                    store = self.server.pipeline_store
+                    active_run = store.active()
+                    latest_run = store.latest()
+                    authority_id = store.authority_id
+                except HarnessError as exc:
+                    # Saved definitions are ordinary project JSON and remain
+                    # useful for review, repair, import, and export even when a
+                    # copied authority descriptor correctly pauses execution.
+                    # Do not turn that execution fence into apparent data loss.
+                    active_run = None
+                    latest_run = None
+                    authority_id = ""
+                    cannot_run = str(exc)
                 if active_run is not None:
                     active_run["project_authority_id"] = authority_id
                 if latest_run is not None:
                     latest_run["project_authority_id"] = authority_id
                 answer: dict[str, Any] = {
                     "project_authority_id": authority_id,
+                    "cannot_run": cannot_run,
                     "saved": saved_now,
+                    "saved_problems": saved_problems,
+                    "selected_name": selected_name,
                     "kinds": [kind.to_dict() for kind in pipeline_lab.KINDS.values()],
                     "running": bool(active_run),
                     "active_run": active_run,
@@ -1320,6 +1342,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 )
                 answer["pipeline"] = on_screen
                 self._json(answer)
+            elif parsed.path == "/api/pipelines/export":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                wanted = (query.get("name", [""])[0] or "").strip()
+                if not wanted:
+                    raise HarnessError("Choose a saved automation to export.")
+                with self.server.pipelines_lock:
+                    document = pipeline_lab.export_document(self.server.config, wanted)
+                    filename = pipeline_lab.file_for(self.server.config, wanted).name
+                self._json({"filename": filename, "document": document})
             elif parsed.path == "/api/pipelines/why-not-alone":
                 # Why this automation should not be left to run itself, if it
                 # should not. Asked before it goes on a timer, not after.
@@ -1369,6 +1401,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "sidebar": projects_lab.how_it_looks(),
                     "how_it_can_look": list(projects_lab.HOW_IT_CAN_LOOK),
                 })
+            elif parsed.path == "/api/swarm/export-kept":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                wanted = str(query.get("name", [""])[0] or "").strip()
+                with self.server.swarm_lock:
+                    document = swarm_lab.export_kept_board(wanted)
+                self._json({
+                    "document": document,
+                    "filename": f"{swarm_lab._filed_under(wanted).rsplit('.', 1)[0]}.json",
+                })
             elif parsed.path == "/api/swarm":
                 self._require_token()
                 config = self.server.config
@@ -1381,9 +1423,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         refresh_providers=refresh_providers
                     )
                     said["what_is_not_ready"] = swarm_lab.what_is_not_ready(config, said)
-                said["cannot_be_changed"] = (
-                    self.server.swarm_runner.why_it_cannot_be_changed()
-                )
+                try:
+                    said["cannot_be_changed"] = (
+                        self.server.swarm_runner.why_it_cannot_be_changed()
+                    )
+                except HarnessError as exc:
+                    # Project automation authority protects execution and
+                    # mutation. It must not erase harmless local state from the
+                    # screen: saved boards and the live board remain readable
+                    # while the reason they cannot be changed is shown.
+                    said["cannot_be_changed"] = str(exc)
                 self._json(said)
             elif parsed.path == "/api/swarm/chats":
                 self._require_token()
@@ -2547,6 +2596,42 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     str(body.get("folder") or "").strip(),
                     str(body.get("name") or ""),
                 ))
+            elif self.path == "/api/swarm/import-kept":
+                raw = body.get("json")
+                document = body.get("document")
+                if raw is None and isinstance(document, dict):
+                    raw = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
+                if not isinstance(raw, str):
+                    raise HarnessError("Choose a JSON board file to import.")
+                try:
+                    raw_bytes = raw.encode("utf-8", errors="strict")
+                except UnicodeEncodeError as exc:
+                    raise HarnessError(
+                        "That saved-board file is not valid UTF-8 text. Nothing was imported."
+                    ) from exc
+                if len(raw_bytes) > swarm_lab.MAX_SAVED_BOARD_DOCUMENT_BYTES:
+                    raise HarnessError(
+                        "A saved-board JSON file may be at most 10000000 UTF-8 bytes. "
+                        "Nothing was imported."
+                    )
+                try:
+                    document = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise HarnessError(
+                        "That file is not valid JSON. Nothing was imported."
+                    ) from exc
+                except RecursionError as exc:
+                    raise HarnessError(
+                        "That saved-board file is nested too deeply to read. Nothing was imported."
+                    ) from exc
+                with self.server.swarm_lock:
+                    saved = swarm_lab.import_kept_board(
+                        document, str(body.get("name") or "")
+                    )
+                    saved["kept"], saved["kept_problems"] = (
+                        swarm_lab.kept_board_inventory()
+                    )
+                self._json(saved)
             elif self.path == "/api/swarm/keep":
                 # Saving the board as it stands, under a name. One board came
                 # back on its own and only ever one, so a second arrangement
@@ -2555,7 +2640,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 with self.server.swarm_lock:
                     said = swarm_lab.keep_this_board(
                         str(body.get("name") or ""), self.server.config)
-                    said["kept"] = swarm_lab.every_kept_board()
+                    said["kept"], said["kept_problems"] = (
+                        swarm_lab.kept_board_inventory()
+                    )
                 self._json(said)
             elif self.path == "/api/swarm/open-kept":
                 with self.server.swarm_lock:
@@ -2564,13 +2651,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     said = self.server.swarm_standing()
                     said["what_is_not_ready"] = swarm_lab.what_is_not_ready(
                         self.server.config, said)
-                    said["kept"] = swarm_lab.every_kept_board()
+                    said["kept"], said["kept_problems"] = (
+                        swarm_lab.kept_board_inventory()
+                    )
                 self._json(said)
             elif self.path == "/api/swarm/forget-kept":
                 with self.server.swarm_lock:
                     swarm_lab.forget_this_board(
                         str(body.get("name") or ""), self.server.config)
-                    self._json({"kept": swarm_lab.every_kept_board()})
+                    kept, problems = swarm_lab.kept_board_inventory()
+                    self._json({"kept": kept, "kept_problems": problems})
             elif self.path == "/api/local-models/use":
                 # One press to use a model already running here. No key, no
                 # seat, nobody to ask - which is the whole point of running one
@@ -2919,9 +3009,30 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     created = pipeline_lab.create_blank(
                         self.server.config, str(body.get("name") or "")
                     )
+                    saved, saved_problems = pipeline_lab.saved_inventory(self.server.config)
                     self._json({
                         "pipeline": created,
-                        "saved": pipeline_lab.saved_ones(self.server.config),
+                        "saved": saved,
+                        "saved_problems": saved_problems,
+                    })
+            elif self.path == "/api/pipelines/import":
+                with self.server.pipelines_lock:
+                    written = body.get("json")
+                    if written is None and isinstance(body.get("document"), dict):
+                        written = json.dumps(
+                            body["document"], ensure_ascii=False, separators=(",", ":")
+                        )
+                    imported = pipeline_lab.import_document(
+                        self.server.config,
+                        written,
+                        name=str(body.get("name") or ""),
+                    )
+                    saved, saved_problems = pipeline_lab.saved_inventory(self.server.config)
+                    self._json({
+                        "pipeline": imported,
+                        "saved": saved,
+                        "saved_problems": saved_problems,
+                        "note": f"Imported and saved {imported['name']}.",
                     })
             elif self.path == "/api/pipelines/put-one-back":
                 # Bringing an old version back is itself a save, so what is on
@@ -2948,9 +3059,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     })
             elif self.path == "/api/pipelines/delete":
                 with self.server.pipelines_lock:
+                    note = pipeline_lab.remove(
+                        self.server.config, str(body.get("name") or "")
+                    )
+                    saved, saved_problems = pipeline_lab.saved_inventory(self.server.config)
                     self._json({
-                        "note": pipeline_lab.remove(self.server.config, str(body.get("name") or "")),
-                        "saved": pipeline_lab.saved_ones(self.server.config),
+                        "note": note,
+                        "saved": saved,
+                        "saved_problems": saved_problems,
                     })
             elif self.path == "/api/pipelines/check":
                 # Says whether a drawing would run, without running any of it.

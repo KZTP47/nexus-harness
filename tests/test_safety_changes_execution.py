@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import ctypes
 import hashlib
 import json
 import os
@@ -12,7 +14,7 @@ from pathlib import Path
 
 from our_harness.changes import FileTransaction, file_sha256
 from our_harness.checkpoints import CheckpointManager
-from our_harness.config import load_config
+from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
 from our_harness.execution import CommandRunner
 from our_harness.models import ChangePlan, HarnessError
 from our_harness.safety import confined_path, confined_walk_files, validate_portable_relative_path
@@ -229,6 +231,58 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(result.cwd, ".")
             with self.assertRaisesRegex(HarnessError, "denied"):
                 runner.run(["git", "reset", "--hard"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows 8.3 path aliases")
+    def test_short_root_alias_and_long_resolved_root_are_the_same_cwd(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="Nexus Alias Test ") as temporary:
+            root = Path(temporary)
+            (root / ".harness").mkdir()
+            (root / "child folder").mkdir()
+            buffer = ctypes.create_unicode_buffer(32_768)
+            copied = ctypes.windll.kernel32.GetShortPathNameW(
+                str(root), buffer, len(buffer),
+            )
+            self.assertGreater(copied, 0, "the Windows test volume has no 8.3 root alias")
+            short_root = Path(buffer.value)
+            self.assertTrue(root.samefile(short_root))
+            runner = CommandRunner(LoadedConfig(
+                copy.deepcopy(DEFAULT_CONFIG), short_root, [], {},
+            ))
+
+            result = runner.run(
+                [sys.executable, "-c", "import os; print(os.getcwd())"],
+                cwd="child folder",
+            )
+
+            self.assertTrue(result.passed, result)
+            self.assertEqual(result.cwd, "child folder")
+            self.assertTrue((Path(result.stdout.strip())).samefile(root / "child folder"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows MAX_PATH cwd behavior")
+    def test_existing_cwd_over_max_path_uses_verified_short_alias(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="Nexus MaxPath Test ") as temporary:
+            root = Path(temporary)
+            runner = CommandRunner(self._config(root))
+            working = root
+            relative_parts: list[str] = []
+            index = 0
+            while len(str(working)) < 285:
+                component = f"long-directory-component-{index:02d}"
+                relative_parts.append(component)
+                working = working / component
+                working.mkdir()
+                index += 1
+            relative = "/".join(relative_parts)
+            self.assertGreaterEqual(len(str(working)), 260)
+
+            result = runner.run(
+                [sys.executable, "-c", "from pathlib import Path; Path('ran.txt').write_text('ok')"],
+                cwd=relative,
+            )
+
+            self.assertTrue(result.passed, result)
+            self.assertEqual(result.cwd, relative)
+            self.assertEqual((working / "ran.txt").read_text(encoding="utf-8"), "ok")
 
     def test_output_is_bounded_while_both_streams_are_drained(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

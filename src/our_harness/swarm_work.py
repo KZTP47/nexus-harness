@@ -155,7 +155,7 @@ def _pause_provider_failure(
         complete=False,
         stopped_because="provider_unavailable",
         remaining=remaining,
-        status="paused",
+        status="paused_provider",
         state={
             "resume_token": ledger.session_id,
             "checkpoint": dict(checkpoint or {}),
@@ -440,18 +440,41 @@ def _canonical_progress_state(
     failed: bool,
     value: dict[str, Any],
     files: object = None,
-) -> tuple[str, str, frozenset[str]]:
+) -> tuple[
+    str, str, frozenset[str], tuple[tuple[str, str], ...], frozenset[str]
+]:
     """Return engine-owned canonical state, never a similarity score over prose.
 
-    Provider wording is deliberately excluded. Until providers supply durable
-    structured evidence IDs, only completion state and exact confined file
-    identities can prove movement between rounds.
+    Provider prose is deliberately excluded.  ``remaining`` is retained only
+    so the engine can attest a monotonic reduction, and structured checkpoints
+    are retained only as stable ID/state pairs whose transitions the progress
+    guard tracks.  Evidence wording itself never buys another round.
     """
 
-    # Everything in ``value`` and ``files`` is provider-authored.  A new
-    # sentence, progress id, or claimed path is not engine evidence and must
-    # not buy another long-horizon epoch.  The project-work loop adds its own
-    # authenticated transaction/verification/context digests separately.
+    checkpoints: dict[str, str] = {}
+    duplicate_checkpoint_ids: set[str] = set()
+    raw_progress = value.get("progress", [])
+    if isinstance(raw_progress, list):
+        for item in raw_progress:
+            if not isinstance(item, dict):
+                continue
+            identifier = re.sub(r"\s+", " ", str(item.get("id") or "").strip().casefold())
+            checkpoint_state = re.sub(
+                r"\s+", " ", str(item.get("state") or "").strip().casefold()
+            )
+            evidence = str(item.get("evidence") or "").strip()
+            # A checkpoint without all three schema fields is merely another
+            # provider claim. Duplicate IDs are ambiguous and therefore do not
+            # become engine-tracked progress in this round.
+            if not identifier or not checkpoint_state or not evidence:
+                continue
+            if identifier in duplicate_checkpoint_ids:
+                continue
+            if identifier in checkpoints:
+                checkpoints.pop(identifier, None)
+                duplicate_checkpoint_ids.add(identifier)
+                continue
+            checkpoints[identifier] = checkpoint_state
     state = {
         "complete": bool(complete),
         "failed": bool(failed),
@@ -462,6 +485,8 @@ def _canonical_progress_state(
             json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
         frozenset(),
+        tuple(sorted(checkpoints.items())),
+        _progress_terms(_remaining(value)),
     )
 
 
@@ -538,6 +563,59 @@ def _requirement_context_terms(contract: dict[str, Any]) -> set[str]:
     return {one for one in terms if one}
 
 
+_CHECKPOINT_STATUS_RANKS = {
+    "pending": 0,
+    "started": 1,
+    "investigating": 2,
+    "in progress": 2,
+    "working": 2,
+    "implemented": 3,
+    "ready": 3,
+    "tested": 4,
+    "validated": 4,
+    "verified": 5,
+    "complete": 6,
+    "completed": 6,
+    "done": 6,
+}
+_CHECKPOINT_TERMINAL_STATES = {"verified", "complete", "completed", "done"}
+
+
+def _checkpoint_progress_value(state: str) -> tuple[str, int] | None:
+    """Recognise deterministic monotonic checkpoint state, not arbitrary prose."""
+
+    held = re.sub(r"[_-]+", " ", str(state or "").strip().casefold())
+    held = re.sub(r"\s+", " ", held)
+    if held in _CHECKPOINT_STATUS_RANKS:
+        return "status", _CHECKPOINT_STATUS_RANKS[held]
+    numbered = re.fullmatch(
+        r"(?:(?:step|checkpoint|phase)\s*)?(\d+)(?:\s*(?:/|of)\s*(\d+))?",
+        held,
+    )
+    if not numbered:
+        return None
+    current = int(numbered.group(1))
+    total = int(numbered.group(2)) if numbered.group(2) else None
+    if current < 0 or (total is not None and (total < 1 or current > total)):
+        return None
+    return (f"counter/{total}" if total is not None else "counter", current)
+
+
+def _meaningful_checkpoint_advance(previous: str, current: str) -> bool:
+    """True only for a forward engine-recognised or terminal transition."""
+
+    before = _checkpoint_progress_value(previous)
+    after = _checkpoint_progress_value(current)
+    if after is None:
+        return False
+    normalized_current = re.sub(
+        r"\s+", " ", re.sub(r"[_-]+", " ", current.strip().casefold())
+    )
+    if before is None:
+        return normalized_current in _CHECKPOINT_TERMINAL_STATES
+    return before[0] == after[0] and after[1] > before[1]
+
+
 class _ProgressGuard:
     """Notice stable or oscillating actionable state without policing duration."""
 
@@ -546,11 +624,79 @@ class _ProgressGuard:
             tuple[tuple[Any, ...], ...]
         ] = []
         self.identical_run = 0
+        self._agents_seen: set[str] = set()
+        self._last_remaining: dict[str, frozenset[str]] = {}
+        self._tracked_checkpoint_ids: dict[str, set[str]] = {}
+        self._checkpoint_last: dict[str, dict[str, str]] = {}
+        self._checkpoint_seen_states: dict[str, dict[str, set[str]]] = {}
+        self._attested_epochs: dict[str, int] = {}
+
+    def _attest(
+        self, state: tuple[tuple[Any, ...], ...],
+    ) -> tuple[tuple[Any, ...], ...]:
+        """Project provider structure into monotonic engine-observed progress.
+
+        Arbitrary new prose or rotating checkpoint IDs cannot keep a run alive.
+        A round advances only when an existing unresolved set shrinks or a
+        stable checkpoint ID reaches a state that ID has never visited before.
+        Revisiting A/B states remains an oscillation and is stopped.
+        """
+
+        attested: list[tuple[Any, ...]] = []
+        for item in state:
+            if len(item) < 2:
+                continue
+            agent_id = str(item[0])
+            base = item[1]
+            remaining = (
+                item[4] if len(item) > 4 and isinstance(item[4], frozenset)
+                else frozenset()
+            )
+            checkpoints = dict(
+                item[3] if len(item) > 3 and isinstance(item[3], tuple) else ()
+            )
+            first = agent_id not in self._agents_seen
+            self._agents_seen.add(agent_id)
+            advanced = False
+            previous_remaining = self._last_remaining.get(agent_id, frozenset())
+            if not first and previous_remaining and remaining < previous_remaining:
+                advanced = True
+            self._last_remaining[agent_id] = remaining
+
+            tracked = self._tracked_checkpoint_ids.setdefault(agent_id, set())
+            last = self._checkpoint_last.setdefault(agent_id, {})
+            seen = self._checkpoint_seen_states.setdefault(agent_id, {})
+            if not tracked and checkpoints:
+                # Establish stable identities without treating the provider's
+                # first claim as completed work.
+                tracked.update(checkpoints)
+            current_terms: set[str] = set()
+            for identifier in sorted(tracked):
+                current = checkpoints.get(identifier, "<missing>")
+                previous = last.get(identifier)
+                visited = seen.setdefault(identifier, set())
+                if (
+                    previous is not None
+                    and current != previous
+                    and current != "<missing>"
+                    and current not in visited
+                    and _meaningful_checkpoint_advance(previous, current)
+                ):
+                    advanced = True
+                if current != "<missing>":
+                    visited.add(current)
+                last[identifier] = current
+            epoch = self._attested_epochs.get(agent_id, 0) + (1 if advanced else 0)
+            self._attested_epochs[agent_id] = epoch
+            current_terms.add(f"attested-epoch:{epoch}")
+            attested.append((agent_id, base, frozenset(current_terms)))
+        return tuple(attested)
 
     def stalled(
         self,
         state: tuple[tuple[Any, ...], ...],
     ) -> bool:
+        state = self._attest(state)
         same_as_last = bool(self.recent) and _progress_states_match(self.recent[-1], state)
         self.identical_run = self.identical_run + 1 if same_as_last else 1
         self.recent.append(state)
@@ -793,7 +939,17 @@ def mentions_project_scope(text: str) -> bool:
 def _contribution(
     one: dict[str, Any], answer: dict[str, Any], phase: str, text: str,
     *, recipient_id: str = "", recipient_name: str = "Team deliberation",
+    semantic: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    source = semantic if isinstance(semantic, dict) else answer
+    semantic_state = {
+        key: copy.deepcopy(source[key])
+        for key in (
+            "goal_complete", "ready_to_execute", "remaining", "questions",
+            "progress", "needs_files", "effect_paths",
+        )
+        if key in source
+    }
     return {
         "speaker_id": one.get("id"),
         "speaker_name": one.get("name"),
@@ -804,6 +960,7 @@ def _contribution(
         "milliseconds": answer.get("milliseconds", answer.get("_milliseconds", 0)),
         "model": answer.get("model", answer.get("_model", "")),
         "phase": phase,
+        **({"semantic_state": semantic_state} if semantic_state else {}),
     }
 
 
@@ -820,7 +977,88 @@ def _actual_conversation(contributions: list[dict[str, Any]]) -> str:
     return transcript
 
 
-PROMPT_TRANSCRIPT_CHARACTERS = 120_000
+PROMPT_TRANSCRIPT_CHARACTERS = int(
+    chat_lab.LONG_HORIZON_CONTEXT_POLICY["prompt_transcript_characters"]
+)
+PROMPT_SEMANTIC_SUMMARY_CHARACTERS = int(
+    chat_lab.LONG_HORIZON_CONTEXT_POLICY["semantic_summary_characters"]
+)
+_SEMANTIC_HISTORY_MARKER = re.compile(
+    r"\b(?:acceptance|blocker|constraint|decision|evidence|fact|must|never|path|"
+    r"requirement|remaining|sentinel|test|verif(?:y|ied|ication))\b",
+    re.IGNORECASE,
+)
+
+
+def _semantic_history_summary(
+    contributions: list[dict[str, Any]], maximum: int,
+) -> str:
+    """Keep deterministic semantic evidence from turns outside the recent tail.
+
+    This is a projection of quoted, untrusted conversation evidence, never new
+    system authority. Structured progress state is preferred. Marker-bearing
+    excerpts preserve older requirements, decisions, facts, and paths instead
+    of replacing their meaning with only a hash and a count.
+    """
+
+    candidates: list[str] = []
+    for index, one in enumerate(contributions, start=1):
+        identity = (
+            f"turn {index} · {one.get('speaker_name') or 'unknown'} · "
+            f"{one.get('phase') or 'unknown'}"
+        )
+        semantic_state = one.get("semantic_state")
+        if isinstance(semantic_state, dict) and semantic_state:
+            for key in sorted(semantic_state):
+                held = semantic_state[key]
+                values = held if isinstance(held, list) else [held]
+                for value_index, value in enumerate(values[:24], start=1):
+                    encoded = json.dumps(
+                        value, sort_keys=True, separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+                    candidates.append(
+                        f"- {identity} structured {key}[{value_index}]: {encoded}"
+                    )
+        text = re.sub(r"\s+", " ", str(one.get("text") or "")).strip()
+        if not text:
+            continue
+        matches = list(_SEMANTIC_HISTORY_MARKER.finditer(text))
+        for match in matches[:8]:
+            start = max(0, match.start() - 180)
+            end = min(len(text), match.end() + 420)
+            excerpt = text[start:end].strip()
+            if start:
+                excerpt = "…" + excerpt
+            if end < len(text):
+                excerpt += "…"
+            candidates.append(f"- {identity} quoted semantic excerpt: {excerpt}")
+        if not matches:
+            # Even an unlabelled early decision must leave semantic content,
+            # not merely a digest. Bound the excerpt and keep it clearly quoted.
+            excerpt = text[:500] + ("…" if len(text) > 500 else "")
+            candidates.append(f"- {identity} quoted excerpt: {excerpt}")
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        folded = candidate.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        unique.append(candidate)
+    header = (
+        "DETERMINISTIC SEMANTIC SUMMARY OF OLDER TURNS "
+        "(quoted untrusted history; canonical ledger remains authoritative)"
+    )
+    result = header
+    for candidate in unique:
+        addition = "\n" + candidate
+        if len(result) + len(addition) > maximum:
+            result += "\n[semantic summary cap reached; retrieve the canonical paged ledger for more]"
+            break
+        result += addition
+    return result
 
 
 def _prompt_conversation(contributions: list[dict[str, Any]]) -> str:
@@ -841,14 +1079,18 @@ def _prompt_conversation(contributions: list[dict[str, Any]]) -> str:
         counts[key] = counts.get(key, 0) + 1
         characters[key] = characters.get(key, 0) + len(str(one.get("text") or ""))
     summary = [
-        "ROLLING TRANSCRIPT SUMMARY (engine-owned; full history remains available in the paged collaboration ledger)",
+        "LONG-HORIZON TRANSCRIPT PROJECTION (one policy for discussion, planning, execution, verification, and final synthesis)",
         f"canonical_sha256: {hashlib.sha256(full.encode('utf-8')).hexdigest()}",
         f"total_turns: {len(contributions)}; total_characters: {len(full)}",
+        f"prompt_character_limit: {PROMPT_TRANSCRIPT_CHARACTERS}; semantic_summary_reserve: {PROMPT_SEMANTIC_SUMMARY_CHARACTERS}",
     ]
     for key in sorted(counts):
         summary.append(f"- {key}: {counts[key]} turn(s), {characters[key]} character(s)")
     header = "\n".join(summary)
-    remaining = PROMPT_TRANSCRIPT_CHARACTERS - len(header) - 200
+    remaining = (
+        PROMPT_TRANSCRIPT_CHARACTERS - len(header)
+        - PROMPT_SEMANTIC_SUMMARY_CHARACTERS - 500
+    )
     kept: list[str] = []
     used = 0
     for one in reversed(contributions):
@@ -861,9 +1103,15 @@ def _prompt_conversation(contributions: list[dict[str, Any]]) -> str:
         kept.append(block)
         used += len(block) + 2
     omitted = max(0, len(contributions) - len(kept))
+    older = contributions[:omitted]
+    semantic_summary = _semantic_history_summary(
+        older, PROMPT_SEMANTIC_SUMMARY_CHARACTERS,
+    )
     return (
         header
-        + f"\n[older turns summarized: {omitted}; newest complete turns below: {len(kept)}]\n\n"
+        + f"\n[older turns semantically summarized: {omitted}; newest complete turns below: {len(kept)}]\n\n"
+        + semantic_summary
+        + "\n\nNEWEST COMPLETE TURNS\n"
         + "\n\n".join(reversed(kept))
     )
 
@@ -877,6 +1125,7 @@ def _prompt_summary_state(contributions: list[dict[str, Any]]) -> dict[str, Any]
         "canonical_characters": len(canonical),
         "prompt_characters": len(_prompt_conversation(contributions)),
         "history_authority": "paged_collaboration_ledger",
+        "context_policy": copy.deepcopy(chat_lab.LONG_HORIZON_CONTEXT_POLICY),
     }
 
 
@@ -1707,7 +1956,7 @@ def collaborate(
                 + "\n\nGOAL-DIRECTED TEAM CONVERSATION\n"
                 + f"Original user goal:\n{text}\n\n"
                 + "ACTUAL CONVERSATION SO FAR\n"
-                + _actual_conversation(contributions)
+                + _prompt_conversation(contributions)
                 + "\n\nContinue the real conversation. Address the other agents directly when useful. "
                   "Do not claim the goal is complete merely because you gave advice: completion means the user's requested outcome has actually been achieved. "
                   "Set goal_complete false and list concrete remaining work whenever anything is unfinished. "
@@ -1778,6 +2027,7 @@ def collaborate(
             contribution = _contribution(
                 one, answer, "agent_discussion", message,
                 recipient_name="Team deliberation",
+                semantic=value,
             )
             contributions.append(contribution)
             _show_turn(live_turn, {"who": "them", **contribution})
@@ -8524,13 +8774,32 @@ def work_together(
                 one for one in reversed(events)
                 if one.get("phase") == "mutation_terminal_checkpoint"
             ), None)
-        resumable_statuses = {"paused", "applied_unverified", "needs_verification", "incomplete"}
+        resumable_statuses = {
+            "paused_provider", "paused_for_user", "applied_unverified",
+            "needs_verification", "incomplete",
+        }
         previous_status = (
             str(last_outcome.get("state", {}).get("status") or "")
             if isinstance(last_outcome, dict) else ""
         )
+        if previous_status == "paused" and isinstance(last_outcome, dict):
+            legacy_reason = str(
+                last_outcome.get("state", {}).get("stopped_because") or ""
+            )
+            previous_status = (
+                "paused_provider"
+                if legacy_reason == "provider_unavailable"
+                else "paused_for_user"
+                if legacy_reason == "paused_for_user"
+                else previous_status
+            )
+        resumable_statuses.add("paused")  # unknown legacy pause still fails closed below
         if goal_event is None or previous_status not in resumable_statuses:
             raise SwarmError("That project-work session is not resumable.")
+        if previous_status == "paused":
+            raise SwarmError(
+                "That legacy paused session does not say whether a user answer or provider retry is required. Start a new run instead."
+            )
         prior_roots = (
             last_outcome.get("state", {}).get("allowed_write_roots", [])
             if isinstance(last_outcome, dict) else []
@@ -8548,7 +8817,10 @@ def work_together(
         previous_scope_restricted = bool(
             prior_state.get("write_scope_restricted", bool(previous_write_roots))
         )
-        if previous_status == "paused" and (user_answers is None or not str(user_answers).strip()):
+        if (
+            previous_status == "paused_for_user"
+            and (user_answers is None or not str(user_answers).strip())
+        ):
             raise SwarmError("Answer the paused questions before resuming project work.")
         text = str(goal_event.get("text") or text)
         resumed_answers = str(user_answers or "").strip()
@@ -8562,14 +8834,34 @@ def work_together(
                 resumed_changed_paths = [
                     str(path) for path in prior_changed if isinstance(path, str)
                 ]
-        ledger.append(
-            kind="user_answer", phase="user_answer", text=resumed_answers,
-            speaker_name="User", recipient_name="Project-work team",
-            state={
-                "status": "resumed", "resumed_session_id": resume_session_id,
-                "previous_status": previous_status,
-            },
-        )
+        if resumed_answers:
+            ledger.append(
+                kind="user_answer", phase="user_answer", text=resumed_answers,
+                speaker_name="User", recipient_name="Project-work team",
+                state={
+                    "status": "resumed", "resumed_session_id": resume_session_id,
+                    "previous_status": previous_status,
+                },
+            )
+        else:
+            provider_retry = previous_status == "paused_provider"
+            ledger.append(
+                kind="nexus_state",
+                phase=(
+                    "provider_recovery_resume" if provider_retry
+                    else "saved_work_resume"
+                ),
+                text=(
+                    "Provider recovery was requested without a user answer."
+                    if provider_retry else
+                    "Saved incomplete or unverified work was resumed without an optional note."
+                ),
+                state={
+                    "status": "resumed", "resumed_session_id": resume_session_id,
+                    "previous_status": previous_status,
+                    "user_answer_required": False,
+                },
+            )
     else:
         ledger.begin(text, participants, mode="project_work")
     # The semantic authority contract is compiled before attachments are
@@ -8714,7 +9006,7 @@ def work_together(
         )
         ledger.finish(
             reply, complete=False, stopped_because="paused_for_user",
-            remaining=[question], status="paused", state=clarification_state,
+            remaining=[question], status="paused_for_user", state=clarification_state,
         )
         return {
             **kept,
@@ -8877,7 +9169,7 @@ def work_together(
                         + "\n\nON-DEMAND REQUESTED PROJECT CONTENT\n"
                         + _requested_files(root, list(latest.values()))
                         + "\n\nACTUAL PLAN CONVERSATION SO FAR\n"
-                        + _actual_conversation(contributions)
+                        + _prompt_conversation(contributions)
                         + "\n\nReview the team plan and respond to the other agents. Improve your own contribution, "
                           "request any existing files still needed, and set ready_to_execute only when this plan can actually fulfill the user's goal. "
                           "Carry forward the exact project-relative files that must change in effect_paths; add any missing required effect paths found during review. "
@@ -8982,7 +9274,7 @@ def work_together(
         )
         ledger.finish(
             reply, complete=False, stopped_because="paused_for_user",
-            remaining=paused_questions, status="paused",
+            remaining=paused_questions, status="paused_for_user",
             state={
                 "questions": paused_questions,
                 "resume_token": ledger.session_id,
@@ -9348,6 +9640,7 @@ def work_together(
                     else "agent_execution"
                 ),
                 execution_words, recipient_name="Team verification",
+                semantic=execution,
             )
             contributions.append(execution_turn)
             _show_turn(live_turn, {"who": "them", **execution_turn})
@@ -9426,7 +9719,9 @@ def work_together(
             words = str(value.get("feedback") or "").strip()
             if one_remaining:
                 words += "\nRemaining: " + "; ".join(one_remaining)
-            turn = _contribution(one, answer, "agent_verification", words)
+            turn = _contribution(
+                one, answer, "agent_verification", words, semantic=value,
+            )
             contributions.append(turn)
             _show_turn(live_turn, {"who": "them", **turn})
             _share_turn(ledger, turn, {
