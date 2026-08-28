@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -22,6 +23,7 @@ from unittest import mock
 
 from our_harness import pipelines, server, timer
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
+from our_harness.pipeline_runs import project_identity
 
 
 class TimerPanelTestCase(unittest.TestCase):
@@ -30,6 +32,15 @@ class TimerPanelTestCase(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         (self.root / ".harness").mkdir()
+        (self.root / ".harness" / ".gitignore").write_text(
+            "project-authority.json\n", encoding="utf-8"
+        )
+        self.environment = mock.patch.dict(os.environ, {
+            "OUR_HARNESS_PIPELINE_RUN_DIR": str(self.root.parent / "runtime"),
+        })
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        project_identity(self.root)
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
         pipelines.save(self.config, {
             "name": "Nightly check",
@@ -235,6 +246,73 @@ class WhatThePanelIsTold(TimerPanelTestCase):
         due = timer.what_is_due(self.config, __import__("datetime").datetime.now()
                                 + __import__("datetime").timedelta(days=1))
         self.assertEqual([one.name for one, _missed in due], ["Every night"])
+
+
+class ProjectAuthorityPausesOnlyTimerExecution(TimerPanelTestCase):
+    def test_definitions_stay_visible_but_enable_and_run_actions_fail_closed(self) -> None:
+        self.a_timer(turned_on=False)
+        paused = {
+            "can_run": False,
+            "reason": "The project authority descriptor was copied or substituted.",
+            "reason_code": "copied_or_substituted",
+        }
+        with mock.patch.object(self.panel, "project_authority_status", return_value=paused):
+            status, said = self.ask("/api/timers")
+            self.assertEqual(status, 200, said)
+            self.assertEqual([one["name"] for one in said["timers"]], ["Every night"])
+            self.assertEqual(said["cannot_run"], paused["reason"])
+
+            status, said = self.ask("/api/timers/save", {"timer": {
+                "name": "Draft schedule", "automation": "Nightly check",
+                "how_often": "every-day", "at": "03:00", "turned_on": False,
+            }})
+            self.assertEqual(status, 200, said)
+
+            status, said = self.ask("/api/timers/save", {"timer": {
+                "name": "Would run", "automation": "Nightly check", "turned_on": True,
+            }})
+            self.assertGreaterEqual(status, 400, said)
+            self.assertIn("copied or substituted", said["error"])
+
+            status, said = self.ask(
+                "/api/timers/turn", {"name": "Every night", "turned_on": True}
+            )
+            self.assertGreaterEqual(status, 400, said)
+            status, said = self.ask(
+                "/api/timers/turn", {"name": "Every night", "turned_on": False}
+            )
+            self.assertEqual(status, 200, said)
+
+            status, said = self.ask("/api/timers/run-now", {"name": "Every night"})
+            self.assertGreaterEqual(status, 400, said)
+
+            status, said = self.ask("/api/timers/remove", {"name": "Draft schedule"})
+            self.assertEqual(status, 200, said)
+
+    def test_timer_ui_disables_and_guards_only_execution_enabling_actions(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8"
+        )
+        refresh = script[script.index("async function refreshTimers"):
+                         script.index("function sayAboutTimers")]
+        render = script[script.index("function renderTimers"):
+                        script.index("async function addATimer")]
+        add = script[script.index("async function addATimer"):
+                     script.index("async function saveATimer")]
+        turn = script[script.index("async function turnTheTimer"):
+                      script.index("async function takeTheTimerOff")]
+        run_now = script[script.index("async function runTheTimerNow"):
+                         script.index("async function copyTheMachineLine")]
+        self.assertIn('pipelineCannotRun = String(said.cannot_run || "")', refresh)
+        self.assertIn('setExecutionControl($("timerAdd")', refresh)
+        self.assertIn('one.turned_on ? "" : pipelineCannotRun', render)
+        self.assertIn('setExecutionControl(now, false, pipelineCannotRun', render)
+        self.assertIn("if (pipelineCannotRun)", add)
+        self.assertLess(add.index("if (pipelineCannotRun)"), add.index("saySoBeforeItRunsAlone"))
+        self.assertIn("if (on && pipelineCannotRun)", turn)
+        self.assertLess(turn.index("if (on && pipelineCannotRun)"), turn.index("saySoBeforeItRunsAlone"))
+        self.assertIn("if (pipelineCannotRun)", run_now)
+        self.assertLess(run_now.index("if (pipelineCannotRun)"), run_now.index('request("/api/timers/run-now"'))
 
 
 if __name__ == "__main__":  # pragma: no cover

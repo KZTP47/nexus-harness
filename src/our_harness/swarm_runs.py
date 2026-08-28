@@ -138,9 +138,238 @@ def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+class _GlobalBoardStore:
+    """The one board lease, without opening or migrating execution journals."""
+
+    def __init__(self, config: LoadedConfig) -> None:
+        self.root = _base()
+        project = config.project_root.resolve()
+        runtime = self.root.resolve()
+        if runtime == project or project in runtime.parents or runtime in project.parents:
+            raise HarnessError("Swarm runtime storage must be external to the project authority")
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.database = self.root / "runs.sqlite3"
+        self._prepare_board_only()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database, timeout=30.0, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        return connection
+
+    @contextmanager
+    def _tx(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _material(row: sqlite3.Row) -> list[Any]:
+        return [row[name] for name in (
+            "singleton", "generation", "active_run_id", "mutation_owner_pid",
+            "mutation_owner_token", "updated_ms",
+        )]
+
+    def _verify(self, row: sqlite3.Row | None) -> None:
+        if row is None:
+            raise HarnessError("The global Swarm board authority is missing.")
+        claimed = str(row["integrity_mac"] or "")
+        if not claimed or not hmac.compare_digest(
+            claimed, mac("swarm-board-authority-v1", self._material(row))
+        ):
+            quarantine_marker(
+                "swarm-board-authority", self.database,
+                "The global Swarm board authority failed keyed integrity.",
+            )
+            raise HarnessError("The global Swarm board authority failed keyed integrity.")
+
+    def _seal(self, db: sqlite3.Connection) -> None:
+        row = db.execute("SELECT * FROM board_authority WHERE singleton=1").fetchone()
+        if row is None:
+            raise HarnessError("The global Swarm board authority is missing.")
+        db.execute(
+            "UPDATE board_authority SET integrity_mac=? WHERE singleton=1",
+            (mac("swarm-board-authority-v1", self._material(row)),),
+        )
+
+    def _prepare_board_only(self) -> None:
+        """Create/verify only the lease table; never inspect or rewrite runs/events."""
+
+        with self._tx() as db:
+            existed = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='board_authority'"
+            ).fetchone() is not None
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS board_authority(
+                  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                  generation INTEGER NOT NULL DEFAULT 0,
+                  active_run_id TEXT NOT NULL DEFAULT '',
+                  mutation_owner_pid INTEGER NOT NULL DEFAULT 0,
+                  mutation_owner_token TEXT NOT NULL DEFAULT '',
+                  updated_ms INTEGER NOT NULL DEFAULT 0,
+                  integrity_mac TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            columns = {str(row[1]) for row in db.execute("PRAGMA table_info(board_authority)")}
+            if "integrity_mac" not in columns:
+                db.execute(
+                    "ALTER TABLE board_authority ADD COLUMN integrity_mac TEXT NOT NULL DEFAULT ''"
+                )
+            db.execute("INSERT OR IGNORE INTO board_authority(singleton) VALUES(1)")
+            row = db.execute("SELECT * FROM board_authority WHERE singleton=1").fetchone()
+            anchor_exists = (self.root / INTEGRITY_ANCHOR).exists()
+            if anchor_exists and not existed:
+                raise HarnessError(
+                    "The anchored Swarm journal is missing its global board authority."
+                )
+            if existed and anchor_exists:
+                self._verify(row)
+            elif not str(row["integrity_mac"] or ""):
+                self._seal(db)
+
+    def _active(self, db: sqlite3.Connection) -> str:
+        held = db.execute("SELECT * FROM board_authority WHERE singleton=1").fetchone()
+        self._verify(held)
+        return str(held["active_run_id"] or "")
+
+    @staticmethod
+    def _run_material(row: sqlite3.Row) -> list[Any]:
+        return [row[name] for name in (
+            "run_id", "request_id", "project_authority", "snapshot_json",
+            "snapshot_sha256", "status", "owner_pid", "owner_token",
+            "stop_requested", "effect_status", "effect_id", "effect_ordinal",
+            "effect_digest", "checkpoint_ordinal", "board_generation",
+            "event_count", "event_head", "result_json", "error",
+            "created_ms", "updated_ms",
+        )]
+
+    def _recover_dead_active_run(self, db: sqlite3.Connection) -> None:
+        """Release only a provably dead/terminal compatible board owner.
+
+        This deliberately does not prepare, migrate, or terminalize the full
+        execution journal. Invalid authority still needs harmless board edits,
+        so this lease boundary reads the exact signed owner row and changes only
+        the lightweight board lease.
+        """
+
+        run_id = self._active(db)
+        if not run_id:
+            return
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'"
+        ).fetchone() is None:
+            return
+        columns = {str(row[1]) for row in db.execute("PRAGMA table_info(runs)")}
+        required = {
+            "run_id", "request_id", "project_authority", "snapshot_json",
+            "snapshot_sha256", "status", "owner_pid", "owner_token",
+            "stop_requested", "effect_status", "effect_id", "effect_ordinal",
+            "effect_digest", "checkpoint_ordinal", "board_generation",
+            "event_count", "event_head", "result_json", "error",
+            "created_ms", "updated_ms", "integrity_mac",
+        }
+        if not required.issubset(columns):
+            return
+        row = db.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if row is None:
+            return
+        expected = mac("swarm-run-v1", self._run_material(row))
+        if not row["integrity_mac"] or not hmac.compare_digest(
+            str(row["integrity_mac"]), expected
+        ):
+            raise HarnessError("The active Swarm board run failed keyed integrity.")
+        snapshot = str(row["snapshot_json"] or "")
+        if hashlib.sha256(snapshot.encode("utf-8")).hexdigest() != str(
+            row["snapshot_sha256"]
+        ):
+            raise HarnessError("The active Swarm board snapshot failed integrity verification.")
+        try:
+            kind = json.loads(snapshot).get("kind")
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HarnessError("The active Swarm board snapshot could not be verified.") from exc
+        if kind != "board_order":
+            raise HarnessError("The active global board lease does not name a board run.")
+        status = str(row["status"] or "")
+        if status not in ACTIVE | TERMINAL:
+            raise HarnessError("The active Swarm board run has an unknown status.")
+        if status not in TERMINAL and _owner_is_alive(
+            int(row["owner_pid"]), str(row["owner_token"])
+        ):
+            return
+        db.execute(
+            "UPDATE board_authority SET active_run_id='',updated_ms=? "
+            "WHERE singleton=1 AND active_run_id=?",
+            (int(time.time() * 1000), run_id),
+        )
+        self._seal(db)
+
+    def pause_reason(self) -> str:
+        with self._tx() as db:
+            self._recover_dead_active_run(db)
+            if self._active(db):
+                return (
+                    "The board is going, so it cannot be changed until it finishes. "
+                    "Press Stop first."
+                )
+        return ""
+
+    @contextmanager
+    def mutation(self) -> Iterator[int]:
+        with self._tx() as db:
+            self._recover_dead_active_run(db)
+            if self._active(db):
+                raise HarnessError(
+                    "The global Swarm board is running in another Nexus process. "
+                    "Stop that exact run before changing the board."
+                )
+            held = db.execute("SELECT * FROM board_authority WHERE singleton=1").fetchone()
+            generation = int(held["generation"]) + 1
+            db.execute(
+                "UPDATE board_authority SET generation=?,mutation_owner_pid=?,"
+                "mutation_owner_token=?,updated_ms=? WHERE singleton=1",
+                (generation, os.getpid(), _process_token(os.getpid()), int(time.time() * 1000)),
+            )
+            self._seal(db)
+            try:
+                yield generation
+            finally:
+                db.execute(
+                    "UPDATE board_authority SET mutation_owner_pid=0,mutation_owner_token='',"
+                    "updated_ms=? WHERE singleton=1",
+                    (int(time.time() * 1000),),
+                )
+                self._seal(db)
+
+    @contextmanager
+    def metadata_mutation(self) -> Iterator[None]:
+        """Serialize a topology-neutral live-board metadata update.
+
+        A board run owns an immutable topology snapshot. Clearing the name of a
+        deleted saved snapshot cannot affect that work, but it must still not
+        race a whole-board write after the run finishes.
+        """
+
+        with self._tx() as db:
+            self._verify(db.execute(
+                "SELECT * FROM board_authority WHERE singleton=1"
+            ).fetchone())
+            yield
+
+
 class SwarmRunStore:
     def __init__(self, config: LoadedConfig) -> None:
         self.authority = project_identity(config.project_root)
+        self._open_storage(config)
+
+    def _open_storage(self, config: LoadedConfig) -> None:
         self.redactor = CredentialRedactor(config)
         self.root = _base()
         project = config.project_root.resolve()
@@ -789,6 +1018,22 @@ class SwarmRunStore:
                 )
                 self._seal_board(db)
 
+    def board_change_pause_reason(self) -> str:
+        """Why the shared board cannot change, independent of project identity."""
+
+        with self._tx() as db:
+            self._recover_dead_board_lease(db)
+            held = db.execute(
+                "SELECT * FROM board_authority WHERE singleton=1"
+            ).fetchone()
+            self._verify_board(held)
+            if held and str(held["active_run_id"] or ""):
+                return (
+                    "The board is going, so it cannot be changed until it finishes. "
+                    "Press Stop first."
+                )
+        return ""
+
     def accept(self, request_id: str, snapshot: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         request = str(request_id or "").strip()
         if not request or len(request) > 160:
@@ -1408,6 +1653,24 @@ def bind(store: SwarmRunStore, run_id: str) -> Iterator[None]:
         yield
     finally:
         _CURRENT.reset(token)
+
+
+@contextmanager
+def global_board_mutation(config: LoadedConfig) -> Iterator[int]:
+    """Mutate user-owned board data without granting project execution authority."""
+
+    with _GlobalBoardStore(config).mutation() as generation:
+        yield generation
+
+
+@contextmanager
+def global_board_metadata_mutation(config: LoadedConfig) -> Iterator[None]:
+    with _GlobalBoardStore(config).metadata_mutation():
+        yield
+
+
+def global_board_change_pause_reason(config: LoadedConfig) -> str:
+    return _GlobalBoardStore(config).pause_reason()
 
 
 def _unscoped_store(config: LoadedConfig) -> _ProviderResourceStore:

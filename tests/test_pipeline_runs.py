@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness import editor, pipelines
@@ -16,6 +17,9 @@ from our_harness.pipeline_runs import (
     PipelineRunConflict,
     PipelineRunNotFound,
     PipelineRunStore,
+    inspect_project_authority,
+    repair_project_authority,
+    project_identity,
 )
 
 
@@ -66,6 +70,96 @@ class PipelineRunStoreTests(unittest.TestCase):
             os.environ.pop("OUR_HARNESS_PIPELINE_RUN_DIR", None)
         else:
             os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = self.prior_override
+
+    def _copied_authority(self) -> tuple[Path, bytes, dict]:
+        (self.root / ".harness" / ".gitignore").write_text(
+            "project-authority.json\n", encoding="utf-8"
+        )
+        project_identity(self.root)
+        prior = (self.root / ".harness" / "project-authority.json").read_bytes()
+        copied = self.container / "copied"
+        (copied / ".harness").mkdir(parents=True)
+        (copied / ".harness" / ".gitignore").write_text(
+            "project-authority.json\n", encoding="utf-8"
+        )
+        (copied / ".harness" / "project-authority.json").write_bytes(prior)
+        return copied, prior, inspect_project_authority(copied)
+
+    def test_explicit_repair_rotates_only_a_copied_local_descriptor(self) -> None:
+        copied, prior, status = self._copied_authority()
+        self.assertEqual(status["reason_code"], "copied_or_substituted")
+        self.assertTrue(status["repairable"])
+        new_id = repair_project_authority(copied, status["fingerprint"])
+        self.assertNotEqual(
+            (copied / ".harness" / "project-authority.json").read_bytes(), prior
+        )
+        self.assertEqual(project_identity(copied), new_id)
+        after = (copied / ".harness" / "project-authority.json").read_bytes()
+        with self.assertRaises(PipelineRunConflict):
+            repair_project_authority(copied, status["fingerprint"])
+        self.assertEqual(
+            (copied / ".harness" / "project-authority.json").read_bytes(), after
+        )
+
+    def test_repair_restores_exact_descriptor_if_registry_commit_fails(self) -> None:
+        copied, prior, status = self._copied_authority()
+        def commit_then_fail(connection) -> None:
+            connection.commit()
+            raise sqlite3.OperationalError("fault after registry commit")
+        with mock.patch(
+            "our_harness.pipeline_runs._commit_authority_rotation",
+            side_effect=commit_then_fail,
+        ):
+            with self.assertRaises(sqlite3.OperationalError):
+                repair_project_authority(copied, status["fingerprint"])
+        self.assertEqual(
+            (copied / ".harness" / "project-authority.json").read_bytes(), prior
+        )
+        self.assertEqual(
+            inspect_project_authority(copied)["reason_code"], "copied_or_substituted"
+        )
+
+    def test_repair_rejects_malformed_stale_and_git_tracked_descriptors(self) -> None:
+        copied, _prior, status = self._copied_authority()
+        with self.assertRaisesRegex(PipelineRunConflict, "changed after confirmation"):
+            repair_project_authority(copied, "0" * 64)
+        (copied / ".harness" / "project-authority.json").write_text(
+            "not-json", encoding="utf-8"
+        )
+        with self.assertRaisesRegex(PipelineRunConflict, "could not be verified"):
+            repair_project_authority(copied, status["fingerprint"])
+
+        tracked = self.container / "tracked"
+        (tracked / ".harness").mkdir(parents=True)
+        (tracked / ".harness" / ".gitignore").write_text(
+            "project-authority.json\n", encoding="utf-8"
+        )
+        (tracked / ".harness" / "project-authority.json").write_text(
+            '{"schema_version":1,"project_authority_id":"'
+            + "1" * 32 + '"}\n', encoding="utf-8"
+        )
+        for command in (
+            ["git", "init"],
+            ["git", "add", "-f", ".harness/project-authority.json"],
+        ):
+            result = __import__("subprocess").run(
+                command, cwd=tracked, capture_output=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+        tracked_status = inspect_project_authority(tracked)
+        with self.assertRaisesRegex(PipelineRunConflict, "tracked by Git"):
+            repair_project_authority(tracked, tracked_status["fingerprint"])
+
+    def test_repair_fails_closed_when_git_metadata_cannot_be_verified(self) -> None:
+        copied, prior, status = self._copied_authority()
+        (copied / ".git").write_text("gitdir: missing-worktree-metadata\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(PipelineRunConflict, "Git tracking could not be checked"):
+            repair_project_authority(copied, status["fingerprint"])
+
+        self.assertEqual(
+            (copied / ".harness" / "project-authority.json").read_bytes(), prior
+        )
 
     def test_two_processes_replay_exact_request_and_reject_other_concurrent_work(self) -> None:
         store = PipelineRunStore(self.config)

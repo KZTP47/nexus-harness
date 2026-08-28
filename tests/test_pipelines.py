@@ -177,6 +177,41 @@ class PipelineFullScreenViewTests(unittest.TestCase):
         self.assertIn('@media (max-width: 380px)', self.styles)
         self.assertIn('.pipeline-tabs { flex-wrap: nowrap; overflow-x: auto;', self.styles)
 
+    def test_desktop_agent_instructions_collapse_and_keep_accessible_contrast(self) -> None:
+        self.assertIn('<details id="agentRunPanel" class="agent-run-panel"', self.markup)
+        self.assertIn('class="agent-run-summary"', self.markup)
+        self.assertNotIn('<details id="agentRunPanel" class="agent-run-panel" open', self.markup)
+        self.assertIn('AGENT_RUN_PANEL_KEY', self.script)
+        self.assertIn('$("agentRunPanel").addEventListener("toggle"', self.script)
+        self.assertIn('.agent-run-summary:focus-visible', self.styles)
+        self.assertIn('.agent-run-body > .hint { margin: 10px 0; color: #334155;', self.styles)
+        self.assertIn('.agent-run-controls button:disabled { opacity: 1; color: #475569;',
+                      self.styles)
+        self.assertIn('color: #f8fafc; background: #0f172a;', self.styles)
+
+        def contrast(foreground: str, background: str) -> float:
+            def luminance(colour: str) -> float:
+                channels = [int(colour[index:index + 2], 16) / 255
+                            for index in (1, 3, 5)]
+                linear = [value / 12.92 if value <= .04045
+                          else ((value + .055) / 1.055) ** 2.4
+                          for value in channels]
+                return .2126 * linear[0] + .7152 * linear[1] + .0722 * linear[2]
+
+            lighter, darker = sorted((luminance(foreground), luminance(background)),
+                                     reverse=True)
+            return (lighter + .05) / (darker + .05)
+
+        for foreground, background in (
+            ("#334155", "#f8fafc"),  # explanatory text
+            ("#172033", "#ffffff"),  # ordinary button
+            ("#ffffff", "#1d4ed8"),  # primary button
+            ("#475569", "#e2e8f0"),  # disabled control without opacity loss
+            ("#f8fafc", "#0f172a"),  # agent contract
+        ):
+            with self.subTest(foreground=foreground, background=background):
+                self.assertGreaterEqual(contrast(foreground, background), 4.5)
+
 
 class ReadingOneTests(PipelineTestCase):
     def test_the_one_it_ships_with_is_a_good_one(self) -> None:

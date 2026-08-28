@@ -1359,7 +1359,7 @@ def write_default_project_config(
     local_ignore = folder / ".gitignore"
     # Shared: config.json and the check suites. Ignored: everything a run writes.
     ignore_lines = [
-        "config.local.json", "memory/", "runs/", "backups/", "checkpoints/", "cache/",
+        "config.local.json", "project-authority.json", "memory/", "runs/", "backups/", "checkpoints/", "cache/",
         "qa/runs/", "qa/tmp/", "qa/history.json", "qa/candidates.json",
     ]
     existing_ignore = local_ignore.read_text(encoding="utf-8") if local_ignore.exists() else ""

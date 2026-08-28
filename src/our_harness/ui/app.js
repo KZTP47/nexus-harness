@@ -601,7 +601,7 @@ async function simulate() { const checked = await validate(); if (!checked.valid
 async function animateTransitions(transitions) { const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches; for (const transition of transitions.filter((item) => item.node)) { nodeStatuses.set(transition.node, transition.state?.stage_passed === false ? "Failed" : "Passed"); renderNodes(); appendEvent(transition.node, transition.state?.stage_passed === false ? "Failed; routed to coder" : "Passed"); if (!reduced) await new Promise((resolve) => setTimeout(resolve, 220)); } }
 function appendEvent(state, result) { const row = document.createElement("tr"); row.append(make("td", "", new Date().toLocaleTimeString()), make("td", "", state), make("td", "", typeof result === "string" ? result : JSON.stringify(result))); $("eventBody").prepend(row); while ($("eventBody").children.length > 500) $("eventBody").lastElementChild.remove(); }
 function showError(message) { $("validationStatus").className = "status-fail"; $("validationStatus").textContent = message; announce(`Error: ${message}`, true); appendEvent("error", message); }
-async function startRun() { const task = $("taskInput").value.trim(); if (!task) { showError("Enter a task before starting a run."); $("taskInput").focus(); return; } const checked = await validate(); if (!checked.valid) return; try { await request("/api/run", {method: "POST", body: JSON.stringify({task, dry_run: $("dryRunInput").checked, graph})}); announce("Run accepted. Events will appear in the run log."); appendEvent("run", "Accepted"); } catch (error) { showError(error.message); } }
+async function startRun() { if (pipelineCannotRun) { showError(executionPauseWords("Project execution", pipelineCannotRun)); return; } const task = $("taskInput").value.trim(); if (!task) { showError("Enter a task before starting a run."); $("taskInput").focus(); return; } const checked = await validate(); if (!checked.valid) return; try { await request("/api/run", {method: "POST", body: JSON.stringify({task, dry_run: $("dryRunInput").checked, graph})}); announce("Run accepted. Events will appear in the run log."); appendEvent("run", "Accepted"); } catch (error) { showError(error.message); } }
 
 async function pollEvents() {
   clearTimeout(pollTimer);
@@ -717,6 +717,8 @@ let qaResult = null;
 async function refreshCheckup(fresh = false) {
   try {
     checkup = await request(`/api/checkup${fresh ? "?refresh=1" : ""}`);
+    pipelineCannotRun = String(checkup.cannot_run || "");
+    showProjectAuthorityPause(checkup.authority, pipelineCannotRun);
     renderCheckup();
   } catch (error) { showError(error.message); }
 }
@@ -757,8 +759,15 @@ function updateQuickReadiness() {
   const missing = checkup.steps
     .filter((step) => !step.done && !(bootstrap && ["stack", "commands", "suite"].includes(step.id)))
     .map((step) => step.title);
-  button.disabled = missing.length > 0;
-  if (missing.length) {
+  const executionPause = executionPauseWords("Project execution", pipelineCannotRun);
+  setExecutionControl(button, missing.length > 0, pipelineCannotRun,
+    "Start a verified long-horizon run", "Project execution");
+  setExecutionControl($("runButton"), false, pipelineCannotRun,
+    "Start this workflow run", "Project execution");
+  if (executionPause) {
+    message.className = "callout";
+    message.textContent = executionPause;
+  } else if (missing.length) {
     message.className = "callout";
     message.textContent = `Finish setup before starting: ${missing.join(", ")}. Use the steps above, then press Check again.`;
     button.title = message.textContent;
@@ -914,6 +923,10 @@ function fillDoItBox(box, job) {
 }
 
 async function quickRun() {
+  if (pipelineCannotRun) {
+    showError(executionPauseWords("Project execution", pipelineCannotRun));
+    return;
+  }
   const task = $("quickTask").value.trim();
   if (!task) { showError("Say what the harness should do first."); $("quickTask").focus(); return; }
   const bootstrap = Boolean($("quickBootstrap")?.checked);
@@ -941,6 +954,8 @@ async function quickRun() {
 async function refreshChecks() {
   try {
     qaSuite = await request("/api/qa/suite");
+    pipelineCannotRun = String(qaSuite.cannot_run || "");
+    showProjectAuthorityPause(qaSuite.authority, pipelineCannotRun);
     const stored = await request("/api/qa/result");
     if (stored.result) qaResult = stored.result;
     renderChecks();
@@ -1019,6 +1034,8 @@ function renderChecks() {
       // already set up with what it means and what to try.
       const ask = make("button", "", "Ask why this failed");
       ask.type = "button";
+      setExecutionControl(ask, false, pipelineCannotRun,
+        "Ask the connected model to explain this failure", "Provider contact");
       ask.addEventListener("click", () => explainFailure(found.id, outcome, ask));
       outcome.append(ask);
     }
@@ -1704,6 +1721,10 @@ async function addStarter(key, button) {
 }
 
 async function explainFailure(caseId, holder, button) {
+  if (pipelineCannotRun) {
+    showError(executionPauseWords("Provider contact", pipelineCannotRun));
+    return;
+  }
   button.disabled = true;
   button.textContent = "Asking...";
   try {
@@ -2681,9 +2702,92 @@ let pipelineZoom = 1;
 let pipelineIsFullScreen = false;
 let pipelineFullScreenHomes = [];
 const PIPELINE_PENDING_KEY_PREFIX = "nexus.pipeline.pending.v2:";
+const AGENT_RUN_PANEL_KEY = "nexus.pipeline.agent-instructions-open.v1";
+const AUTHORITY_REPAIR_SUCCESS_KEY = "nexus.authority-repair-success.v1";
 let pipelineAuthorityId = "";
 let pipelinePendingRequest = null;
 let pipelineCannotRun = "";
+let currentAuthorityRepair = null;
+
+function applyAgentRunPanelPreference() {
+  try { $("agentRunPanel").open = window.localStorage.getItem(AGENT_RUN_PANEL_KEY) === "yes"; }
+  catch (_error) { $("agentRunPanel").open = false; }
+}
+
+function rememberAgentRunPanelPreference() {
+  try { window.localStorage.setItem(AGENT_RUN_PANEL_KEY, $("agentRunPanel").open ? "yes" : "no"); }
+  catch (_error) { /* The native disclosure still works when storage is unavailable. */ }
+}
+
+function showProjectAuthorityPause(authority, cannotRun) {
+  const notice = $("authorityRepairNotice");
+  const reason = String(cannotRun || authority?.reason || "");
+  if (!notice) return;
+  notice.hidden = !reason;
+  $("authorityRepairReason").textContent = reason;
+  currentAuthorityRepair = authority?.repairable ? authority : null;
+  $("authorityRepairButton").hidden = !currentAuthorityRepair;
+  if (!reason) $("authorityRepairSaid").textContent = "";
+}
+
+function showAuthorityRepairSuccess(words) {
+  const notice = $("authorityRepairNotice");
+  const message = String(words || "This folder is registered as a new local project. Project execution is ready.");
+  if (!notice) return;
+  currentAuthorityRepair = null;
+  notice.hidden = false;
+  $("authorityRepairButton").hidden = true;
+  $("authorityRepairReason").textContent = message;
+  $("authorityRepairSaid").textContent = "You can start the project work again now.";
+  notice.tabIndex = -1;
+  notice.focus();
+  announce(message);
+}
+
+function restoreAuthorityRepairSuccess() {
+  try {
+    const words = window.sessionStorage.getItem(AUTHORITY_REPAIR_SUCCESS_KEY);
+    if (!words) return;
+    window.sessionStorage.removeItem(AUTHORITY_REPAIR_SUCCESS_KEY);
+    showAuthorityRepairSuccess(words);
+  } catch (_error) { /* Repair still succeeded when browser storage is unavailable. */ }
+}
+
+async function useFolderAsNewLocalProject() {
+  const authority = currentAuthorityRepair;
+  if (!authority) return;
+  const accepted = window.confirm(
+    "Use this folder as a new local project?\n\n"
+    + "Nexus will replace only this folder’s ignored local authority descriptor. "
+    + "The original project keeps its identity. Board and automation files are not deleted."
+  );
+  if (!accepted) return;
+  const button = $("authorityRepairButton");
+  button.disabled = true;
+  $("authorityRepairSaid").textContent = "Registering this folder locally…";
+  try {
+    const said = await request("/api/projects/use-as-new-local", {
+      method: "POST",
+      body: JSON.stringify({
+        confirmation: "USE THIS FOLDER AS A NEW LOCAL PROJECT",
+        fingerprint: authority.fingerprint,
+      }),
+    });
+    const note = said.note || "This folder is registered as a new local project.";
+    $("authorityRepairSaid").textContent = note;
+    try {
+      window.sessionStorage.setItem(AUTHORITY_REPAIR_SUCCESS_KEY, note);
+      window.location.reload();
+    } catch (_storageError) {
+      await refreshCheckup();
+      await refreshChecks();
+      showAuthorityRepairSuccess(note);
+    }
+  } catch (error) {
+    $("authorityRepairSaid").textContent = error.message;
+    button.disabled = false;
+  }
+}
 
 function pipelinePendingKey(authorityId = pipelineAuthorityId) {
   return `${PIPELINE_PENDING_KEY_PREFIX}${authorityId}`;
@@ -2914,6 +3018,7 @@ async function refreshPipelines(name) {
     const said = await request(`/api/pipelines${requestedName ? `?name=${encodeURIComponent(requestedName)}` : ""}`);
     if (mine !== pipelineNewestRefresh) return;
     pipelineCannotRun = String(said.cannot_run || "");
+    showProjectAuthorityPause(said.authority, pipelineCannotRun);
     if (said.project_authority_id) usePipelineAuthority(said.project_authority_id);
     else {
       pipelineAuthorityId = "";
@@ -3043,6 +3148,7 @@ function renderPipelineSaved() {
   $("pipelineExport").disabled = !pipelineSavedName || !pipelineSaved.includes(pipelineSavedName);
   $("pipelineRun").disabled = Boolean(pipelineCannotRun);
   $("pipelineRun").title = pipelineCannotRun;
+  $("agentRunCopyContract").disabled = !pipelineSaved.length;
   $("agentRunNow").disabled = Boolean(pipelineCannotRun) || !pipelineSaved.length;
   $("agentRunNow").title = pipelineCannotRun;
   if (!pipelineSaved.length) {
@@ -4453,6 +4559,8 @@ function applyCheckEvent(event) {
 
 function bindEvents() {
   applyMoreOptionsPreference();
+  applyAgentRunPanelPreference();
+  $("agentRunPanel").addEventListener("toggle", rememberAgentRunPanelPreference);
   document.querySelectorAll("[data-node-type]").forEach((button) => { button.addEventListener("click", () => addNode(button.dataset.nodeType, 360, 300, button)); button.addEventListener("dragstart", (event) => event.dataTransfer.setData("application/x-harness-node", button.dataset.nodeType)); });
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
   $("canvas").addEventListener("dragover", (event) => { if (event.dataTransfer.types.includes("application/x-harness-node")) event.preventDefault(); });
@@ -4546,6 +4654,7 @@ function bindEvents() {
     $("thePage").addEventListener("toggle", () => $("thePage").open && refreshThePage());
   }
   $("swarmKeep").addEventListener("click", keepThisBoard);
+  $("authorityRepairButton").addEventListener("click", useFolderAsNewLocalProject);
   $("swarmImport").addEventListener("click", () => $("swarmImportFile").click());
   $("swarmImportFile").addEventListener(
     "change", (event) => importKeptBoard(event.target.files?.[0]));
@@ -5722,12 +5831,29 @@ let timers = [];
 let timerHowOften = [];
 let timerMachine = {};
 
+function executionPauseWords(kind, reason) {
+  const why = String(reason || "").trim();
+  return why ? `${kind} is paused: ${why}` : "";
+}
+
+function setExecutionControl(button, ordinarilyDisabled, reason, ordinaryTitle = "",
+                             kind = "Project execution") {
+  if (!button) return;
+  const pause = executionPauseWords(kind, reason);
+  button.disabled = Boolean(ordinarilyDisabled) || Boolean(pause);
+  button.title = pause || ordinaryTitle;
+  if (pause) button.setAttribute("aria-describedby", "authorityRepairReason");
+  else button.removeAttribute("aria-describedby");
+}
+
 async function refreshTimers() {
   try {
     const said = await request("/api/timers");
     timers = said.timers || [];
     timerHowOften = said.how_often || [];
     timerMachine = said.how_to_ask_this_machine || {};
+    pipelineCannotRun = String(said.cannot_run || "");
+    showProjectAuthorityPause(said.authority, pipelineCannotRun);
     fillOneChoice("timerAutomation", (said.automations || []).map((one) => ({name: one, label: one})), "name",
                   $("timerAutomation").value || (said.automations || [])[0] || "");
     fillOneChoice("timerHowOften", timerHowOften, "how_often",
@@ -5736,6 +5862,8 @@ async function refreshTimers() {
                   "day", $("timerOnDay").value || "monday");
     sayWhatTheTimerMeans();
     renderTimers();
+    setExecutionControl($("timerAdd"), false, pipelineCannotRun,
+      "Put this automation on a timer", "Automation execution");
     $("timerMachineLine").textContent = timerMachine.what || "";
     $("timerMachineOff").textContent = timerMachine.to_take_it_off || "";
     if (said.could_not_be_read) sayAboutTimers(said.could_not_be_read);
@@ -5781,10 +5909,14 @@ function renderTimers() {
     const buttons = make("div", "button-row");
     const turn = make("button", "", one.turned_on ? "Turn it off" : "Turn it on");
     turn.type = "button";
+    setExecutionControl(turn, false, one.turned_on ? "" : pipelineCannotRun,
+      one.turned_on ? "Stop this timer from running" : "Let this timer run on its schedule",
+      "Automation execution");
     turn.addEventListener("click", () => turnTheTimer(one, !one.turned_on));
     const now = make("button", "", "Run it now");
     now.type = "button";
-    now.title = "Do what the timer would do, without waiting for it";
+    setExecutionControl(now, false, pipelineCannotRun,
+      "Do what the timer would do, without waiting for it", "Automation execution");
     now.addEventListener("click", () => runTheTimerNow(one, now));
     const off = make("button", "", "Take it off");
     off.type = "button";
@@ -5796,6 +5928,10 @@ function renderTimers() {
 }
 
 async function addATimer() {
+  if (pipelineCannotRun) {
+    sayAboutTimers(executionPauseWords("Automation execution", pipelineCannotRun));
+    return;
+  }
   const name = $("timerName").value.trim();
   const automation = $("timerAutomation").value;
   if (!name) { sayAboutTimers("Give the timer a name first."); return; }
@@ -5866,6 +6002,10 @@ async function saySoBeforeItRunsAlone(automation, what) {
 }
 
 async function turnTheTimer(one, on) {
+  if (on && pipelineCannotRun) {
+    sayAboutTimers(executionPauseWords("Automation execution", pipelineCannotRun));
+    return;
+  }
   // Asked again. Turning one back on is putting it on a timer just as much as
   // adding it was, and the reason it should not run alone has not gone away.
   if (on && !await saySoBeforeItRunsAlone(one.automation, "Turn it on anyway?")) {
@@ -5897,6 +6037,10 @@ async function takeTheTimerOff(one) {
 }
 
 async function runTheTimerNow(one, button) {
+  if (pipelineCannotRun) {
+    sayAboutTimers(executionPauseWords("Automation execution", pipelineCannotRun));
+    return;
+  }
   button.disabled = true;
   sayAboutTimers(`Running ${one.automation} now...`);
   try {
@@ -5939,6 +6083,7 @@ let talkOpen = "";       // whose conversation is on screen
 let talkBusy = false;    // waiting for an answer
 let talkStopping = false;
 let talkBusyRequest = null;
+let talkCannotRun = "";
 // Updated from the backend on every chat read.  The generous default only
 // covers startup before that response lands; the server remains authoritative.
 let chatLimits = {
@@ -5993,6 +6138,8 @@ async function refreshTalk(who, quietly) {
     if (mine !== talkNewestRefresh) return;  // a newer look started while this one ran
     talkWho = said.who || [];
     talkOpen = said.open || "";
+    talkCannotRun = String(said.cannot_run || "");
+    showProjectAuthorityPause(said.authority, talkCannotRun);
     if (said.limits && typeof said.limits === "object") chatLimits = said.limits;
     const outputFact = outputBudgetFact(chatLimits);
     $("talkBudget").textContent =
@@ -6035,10 +6182,13 @@ function sayInTalk(words) { $("talkSaid").textContent = words; }
 function setWhatCanBePressed() {
   const somebody = talkTheOpenOne();
   $("talkBox").disabled = !somebody;
-  $("talkSend").disabled = talkBusy || !somebody;
+  setExecutionControl($("talkSend"), talkBusy || !somebody, talkCannotRun,
+    "Send this message to the selected assistant", "Provider contact");
   $("talkStop").disabled = !talkBusy || talkStopping;
   $("talkStop").textContent = talkStopping ? "Stopping…" : "Stop";
-  $("talkAskEveryone").disabled = talkBusy || !talkWho.some((one) => one.ready);
+  setExecutionControl($("talkAskEveryone"),
+    talkBusy || !talkWho.some((one) => one.ready), talkCannotRun,
+    "Ask every ready assistant", "Provider contact");
   $("talkStartAgain").disabled = talkBusy || !somebody;
   // The names on the left too, and now rather than the next time the list is
   // drawn: switching while an answer is on its way leaves "Asking them..." on
@@ -6116,6 +6266,12 @@ function countWhatIsTyped() {
 
 async function sendWhatIsTyped() {
   const box = $("talkBox");
+  const executionPause = executionPauseWords("Provider contact", talkCannotRun);
+  if (executionPause) {
+    sayInTalk(executionPause);
+    box.focus();
+    return;
+  }
   const words = box.value.trim();
   const one = talkTheOpenOne();
   if (!words) { sayInTalk("Type something first."); return; }
@@ -6178,6 +6334,12 @@ function readOneTurnBack(row) {
 
 async function askEveryone() {
   const box = $("talkBox");
+  const executionPause = executionPauseWords("Provider contact", talkCannotRun);
+  if (executionPause) {
+    sayInTalk(executionPause);
+    box.focus();
+    return;
+  }
   const words = box.value.trim();
   if (!words) { sayInTalk("Type something first."); return; }
   if (talkBusy) { sayInTalk("Still waiting for the last answer."); return; }
@@ -6403,6 +6565,7 @@ async function boot() {
     await refreshCheckup();
     await refreshHowItWorks();
     await refreshChecks();
+    restoreAuthorityRepairSuccess();
     await refreshTeamNotes();
     await refreshWorkflows();
     pollEvents();
@@ -6810,7 +6973,10 @@ function renderWorkRecoveryButtons(agentId) {
   const buttons = [card?.querySelector(".work-recovery-resume")];
   if (theBigOne === agentId) buttons.push($("theBigChatWorkRecovery")
     ?.querySelector(".work-recovery-resume"));
-  for (const button of buttons.filter(Boolean)) button.disabled = unavailable || answerMissing;
+  for (const button of buttons.filter(Boolean)) {
+    setSwarmProviderControl(button, unavailable || answerMissing,
+      answerMissing ? "Answer the paused questions before resuming" : "Resume this saved project-work run");
+  }
 }
 
 function renderWorkRecovery(agentId) {
@@ -7234,6 +7400,7 @@ async function refreshSwarm(quietly) {
     if (mine !== swarmNewestRefresh) return;
     if (changesThen !== howManyChangesLanded) return;
     swarmSaid = said;
+    showProjectAuthorityPause(said.authority, said.cannot_run);
     swarmBoardHydrated = true;
     acceptKeptInventory(said, true);
     keepTheSwarmPick();
@@ -8320,7 +8487,8 @@ function setWhatCanBePressedInSwarm() {
   // chat nothing points at any more. The server turns those saves down as
   // well; this is so nobody is offered a button that will be refused.
   const held = Boolean(whyTheBoardIsHeld());
-  $("swarmKeep").disabled = held;
+  // Saving a named snapshot does not mutate the live topology being executed.
+  $("swarmKeep").disabled = false;
   $("swarmAddAgent").disabled = held || board.agents.length >= (most.agents || 24);
   $("swarmAddProject").disabled = held || board.projects.length >= (most.projects || 12);
   $("swarmRemoveAgent").disabled = held || !agent;
@@ -8355,7 +8523,8 @@ function setWhatCanBePressedInSwarm() {
   $("swarmLineRemove").disabled = held || !line || !$("swarmLineOn").checked;
   for (const tick of $("swarmWorksOn").querySelectorAll("input")) tick.disabled = held;
   for (const tick of $("swarmTalksTo").querySelectorAll("input")) tick.disabled = held;
-  $("swarmStart").disabled = held || swarmGoing;
+  $("swarmStart").disabled = held || Boolean(swarmSaid.cannot_run) || swarmGoing;
+  $("swarmStart").title = String(swarmSaid.cannot_run || held || "");
   $("swarmStop").disabled = !swarmGoing;
   for (const card of $("swarmBoard").querySelectorAll(".swarm-chat-card")) {
     setWhatCanBePressedInAChat(card);
@@ -8365,22 +8534,20 @@ function setWhatCanBePressedInSwarm() {
     const waiting = busy || swarmConversationSwitching.has(theBigOne);
     const stopping = swarmStopping.has(theBigOne);
     const recovery = workRecoveryFor(theBigOne);
-    for (const id of [
-      "theBigChatSend", "theBigChatSolo", "theBigChatAttach",
-      "theBigChatCollaborate", "theBigChatWork",
-    ]) {
-      const button = $(id);
-      if (button) button.disabled = waiting;
-    }
+    $("theBigChatAttach").disabled = waiting;
+    setSwarmProviderControl($("theBigChatSend"), waiting, "Send with automatic collaboration");
+    setSwarmProviderControl($("theBigChatSolo"), waiting, "Ask only this agent");
+    setSwarmProviderControl($("theBigChatCollaborate"), waiting,
+      "Ask connected agents to collaborate");
     const conversation = activeConversationFor(theBigOne);
     if ($("theBigChatWork")) {
-      $("theBigChatWork").disabled = waiting || Boolean(recovery)
-        || (Boolean(conversation) && !conversation.project);
-      $("theBigChatWork").title = recovery
+      const workTitle = recovery
         ? "Resume the saved project-work run before starting another"
         : conversation && !conversation.project
         ? "Choose this chat's active project first"
         : "Ask this pair to work together on the selected project";
+      setSwarmProviderControl($("theBigChatWork"), waiting || Boolean(recovery)
+        || (Boolean(conversation) && !conversation.project), workTitle);
     }
     if ($("theBigChatProject")) $("theBigChatProject").disabled = waiting || !conversation;
     syncChatRoundPolicy(theBigOne);
@@ -9492,21 +9659,25 @@ function setWhatCanBePressedInAChat(card) {
   // Disabling the textarea threw away a useful distinction between "cannot
   // send yet" and "cannot compose", and made restored draft state unusable.
   card.querySelector(".swarm-chat-box").disabled = !agent;
-  card.querySelector(".swarm-chat-send").disabled = waiting || !agent || !agent.ready;
-  card.querySelector(".swarm-chat-solo").disabled = waiting || !agent || !agent.ready;
+  setSwarmProviderControl(card.querySelector(".swarm-chat-send"),
+    waiting || !agent || !agent.ready, "Send with automatic collaboration");
+  setSwarmProviderControl(card.querySelector(".swarm-chat-solo"),
+    waiting || !agent || !agent.ready, "Ask only this agent");
   const stop = card.querySelector(".swarm-chat-stop");
   stop.disabled = !busy || swarmStopping.has(card.dataset.agent);
   stop.textContent = swarmStopping.has(card.dataset.agent) ? "Stopping…" : "Stop";
   card.querySelector(".swarm-chat-attach").disabled = waiting || !agent || !agent.ready;
-  card.querySelector(".swarm-chat-collaborate").disabled = waiting || !agent || !agent.ready;
+  setSwarmProviderControl(card.querySelector(".swarm-chat-collaborate"),
+    waiting || !agent || !agent.ready, "Ask connected agents to collaborate");
   syncChatRoundPolicy(card.dataset.agent);
   const conversation = activeConversationFor(card.dataset.agent);
-  card.querySelector(".swarm-chat-work").disabled = waiting || !agent || !agent.ready
+  const workDisabled = waiting || !agent || !agent.ready
     || Boolean(workRecoveryFor(card.dataset.agent))
     || (Boolean(conversation) && !conversation.project);
-  card.querySelector(".swarm-chat-work").title = workRecoveryFor(card.dataset.agent)
+  const workTitle = workRecoveryFor(card.dataset.agent)
     ? "Resume the saved project-work run before starting another"
     : "Ask connected project agents to plan, then apply validated file changes";
+  setSwarmProviderControl(card.querySelector(".swarm-chat-work"), workDisabled, workTitle);
   card.querySelector(".swarm-chat-again").disabled = waiting || !agent;
   renderWorkRecoveryButtons(card.dataset.agent);
 }
@@ -9768,6 +9939,15 @@ function automaticRoundStopWords(answered) {
   return "";
 }
 
+function swarmProviderPauseMessage() {
+  return executionPauseWords("Provider contact", swarmSaid.cannot_run);
+}
+
+function setSwarmProviderControl(button, ordinarilyDisabled, ordinaryTitle = "") {
+  setExecutionControl(button, ordinarilyDisabled, swarmSaid.cannot_run, ordinaryTitle,
+    "Provider contact");
+}
+
 function confirmProjectWork(agent, words, mode) {
   const needsConfirmation = mode === "work" || (mode === "auto" && looksLikeProjectWork(words));
   if (!needsConfirmation) return {allowed: true, confirmed: false};
@@ -9825,6 +10005,13 @@ async function resumeSwarmWork(agentId) {
   const agent = theSwarmAgent(agentId);
   const conversation = activeConversationFor(agentId);
   if (!recovery || !agent || !conversation) return;
+  const executionPause = swarmProviderPauseMessage();
+  if (executionPause) {
+    sayInTheChatFor(agentId, executionPause);
+    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = executionPause;
+    renderWorkRecoveryButtons(agentId);
+    return;
+  }
   if (!agent.ready) {
     sayInTheChatFor(agentId, agent.why_not || "This agent is not ready yet.");
     return;
@@ -9911,6 +10098,12 @@ async function sendWhatIsTypedTo(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!card || !agent) return;
   const box = card.querySelector(".swarm-chat-box");
+  const executionPause = swarmProviderPauseMessage();
+  if (executionPause) {
+    sayInTheChatFor(agentId, executionPause);
+    box.focus();
+    return;
+  }
   const words = box.value.trim();
   if (!words) { sayInTheChatFor(agentId, "Type something first."); return; }
   if (words.length > Number(limitsForSwarmChat(agentId).input_characters || 200000)) {
@@ -10502,8 +10695,7 @@ function renderTheKeptBoards() {
     const drop = make("button", "swarm-icon-button", "Delete");
     drop.type = "button";
     drop.setAttribute("aria-label", `Delete the saved board called ${one.name}`);
-    drop.disabled = held;
-    if (held) drop.title = `This board is safe, but cannot be deleted yet. ${whyTheBoardIsHeld()}`;
+    drop.disabled = false;
     drop.addEventListener("click", () => forgetTheKeptBoard(one.name));
     row.append(drop);
     list.append(row);
@@ -11813,6 +12005,12 @@ async function sendFromTheBigChat(mode = "auto") {
   if (!theBigOne) return;
   const agentId = theBigOne;
   const agent = theSwarmAgent(agentId);
+  const executionPause = swarmProviderPauseMessage();
+  if (executionPause) {
+    $("theBigChatSaidBack").textContent = executionPause;
+    box.focus();
+    return;
+  }
   if (!said) {
     $("theBigChatSaidBack").textContent = mode === "work"
       ? "Describe the project-file change first."

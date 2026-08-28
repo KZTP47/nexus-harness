@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
-from our_harness import pipelines, projects, server
+from our_harness import chat, pipelines, projects, server
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
 
 
@@ -46,6 +46,7 @@ class ProjectTestCase(unittest.TestCase):
         patched = mock.patch.dict(os.environ, {
             "APPDATA": str(self.somewhere_else),
             "XDG_CONFIG_HOME": str(self.somewhere_else),
+            "OUR_HARNESS_PIPELINE_RUN_DIR": str(self.root / "pipeline-runtime"),
             "OUR_HARNESS_SWARM_RUN_DIR": str(self.root / "swarm-runtime"),
         })
         patched.start()
@@ -309,6 +310,244 @@ class MovingToAnotherOne(ProjectTestCase):
 
         _status, after = self.ask("/api/pipelines")
         self.assertEqual(after["saved"], [], "beta has its own, and it is empty")
+
+    def test_a_blocked_pipeline_store_cannot_republish_the_old_project_after_move(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        moved = threading.Event()
+        stores: list[object] = []
+        result: list[object] = []
+
+        class BlockingStore:
+            def __init__(_self, config: LoadedConfig) -> None:
+                _self.project_root = config.project_root
+                stores.append(_self)
+                if len(stores) == 1:
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test did not release the store constructor")
+
+        with mock.patch.object(server.pipeline_runtime, "PipelineRunStore", BlockingStore):
+            constructor = threading.Thread(
+                target=lambda: result.append(self.panel.pipeline_store), daemon=True
+            )
+            constructor.start()
+            self.assertTrue(entered.wait(5))
+
+            switch = threading.Thread(
+                target=lambda: (self.panel.move_to(str(self.second)), moved.set()),
+                daemon=True,
+            )
+            switch.start()
+            self.assertFalse(
+                moved.wait(0.1),
+                "move must wait until the old-project cache publication is settled",
+            )
+            release.set()
+            constructor.join(5)
+            switch.join(5)
+
+            self.assertFalse(constructor.is_alive())
+            self.assertFalse(switch.is_alive())
+            self.assertTrue(moved.is_set())
+            self.assertEqual(result[0].project_root, self.first)
+            self.assertEqual(self.panel.config.project_root, self.second)
+            self.assertIsNone(self.panel._pipeline_store)
+            self.assertEqual(self.panel.pipeline_store.project_root, self.second)
+
+    def test_a_blocked_swarm_store_cannot_republish_the_old_project_after_move(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        moved = threading.Event()
+        stores: list[object] = []
+        result: list[object] = []
+
+        class BlockingStore:
+            def __init__(_self, config: LoadedConfig) -> None:
+                _self.project_root = config.project_root
+                stores.append(_self)
+                if len(stores) == 1:
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test did not release the store constructor")
+
+            def active(_self) -> None:
+                return None
+
+        with mock.patch.object(server.swarm_runs, "SwarmRunStore", BlockingStore):
+            constructor = threading.Thread(
+                target=lambda: result.append(self.panel.swarm_runs), daemon=True
+            )
+            constructor.start()
+            self.assertTrue(entered.wait(5))
+
+            switch = threading.Thread(
+                target=lambda: (self.panel.move_to(str(self.second)), moved.set()),
+                daemon=True,
+            )
+            switch.start()
+            self.assertFalse(
+                moved.wait(0.1),
+                "move must wait until the old-project cache publication is settled",
+            )
+            release.set()
+            constructor.join(5)
+            switch.join(5)
+
+            self.assertFalse(constructor.is_alive())
+            self.assertFalse(switch.is_alive())
+            self.assertTrue(moved.is_set())
+            self.assertEqual(result[0].project_root, self.first)
+            self.assertEqual(self.panel.config.project_root, self.second)
+            self.assertIsNone(self.panel._swarm_runs)
+            self.assertEqual(self.panel.swarm_runs.project_root, self.second)
+
+    def test_move_is_refused_while_pipeline_acceptance_is_in_flight(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingStore:
+            project_root = self.first
+
+            def accept(_self, *_args, **_kwargs):
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("test did not release acceptance")
+                return ({
+                    "run_id": "alpha-replay",
+                    "attempt_id": "alpha-attempt",
+                    "name": "Only in alpha",
+                    "definition_digest": "alpha-digest",
+                }, False)
+
+            def active(_self) -> None:
+                return None
+
+        self.panel._pipeline_store = BlockingStore()
+        answer: list[tuple[int, dict]] = []
+        request = threading.Thread(
+            target=lambda: answer.append(self.ask(
+                "/api/pipelines/agent-run",
+                {"automation": "Only in alpha", "request_id": "same-alpha-request"},
+            )),
+            daemon=True,
+        )
+        request.start()
+        self.assertTrue(entered.wait(5))
+
+        with self.assertRaisesRegex(server.HarnessError, "being accepted"):
+            self.panel.move_to(str(self.second))
+        self.assertEqual(self.panel.config.project_root, self.first)
+
+        release.set()
+        request.join(5)
+        self.assertFalse(request.is_alive())
+        self.assertEqual(answer[0][0], 202, answer)
+        self.assertTrue(answer[0][1]["replayed"])
+        self.assertEqual(self.panel.config.project_root, self.first)
+
+        self.panel.move_to(str(self.second))
+        self.assertEqual(self.panel.config.project_root, self.second)
+
+    def test_move_is_refused_for_each_whole_legacy_provider_turn(self) -> None:
+        provider_roots: list[Path] = []
+        cases = (
+            ("say", "/api/chat/say", {"who": "codex", "text": "stay in alpha"},
+             {"said": "alpha answer"}),
+            ("ask_everyone", "/api/chat/ask-everyone", {"text": "stay in alpha"}, []),
+        )
+
+        for provider_method, path, body, returned in cases:
+            with self.subTest(path=path):
+                entered = threading.Event()
+                release = threading.Event()
+
+                def blocked(config: LoadedConfig, *_args) -> object:
+                    provider_roots.append(config.project_root)
+                    entered.set()
+                    if not release.wait(5):
+                        raise RuntimeError("test did not release provider turn")
+                    return returned
+
+                answer: list[tuple[int, dict]] = []
+                with mock.patch.object(chat, provider_method, side_effect=blocked):
+                    request = threading.Thread(
+                        target=lambda: answer.append(self.ask(path, body)), daemon=True
+                    )
+                    request.start()
+                    self.assertTrue(entered.wait(5))
+
+                    with self.assertRaisesRegex(server.HarnessError, "contacting a provider"):
+                        self.panel.move_to(str(self.second))
+                    self.assertEqual(self.panel.config.project_root, self.first)
+
+                    release.set()
+                    request.join(5)
+
+                self.assertFalse(request.is_alive())
+                self.assertEqual(answer[0][0], 200, answer)
+
+        self.assertEqual(provider_roots, [self.first, self.first])
+        self.panel.move_to(str(self.second))
+        self.assertEqual(self.panel.config.project_root, self.second)
+
+    def test_talk_authority_check_and_provider_call_stay_on_the_same_project(self) -> None:
+        # Give alpha a valid local authority and make beta the copied project
+        # whose execution must remain paused.
+        self.panel.pipeline_store
+        descriptor = self.first / ".harness" / "project-authority.json"
+        copied = self.second / ".harness" / "project-authority.json"
+        copied.write_bytes(descriptor.read_bytes())
+
+        authority_entered = threading.Event()
+        release_authority = threading.Event()
+        provider_roots: list[Path] = []
+        original_status = self.panel.project_authority_status
+
+        def blocked_authority() -> dict:
+            status = original_status()
+            authority_entered.set()
+            if not release_authority.wait(5):
+                raise RuntimeError("test did not release authority inspection")
+            return status
+
+        def answer(config: LoadedConfig, _who: str, _text: str) -> dict:
+            provider_roots.append(config.project_root)
+            return {"said": "alpha answer"}
+
+        result: list[tuple[int, dict]] = []
+        with mock.patch.object(
+            self.panel, "project_authority_status", side_effect=blocked_authority
+        ), mock.patch.object(chat, "say", side_effect=answer):
+            request = threading.Thread(
+                target=lambda: result.append(self.ask(
+                    "/api/chat/say", {"who": "codex", "text": "stay in alpha"}
+                )),
+                daemon=True,
+            )
+            request.start()
+            self.assertTrue(authority_entered.wait(5))
+            try:
+                # The read-only fast precheck may overlap a move. Its answer
+                # must never authorize the later provider call: the admitted
+                # recheck sees beta's copied authority and refuses it.
+                self.panel.move_to(str(self.second))
+                self.assertEqual(self.panel.config.project_root, self.second)
+            finally:
+                release_authority.set()
+            request.join(5)
+
+        self.assertFalse(request.is_alive())
+        self.assertEqual(result[0][0], 400, result)
+        self.assertIn("copied or substituted", result[0][1]["error"])
+        self.assertEqual(provider_roots, [])
+
+        # The copied target remains visibly execution-paused instead of
+        # inheriting alpha's earlier check.
+        status, standing = self.ask("/api/chat")
+        self.assertEqual(status, 200, standing)
+        self.assertTrue(standing["cannot_run"], standing)
+        self.assertFalse(standing["authority"]["can_run"], standing)
 
     def test_moving_says_the_page_will_be_read_again(self) -> None:
         _status, said = self.ask("/api/projects/open", {"path": str(self.second)})

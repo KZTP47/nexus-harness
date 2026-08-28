@@ -497,9 +497,9 @@ def save(said: Any, config: Any) -> Board:
     while another process is executing a snapshot of it.
     """
 
-    from .swarm_runs import SwarmRunStore
+    from .swarm_runs import global_board_mutation
 
-    with SwarmRunStore(config).board_mutation():
+    with global_board_mutation(config):
         return _save_while_board_authority_is_held(said, config)
 
 
@@ -2224,12 +2224,12 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
     going. Somebody pressing save has just finished arranging it.
     """
 
-    from .swarm_runs import SwarmRunStore
+    from .safety import ProjectTransactionLock
 
-    with SwarmRunStore(config).board_mutation():
+    where = where_the_kept_ones_live()
+    where.mkdir(parents=True, exist_ok=True)
+    with ProjectTransactionLock(where.parent).held(timeout_seconds=10):
         filed = _filed_under(name)
-        where = where_the_kept_ones_live()
-        where.mkdir(parents=True, exist_ok=True)
         already = every_kept_board()
         if len(already) >= MOST_KEPT_BOARDS and not (where / filed).is_file():
             raise SwarmError(
@@ -2246,9 +2246,12 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
         )
         # Written beside and moved into place, so a panel reading the list never
         # catches a board half written.
-        beside = where / f"{filed}.{os.getpid()}.part"
-        beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
-        os.replace(beside, where / filed)
+        beside = where / f".{filed}.{os.getpid()}.{time.time_ns()}.part"
+        try:
+            beside.write_text(json.dumps(held, indent=2) + "\n", encoding="utf-8")
+            os.replace(beside, where / filed)
+        finally:
+            beside.unlink(missing_ok=True)
         return {"name": held["name"], "saved_at": held["saved_at"]}
 
 
@@ -2260,9 +2263,9 @@ def open_this_board(name: str, config: Any) -> Board:
     somebody ends up with a board holding both and belonging to neither.
     """
 
-    from .swarm_runs import SwarmRunStore
+    from .swarm_runs import global_board_mutation
 
-    with SwarmRunStore(config).board_mutation():
+    with global_board_mutation(config):
         opened_as = " ".join(str(name).split())
         where = where_the_kept_ones_live() / _filed_under(opened_as)
         try:
@@ -2284,17 +2287,21 @@ def open_this_board(name: str, config: Any) -> Board:
 def forget_this_board(name: str, config: Any) -> None:
     """Throw away one saved board."""
 
-    from .swarm_runs import SwarmRunStore
+    from .safety import ProjectTransactionLock
+    from .swarm_runs import global_board_metadata_mutation
 
-    with SwarmRunStore(config).board_mutation():
+    library = where_the_kept_ones_live()
+    library.mkdir(parents=True, exist_ok=True)
+    with ProjectTransactionLock(library.parent).held(timeout_seconds=10):
         forgotten = " ".join(str(name).split())
-        where = where_the_kept_ones_live() / _filed_under(forgotten)
+        where = library / _filed_under(forgotten)
         try:
             where.unlink()
         except FileNotFoundError as exc:
             raise SwarmError(f"There is no saved board called {name}.") from exc
         except OSError as exc:
             raise SwarmError(f"The board saved as {name} could not be deleted: {exc}") from exc
+    with global_board_metadata_mutation(config):
         board = load()
         if board.active_saved_board == forgotten:
             _save_while_board_authority_is_held(

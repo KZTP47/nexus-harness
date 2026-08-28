@@ -311,6 +311,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.events = EventBus(redactor=CredentialRedactor(config))
         self._swarm_runs: swarm_runs.SwarmRunStore | None = None
         self._swarm_runner: swarm_lab.Running | None = None
+        self.authority_lock = threading.Lock()
         self.chat_activities = ChatActivities()
         self.chat_cancellations = cancellation.ChatCancellationRegistry()
         self.web_chats = web_chats.WebChatBroker()
@@ -359,6 +360,9 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # One pipeline run at a time. A pipeline starts real suites and real
         # commands, and two at once would fight over the same project.
         self.pipeline_lock = threading.Lock()
+        # Serializes project switching with the short admission window before
+        # a command owns its durable run/provider lease.
+        self.project_admission_lock = threading.Lock()
         # Created only when automation functionality is first used. Merely
         # opening an unrelated chat must not write a project authority
         # descriptor into that project.
@@ -384,27 +388,65 @@ class HarnessHTTPServer(ThreadingHTTPServer):
 
     @property
     def pipeline_store(self) -> pipeline_runtime.PipelineRunStore:
-        held = self._pipeline_store
-        if held is None:
-            held = pipeline_runtime.PipelineRunStore(self.config)
-            self._pipeline_store = held
-        return held
+        with self.authority_lock:
+            held = self._pipeline_store
+            if held is None:
+                held = pipeline_runtime.PipelineRunStore(self.config)
+                self._pipeline_store = held
+            return held
 
     @property
     def swarm_runs(self) -> swarm_runs.SwarmRunStore:
-        held = self._swarm_runs
-        if held is None:
-            held = swarm_runs.SwarmRunStore(self.config)
-            self._swarm_runs = held
-        return held
+        with self.authority_lock:
+            held = self._swarm_runs
+            if held is None:
+                held = swarm_runs.SwarmRunStore(self.config)
+                self._swarm_runs = held
+            return held
 
     @property
     def swarm_runner(self) -> swarm_lab.Running:
+        with self.authority_lock:
+            held = self._swarm_runner
+            if held is None:
+                # Avoid recursively taking authority_lock via the property.
+                store = self._swarm_runs
+                if store is None:
+                    store = swarm_runs.SwarmRunStore(self.config)
+                    self._swarm_runs = store
+                held = swarm_lab.Running(store)
+                self._swarm_runner = held
+            return held
+
+    def project_authority_status(self) -> dict[str, Any]:
+        try:
+            return pipeline_runtime.inspect_project_authority(self.config.project_root)
+        except HarnessError as exc:
+            return {
+                "can_run": False, "reason": str(exc), "reason_code": "unsafe_or_malformed",
+                "repairable": False, "fingerprint": "",
+            }
+
+    def require_project_execution_authority(self) -> dict[str, Any]:
+        authority = self.project_authority_status()
+        if not authority.get("can_run"):
+            raise HarnessError(str(authority.get("reason") or "Project execution is paused."))
+        return authority
+
+    def swarm_change_pause_reason(self) -> str:
         held = self._swarm_runner
-        if held is None:
-            held = swarm_lab.Running(self.swarm_runs)
-            self._swarm_runner = held
-        return held
+        if held is not None:
+            reason = held.why_it_cannot_be_changed()
+            if reason:
+                return reason
+        return swarm_runs.global_board_change_pause_reason(self.config)
+
+    def decorate_swarm_authority(self, standing: dict[str, Any]) -> dict[str, Any]:
+        authority = self.project_authority_status()
+        standing["cannot_run"] = str(authority.get("reason") or "")
+        standing["authority"] = authority
+        standing["cannot_be_changed"] = self.swarm_change_pause_reason()
+        return standing
 
     @staticmethod
     def _pipeline_result(run: Any) -> dict[str, Any]:
@@ -534,17 +576,30 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             raise HarnessError(
                 f"There is no folder at {wanted}. Pick the folder your project is in."
             )
+        config = load_config(wanted)
+        registry = load_plugins(config)
+        workflow_policy = resolve_workflow_policy(config, registry.workflow_nodes)
+        check_kinds = dict(registry.check_kinds)
+        redactor = CredentialRedactor(config)
+        if not self.project_admission_lock.acquire(blocking=False):
+            raise HarnessError(
+                "A project command is being accepted or contacting a provider. "
+                "Wait for it before moving projects."
+            )
         if self.pipeline_running:
+            self.project_admission_lock.release()
             raise HarnessError(
                 "An automation is running. Wait for it to finish, or stop it, "
                 "before moving to another project."
             )
         if not self.pipeline_lock.acquire(blocking=False):
+            self.project_admission_lock.release()
             raise HarnessError(
                 "An automation is being accepted or is running. Wait for it before moving projects."
             )
         if not self.run_lock.acquire(blocking=False):
             self.pipeline_lock.release()
+            self.project_admission_lock.release()
             raise HarnessError(
                 "A run is going. Wait for it to finish before moving to "
                 "another project."
@@ -552,46 +607,50 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         if not self.swarm_lock.acquire(blocking=False):
             self.run_lock.release()
             self.pipeline_lock.release()
+            self.project_admission_lock.release()
             raise HarnessError(
                 "A Swarm board or chat command is being accepted. Wait for it before moving projects."
             )
         try:
-            active_swarm = self.swarm_runs.active()
-            if active_swarm is not None:
-                raise HarnessError(
-                    "A Swarm board or chat command is active. Wait for it to finish, "
-                    "or stop that exact run, before moving to another project."
-                )
+            # Switching away from a copied/unregistered project is harmless
+            # and must not instantiate its execution authority merely to ask
+            # whether this process already owns a run.
             if not self.qa_lock.acquire(blocking=False):
                 raise HarnessError(
                     "The checks are running. Wait for them to finish before "
                     "moving to another project."
                 )
             try:
-                config = load_config(wanted)
-                registry = load_plugins(config)
-                self.config = config
-                self._pipeline_store = None
-                self._swarm_runs = None
-                self._swarm_runner = None
-                self.pipeline_active_run_id = ""
-                self.workflow_policy = resolve_workflow_policy(
-                    config, registry.workflow_nodes
-                )
-                self.check_kinds = dict(registry.check_kinds)
-                # What to keep out of the news is worked out from the project's
-                # own settings, so it moves with the project too.
-                self.events.redactor = CredentialRedactor(config)
-                self.qa_result = None
-                self.pipeline_run = None
-                self.seats_before = None
-                self.seats_were_set_up = False
+                with self.authority_lock:
+                    active_swarm = (
+                        self._swarm_runs.active() if self._swarm_runs is not None else None
+                    )
+                    if active_swarm is not None:
+                        raise HarnessError(
+                            "A Swarm board or chat command is active. Wait for it to finish, "
+                            "or stop that exact run, before moving to another project."
+                        )
+                    self.config = config
+                    self._pipeline_store = None
+                    self._swarm_runs = None
+                    self._swarm_runner = None
+                    self.pipeline_active_run_id = ""
+                    self.workflow_policy = workflow_policy
+                    self.check_kinds = check_kinds
+                    # What to keep out of the news is worked out from the project's
+                    # own settings, so it moves with the project too.
+                    self.events.redactor = redactor
+                    self.qa_result = None
+                    self.pipeline_run = None
+                    self.seats_before = None
+                    self.seats_were_set_up = False
             finally:
                 self.qa_lock.release()
         finally:
             self.swarm_lock.release()
             self.run_lock.release()
             self.pipeline_lock.release()
+            self.project_admission_lock.release()
         projects_lab.opened(wanted)
         return projects_lab.where_we_are(self.config)
 
@@ -1282,8 +1341,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         if selected_name
                         else pipeline_lab.a_starting_pipeline()
                     )
-                cannot_run = ""
+                authority = self.server.project_authority_status()
+                cannot_run = str(authority.get("reason") or "")
                 try:
+                    if cannot_run:
+                        raise HarnessError(cannot_run)
                     store = self.server.pipeline_store
                     active_run = store.active()
                     latest_run = store.latest()
@@ -1304,6 +1366,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 answer: dict[str, Any] = {
                     "project_authority_id": authority_id,
                     "cannot_run": cannot_run,
+                    "authority": authority,
                     "saved": saved_now,
                     "saved_problems": saved_problems,
                     "selected_name": selected_name,
@@ -1424,15 +1487,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     )
                     said["what_is_not_ready"] = swarm_lab.what_is_not_ready(config, said)
                 try:
-                    said["cannot_be_changed"] = (
-                        self.server.swarm_runner.why_it_cannot_be_changed()
-                    )
+                    self.server.decorate_swarm_authority(said)
                 except HarnessError as exc:
-                    # Project automation authority protects execution and
-                    # mutation. It must not erase harmless local state from the
-                    # screen: saved boards and the live board remain readable
-                    # while the reason they cannot be changed is shown.
+                    # Failure to verify the global board lease is a mutation
+                    # fence, not permission to hide the user's board data.
                     said["cannot_be_changed"] = str(exc)
+                    authority = self.server.project_authority_status()
+                    said["cannot_run"] = str(authority.get("reason") or "")
+                    said["authority"] = authority
                 self._json(said)
             elif parsed.path == "/api/swarm/chats":
                 self._require_token()
@@ -1496,11 +1558,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     after = int(query.get("after", ["0"])[0])
                 except ValueError:
                     after = 0
-                self._json({
-                    "doing": self.server.swarm_runner.how_it_is_going(
-                        query.get("run_id", [""])[0], after
-                    )
-                })
+                run_id = query.get("run_id", [""])[0]
+                runner = self.server._swarm_runner
+                doing = (
+                    runner.how_it_is_going(run_id, after)
+                    if runner is not None
+                    else self.server.swarm_runner.how_it_is_going(run_id, after)
+                    if run_id
+                    else None
+                )
+                self._json({"doing": doing})
             elif parsed.path == "/api/swarm/attachment":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -1512,7 +1579,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # going": these are whole answers, and a page watching a run
                 # asks how it is going every second and a half.
                 self._require_token()
-                self._json(self.server.swarm_runner.what_they_said())
+                runner = self.server._swarm_runner
+                self._json(
+                    runner.what_they_said() if runner is not None
+                    else swarm_lab.Running().what_they_said()
+                )
             elif parsed.path == "/api/telling":
                 self._require_token()
                 config = self.server.config
@@ -1542,6 +1613,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 with self.server.pipelines_lock:
                     found = timer_lab.every_one(config)
                     saved = pipeline_lab.saved_ones(config)
+                authority = self.server.project_authority_status()
                 self._json({
                     "timers": [
                         dict(
@@ -1561,6 +1633,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "days": list(timer_lab.DAYS),
                     "how_to_ask_this_machine": timer_lab.how_to_ask_this_machine(config),
                     "could_not_be_read": timer_lab.what_could_not_be_read(config),
+                    "cannot_run": str(authority.get("reason") or ""),
+                    "authority": authority,
                 })
             elif parsed.path == "/api/chat":
                 self._require_token()
@@ -1572,6 +1646,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 ready = [one for one in everyone if one["ready"]]
                 if not any(one["route"] == wanted for one in ready):
                     wanted = ready[0]["route"] if ready else ""
+                authority = self.server.project_authority_status()
                 self._json({
                     "who": everyone,
                     "open": wanted,
@@ -1584,6 +1659,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "limits": chat_lab.effective_limits(
                         self.server.config, wanted
                     ),
+                    "cannot_run": str(authority.get("reason") or ""),
+                    "authority": authority,
                 })
             elif parsed.path == "/api/look-up":
                 self._require_token()
@@ -1701,7 +1778,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     return
                 query = urllib.parse.parse_qs(parsed.query)
                 if parsed.path == "/api/qa/suite":
-                    self._json(self._qa_suite())
+                    authority = self.server.project_authority_status()
+                    self._json({
+                        **self._qa_suite(),
+                        "cannot_run": str(authority.get("reason") or ""),
+                        "authority": authority,
+                    })
                 elif parsed.path == "/api/qa/history":
                     try:
                         suite = qalab.load_suite(self.server.config, None, self.server.check_kinds)
@@ -1717,7 +1799,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 else:
                     refresh = query.get("refresh", [""])[0] == "1"
                     advice = setup_advice(self.server.config, refresh=refresh)
-                    self._json({**self._checkup(advice), "model_setup": advice})
+                    authority = self.server.project_authority_status()
+                    self._json({
+                        **self._checkup(advice), "model_setup": advice,
+                        "cannot_run": str(authority.get("reason") or ""),
+                        "authority": authority,
+                    })
             elif parsed.path == "/api/health":
                 self._json({"status": "ok"})
             elif parsed.path == "/favicon.ico":
@@ -1768,6 +1855,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 result = simulate_graph(body.get("graph", {}), state)
                 self._json(result)
             elif self.path == "/api/run":
+                self.server.require_project_execution_authority()
                 task = body.get("task", "")
                 if not isinstance(task, str) or not task.strip():
                     raise HarnessError("Task is required")
@@ -1881,6 +1969,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         "question": handover.failure_question(case, evidence),
                     })
                     return
+                self.server.require_project_execution_authority()
                 answer = handover.explain_failure(self.server.config, case, evidence)
                 self._json(answer.to_dict())
             elif self.path == "/api/qa/remove":
@@ -1897,6 +1986,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                   qalab.write_suite(self.server.config, written)
                   self._json({"removed": wanted, "cases": len(keeping)})
             elif self.path == "/api/qa/record":
+                self.server.require_project_execution_authority()
                 url = str(body.get("url") or "")
                 selectors.check_url(self.server.config, url)
                 if not self.server.reserve_qa():
@@ -2036,6 +2126,64 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json({
                     "sidebar": projects_lab.make_it_look(str(body.get("how") or ""))
                 })
+            elif self.path == "/api/projects/use-as-new-local":
+                if body.get("confirmation") != "USE THIS FOLDER AS A NEW LOCAL PROJECT":
+                    raise HarnessError(
+                        "Confirm ‘Use this folder as a new local project’ before rotating authority."
+                    )
+                if not self.server.pipeline_lock.acquire(blocking=False):
+                    raise HarnessError("An automation is active; wait for it before repairing authority.")
+                if not self.server.run_lock.acquire(blocking=False):
+                    self.server.pipeline_lock.release()
+                    raise HarnessError("Project work is active; wait for it before repairing authority.")
+                if not self.server.swarm_lock.acquire(blocking=False):
+                    self.server.run_lock.release()
+                    self.server.pipeline_lock.release()
+                    raise HarnessError("Swarm work is being accepted; wait before repairing authority.")
+                try:
+                    if self.server.pipeline_running:
+                        raise HarnessError(
+                            "An automation is active; wait for it before repairing authority."
+                        )
+                    if self.server._swarm_runner is not None and self.server._swarm_runner.busy:
+                        raise HarnessError(
+                            "The board is active; stop it before repairing authority."
+                        )
+                    if self.server._pipeline_store is not None \
+                            and self.server._pipeline_store.active() is not None:
+                        raise HarnessError(
+                            "An automation run is active; stop it before repairing authority."
+                        )
+                    if self.server._swarm_runs is not None \
+                            and self.server._swarm_runs.active() is not None:
+                        raise HarnessError(
+                            "Swarm or chat work is active; stop it before repairing authority."
+                        )
+                    if self.server.swarm_change_pause_reason():
+                        raise HarnessError(
+                            "A board run is active; stop it before repairing authority."
+                        )
+                    with self.server.authority_lock:
+                        authority_id = pipeline_runtime.repair_project_authority(
+                            self.server.config.project_root,
+                            str(body.get("fingerprint") or ""),
+                        )
+                        # Discard only cached execution objects, and only after
+                        # the descriptor and user-local registration both land.
+                        self.server._pipeline_store = None
+                        self.server._swarm_runs = None
+                        self.server._swarm_runner = None
+                    authority = self.server.project_authority_status()
+                    self._json({
+                        "repaired": True,
+                        "project_authority_id": authority_id,
+                        "authority": authority,
+                        "note": "This folder is now a new local project. Project work is enabled.",
+                    })
+                finally:
+                    self.server.swarm_lock.release()
+                    self.server.run_lock.release()
+                    self.server.pipeline_lock.release()
             elif self.path == "/api/swarm/save":
                 # The whole board at once. It is one small picture, and saving
                 # it whole means the panel can never leave a line pointing at a
@@ -2044,7 +2192,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # in the gap between "is anything going?" and the write, and
                 # then be working from a board that had changed underneath it.
                 with self.server.swarm_lock:
-                    stopping = self.server.swarm_runner.why_it_cannot_be_changed()
+                    stopping = self.server.swarm_change_pause_reason()
                     if stopping:
                         raise swarm_lab.SwarmError(stopping)
                     swarm_lab.save(body.get("board"), self.server.config)
@@ -2056,6 +2204,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     said["what_is_not_ready"] = swarm_lab.what_is_not_ready(
                         self.server.config, said
                     )
+                    self.server.decorate_swarm_authority(said)
                 self._json(said)
             elif self.path in {
                 "/api/swarm/chats/create",
@@ -2654,6 +2803,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     said["kept"], said["kept_problems"] = (
                         swarm_lab.kept_board_inventory()
                     )
+                    self.server.decorate_swarm_authority(said)
                 self._json(said)
             elif self.path == "/api/swarm/forget-kept":
                 with self.server.swarm_lock:
@@ -2855,6 +3005,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 )
                 self._json(said.to_dict())
             elif self.path == "/api/timers/save":
+                timer_value = body.get("timer")
+                if not isinstance(timer_value, dict) or timer_value.get("turned_on") is not False:
+                    self.server.require_project_execution_authority()
                 with self.server.pipelines_lock:
                     # Saving does the refusing. Held in the panel's own code
                     # alone, anything talking to the harness directly got none
@@ -2882,6 +3035,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         )
                     })
             elif self.path == "/api/timers/turn":
+                turning_on = bool(body.get("turned_on"))
+                if turning_on:
+                    self.server.require_project_execution_authority()
                 # Only the on-off switch, flipped where the timer is kept.
                 # Sending the whole timer back from a panel that had been open
                 # a while put back the old time and the old automation with it.
@@ -2889,7 +3045,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     one = timer_lab.load(
                         self.server.config, str(body.get("name") or "")
                     )
-                    one.turned_on = bool(body.get("turned_on"))
+                    one.turned_on = turning_on
                     saved = timer_lab.save(
                         self.server.config,
                         one.to_dict(),
@@ -2900,35 +3056,51 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     "note": f"{saved.name} is turned {'on' if saved.turned_on else 'off'}.",
                 })
             elif self.path == "/api/timers/run-now":
+                self.server.require_project_execution_authority()
                 self._json(self.server.run_manual_timer(
                     str(body.get("name") or ""),
                     str(body.get("request_id") or ""),
                 ))
             elif self.path == "/api/chat/say":
-                # No lock here: the conversation has one of its own, taken by
-                # every way of reaching it, including asking everyone at once.
+                # The conversation has its own provider lock; admission also
+                # pins the current project until this provider turn finishes.
                 who = str(body.get("who") or "")
                 chat_key = f"talk:{who}"
+                # Static invalid/copy authority is rejected without claiming
+                # a chat turn. The same check is deliberately repeated after
+                # admission below because the project may move between these
+                # two points.
+                self.server.require_project_execution_authority()
+                # Claim the individual turn first so a duplicate request is
+                # refused immediately instead of queueing behind project
+                # admission and silently becoming a second provider turn.
                 cancel_token = self.server.chat_cancellations.begin(chat_key)
                 try:
-                    with cancellation.use(cancel_token):
-                        self._json(chat_lab.say(
-                            self.server.config, who, str(body.get("text") or ""),
-                        ))
+                    with self.server.project_admission_lock:
+                        self.server.require_project_execution_authority()
+                        config = self.server.config
+                        with cancellation.use(cancel_token):
+                            self._json(chat_lab.say(
+                                config, who, str(body.get("text") or ""),
+                            ))
                 finally:
                     self.server.chat_cancellations.finish(chat_key, cancel_token)
             elif self.path == "/api/chat/ask-everyone":
                 # Every one of them, at the same time. Six one after another is
                 # six waits.
                 chat_key = "talk:everyone"
+                self.server.require_project_execution_authority()
                 cancel_token = self.server.chat_cancellations.begin(chat_key)
                 try:
-                    with cancellation.use(cancel_token):
-                        self._json({
-                            "answers": chat_lab.ask_everyone(
-                                self.server.config, str(body.get("text") or "")
-                            )
-                        })
+                    with self.server.project_admission_lock:
+                        self.server.require_project_execution_authority()
+                        config = self.server.config
+                        with cancellation.use(cancel_token):
+                            self._json({
+                                "answers": chat_lab.ask_everyone(
+                                    config, str(body.get("text") or "")
+                                )
+                            })
                 finally:
                     self.server.chat_cancellations.finish(chat_key, cancel_token)
             elif self.path == "/api/chat/stop":
@@ -3114,43 +3286,54 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     ),
                 })
             elif self.path in ("/api/pipelines/run", "/api/pipelines/agent-run"):
-                if self.path == "/api/pipelines/agent-run":
-                    automation = str(body.get("automation") or "").strip()
-                    if not automation or any(body.get(key) for key in ("from_here", "only")):
-                        raise HarnessError("Agent runs require exactly one saved automation name.")
-                    with self.server.pipelines_lock:
-                        drawn = pipeline_lab.load(self.server.config, automation)
-                else:
-                    drawn = pipeline_lab.read_it(body.get("pipeline"))
                 local_lock_held = False
                 try:
-                    # Resolve every nested definition before acceptance. The
-                    # thread receives this immutable snapshot, never a later
-                    # edit of a saved child automation.
-                    frozen = pipeline_lab.freeze_definition(self.server.config, drawn)
-                    accepted, created = self.server.pipeline_store.accept(
-                        frozen,
-                        source=("desktop-agent" if self.path == "/api/pipelines/agent-run" else "panel"),
-                        request_id=str(body.get("request_id") or ""),
-                    )
-                    if not created:
-                        self._json({
-                            "accepted": True,
-                            "replayed": True,
-                            "run_id": accepted["run_id"],
-                            "name": accepted["name"],
-                        }, HTTPStatus.ACCEPTED)
-                        return
-                    if not self.server.pipeline_lock.acquire(blocking=False):
-                        self.server.pipeline_store.fail(
-                            accepted["run_id"],
-                            accepted["attempt_id"],
-                            "A local automation worker is running without a matching coordinator lease.",
+                    with self.server.project_admission_lock:
+                        config = self.server.config
+                        if self.path == "/api/pipelines/agent-run":
+                            automation = str(body.get("automation") or "").strip()
+                            if not automation or any(
+                                body.get(key) for key in ("from_here", "only")
+                            ):
+                                raise HarnessError(
+                                    "Agent runs require exactly one saved automation name."
+                                )
+                            with self.server.pipelines_lock:
+                                drawn = pipeline_lab.load(config, automation)
+                        else:
+                            drawn = pipeline_lab.read_it(body.get("pipeline"))
+                        # Resolve every nested definition before acceptance. The
+                        # thread receives this immutable snapshot, never a later
+                        # edit of a saved child automation.
+                        frozen = pipeline_lab.freeze_definition(config, drawn)
+                        store = self.server.pipeline_store
+                        accepted, created = store.accept(
+                            frozen,
+                            source=(
+                                "desktop-agent"
+                                if self.path == "/api/pipelines/agent-run" else "panel"
+                            ),
+                            request_id=str(body.get("request_id") or ""),
                         )
-                        raise HarnessError(
-                            "A pipeline is running already. Wait for it, or press Stop."
-                        )
-                    local_lock_held = True
+                        if not created:
+                            self._json({
+                                "accepted": True,
+                                "replayed": True,
+                                "run_id": accepted["run_id"],
+                                "name": accepted["name"],
+                            }, HTTPStatus.ACCEPTED)
+                            return
+                        if not self.server.pipeline_lock.acquire(blocking=False):
+                            store.fail(
+                                accepted["run_id"],
+                                accepted["attempt_id"],
+                                "A local automation worker is running without a matching coordinator lease.",
+                            )
+                            raise HarnessError(
+                                "A pipeline is running already. Wait for it, or press Stop."
+                            )
+                        local_lock_held = True
+                        kinds = dict(self.server.check_kinds)
                 except Exception:
                     if local_lock_held:
                         self.server.pipeline_lock.release()
@@ -3170,13 +3353,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 answers = body.get("answers")
                 answers = answers if isinstance(answers, dict) else {}
                 events = self.server.events
-                config = self.server.config
-                kinds = self.server.check_kinds
                 server = self.server
 
                 def go() -> None:
                     try:
-                        server.pipeline_store.start(run_id, attempt_id)
+                        store.start(run_id, attempt_id)
                         events.add({
                             "kind": "pipeline_started", "node": "pipeline", "run_id": run_id,
                             "payload": {"name": drawn["name"], "run_id": run_id},
@@ -3187,26 +3368,26 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             payload = event.get("payload")
                             if isinstance(payload, dict):
                                 event["payload"] = {**payload, "run_id": run_id}
-                            server.pipeline_store.append_event(run_id, attempt_id, event)
+                            store.append_event(run_id, attempt_id, event)
                             events.add(event)
 
                         def waiting_on(step: str):
-                            answer = server.pipeline_store.decision(run_id, step)
+                            answer = store.decision(run_id, step)
                             waiting = step if answer is None else ""
                             server.pipeline_waiting_at = waiting
-                            current = server.pipeline_store.get(run_id)
+                            current = store.get(run_id)
                             if current.get("waiting_at") != waiting and current["state"] != "stopping":
-                                server.pipeline_store.set_waiting(run_id, attempt_id, waiting)
+                                store.set_waiting(run_id, attempt_id, waiting)
                             return answer
 
                         run = pipeline_lab.run_it(
                             config, drawn, tell=tell, check_kinds=kinds,
-                            stopping=lambda: server.pipeline_store.should_stop(run_id),
+                            stopping=lambda: store.should_stop(run_id),
                             from_here=from_here, only=only, answers=answers,
                             waiting_on=waiting_on,
                             run_id=run_id, frozen=frozen, decision_nonce=attempt_id,
                         )
-                        finished = server.pipeline_store.finish(run_id, attempt_id, run.to_dict())
+                        finished = store.finish(run_id, attempt_id, run.to_dict())
                         server.pipeline_run = finished.get("result") or run.to_dict()
                         events.add({
                             "kind": "pipeline_finished", "node": "pipeline", "run_id": run_id,
@@ -3227,7 +3408,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             "milliseconds": 0,
                         }
                         try:
-                            finished = server.pipeline_store.fail(
+                            finished = store.fail(
                                 run_id, attempt_id, failed_result["said"]
                             )
                             server.pipeline_run = finished.get("result") or failed_result
@@ -3250,7 +3431,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 except Exception:
                     self.server.pipeline_running = False
                     try:
-                        self.server.pipeline_store.fail(
+                        store.fail(
                             run_id, attempt_id, "The automation worker could not be started."
                         )
                     except Exception:
@@ -3312,6 +3493,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                   answer["path"] = path.relative_to(self.server.config.project_root).as_posix()
                   self._json(answer)
             elif self.path == "/api/qa/coverage":
+                self.server.require_project_execution_authority()
                 url = str(body.get("url") or "")
                 selectors.check_url(self.server.config, url)
                 asked_pages = body.get("max_pages")
@@ -3345,6 +3527,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                   )
                   self._json({"added": added})
             elif self.path == "/api/qa/pick":
+                self.server.require_project_execution_authority()
                 url = str(body.get("url") or "")
                 selectors.check_url(self.server.config, url)
                 if not self.server.reserve_qa():
@@ -3358,6 +3541,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     raise
                 self._json({"accepted": True}, HTTPStatus.ACCEPTED)
             elif self.path == "/api/qa/baseline":
+                self.server.require_project_execution_authority()
                 suite = qalab.load_suite(self.server.config, None, self.server.check_kinds)
                 shots = [case.id for case in suite.cases if case.kind == "visual"]
                 asked = body.get("cases") or []
@@ -3387,6 +3571,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     raise
                 self._json({"accepted": True, "cases": len(shots)}, HTTPStatus.ACCEPTED)
             elif self.path == "/api/qa/run":
+                self.server.require_project_execution_authority()
                 tags = body.get("tags") or []
                 ids = body.get("cases") or []
                 if not isinstance(tags, list) or not isinstance(ids, list):

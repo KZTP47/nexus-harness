@@ -177,6 +177,25 @@ class NobodyLosesATurn(PanelTestCase):
         self.assertTrue(("message A" in words) ^ ("message B" in words), said["said"])
         self.assertEqual(len(said["said"]), 2, said["said"])
 
+    def test_two_ask_everyone_turns_fail_fast_instead_of_queueing(self) -> None:
+        answers: list = []
+
+        def go(text: str) -> None:
+            answers.append(self.ask("/api/chat/ask-everyone", {"text": text}))
+
+        threads = [
+            threading.Thread(target=go, args=(text,))
+            for text in ("message A", "message B")
+        ]
+        for one in threads:
+            one.start()
+        for one in threads:
+            one.join(timeout=60)
+
+        self.assertEqual(sorted(status for status, _said in answers), [200, 400])
+        refused = next(said for status, said in answers if status == 400)
+        self.assertIn("already waiting", refused["error"])
+
     def test_asking_everyone_does_not_lose_a_turn_either(self) -> None:
         """The one the lock was missing from.
 

@@ -87,6 +87,16 @@
     </nav>
   </details>
 
+  <section id="authorityRepairNotice" class="callout authority-repair" role="status" hidden>
+    <strong>Project work is paused for this folder</strong>
+    <p id="authorityRepairReason"></p>
+    <p>Your saved boards, chats and transcripts, and automation definitions are still present and editable.</p>
+    <button id="authorityRepairButton" type="button" hidden>
+      Use this folder as a new local project
+    </button>
+    <p id="authorityRepairSaid" class="hint" aria-live="polite"></p>
+  </section>
+
   <main id="startView" data-view-panel="start" class="data-view">
     <section class="glass data-panel" aria-labelledby="startTitle">
       <div class="section-heading">
@@ -515,18 +525,20 @@
           <button id="pipelineStopActive" class="danger" type="button">Stop this run</button>
         </div>
       </section>
-      <section class="agent-run-panel" aria-labelledby="agentRunTitle">
-        <h3 id="agentRunTitle">Run this from a desktop AI agent</h3>
-        <p class="hint">Choose a saved automation. The contract gives the agent the exact name, endpoint, payload, and completion check, so it never has to guess.</p>
-        <div class="agent-run-controls">
-          <label for="agentRunAutomation">Saved automation</label>
-          <select id="agentRunAutomation"></select>
-          <button id="agentRunCopyContract" type="button">Copy agent instructions</button>
-          <button id="agentRunNow" class="primary" type="button">Run for agent</button>
+      <details id="agentRunPanel" class="agent-run-panel" aria-labelledby="agentRunTitle">
+        <summary class="agent-run-summary"><h3 id="agentRunTitle">Run this from a desktop AI agent</h3></summary>
+        <div class="agent-run-body">
+          <p class="hint">Choose a saved automation. The contract gives the agent the exact name, endpoint, payload, and completion check, so it never has to guess.</p>
+          <div class="agent-run-controls">
+            <label for="agentRunAutomation">Saved automation</label>
+            <select id="agentRunAutomation"></select>
+            <button id="agentRunCopyContract" type="button">Copy agent instructions</button>
+            <button id="agentRunNow" class="primary" type="button">Run for agent</button>
+          </div>
+          <pre id="agentRunContract" class="agent-run-contract" aria-live="polite">Choose a saved automation to see its exact agent contract.</pre>
+          <p id="agentRunSaid" class="hint" role="status"></p>
         </div>
-        <pre id="agentRunContract" class="agent-run-contract" aria-live="polite">Choose a saved automation to see its exact agent contract.</pre>
-        <p id="agentRunSaid" class="hint" role="status"></p>
-      </section>
+      </details>
       <div id="pipelineAsk" class="pipeline-ask" role="group" aria-label="A step is waiting for you" hidden></div>
       <div class="pipeline-tabs" role="tablist" aria-label="How to look at this pipeline">
         <button id="pipelineTabBoard" type="button" role="tab" data-pipeline-tab="board" aria-controls="pipelineStage" aria-selected="true" tabindex="0">The picture</button>

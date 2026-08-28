@@ -438,6 +438,40 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 .pipeline-bar-fields button { white-space: nowrap; background: #fff; color: #1f2933; border: 1px solid #cbd2db; border-radius: 8px; padding: 6px 10px; font-size: .82rem; }
 .pipeline-said { margin: 0; padding: 8px 16px; background: #fff; border-bottom: 1px solid #e2e6ec; color: #1f2933; font-size: .86rem; }
 
+/* Agent instructions are useful occasionally, but the drawing is the primary
+   workspace. Keep this as one compact, keyboard-operable disclosure until it
+   is needed. All colours are explicit because this light pipeline view sits
+   inside the otherwise dark application theme. */
+.agent-run-panel { margin: 0; border-bottom: 1px solid #cbd5e1; background: #f8fafc; color: #0f172a; }
+.agent-run-summary { display: flex; align-items: center; gap: 12px; min-height: 46px;
+  padding: 8px 16px; color: #0f172a; cursor: pointer; list-style: none; }
+.agent-run-summary::-webkit-details-marker { display: none; }
+.agent-run-summary h3 { margin: 0; font-size: .95rem; color: #0f172a; }
+.agent-run-summary::after { content: "Show instructions"; margin-left: auto; padding: 5px 9px;
+  border: 1px solid #64748b; border-radius: 8px; color: #1e3a5f; background: #fff;
+  font-size: .78rem; font-weight: 750; white-space: nowrap; }
+.agent-run-panel[open] > .agent-run-summary::after { content: "Hide instructions"; }
+.agent-run-summary:hover { background: #e8f3ff; }
+.agent-run-summary:focus-visible { outline: 3px solid #1d4ed8; outline-offset: -3px; }
+.agent-run-body { padding: 0 16px 12px; border-top: 1px solid #e2e8f0; }
+.agent-run-body > .hint { margin: 10px 0; color: #334155; line-height: 1.45; }
+.agent-run-controls { display: grid; grid-template-columns: auto minmax(12rem, 1fr) auto auto;
+  align-items: end; gap: 8px; }
+.agent-run-controls label { align-self: center; color: #1e293b; }
+.agent-run-controls select { min-height: 40px; color: #0f172a; background: #fff;
+  border-color: #94a3b8; }
+.agent-run-controls button { padding: 7px 12px; color: #172033; background: #fff;
+  border-color: #64748b; box-shadow: 0 1px 3px rgba(15, 23, 42, .14); }
+.agent-run-controls button:hover { border-color: #1d4ed8; background: #eff6ff; }
+.agent-run-controls button.primary { color: #fff; background: #1d4ed8; border-color: #1e40af; }
+.agent-run-controls button.primary:hover { background: #1e40af; }
+.agent-run-controls button:disabled { opacity: 1; color: #475569; background: #e2e8f0;
+  border-color: #94a3b8; box-shadow: none; }
+.agent-run-contract { max-height: 12rem; margin: 10px 0 0; padding: 10px 12px; overflow: auto;
+  border: 1px solid #334155; border-radius: 8px; color: #f8fafc; background: #0f172a;
+  font-size: .78rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+#agentRunSaid { min-height: 1.2em; }
+
 .pipeline-stage { display: flex; flex: 1 0 360px; min-height: 360px; }
 .pipeline-focus-side { display: none; }
 .pipeline-focus-main { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }

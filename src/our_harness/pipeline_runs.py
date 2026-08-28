@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import subprocess
 import threading
 import time
 from typing import Any, Iterator
@@ -204,6 +205,344 @@ def _write_descriptor(where: Path, authority_id: str) -> None:
             pass
 
 
+def _authority_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS project_authorities (
+               project_authority_id TEXT PRIMARY KEY,
+               filesystem_key TEXT NOT NULL UNIQUE,
+               canonical_path TEXT NOT NULL UNIQUE,
+               revision INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+           )"""
+    )
+
+
+def _authority_fingerprint(
+    authority_id: str, filesystem_key: str, canonical_path: str, reason_code: str,
+) -> str:
+    return hashlib.sha256(
+        f"{authority_id}\0{filesystem_key}\0{canonical_path}\0{reason_code}".encode("utf-8")
+    ).hexdigest()
+
+
+def _authority_state_from_rows(
+    *, described_id: str, filesystem_key: str, canonical_path: str,
+    by_identity: sqlite3.Row | None, by_path: sqlite3.Row | None,
+    by_descriptor: sqlite3.Row | None,
+) -> dict[str, Any]:
+    """Project execution status without registering or relocating anything."""
+
+    def paused(reason: str, code: str, *, repairable: bool = False) -> dict[str, Any]:
+        return {
+            "can_run": False,
+            "reason": reason,
+            "reason_code": code,
+            "repairable": repairable,
+            "fingerprint": _authority_fingerprint(
+                described_id, filesystem_key, canonical_path, code
+            ),
+        }
+
+    if not described_id:
+        if by_identity is not None or by_path is not None:
+            return paused(
+                "The project authority registry and local descriptor disagree.",
+                "ambiguous_registry",
+            )
+        return {
+            "can_run": True, "reason": "", "reason_code": "new_project",
+            "repairable": False, "fingerprint": "",
+        }
+    if by_descriptor is None:
+        if by_identity is not None or by_path is not None:
+            return paused(
+                "The project authority descriptor conflicts with an existing local registration.",
+                "ambiguous_registry",
+            )
+        return paused(
+            "The project authority descriptor is not registered for this user.",
+            "unregistered",
+            repairable=True,
+        )
+    if str(by_descriptor["filesystem_key"]) != filesystem_key:
+        if by_identity is not None or by_path is not None:
+            return paused(
+                "The copied project also conflicts with an existing local registration.",
+                "ambiguous_registry",
+            )
+        return paused(
+            "The project authority descriptor was copied or substituted; automation is paused.",
+            "copied_or_substituted",
+            repairable=True,
+        )
+    if by_path is not None and str(by_path["project_authority_id"]) != described_id:
+        return paused(
+            "This path is already bound to another project authority.",
+            "ambiguous_registry",
+        )
+    old_path = Path(str(by_descriptor["canonical_path"]))
+    if os.path.normcase(str(old_path)) != canonical_path and old_path.exists():
+        return paused(
+            "The registered project location still exists; a copied alias cannot be opened.",
+            "live_alias",
+        )
+    return {
+        "can_run": True, "reason": "", "reason_code": "registered",
+        "repairable": False, "fingerprint": "",
+    }
+
+
+def inspect_project_authority(project_root: Path) -> dict[str, Any]:
+    """Read execution authority status without creating stores or registrations."""
+
+    supplied = project_root.expanduser().absolute()
+    _reject_reparse_or_link(supplied)
+    root = supplied.resolve(strict=True)
+    _reject_reparse_or_link(root)
+    base = _runtime_base()
+    if base == root or root in base.parents:
+        raise PipelineRunConflict("Pipeline runtime storage must be outside the project tree.")
+    described_id = _read_descriptor(root / AUTHORITY_DESCRIPTOR)
+    filesystem_key = _filesystem_key(root)
+    canonical_path = os.path.normcase(str(root))
+    registry = base / AUTHORITY_REGISTRY
+    if not registry.exists():
+        return _authority_state_from_rows(
+            described_id=described_id, filesystem_key=filesystem_key,
+            canonical_path=canonical_path, by_identity=None, by_path=None,
+            by_descriptor=None,
+        )
+    if registry.is_symlink() or not registry.is_file():
+        raise PipelineRunConflict("The project authority registry is not a regular file.")
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{registry.as_posix()}?mode=ro", uri=True, timeout=10.0
+        )
+        connection.row_factory = sqlite3.Row
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_authorities'"
+        ).fetchone()
+        if table is None:
+            by_identity = by_path = by_descriptor = None
+        else:
+            by_identity = connection.execute(
+                "SELECT * FROM project_authorities WHERE filesystem_key=?", (filesystem_key,)
+            ).fetchone()
+            by_path = connection.execute(
+                "SELECT * FROM project_authorities WHERE canonical_path=?", (canonical_path,)
+            ).fetchone()
+            by_descriptor = connection.execute(
+                "SELECT * FROM project_authorities WHERE project_authority_id=?", (described_id,)
+            ).fetchone() if described_id else None
+    except sqlite3.Error as exc:
+        raise PipelineRunConflict("The project authority registry could not be verified.") from exc
+    finally:
+        if connection is not None:
+            connection.close()
+    return _authority_state_from_rows(
+        described_id=described_id, filesystem_key=filesystem_key,
+        canonical_path=canonical_path, by_identity=by_identity, by_path=by_path,
+        by_descriptor=by_descriptor,
+    )
+
+
+def _descriptor_is_explicitly_ignored(root: Path) -> bool:
+    ignore = root / ".harness" / ".gitignore"
+    if ignore.exists():
+        _reject_reparse_or_link(ignore)
+    if ignore.is_symlink() or not ignore.is_file():
+        return False
+    try:
+        lines = ignore.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    ignored = False
+    for raw in lines:
+        line = raw.strip()
+        if line in {"project-authority.json", "/project-authority.json"}:
+            ignored = True
+        elif line in {"!project-authority.json", "!/project-authority.json"}:
+            ignored = False
+    return ignored
+
+
+def _reject_reparse_chain(path: Path) -> None:
+    current = path
+    while True:
+        if current.exists():
+            _reject_reparse_or_link(current)
+        if current.parent == current:
+            return
+        current = current.parent
+
+
+def _descriptor_is_git_tracked(root: Path) -> bool:
+    has_git_marker = any(
+        (candidate / ".git").exists() or (candidate / ".git").is_symlink()
+        for candidate in (root, *root.parents)
+    )
+    try:
+        checked = subprocess.run(
+            [
+                "git", "-C", str(root), "ls-files", "--error-unmatch", "--",
+                ".harness/project-authority.json",
+            ],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=3, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise PipelineRunConflict(
+            "Git tracking could not be checked, so the authority descriptor was not rotated."
+        ) from exc
+    if checked.returncode == 0:
+        return True
+    if checked.returncode == 1:
+        return False
+    error = checked.stderr.decode("utf-8", errors="replace").lower()
+    if (checked.returncode == 128 and not has_git_marker
+            and "not a git repository" in error):
+        return False
+    raise PipelineRunConflict(
+        "Git tracking could not be checked, so the authority descriptor was not rotated."
+    )
+
+
+def _commit_authority_rotation(connection: sqlite3.Connection) -> None:
+    connection.commit()
+
+
+def repair_project_authority(project_root: Path, expected_fingerprint: str) -> str:
+    """Explicitly make a copied/unregistered folder a new local authority."""
+
+    expected = str(expected_fingerprint or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise PipelineRunConflict("A current project-authority confirmation is required.")
+    supplied = project_root.expanduser().absolute()
+    _reject_reparse_chain(supplied)
+    root = supplied.resolve(strict=True)
+    _reject_reparse_or_link(root)
+    harness = root / ".harness"
+    descriptor = root / AUTHORITY_DESCRIPTOR
+    _reject_reparse_or_link(harness)
+    if not harness.is_dir():
+        raise PipelineRunConflict("The local .harness folder could not be verified.")
+    _reject_reparse_or_link(descriptor)
+    if not _descriptor_is_explicitly_ignored(root):
+        raise PipelineRunConflict(
+            "The authority descriptor is not explicitly ignored by .harness/.gitignore."
+        )
+    if _descriptor_is_git_tracked(root):
+        raise PipelineRunConflict(
+            "The authority descriptor is tracked by Git and cannot be rotated as local-only state."
+        )
+    described_id = _read_descriptor(descriptor)
+    prior_descriptor = descriptor.read_bytes()
+    before = descriptor.stat(follow_symlinks=False)
+    before_signature = (
+        int(before.st_dev), int(before.st_ino), int(before.st_size),
+        int(before.st_mtime_ns), described_id,
+    )
+    filesystem_key = _filesystem_key(root)
+    canonical_path = os.path.normcase(str(root))
+    base = _runtime_base()
+    if base == root or root in base.parents:
+        raise PipelineRunConflict("Pipeline runtime storage must be outside the project tree.")
+    base.mkdir(parents=True, exist_ok=True)
+    registry = base / AUTHORITY_REGISTRY
+    connection = sqlite3.connect(registry, timeout=10.0)
+    connection.row_factory = sqlite3.Row
+    temporary = descriptor.with_name(f".{descriptor.name}.{uuid.uuid4().hex}.tmp")
+    replaced = False
+    authority_id = ""
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA busy_timeout=10000")
+        _authority_schema(connection)
+        connection.commit()
+        connection.execute("BEGIN IMMEDIATE")
+        by_identity = connection.execute(
+            "SELECT * FROM project_authorities WHERE filesystem_key=?", (filesystem_key,)
+        ).fetchone()
+        by_path = connection.execute(
+            "SELECT * FROM project_authorities WHERE canonical_path=?", (canonical_path,)
+        ).fetchone()
+        by_descriptor = connection.execute(
+            "SELECT * FROM project_authorities WHERE project_authority_id=?", (described_id,)
+        ).fetchone()
+        state = _authority_state_from_rows(
+            described_id=described_id, filesystem_key=filesystem_key,
+            canonical_path=canonical_path, by_identity=by_identity,
+            by_path=by_path, by_descriptor=by_descriptor,
+        )
+        if state["fingerprint"] != expected:
+            raise PipelineRunConflict(
+                "Project authority changed after confirmation. Refresh and review it again."
+            )
+        if not state["repairable"] or state["reason_code"] not in {
+            "copied_or_substituted", "unregistered",
+        }:
+            raise PipelineRunConflict("This project authority must not be rotated.")
+        if by_identity is not None or by_path is not None:
+            raise PipelineRunConflict("The project has an ambiguous local authority registration.")
+        now = descriptor.stat(follow_symlinks=False)
+        now_signature = (
+            int(now.st_dev), int(now.st_ino), int(now.st_size),
+            int(now.st_mtime_ns), _read_descriptor(descriptor),
+        )
+        if now_signature != before_signature:
+            raise PipelineRunConflict(
+                "The project authority descriptor changed during confirmation."
+            )
+        authority_id = uuid.uuid4().hex
+        connection.execute(
+            "INSERT INTO project_authorities VALUES (?,?,?,?,?)",
+            (authority_id, filesystem_key, canonical_path, 1, _now_ms()),
+        )
+        payload = json.dumps({
+            "schema_version": 1, "project_authority_id": authority_id,
+        }, indent=2) + "\n"
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, descriptor)
+        replaced = True
+        _commit_authority_rotation(connection)
+        return authority_id
+    except Exception:
+        registry_may_have_committed = replaced and not connection.in_transaction
+        connection.rollback()
+        try:
+            if registry_may_have_committed and authority_id:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "DELETE FROM project_authorities WHERE project_authority_id=? "
+                    "AND filesystem_key=? AND canonical_path=?",
+                    (authority_id, filesystem_key, canonical_path),
+                )
+                connection.commit()
+        finally:
+            if replaced:
+                restoration = descriptor.with_name(
+                    f".{descriptor.name}.{uuid.uuid4().hex}.restore"
+                )
+                try:
+                    with restoration.open("xb") as stream:
+                        stream.write(prior_descriptor)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(restoration, descriptor)
+                finally:
+                    restoration.unlink(missing_ok=True)
+        raise
+    finally:
+        connection.close()
+        temporary.unlink(missing_ok=True)
+
+
 def project_identity(project_root: Path) -> str:
     """Resolve one stable registered authority, including same-volume renames.
 
@@ -234,15 +573,7 @@ def project_identity(project_root: Path) -> str:
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=FULL")
         connection.execute("PRAGMA busy_timeout=10000")
-        connection.execute(
-            """CREATE TABLE IF NOT EXISTS project_authorities (
-                   project_authority_id TEXT PRIMARY KEY,
-                   filesystem_key TEXT NOT NULL UNIQUE,
-                   canonical_path TEXT NOT NULL UNIQUE,
-                   revision INTEGER NOT NULL,
-                   updated_at_ms INTEGER NOT NULL
-               )"""
-        )
+        _authority_schema(connection)
         connection.commit()
         connection.execute("BEGIN IMMEDIATE")
         by_identity = connection.execute(

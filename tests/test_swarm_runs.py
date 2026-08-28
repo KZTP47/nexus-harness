@@ -17,7 +17,9 @@ from unittest import mock
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
 from our_harness import cancellation, swarm
-from our_harness.swarm_runs import SwarmRunStore, bind, provider_effect
+from our_harness.swarm_runs import (
+    SwarmRunStore, bind, global_board_change_pause_reason, provider_effect,
+)
 
 
 def _leave_provider_effect_dispatched(root: str, runtime: str, marker: str) -> None:
@@ -67,6 +69,17 @@ def _own_board_until_stopped(root: str, runtime: str, marker: str) -> None:
         store.fail(run_id, "stopped by another process", stopped=True)
 
 
+def _leave_board_owner_dead(root: str, runtime: str, marker: str) -> None:
+    os.environ["OUR_HARNESS_SWARM_RUN_DIR"] = runtime
+    config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(root), [], {})
+    store = SwarmRunStore(config)
+    accepted, _ = store.accept(
+        "dead-board-owner", {"kind": "board_order", "board": {"version": 1}}
+    )
+    store.start(accepted["run_id"])
+    Path(marker).write_text(accepted["run_id"], encoding="utf-8")
+
+
 def _hold_conversation_turn(
     root: str, runtime: str, ready_marker: str, release_marker: str,
 ) -> None:
@@ -90,7 +103,11 @@ class SwarmRunStoreTests(unittest.TestCase):
         (self.root / ".harness").mkdir(parents=True)
         self.runtime = self.container / "trusted-user-control"
         self.prior_override = os.environ.get("OUR_HARNESS_SWARM_RUN_DIR")
+        self.prior_authority_override = os.environ.get("OUR_HARNESS_PIPELINE_RUN_DIR")
         os.environ["OUR_HARNESS_SWARM_RUN_DIR"] = str(self.runtime)
+        os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = str(
+            self.container / "trusted-authority-control"
+        )
         self.addCleanup(self._restore_override)
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
 
@@ -99,6 +116,10 @@ class SwarmRunStoreTests(unittest.TestCase):
             os.environ.pop("OUR_HARNESS_SWARM_RUN_DIR", None)
         else:
             os.environ["OUR_HARNESS_SWARM_RUN_DIR"] = self.prior_override
+        if self.prior_authority_override is None:
+            os.environ.pop("OUR_HARNESS_PIPELINE_RUN_DIR", None)
+        else:
+            os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = self.prior_authority_override
 
     def _running(self, request: str = "request", snapshot: dict | None = None):
         store = SwarmRunStore(self.config)
@@ -463,7 +484,129 @@ class SwarmRunStoreTests(unittest.TestCase):
         with second.board_mutation() as generation:
             self.assertGreater(generation, 0)
 
-    def test_named_board_save_open_and_forget_share_the_global_run_fence(self) -> None:
+    def test_lightweight_board_lease_recovers_dead_owner_but_not_live_owner(self) -> None:
+        dead_marker = self.container / "dead-board-owner"
+        dead = multiprocessing.Process(
+            target=_leave_board_owner_dead,
+            args=(str(self.root), str(self.runtime), str(dead_marker)),
+        )
+        dead.start()
+        dead.join(10)
+        self.assertEqual(dead.exitcode, 0)
+        self.assertTrue(dead_marker.exists())
+        self.assertEqual(global_board_change_pause_reason(self.config), "")
+
+        board_file = self.container / "settings" / "swarm.json"
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_file):
+            saved = swarm.save({"agents": [{"name": "Recovered"}]}, self.config)
+        self.assertEqual(saved.agents[0].name, "Recovered")
+
+        live_marker = self.container / "live-board-owner"
+        live = multiprocessing.Process(
+            target=_own_board_until_stopped,
+            args=(str(self.root), str(self.runtime), str(live_marker)),
+        )
+        live.start()
+        try:
+            limit = time.time() + 5
+            while time.time() < limit and not live_marker.exists():
+                time.sleep(0.02)
+            self.assertTrue(live_marker.exists(), "the live board owner did not start")
+            self.assertIn("cannot be changed", global_board_change_pause_reason(self.config))
+            with mock.patch.object(swarm, "where_it_lives", return_value=board_file):
+                with self.assertRaisesRegex(HarnessError, "global Swarm board"):
+                    swarm.save({"agents": [{"name": "Must stay blocked"}]}, self.config)
+            SwarmRunStore(self.config).request_stop(live_marker.read_text(encoding="utf-8"))
+            live.join(5)
+        finally:
+            if live.is_alive():
+                live.terminate()
+                live.join(2)
+        self.assertEqual(live.exitcode, 0)
+
+    def test_live_board_run_allows_saved_library_crud_but_not_open_or_live_save(self) -> None:
+        board_file = self.container / "settings" / "swarm.json"
+        saved_boards = self.container / "settings" / "saved"
+        path_patches = (
+            mock.patch.object(swarm, "where_it_lives", return_value=board_file),
+            mock.patch.object(swarm, "where_the_kept_ones_live", return_value=saved_boards),
+        )
+        with path_patches[0], path_patches[1]:
+            initial = swarm.save({
+                "agents": [{"name": "Topology stays"}],
+                "active_saved_board": "Named",
+            }, self.config)
+            swarm.keep_this_board("Named", self.config)
+            portable = swarm.export_kept_board("Named")
+
+            marker = self.container / "library-live-owner"
+            live = multiprocessing.Process(
+                target=_own_board_until_stopped,
+                args=(str(self.root), str(self.runtime), str(marker)),
+            )
+            live.start()
+            try:
+                limit = time.time() + 5
+                while time.time() < limit and not marker.exists():
+                    time.sleep(0.02)
+                self.assertTrue(marker.exists(), "the live board owner did not start")
+
+                swarm.keep_this_board("During run", self.config)
+                self.assertEqual(swarm.export_kept_board("During run")["name"], "During run")
+                swarm.import_kept_board(portable, "Imported during run")
+                swarm.forget_this_board("Named", self.config)
+
+                after = swarm.load()
+                self.assertEqual([one.name for one in after.agents], ["Topology stays"])
+                self.assertEqual(after.projects, initial.projects)
+                self.assertEqual(after.works_on, initial.works_on)
+                self.assertEqual(after.talks_to, initial.talks_to)
+                self.assertEqual(after.active_saved_board, "")
+                self.assertEqual(
+                    {one["name"] for one in swarm.every_kept_board()},
+                    {"During run", "Imported during run"},
+                )
+                with self.assertRaisesRegex(HarnessError, "global Swarm board"):
+                    swarm.open_this_board("During run", self.config)
+                with self.assertRaisesRegex(HarnessError, "global Swarm board"):
+                    swarm.save({"agents": [{"name": "Forbidden live change"}]}, self.config)
+
+                SwarmRunStore(self.config).request_stop(marker.read_text(encoding="utf-8"))
+                live.join(5)
+            finally:
+                if live.is_alive():
+                    live.terminate()
+                    live.join(2)
+            self.assertEqual(live.exitcode, 0)
+
+    def test_harmless_board_save_does_not_upgrade_legacy_execution_journal(self) -> None:
+        self.runtime.mkdir(parents=True)
+        database = self.runtime / "runs.sqlite3"
+        with closing(sqlite3.connect(database)) as db:
+            db.execute(
+                "CREATE TABLE runs(run_id TEXT PRIMARY KEY, request_id TEXT NOT NULL)"
+            )
+            db.execute("INSERT INTO runs VALUES('legacy-run','legacy-request')")
+            db.commit()
+        board_file = self.container / "settings" / "swarm.json"
+        with mock.patch.object(swarm, "where_it_lives", return_value=board_file):
+            saved = swarm.save({"agents": [{"name": "Still editable"}]}, self.config)
+        self.assertEqual(saved.agents[0].name, "Still editable")
+        self.assertEqual(global_board_change_pause_reason(self.config), "")
+        with closing(sqlite3.connect(database)) as db:
+            self.assertEqual(
+                [row[1] for row in db.execute("PRAGMA table_info(runs)")],
+                ["run_id", "request_id"],
+            )
+            self.assertEqual(
+                db.execute("SELECT * FROM runs").fetchall(),
+                [("legacy-run", "legacy-request")],
+            )
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='runs_global_request_legacy'"
+            ).fetchone())
+
+    def test_named_board_library_stays_editable_while_open_is_globally_fenced(self) -> None:
         board_file = self.container / "settings" / "swarm.json"
         saved_boards = self.container / "settings" / "saved"
         with mock.patch.object(swarm, "where_it_lives", return_value=board_file), \
@@ -477,16 +620,11 @@ class SwarmRunStoreTests(unittest.TestCase):
                 "named-board-fence", {"kind": "board_order", "board": {}}
             )
             store.start(accepted["run_id"])
-            for mutation in (
-                lambda: swarm.keep_this_board("Another", self.config),
-                lambda: swarm.open_this_board("Known", self.config),
-                lambda: swarm.forget_this_board("Known", self.config),
-            ):
-                with self.subTest(mutation=mutation), self.assertRaisesRegex(
-                    HarnessError, "global Swarm board"
-                ):
-                    mutation()
-            self.assertEqual([one["name"] for one in swarm.every_kept_board()], ["Known"])
+            swarm.keep_this_board("Another", self.config)
+            with self.assertRaisesRegex(HarnessError, "global Swarm board"):
+                swarm.open_this_board("Known", self.config)
+            swarm.forget_this_board("Known", self.config)
+            self.assertEqual([one["name"] for one in swarm.every_kept_board()], ["Another"])
             store.fail(accepted["run_id"], "done", stopped=True)
 
     def test_exact_stop_from_another_process_fences_the_owner(self) -> None:

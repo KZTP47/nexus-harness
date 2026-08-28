@@ -50,6 +50,7 @@ class BoardTestCase(unittest.TestCase):
             "APPDATA": str(self.somewhere_else),
             "XDG_CONFIG_HOME": str(self.somewhere_else),
             "OUR_HARNESS_SWARM_RUN_DIR": str(self.root / "runtime"),
+            "OUR_HARNESS_PIPELINE_RUN_DIR": str(self.root / "authority-runtime"),
         })
         patched.start()
         self.addCleanup(patched.stop)
@@ -1509,7 +1510,9 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("It has not replaced the board on screen", self.script)
         self.assertIn('id="swarmKeptProblems"', self.markup)
         self.assertIn("MAX_SAVED_BOARD_IMPORT_BYTES = 10_000_000", self.script)
-        self.assertIn('$("swarmStart").disabled = held || swarmGoing', self.script)
+        self.assertIn('$("swarmStart").disabled = held || Boolean(swarmSaid.cannot_run) || swarmGoing', self.script)
+        self.assertIn('id="authorityRepairButton"', self.markup)
+        self.assertIn("USE THIS FOLDER AS A NEW LOCAL PROJECT", self.script)
         self.assertIn("swarmKeptProblems = said.kept_problems || []", self.script)
 
     def test_startup_draws_saved_boards_before_refreshing_provider_status(self) -> None:
@@ -2193,21 +2196,125 @@ class WhatThePanelIsTold(BoardTestCase):
         )
 
     def test_authority_pause_does_not_hide_live_or_saved_boards(self) -> None:
+        original = self.a_project("authority-original")
+        (original / ".harness" / ".gitignore").write_text(
+            "project-authority.json\n", encoding="utf-8"
+        )
+        original_config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), original, [], {})
+        swarm_runs.SwarmRunStore(original_config)
+        copied_descriptor = original / ".harness" / "project-authority.json"
+        target_descriptor = self.where / ".harness" / "project-authority.json"
+        target_descriptor.write_bytes(copied_descriptor.read_bytes())
+        (self.where / ".harness" / ".gitignore").write_text(
+            "project-authority.json\n", encoding="utf-8"
+        )
         swarm.import_kept_board({
             "format": swarm.SAVED_BOARD_DOCUMENT,
             "name": "Still mine",
             "board": {"agents": [{"name": "The planner"}]},
         })
-        with mock.patch.object(
-            swarm_runs, "SwarmRunStore",
-            side_effect=swarm.SwarmError(
-                "The project authority descriptor was copied or substituted; automation is paused."
-            ),
-        ):
-            status, said = self.ask("/api/swarm?refresh_providers=false")
+        status, said = self.ask("/api/swarm?refresh_providers=false")
         self.assertEqual(status, 200)
         self.assertEqual([one["name"] for one in said["kept"]], ["Still mine"])
-        self.assertIn("automation is paused", said["cannot_be_changed"])
+        self.assertEqual(said["cannot_be_changed"], "")
+        self.assertIn("automation is paused", said["cannot_run"])
+        self.assertTrue(said["authority"]["repairable"])
+
+        with mock.patch.object(chat, "who_can_talk", return_value=[]):
+            talk_status, talk = self.ask("/api/chat")
+        self.assertEqual(talk_status, 200, talk)
+        self.assertEqual(talk["cannot_run"], said["cannot_run"])
+        self.assertEqual(talk["authority"]["fingerprint"], said["authority"]["fingerprint"])
+        self.assertIsNone(self.panel._pipeline_store)
+
+        saved_status, saved = self.ask(
+            "/api/swarm/save", {"board": {"agents": [{"name": "Editable"}]}}
+        )
+        self.assertEqual(saved_status, 200, saved)
+        self.assertEqual(saved["board"]["agents"][0]["name"], "Editable")
+        self.assertIsNone(self.panel._swarm_runs)
+        kept_status, kept = self.ask("/api/swarm/keep", {"name": "Snapshot"})
+        self.assertEqual(kept_status, 200, kept)
+        exported_status, _exported = self.ask("/api/swarm/export-kept?name=Snapshot")
+        self.assertEqual(exported_status, 200)
+        opened_status, opened = self.ask("/api/swarm/open-kept", {"name": "Snapshot"})
+        self.assertEqual(opened_status, 200, opened)
+        self.assertEqual(opened["cannot_be_changed"], "")
+        self.assertIn("automation is paused", opened["cannot_run"])
+        forgotten_status, forgotten = self.ask(
+            "/api/swarm/forget-kept", {"name": "Snapshot"}
+        )
+        self.assertEqual(forgotten_status, 200, forgotten)
+        start_status, refused = self.ask(
+            "/api/swarm/start", {"request_id": "copied-before-repair"}
+        )
+        self.assertEqual(start_status, 400)
+        self.assertIn("copied or substituted", refused["error"])
+
+        # Every legacy project/provider/QA execution route fails before taking
+        # a lease, creating a thread, or opening a provider cancellation scope.
+        executable_requests = [
+            ("/api/run", {"task": "Do not dispatch"}),
+            ("/api/chat/say", {"who": "openai", "text": "Do not ask"}),
+            ("/api/chat/ask-everyone", {"text": "Do not ask"}),
+            ("/api/qa/record", {"url": "http://127.0.0.1/"}),
+            ("/api/qa/coverage", {"url": "http://127.0.0.1/"}),
+            ("/api/qa/pick", {"url": "http://127.0.0.1/"}),
+            ("/api/qa/baseline", {}),
+            ("/api/qa/run", {}),
+            ("/api/qa/explain", {"case": "failed-case"}),
+        ]
+        self.panel.qa_result = {"cases": []}
+        with (
+            mock.patch.object(self.panel, "reserve_run", wraps=self.panel.reserve_run) as reserve_run,
+            mock.patch.object(self.panel, "reserve_qa", wraps=self.panel.reserve_qa) as reserve_qa,
+            mock.patch.object(
+                self.panel.chat_cancellations, "begin",
+                wraps=self.panel.chat_cancellations.begin,
+            ) as begin_chat,
+            mock.patch.object(server.HarnessHandler, "_run_task") as dispatch_run,
+            mock.patch.object(
+                server.handover, "failure_from_run", return_value=({"id": "failed-case"}, {})
+            ),
+            mock.patch.object(server.handover, "failure_question", return_value="Local question"),
+            mock.patch.object(server.handover, "explain_failure") as explain_failure,
+        ):
+            for path, body in executable_requests:
+                refused_status, refused = self.ask(path, body)
+                self.assertEqual(refused_status, 400, (path, refused))
+                self.assertIn("copied or substituted", refused["error"], path)
+            local_status, local_question = self.ask(
+                "/api/qa/explain", {"case": "failed-case", "question_only": True}
+            )
+            self.assertEqual(local_status, 200, local_question)
+            self.assertIn("question", local_question)
+        reserve_run.assert_not_called()
+        reserve_qa.assert_not_called()
+        begin_chat.assert_not_called()
+        dispatch_run.assert_not_called()
+        explain_failure.assert_not_called()
+        self.assertTrue(self.panel.run_lock.acquire(blocking=False))
+        self.panel.run_lock.release()
+        self.assertTrue(self.panel.qa_lock.acquire(blocking=False))
+        self.panel.qa_lock.release()
+        self.assertIsNone(self.panel._pipeline_store)
+
+        no_confirm, refused = self.ask(
+            "/api/projects/use-as-new-local",
+            {"fingerprint": said["authority"]["fingerprint"]},
+        )
+        self.assertEqual(no_confirm, 400)
+        self.assertIn("Confirm", refused["error"])
+        repaired_status, repaired = self.ask(
+            "/api/projects/use-as-new-local", {
+                "confirmation": "USE THIS FOLDER AS A NEW LOCAL PROJECT",
+                "fingerprint": said["authority"]["fingerprint"],
+            },
+        )
+        self.assertEqual(repaired_status, 200, repaired)
+        self.assertTrue(repaired["repaired"])
+        self.assertTrue(repaired["authority"]["can_run"])
+        self.assertEqual(self.panel.swarm_runs.authority, repaired["project_authority_id"])
 
     def test_saved_board_json_api_imports_lists_and_exports(self) -> None:
         document = {
@@ -3278,6 +3385,131 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertIn('card.querySelector(".swarm-chat-box").disabled = !agent;', controls)
         self.assertIn("waiting || !agent || !agent.ready", controls)
         self.assertNotIn('swarm-chat-box").disabled = !agent || !agent.ready', controls)
+
+    def test_authority_pause_disables_every_provider_action_but_keeps_local_controls(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        compact = script[script.index("function setWhatCanBePressedInAChat"):
+                         script.index("function stoppedChatError")]
+        enlarged = script[script.index("function setWhatCanBePressedInSwarm"):
+                          script.index("// ---- changing it")]
+        recovery = script[script.index("function renderWorkRecoveryButtons"):
+                          script.index("function renderWorkRecovery(agentId)")]
+        helper = script[script.index("function swarmProviderPauseMessage"):
+                        script.index("function confirmProjectWork")]
+        for class_name in ("swarm-chat-send", "swarm-chat-solo",
+                           "swarm-chat-collaborate", "swarm-chat-work"):
+            self.assertIn(f'setSwarmProviderControl(card.querySelector(".{class_name}")', compact)
+        for control_id in ("theBigChatSend", "theBigChatSolo",
+                           "theBigChatCollaborate", "theBigChatWork"):
+            self.assertIn(f'setSwarmProviderControl($("{control_id}")', enlarged)
+        self.assertIn("setSwarmProviderControl(button", recovery)
+        self.assertIn('button.setAttribute("aria-describedby", "authorityRepairReason")', script)
+        self.assertIn('$("theBigChatAttach").disabled = waiting;', enlarged)
+        self.assertNotIn('setSwarmProviderControl($("theBigChatAttach")', enlarged)
+        self.assertIn('card.querySelector(".swarm-chat-attach").disabled', compact)
+        self.assertNotIn('setSwarmProviderControl(card.querySelector(".swarm-chat-attach")', compact)
+        self.assertIn('return executionPauseWords("Provider contact", swarmSaid.cannot_run)', helper)
+        saved_library = script[script.index("function renderTheKeptBoards"):
+                               script.index("async function keepThisBoard")]
+        self.assertIn('$("swarmKeep").disabled = false', script)
+        self.assertIn("drop.disabled = false", saved_library)
+        self.assertIn("open.disabled = held", saved_library)
+
+    def test_start_controls_are_disabled_and_guarded_by_the_same_authority_reason(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        checkup = script[script.index("async function refreshCheckup"):
+                         script.index("// Whether somebody has opened")]
+        quick = script[script.index("async function quickRun"):
+                       script.index("/* ---- Checks ----")]
+        start = script[script.index("async function startRun"):
+                       script.index("async function pollEvents")]
+        self.assertIn('pipelineCannotRun = String(checkup.cannot_run || "")', checkup)
+        self.assertIn('setExecutionControl(button, missing.length > 0, pipelineCannotRun', checkup)
+        self.assertIn('setExecutionControl($("runButton"), false, pipelineCannotRun', checkup)
+        self.assertLess(quick.index("if (pipelineCannotRun)"), quick.index('request("/api/run"'))
+        self.assertLess(start.index("if (pipelineCannotRun)"), start.index('request("/api/run"'))
+
+        checks = script[script.index("async function refreshChecks"):
+                        script.index("async function createSuite")]
+        explain = script[script.index("async function explainFailure"):
+                         script.index("async function showPictures")]
+        self.assertIn('pipelineCannotRun = String(qaSuite.cannot_run || "")', checks)
+        self.assertIn('setExecutionControl(ask, false, pipelineCannotRun', checks)
+        self.assertLess(explain.index("if (pipelineCannotRun)"),
+                        explain.index('request("/api/qa/explain"'))
+
+        markup = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/index.html").read_text(
+            encoding="utf-8")
+        self.assertIn(
+            "Your saved boards, chats and transcripts, and automation definitions are still present and editable.",
+            markup,
+        )
+        repair = script[script.index("function showAuthorityRepairSuccess"):
+                        script.index("function pipelinePendingKey")]
+        boot = script[script.index("async function boot"):
+                      script.index("// ---- the board of agents")]
+        self.assertIn("window.sessionStorage.setItem(AUTHORITY_REPAIR_SUCCESS_KEY, note)", repair)
+        self.assertLess(repair.index("sessionStorage.setItem"), repair.index("window.location.reload"))
+        self.assertIn("notice.focus()", repair)
+        self.assertIn("announce(message)", repair)
+        self.assertLess(boot.index("await refreshChecks()"),
+                        boot.index("restoreAuthorityRepairSuccess()"))
+
+    def test_chat_submission_guards_preserve_drafts_before_permission_or_provider_contact(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        compact = script[script.index("async function sendWhatIsTypedTo"):
+                         script.index("async function startTheChatAgainFor")]
+        enlarged = script[script.index("async function sendFromTheBigChat"):
+                          script.index("function wireUpTheTray")]
+        resume = script[script.index("async function resumeSwarmWork"):
+                        script.index("async function sendWhatIsTypedTo")]
+        for body in (compact, enlarged):
+            guard = body.index("const executionPause = swarmProviderPauseMessage()")
+            self.assertLess(guard, body.index("confirmProjectWork"))
+            self.assertLess(guard, body.index('request("/api/swarm/say"'))
+            self.assertIn("box.focus()", body[guard:body.index("confirmProjectWork")])
+        self.assertLess(
+            enlarged.index("const executionPause = swarmProviderPauseMessage()"),
+            enlarged.index('box.value = ""'),
+        )
+        self.assertLess(
+            compact.index("const executionPause = swarmProviderPauseMessage()"),
+            compact.index('box.value = ""'),
+        )
+        self.assertLess(
+            resume.index("const executionPause = swarmProviderPauseMessage()"),
+            resume.index('request("/api/swarm/say"'),
+        )
+
+    def test_legacy_talk_disables_and_guards_only_provider_contact(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        refresh = script[script.index("async function refreshTalk"):
+                         script.index("function talkTheOpenOne")]
+        controls = script[script.index("function setWhatCanBePressed()"):
+                          script.index("function renderTalkWho")]
+        send = script[script.index("async function sendWhatIsTyped()"):
+                      script.index("function readOneTurnBack")]
+        everyone = script[script.index("async function askEveryone()"):
+                          script.index("async function stopTalking")]
+        self.assertIn('talkCannotRun = String(said.cannot_run || "")', refresh)
+        self.assertIn("showProjectAuthorityPause(said.authority, talkCannotRun)", refresh)
+        self.assertIn('setExecutionControl($("talkSend")', controls)
+        self.assertIn('setExecutionControl($("talkAskEveryone")', controls)
+        self.assertIn('$("talkBox").disabled = !somebody', controls)
+        self.assertIn('$("talkStartAgain").disabled = talkBusy || !somebody', controls)
+        for body, endpoint in (
+            (send, 'request("/api/chat/say"'),
+            (everyone, 'request("/api/chat/ask-everyone"'),
+        ):
+            guard = body.index('executionPauseWords("Provider contact", talkCannotRun)')
+            self.assertLess(guard, body.index("talkBusy = true"))
+            self.assertLess(guard, body.index(endpoint))
+            self.assertIn("box.focus()", body[guard:body.index("talkBusy = true")])
+            self.assertLess(guard, body.index('box.value = ""'))
 
     def test_maximised_composer_is_viewport_bound_and_render_independent(self) -> None:
         root = Path(__file__).resolve().parents[1]
