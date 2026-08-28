@@ -39,7 +39,7 @@
       "HOMEPATH",
       "HOME"
     ],
-    "max_changed_bytes": 2000000,
+    "max_changed_bytes": 32000000,
     "max_changed_files": 24,
     "max_output_bytes": 250000,
     "mode": "process",
@@ -122,7 +122,7 @@
     "api_mode": "auto",
     "command": [],
     "endpoint": "http://127.0.0.1:11434",
-    "max_output_tokens": 8192,
+    "max_output_tokens": 65536,
     "model": "qwen2.5-coder:7b",
     "name": "ollama",
     "prompt_cache_key": "",
@@ -134,7 +134,7 @@
       "planner": 1000000
     },
     "temperature": 0.2,
-    "timeout_seconds": 180
+    "timeout_seconds": 600
   },
   "providers": {},
   "qa": {
@@ -162,9 +162,9 @@
   "workflow": {
     "max_elapsed_seconds": 1800,
     "max_iterations": 4,
-    "max_tool_calls": 12,
+    "max_tool_calls": 48,
     "max_tool_output_bytes": 32000,
-    "max_tool_total_bytes": 128000,
+    "max_tool_total_bytes": 512000,
     "name": "planner-coder-reviewer",
     "repeat_failure_limit": 2,
     "require_executable_counterexamples": false,

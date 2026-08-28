@@ -1,0 +1,1 @@
+UNCONFIGURED - replace with the exact Authenticode certificate Subject before any public release

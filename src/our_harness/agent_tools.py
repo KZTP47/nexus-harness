@@ -10,12 +10,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from . import cancellation
 from .config import LoadedConfig
 from .ignore_policy import IgnorePolicy
 from .mcp import MCPClient, configured_server
 from .memory import MemoryHit, MemoryStore
 from .messaging import EVERYONE, MessageBoard
-from .models import Deadline, HarnessError
+from .models import Deadline, DeadlineExpired, HarnessError
 from .programmatic_workspace import (
     ApplyPatch as ProgrammaticApplyPatch,
     DeleteFile as ProgrammaticDeleteFile,
@@ -365,6 +366,8 @@ class AgentToolSession:
         deadline: Deadline,
         emit: EventEmitter,
         run_id: str | None = None,
+        extra_read_only_tools: dict[str, Callable[[object], dict[str, Any]]] | None = None,
+        prepare_tool: Callable[[str, object, Deadline], None] | None = None,
     ):
         self.config = config
         self.memory = memory
@@ -393,6 +396,20 @@ class AgentToolSession:
         self._staged_cache_keys: set[str] = set()
         self._staged_candidate: StagedCandidate | None = None
         self._board: MessageBoard | None = None
+        self._extra_read_only_tools = dict(extra_read_only_tools or {})
+        if prepare_tool is not None and not callable(prepare_tool):
+            raise HarnessError("Agent tool preparation hook must be callable")
+        self._prepare_tool = prepare_tool
+        reserved = {item["name"] for item in (
+            TOOL_DEFINITIONS + TEAM_TOOL_DEFINITIONS + MY_LIST_TOOL_DEFINITIONS
+            + STAGED_TOOL_DEFINITIONS
+        )} | {"mcp_call"}
+        if any(
+            not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", name)
+            or name in reserved or not callable(handler)
+            for name, handler in self._extra_read_only_tools.items()
+        ):
+            raise HarnessError("Extra read-only agent tools contain an invalid or reserved tool binding")
 
     def attach_staged_workspace(
         self,
@@ -624,8 +641,12 @@ class AgentToolSession:
             status = "error"
         else:
             try:
+                if self._prepare_tool is not None:
+                    self._prepare_tool(name, arguments, self.deadline)
                 content = self._dispatch(name, arguments, node=node, call_id=call_id)
                 status = "ok"
+            except (cancellation.ChatCancelled, DeadlineExpired):
+                raise
             except HarnessError as exc:
                 content = {"error": str(exc)}
                 status = "error"
@@ -806,6 +827,8 @@ class AgentToolSession:
         return content, byte_count, truncated
 
     def _dispatch(self, name: str, arguments: object, *, node: str, call_id: str) -> dict[str, Any]:
+        if name in self._extra_read_only_tools:
+            return self._extra_read_only_tools[name](arguments)
         if name in STAGED_TOOL_NAMES:
             return self._staged_dispatch(name, arguments, node=node, call_id=call_id)
         if name == "list_tree":
@@ -1092,7 +1115,12 @@ class AgentToolSession:
         end_line = _require_int(value["end_line"], "end_line", start_line, 10_000_000)
         requested_bytes = _require_int(value["max_bytes"], "max_bytes", 1, self.per_call_bytes)
         raw = self._stable_regular_bytes(relative)
-        text = raw.decode("utf-8", errors="replace")
+        try:
+            text = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise HarnessError(
+                "read_file target is not valid UTF-8 text; Nexus did not replace or corrupt bytes"
+            ) from exc
         lines = text.splitlines(keepends=True)
         selected = "".join(lines[start_line - 1 : end_line])
         selected_raw = selected.encode("utf-8")

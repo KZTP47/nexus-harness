@@ -52,8 +52,8 @@ Keep shareable model selection in `.harness/config.json`:
     "prompt_cache_key": "",
     "prompt_cache_retention": "24h",
     "temperature": 0.2,
-    "max_output_tokens": 8192,
-    "timeout_seconds": 180
+    "max_output_tokens": 65536,
+    "timeout_seconds": 600
   }
 }
 ```
@@ -245,6 +245,42 @@ Detection runs during `harness init`. Detected commands are written only to igno
 
 Commands are argv arrays. They do not use a shell unless an explicit tool executable starts one.
 
+A zero exit code is not test evidence. Nexus positively parses executed-test
+counts from unittest, pytest, Vitest, Jest, Playwright, Go JSON events, Cargo,
+.NET, Maven Surefire, and Gradle summaries. Every selected test command must
+prove that at least one test executed with no reported failure. Arbitrary text,
+including `ok` or `No unit tests to run`, remains unverified.
+
+A custom runner can opt into one strict machine-readable contract in trusted
+local configuration. Its stdout must be exactly one JSON object; the named
+total and failed fields must be non-negative integers, total must exceed zero,
+and failed must be zero. The command match is exact:
+
+```json
+{
+  "project": {
+    "test_commands": [["company-test", "--json"]],
+    "test_evidence_contracts": [{
+      "command": ["company-test", "--json"],
+      "format": "json-stdout",
+      "total_field": "summary.executed",
+      "failed_field": "summary.failed",
+      "requirement_probes": {
+        "langgraph_enforcement": "summary.langgraph_enforced"
+      }
+    }]
+  }
+}
+```
+
+Evidence contracts have the same executable authority as test commands, so a
+shareable repository file cannot activate one until the exact settings file is
+reviewed and trusted on that machine.
+`requirement_probes` is optional. It maps a whole-goal behavioral requirement
+ID to a JSON field that must be `true` or a positive number. This is required
+when a custom runner is meant to prove behavior such as LangGraph enforcement;
+command names, filenames, and placeholder tests never prove that behavior.
+
 ## Memory
 
 ```json
@@ -274,7 +310,7 @@ When `memory.enabled` is `false`, the harness does not create the configured dat
     "timeout_seconds": 180,
     "max_output_bytes": 250000,
     "max_changed_files": 24,
-    "max_changed_bytes": 2000000,
+    "max_changed_bytes": 32000000,
     "inherit_environment": ["PATH", "PATHEXT", "SYSTEMDRIVE", "SYSTEMROOT", "WINDIR", "TMP", "TEMP", "LANG", "LC_ALL"],
     "deny_executables": ["format", "diskpart", "shutdown", "reboot"],
     "deny_argument_sequences": ["--force", "reset --hard", "clean -fd", "push --force"],
@@ -297,9 +333,9 @@ The denied list is a final guard, not a full policy language. Shareable config m
     "max_iterations": 4,
     "max_elapsed_seconds": 1800,
     "repeat_failure_limit": 2,
-    "max_tool_calls": 12,
+    "max_tool_calls": 48,
     "max_tool_output_bytes": 32000,
-    "max_tool_total_bytes": 128000,
+    "max_tool_total_bytes": 512000,
     "reviewers": 2,
     "review_parallelism": 2,
     "reviewer_lenses": ["correctness", "counterexample"],
@@ -312,7 +348,7 @@ The denied list is a final guard, not a full policy language. Shareable config m
 
 `workflow.max_elapsed_seconds` is one deadline for discovery, retrieval, provider calls, commands, review, and persistence. Provider, discovery-tool, MCP, and command adapters receive the smaller of their configured timeout and the remaining workflow time.
 
-`workflow.max_tool_calls` bounds planner/coder discovery calls across the entire run. `max_tool_output_bytes` is the per-result serialized limit and `max_tool_total_bytes` is the run-wide result limit. Duplicate calls count toward the call limit and reuse the first bounded result. Completed results are journaled by run, node, call ID, tool, and canonical argument hash. A resumed node reuses an exact matching journal entry and rejects call-ID rebinding.
+`workflow.max_tool_calls` and `max_tool_total_bytes` bound one discovery epoch. Ordinary workflow runs have one epoch. Long-horizon project work may open another equally bounded epoch only after Nexus durably records a changed semantic project-state checkpoint. A restart, resume, repeated provider claim, or unchanged retry never creates budget. Project-work responses and live progress disclose the current epoch, calls remaining, the progress-only renewal policy, and the finite 2,000-call/20,000,000-byte lifetime safety ceilings. `max_tool_output_bytes` remains the per-result serialized limit. Duplicate calls count and reuse the first bounded result; completed call/result IDs and canonical argument bindings remain journaled across epochs and resumes.
 
 `workflow.reviewers` and `workflow.review_parallelism` each accept 1 through 5. `reviewer_lenses` is optional; when present, it must contain one unique plain name per reviewer. A value above one runs the production evaluator as an independent panel. Each member gets a separate provider instance, immutable lens policy, the same canonical evidence packet, and the same absolute deadline. The run records per-reviewer latency and token usage, isolates failures, and passes only when every required reviewer passes. A value of one keeps the single isolated reviewer path. Shareable project config cannot turn a trusted `require_review` or `rollback_on_exhaustion` value from `true` to `false`; a later trusted layer may do so explicitly.
 

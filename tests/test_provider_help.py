@@ -104,6 +104,81 @@ class ProviderHelpTests(unittest.TestCase):
         self.assertIn("not connected", options["codex-cli"].reason)
         self.assertNotIn("/usr/bin/codex", options["codex-cli"].reason)
 
+    def test_sign_in_diagnostics_use_the_exact_configured_cli_command(self) -> None:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "work": {
+                "kind": "claude-cli", "model": "default",
+                "command": ["C:/Company Tools/claude-wrapper.exe", "--work-seat"],
+            }
+        }
+        config = LoadedConfig(data, self.root, [], {})
+        with mock.patch.object(subscription_cli, "available", return_value=True) as available, \
+             mock.patch.object(subscription_cli, "connection_status", return_value={
+                 "authentication": "signed-in", "installed": True,
+             }) as status, \
+             mock.patch("our_harness.chat.what_would_not_answer", return_value={}):
+            option = provider_help._signed_in_tool("claude-cli", config, True)
+        self.assertEqual(option.state, READY)
+        self.assertEqual(
+            status.call_args.kwargs["command"],
+            ["C:/Company Tools/claude-wrapper.exe", "--work-seat"],
+        )
+        available.assert_called_once_with(
+            "claude-cli", ["C:/Company Tools/claude-wrapper.exe", "--work-seat"]
+        )
+
+    def test_unknown_gemini_auth_is_allowed_as_a_labelled_first_request(self) -> None:
+        from our_harness import server as server_module
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["provider"].update({
+            "name": "gemini-cli", "model": "default", "command": ["C:/Tools/gemini.exe"]
+        })
+        config = LoadedConfig(data, self.root, [], {})
+        status = {
+            "route": "default", "kind": "gemini-cli", "installed": True,
+            "state": "installed", "authentication": "unknown", "note": "No safe status command.",
+        }
+        with mock.patch.object(server_module, "connection_status", return_value=status):
+            found = server_module.effective_route_readiness(config)[0]
+        self.assertTrue(found["ready"])
+        self.assertTrue(found["ready_for_first_request"])
+        self.assertEqual(found["state"], "first-request-required")
+        self.assertIn("first run", found["note"])
+
+    def test_every_effective_agent_route_must_be_ready(self) -> None:
+        from our_harness import server as server_module
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "coder_route": {"kind": "claude-cli", "model": "default"},
+            "review_route": {"kind": "codex-cli", "model": "default"},
+        }
+        data["agents"] = {
+            "coder": {"provider_ref": "coder_route", "role": "coder"},
+            "reviewer": {"provider_ref": "review_route", "role": "evaluator"},
+        }
+        config = LoadedConfig(data, self.root, [], {})
+
+        def state(_config, route, **_kwargs):
+            ready = route != "review_route"
+            return {
+                "route": route, "kind": "fake", "installed": ready,
+                "state": "ready" if ready else "needs-login",
+                "authentication": "signed-in" if ready else "signed-out",
+                "note": f"{route} {'ready' if ready else 'signed out'}",
+            }
+
+        with mock.patch.object(server_module, "connection_status", side_effect=state):
+            routes = server_module.effective_route_readiness(config)
+        self.assertEqual([item["route"] for item in routes], [
+            "default", "coder_route", "review_route",
+        ])
+        self.assertTrue(routes[0]["ready"])
+        self.assertTrue(routes[1]["ready"])
+        self.assertFalse(routes[2]["ready"])
+
     def test_ready_ways_are_listed_before_the_rest(self) -> None:
         os.environ["GEMINI_API_KEY"] = "test-value"
         options = provider_options(self.config())

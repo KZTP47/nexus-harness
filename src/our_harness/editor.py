@@ -417,7 +417,7 @@ class Conversation:
             return {
                 "protocolVersion": self.agreed_version,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": WHAT_WE_ARE_CALLED, "version": "0.1.0"},
+                "serverInfo": {"name": WHAT_WE_ARE_CALLED, "version": "0.2.0"},
                 # The name is written down once, in our_harness.PRODUCT_NAME.
                 # Written out again here, a rename would leave this saying the
                 # old one to every editor that asks.

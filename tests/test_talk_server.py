@@ -107,6 +107,9 @@ class OpeningTheTab(PanelTestCase):
         _status, said = self.ask("/api/chat")
         self.assertEqual(said["most_letters"], chat.MOST_LETTERS)
         self.assertEqual(said["most_kept"], chat.MOST_KEPT)
+        self.assertEqual(said["limits"]["input_characters"], chat.MOST_LETTERS)
+        self.assertEqual(said["limits"]["answer_characters"], chat.LONGEST_ANSWER)
+        self.assertEqual(said["limits"]["overflow_policy"], "reject_without_truncation")
 
 
 class SayingSomething(PanelTestCase):

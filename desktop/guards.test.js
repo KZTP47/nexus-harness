@@ -119,6 +119,13 @@ test("a repairable mismatch explains what the repair button will do", () => {
   assert.match(said, /recover automatically on later starts/);
 });
 
+test("an installed mismatch tells the truth about its immutable private bundle", () => {
+  const said = whyItReallyIs("error: Unknown config key: newer", { installed: true });
+  assert.match(said, /will not mix project source/);
+  assert.match(said, /newer signed Nexus release/);
+  assert.doesNotMatch(said, /python scripts\/harness\.py/);
+});
+
 test("an untrusted settings file is named as the reason", () => {
   const said = whyItReallyIs(
     "error: project.test_commands is set in a settings file this machine has "

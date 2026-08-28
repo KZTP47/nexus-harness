@@ -189,6 +189,7 @@ class CommandRunner:
         timeout: int | float | None = None,
         stdin_text: str | None = None,
         max_output_bytes: int | None = None,
+        environment_overrides: dict[str, str] | None = None,
     ) -> CommandResult:
         self._check(argv)
         working = confined_path(self.root, cwd, allow_missing=False)
@@ -207,6 +208,14 @@ class CommandRunner:
             ]
             working = self.root
         environment = safe_environment(self.config.get("execution.inherit_environment", []))
+        if environment_overrides:
+            if not all(
+                isinstance(key, str) and key and "=" not in key
+                and isinstance(value, str) and "\x00" not in value
+                for key, value in environment_overrides.items()
+            ):
+                raise HarnessError("Command environment overrides must be plain string names and values")
+            environment.update(environment_overrides)
         configured_limit = int(self.config.get("execution.max_output_bytes"))
         limit = configured_limit if max_output_bytes is None else min(configured_limit, max(1, int(max_output_bytes)))
         configured_timeout = float(self.config.get("execution.timeout_seconds"))

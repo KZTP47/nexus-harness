@@ -85,12 +85,12 @@ def detect_project(root: Path) -> list[Detection]:
     if (root / "Cargo.toml").exists():
         detections.append(Detection("rust", ["Cargo.toml"], [["cargo", "test"]], [["cargo", "clippy", "--all-targets"]], [["cargo", "build"]], 1.0))
     if (root / "go.mod").exists():
-        detections.append(Detection("go", ["go.mod"], [["go", "test", "./..."]], [["go", "vet", "./..."]], [["go", "build", "./..."]], 1.0))
+        detections.append(Detection("go", ["go.mod"], [["go", "test", "-json", "./..."]], [["go", "vet", "./..."]], [["go", "build", "./..."]], 1.0))
     if (root / "pom.xml").exists():
         detections.append(Detection("java-maven", ["pom.xml"], [["mvn", "test"]], [], [["mvn", "package", "-DskipTests"]], 1.0))
     if (root / "gradlew").exists() or (root / "gradlew.bat").exists():
         wrapper = "gradlew.bat" if (root / "gradlew.bat").exists() else "./gradlew"
-        detections.append(Detection("java-gradle", [Path(wrapper).name], [[wrapper, "test"]], [], [[wrapper, "build"]], 1.0))
+        detections.append(Detection("java-gradle", [Path(wrapper).name], [[wrapper, "test", "--info", "--console=plain"]], [], [[wrapper, "build"]], 1.0))
     solutions = list(root.glob("*.sln"))
     projects = list(root.glob("*.csproj"))
     if solutions or projects:

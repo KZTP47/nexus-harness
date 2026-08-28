@@ -1,0 +1,157 @@
+name: Windows desktop release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  clean-windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Test source installer contract
+        run: python -m unittest tests.test_release_installer -v
+
+      - name: Require the release tag to match the app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (Get-Content -Raw -LiteralPath desktop/package.json | ConvertFrom-Json).version
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag $env:GITHUB_REF_NAME does not match desktop version $version." }
+
+      - name: Prepare Authenticode signing or label an unsigned development build
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ($env:WINDOWS_CERTIFICATE_BASE64 -and $env:WINDOWS_CERTIFICATE_PASSWORD) {
+            $expectedPublisher = (Get-Content -Raw -LiteralPath release/windows-authenticode-publisher.txt).Trim()
+            if (-not $expectedPublisher -or $expectedPublisher.StartsWith('UNCONFIGURED')) {
+              throw 'Set release/windows-authenticode-publisher.txt to the certificate exact Subject before signing.'
+            }
+            $certificate = Join-Path $env:RUNNER_TEMP 'nexus-authenticode.pfx'
+            [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+            "CSC_LINK=$certificate" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "CSC_KEY_PASSWORD=$env:WINDOWS_CERTIFICATE_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "NEXUS_SIGNED_BUILD=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } elseif ($env:GITHUB_REF -like 'refs/tags/v*') {
+            throw 'A release tag requires WINDOWS_CERTIFICATE_BASE64 and WINDOWS_CERTIFICATE_PASSWORD. No unsigned public release will be created.'
+          } else {
+            "NEXUS_UNSIGNED_DEV=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+
+      - name: Install pinned desktop dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Test desktop ownership, startup, and packaging contracts
+        working-directory: desktop
+        run: npm test
+
+      - name: Build versioned NSIS installer
+        working-directory: desktop
+        run: npm run build -- --win nsis
+
+      - name: Give a signed release its canonical public filename
+        if: env.NEXUS_SIGNED_BUILD == '1'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED-DEV.exe')
+          if ($installers.Count -ne 1) { throw "Expected one signed release candidate, found $($installers.Count)." }
+          Rename-Item -LiteralPath $installers[0].FullName -NewName ($installers[0].Name -replace '-UNSIGNED-DEV\.exe$', '.exe')
+
+      - name: Smoke-test the unpacked clean-machine app
+        working-directory: desktop
+        run: npm run smoke:built
+
+      - name: Install and smoke-test the real per-user package
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
+          if ($installers.Count -ne 1) { throw "Expected one installer, found $($installers.Count)." }
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs/our-harness-desktop/Nexus Harness.exe'
+          $process = Start-Process -FilePath $installers[0].FullName -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
+          if ($process.ExitCode -ne 0) { throw "Installer stopped with code $($process.ExitCode)." }
+          if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) { throw "Installer did not create $installed." }
+          Push-Location desktop
+          try { npm run smoke:built -- "$installed" } finally { Pop-Location }
+
+      - name: Verify the installer Authenticode signature
+        if: env.NEXUS_SIGNED_BUILD == '1'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
+          if ($installers.Count -ne 1) { throw "Expected one installer, found $($installers.Count)." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
+          if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate.Subject) {
+            throw "Installer signature is not valid: $($signature.Status) $($signature.StatusMessage)"
+          }
+          $expectedPublisher = (Get-Content -Raw -LiteralPath release/windows-authenticode-publisher.txt).Trim()
+          if ($signature.SignerCertificate.Subject -cne $expectedPublisher) {
+            throw "Installer publisher '$($signature.SignerCertificate.Subject)' does not match pinned publisher '$expectedPublisher'."
+          }
+
+      - name: Write installer SHA-256
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
+          if ($installers.Count -ne 1) { throw "Expected one versioned NSIS installer, found $($installers.Count)." }
+          $installer = $installers[0]
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
+          "$hash  $($installer.Name)" | Set-Content -Encoding ascii -NoNewline -LiteralPath "$($installer.FullName).sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nexus-harness-windows-${{ github.ref_name }}
+          if-no-files-found: error
+          path: |
+            desktop/build-output/Nexus-Harness-Setup-*.exe
+            desktop/build-output/Nexus-Harness-Setup-*.exe.sha256
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: clean-windows-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nexus-harness-windows-${{ github.ref_name }}
+          path: release
+      - name: Refuse an existing mutable release and publish once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists. Refusing to replace or append assets." >&2
+            exit 1
+          fi
+          mapfile -t assets < <(find release -maxdepth 1 -type f -name 'Nexus-Harness-Setup-*' -print)
+          if [[ ${#assets[@]} -ne 2 ]]; then
+            echo "Expected exactly the installer and checksum, found ${#assets[@]}." >&2
+            exit 1
+          fi
+          gh release create "$tag" "${assets[@]}" --verify-tag --generate-notes --title "Nexus Harness $tag"

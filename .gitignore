@@ -33,6 +33,11 @@ Nexus Harness Memory/
 # Dependencies and build output
 node_modules/
 desktop/build-output/
+desktop/runtime/
+desktop/.runtime-build.lock
+.harness/desktop-deployment.lock
+.harness/desktop-deployment.owner.json
+desktop/build-info.json
 desktop/dist/
 .wheel-stage*/
 build/
@@ -43,6 +48,10 @@ __pycache__/
 
 # Local scratch
 %SystemDrive%/
+.codex-remote-attachments/
+.harness/pipelines/auto2-copy.json
+.harness/pipelines/first-pipeline.json
+.harness/pipelines/new-automation2.json
 benchmark-logs/
 benchmark-archive/
 reports/

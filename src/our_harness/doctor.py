@@ -73,6 +73,41 @@ def _codex_profile_checks(config: LoadedConfig) -> list[Check]:
     return checks
 
 
+def _subscription_profile_checks(config: LoadedConfig) -> list[Check]:
+    """Verify named command-line routes, not merely the legacy default route."""
+
+    from .providers.subscription_cli import SUBSCRIPTION_KINDS, connection_status
+
+    checks: list[Check] = []
+    for profile in ProviderRegistry(config).profiles():
+        if profile.name not in SUBSCRIPTION_KINDS or profile.name == "codex-cli":
+            continue
+        try:
+            status = connection_status(
+                profile.name,
+                timeout_seconds=min(10, profile.timeout_seconds),
+                use_cache=True,
+                probe=True,
+                command=profile.command or None,
+            )
+        except Exception as exc:
+            checks.append(Check("fail", f"provider:{profile.id}", str(exc)))
+            continue
+        authentication = str(status.get("authentication") or "unknown")
+        if not status.get("installed"):
+            checks.append(Check("fail", f"provider:{profile.id}", "The configured command is not installed"))
+        elif authentication == "signed-out":
+            checks.append(Check("fail", f"provider:{profile.id}", "The command is installed but signed out"))
+        elif authentication == "signed-in":
+            checks.append(Check("ok", f"provider:{profile.id}", "The command is installed and its sign-in is ready"))
+        else:
+            checks.append(Check(
+                "warn", f"provider:{profile.id}",
+                "The command is installed, but it has no safe local sign-in check; its first small request is the final readiness test",
+            ))
+    return checks
+
+
 def run_doctor(config: LoadedConfig) -> dict[str, Any]:
     checks: list[Check] = []
     version_ok = sys.version_info >= (3, 11)
@@ -110,6 +145,7 @@ def run_doctor(config: LoadedConfig) -> dict[str, Any]:
     )
     checks.append(_provider_check(config))
     checks.extend(_codex_profile_checks(config))
+    checks.extend(_subscription_profile_checks(config))
     try:
         db = sqlite3.connect(":memory:")
         db.execute("CREATE VIRTUAL TABLE probe USING fts5(value)")

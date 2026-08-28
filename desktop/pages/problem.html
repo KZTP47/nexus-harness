@@ -13,14 +13,23 @@
     <p class="lead" id="detail"></p>
     <p id="because" class="lead" hidden></p>
     <div id="guesses">
-    <p>Most of the time this means one of these:</p>
+    <p>The installed app carries its own supported Python and Nexus code. Most startup failures now mean one of these:</p>
     <ul>
-      <li><strong>Python 3.11 or newer is not installed</strong>, or the app cannot find it. Install it, then start the app again.</li>
-      <li><strong>The folder you chose is not the harness.</strong> Pick the folder that has <code>src</code> and <code>scripts</code> in it. The app takes the harness's own code from beside itself, so a plain download works with nothing installed - but it has to be pointed at the right place.</li>
-      <li><strong>Something is missing from the download.</strong> If <code>src/our_harness</code> is not there, the copy is incomplete. Download it again.</li>
+      <li><strong>The installed package is incomplete.</strong> Reinstall the same checksummed release; no separate Python installation is needed.</li>
+      <li><strong>The selected project moved or cannot be read.</strong> Choose the code folder you actually want Nexus to work on.</li>
+      <li><strong>The project's machine-local settings need review.</strong> Nexus will show the exact file and consequences before offering trust.</li>
     </ul>
-    <p>If Python lives somewhere unusual, set the <code>HARNESS_PYTHON</code> environment variable to its full path before starting this app. If you would rather install the harness into Python, open a terminal in the project folder and run <code>python -m pip install .</code> - it is not needed, and it works too.</p>
+    <p>Source developers may still set <code>HARNESS_PYTHON</code>; that external fallback must be Python 3.11 or newer.</p>
     </div>
+    <section id="trustReview" hidden>
+      <h2>Review this project's machine-local settings</h2>
+      <p id="trustPath"></p>
+      <pre id="trustContents"></pre>
+      <p>Trusting this exact file allows Nexus to:</p>
+      <ul id="trustConsequences"></ul>
+      <button id="trust" type="button">Trust this exact file and start</button>
+      <p id="trustStatus" role="status"></p>
+    </section>
     <div class="row">
       <button id="repair" class="primary" type="button" hidden>Fix and start</button>
       <button id="retry" class="primary" type="button">Try again</button>

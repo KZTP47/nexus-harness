@@ -38,7 +38,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,7 @@ from . import cancellation
 from .config import LoadedConfig
 from .models import HarnessError, ProviderRequest, ResponseFormat
 from .providers import ProviderRegistry, create_provider
-from .redaction import CredentialRedactor
+from .redaction import CredentialRedactor, bounded_redacted_text
 from .safety import confined_path
 
 # Where the conversations are kept, so one survives closing the panel.
@@ -63,22 +63,32 @@ LONGEST_NO = 800
 # says nothing about Monday, and a note nobody can clear is a note that stops
 # being read. Anything getting through clears it long before this.
 A_NO_IS_WORTH_MENTIONING_FOR = 24 * 60 * 60
-# One message is a message. Anything longer belongs in the project, with the
-# message pointing at it.
-MOST_LETTERS = 6000
+# A long-horizon goal is often a real specification.  This is a disclosed hard
+# safety boundary, not a convenient UI size: the browser and server advertise
+# the same value and reject an over-limit request instead of silently clipping
+# it.  Text files remain the better home for very large reference material.
+MOST_LETTERS = 200_000
 # How much of a conversation is kept and sent back. Enough to hold a thread of
 # thought; few enough that the last turn does not cost the price of all of them.
 MOST_KEPT = 40
-# What one answer may be, and how long it may take. A signed-in tool starting
-# up for the first time is slow once and quick afterwards.
-LONGEST_ANSWER = 20_000
-LONGEST_WAIT_SECONDS = 180.0
+# What one answer may be, and how long it may take.  No code may slice an
+# answer to this size: exceeding it is a visible transport failure so Nexus can
+# resume/retry without recording a plausible-looking fragment as complete.
+LONGEST_ANSWER = 8_000_000
+LONGEST_WAIT_SECONDS = 600.0
+# Non-interactive CLI adapters use this as their minimum capture budget.  The
+# execution command limit is a different concern and used to truncate provider
+# answers even when the response schema explicitly allowed larger file sets.
+# Eight million answer characters can occupy almost 96 MB when a provider
+# JSON-escapes non-BMP Unicode as surrogate pairs. This is a disclosed hard
+# transport boundary, separate from local command/test output.
+PROVIDER_TRANSPORT_OUTPUT_BYTES = 100_000_000
 # How many can be asked the same thing at once.
 MOST_AT_ONCE = 6
 MOST_ATTACHMENTS = 6
 MOST_ATTACHMENT_BYTES = 4_000_000
 MOST_ATTACHMENTS_BYTES = 8_000_000
-MOST_ATTACHMENT_TEXT = 80_000
+MOST_ATTACHMENT_TEXT = 1_000_000
 # The name the default route is filed under, since it has no name of its own.
 THE_USUAL_ONE = "the-usual-one"
 
@@ -312,6 +322,31 @@ def keep_attachments(
         total += len(content)
         if total > MOST_ATTACHMENTS_BYTES:
             raise ChatError("The attachments together are larger than 8 MB.")
+        textual = (
+            mime.startswith("text/")
+            or mime in {"application/json", "application/xml", "application/javascript"}
+            or Path(name).suffix.lower() in {
+                ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".md",
+                ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv",
+            }
+        )
+        if textual:
+            try:
+                decoded = content.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise ChatError(
+                    f"{name} is labelled as text but is not valid UTF-8 at byte "
+                    f"{exc.start}. Nexus did not replace or discard any bytes. "
+                    "Save it as UTF-8 or attach it as a binary reference."
+                ) from exc
+        else:
+            decoded = ""
+        if len(decoded) > MOST_ATTACHMENT_TEXT:
+            raise ChatError(
+                f"{name} contains more than {MOST_ATTACHMENT_TEXT:,} text characters. "
+                "Nexus did not clip it. Split it into smaller files so every character "
+                "can be supplied to the assistant."
+            )
         attachment_id = uuid.uuid4().hex
         suffix = Path(name).suffix[:16]
         stored = folder / f"{attachment_id}{suffix}"
@@ -335,16 +370,7 @@ def keep_attachments(
             "data": base64.b64encode(content).decode("ascii"),
             "path": str(stored),
         })
-        textual = (
-            mime.startswith("text/")
-            or mime in {"application/json", "application/xml", "application/javascript"}
-            or Path(name).suffix.lower() in {
-                ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".md",
-                ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv",
-            }
-        )
         if textual:
-            decoded = content.decode("utf-8", errors="replace")[:MOST_ATTACHMENT_TEXT]
             text_blocks.append(f"ATTACHED TEXT FILE {position + 1}: {name}\n{decoded}")
     return kept, provider_files, "\n\n".join(text_blocks)
 
@@ -621,10 +647,13 @@ def what_would_not_answer(config: LoadedConfig) -> dict[str, dict[str, Any]]:
         kept: dict[str, dict[str, Any]] = {}
         cleaned = dict(held)
         changed = False
+        redactor = CredentialRedactor(config)
         for route, one in held.items():
             if not isinstance(one, dict) or not isinstance(one.get("why"), str):
                 continue
-            safe_why = _without_personal_account_details(one["why"])
+            safe_why = bounded_redacted_text(
+                redactor, _without_personal_account_details(one["why"]), 65_536
+            )
             if safe_why != one["why"]:
                 cleaned[route] = dict(one, why=safe_why)
                 changed = True
@@ -667,8 +696,10 @@ def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) ->
             held = what_would_not_answer(config)
             if why:
                 held[route] = {
-                    "why": _cut_at_a_full_stop(
-                        _without_personal_account_details(why)
+                    "why": bounded_redacted_text(
+                        CredentialRedactor(config),
+                        _without_personal_account_details(why),
+                        65_536,
                     ),
                     "when": time.time(),
                     "at": _now(),
@@ -880,7 +911,7 @@ def _said_from_dicts(held: object) -> list[Said]:
             continue
         kept.append(Said(
             who=who,
-            text=text[:LONGEST_ANSWER],
+            text=text,
             at=str(one.get("at") or ""),
             milliseconds=int(one.get("milliseconds") or 0),
             model=str(one.get("model") or ""),
@@ -1190,12 +1221,205 @@ def _check_what_was_typed(text: str) -> str:
         raise ChatError("Type something first.")
     if len(said) > MOST_LETTERS:
         raise ChatError(
-            f"That is longer than {MOST_LETTERS} letters. Keep the message short "
-            "and point at the file, rather than pasting all of it."
+            f"That message is {len(said):,} characters; the effective limit is "
+            f"{MOST_LETTERS:,}. Nexus did not truncate it. Attach or point at a file, "
+            "or split the request into explicit consecutive parts."
         )
     if any(ord(letter) < 32 and letter not in "\t\n\r" for letter in said):
         raise ChatError("That message holds a control character.")
     return said
+
+
+def effective_limits(
+    config: LoadedConfig | None = None, route: str = ""
+) -> dict[str, Any]:
+    """The actual chat/transport budget shown by every composer.
+
+    These are deliberately machine-readable so the UI never has to remember a
+    second copy of a backend limit.  Route/model context windows can be smaller;
+    a provider rejection is preserved verbatim (after credential redaction)
+    rather than guessed or hidden here.
+    """
+
+    routed = config
+    is_web = route.startswith("web:")
+    if config is not None and route and not route.startswith("web:"):
+        try:
+            routed = ProviderRegistry(config).provider_config(route)
+        except HarnessError:
+            routed = config
+    configured_output = 0
+    configured_timeout = LONGEST_WAIT_SECONDS
+    if config is not None:
+        try:
+            configured_output = int(config.get("execution.max_output_bytes"))
+            configured_timeout = min(
+                LONGEST_WAIT_SECONDS, float(routed.get("provider.timeout_seconds"))
+            )
+        except (TypeError, ValueError):
+            pass
+    if is_web:
+        from .web_chats import WEB_WAIT_SECONDS
+
+        configured_timeout = WEB_WAIT_SECONDS
+    provider_kind = "web-chat" if is_web else str(
+        routed.get("provider.name") if routed is not None else ""
+    )
+    token_limited_kinds = {
+        "openai", "openai-compatible", "anthropic", "gemini", "ollama", "local",
+    }
+    cli_kinds = {
+        "codex-cli", "claude-cli", "copilot-cli", "assistant-cli", "gemini-cli",
+    }
+    token_control = (
+        "provider_page_uncontrolled" if is_web
+        else "nexus_requested_maximum" if provider_kind in token_limited_kinds
+        else "provider_cli_uncontrolled"
+    )
+    if is_web:
+        provider_capture_bytes: int | None = None
+        provider_capture_policy = "provider_page_answer_bridge"
+        structured_capture_policy = "provider_page_answer_bridge"
+    elif provider_kind in cli_kinds:
+        provider_capture_bytes = max(2_000_000, configured_output)
+        provider_capture_policy = "cli_plain_response_fixed"
+        structured_capture_policy = "schema_derived"
+    else:
+        provider_capture_bytes = max(
+            PROVIDER_TRANSPORT_OUTPUT_BYTES, configured_output
+        )
+        provider_capture_policy = "provider_http_or_process_transport"
+        structured_capture_policy = "same_fixed_transport"
+    return {
+        "input_characters": MOST_LETTERS,
+        "answer_characters": LONGEST_ANSWER,
+        "provider_kind": provider_kind,
+        "provider_capture_bytes": provider_capture_bytes,
+        "provider_capture_policy": provider_capture_policy,
+        "structured_capture_policy": structured_capture_policy,
+        "turn_timeout_seconds": configured_timeout,
+        "configured_provider_output_tokens": (
+            None if token_control != "nexus_requested_maximum" else (
+                int(routed.get("provider.max_output_tokens")) if routed is not None else 65_536
+            )
+        ),
+        "output_token_control": token_control,
+        "history_turns": MOST_KEPT,
+        "attachments": {
+            "count": MOST_ATTACHMENTS,
+            "each_bytes": MOST_ATTACHMENT_BYTES,
+            "total_bytes": MOST_ATTACHMENTS_BYTES,
+            "text_characters_each": MOST_ATTACHMENT_TEXT,
+        },
+        "overflow_policy": "reject_without_truncation",
+        "note": (
+            "Nexus never clips prompts or answers. A provider can have a smaller "
+            "model-specific context window; its redacted reason will be shown if so."
+        ),
+    }
+
+
+_ONE_OUTER_FENCE = re.compile(
+    r"\A\s*```(?:json|JSON)?[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```\s*\Z"
+)
+
+
+def _structured_value(text: str) -> Any:
+    """Decode a native JSON answer or one *outer* web-style JSON fence.
+
+    Matching the whole response matters: taking the first fence corrupts JSON
+    whenever a file body inside the result itself contains Markdown fences.
+    """
+
+    held = str(text or "").strip()
+    fenced = _ONE_OUTER_FENCE.fullmatch(held)
+    if fenced:
+        held = fenced.group("body").strip()
+    return json.loads(held)
+
+
+def _contract_failure(text: str, response_format: ResponseFormat) -> str:
+    from . import contracts
+
+    try:
+        value = _structured_value(text)
+    except json.JSONDecodeError as exc:
+        return f"response is not valid JSON ({exc.msg} at character {exc.pos})"
+    failures = contracts.problems(value, response_format.schema)
+    return "; ".join(failures[:8])
+
+
+def _complete_with_one_schema_repair(
+    provider, request: ProviderRequest, redactor: CredentialRedactor
+):  # type: ignore[no-untyped-def]
+    """Complete once, with exactly one correction for a malformed contract.
+
+    This is intentionally below orchestration so every stateless CLI/API route
+    gets the same bounded recovery. Consumer web chats keep their existing
+    delivery-aware repair path because resending there can duplicate an
+    uncertain browser side effect.
+    """
+
+    response = provider.complete(request)
+    if request.response_format is None:
+        return response
+    failure = _contract_failure(response.text, request.response_format)
+    if not failure:
+        return response
+    if not bool(getattr(provider, "structured_retry_is_safe", False)):
+        raise ChatError(
+            f"The assistant returned malformed {request.response_format.name} JSON. "
+            "Nexus did not retry because this provider call is not proven side-effect-free: "
+            f"{failure}"
+        )
+    # The malformed response is provider output and may echo credentials from
+    # context.  Redact before it enters the retry prompt; never put the raw
+    # payload in a user-facing exception, transcript, or collaboration ledger.
+    rejected = redactor.text(str(response.text or ""))
+    excerpt_limit = 16_000
+    if len(rejected) > excerpt_limit:
+        rejected_excerpt = (
+            rejected[:8_000]
+            + "\n...[middle omitted from repair prompt; original was not altered]...\n"
+            + rejected[-8_000:]
+        )
+    else:
+        rejected_excerpt = rejected
+    correction = (
+        "STRUCTURED FORMAT CORRECTION (one and only retry)\n"
+        f"Your previous answer did not match {request.response_format.name}: {failure}.\n"
+        "Return the complete answer again as one JSON value matching the supplied "
+        "schema. Do not add prose or an outer wrapper.\n\n"
+        f"PREVIOUS ANSWER (sha256 {hashlib.sha256(rejected.encode('utf-8')).hexdigest()})\n"
+        + rejected_excerpt
+    )
+    repaired = provider.complete(replace(
+        request,
+        messages=[*request.messages, {"role": "assistant", "content": rejected_excerpt},
+                  {"role": "user", "content": correction}],
+        prefer_existing_conversation=False,
+    ))
+    second_failure = _contract_failure(repaired.text, request.response_format)
+    if second_failure:
+        raise ChatError(
+            f"The assistant returned malformed {request.response_format.name} JSON twice. "
+            f"Nexus kept the real cause and stopped instead of applying a partial result: "
+            f"{second_failure}"
+        )
+    return repaired
+
+
+def _checked_answer(text: str, who: str = "The assistant") -> str:
+    held = str(text or "").strip()
+    if not held:
+        raise ChatError(f"{who} answered with nothing at all.")
+    if len(held) > LONGEST_ANSWER:
+        raise ChatError(
+            f"{who} returned {len(held):,} characters, above Nexus's disclosed "
+            f"{LONGEST_ANSWER:,}-character answer limit. Nexus did not save or "
+            "truncate the answer; resume with a smaller/file-backed result."
+        )
+    return held
 
 
 def say(
@@ -1274,6 +1498,7 @@ def say(
             recipients=recipients,
             conversation_key=conversation_key,
             prefer_existing_conversation=prefer_existing_conversation,
+            max_output_tokens=int(routed.get("provider.max_output_tokens") or 65_536),
         )
 
 
@@ -1294,6 +1519,7 @@ def _ask_and_keep(
     recipients=None,
     conversation_key="",
     prefer_existing_conversation=False,
+    max_output_tokens=65_536,
 ) -> dict[str, Any]:
     so_far = read_it(config, route, filed_as)
     eligible = [
@@ -1323,7 +1549,7 @@ def _ask_and_keep(
         messages=messages,
         model=model,
         temperature=0.3,
-        max_output_tokens=2048,
+        max_output_tokens=max(1, int(max_output_tokens)),
         timeout_seconds=LONGEST_WAIT_SECONDS,
         attachments=list(provider_attachments or []),
         conversation_key=str(
@@ -1340,7 +1566,7 @@ def _ask_and_keep(
             "messages": request.messages, "response_format": bool(request.response_format),
         }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         with provider_effect(config, route, request.conversation_key, effect_digest):
-            answered = provider.complete(request)
+            answered = _complete_with_one_schema_repair(provider, request, redactor)
     except cancellation.ChatCancelled:
         # Stop is control flow, not a provider refusal.  Turning it into a
         # ChatError makes multi-round collaboration treat the user's stop as a
@@ -1361,9 +1587,10 @@ def _ask_and_keep(
         ) from exc
     # It answered, so whatever it said last time is over.
     _write_down_that_it_would_not(config, route, "")
-    back = redactor.text(str(getattr(answered, "text", "") or "").strip())
-    if not back:
-        raise ChatError(f"{named or 'The assistant'} answered with nothing at all.")
+    back = _checked_answer(
+        redactor.text(str(getattr(answered, "text", "") or "")),
+        named or "The assistant",
+    )
     turns = so_far + [
         Said(
             who="you",
@@ -1381,7 +1608,7 @@ def _ask_and_keep(
         ),
         Said(
             who="them",
-            text=back[:LONGEST_ANSWER],
+            text=back,
             at=_now(),
             milliseconds=int((time.monotonic() - started) * 1000),
             model=model,
@@ -1432,7 +1659,7 @@ def ask_once(
             messages=[{"role": "user", "content": redactor.text(asked)}],
             model=str(routed.get("provider.model") or ""),
             temperature=0.2,
-            max_output_tokens=4096,
+            max_output_tokens=max(1, int(routed.get("provider.max_output_tokens") or 65_536)),
             timeout_seconds=LONGEST_WAIT_SECONDS,
             response_format=response_format,
             attachments=list(provider_attachments or []),
@@ -1447,7 +1674,11 @@ def ask_once(
             "messages": request.messages, "response_format": bool(response_format),
         }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         with provider_effect(config, named, request.conversation_key, effect_digest):
-            response = provider.complete(request)
+            response = (
+                provider.complete(request)
+                if named.startswith("web:")
+                else _complete_with_one_schema_repair(provider, request, redactor)
+            )
     except cancellation.ChatCancelled:
         # Collaboration catches this exact type and aborts the whole request.
         # Do not flatten it into an ordinary per-agent failure that the next
@@ -1459,11 +1690,11 @@ def ask_once(
                 redactor.text(f"{named or 'The assistant'} was asked and did not answer: {_in_plain_words(exc)}")
             )
         ) from exc
-    answer = redactor.text(str(response.text or "").strip())
-    if not answer:
-        raise ChatError(f"{named or 'The assistant'} answered with nothing at all.")
+    answer = _checked_answer(
+        redactor.text(str(response.text or "")), named or "The assistant"
+    )
     return {
-        "text": answer[:LONGEST_ANSWER],
+        "text": answer,
         "milliseconds": int((time.monotonic() - started) * 1000),
         "model": (
             f"{(web_chats.active().route(named) or {}).get('provider', 'web')} web chat"
@@ -1489,7 +1720,7 @@ def keep_exchange(
     with _the_lock_for(_filed_under(filed_as or route)):
         turns = read_it(config, route, filed_as) + [
             Said("you", redactor.text(_check_what_was_typed(text)), _now(), attachments=list(attachments or [])),
-            Said("them", redactor.text(answer)[:LONGEST_ANSWER], _now(), milliseconds, model),
+            Said("them", _checked_answer(redactor.text(answer)), _now(), milliseconds, model),
         ]
         _keep_it(config, route, turns, filed_as)
     return {
@@ -1523,7 +1754,9 @@ def keep_failed_exchange(
 
     redactor = CredentialRedactor(config)
     safe_text = redactor.text(_check_what_was_typed(text))
-    safe_error = redactor.text(str(error or "Nexus did not receive an answer")).strip()
+    safe_error = bounded_redacted_text(
+        redactor, error or "Nexus did not receive an answer", 65_536
+    ).strip()
     safe_state = re.sub(r"[^a-z0-9_-]", "", str(state or "failed").lower())[:40] or "failed"
     run_note = f" Run {str(run_id)[:64]}." if run_id else ""
     if safe_state in {"delivery_unknown", "outcome_unknown"}:
@@ -1544,14 +1777,14 @@ def keep_failed_exchange(
             "you", safe_text, now, attachments=list(attachments or []),
             speaker_name="You", phase="user_prompt",
         ))
-        for contribution in list(contributions or [])[:16]:
+        for contribution in list(contributions or []):
             if not isinstance(contribution, dict) or not str(
                 contribution.get("text") or ""
             ).strip():
                 continue
             turns.append(Said(
                 "them",
-                redactor.text(str(contribution.get("text") or ""))[:LONGEST_ANSWER],
+                _checked_answer(redactor.text(str(contribution.get("text") or ""))),
                 now,
                 max(0, int(contribution.get("milliseconds") or 0)),
                 str(contribution.get("model") or "")[:200],
@@ -1563,7 +1796,7 @@ def keep_failed_exchange(
                 phase=str(contribution.get("phase") or "agent_reply")[:40],
             ))
         turns.append(Said(
-            "them", outcome[:LONGEST_ANSWER], now,
+            "them", _checked_answer(outcome, "Nexus"), now,
             model=f"nexus/{safe_state}", speaker_id="nexus",
             speaker_name="Nexus", recipient_name="You", phase="nexus_error",
         ))
@@ -1623,7 +1856,7 @@ def keep_multiparty_exchange(
             ))[:240]
             turns.append(Said(
                 "them",
-                redactor.text(str(contribution.get("text") or ""))[:LONGEST_ANSWER],
+                _checked_answer(redactor.text(str(contribution.get("text") or ""))),
                 now,
                 int(contribution.get("milliseconds") or 0),
                 str(contribution.get("model") or ""),
@@ -1637,7 +1870,7 @@ def keep_multiparty_exchange(
                 ))[:80],
             ))
         turns.append(Said(
-            "them", redactor.text(answer)[:LONGEST_ANSWER], now,
+            "them", _checked_answer(redactor.text(answer)), now,
             milliseconds, model,
             speaker_id=lead_id, speaker_name=lead_name,
             speaker_route=str(lead.get("who") or "")[:120],
@@ -1708,9 +1941,6 @@ def ask_everyone(config: LoadedConfig, text: str) -> list[dict[str, Any]]:
 # reason was one line out of a screen of noise; it is not enough now that the
 # tools which will not answer are told to say what they know about themselves as
 # well, and cutting that off in the middle wastes the part that says what to do.
-LONGEST_REASON = 900
-
-
 def _in_plain_words(exc: Exception) -> str:
     """The sentence inside what a tool printed, rather than the whole of it.
 
@@ -1731,8 +1961,8 @@ def _in_plain_words(exc: Exception) -> str:
                 # upstream's own JSON one after the other, and this branch
                 # used to hand the page back with its tags on.
                 before = _without_markup(said[:start]).strip()
-                return f"{before} {inside.strip()}".strip()[:LONGEST_REASON]
-    return _without_markup(said)[:LONGEST_REASON]
+                return f"{before} {inside.strip()}".strip()
+    return _without_markup(said)
 
 
 # How many braces are tried before giving up looking for the JSON.
@@ -1767,8 +1997,9 @@ def _the_answer_tacked_on_the_end(said: str) -> tuple[dict[str, Any] | None, int
 _OPENS_A_DOCUMENT = re.compile(
     r"^[^<]{0,200}<\s*(?:!doctype\s+html\b|html\s*[>\s])", re.IGNORECASE
 )
-# How much of a page is looked at. Whoever reads an error page already trims it
-# to well under this; the cap is here so that stays true if one day they do not.
+# Historical diagnostic threshold retained for compatibility with callers and
+# tests. Pages are now parsed in full; any durable cause cap is applied only
+# after credential redaction by ``bounded_redacted_text``.
 MOST_TO_READ = 20_000
 # What a page says in a tag that is worth nothing to a person.
 _NOT_WORTH_READING = frozenset({"viewport", "generator", "referrer", "theme-color"})
@@ -1872,13 +2103,6 @@ def _without_markup(said: str) -> str:
     # about half tags that had no business being applied to it.
     if not _OPENS_A_DOCUMENT.match(said):
         return said
-    if len(said) > MOST_TO_READ:
-        said = said[:MOST_TO_READ]
-        # A tag cut in half is read as words and shows up as `< di`. Only the
-        # half tag goes, and only when there is something left without it.
-        opened, shut = said.rfind("<"), said.rfind(">")
-        if opened > shut and opened > 0:
-            said = said[:opened]
     words = _the_words_in(said)
     if words is None:
         return said

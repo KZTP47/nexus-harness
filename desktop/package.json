@@ -1,15 +1,16 @@
 {
   "name": "our-harness-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Desktop window for the Nexus Harness control panel",
   "main": "main.js",
   "private": true,
   "dependencies": {
-    "playwright-core": "^1.62.1"
+    "playwright-core": "1.62.1"
   },
   "scripts": {
     "start": "electron .",
     "test": "node --test",
+    "prebuild": "python ../scripts/prepare_windows_runtime.py && python ../scripts/smoke_bundled_playwright.py && python ../scripts/prepare_build_info.py",
     "build": "electron-builder",
     "smoke": "node smoke.js",
     "smoke:packaged": "node packaged.smoke.js",
@@ -36,6 +37,7 @@
       "web-chat-shell-preload.js",
       "pages/**",
       "nexus-harness.ico",
+      "build-info.json",
       "package.json",
       "!**/*.test.js",
       "!smoke.js",
@@ -46,7 +48,8 @@
     ],
     "win": {
       "target": "nsis",
-      "icon": "nexus-harness.ico"
+      "icon": "nexus-harness.ico",
+      "artifactName": "Nexus-Harness-Setup-${version}-UNSIGNED-DEV.${ext}"
     },
     "mac": {
       "target": "dmg",
@@ -67,6 +70,14 @@
       {
         "from": "../scripts/harness.py",
         "to": "harness/scripts/harness.py"
+      },
+      {
+        "from": "runtime",
+        "to": "runtime"
+      },
+      {
+        "from": "../THIRD_PARTY_NOTICES.md",
+        "to": "THIRD_PARTY_NOTICES.md"
       }
     ],
     "nsis": {
@@ -75,7 +86,11 @@
       "installerHeaderIcon": "nexus-harness.ico",
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "Nexus Harness"
+      "shortcutName": "Nexus Harness",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false
     }
   },
   "author": "Nexus Harness"

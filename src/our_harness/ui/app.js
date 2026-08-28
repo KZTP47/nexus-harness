@@ -745,6 +745,29 @@ function renderCheckup() {
     if (step.id === "provider") item.append(modelSetup());
     list.append(item);
   }
+  updateQuickReadiness();
+}
+
+function updateQuickReadiness() {
+  const button = $("quickRun");
+  const message = $("quickReadiness");
+  if (!button || !message || !checkup) return;
+  const bootstrap = Boolean($("quickBootstrap")?.checked);
+  const missing = checkup.steps
+    .filter((step) => !step.done && !(bootstrap && ["stack", "commands", "suite"].includes(step.id)))
+    .map((step) => step.title);
+  button.disabled = missing.length > 0;
+  if (missing.length) {
+    message.className = "callout";
+    message.textContent = `Finish setup before starting: ${missing.join(", ")}. Use the steps above, then press Check again.`;
+    button.title = message.textContent;
+  } else {
+    message.className = "callout good";
+    message.textContent = bootstrap
+      ? "Bootstrap ready: Nexus will create runnable test infrastructure first, then use it to verify the goal."
+      : "Ready: every effective model route is connected and Nexus has a real test command and check suite for verifying the result.";
+    button.title = "Start a verified long-horizon run";
+  }
 }
 
 // Whether somebody has opened or closed "Ways to connect a model" by hand.
@@ -892,8 +915,20 @@ function fillDoItBox(box, job) {
 async function quickRun() {
   const task = $("quickTask").value.trim();
   if (!task) { showError("Say what the harness should do first."); $("quickTask").focus(); return; }
+  const bootstrap = Boolean($("quickBootstrap")?.checked);
+  const missing = (checkup?.steps || []).filter(
+    (step) => !step.done && !(bootstrap && ["stack", "commands", "suite"].includes(step.id))
+  );
+  if (!checkup || missing.length) {
+    updateQuickReadiness();
+    showError("Finish the setup steps above before starting. Nexus will not begin work it cannot verify.");
+    $("quickReadiness").scrollIntoView({behavior: "smooth", block: "center"});
+    return;
+  }
   try {
-    await request("/api/run", {method: "POST", body: JSON.stringify({task, dry_run: $("quickDryRun").checked})});
+    await request("/api/run", {method: "POST", body: JSON.stringify({
+      task, dry_run: $("quickDryRun").checked, bootstrap_tests: bootstrap,
+    })});
     announce("Started. Open Workflow to watch the run log.");
     appendEvent("run", "Accepted");
     switchView("workflow");
@@ -4305,7 +4340,7 @@ function bindEvents() {
   ["nodeLabel", "nodeProvider", "nodeModel", "nodeRoleName", "nodePrompt", "nodeRole", "mergeSlots", "mergeOutput"].forEach((id) => $(id).addEventListener("change", updateSelectedNode)); $("nodeCapabilities").addEventListener("change", updateSelectedNode); $("nodeAgentRef").addEventListener("change", () => { applyAgentAssignment($("nodeAgentRef"), $("nodeProvider"), $("nodeModel"), $("nodeRoleName"), $("nodeCapabilities")); updateSelectedNode(); });
   ["edgeMode", "edgeCondition", "edgeVariables", "edgeTargetSlot", "edgeReturnFields", "maxIterations", "temperatureDecay", "loopTimeout"].forEach((id) => $(id).addEventListener("change", updateSelectedEdge)); $("deleteNode").addEventListener("click", () => selected?.kind === "node" && removeNode(selected.id)); $("deleteEdge").addEventListener("click", () => selected?.kind === "edge" && removeEdge(selected.id));
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
-  $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
+  $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickBootstrap").addEventListener("change", updateQuickReadiness); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
   window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("moreOptionsEnabled").addEventListener("change", changeMoreOptionsPreference); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
@@ -5772,6 +5807,41 @@ let talkOpen = "";       // whose conversation is on screen
 let talkBusy = false;    // waiting for an answer
 let talkStopping = false;
 let talkBusyRequest = null;
+// Updated from the backend on every chat read.  The generous default only
+// covers startup before that response lands; the server remains authoritative.
+let chatLimits = {
+  input_characters: 200000,
+  answer_characters: 8000000,
+  configured_provider_output_tokens: 65536,
+  provider_capture_bytes: 100000000,
+  turn_timeout_seconds: 600,
+  overflow_policy: "reject_without_truncation",
+};
+const swarmChatLimits = new Map();
+
+function limitsForSwarmChat(agentId) {
+  return swarmChatLimits.get(String(agentId || "")) || chatLimits;
+}
+
+function outputBudgetFact(limits) {
+  if (limits.output_token_control === "provider_page_uncontrolled") {
+    return "the connected provider page controls its own output tokens";
+  }
+  if (limits.output_token_control === "nexus_requested_maximum") {
+    return `${Number(limits.configured_provider_output_tokens).toLocaleString()} requested output tokens`;
+  }
+  return "this provider CLI/service controls its own output tokens";
+}
+
+function captureBudgetFact(limits) {
+  if (limits.provider_capture_policy === "provider_page_answer_bridge") {
+    return `${Number(limits.answer_characters || 8000000).toLocaleString()}-character web answer bridge`;
+  }
+  if (limits.provider_capture_policy === "cli_plain_response_fixed") {
+    return `${Number(limits.provider_capture_bytes || 2000000).toLocaleString()}-byte ordinary CLI capture; structured work uses schema-derived capture`;
+  }
+  return `${Number(limits.provider_capture_bytes || 100000000).toLocaleString()}-byte provider transport capture`;
+}
 // Which refresh is the newest. Looking over the machine runs each assistant's
 // own tool, which takes about a second, so an old one can land long after
 // somebody has moved on - and used to write its words over theirs.
@@ -5785,6 +5855,15 @@ async function refreshTalk(who, quietly) {
     if (mine !== talkNewestRefresh) return;  // a newer look started while this one ran
     talkWho = said.who || [];
     talkOpen = said.open || "";
+    if (said.limits && typeof said.limits === "object") chatLimits = said.limits;
+    const outputFact = outputBudgetFact(chatLimits);
+    $("talkBudget").textContent =
+      `Effective budget: ${Number(chatLimits.input_characters || 200000).toLocaleString()} input characters, `
+      + `${outputFact}, `
+      + `${Number(chatLimits.answer_characters || 8000000).toLocaleString()} answer characters, `
+      + `${captureBudgetFact(chatLimits)}, `
+      + `${Number(chatLimits.turn_timeout_seconds || 600).toLocaleString()} seconds. `
+      + "Overflow is rejected without truncation; attach text files for larger reference material.";
     renderTalkWho();
     renderTalkThread(said.said || []);
     // Quietly, when this is a tidy-up after something the person just did.
@@ -5890,8 +5969,11 @@ function renderTalkThread(said) {
 
 function countWhatIsTyped() {
   const box = $("talkBox");
-  const left = Number(box.maxLength || 6000) - box.value.length;
-  $("talkCount").textContent = left < 400 ? `${left} letters left` : "";
+  const typed = box.value.length;
+  const limit = Number(chatLimits.input_characters || 200000);
+  $("talkCount").textContent = typed > limit
+    ? `${(typed - limit).toLocaleString()} characters over the ${limit.toLocaleString()} limit — nothing will be truncated`
+    : `${typed.toLocaleString()} / ${limit.toLocaleString()} characters`;
 }
 
 async function sendWhatIsTyped() {
@@ -5899,6 +5981,10 @@ async function sendWhatIsTyped() {
   const words = box.value.trim();
   const one = talkTheOpenOne();
   if (!words) { sayInTalk("Type something first."); return; }
+  if (words.length > Number(chatLimits.input_characters || 200000)) {
+    sayInTalk("This message is over the displayed limit. Nexus did not truncate it; split it or attach a file.");
+    return;
+  }
   if (!one) { sayInTalk("Nobody is set up to talk to yet."); return; }
   if (talkBusy) { sayInTalk("Still waiting for the last answer."); return; }
   talkBusy = true;
@@ -6155,6 +6241,10 @@ async function boot() {
     const value = await request("/api/bootstrap");
     token = value.token;
     startedId = value.started_id || "";
+    if (value.runtime) {
+      $("runtimeIdentity").textContent = `Nexus ${value.runtime.version} · ${value.runtime.commit || "unknown commit"} · Python ${value.runtime.python_version} · local port ${value.runtime.port} · process ${value.runtime.process_id}`;
+      $("runtimeIdentity").title = `Build: ${value.runtime.build_kind || "unknown"}\nProject root: ${value.runtime.project_root}\nRuntime: ${value.runtime.python_executable}`;
+    }
     // Event wiring happens before bootstrap, but the token-protected web-chat
     // courier cannot start until this point. Start it explicitly now instead
     // of relying on a later timer tick to rescue the first no-token attempt.
@@ -6236,6 +6326,15 @@ let theBigChatComposerKey = "";
 // objective no-progress guard remains active so this is not an infinite-loop switch.
 const swarmChatRoundPolicies = new Map();
 const DEFAULT_FINITE_TEAM_ROUNDS = 12;
+// A paused or not-yet-verified project run belongs to one exact saved pair
+// chat. Keep its opaque resume token and mechanically enforced destinations
+// outside the rendered cards so minimising, maximising, switching chats, or
+// reloading the panel cannot strand work which the server says is resumable.
+const SWARM_WORK_RECOVERIES_KEY = "nexus.swarm.work-recoveries.v1";
+const SWARM_RECOVERABLE_WORK_STATUSES = new Set([
+  "paused_for_user", "applied_unverified", "needs_verification",
+]);
+const swarmWorkRecoveries = loadSwarmWorkRecoveries();
 // A long provider request remains one HTTP call, but its truthful Nexus stages
 // arrive through a second, lightweight activity feed.  This map lets both the
 // movable and maximised views show the same live state.
@@ -6349,6 +6448,196 @@ function activeConversationFor(agentId) {
 
 function swarmChatKey(agentId) {
   return `${agentId}:${activeConversationFor(agentId)?.id || "legacy"}`;
+}
+
+function frozenWorkRecovery(value) {
+  const roots = Array.isArray(value?.allowedWriteRoots)
+    ? value.allowedWriteRoots.map((one) => String(one)).filter(Boolean) : [];
+  const questions = Array.isArray(value?.questions)
+    ? value.questions.map((one) => String(one)).filter(Boolean) : [];
+  const remaining = Array.isArray(value?.remaining)
+    ? value.remaining.map((one) => String(one)).filter(Boolean) : [];
+  return Object.freeze({
+    status: String(value?.status || ""),
+    resumeToken: String(value?.resumeToken || ""),
+    // This array is never exposed through an editable control. Freezing it also
+    // makes accidental in-memory widening fail instead of silently changing the
+    // authority later sent back to the server.
+    allowedWriteRoots: Object.freeze(roots),
+    writeScopeRestricted: Boolean(value?.writeScopeRestricted),
+    contextToolBudget: Object.freeze({...value?.contextToolBudget}),
+    questions: Object.freeze(questions),
+    remaining: Object.freeze(remaining),
+    objective: String(value?.objective || ""),
+    answerDraft: String(value?.answerDraft || ""),
+    projectId: String(value?.projectId || ""),
+    projectName: String(value?.projectName || ""),
+    updatedAt: String(value?.updatedAt || new Date().toISOString()),
+  });
+}
+
+function loadSwarmWorkRecoveries() {
+  const found = new Map();
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(SWARM_WORK_RECOVERIES_KEY) || "{}");
+    for (const [key, value] of Object.entries(saved || {}).slice(-50)) {
+      const recovery = frozenWorkRecovery(value);
+      if (key && SWARM_RECOVERABLE_WORK_STATUSES.has(recovery.status)
+          && recovery.resumeToken && recovery.objective) found.set(key, recovery);
+    }
+  } catch (_) {
+    // Storage is a recovery aid. A denied or corrupt local store must not stop
+    // ordinary chat from opening.
+  }
+  return found;
+}
+
+function saveSwarmWorkRecoveries() {
+  try {
+    const entries = [...swarmWorkRecoveries.entries()].slice(-50);
+    window.localStorage.setItem(SWARM_WORK_RECOVERIES_KEY,
+      JSON.stringify(Object.fromEntries(entries)));
+  } catch (_) { /* local persistence may be unavailable */ }
+}
+
+function workRecoveryFor(agentId) {
+  return swarmWorkRecoveries.get(swarmChatKey(agentId)) || null;
+}
+
+function rememberWorkRecoveryForKey(key, answered, objective, conversation = null) {
+  const status = String(answered?.status || answered?.verification_status || "");
+  const token = String(answered?.resume_token || "");
+  if (!SWARM_RECOVERABLE_WORK_STATUSES.has(status) || !token) {
+    if (answered?.goal_complete === true || answered?.status === "complete") {
+      swarmWorkRecoveries.delete(key);
+      saveSwarmWorkRecoveries();
+    }
+    return null;
+  }
+  const before = swarmWorkRecoveries.get(key);
+  // The server normally returns the same roots on every pass. Once this token
+  // has been saved, retain the first set even if a later response or renderer
+  // accidentally supplies something different: resume authority never widens.
+  const sameRun = before?.resumeToken === token;
+  const project = answered?.project || {};
+  const recovery = frozenWorkRecovery({
+    status,
+    resumeToken: token,
+    allowedWriteRoots: sameRun
+      ? before.allowedWriteRoots : (answered?.allowed_write_roots || []),
+    writeScopeRestricted: sameRun
+      ? before.writeScopeRestricted : Boolean(answered?.write_scope_restricted),
+    contextToolBudget: answered?.context_tool_budget || before?.contextToolBudget || {},
+    questions: answered?.questions || [],
+    remaining: answered?.remaining || [],
+    objective: sameRun ? before.objective : objective,
+    answerDraft: sameRun ? before.answerDraft : "",
+    projectId: sameRun ? before.projectId : (project.id || conversation?.project || ""),
+    projectName: sameRun ? before.projectName : (project.name || "the selected project"),
+    updatedAt: new Date().toISOString(),
+  });
+  swarmWorkRecoveries.set(key, recovery);
+  saveSwarmWorkRecoveries();
+  return recovery;
+}
+
+function updateWorkRecoveryAnswer(agentId, answer, source) {
+  const key = swarmChatKey(agentId);
+  const before = swarmWorkRecoveries.get(key);
+  if (!before) return;
+  swarmWorkRecoveries.set(key, frozenWorkRecovery({...before, answerDraft: answer}));
+  saveSwarmWorkRecoveries();
+  const card = theChatCardFor(agentId);
+  const fields = [card?.querySelector(".work-recovery-answer")];
+  if (theBigOne === agentId) fields.push($("theBigChatWorkRecovery")
+    ?.querySelector(".work-recovery-answer"));
+  for (const field of fields.filter(Boolean)) {
+    if (field !== source && field.value !== answer) field.value = answer;
+  }
+  renderWorkRecoveryButtons(agentId);
+}
+
+function workRecoveryTitle(status) {
+  return status === "paused_for_user"
+    ? "Project work paused for your answer"
+    : status === "needs_verification"
+      ? "Applied changes need verification"
+      : "Applied changes are not verified yet";
+}
+
+function fillWorkRecoveryPanel(panel, agentId) {
+  if (!panel) return;
+  const recovery = workRecoveryFor(agentId);
+  panel.hidden = !recovery;
+  panel.replaceChildren();
+  if (!recovery) return;
+  panel.dataset.status = recovery.status;
+  panel.append(make("h4", "work-recovery-title", workRecoveryTitle(recovery.status)));
+  panel.append(make("p", "work-recovery-status", recovery.status === "paused_for_user"
+    ? "Nexus changed no files. Answer below to continue this exact saved run."
+    : "Nexus has not claimed completion. Resume the same run so the team can verify or revise what was applied."));
+  const needs = recovery.questions.length ? recovery.questions : recovery.remaining;
+  if (needs.length) {
+    const heading = make("strong", "", recovery.questions.length
+      ? "Questions from the team" : "What remains");
+    const list = make("ul", "work-recovery-items");
+    for (const one of needs) list.append(make("li", "", one));
+    panel.append(heading, list);
+  }
+  const scope = make("details", "work-recovery-scope");
+  scope.append(make("summary", "", "Locked write destinations"));
+  scope.append(make("p", "hint",
+    `Project: ${recovery.projectName}. These destinations are read-only and cannot be widened while resuming.`));
+  const roots = make("ul", "work-recovery-roots");
+  for (const root of recovery.allowedWriteRoots) roots.append(make("li", "", root));
+  if (recovery.writeScopeRestricted && !recovery.allowedWriteRoots.length) {
+    roots.append(make("li", "", "No project path is writable until you start a new run with valid destinations."));
+  } else if (!recovery.allowedWriteRoots.length) {
+    roots.append(make("li", "", "No narrower subfolder was recorded; the original project scope remains in force."));
+  }
+  scope.append(roots);
+  if (recovery.contextToolBudget?.summary) {
+    scope.append(make("p", "hint", recovery.contextToolBudget.summary));
+  }
+  panel.append(scope);
+  const label = make("label", "work-recovery-answer-label",
+    recovery.status === "paused_for_user" ? "Your answer" : "Optional verification note");
+  const answer = make("textarea", "work-recovery-answer");
+  answer.rows = recovery.status === "paused_for_user" ? 3 : 2;
+  answer.value = recovery.answerDraft;
+  answer.placeholder = recovery.status === "paused_for_user"
+    ? "Answer the team's questions to resume"
+    : "Add context for the verification pass, or resume without a note";
+  answer.addEventListener("input", () => updateWorkRecoveryAnswer(agentId, answer.value, answer));
+  label.append(answer);
+  panel.append(label);
+  const row = make("div", "button-row work-recovery-actions");
+  const resume = make("button", "primary work-recovery-resume",
+    recovery.status === "paused_for_user" ? "Answer and resume" : "Resume verification");
+  resume.type = "button";
+  resume.addEventListener("click", () => resumeSwarmWork(agentId));
+  row.append(resume);
+  panel.append(row);
+}
+
+function renderWorkRecoveryButtons(agentId) {
+  const recovery = workRecoveryFor(agentId);
+  const unavailable = swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)
+    || !theSwarmAgent(agentId)?.ready;
+  const answerMissing = recovery?.status === "paused_for_user"
+    && !String(recovery.answerDraft || "").trim();
+  const card = theChatCardFor(agentId);
+  const buttons = [card?.querySelector(".work-recovery-resume")];
+  if (theBigOne === agentId) buttons.push($("theBigChatWorkRecovery")
+    ?.querySelector(".work-recovery-resume"));
+  for (const button of buttons.filter(Boolean)) button.disabled = unavailable || answerMissing;
+}
+
+function renderWorkRecovery(agentId) {
+  const card = theChatCardFor(agentId);
+  fillWorkRecoveryPanel(card?.querySelector(".swarm-chat-work-recovery"), agentId);
+  if (theBigOne === agentId) fillWorkRecoveryPanel($("theBigChatWorkRecovery"), agentId);
+  renderWorkRecoveryButtons(agentId);
 }
 
 function chatRoundPolicyFor(agentId) {
@@ -7890,6 +8179,7 @@ function setWhatCanBePressedInSwarm() {
     const busy = swarmBusy.has(theBigOne);
     const waiting = busy || swarmConversationSwitching.has(theBigOne);
     const stopping = swarmStopping.has(theBigOne);
+    const recovery = workRecoveryFor(theBigOne);
     for (const id of [
       "theBigChatSend", "theBigChatSolo", "theBigChatAttach",
       "theBigChatCollaborate", "theBigChatWork",
@@ -7899,8 +8189,11 @@ function setWhatCanBePressedInSwarm() {
     }
     const conversation = activeConversationFor(theBigOne);
     if ($("theBigChatWork")) {
-      $("theBigChatWork").disabled = waiting || (Boolean(conversation) && !conversation.project);
-      $("theBigChatWork").title = conversation && !conversation.project
+      $("theBigChatWork").disabled = waiting || Boolean(recovery)
+        || (Boolean(conversation) && !conversation.project);
+      $("theBigChatWork").title = recovery
+        ? "Resume the saved project-work run before starting another"
+        : conversation && !conversation.project
         ? "Choose this chat's active project first"
         : "Ask this pair to work together on the selected project";
     }
@@ -7914,6 +8207,7 @@ function setWhatCanBePressedInSwarm() {
       stop.disabled = !busy || stopping;
       stop.textContent = stopping ? "Stopping…" : "Stop";
     }
+    renderWorkRecoveryButtons(theBigOne);
   }
 }
 
@@ -8872,10 +9166,13 @@ function oneSwarmChatCard(held) {
   showActivityInPanel(activityPanel, swarmChatActivity.get(held.agent));
   card.append(activityPanel);
 
+  const recoveryPanel = make("section", "work-recovery swarm-chat-work-recovery");
+  fillWorkRecoveryPanel(recoveryPanel, held.agent);
+  card.append(recoveryPanel);
+
   const form = make("form", "swarm-chat-form");
   const box = make("textarea", "swarm-chat-box");
   box.rows = 6;
-  box.maxLength = 6000;
   box.placeholder = "What did you change and why?";
   box.setAttribute("aria-label", `What to say to ${agent.name}`);
   form.append(box);
@@ -9020,8 +9317,13 @@ function setWhatCanBePressedInAChat(card) {
   syncChatRoundPolicy(card.dataset.agent);
   const conversation = activeConversationFor(card.dataset.agent);
   card.querySelector(".swarm-chat-work").disabled = waiting || !agent || !agent.ready
+    || Boolean(workRecoveryFor(card.dataset.agent))
     || (Boolean(conversation) && !conversation.project);
+  card.querySelector(".swarm-chat-work").title = workRecoveryFor(card.dataset.agent)
+    ? "Resume the saved project-work run before starting another"
+    : "Ask connected project agents to plan, then apply validated file changes";
   card.querySelector(".swarm-chat-again").disabled = waiting || !agent;
+  renderWorkRecoveryButtons(card.dataset.agent);
 }
 
 function stoppedChatError(error) {
@@ -9076,6 +9378,9 @@ async function refreshTheChatFor(agentId) {
     if (activeConversationIdFor(agentId) !== conversationId
         || swarmChatRevisions.get(agentId) !== revision
         || swarmChatRevisions.get(revisionKey) !== revision) return;
+    if (said.limits && typeof said.limits === "object") {
+      swarmChatLimits.set(String(agentId), said.limits);
+    }
     keepWhatWasSaidTo(agentId, said.said || [], conversationId);
     countWhatIsTypedTo(agentId);
   } catch (error) {
@@ -9237,7 +9542,25 @@ function countWhatIsTypedTo(agentId) {
   const card = theChatCardFor(agentId);
   if (!card) return;
   const typed = card.querySelector(".swarm-chat-box").value.length;
-  card.querySelector(".swarm-chat-count").textContent = typed ? `${typed} letters` : "";
+  const limits = limitsForSwarmChat(agentId);
+  const limit = Number(limits.input_characters || 200000);
+  card.querySelector(".swarm-chat-count").textContent = typed > limit
+    ? `${(typed - limit).toLocaleString()} over ${limit.toLocaleString()} — not truncated`
+    : `${typed.toLocaleString()} / ${limit.toLocaleString()} characters`;
+  if (theBigOne === agentId) countWhatIsTypedInBigChat();
+}
+
+function countWhatIsTypedInBigChat() {
+  const box = $("theBigChatBox");
+  const counter = $("theBigChatCount");
+  if (!box || !counter) return;
+  const typed = box.value.length;
+  const limits = limitsForSwarmChat(theBigOne);
+  const limit = Number(limits.input_characters || 200000);
+  const outputFact = outputBudgetFact(limits);
+  counter.textContent = typed > limit
+    ? `${(typed - limit).toLocaleString()} characters over ${limit.toLocaleString()} — Nexus will not truncate or send it`
+    : `${typed.toLocaleString()} / ${limit.toLocaleString()} characters · answer hard cap ${Number(limits.answer_characters || 8000000).toLocaleString()} characters · ${outputFact} · ${captureBudgetFact(limits)}`;
 }
 
 function looksLikeProjectWork(words) {
@@ -9262,6 +9585,13 @@ function automaticRoundStopWords(answered) {
 function confirmProjectWork(agent, words, mode) {
   const needsConfirmation = mode === "work" || (mode === "auto" && looksLikeProjectWork(words));
   if (!needsConfirmation) return {allowed: true, confirmed: false};
+  if (workRecoveryFor(agent?.id)) {
+    const message = "Resume the saved project-work run before starting another file task in this chat.";
+    sayInTheChatFor(agent?.id, message);
+    if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
+    renderWorkRecovery(agent?.id);
+    return {allowed: false, confirmed: false};
+  }
   const conversation = activeConversationFor(agent?.id);
   const project = (conversation?.projects || []).find(
     (one) => one.id === conversation?.project
@@ -9274,6 +9604,111 @@ function confirmProjectWork(agent, words, mode) {
   return {allowed, confirmed: allowed};
 }
 
+function workResponseWords(answered, agentName = "The team", ordinaryWords = "") {
+  const status = String(answered?.status || answered?.verification_status || "");
+  const budget = answered?.context_tool_budget?.summary
+    ? ` ${answered.context_tool_budget.summary}` : "";
+  if (status === "paused_for_user") {
+    return "Project work paused safely. Answer the questions in the saved run card to continue." + budget;
+  }
+  if (status === "needs_verification") {
+    return "Changes were applied, but deterministic verification failed. Resume the saved run to verify or revise them." + budget;
+  }
+  if (status === "applied_unverified") {
+    return "Changes were applied but are not deterministically verified. Resume the saved run before treating the work as complete." + budget;
+  }
+  if (ordinaryWords) return ordinaryWords;
+  return answered.partial_provider_failure || automaticRoundStopWords(answered) || (answered?.changed?.length
+    ? `${agentName} answered. Nexus applied ${answered.changed.length} file change(s).`
+    : answered.routing?.requested === "auto" && answered.routing?.selected === "collaborate"
+      ? `${agentName} answered after Nexus automatically involved ${answered.collaborated_with?.length || 0} connected agent(s).`
+      : answered?.collaborated_with?.length
+        ? `${agentName} answered after hearing ${answered.collaborated_with.length} connected agent(s).`
+        : answered?.routing?.reason || `${agentName} answered.`);
+}
+
+async function resumeSwarmWork(agentId) {
+  const key = swarmChatKey(agentId);
+  const recovery = swarmWorkRecoveries.get(key);
+  const agent = theSwarmAgent(agentId);
+  const conversation = activeConversationFor(agentId);
+  if (!recovery || !agent || !conversation) return;
+  if (!agent.ready) {
+    sayInTheChatFor(agentId, agent.why_not || "This agent is not ready yet.");
+    return;
+  }
+  if (swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
+  const answers = String(recovery.answerDraft || "").trim();
+  if (recovery.status === "paused_for_user" && !answers) {
+    const message = "Answer the paused questions before resuming this run.";
+    sayInTheChatFor(agentId, message);
+    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    renderWorkRecoveryButtons(agentId);
+    return;
+  }
+  if (recovery.projectId && conversation.project !== recovery.projectId) {
+    const message = `Select ${recovery.projectName} for this chat before resuming its saved run.`;
+    sayInTheChatFor(agentId, message);
+    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    return;
+  }
+  swarmBusy.add(agentId);
+  swarmStopping.delete(agentId);
+  nextSwarmChatRevision(agentId);
+  const activity = beginSwarmChatActivity(agentId, "work", agent);
+  sayInTheChatFor(agentId, recovery.status === "paused_for_user"
+    ? "Resuming the saved run with your answer..."
+    : "Resuming deterministic verification for the saved run...");
+  if (theBigOne === agentId) $("theBigChatSaidBack").textContent =
+    "Resuming the exact saved project-work session...";
+  setWhatCanBePressedInSwarm();
+  renderWorkRecovery(agentId);
+  try {
+    const answered = await request("/api/swarm/say", {
+      method: "POST", body: JSON.stringify({
+        agent: agentId,
+        text: recovery.objective,
+        mode: "work",
+        attachments: [],
+        activity: activity.id,
+        chat: conversation.id,
+        allow_project_changes: true,
+        round_limit: selectedChatRoundLimit(agentId),
+        resume_session_id: recovery.resumeToken,
+        user_answers: answers,
+        // Clone the frozen authority for JSON serialization. It came from the
+        // original server response and has no editable UI path.
+        ...(recovery.writeScopeRestricted
+          ? {allowed_write_roots: [...recovery.allowedWriteRoots]} : {}),
+      }),
+    });
+    finishSwarmChatActivity(agentId, true);
+    keepWhatWasSaidTo(agentId, answered.said || [], conversation.id);
+    const next = rememberWorkRecoveryForKey(key, answered, recovery.objective, conversation);
+    if (next) {
+      swarmWorkRecoveries.set(key, frozenWorkRecovery({...next, answerDraft: ""}));
+      saveSwarmWorkRecoveries();
+    }
+    renderWorkRecovery(agentId);
+    const message = workResponseWords(answered, agent.name);
+    sayInTheChatFor(agentId, message);
+    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    refreshSwarm(true);
+  } catch (error) {
+    await refreshTheChatFor(agentId);
+    const message = String(error?.message || error);
+    sayInTheChatFor(agentId, message);
+    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    if (!stoppedChatError(error)) showError(message);
+    finishSwarmChatActivity(agentId, false, message);
+  } finally {
+    swarmBusy.delete(agentId);
+    swarmStopping.delete(agentId);
+    setWhatCanBePressedInSwarm();
+    renderWorkRecovery(agentId);
+  }
+}
+
 async function sendWhatIsTypedTo(agentId) {
   const mode = arguments[1] || "auto";
   const card = theChatCardFor(agentId);
@@ -9282,6 +9717,11 @@ async function sendWhatIsTypedTo(agentId) {
   const box = card.querySelector(".swarm-chat-box");
   const words = box.value.trim();
   if (!words) { sayInTheChatFor(agentId, "Type something first."); return; }
+  if (words.length > Number(limitsForSwarmChat(agentId).input_characters || 200000)) {
+    sayInTheChatFor(agentId,
+      "This message is over the displayed limit. Nexus kept the complete draft; split it or attach a file.");
+    return;
+  }
   if (!agent.ready) {
     sayInTheChatFor(agentId, agent.why_not || "This one is not set up yet.");
     return;
@@ -9296,6 +9736,8 @@ async function sendWhatIsTypedTo(agentId) {
   }
   const projectPermission = confirmProjectWork(agent, words, mode);
   if (!projectPermission.allowed) return;
+  const conversation = activeConversationFor(agentId);
+  const recoveryKey = swarmChatKey(agentId);
   // One agent at a time, not one chat at a time: two chats open on two
   // different agents can both be waiting, which is the whole point of having
   // several of them on the board.
@@ -9311,7 +9753,6 @@ async function sendWhatIsTypedTo(agentId) {
     : mode === "collaborate" ? "Relaying to connected agents..."
     : "Planning and validating project-file work...");
   try {
-    const conversation = activeConversationFor(agentId);
     const said = await request("/api/swarm/say", {
       method: "POST", body: JSON.stringify({
         agent: agentId, text: words, mode, attachments, activity: activity.id,
@@ -9321,6 +9762,7 @@ async function sendWhatIsTypedTo(agentId) {
       }),
     });
     finishSwarmChatActivity(agentId, true);
+    rememberWorkRecoveryForKey(recoveryKey, said, words, conversation);
     if (!theChatCardFor(agentId)) {
       // The chat was closed while the answer was on its way. It is kept, and is
       // there when it is opened again.
@@ -9331,13 +9773,15 @@ async function sendWhatIsTypedTo(agentId) {
     renderChatAttachments(agentId);
     countWhatIsTypedTo(agentId);
     keepWhatWasSaidTo(agentId, said.said || [], conversation?.id || "");
-    sayInTheChatFor(agentId, said.partial_provider_failure || automaticRoundStopWords(said) || (said.changed?.length
+    renderWorkRecovery(agentId);
+    const ordinaryWords = said.partial_provider_failure || automaticRoundStopWords(said) || (said.changed?.length
       ? `${agent.name} answered. Nexus applied ${said.changed.length} file change(s).`
       : said.routing?.requested === "auto" && said.routing?.selected === "collaborate"
         ? `${agent.name} answered after Nexus automatically involved ${said.collaborated_with?.length || 0} connected agent(s).`
-      : said.collaborated_with?.length
-        ? `${agent.name} answered after hearing ${said.collaborated_with.length} connected agent(s).`
-        : `${agent.name} answered.`));
+        : said.collaborated_with?.length
+          ? `${agent.name} answered after hearing ${said.collaborated_with.length} connected agent(s).`
+          : `${agent.name} answered.`);
+    sayInTheChatFor(agentId, workResponseWords(said, agent.name, ordinaryWords));
     // The list down the side carries the last thing said under each name, and
     // something was just said.
     refreshSwarm(true);
@@ -10407,6 +10851,7 @@ function rememberTheBigChatComposer() {
     direction: box.selectionDirection || "none",
   };
   theBigChatComposerDrafts.set(theBigChatComposerKey, state);
+  countWhatIsTypedInBigChat();
   return state;
 }
 
@@ -10909,6 +11354,7 @@ function renderTheBigChat() {
     name: one.name, type: one.type, size: one.size, dataLength: one.data?.length || 0,
   })))) renderChatAttachments(theBigOne);
   renderSwarmChatActivity(theBigOne);
+  renderWorkRecovery(theBigOne);
   if (bigChatPartChanged("doing", {
     doing: (swarmDoing?.turns || []).filter((one) => one.agent === theBigOne),
     trouble: agent?.trouble_last_time || "", fix: agent?.how_to_fix_it || "",
@@ -11083,6 +11529,13 @@ async function sendFromTheBigChat(mode = "auto") {
     box.focus();
     return;
   }
+  if (said.length > Number(limitsForSwarmChat(agentId).input_characters || 200000)) {
+    $("theBigChatSaidBack").textContent =
+      "This message is over the displayed limit. Nexus kept the complete draft; split it or attach a file.";
+    countWhatIsTypedInBigChat();
+    box.focus();
+    return;
+  }
   if (!agent?.ready) {
     $("theBigChatSaidBack").textContent = agent?.why_not || "This agent is not ready yet.";
     return;
@@ -11097,6 +11550,8 @@ async function sendFromTheBigChat(mode = "auto") {
   }
   const projectPermission = confirmProjectWork(agent, said, mode);
   if (!projectPermission.allowed) return;
+  const conversation = activeConversationFor(agentId);
+  const recoveryKey = swarmChatKey(agentId);
   swarmBusy.add(agentId);
   swarmStopping.delete(agentId);
   nextSwarmChatRevision(agentId);
@@ -11122,7 +11577,6 @@ async function sendFromTheBigChat(mode = "auto") {
     : mode === "collaborate" ? "Relaying to connected agents..."
     : "Planning and validating file changes...";
   try {
-    const conversation = activeConversationFor(agentId);
     const answered = await request("/api/swarm/say", {
       method: "POST", body: JSON.stringify({
         agent: agentId, text: said, mode, attachments, activity: activity.id,
@@ -11132,16 +11586,12 @@ async function sendFromTheBigChat(mode = "auto") {
       }),
     });
     finishSwarmChatActivity(agentId, true);
+    rememberWorkRecoveryForKey(recoveryKey, answered, said, conversation);
     swarmChatAttachments.delete(attachmentKey);
     renderChatAttachments(agentId);
     keepWhatWasSaidTo(agentId, answered.said || [], conversation?.id || "");
-    $("theBigChatSaidBack").textContent = answered.partial_provider_failure || automaticRoundStopWords(answered) || (answered.changed?.length
-      ? `Applied ${answered.changed.length} file change(s).`
-      : answered.routing?.requested === "auto" && answered.routing?.selected === "collaborate"
-        ? `Automatically involved ${answered.collaborated_with?.length || 0} connected agent(s).`
-      : answered.collaborated_with?.length
-        ? `Heard ${answered.collaborated_with.length} connected agent(s).`
-        : answered.routing?.reason || "Answered directly.");
+    renderWorkRecovery(agentId);
+    $("theBigChatSaidBack").textContent = workResponseWords(answered, agent.name);
     refreshSwarm(true);
   } catch (trouble) {
     if (theBigOne === agentId && swarmChatKey(agentId) === attachmentKey && !box.value) {

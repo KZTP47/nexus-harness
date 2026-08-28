@@ -776,6 +776,24 @@ class MemoryStore:
         self.connection.commit()
         return run_id
 
+    def ensure_external_run(
+        self, run_id: str, task: str, graph_version: str = "external-tools-v1",
+    ) -> None:
+        """Register a caller-owned durable run identity for the tool journal."""
+
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", str(run_id or "")):
+            raise HarnessError("External agent-tool run ID is invalid")
+        now = int(time.time())
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO runs(id, task, state, graph_version, started_at, updated_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    run_id, self.redact_text(task), "swarm_tools",
+                    graph_version, now, now,
+                ),
+            )
+
     def append_event(self, run_id: str, kind: str, node_id: str, payload: dict[str, Any], causation_id: str | None = None) -> str:
         event_id = uuid.uuid4().hex
         canonical = json.dumps(self.redact_value(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)

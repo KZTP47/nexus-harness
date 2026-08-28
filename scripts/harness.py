@@ -17,6 +17,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 11):
+    found = ".".join(str(part) for part in sys.version_info[:3])
+    raise SystemExit(f"Nexus Harness requires Python 3.11 or newer; this interpreter is {found}.")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from our_harness.cli import main  # noqa: E402  (the path has to come first)

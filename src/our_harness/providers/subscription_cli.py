@@ -3,7 +3,8 @@
 Some organisations have seats for Claude or GitHub Copilot but no API keys, and
 will never get any. Those assistants each ship a command line tool that is
 already signed in. This provider drives one of those tools as a plain program:
-it hands the prompt in on standard input, reads the answer back, and reports
+it uses the tool's documented non-interactive prompt channel (stdin for tools
+that support it, ``-p PROMPT`` for Copilot), reads the answer back, and reports
 usage as subscription work with no price attached.
 
 A recipe says how to talk to one tool: what to run, how to pass the model, and
@@ -25,8 +26,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..models import HarnessError, ProviderRequest, ProviderResponse
+from ..redaction import bounded_redacted_text
 from .base import Provider
-from .codex_cli import _minimal_codex_environment, _remaining, _run_bounded
+from .codex_cli import (
+    _minimal_codex_environment, _provider_capture_limit, _remaining, _run_bounded,
+)
 
 SUBSCRIPTION_KINDS = ("claude-cli", "copilot-cli", "assistant-cli")
 UNPRICED = "subscription-unpriced"
@@ -242,7 +246,12 @@ COPILOT_RECIPE = CliRecipe(
     label="GitHub Copilot command line",
     key_it_reads="GH_TOKEN",
     command=("copilot",),
-    arguments=("-p", "--allow-all-tools", "--model", "{model}"),
+    # Do not grant tools to an ordinary chat/structured-output request. The
+    # CLI's default permission boundary remains in force; project mutation is
+    # owned by Nexus transactions, not an opaque provider subprocess.
+    # The prompt is inserted as the value immediately after -p at runtime;
+    # stdin is not Copilot CLI's documented programmatic prompt contract.
+    arguments=("--model", "{model}"),
     text_field="",
     # GitHub documents `copilot login` as the CLI's interactive authentication
     # flow. It does not document a non-request status command, so an explicit
@@ -274,9 +283,10 @@ GEMINI_RECIPE = CliRecipe(
     id="gemini-cli",
     label="Gemini command line",
     command=("gemini",),
-    # The prompt goes in on standard input, which this reads when there is
-    # anything there. Nothing is auto-approved and no tools are allowed: this is
-    # a conversation, and a conversation that can change files is not one.
+    # The prompt goes in on standard input. Default approval mode does not
+    # auto-approve tools, but it is not a discovery-disable guarantee because
+    # machine/user policy can authorize tools; this route is therefore never
+    # automatically replayed for schema repair.
     arguments=("--output-format", "json", "--approval-mode", "default", "--model", "{model}"),
     text_field="response",
     # It says so with an object rather than a flag.
@@ -682,11 +692,19 @@ def _prompt(request: ProviderRequest) -> str:
 
 
 def _plain_text(raw: str) -> str:
-    """The answer when the tool prints text rather than JSON."""
+    """Unwrap only one fence that encloses the *entire* answer.
+
+    A first-fence search truncated structured results containing source-code
+    fences.  Leading/trailing prose now stays intact and is rejected by the
+    schema validator instead of being mistaken for a complete answer.
+    """
 
     text = raw.strip()
-    fenced = re.findall(r"```(?:[a-zA-Z0-9_-]*)\r?\n(.*?)```", text, re.DOTALL)
-    return (fenced[0].strip() if fenced else text)
+    fenced = re.fullmatch(
+        r"\s*```(?:[a-zA-Z0-9_-]*)[ \t]*\r?\n([\s\S]*?)\r?\n```\s*",
+        text,
+    )
+    return fenced.group(1).strip() if fenced else text
 
 
 # How much of a tool's own reason for refusing is worth reading. Far above a
@@ -708,6 +726,17 @@ class SubscriptionCLIProvider(Provider):
         # more.
         self._asked_with: list[str] = []
         self._deadline: float | None = None
+
+    @property
+    def structured_retry_is_safe(self) -> bool:
+        # Only shipped recipes whose argv below explicitly disables mutation
+        # can be replayed for a format-only correction. A custom argument list
+        # or generic assistant command may have side effects and is never
+        # retried automatically.
+        return (
+            self.settings.get("arguments") is None
+            and self.recipe.id == "claude-cli"
+        )
 
     def _command(self) -> list[str]:
         configured = self.settings.get("command") or list(self.recipe.command)
@@ -851,7 +880,13 @@ class SubscriptionCLIProvider(Provider):
         deadline_at = time.monotonic() + timeout
         self._deadline = deadline_at
         self._preflight(command, deadline_at)
-        output_limit = min(2_000_000, int(self.config.get("execution.max_output_bytes")))
+        # Provider result transport must be able to carry the response schemas
+        # Nexus itself supplies.  It is not the same budget as stdout from a
+        # project test command.
+        output_limit = _provider_capture_limit(
+            int(self.config.get("execution.max_output_bytes")),
+            request.response_format.schema if request.response_format is not None else None,
+        )
         argv = recipe.argv(command, str(request.model or ""))
         image_paths = [
             str(one.get("path") or "") for one in request.attachments
@@ -872,11 +907,47 @@ class SubscriptionCLIProvider(Provider):
             argv.extend(["--allowed-tools", "read_file"])
             for folder in sorted({str(Path(path).parent) for path in image_paths}):
                 argv.extend(["--include-directories", folder])
+        elif recipe.id == "claude-cli" and self.settings.get("arguments") is None:
+            # Claude Code otherwise inherits its normal tool set even in -p
+            # mode. Empty --tools makes this an answer-only provider call.
+            argv.extend(["--tools", ""])
+        # Gemini's --allowed-tools is an approval allow-list, not a tool
+        # discovery disable switch. Non-interactive default mode is safer than
+        # yolo, but machine/user policy can still authorize tools; consequently
+        # Gemini is deliberately not marked retry-safe above.
+        prompt = self._redactor.text(_prompt(request))
+        stdin_text: str | None = prompt
+        if recipe.id == "copilot-cli" and self.settings.get("arguments") is None:
+            # GitHub's current programmatic contract is `-p PROMPT -s`. Keep
+            # tools out of model discovery, deny every documented permission
+            # class as a second boundary, and disable built-in MCP servers.
+            # Copilot remains non-retryable because separately configured MCP
+            # servers cannot be exhaustively named by this generic route.
+            insert_at = len(command)
+            prompt_argument = prompt
+            if Path(command[0]).suffix.lower() in {".cmd", ".bat"}:
+                # npm's Windows launcher expands `%*` through cmd.exe, where a
+                # literal newline starts another batch command instead of
+                # staying inside the -p value. Preserve every separator as the
+                # two visible characters `\n`; the prompt tells the model what
+                # they mean and remains one argv value end to end.
+                prompt_argument = (
+                    "Literal \\n sequences below are line breaks in the Nexus prompt. "
+                    + prompt.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+                )
+            argv[insert_at:insert_at] = [
+                "-p", prompt_argument,
+                "-s", "--no-banner", "--no-ask-user", "--no-experimental",
+                "--available-tools=",
+                "--deny-tool=read,write,shell,url,memory",
+                "--disable-builtin-mcps",
+            ]
+            stdin_text = None
         started = time.monotonic()
         result = _run_bounded(
             argv,
             cwd=Path.cwd(),
-            stdin_text=self._redactor.text(_prompt(request)),
+            stdin_text=stdin_text,
             timeout_seconds=_remaining(deadline_at),
             max_output_bytes=output_limit,
             also_in_the_environment=self._what_it_is_handed(recipe),
@@ -937,7 +1008,9 @@ class SubscriptionCLIProvider(Provider):
                 continue
             said = _dotted(body, recipe.error_message_field)
             if isinstance(said, str) and said.strip():
-                return self._redactor.text(" ".join(said.split()))[:LONGEST_REASON]
+                return bounded_redacted_text(
+                    self._redactor, " ".join(said.split()), LONGEST_REASON
+                )
         return ""
 
     def _just_a_glimpse(self, said: str) -> str:
@@ -1101,7 +1174,9 @@ class SubscriptionCLIProvider(Provider):
             # Cut to a length a person reads. Every other way of building one of
             # these caps what it holds; this one did not, so a tool that answers
             # with a page of detail put a page of detail in a sentence.
-            why = self._redactor.text(str(said or "no reason given"))[:LONGEST_REASON]
+            why = bounded_redacted_text(
+                self._redactor, said or "no reason given", LONGEST_REASON
+            )
             raise HarnessError(
                 f"{recipe.label} refused the request: {why}"
                 f"{self._and_what_it_says_about_itself(recipe, self._deadline, self._did_it_ask_anybody(recipe, stdout, stderr), why)}"

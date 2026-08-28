@@ -1826,6 +1826,59 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('agent_execution: "Connected-agent provisional execution"', self.script)
         self.assertIn('agent_verification: "Work verification"', self.script)
 
+    def test_incident_recoverable_work_is_durable_and_visible_in_both_chat_views(self) -> None:
+        """A judge-reported pause used to survive only in the HTTP response.
+
+        Closing the floating card, maximising it, switching pair chats, or
+        reloading the panel then lost the only resume token. The recovery state
+        must be keyed by the exact conversation and rendered by both surfaces.
+        """
+
+        self.assertIn('id="theBigChatWorkRecovery"', self.markup)
+        self.assertIn('"nexus.swarm.work-recoveries.v1"', self.script)
+        self.assertIn('"paused_for_user", "applied_unverified", "needs_verification"',
+                      self.script)
+        self.assertIn("swarmWorkRecoveries.get(swarmChatKey(agentId))", self.script)
+        self.assertIn('make("section", "work-recovery swarm-chat-work-recovery")',
+                      self.script)
+        self.assertIn('fillWorkRecoveryPanel($("theBigChatWorkRecovery"), agentId)',
+                      self.script)
+        self.assertIn("allowedWriteRoots: Object.freeze(roots)", self.script)
+        self.assertIn("writeScopeRestricted: Boolean", self.script)
+        self.assertIn("contextToolBudget: Object.freeze", self.script)
+        self.assertIn("answered?.context_tool_budget?.summary", self.script)
+        self.assertIn("Questions from the team", self.script)
+        self.assertIn("Locked write destinations", self.script)
+        self.assertIn(".work-recovery", self.styles)
+
+    def test_incident_resume_posts_answers_token_and_the_original_locked_scope(self) -> None:
+        """A resume is a continuation, not a fresh mutable file request."""
+
+        resume = self.script[
+            self.script.index("async function resumeSwarmWork(agentId)"):
+            self.script.index("async function sendWhatIsTypedTo(agentId)")
+        ]
+        self.assertIn('request("/api/swarm/say"', resume)
+        self.assertIn('text: recovery.objective', resume)
+        self.assertIn('mode: "work"', resume)
+        self.assertIn('resume_session_id: recovery.resumeToken', resume)
+        self.assertIn('user_answers: answers', resume)
+        self.assertIn('? {allowed_write_roots: [...recovery.allowedWriteRoots]} : {}', resume)
+        self.assertIn("recovery.writeScopeRestricted", resume)
+        self.assertIn('conversation.project !== recovery.projectId', resume)
+        self.assertNotIn("confirmProjectWork", resume)
+
+    def test_incident_unverified_work_never_uses_the_applied_success_message(self) -> None:
+        reporting = self.script[
+            self.script.index("function workResponseWords(answered"):
+            self.script.index("async function resumeSwarmWork(agentId)")
+        ]
+        self.assertIn('status === "needs_verification"', reporting)
+        self.assertIn('status === "applied_unverified"', reporting)
+        self.assertIn("Nexus has not claimed completion", self.script)
+        self.assertLess(reporting.index('status === "applied_unverified"'),
+                        reporting.index("answered?.changed?.length"))
+
     def test_add_project_dialog_offers_the_electron_folder_picker(self) -> None:
         self.assertIn('id="askDialogBrowse"', self.markup)
         self.assertIn('Browse folder…', self.markup)
@@ -2651,6 +2704,77 @@ class WhatThePanelIsTold(BoardTestCase):
             conversation["web_legacy_candidate"],
         )
         self.assertEqual(work.call_args.kwargs["round_limit"], 37)
+        self.assertIsNone(work.call_args.kwargs["allowed_write_roots"])
+
+    def test_project_work_http_boundary_rejects_oversized_goal_and_resume_answer_before_dispatch(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [{"name": "Chosen", "path": str(self.root)}],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        conversation = next(one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-2"])
+        _status, standing = self.ask("/api/swarm")
+        for agent in standing["board"]["agents"]:
+            agent["ready"] = True
+            agent["why_not"] = ""
+        answer = {"said": [], "changed": [], "status": "incomplete"}
+        with mock.patch.object(self.panel, "swarm_standing", return_value=standing), mock.patch.object(
+            swarm_work, "work_together", return_value=answer
+        ) as work:
+            at_limit = "Create file.txt " + ("x" * (200_000 - len("Create file.txt ") - 1)) + "ü"
+            status, boundary = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": at_limit, "mode": "work",
+                "allow_project_changes": True,
+            })
+            self.assertEqual(status, 200, boundary)
+            self.assertEqual(len(work.call_args.args[3]), 200_000)
+            work.reset_mock()
+
+            def journal_counts() -> tuple[int, int]:
+                with self.panel.swarm_runs._read() as database:
+                    return (
+                        int(database.execute("SELECT COUNT(*) FROM runs").fetchone()[0]),
+                        int(database.execute("SELECT COUNT(*) FROM events").fetchone()[0]),
+                    )
+
+            before_invalid = journal_counts()
+            status, refused = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "Create file.txt " + ("x" * (200_001 - len("Create file.txt "))), "mode": "work",
+                "allow_project_changes": True,
+            })
+            self.assertEqual(status, 400)
+            self.assertIn("200,001", refused["error"])
+            work.assert_not_called()
+            self.assertEqual(journal_counts(), before_invalid)
+            status, refused = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "resume", "mode": "work", "allow_project_changes": True,
+                "resume_session_id": "resume-token-123",
+                "user_answers": "y" * 200_001,
+            })
+            self.assertEqual(status, 400)
+            self.assertIn("200,001", refused["error"])
+            work.assert_not_called()
+            self.assertEqual(journal_counts(), before_invalid)
+            status, refused = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "Create file.txt\u0000", "mode": "work",
+                "allow_project_changes": True,
+            })
+            self.assertEqual(status, 400)
+            self.assertIn("control character", refused["error"])
+            work.assert_not_called()
+            self.assertEqual(journal_counts(), before_invalid)
 
     def test_invalid_chat_round_limit_is_rejected_before_contacting_an_agent(self) -> None:
         self.ask("/api/swarm/save", {"board": {
@@ -2945,6 +3069,30 @@ class WhatThePanelIsTold(BoardTestCase):
         status, said = self.ask("/api/swarm/stop", {})
         self.assertEqual(status, 400)
         self.assertIn("exact Swarm run ID", said["error"])
+
+    def test_stop_endpoint_accepts_owner_terminalizing_before_projection_returns(self) -> None:
+        store = self.panel.swarm_runs
+        accepted, _created = store.accept(
+            "http-stop-terminal-race", {"kind": "board_order", "board": {}}
+        )
+        run_id = store.start(accepted["run_id"])["run_id"]
+        request_stop = store.request_stop
+
+        def owner_finishes_during_projection(identity: str) -> dict:
+            request_stop(identity)
+            store.fail(run_id, "stopped by owner", stopped=True)
+            return store.get(run_id)
+
+        with mock.patch.object(
+            store, "request_stop", side_effect=owner_finishes_during_projection,
+        ):
+            status, said = self.ask("/api/swarm/stop", {"run_id": run_id})
+
+        self.assertEqual(status, 200)
+        self.assertIn("already stopped", said["note"])
+        self.assertEqual(said["run_id"], run_id)
+        self.assertEqual(said["doing"]["status"], "stopped")
+        self.assertFalse(said["doing"]["going"])
 
     def test_a_save_from_a_window_that_is_behind_is_refused(self) -> None:
         status, said = self.ask("/api/swarm/save", {"board": {

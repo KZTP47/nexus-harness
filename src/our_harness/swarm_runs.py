@@ -18,7 +18,7 @@ import uuid
 from .config import LoadedConfig
 from .models import HarnessError
 from .pipeline_runs import _owner_is_alive, _process_token, project_identity
-from .redaction import CredentialRedactor
+from .redaction import CredentialRedactor, bounded_redacted_text
 from .runtime_integrity import atomic_text, mac, quarantine_marker
 
 
@@ -440,7 +440,7 @@ class SwarmRunStore:
                         raise HarnessError(
                             "The durable Swarm run journal is corrupt; Nexus will not guess at its commands."
                         ) from exc
-                    error = self.redactor.text(str(row[3] or ""))[:1000]
+                    error = bounded_redacted_text(self.redactor, row[3], 65_536)
                     snapshot_json = _canonical(snapshot)
                     db.execute(
                         "UPDATE runs SET snapshot_json=?,snapshot_sha256=?,result_json=?,error=? WHERE run_id=?",
@@ -974,7 +974,7 @@ class SwarmRunStore:
             self._release_board_lease(db, run_id)
 
     def fail(self, run_id: str, message: str, stopped: bool = False) -> None:
-        clean_message = self.redactor.text(str(message or ""))[:1000]
+        clean_message = bounded_redacted_text(self.redactor, message, 65_536)
         with self._tx() as db:
             row = db.execute("SELECT * FROM runs WHERE run_id=? AND project_authority=?", (run_id, self.authority)).fetchone()
             self._verify_run(db, row)

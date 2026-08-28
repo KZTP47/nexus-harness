@@ -24,7 +24,7 @@ from unittest import mock
 
 from our_harness import chat, web_chats
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
-from our_harness.models import HarnessError
+from our_harness.models import HarnessError, ResponseFormat
 
 
 class Back:
@@ -66,6 +66,28 @@ class TalkingTestCase(unittest.TestCase):
 
 
 class OneConversation(TalkingTestCase):
+    def test_web_budget_reports_bridge_capability_not_api_token_fiction(self) -> None:
+        limits = chat.effective_limits(self.config, "web:claude-example")
+        self.assertEqual(limits["turn_timeout_seconds"], web_chats.WEB_WAIT_SECONDS)
+        self.assertIsNone(limits["configured_provider_output_tokens"])
+        self.assertEqual(limits["output_token_control"], "provider_page_uncontrolled")
+
+    def test_budget_facts_match_api_and_cli_runtime_contracts(self) -> None:
+        api = chat.effective_limits(self.config, "")
+        self.assertEqual(api["output_token_control"], "nexus_requested_maximum")
+        self.assertEqual(api["provider_capture_bytes"], 100_000_000)
+
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "codex": {"kind": "codex-cli", "model": "gpt-5", "command": ["codex"]},
+        }
+        cli_config = LoadedConfig(data, self.root, [], {})
+        cli = chat.effective_limits(cli_config, "codex")
+        self.assertEqual(cli["output_token_control"], "provider_cli_uncontrolled")
+        self.assertIsNone(cli["configured_provider_output_tokens"])
+        self.assertEqual(cli["provider_capture_bytes"], 2_000_000)
+        self.assertEqual(cli["structured_capture_policy"], "schema_derived")
+
     def test_saying_something_gets_an_answer_back(self) -> None:
         answering = Answering()
         with self.standing_in(answering):
@@ -328,7 +350,8 @@ class WhatItRefuses(TalkingTestCase):
     def test_a_message_the_size_of_a_file_is_refused(self) -> None:
         with self.assertRaises(chat.ChatError) as caught:
             chat.say(self.config, "", "a" * (chat.MOST_LETTERS + 1))
-        self.assertIn("point at the file", str(caught.exception))
+        self.assertIn("point at a file", str(caught.exception))
+        self.assertIn("did not truncate", str(caught.exception))
 
     def test_a_message_with_a_control_character_is_refused(self) -> None:
         with self.assertRaises(chat.ChatError):
@@ -383,10 +406,99 @@ class WhatItRefuses(TalkingTestCase):
                 chat.say(self.config, "", "Anything")
         self.assertIn("nothing at all", str(caught.exception))
 
-    def test_a_very_long_answer_is_cut(self) -> None:
+    def test_an_over_limit_answer_is_rejected_without_saving_a_fragment(self) -> None:
         with self.standing_in(Answering("x" * (chat.LONGEST_ANSWER + 500))):
-            got = chat.say(self.config, "", "Anything")
-        self.assertEqual(len(got["answer"]["text"]), chat.LONGEST_ANSWER)
+            with self.assertRaises(chat.ChatError) as caught:
+                chat.say(self.config, "", "Anything")
+        self.assertIn("did not save or truncate", str(caught.exception))
+        self.assertEqual(chat.read_it(self.config, ""), [])
+
+    def test_the_incident_sized_prompt_and_answer_are_preserved_end_to_end(self) -> None:
+        prompt = "goal:" + ("p" * 6_253)
+        answer = "result:" + ("r" * 35_782)
+        provider = Answering(answer)
+        with self.standing_in(provider):
+            got = chat.say(self.config, "", prompt)
+        self.assertEqual(provider.asked[0].messages[-1]["content"], prompt)
+        self.assertEqual(got["answer"]["text"], answer)
+        self.assertEqual(chat.read_it(self.config, "")[-1].text, answer)
+
+    def test_long_failed_turn_keeps_the_canonical_user_goal(self) -> None:
+        goal = "g" * chat.MOST_LETTERS
+        chat.keep_failed_exchange(
+            self.config, "", goal, "provider unavailable", state="failed"
+        )
+        turns = chat.read_it(self.config, "")
+        self.assertEqual(turns[0].text, goal)
+        self.assertIn("provider unavailable", turns[-1].text)
+
+    def test_failed_team_turn_keeps_every_contribution_and_bounded_redacted_cause(self) -> None:
+        secret = "secret-value-that-must-never-survive"
+        cause = ("first cause words " + ("x" * 70_000)
+                 + f" Bearer {secret} FINAL-CAUSE-TAIL")
+        contributions = [
+            {
+                "speaker_id": f"agent-{number}",
+                "speaker_name": f"Agent {number}",
+                "text": f"contribution-{number}",
+            }
+            for number in range(50)
+        ]
+        chat.keep_failed_exchange(
+            self.config, "", "long team failure", cause,
+            state="failed", contributions=contributions,
+        )
+        turns = chat.read_it(self.config, "")
+        self.assertEqual(len(turns), 52)
+        self.assertEqual(
+            [one.text for one in turns[1:-1]],
+            [f"contribution-{number}" for number in range(50)],
+        )
+        self.assertNotIn(secret, turns[-1].text)
+        self.assertIn("[REDACTED]", turns[-1].text)
+        self.assertIn("NEXUS_REDACTED_CAUSE_BOUNDARY", turns[-1].text)
+        self.assertIn("FINAL-CAUSE-TAIL", turns[-1].text)
+
+    def test_structured_cli_gets_exactly_one_repair_and_never_leaks_raw_failure(self) -> None:
+        class Twice(Answering):
+            structured_retry_is_safe = True
+            def __init__(self, answers):
+                super().__init__("")
+                self.answers = iter(answers)
+
+            def complete(self, request):
+                self.asked.append(request)
+                return Back(next(self.answers))
+
+        wanted = ResponseFormat("demo", {
+            "type": "object", "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"], "additionalProperties": False,
+        })
+        secret = "sk-abcdef0123456789abcdef01"
+        provider = Twice([f"not-json {secret}", json.dumps({"ok": True})])
+        with self.standing_in(provider):
+            got = chat.ask_once(self.config, "", "Do it", response_format=wanted)
+        self.assertEqual(json.loads(got["text"]), {"ok": True})
+        self.assertEqual(len(provider.asked), 2)
+        self.assertNotIn(secret, json.dumps(provider.asked[1].messages))
+
+        provider = Twice([f"not-json {secret}", f"still-not-json {secret}"])
+        with self.standing_in(provider):
+            with self.assertRaises(chat.ChatError) as caught:
+                chat.ask_once(self.config, "", "Do it", response_format=wanted)
+        self.assertEqual(len(provider.asked), 2)
+        self.assertNotIn(secret, str(caught.exception))
+
+    def test_structured_provider_not_proven_pure_is_never_retried(self) -> None:
+        provider = Answering("not-json")
+        wanted = ResponseFormat("demo", {
+            "type": "object", "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"], "additionalProperties": False,
+        })
+        with self.standing_in(provider):
+            with self.assertRaisesRegex(chat.ChatError, "not proven side-effect-free"):
+                chat.ask_once(self.config, "", "Do it", response_format=wanted)
+        self.assertEqual(len(provider.asked), 1)
 
     def test_a_refusal_is_shown_as_a_sentence_not_a_page(self) -> None:
         def wont(config):
@@ -649,18 +761,15 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
         self.assertEqual(
             sorted(chat.what_would_not_answer(self.config)), ["claude", "copilot"])
 
-    def test_a_long_refusal_stops_where_a_sentence_stops(self) -> None:
-        """Cut by counting letters alone, this landed in the middle of the
-        sentence that says what to do about it - so the half somebody could act
-        on was the half thrown away."""
+    def test_a_long_refusal_keeps_the_actionable_final_sentence(self) -> None:
 
         said = ("The service turned this down. " * 40) + "Ask your admin to turn it on."
         self.assertGreater(len(said), chat.LONGEST_NO, "or nothing is being cut")
         chat._write_down_that_it_would_not(self.config, "claude", said)
         held = chat.what_would_not_answer(self.config)["claude"]["why"]
-        self.assertLessEqual(len(held), chat.LONGEST_NO)
+        self.assertEqual(held, said)
         self.assertTrue(held.endswith("."), held[-40:])
-        self.assertNotIn("The service turned this dow.", held)
+        self.assertIn("Ask your admin to turn it on.", held)
 
     def test_it_does_not_stop_at_an_abbreviation_and_call_that_a_sentence(self) -> None:
         """Stopping after "Mr." leaves something that reads like a whole
@@ -687,19 +796,17 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
             held.rstrip(".").rstrip(".").endswith("Mr"),
             f"it stopped at an abbreviation: {held[-60:]}")
 
-    def test_anything_shortened_says_that_it_was(self) -> None:
-        """A cut that ends on a full stop reads as all of it, and somebody acts
-        on half a reason believing they have the whole one."""
-
-        chat._write_down_that_it_would_not(self.config, "claude", "One sentence. " * 200)
+    def test_a_multi_sentence_refusal_is_not_silently_shortened(self) -> None:
+        said = "One sentence. " * 200
+        chat._write_down_that_it_would_not(self.config, "claude", said)
         held = chat.what_would_not_answer(self.config)["claude"]["why"]
-        self.assertTrue(held.endswith("..."), held[-30:])
+        self.assertEqual(held, said)
 
-    def test_one_very_long_sentence_says_it_is_not_all_of_it(self) -> None:
-        chat._write_down_that_it_would_not(self.config, "claude", "x" * 2000)
+    def test_one_very_long_sentence_is_kept_when_it_fits_safe_storage(self) -> None:
+        said = "x" * 2000
+        chat._write_down_that_it_would_not(self.config, "claude", said)
         held = chat.what_would_not_answer(self.config)["claude"]["why"]
-        self.assertLessEqual(len(held), chat.LONGEST_NO)
-        self.assertTrue(held.endswith("..."))
+        self.assertEqual(held, said)
 
     def test_a_refusal_that_already_fits_is_left_exactly_as_it_is(self) -> None:
         chat._write_down_that_it_would_not(self.config, "claude", "It said no.")

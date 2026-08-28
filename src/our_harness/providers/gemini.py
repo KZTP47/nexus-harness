@@ -10,6 +10,8 @@ from .base import Provider
 class GeminiProvider(Provider):
     """Gemini Interactions API adapter with native function continuation."""
 
+    structured_retry_is_safe = True
+
     def _url(self) -> str:
         endpoint = str(self.settings["endpoint"]).rstrip("/")
         return endpoint if endpoint.endswith("/interactions") else endpoint + "/interactions"

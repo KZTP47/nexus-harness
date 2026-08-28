@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from our_harness.changes import FileTransaction, file_sha256
+from our_harness import changes as changes_module
 from our_harness.config import load_config as _load_config
 from our_harness.models import ChangePlan, HarnessError
 from our_harness.workflow import HarnessApplication
@@ -74,10 +75,22 @@ def configure_workflow(root: Path) -> None:
     check = [
         sys.executable,
         "-c",
-        "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'",
+        (
+            "import json; from pathlib import Path; "
+            "assert Path('value.py').read_text() == 'VALUE = 2\\n'; "
+            "print(json.dumps({'tests': {'total': 1, 'failed': 0}}))"
+        ),
     ]
     (root / ".harness" / "config.local.json").write_text(
-        json.dumps({"project": {"test_commands": [check]}}),
+        json.dumps({"project": {
+            "test_commands": [check],
+            "test_evidence_contracts": [{
+                "command": check,
+                "format": "json-stdout",
+                "total_field": "tests.total",
+                "failed_field": "tests.failed",
+            }],
+        }}),
         encoding="utf-8",
     )
 
@@ -169,6 +182,33 @@ class TransactionSafetyRegressionTests(unittest.TestCase):
                 with self.assertRaisesRegex(HarnessError, "Baseline conflict before replacement"):
                     transaction.apply([ChangePlan("value.txt", file_sha256(target), "replacement")])
             self.assertEqual(target.read_text(encoding="utf-8"), "late user content")
+
+    def test_exclusive_target_lease_closes_the_final_revalidation_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "value.txt"
+            target.write_text("baseline", encoding="utf-8")
+            transaction = FileTransaction(root)
+            original_enter = changes_module._ExclusiveTarget.__enter__
+            raced = False
+
+            def race(lease):
+                nonlocal raced
+                if not raced:
+                    raced = True
+                    # This lands after FileTransaction's last path-based
+                    # snapshot check but before the exclusive OS handle opens.
+                    target.write_text("concurrent final-window edit", encoding="utf-8")
+                return original_enter(lease)
+
+            with patch.object(changes_module._ExclusiveTarget, "__enter__", race):
+                with self.assertRaisesRegex(HarnessError, "Baseline conflict before exclusive replacement"):
+                    transaction.apply([
+                        ChangePlan("value.txt", file_sha256(target), "replacement")
+                    ])
+            self.assertEqual(
+                "concurrent final-window edit", target.read_text(encoding="utf-8")
+            )
 
     def test_rollback_validates_every_backup_before_any_restore(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

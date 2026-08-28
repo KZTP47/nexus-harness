@@ -8,7 +8,7 @@ import stat
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -136,8 +136,165 @@ def _same_snapshot(left: _FileSnapshot, right: _FileSnapshot) -> bool:
     )
 
 
+class _ExclusiveTarget:
+    """An exclusive, identity-stable target lease for the mutation window."""
+
+    def __init__(self, path: Path, expected: _FileSnapshot) -> None:
+        self.path = path
+        self.expected = expected
+        self.created = False
+        self.handle: int | None = None
+        self.committed = False
+
+    def __enter__(self) -> "_ExclusiveTarget":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            import fcntl
+            flags = os.O_RDWR | (os.O_CREAT | os.O_EXCL if self.expected.sha256 is None else 0)
+            try:
+                self.handle = os.open(self.path, flags, 0o600)
+                self.created = self.expected.sha256 is None
+                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise HarnessError(f"Concurrent edit conflict before replacement: {self.path.name}") from exc
+        else:
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateFileW.restype = wintypes.HANDLE
+            access = 0x80000000 | 0x40000000 | 0x00010000  # read, write, delete
+            share = 0x00000001  # existing readers only; no writer/delete sharing
+            creation = 1 if self.expected.sha256 is None else 3  # CREATE_NEW / OPEN_EXISTING
+            handle = kernel32.CreateFileW(
+                wintypes.LPCWSTR(str(self.path)), access, share, None, creation,
+                0x00000080, None,
+            )
+            if handle == wintypes.HANDLE(-1).value:
+                raise HarnessError(
+                    f"Concurrent edit conflict before replacement: {self.path.name}"
+                )
+            self.handle = int(handle)
+            self.created = self.expected.sha256 is None
+        if os.name == "nt":
+            content, inode = self._windows_content_identity()
+            current_hash = sha256_bytes(content)
+        else:
+            current = _read_snapshot(self.path)
+            current_hash = current.sha256
+            inode = current.inode
+        if self.created:
+            if current_hash != sha256_bytes(b""):
+                self.close(remove_created=True)
+                raise HarnessError(f"Concurrent create conflict before replacement: {self.path.name}")
+        else:
+            if current_hash != self.expected.sha256 or (
+                self.expected.inode is not None and inode is not None
+                and int(inode) != int(self.expected.inode)
+            ):
+                self.close()
+                raise HarnessError(f"Baseline conflict before exclusive replacement: {self.path.name}")
+        return self
+
+    def _windows_content_identity(self) -> tuple[bytes, int | None]:
+        import ctypes
+        from ctypes import wintypes
+        if self.handle is None:
+            raise HarnessError("Exclusive target lease is closed")
+        class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("dwFileAttributes", wintypes.DWORD), ("ftCreationTime", wintypes.FILETIME),
+                ("ftLastAccessTime", wintypes.FILETIME), ("ftLastWriteTime", wintypes.FILETIME),
+                ("dwVolumeSerialNumber", wintypes.DWORD), ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD), ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD), ("nFileIndexLow", wintypes.DWORD),
+            ]
+        info = BY_HANDLE_FILE_INFORMATION()
+        if not ctypes.windll.kernel32.GetFileInformationByHandle(self.handle, ctypes.byref(info)):
+            raise HarnessError(f"Could not identify exclusive target: {self.path.name}")
+        size = (int(info.nFileSizeHigh) << 32) | int(info.nFileSizeLow)
+        if not ctypes.windll.kernel32.SetFilePointerEx(
+            self.handle, ctypes.c_longlong(0), None, 0,
+        ):
+            raise HarnessError(f"Could not read exclusive target: {self.path.name}")
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            amount = min(remaining, 1024 * 1024)
+            buffer = ctypes.create_string_buffer(amount)
+            read = wintypes.DWORD(0)
+            if not ctypes.windll.kernel32.ReadFile(
+                self.handle, buffer, amount, ctypes.byref(read), None,
+            ):
+                raise HarnessError(f"Could not read exclusive target: {self.path.name}")
+            if read.value == 0:
+                break
+            chunks.append(buffer.raw[:read.value])
+            remaining -= read.value
+        inode = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
+        return b"".join(chunks), inode
+
+    def write(self, content: bytes) -> None:
+        if self.handle is None:
+            raise HarnessError("Exclusive target lease is closed")
+        if os.name != "nt":
+            os.lseek(self.handle, 0, os.SEEK_SET)
+            os.ftruncate(self.handle, 0)
+            view = memoryview(content)
+            while view:
+                written = os.write(self.handle, view)
+                view = view[written:]
+            os.fsync(self.handle)
+            return
+        import ctypes
+        from ctypes import wintypes
+        position = ctypes.c_longlong(0)
+        if not ctypes.windll.kernel32.SetFilePointerEx(self.handle, position, None, 0):
+            raise HarnessError(f"Could not position exclusive target: {self.path.name}")
+        if not ctypes.windll.kernel32.SetEndOfFile(self.handle):
+            raise HarnessError(f"Could not truncate exclusive target: {self.path.name}")
+        if content:
+            buffer = ctypes.create_string_buffer(content)
+            written = wintypes.DWORD(0)
+            if not ctypes.windll.kernel32.WriteFile(
+                self.handle, buffer, len(content), ctypes.byref(written), None,
+            ) or written.value != len(content):
+                raise HarnessError(f"Could not write exclusive target: {self.path.name}")
+        if not ctypes.windll.kernel32.FlushFileBuffers(self.handle):
+            raise HarnessError(f"Could not flush exclusive target: {self.path.name}")
+
+    def delete(self) -> None:
+        if self.handle is None:
+            raise HarnessError("Exclusive target lease is closed")
+        if os.name != "nt":
+            self.path.unlink()
+            return
+        import ctypes
+        class FILE_DISPOSITION_INFO(ctypes.Structure):
+            _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+        info = FILE_DISPOSITION_INFO(1)
+        if not ctypes.windll.kernel32.SetFileInformationByHandle(
+            self.handle, 4, ctypes.byref(info), ctypes.sizeof(info),
+        ):
+            raise HarnessError(f"Could not delete exclusive target: {self.path.name}")
+
+    def close(self, *, remove_created: bool = False) -> None:
+        handle, self.handle = self.handle, None
+        if handle is not None:
+            if os.name == "nt":
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(handle)
+            else:
+                os.close(handle)
+        if remove_created and self.path.exists():
+            self.path.unlink(missing_ok=True)
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        remove_created = self.created and not self.committed
+        self.close(remove_created=remove_created)
+
+
 class FileTransaction:
-    def __init__(self, root: Path, max_files: int = 24, max_bytes: int = 2_000_000):
+    def __init__(self, root: Path, max_files: int = 24, max_bytes: int = 32_000_000):
         self.root = root.resolve()
         self.max_files = max_files
         self.max_bytes = max_bytes
@@ -289,24 +446,80 @@ class FileTransaction:
             _, _, manifest = self._prepare_locked(entries, transaction_id or self.new_transaction_id())
             return manifest
 
-    def apply(self, plans: Iterable[ChangePlan], transaction_id: str | None = None) -> dict[str, object]:
+    def apply(
+        self,
+        plans: Iterable[ChangePlan],
+        transaction_id: str | None = None,
+        *,
+        allowed_exact_capabilities: dict[str, set[str]] | None = None,
+        allowed_write_roots: list[str] | None = None,
+        protected_paths: list[str] | None = None,
+    ) -> dict[str, object]:
         with self.locked():
             entries = list(plans)
             if not entries:
                 return {"transaction_id": None, "changes": []}
+            for entry in entries:
+                relative = entry.path.replace("\\", "/").strip("/")
+                folded = relative.casefold()
+                under = lambda roots: any(
+                    folded == str(root).replace("\\", "/").strip("/").casefold()
+                    or folded.startswith(str(root).replace("\\", "/").strip("/").casefold() + "/")
+                    for root in (roots or [])
+                )
+                if protected_paths and under(protected_paths):
+                    raise HarnessError(f"Transaction path is protected by the compiled goal: {relative}")
+                if allowed_write_roots is not None and not under(allowed_write_roots):
+                    raise HarnessError(f"Transaction path is outside the explicit write destinations: {relative}")
+                # Root grants and exact operation grants compose.  Exact-only
+                # goals pass no root grant and therefore remain exact.
+                if allowed_exact_capabilities is not None:
+                    capability = "DELETE" if entry.delete else (
+                        "MODIFY" if confined_path(self.root, relative).exists() else "CREATE"
+                    )
+                    allowed = {
+                        str(one).upper()
+                        for one in allowed_exact_capabilities.get(folded, set())
+                    }
+                    allowed_by_root = bool(allowed_write_roots and under(allowed_write_roots))
+                    if allowed and capability not in allowed and "CREATE_OR_MODIFY" not in allowed:
+                        raise HarnessError(
+                            f"Transaction {capability.lower()} is not an exact compiled goal grant: {relative}"
+                        )
+                    if not allowed and not allowed_by_root:
+                        raise HarnessError(
+                            f"Transaction {capability.lower()} is not an exact compiled goal grant: {relative}"
+                        )
             txid = transaction_id or self.new_transaction_id()
             prepared, backup_root, manifest = self._prepare_locked(entries, txid)
             attempted: set[str] = set()
             try:
-                for entry, _, before in prepared:
+                for entry, _path, before in prepared:
                     self._assert_unchanged(entry.path, before, "replacement")
-                for entry, path, before in prepared:
-                    self._assert_unchanged(entry.path, before, "replacement")
-                    attempted.add(entry.path)
-                    if entry.delete:
-                        path.unlink(missing_ok=True)
-                    else:
-                        atomic_write(path, _content_bytes(entry) or b"", entry.mode if entry.mode is not None else before.mode)
+                with ExitStack() as stack:
+                    leases = [
+                        stack.enter_context(_ExclusiveTarget(path, before))
+                        for _entry, path, before in prepared
+                    ]
+                    for (entry, path, before), lease in zip(prepared, leases):
+                        attempted.add(entry.path)
+                        if entry.delete:
+                            lease.delete()
+                        else:
+                            lease.write(_content_bytes(entry) or b"")
+                            if entry.mode is not None:
+                                path.chmod(entry.mode)
+                        record = next(item for item in manifest["changes"] if item["path"] == entry.path)
+                        if not entry.delete:
+                            applied_hash = (
+                                sha256_bytes(lease._windows_content_identity()[0])
+                                if os.name == "nt" else file_sha256(path)
+                            )
+                            if applied_hash != record["after_sha256"]:
+                                raise HarnessError(f"Applied file failed verification: {entry.path}")
+                    for lease in leases:
+                        lease.committed = True
+                for entry, path, _before in prepared:
                     record = next(item for item in manifest["changes"] if item["path"] == entry.path)
                     if file_sha256(path) != record["after_sha256"]:
                         raise HarnessError(f"Applied file failed verification: {entry.path}")

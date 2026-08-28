@@ -158,12 +158,13 @@ def _hosted(
     )
 
 
-def _routes_of_kind(config: LoadedConfig, identifier: str) -> list[str]:
+def _routes_of_kind(config: LoadedConfig, identifier: str) -> list[tuple[str, list[str]]]:
     routes = config.get("providers", {}) or {}
     if not isinstance(routes, dict):
         return []
     return [
-        str(name) for name, held in routes.items()
+        (str(name), [str(part) for part in held.get("command", [])])
+        for name, held in routes.items()
         if isinstance(held, dict)
         and str(held.get("kind") or held.get("name") or "") == identifier
     ]
@@ -181,17 +182,41 @@ def _signed_in_tool(
         "Uses the personal or work subscription already signed in on this computer. "
         "No API key is copied into the harness."
     )
-    found = available(identifier)
+    routes = _routes_of_kind(config, identifier)
+    configured = routes[0][1] if routes else [
+        str(part) for part in (config.get("provider.command") or [])
+    ]
+    # Probe the executable the route will actually launch. A company wrapper
+    # may be an absolute path and the upstream CLI may intentionally not be on
+    # PATH; checking the default name first misreports that valid setup absent.
+    found = available(identifier, configured or None)
     if found:
-        routes = _routes_of_kind(config, identifier)
         # A saved refusal is already scrubbed before it reaches this page. It
         # means the route exists but its connection needs attention; it does not
         # turn an installed program into "not here" or permanently disable it.
         from .chat import what_would_not_answer
 
         refusals = what_would_not_answer(config)
-        problem = next((refusals[name]["why"] for name in routes if name in refusals), "")
-        if problem:
+        problem = next((refusals[name]["why"] for name, _command in routes if name in refusals), "")
+        authentication = "unknown"
+        if routes or in_use:
+            from .providers.subscription_cli import connection_status
+
+            authentication = str(
+                connection_status(
+                    identifier, use_cache=True, probe=True,
+                    command=configured or None,
+                ).get("authentication")
+                or "unknown"
+            )
+        if authentication == "signed-out":
+            state = ATTENTION
+            reason = "Installed and connected, but its own command line reports that it is signed out."
+            steps = (
+                "Press the sign-in action on the agent card, or run the assistant's login command.",
+                "Come back and press Check again. Nexus will not start a run through a signed-out route.",
+            )
+        elif problem:
             state = ATTENTION
             reason = f"Installed and connected in settings. Last request: {problem}"
             steps = (
@@ -200,8 +225,14 @@ def _signed_in_tool(
             )
         elif routes or str(config.get("provider.name") or "") == identifier:
             state = READY
-            reason = "Installed and connected in this project's settings."
-            steps = ("The first message verifies that the subscription service is answering.",)
+            reason = (
+                "Installed, connected, and its command-line sign-in is confirmed."
+                if authentication == "signed-in"
+                else "Installed and connected. This tool has no safe sign-in-status command."
+            )
+            steps = (() if authentication == "signed-in" else (
+                "Its first small request verifies the subscription service; Nexus shows the provider's exact reason if it refuses.",
+            ))
         else:
             state = INSTALLED
             reason = "Installed on this machine, but not connected to this project yet."

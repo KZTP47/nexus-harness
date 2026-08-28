@@ -235,6 +235,9 @@ def command_test(args: argparse.Namespace) -> int:
             print(f"{status} {' '.join(item['argv'])} ({item['duration_ms']} ms)")
             if status == "FAIL":
                 print(item["stderr"] or item["stdout"])
+        for problem in result.get("verification_problems", []):
+            if problem.get("reason", "").startswith("test command"):
+                print(f"FAIL verification evidence: {problem['reason']}")
     return 0 if result["passed"] else 1
 
 
@@ -942,7 +945,8 @@ def command_trust(args: argparse.Namespace) -> int:
     # else often has only the shared one, and its settings are refused until
     # somebody says it is theirs. Before this, that left three commands each
     # pointing at the next and no way through.
-    which = local if local.is_file() else shared
+    reviewed_path = getattr(args, "reviewed_config", None)
+    which = Path(reviewed_path).resolve(strict=True) if reviewed_path else (local if local.is_file() else shared)
     if not which.is_file():
         raise HarnessError(
             f"There is no {local} and no {shared}. Run 'harness init' first, or write "
@@ -963,7 +967,16 @@ def command_trust(args: argparse.Namespace) -> int:
         if answer.lower() not in ("y", "yes"):
             print("Left as it was.")
             return 1
-    store = trust_project_local_config(root, which)
+    expected_sha256 = getattr(args, "expected_sha256", None)
+    if bool(reviewed_path) != bool(expected_sha256):
+        raise HarnessError("--reviewed-config and --expected-sha256 must be supplied together")
+    try:
+        store = (
+            trust_project_local_config(root, which, expected_sha256=expected_sha256)
+            if expected_sha256 else trust_project_local_config(root, which)
+        )
+    except ValueError as exc:
+        raise HarnessError(str(exc)) from exc
     print(f"Trusted. Recorded in {store}")
     print("Edit the file again and this goes back to untrusted, on purpose.")
     return 0
@@ -1988,6 +2001,8 @@ def parser() -> argparse.ArgumentParser:
     trust = sub.add_parser("trust", help="Say the local config file in this project is yours")
     trust.add_argument("--yes", action="store_true", help="Do not ask first")
     trust.add_argument("--show", action="store_true", help="Only say whether it is trusted")
+    trust.add_argument("--reviewed-config", help="Exact canonical config path shown to the user")
+    trust.add_argument("--expected-sha256", help="SHA-256 of the exact bytes the user reviewed")
     trust.set_defaults(handler=command_trust)
     checkpoint = sub.add_parser("checkpoint", help="Create, list, or restore project safety snapshots")
     checkpoint_sub = checkpoint.add_subparsers(dest="checkpoint_command", required=True)

@@ -133,6 +133,30 @@
         "test_commands": {
           "$ref": "#/$defs/commands"
         },
+        "test_evidence_contracts": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["command", "format", "total_field", "failed_field"],
+            "properties": {
+              "command": {"$ref": "#/$defs/command"},
+              "format": {"const": "json-stdout"},
+              "total_field": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,7}$"},
+              "failed_field": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,7}$"},
+              "requirement_probes": {
+                "type": "object",
+                "maxProperties": 64,
+                "propertyNames": {"pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"},
+                "additionalProperties": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*){0,7}$"
+                }
+              }
+            }
+          }
+        },
         "lint_commands": {
           "$ref": "#/$defs/commands"
         },

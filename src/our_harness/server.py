@@ -6,6 +6,8 @@ import os
 import re
 import secrets
 import socket
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -58,13 +60,68 @@ from .plugins import check_kinds, load_plugins
 from .redaction import CredentialRedactor
 from .provider_help import setup_advice
 from .providers import ProviderRegistry
+from .providers.connection import connection_status
 from . import workflows as workflow_store
 from .workflow import HarnessApplication
+from . import __version__
 
 
 def loopback_url(host: str, port: int) -> str:
     authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"http://{authority}:{port}"
+
+
+def harness_commit_identity() -> str:
+    embedded = str(os.environ.get("NEXUS_BUILD_COMMIT") or "").strip()
+    if embedded and embedded != "unknown":
+        return embedded + ("+dirty" if os.environ.get("NEXUS_BUILD_DIRTY") == "1" else "")
+    root = Path(__file__).resolve().parents[2]
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=2, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    commit = result.stdout.strip()
+    return commit if re.fullmatch(r"[0-9a-fA-F]{40}", commit) else "unknown"
+
+
+def effective_route_readiness(config: LoadedConfig) -> list[dict[str, Any]]:
+    """Check every model route the configured workflow can assign work to."""
+
+    registry = ProviderRegistry(config)
+    required_routes = ["default"]
+    required_routes.extend(agent.provider_ref for agent in registry.agents())
+    readiness: list[dict[str, Any]] = []
+    for route in dict.fromkeys(required_routes):
+        try:
+            status = connection_status(config, route, timeout_seconds=2.0)
+        except HarnessError as exc:
+            status = {
+                "route": route, "kind": "unknown", "installed": False,
+                "state": "invalid", "authentication": "unknown",
+                "checked_by": "effective-route-resolution", "note": str(exc),
+            }
+        unknown_but_probeable = (
+            bool(status.get("installed"))
+            and str(status.get("kind")) in {"gemini-cli", "copilot-cli"}
+            and str(status.get("authentication")) == "unknown"
+        )
+        if unknown_but_probeable:
+            status["state"] = "first-request-required"
+            status["ready_for_first_request"] = True
+            status["note"] = (
+                str(status.get("note") or "").rstrip()
+                + " Nexus cannot verify this CLI without a model call. The first run is clearly treated as a live readiness request; "
+                  "if the provider refuses it, no success is claimed and its exact sign-in error is shown."
+            ).strip()
+        status["ready"] = unknown_but_probeable or (bool(status.get("installed")) and str(status.get("state")) in {
+            "authenticated", "configured", "ready",
+        })
+        readiness.append(status)
+    return readiness
 
 
 class EventBus:
@@ -791,7 +848,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
         settings, _trouble = seat_setup.settings_to_work_from(self.server.config.project_root)
         return settings
 
-    def _checkup(self) -> dict[str, Any]:
+    def _checkup(self, model_setup: dict[str, Any] | None = None) -> dict[str, Any]:
         """One plain-language answer to 'is this project ready to use?'."""
 
         config = self.server.config
@@ -803,13 +860,30 @@ class HarnessHandler(BaseHTTPRequestHandler):
             or combined_commands(detect_project(config.project_root), kind)
             for kind in ("test", "lint", "build")
         }
-        levels = {str(check.get("name")): str(check.get("level")) for check in doctor["checks"]}
+        # The legacy workflow uses the default route. Explicit trusted agents
+        # are a deliberate workflow choice, so every one of their effective
+        # routes must be ready; an unrelated healthy provider must never turn
+        # this step green.
+        route_readiness = effective_route_readiness(config)
+        provider_ready = bool(route_readiness) and all(item["ready"] for item in route_readiness)
+        first_request_routes = [item["route"] for item in route_readiness if item.get("ready_for_first_request")]
+        route_problem = "; ".join(
+            f"{item['route']}: {item.get('note') or item.get('state')}"
+            for item in route_readiness if not item["ready"]
+        )
         steps = [
             {
                 "id": "provider",
                 "title": "Connect a model",
-                "done": levels.get("provider") == "ok",
-                "detail": "The harness needs one model service it can reach.",
+                "done": provider_ready,
+                "detail": (
+                    (("Ready to make a clearly labelled first live readiness request through: "
+                      + ", ".join(first_request_routes) + ". No success will be claimed if it refuses.")
+                     if first_request_routes else
+                     "Every route used by the selected workflow and its trusted agents is ready.")
+                    if provider_ready else
+                    "Every effective route must be ready, not merely one unrelated provider. " + route_problem
+                ),
                 "action": "harness doctor",
             },
             {
@@ -841,6 +915,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
             "doctor": doctor,
             "detections": detections,
             "commands": commands,
+            "required_routes": route_readiness,
+            "bootstrap_ready": provider_ready,
         }
 
     def _executable_graph(self, value: object) -> tuple[dict[str, Any], list[dict[str, str]]]:
@@ -1022,6 +1098,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     # Changes every time the harness starts, so a page left open
                     # can tell that it is now talking to a different run.
                     "started_id": self.server.started_id,
+                    "runtime": {
+                        "version": __version__,
+                        "commit": harness_commit_identity(),
+                        "build_kind": str(os.environ.get("NEXUS_BUILD_KIND") or "source/runtime identity unavailable"),
+                        "project_root": str(self.server.config.project_root),
+                        "port": self.server.server_port,
+                        "process_id": os.getpid(),
+                        "python_executable": sys.executable,
+                        "python_version": sys.version.split()[0],
+                    },
                 })
             elif parsed.path == "/api/events":
                 try:
@@ -1349,6 +1435,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         )
                     ],
                     "most_letters": chat_lab.MOST_LETTERS,
+                    "limits": chat_lab.effective_limits(
+                        self.server.config, str(one.who or "")
+                    ),
                     "conversation": conversation,
                 })
             elif parsed.path == "/api/swarm/how-it-is-going":
@@ -1443,6 +1532,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     ] if ready else [],
                     "most_letters": chat_lab.MOST_LETTERS,
                     "most_kept": chat_lab.MOST_KEPT,
+                    "limits": chat_lab.effective_limits(
+                        self.server.config, wanted
+                    ),
                 })
             elif parsed.path == "/api/look-up":
                 self._require_token()
@@ -1575,10 +1667,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self._json({"result": self.server.qa_result, "running": self.server.qa_lock.locked()})
                 else:
                     refresh = query.get("refresh", [""])[0] == "1"
-                    self._json({
-                        **self._checkup(),
-                        "model_setup": setup_advice(self.server.config, refresh=refresh),
-                    })
+                    advice = setup_advice(self.server.config, refresh=refresh)
+                    self._json({**self._checkup(advice), "model_setup": advice})
             elif parsed.path == "/api/health":
                 self._json({"status": "ok"})
             elif parsed.path == "/favicon.ico":
@@ -1632,6 +1722,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 task = body.get("task", "")
                 if not isinstance(task, str) or not task.strip():
                     raise HarnessError("Task is required")
+                bootstrap_tests = body.get("bootstrap_tests", False)
+                if not isinstance(bootstrap_tests, bool):
+                    raise HarnessError("bootstrap_tests must be true or false")
+                if bootstrap_tests:
+                    task = task.rstrip() + (
+                        "\n\nNEXUS BOOTSTRAP MODE (explicitly selected by the user): "
+                        "this project does not yet have dependable automated tests. "
+                        "First inspect its stack and create the smallest maintainable runnable test infrastructure, "
+                        "including a real test command and focused acceptance tests for this goal. "
+                        "Then run those tests and the project's other applicable checks. "
+                        "Bootstrap mode never waives final verification and is not permission to claim success without evidence."
+                    )
                 graph = body.get("graph")
                 if graph is not None:
                     if not isinstance(graph, dict):
@@ -1644,7 +1746,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 if not self.server.reserve_run():
                     self._json({"error": "A workspace run is already active"}, HTTPStatus.CONFLICT)
                     return
-                thread = threading.Thread(target=self._run_task, args=(task, bool(body.get("dry_run", False)), graph), daemon=True)
+                thread = threading.Thread(
+                    target=self._run_task,
+                    args=(task, bool(body.get("dry_run", False)), graph, bootstrap_tests),
+                    daemon=True,
+                )
                 try:
                     thread.start()
                 except Exception:
@@ -1985,7 +2091,19 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 chat_scope = None
                 chat_owned = False
                 answer_saved = False
+                requested_mode = str(body.get("mode") or "auto")
+                work_text = None
+                work_answers = body.get("user_answers")
                 try:
+                    # Project-work text is domain authority for mutation and
+                    # resume. Reject it before accepting a durable run,
+                    # acquiring a conversation lease, or opening cancellation
+                    # state, so an invalid/stale client cannot leave phantom
+                    # run history behind.
+                    if requested_mode == "work":
+                        work_text = chat_lab._check_what_was_typed(body.get("text"))
+                        if body.get("resume_session_id") and work_answers is not None:
+                            work_answers = chat_lab._check_what_was_typed(work_answers)
                     with self.server.swarm_lock:
                         # Acceptance and project switching share this lock.  A
                         # request that is accepted captures all project-scoped
@@ -2073,7 +2191,6 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             f"{one.name} has no assistant chosen yet. Open its "
                             "settings and pick which one it uses."
                         )
-                    requested_mode = str(body.get("mode") or "auto")
                     round_limit = swarm_work.user_round_limit(
                         body.get("round_limit")
                     )
@@ -2163,7 +2280,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             )
                         answer = swarm_work.work_together(
                             config, board_payload, agent_id,
-                            str(body.get("text") or ""), body.get("attachments"),
+                            str(work_text), body.get("attachments"),
                             progress=progress, live_turn=live_turn,
                             peer_id=peer_id, project_id=project_id,
                             filed_as=filed_as,
@@ -2173,6 +2290,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                                 conversation.get("web_legacy_candidate")
                             ) if conversation else True,
                             round_limit=round_limit,
+                            resume_session_id=str(body.get("resume_session_id") or ""),
+                            user_answers=work_answers,
+                            allowed_write_roots=body.get("allowed_write_roots"),
                         )
                     elif mode == "chat":
                         progress(
@@ -2227,6 +2347,24 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     run_store.finish(run_id, response)
                     self._json(response)
                 except Exception as exc:
+                    if isinstance(exc, swarm_work.ResumableSwarmError):
+                        response = dict(
+                            exc.payload,
+                            agent=one.to_dict() if one is not None else {},
+                            routing=routing,
+                            conversation=conversation,
+                            run_id=run_id,
+                            request_id=request_id,
+                        )
+                        answer_saved = True
+                        activity.update(
+                            activity_id, "Paused for recovery", str(exc), state="complete"
+                        )
+                        if run_id:
+                            run_store.checkpoint(run_id, "paused", response)
+                            run_store.finish(run_id, response)
+                        self._json(response)
+                        return
                     stopped = isinstance(exc, cancellation.ChatCancelled)
                     activity.update(
                         activity_id, "Stopped" if stopped else "Request stopped",
@@ -3261,10 +3399,43 @@ class HarnessHandler(BaseHTTPRequestHandler):
         finally:
             self.server.release_qa()
 
-    def _run_task(self, task: str, dry_run: bool, graph: dict[str, Any] | None = None) -> None:
+    def _run_task(
+        self,
+        task: str,
+        dry_run: bool,
+        graph: dict[str, Any] | None = None,
+        bootstrap_tests: bool = False,
+    ) -> None:
         try:
             with HarnessApplication(self.server.config, self.server.events.add) as app:
+                if bootstrap_tests:
+                    self.server.events.add({
+                        "kind": "bootstrap_milestone", "node": "verification",
+                        "payload": {
+                            "state": "required",
+                            "summary": "Before completion, Nexus must create runnable tests and execute non-empty verification evidence.",
+                        },
+                    })
                 result = app.run_task(task, dry_run=dry_run, graph=graph)
+                if bootstrap_tests and not dry_run:
+                    proof = app.test(check_kinds=("test",))
+                    if not proof.get("passed"):
+                        reasons = "; ".join(
+                            str(item.get("reason")) for item in proof.get("verification_problems", [])
+                        ) or "no runnable test command was created"
+                        raise HarnessError(
+                            "Bootstrap milestone was not met: Nexus may not claim verified completion until "
+                            f"new test infrastructure runs real tests ({reasons})."
+                        )
+                    result["bootstrap_verification"] = proof
+                    self.server.events.add({
+                        "kind": "bootstrap_milestone", "node": "verification",
+                        "payload": {
+                            "state": "passed",
+                            "summary": "Created test infrastructure produced non-empty passing verification evidence.",
+                            "commands": proof.get("commands", []),
+                        },
+                    })
             self.server.events.add({"kind": "run_result", "node": "complete", "payload": result})
         except Exception as exc:
             self.server.events.add({"kind": "run_error", "node": "failed", "payload": {"error": str(exc)}})

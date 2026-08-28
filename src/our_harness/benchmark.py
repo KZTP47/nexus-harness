@@ -555,11 +555,13 @@ def _agentic_attempt(
         hidden_safe_cwd.mkdir()
         public_path = public_evaluator_root / "public_evaluator.py"
         public_path.write_text(
-            "import pathlib, sys, unittest\n"
+            "import json, pathlib, sys, unittest\n"
             "root = pathlib.Path(sys.argv[1]).resolve()\n"
             "sys.path.insert(0, str(root))\n"
             "suite = unittest.defaultTestLoader.discover(str(root / 'tests_public'))\n"
             "result = unittest.TextTestRunner(verbosity=0).run(suite)\n"
+            "if result.wasSuccessful():\n"
+            "    print(json.dumps({'tests': {'total': result.testsRun, 'failed': 0}}))\n"
             "raise SystemExit(0 if result.wasSuccessful() else 1)\n",
             encoding="utf-8",
             newline="",
@@ -588,7 +590,17 @@ def _agentic_attempt(
         }
         workflow.update(workflow_profile)
         overrides = {
-            "project": {"test_commands": [workflow_command], "lint_commands": [], "build_commands": []},
+            "project": {
+                "test_commands": [workflow_command],
+                "test_evidence_contracts": [{
+                    "command": workflow_command,
+                    "format": "json-stdout",
+                    "total_field": "tests.total",
+                    "failed_field": "tests.failed",
+                }],
+                "lint_commands": [],
+                "build_commands": [],
+            },
             "execution": {"mode": "process", "timeout_seconds": 30, "max_output_bytes": 100_000},
             "git": {"enabled": False, "allow_commit": False, "allow_push": False, "allow_merge": False},
             "memory": {"embedding_provider": "", "embedding_model": ""},

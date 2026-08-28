@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "node": {
+    "version": "22.18.0",
+    "url": "https://nodejs.org/dist/v22.18.0/node-v22.18.0-win-x64.zip",
+    "sha256": "c95d8a7e1c99e669cc08c9f1176e068c1f50847c37908fcb8c35b62482366511",
+    "archive_root": "node-v22.18.0-win-x64"
+  },
+  "packages": [
+    {
+      "name": "playwright-core",
+      "version": "1.62.1",
+      "url": "https://registry.npmjs.org/playwright-core/-/playwright-core-1.62.1.tgz",
+      "integrity": "sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw=="
+    },
+    {
+      "name": "playwright",
+      "version": "1.62.1",
+      "url": "https://registry.npmjs.org/playwright/-/playwright-1.62.1.tgz",
+      "integrity": "sha512-0M+L3LAD8/nm554LOla9Ayx0j0tmFZ0FBcoQ7F1VuVHpM/XpiC8RcDzBQB8W5+hA8L22THxELzeF+2WcUzvcLg=="
+    },
+    {
+      "name": "@playwright/test",
+      "version": "1.62.1",
+      "url": "https://registry.npmjs.org/@playwright/test/-/test-1.62.1.tgz",
+      "integrity": "sha512-DTcUc8qii+cpHvtOwggMtBRMjKZHXYWdw8syRYu2vtzuq4Wxphqq4NfCs5Zt44L6mA8rfDfj+PHnxFc/FeK6mQ=="
+    }
+  ],
+  "chromium": {
+    "name": "chromium-headless-shell",
+    "browser_version": "151.0.7922.34",
+    "revision": "1234",
+    "url": "https://cdn.playwright.dev/builds/cft/151.0.7922.34/win64/chrome-headless-shell-win64.zip",
+    "sha256": "46cc69ef55ba29268ffe32dda4192a9d2165be42c3f4e923241153d519493aea",
+    "archive_root": "chrome-headless-shell-win64",
+    "install_dir": "chromium_headless_shell-1234",
+    "executable": "chrome-headless-shell-win64/chrome-headless-shell.exe"
+  }
+}

@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -9,7 +14,13 @@ from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.context import ContextCompiler
 from our_harness.memory import MemoryStore
 from our_harness.models import HarnessError
-from our_harness.persistent_memory import PersistentMemoryHooks, initialize_vault
+from our_harness.persistent_memory import (
+    DEPLOYMENT_LOCK_OWNER,
+    PersistentMemoryHooks,
+    _checkout_deployment_lock,
+    _is_owned_build_lock_failure,
+    initialize_vault,
+)
 from our_harness.workflow import HarnessApplication
 
 
@@ -85,6 +96,79 @@ class PersistentMemoryHookTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "build failed"):
             failing.after_session("do not close", {"run_id": "blocked", "state": "complete"})
         self.assertEqual(list((self.vault / "Sessions").glob("*-blocked.md")), [])
+
+    def test_closeout_retries_all_windows_owned_artifact_lock_wordings(self) -> None:
+        owned = r"C:\project\desktop\build-output\win-unpacked\resources\runtime\locked.pyc"
+        self.assertTrue(
+            _is_owned_build_lock_failure(
+                f"remove {owned}: The process cannot access the file because it is being used by another process."
+            )
+        )
+        self.assertTrue(_is_owned_build_lock_failure(f"remove {owned}: Access is denied."))
+        self.assertFalse(
+            _is_owned_build_lock_failure(
+                r"remove C:\some-other-app\locked.pyc: being used by another process"
+            )
+        )
+
+    def test_checkout_deployment_lock_serializes_processes_and_recovers_dead_owner(self) -> None:
+        marker = self.project / "deployment-order.txt"
+        source = Path(__file__).resolve().parents[1] / "src"
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(source) + os.pathsep + environment.get("PYTHONPATH", "")
+        worker = (
+            "import os,sys,time; from pathlib import Path; "
+            "from our_harness.persistent_memory import _checkout_deployment_lock; "
+            "root=Path(sys.argv[1]); marker=Path(sys.argv[2]); label=sys.argv[3]; delay=float(sys.argv[4]); "
+            "lock=_checkout_deployment_lock(root,5,purpose=label); lock.__enter__(); "
+            "marker.open('a',encoding='utf-8').write(label+':start\\n'); "
+            "time.sleep(delay); marker.open('a',encoding='utf-8').write(label+':end\\n'); lock.__exit__(None,None,None)"
+        )
+        first = subprocess.Popen(
+            [sys.executable, "-c", worker, str(self.project), str(marker), "one", "0.45"],
+            env=environment,
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if marker.is_file() and "one:start" in marker.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.02)
+        else:
+            first.kill()
+            self.fail("first deployment-lock process did not acquire the lock")
+        owner = json.loads((self.project / DEPLOYMENT_LOCK_OWNER).read_text(encoding="utf-8"))
+        self.assertEqual(owner["state"], "owning")
+        self.assertEqual(owner["pid"], first.pid)
+        self.assertEqual(owner["project_root"], str(self.project.resolve()))
+
+        second = subprocess.Popen(
+            [sys.executable, "-c", worker, str(self.project), str(marker), "two", "0.02"],
+            env=environment,
+        )
+        self.assertEqual(first.wait(timeout=10), 0)
+        self.assertEqual(second.wait(timeout=10), 0)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8").splitlines(),
+            ["one:start", "one:end", "two:start", "two:end"],
+        )
+
+        crashed = (
+            "import os,sys; from pathlib import Path; "
+            "from our_harness.persistent_memory import _checkout_deployment_lock; "
+            "lock=_checkout_deployment_lock(Path(sys.argv[1]),5,purpose='crashed'); lock.__enter__(); "
+            "Path(sys.argv[2]).write_text('owned',encoding='utf-8'); os._exit(0)"
+        )
+        crash_marker = self.project / "crashed-owner.txt"
+        dead = subprocess.Popen(
+            [sys.executable, "-c", crashed, str(self.project), str(crash_marker)],
+            env=environment,
+        )
+        self.assertEqual(dead.wait(timeout=10), 0)
+        self.assertTrue(crash_marker.is_file())
+        started = time.monotonic()
+        with _checkout_deployment_lock(self.project, 2, purpose="recovered") as recovered:
+            self.assertEqual(recovered["pid"], os.getpid())
+        self.assertLess(time.monotonic() - started, 1)
 
     def test_binding_rejects_every_other_project(self) -> None:
         other = self.project.parent / "other"

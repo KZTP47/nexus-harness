@@ -69,7 +69,19 @@ button:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline
   animation: spin 1s linear infinite;
 }
 .status-row { display: flex; align-items: center; }
+.facts {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.5fr) minmax(0, 1fr);
+  gap: 8px 18px;
+  margin: 20px 0;
+}
+.facts dt { color: var(--muted); font-weight: 700; }
+.facts dd { margin: 0; overflow-wrap: anywhere; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
   .spinner { animation: none; border-top-color: var(--line); }
+}
+@media (max-width: 560px) {
+  .facts { grid-template-columns: 1fr; gap: 2px; }
+  .facts dd { margin-bottom: 10px; }
 }

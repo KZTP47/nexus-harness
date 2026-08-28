@@ -35,7 +35,7 @@ LATEST_LEGACY_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_LEGACY_PROTOCOL_VERSIONS = frozenset(
     {LATEST_LEGACY_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"}
 )
-_CLIENT_INFO = {"name": "our-harness", "version": "0.1.0"}
+_CLIENT_INFO = {"name": "our-harness", "version": "0.2.0"}
 
 
 class MCPRemoteError(HarnessError):
@@ -211,7 +211,10 @@ class MCPClient:
             raise HarnessError("MCP stdio server needs a command")
         popen_options: dict[str, Any] = {}
         if os.name == "nt":
-            popen_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            popen_options["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
         else:
             popen_options["start_new_session"] = True
         self.process = subprocess.Popen(

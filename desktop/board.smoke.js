@@ -423,7 +423,7 @@ async function main() {
     await page.waitForFunction(
       (agent) => document.querySelector(
         `.swarm-chat-card[data-agent="${agent}"] .swarm-chat-count`)
-        .textContent === "22 letters",
+        .textContent === "22 / 200,000 characters",
       which, { timeout: 20000 }
     );
     console.log("pass  what is typed into it really goes in");

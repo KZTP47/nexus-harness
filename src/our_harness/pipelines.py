@@ -1020,6 +1020,7 @@ def _run_git_repo(config: LoadedConfig, node: dict[str, Any], _kinds) -> tuple[b
             finished = subprocess.run(
                 ["git", *parts], cwd=config.project_root, capture_output=True,
                 text=True, timeout=60.0, check=False,
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
             )
         except FileNotFoundError:
             return 127, "git is not on this machine"

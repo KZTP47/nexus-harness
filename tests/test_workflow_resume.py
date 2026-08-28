@@ -82,10 +82,23 @@ def configure(root: Path) -> None:
     check = [
         sys.executable,
         "-c",
-        "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'",
+        (
+            "import json; from pathlib import Path; "
+            "assert Path('value.py').read_text() == 'VALUE = 2\\n'; "
+            "print(json.dumps({'tests': {'total': 1, 'failed': 0}}))"
+        ),
     ]
     (root / ".harness" / "config.local.json").write_text(
-        json.dumps({"project": {"test_commands": [check], "lint_commands": [check]}}),
+        json.dumps({"project": {
+            "test_commands": [check],
+            "test_evidence_contracts": [{
+                "command": check,
+                "format": "json-stdout",
+                "total_field": "tests.total",
+                "failed_field": "tests.failed",
+            }],
+            "lint_commands": [check],
+        }}),
         encoding="utf-8",
     )
 
@@ -301,10 +314,23 @@ class WorkflowResumeTests(unittest.TestCase):
             check = [
                 sys.executable,
                 "-c",
-                f"from pathlib import Path; assert Path('routes.py').read_bytes() == {content.encode('utf-8')!r}",
+                (
+                    "import json; from pathlib import Path; "
+                    f"assert Path('routes.py').read_bytes() == {content.encode('utf-8')!r}; "
+                    "print(json.dumps({'tests': {'total': 1, 'failed': 0}}))"
+                ),
             ]
             (root / ".harness" / "config.local.json").write_text(
-                json.dumps({"project": {"test_commands": [check], "lint_commands": [check]}}),
+                json.dumps({"project": {
+                    "test_commands": [check],
+                    "test_evidence_contracts": [{
+                        "command": check,
+                        "format": "json-stdout",
+                        "total_field": "tests.total",
+                        "failed_field": "tests.failed",
+                    }],
+                    "lint_commands": [check],
+                }}),
                 encoding="utf-8",
             )
             provider = QueueProvider(responses)

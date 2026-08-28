@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import ssl
+import urllib.error
+import urllib.request
 from typing import Any
 
 from ..config import LoadedConfig
@@ -23,6 +26,8 @@ def _routed(config: LoadedConfig, route: str) -> tuple[str, LoadedConfig]:
     named = str(route or "").strip()
     if not named:
         raise HarnessError("Choose which agent route to check first.")
+    if named == "default":
+        return named, config
     try:
         return named, ProviderRegistry(config).provider_config(named)
     except HarnessError:
@@ -138,6 +143,28 @@ def connection_status(
             "note": (
                 "No login is required. The configured local model command is installed."
                 if ready else "No login is required, but the configured local model command is not installed."
+            ),
+        }, named, kind)
+
+    if kind == "ollama":
+        endpoint = str(settings.get("endpoint") or "").rstrip("/")
+        try:
+            with urllib.request.urlopen(
+                f"{endpoint}/api/tags", timeout=min(timeout_seconds, 2.0)
+            ) as response:
+                ready = response.status == 200
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError, ValueError):
+            ready = False
+        return _with_route({
+            "installed": ready,
+            "authentication": "not-required",
+            "state": "ready" if ready else "unreachable",
+            "can_login": False,
+            "checked_by": "ollama-local-health",
+            "note": (
+                f"The exact Ollama route is reachable at {endpoint}."
+                if ready else
+                f"The exact Ollama route is not reachable at {endpoint}. Start Ollama there or choose another route."
             ),
         }, named, kind)
 

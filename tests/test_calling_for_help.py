@@ -57,6 +57,12 @@ class CallingForHelp(unittest.TestCase):
         self.assertEqual(said.question, "Is the old parser still used?")
         self.assertGreaterEqual(said.milliseconds, 0)
 
+    def test_incident_sized_helper_answer_is_preserved(self) -> None:
+        answer = "result:" + ("r" * 35_789)
+        with self.standing_in(Answering(answer)):
+            said = helper.ask_for_help(self.config, "What did the check find?")
+        self.assertEqual(said.answer, answer)
+
     def test_it_is_told_not_to_do_the_work(self) -> None:
         """A helper that thinks it is running the job starts trying to run it."""
 
@@ -120,10 +126,11 @@ class CallingForHelp(unittest.TestCase):
                 helper.ask_for_help(self.config, "Anything?")
         self.assertIn("nothing at all", str(caught.exception))
 
-    def test_a_very_long_answer_is_cut(self) -> None:
+    def test_an_over_limit_answer_is_rejected_without_a_partial_result(self) -> None:
         with self.standing_in(Answering("x" * (helper.LONGEST_ANSWER + 500))):
-            said = helper.ask_for_help(self.config, "Anything?")
-        self.assertEqual(len(said.answer), helper.LONGEST_ANSWER)
+            with self.assertRaises(helper.HelperError) as caught:
+                helper.ask_for_help(self.config, "Anything?")
+        self.assertIn("did not truncate", str(caught.exception))
 
     def test_credentials_never_reach_the_assistant_or_the_record(self) -> None:
         self.config.data.setdefault("redaction", {})

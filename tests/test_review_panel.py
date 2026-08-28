@@ -208,7 +208,8 @@ class ReviewPanelTests(unittest.TestCase):
             program = (
                 "import json,os,pathlib,sys,time;"
                 "data={'pid':os.getpid(),'ppid':os.getppid(),'pgrp':os.getpgrp() if hasattr(os,'getpgrp') else None};"
-                "pathlib.Path(sys.argv[1]).write_text(json.dumps(data),encoding='utf-8');"
+                "target=pathlib.Path(sys.argv[1]);temporary=target.with_name(target.name+'.tmp');"
+                "temporary.write_text(json.dumps(data),encoding='utf-8');os.replace(temporary,target);"
                 "time.sleep(30)"
             )
             script = "\n".join(
@@ -275,7 +276,10 @@ class ReviewPanelTests(unittest.TestCase):
         malformed = {"verdict": "MAYBE", "findings": [], "residual_risks": []}
         with tempfile.TemporaryDirectory() as temporary:
             panel = ReviewPanel(panel_config(Path(temporary), 2, 2, payloads=[malformed, PASS]))
-            result = panel.review({"patch": "x"}, deadline_at=time.monotonic() + 2)
+            # Process startup can be substantially slower while the integrated
+            # suite is launching other isolated workers. Keep this test about
+            # malformed-result isolation, not about the shared deadline.
+            result = panel.review({"patch": "x"}, deadline_at=time.monotonic() + 5)
             self.assertEqual(result.verdict, "BLOCK")
             self.assertEqual([item.status for item in result.reviews].count("failed"), 1)
             self.assertEqual([item.status for item in result.reviews].count("passed"), 1)

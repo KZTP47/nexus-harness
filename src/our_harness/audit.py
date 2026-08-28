@@ -9,7 +9,10 @@ from typing import Any, Iterable
 
 ABSOLUTE_PATTERNS = [
     re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]"),
-    re.compile(r"(?<![\\/])\\\\[^\\/\s]+[\\/][^\\/\s]+"),
+    # A UNC server/share begins with filesystem-name characters.  Requiring
+    # those prevents escaped source-code fragments such as ``'\\\\','/'``
+    # from being mistaken for machine paths while still finding real UNC roots.
+    re.compile(r"(?<![\\/])\\\\[A-Za-z0-9_.-]+[\\/][A-Za-z0-9_$.-]+"),
     re.compile(
         r"(?<![:A-Za-z0-9_])/(?:Users|home|root|tmp|var|opt|srv|mnt|media|Volumes|workspace|workspaces|project|projects|repo|repos)(?:/[^\s'\"`]+)+",
         re.IGNORECASE,
@@ -28,6 +31,10 @@ EXCLUDED_PARTS = {
     ".git", ".venv", "dist", "build", "tests", "__pycache__",
     # Third-party trees are not ours to rewrite, and the harness never ships them.
     "node_modules", ".harness", "benchmark-archive", "benchmark-logs",
+    # Generated, ignored release input. Its exact locked distributions and
+    # imports are validated by prepare_windows_runtime.py; scanning vendor
+    # source as if Nexus authored it creates false machine-path findings.
+    "runtime",
     # What a build put there, including the copy of this very code that the
     # desktop app carries. Read as source, the audit was reading its own output
     # and telling us off for it.

@@ -6,6 +6,7 @@ const detail = query.get("detail");
 const log = query.get("log");
 const because = query.get("because");
 const repair = query.get("repair");
+const trust = query.get("trust");
 
 if (title) document.getElementById("title").textContent = title;
 document.getElementById("detail").textContent = detail || "The harness did not start.";
@@ -36,6 +37,29 @@ if (repair) {
     if (!started) {
       button.disabled = false;
       button.textContent = "Fix and start";
+    }
+  });
+}
+if (trust) {
+  const review = document.getElementById("trustReview");
+  review.hidden = false;
+  window.harnessDesktop.reviewTrust().then((value) => {
+    document.getElementById("trustPath").textContent = value.path;
+    document.getElementById("trustContents").textContent = value.contents;
+    const list = document.getElementById("trustConsequences");
+    for (const line of value.consequences) {
+      const item = document.createElement("li");
+      item.textContent = line;
+      list.append(item);
+    }
+  }).catch((error) => { document.getElementById("trustStatus").textContent = error.message; });
+  document.getElementById("trust").addEventListener("click", async (event) => {
+    event.currentTarget.disabled = true;
+    document.getElementById("trustStatus").textContent = "Recording trust for the exact file shown above.";
+    try { await window.harnessDesktop.trustProject(); }
+    catch (error) {
+      event.currentTarget.disabled = false;
+      document.getElementById("trustStatus").textContent = error.message;
     }
   });
 }

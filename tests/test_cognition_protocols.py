@@ -136,6 +136,22 @@ class ProviderRoutingTests(unittest.TestCase):
             )
             self.assertEqual(provider.complete(self._request()).text, "hello")
 
+    def test_local_provider_redacts_full_stderr_before_bounding(self) -> None:
+        secret = "local-provider-secret-0123456789"
+        stderr = ("x" * 7_985) + "Bearer " + secret + (" middle" * 1_000) + " ACTIONABLE-STDERR-TAIL"
+        program = f"import sys; sys.stderr.write({stderr!r}); raise SystemExit(7)"
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = self._local_provider(Path(temporary), program, output_limit=100_000)
+            with self.assertRaises(HarnessError) as caught:
+                provider.complete(self._request())
+
+        message = str(caught.exception)
+        self.assertIn("Local provider exited 7", message)
+        self.assertIn("NEXUS_REDACTED_CAUSE_BOUNDARY", message)
+        self.assertIn("ACTIONABLE-STDERR-TAIL", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(secret[:8], message)
+
     def test_local_provider_rejects_oversize_timeout_and_non_string_text(self) -> None:
         cases = [
             ("import json; print(json.dumps({'text':'x'*10000}))", 3, "exceeded"),

@@ -191,6 +191,7 @@ class _Talking:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 cwd=str(root),
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
             )
         except OSError as exc:
             raise NavigateError(f"{argv[0]} would not start: {exc}") from exc

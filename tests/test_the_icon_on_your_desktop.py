@@ -552,19 +552,17 @@ class SomebodyCanFindItTests(unittest.TestCase):
 
     def test_it_runs_the_script_that_does_the_work(self) -> None:
         said = (ROOT / "Install Nexus Harness.cmd").read_text(encoding="utf-8")
-        self.assertIn("put_it_on_your_desktop.py", said)
-        # It has to work for somebody who has Python under either name.
-        self.assertIn("where python", said)
-        self.assertIn("where py", said)
+        self.assertIn("install_nexus_harness.ps1", said)
+        self.assertNotIn("put_it_on_your_desktop.py", said)
+        self.assertIn("powershell.exe", said)
         # And stay open long enough to be read when something goes wrong.
         self.assertIn("pause", said)
 
-    def test_it_says_what_to_do_when_python_is_missing(self) -> None:
-        """The one thing it cannot do for somebody, so it has to be said."""
-
+    def test_it_does_not_require_system_python(self) -> None:
         said = (ROOT / "Install Nexus Harness.cmd").read_text(encoding="utf-8")
-        self.assertIn("python.org", said)
-        self.assertIn("PATH", said)
+        self.assertNotIn("where python", said.lower())
+        self.assertNotIn("where py", said.lower())
+        self.assertIn("no separate Python", said)
 
     def test_the_readme_tells_somebody_to_run_it(self) -> None:
         said = (ROOT / "README.md").read_text(encoding="utf-8")

@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import HarnessError, ProviderRequest, ProviderResponse
+from ..redaction import bounded_redacted_text
 from .. import cancellation
 from .base import Provider, _interrupt_http_response
 from .subscription_cli import UNPRICED
@@ -187,6 +188,7 @@ def _keep_it_to_yourself(where: Path) -> None:
         subprocess.run(
             ["icacls", str(where), "/inheritance:r", "/grant:r", f"{who}:F"],
             capture_output=True, timeout=15, check=False,
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
         )
     except (OSError, subprocess.SubprocessError):
         return
@@ -218,10 +220,14 @@ def _ask_microsoft(url: str, form: dict[str, str], timeout: float = 30.0) -> dic
     )
     try:
         with urllib.request.urlopen(asked, timeout=timeout) as answered:  # noqa: S310
-            raw = answered.read(1_000_000)
+            raw = answered.read(1_000_001)
+            if len(raw) > 1_000_000:
+                raise HarnessError("Microsoft sign-in response exceeded its 1,000,000-byte limit")
     except urllib.error.HTTPError as exc:
         try:
-            raw = exc.read(1_000_000)
+            raw = exc.read(1_000_001)
+            if len(raw) > 1_000_000:
+                raise HarnessError("Microsoft sign-in error exceeded its 1,000,000-byte limit")
         finally:
             exc.close()
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -514,10 +520,22 @@ class M365CopilotProvider(Provider):
             with self._http_opener.open(asked, timeout=min(timeout or LONGEST_WAIT, LONGEST_WAIT)) as answered:
                 response_holder["response"] = answered
                 cancellation.checkpoint()
-                raw = answered.read(20_000_000)
+                response_limit = 100_000_000
+                raw = answered.read(response_limit + 1)
+                if len(raw) > response_limit:
+                    raise HarnessError(
+                        f"Microsoft 365 Copilot response exceeded its {response_limit:,}-byte transport limit"
+                    )
         except urllib.error.HTTPError as exc:
             try:
-                body_said = exc.read(16_000).decode("utf-8", errors="replace")
+                error_limit = 100_000_000
+                error_raw = exc.read(error_limit + 1)
+                body_said = error_raw.decode("utf-8", errors="replace")
+                if len(error_raw) > error_limit:
+                    body_said += (
+                        f" [Microsoft error body exceeded the disclosed {error_limit:,}-byte "
+                        "transport limit; Nexus did not treat the captured prefix as complete.]"
+                    )
             finally:
                 exc.close()
             cancellation.checkpoint()
@@ -539,7 +557,9 @@ class M365CopilotProvider(Provider):
         return held
 
     def _what_that_number_meant(self, number: int, body: str) -> HarnessError:
-        theirs = self._redactor.text(" ".join(body.split()))[:400]
+        theirs = bounded_redacted_text(
+            self._redactor, " ".join(body.split()), 4_000
+        )
         if number == 401:
             return SignInNeeded(
                 "Microsoft no longer accepts this sign-in. Open Your team and sign in again."

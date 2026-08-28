@@ -19,12 +19,14 @@ from typing import Any
 
 from . import cancellation
 from .models import HarnessError, ProviderRequest, ProviderResponse
+from .redaction import CredentialRedactor, bounded_redacted_text
 
 WEB_ROUTE = re.compile(r"^web:([a-z0-9][a-z0-9-]{5,63})$")
 REQUEST_ID = re.compile(r"^[a-f0-9]{32}$")
 CONVERSATION_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
 HEARTBEAT_SECONDS = 15.0
 WEB_WAIT_SECONDS = 420.0
+MAX_WEB_ANSWER_CHARACTERS = 8_000_000
 
 
 def _safe_conversation_key(value: object) -> str:
@@ -78,6 +80,7 @@ class WebChatBroker:
         self._condition = threading.Condition()
         self._connections: dict[str, dict[str, Any]] = {}
         self._requests: dict[str, WebRequest] = {}
+        self._redactor = CredentialRedactor()
 
     def heartbeat(self, connections: object) -> list[dict[str, Any]]:
         if not isinstance(connections, list):
@@ -261,8 +264,17 @@ class WebChatBroker:
             wanted = self._requests.get(wanted_id)
             if wanted is None:
                 return
-            problem = " ".join(str(error or "").split())[:1000]
-            text = str(answer or "").strip()[:200_000]
+            problem = bounded_redacted_text(
+                self._redactor, " ".join(str(error or "").split()), 65_536
+            )
+            text = str(answer or "").strip()
+            if len(text) > MAX_WEB_ANSWER_CHARACTERS:
+                problem = (
+                    f"The provider web chat returned {len(text):,} characters, above "
+                    f"the disclosed {MAX_WEB_ANSWER_CHARACTERS:,}-character bridge limit. "
+                    "Nexus did not truncate or save a partial answer."
+                )
+                text = ""
             if problem or not text:
                 wanted.state = "error"
                 wanted.error = problem or "The provider web chat returned no visible answer."

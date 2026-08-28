@@ -35,6 +35,7 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 # Long enough for a slow machine to start Python and bind a port, short enough
@@ -45,6 +46,64 @@ LONGEST_WAIT_FOR_THE_PANEL = 90.0
 # browser that is already running is not a process of its own, and then closing
 # it tells this nothing and the panel is left running for ever.
 WHERE_THE_WINDOW_KEEPS_ITSELF = "window"
+ALREADY_EXISTS = 183
+
+
+def _instance_file(root: Path) -> Path:
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "NexusHarness" / "source-instance.json"
+
+
+def _claim_source_instance(root: Path) -> tuple[int | None, bool]:
+    """Own one source-window process across all checkouts on Windows.
+
+    A kernel mutex disappears even when the process crashes, unlike a PID file.
+    The small JSON file is diagnostic state only and is never treated as the
+    lock itself.
+    """
+
+    if os.name != "nt":
+        return None, False
+    import ctypes
+
+    ctypes.windll.kernel32.SetLastError(0)
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\NexusHarnessSourceWindow")
+    if not handle:
+        raise OSError("Windows could not create the Nexus source-window ownership lock")
+    return int(handle), ctypes.windll.kernel32.GetLastError() == ALREADY_EXISTS
+
+
+def _release_source_instance(handle: int | None) -> None:
+    if handle is not None and os.name == "nt":
+        import ctypes
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def _remember_source_instance(root: Path, url: str) -> None:
+    where = _instance_file(root)
+    where.parent.mkdir(parents=True, exist_ok=True)
+    where.write_text(json.dumps({
+        "process_id": os.getpid(),
+        "project_root": str(root.resolve()),
+        "url": url,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }, indent=2) + "\n", encoding="utf-8")
+
+
+def _existing_source_instance(root: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(_instance_file(root).read_text(encoding="utf-8"))
+        url = str(value.get("url") or "")
+        parsed = urlparse(url)
+        if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+            return {
+                "url": url,
+                "project_root": str(value.get("project_root") or "Unknown source checkout"),
+                "process_id": value.get("process_id"),
+            }
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return None
 
 
 def _where_browsers_live() -> tuple[Path, ...]:
@@ -255,9 +314,11 @@ def a_page_about_what_went_wrong(exc: "TheAppWouldNotStart") -> str:
       <p>This project has a settings file, and a settings file can name commands
       to run. Nothing reads one until somebody says the file is theirs. That is
       a deliberate stop, not a fault.</p>
-      <p>If this project is yours, run the installer again and say yes when it
-      asks, or open a terminal in the project folder and run:</p>
-      <pre>python scripts/harness.py trust</pre>
+      <p>This source fallback cannot safely record trust from an error page.
+      Review <code>.harness/config.local.json</code> in this exact checkout,
+      then run the command below from this checkout. The installed desktop app
+      provides an on-screen review-and-trust button instead.</p>
+      <pre>python scripts/harness.py --project . trust</pre>
 """
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -315,6 +376,30 @@ def main(argv: list[str] | None = None) -> int:
     said = parser.parse_args(argv)
 
     browser = None if said.in_a_tab else a_browser_that_can_do_windows()
+    ownership, already_open = _claim_source_instance(ROOT)
+    if already_open:
+        _release_source_instance(ownership)
+        existing = _existing_source_instance(ROOT)
+        if existing:
+            url = str(existing["url"])
+            owner = str(existing["project_root"])
+            process_id = existing.get("process_id")
+            print(
+                "Nexus source mode is already owned by "
+                f"{owner} (process {process_id or 'unknown'}) at {url}. "
+                "Focusing that exact owner instead. Close it before opening a different checkout."
+            )
+            if browser is not None:
+                open_it_in_a_window(browser, url, where_the_window_keeps_itself(ROOT))
+            else:
+                webbrowser.open(url)
+            return 0
+        print(
+            "Another Nexus source-mode process owns the machine-wide window lock, "
+            "but its identity record is missing or invalid. Close that Nexus window "
+            "(or end the stale process) before opening this checkout."
+        )
+        return 1
     try:
         panel, url = start_the_panel(ROOT, said.port)
     except TheAppWouldNotStart as exc:
@@ -327,6 +412,14 @@ def main(argv: list[str] | None = None) -> int:
         # press it, nothing happens, no window, no message, nothing to go on.
         if browser is not None:
             show_what_went_wrong(browser, exc)
+        _release_source_instance(ownership)
+        return 1
+    try:
+        _remember_source_instance(ROOT, url)
+    except OSError as exc:
+        _stop_it(panel)
+        _release_source_instance(ownership)
+        print(f"The source window could not record which process owns it: {exc}")
         return 1
     try:
         if browser is None:
@@ -345,6 +438,10 @@ def main(argv: list[str] | None = None) -> int:
         pass
     finally:
         _stop_it(panel)
+        try:
+            _instance_file(ROOT).unlink(missing_ok=True)
+        finally:
+            _release_source_instance(ownership)
     return 0
 
 

@@ -27,7 +27,13 @@ from ..models import (
     ProviderResponse,
     ResponsesContinuation,
 )
-from ..redaction import CredentialRedactor
+from ..redaction import CredentialRedactor, bounded_redacted_text
+
+
+# Provider payload transport is separate from local command/test output. The
+# public answer contract permits eight million characters; a JSON encoder can
+# represent each non-BMP character as a twelve-byte surrogate pair.
+MAX_PROVIDER_RESPONSE_BYTES = 100_000_000
 
 
 class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -149,14 +155,32 @@ class Provider(ABC):
             with self._http_opener.open(request, timeout=self._timeout(timeout_seconds)) as response:
                 response_holder["response"] = response
                 cancellation.checkpoint()
-                raw = response.read(20_000_000)
+                response_limit = max(
+                    MAX_PROVIDER_RESPONSE_BYTES,
+                    int(self.config.get("execution.max_output_bytes")),
+                )
+                raw = response.read(response_limit + 1)
+                if len(raw) > response_limit:
+                    raise HarnessError(
+                        f"Provider response exceeded its {response_limit:,}-byte transport limit"
+                    )
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read(16_000).decode("utf-8", errors="replace")
+                error_raw = exc.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                body = error_raw.decode("utf-8", errors="replace")
+                if len(error_raw) > MAX_PROVIDER_RESPONSE_BYTES:
+                    body += (
+                        f" [Provider error body exceeded the disclosed "
+                        f"{MAX_PROVIDER_RESPONSE_BYTES:,}-byte transport limit; "
+                        "Nexus did not treat the captured prefix as complete.]"
+                    )
             finally:
                 exc.close()
             cancellation.checkpoint()
-            raise HarnessError(f"Provider HTTP {exc.code}: {self._redactor.text(body)}") from exc
+            raise HarnessError(
+                f"Provider HTTP {exc.code}: "
+                + bounded_redacted_text(self._redactor, body, 65_536)
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             cancellation.checkpoint()
             raise HarnessError(
@@ -259,8 +283,14 @@ class Provider(ABC):
                     if not isinstance(chunk, bytes):
                         raise HarnessError("Provider stream reader returned a non-byte chunk")
                     consumed += len(chunk)
-                    if consumed > 20_000_000:
-                        raise HarnessError("Provider stream exceeded its byte limit")
+                    response_limit = max(
+                        MAX_PROVIDER_RESPONSE_BYTES,
+                        int(self.config.get("execution.max_output_bytes")),
+                    )
+                    if consumed > response_limit:
+                        raise HarnessError(
+                            f"Provider stream exceeded its {response_limit:,}-byte transport limit"
+                        )
                     yield from decoder.feed(chunk)
                     continue
                 if kind == "error":
@@ -273,11 +303,21 @@ class Provider(ABC):
                 break
         except urllib.error.HTTPError as exc:
             try:
-                body = exc.read(16_000).decode("utf-8", errors="replace")
+                error_raw = exc.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                body = error_raw.decode("utf-8", errors="replace")
+                if len(error_raw) > MAX_PROVIDER_RESPONSE_BYTES:
+                    body += (
+                        f" [Provider error body exceeded the disclosed "
+                        f"{MAX_PROVIDER_RESPONSE_BYTES:,}-byte transport limit; "
+                        "Nexus did not treat the captured prefix as complete.]"
+                    )
             finally:
                 _interrupt_http_response(exc)
             cancellation.checkpoint()
-            raise HarnessError(f"Provider HTTP {exc.code}: {self._redactor.text(body)}") from exc
+            raise HarnessError(
+                f"Provider HTTP {exc.code}: "
+                + bounded_redacted_text(self._redactor, body, 65_536)
+            ) from exc
         except (urllib.error.URLError, TimeoutError, OSError, UnicodeDecodeError) as exc:
             cancellation.checkpoint()
             raise HarnessError(f"Provider stream failed: {exc}") from exc
@@ -432,6 +472,7 @@ def _chat_tool_calls(fragments: object) -> list[dict[str, Any]]:
 
 
 class OpenAIProvider(Provider):
+    structured_retry_is_safe = True
     @staticmethod
     def _with_images(request: ProviderRequest, messages: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
         images = request_images(request)
@@ -859,6 +900,7 @@ class OpenAIProvider(Provider):
 
 
 class AnthropicProvider(Provider):
+    structured_retry_is_safe = True
     @staticmethod
     def _tools(request: ProviderRequest) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
@@ -1116,6 +1158,7 @@ class AnthropicProvider(Provider):
 
 
 class OllamaProvider(Provider):
+    structured_retry_is_safe = True
     @staticmethod
     def _tools(request: ProviderRequest) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
@@ -1344,7 +1387,10 @@ class LocalProcessProvider(Provider):
                 else None
             ),
         }))
-        response_limit = min(2_000_000, int(self.config.get("execution.max_output_bytes")))
+        response_limit = max(
+            MAX_PROVIDER_RESPONSE_BYTES,
+            int(self.config.get("execution.max_output_bytes")),
+        )
         try:
             result = CommandRunner(self.config).run(
                 command,
@@ -1359,7 +1405,8 @@ class LocalProcessProvider(Provider):
         if result.output_truncated:
             raise HarnessError(f"Local provider response exceeded its {response_limit}-byte limit")
         if result.exit_code != 0:
-            raise HarnessError(f"Local provider exited {result.exit_code}: {result.stderr[:8000]}")
+            detail = bounded_redacted_text(self._redactor, result.stderr, 8_000)
+            raise HarnessError(f"Local provider exited {result.exit_code}: {detail}")
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as exc:

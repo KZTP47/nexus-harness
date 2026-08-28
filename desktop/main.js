@@ -7,17 +7,49 @@
 const electron = require("electron");
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = electron;
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const path = require("node:path");
 
 const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
 const { attachGuards, onlyOnce, isHarnessVersionMismatch, whyItReallyIs } = require("./guards");
 const { WebChatManager } = require("./web-chats");
 
-const server = new HarnessServer({ onExit: (code) => reportServerStopped(code) });
+function readBuildInfo() {
+  try {
+    const value = JSON.parse(fs.readFileSync(path.join(__dirname, "build-info.json"), "utf8"));
+    return value && typeof value === "object" ? value : {};
+  } catch (_error) { return {}; }
+}
+
+const buildInfo = readBuildInfo();
+const server = new HarnessServer({
+  onExit: (code) => reportServerStopped(code),
+  bundledRequired: app.isPackaged,
+  environment: {
+    ...process.env,
+    NEXUS_BUILD_COMMIT: String(buildInfo.commit || "unknown"),
+    NEXUS_BUILD_DIRTY: buildInfo.dirty ? "1" : "0",
+    NEXUS_BUILD_KIND: String(buildInfo.build_kind || "source development build"),
+  },
+});
 let window = null;
 let projectPath = "";
 let repairAvailable = false;
 let webChatManager = null;
+let reviewedTrust = null;
+const ownsApplicationInstance = app.requestSingleInstanceLock();
+
+if (!ownsApplicationInstance) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!window || window.isDestroyed()) return;
+    if (window.isMinimized()) window.restore();
+    window.show();
+    window.focus();
+    window.webContents.focus();
+  });
+}
 
 function settingsFile() {
   return path.join(app.getPath("userData"), "settings.json");
@@ -71,6 +103,11 @@ function newestProjectFromTheHarnessList() {
 }
 
 function projectToOpenAtStartup() {
+  const flag = process.argv.indexOf("--project");
+  if (flag >= 0 && flag + 1 < process.argv.length) {
+    const selected = existingProject(process.argv[flag + 1]);
+    if (selected) return selected;
+  }
   const settings = readSettings();
   const remembered = existingProject(settings.lastProject);
   const newest = newestProjectFromTheHarnessList();
@@ -147,6 +184,24 @@ function projectCarriesHarness(chosen) {
   }
 }
 
+function runtimeDiagnostics() {
+  let port = "not running";
+  try { port = String(new URL(server.url).port || "not running"); } catch (_error) { /* no URL */ }
+  return {
+    version: app.getVersion(),
+    commit: `${buildInfo.commit || "unknown"}${buildInfo.dirty ? "+dirty" : ""}`,
+    buildKind: String(buildInfo.build_kind || (app.isPackaged ? "packaged build with missing identity" : "source development build")),
+    packaged: app.isPackaged,
+    installation: app.isPackaged ? "installed desktop release" : "source development build",
+    project: projectPath || "No project is open",
+    serverUrl: server.url || "The local server is not running",
+    port,
+    processId: process.pid,
+    executable: process.execPath,
+    electron: process.versions.electron,
+  };
+}
+
 function projectKey(chosen) {
   const resolved = path.resolve(chosen);
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
@@ -180,6 +235,7 @@ async function openProject(chosen, options = {}) {
     return;
   }
   chosen = remembered;
+  reviewedTrust = null;
   repairAvailable = false;
   showPage("starting.html", { project: path.basename(chosen) });
   server.stop();
@@ -187,7 +243,7 @@ async function openProject(chosen, options = {}) {
     const url = await server.start(chosen, options);
     if (window && !window.isDestroyed()) window.loadURL(url);
   } catch (error) {
-    const canRepair = isHarnessVersionMismatch(error.message) && projectCarriesHarness(chosen);
+    const canRepair = !app.isPackaged && isHarnessVersionMismatch(error.message) && projectCarriesHarness(chosen);
     // Once somebody has chosen this repair for this project, future launches
     // recover without stopping at the error page. The bundled copy still gets
     // the first attempt, so an updated installer naturally takes over again.
@@ -200,8 +256,9 @@ async function openProject(chosen, options = {}) {
       detail: onlyOnce(error.message),
       // What this one really means, when the app can tell. Three guesses that
       // are all wrong send somebody looking in three wrong places.
-      because: whyItReallyIs(error.message, { canRepair: repairAvailable }),
+      because: whyItReallyIs(error.message, { canRepair: repairAvailable, installed: app.isPackaged }),
       repair: repairAvailable ? "1" : "",
+      trust: /has not been told to trust|requires trusted|not trusted yet/i.test(error.message) ? "1" : "",
       log: server.recentLog().split("\n").slice(-12).join("\n"),
     });
   }
@@ -322,6 +379,10 @@ function buildMenu() {
           label: "Welcome screen",
           click: () => showPage("welcome.html"),
         },
+        {
+          label: "About and diagnostics",
+          click: () => showPage("about.html"),
+        },
       ],
     },
   ];
@@ -361,6 +422,50 @@ ipcMain.handle("harness:repairVersionMismatch", () => {
 ipcMain.handle("harness:help", () => {
   showPage("help.html");
   return true;
+});
+ipcMain.handle("harness:diagnostics", (event) => (
+  fromHarnessWindow(event) ? runtimeDiagnostics() : null
+));
+ipcMain.handle("harness:reviewTrust", (event) => {
+  if (!fromHarnessWindow(event) || !projectPath) return null;
+  const local = path.join(projectPath, ".harness", "config.local.json");
+  const shared = path.join(projectPath, ".harness", "config.json");
+  const selected = fs.realpathSync.native(fs.existsSync(local) ? local : shared);
+  if (fs.statSync(selected).size > 1024 * 1024) throw new Error("The settings file is too large to review safely.");
+  const contents = fs.readFileSync(selected, "utf8");
+  const value = JSON.parse(contents);
+  const consequences = [];
+  if (value.providers || value.provider) consequences.push("start the provider programs or contact the model endpoints named here");
+  if (value.project?.test_commands) consequences.push("run the project test commands named here");
+  if (value.mcp?.servers) consequences.push("start the MCP servers named here");
+  if (value.plugins?.paths) consequences.push("load executable plugins named here");
+  reviewedTrust = {
+    path: selected,
+    sha256: crypto.createHash("sha256").update(contents, "utf8").digest("hex"),
+  };
+  return {
+    path: selected,
+    contents,
+    consequences: consequences.length ? consequences : ["apply the non-executable project settings shown here"],
+  };
+});
+ipcMain.handle("harness:trustProject", async (event) => {
+  if (!fromHarnessWindow(event) || !projectPath) throw new Error("No project is open.");
+  if (!reviewedTrust) throw new Error("Review the exact settings file before trusting it.");
+  const current = fs.readFileSync(reviewedTrust.path, "utf8");
+  const digest = crypto.createHash("sha256").update(current, "utf8").digest("hex");
+  if (digest !== reviewedTrust.sha256) {
+    reviewedTrust = null;
+    throw new Error("The settings file changed after review. Press Try again and review the new exact contents.");
+  }
+  const reviewed = reviewedTrust;
+  const result = await server.trustProject(projectPath, {
+    reviewedConfig: fs.realpathSync.native(reviewed.path),
+    expectedSha256: reviewed.sha256,
+  });
+  reviewedTrust = null;
+  openProject(projectPath);
+  return result;
 });
 ipcMain.handle("harness:showProjectFile", (_event, relativePath) => {
   const target = projectFileToShow(projectPath, relativePath);
@@ -458,7 +563,7 @@ ipcMain.handle("harness:webChatShellClose", (event) => {
   return true;
 });
 
-app.whenReady().then(async () => {
+if (ownsApplicationInstance) app.whenReady().then(async () => {
   buildMenu();
   createWindow();
   // Show the window before anything else. A folder picker on top of a blank

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'">
+  <title>About Nexus Harness</title>
+  <link rel="stylesheet" href="shell.css">
+</head>
+<body>
+  <main>
+    <h1>About and diagnostics</h1>
+    <p class="lead">These are the exact app and project this window owns. Include them when reporting a startup problem.</p>
+    <dl id="facts" class="facts"><dt>Status</dt><dd>Reading this app.</dd></dl>
+    <p id="copyStatus" role="status"></p>
+    <div class="row">
+      <button id="copy" type="button">Copy diagnostics</button>
+      <button id="back" class="primary" type="button">Back to my project</button>
+    </div>
+  </main>
+  <script src="about.js"></script>
+</body>
+</html>

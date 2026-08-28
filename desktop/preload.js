@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   retry: () => ipcRenderer.invoke("harness:retry"),
   repairVersionMismatch: () => ipcRenderer.invoke("harness:repairVersionMismatch"),
   showHelp: () => ipcRenderer.invoke("harness:help"),
+  diagnostics: () => ipcRenderer.invoke("harness:diagnostics"),
+  reviewTrust: () => ipcRenderer.invoke("harness:reviewTrust"),
+  trustProject: () => ipcRenderer.invoke("harness:trustProject"),
   showProjectFile: (relativePath) => ipcRenderer.invoke(
     "harness:showProjectFile", String(relativePath || "")),
   focusHarness: () => ipcRenderer.invoke("harness:focusHarness"),

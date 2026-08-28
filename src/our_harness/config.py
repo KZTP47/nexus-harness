@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import secrets
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,14 +29,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "prompt_cache_key": "",
         "prompt_cache_retention": "",
         "temperature": 0.2,
-        "max_output_tokens": 8192,
+        # A ceiling, not a target. Long structured coding results routinely
+        # exceed 8k tokens; adapters still report a provider-specific rejection
+        # when a selected model supports less.
+        "max_output_tokens": 65_536,
         "role_output_caps": {
             "planner": 1_000_000,
             "coder": 1_000_000,
             "evaluator": 1_000_000,
             "merge": 1_000_000,
         },
-        "timeout_seconds": 180,
+        "timeout_seconds": 600,
         "command": [],
         # Google will not answer a work account until it is told which Cloud
         # project to bill the work to, and the message it sends for that is a
@@ -60,6 +64,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ],
         "max_file_bytes": 1_000_000,
         "test_commands": [],
+        # Exact custom commands may prove execution with a strict JSON object
+        # on stdout. This is executable verification authority and therefore
+        # requires the same machine-local trust as the command itself.
+        "test_evidence_contracts": [],
         "lint_commands": [],
         "build_commands": [],
         "security_commands": [],
@@ -70,7 +78,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "timeout_seconds": 180,
         "max_output_bytes": 250_000,
         "max_changed_files": 24,
-        "max_changed_bytes": 2_000_000,
+        # The shipped board-work response contract can propose twelve 500 KB
+        # files. Keep the transaction boundary above that complete contract so
+        # schema-valid work is not rejected by a smaller hidden downstream cap.
+        "max_changed_bytes": 32_000_000,
         # Real toolchains need these to find their own installs: Python resolves
         # per-user site-packages through APPDATA, npm and git read the profile
         # folders, and every one of them is a path, not a secret.
@@ -121,9 +132,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_iterations": 4,
         "max_elapsed_seconds": 1800,
         "repeat_failure_limit": 2,
-        "max_tool_calls": 12,
+        "max_tool_calls": 48,
         "max_tool_output_bytes": 32_000,
-        "max_tool_total_bytes": 128_000,
+        "max_tool_total_bytes": 512_000,
         "reviewers": 1,
         "review_parallelism": 1,
         "reviewer_lenses": [],
@@ -285,10 +296,35 @@ def is_project_shared_config_trusted(root: Path) -> bool:
         return False
 
 
-def trust_project_local_config(root: Path, local_path: Path | None = None) -> Path:
+def trust_project_local_config(
+    root: Path,
+    local_path: Path | None = None,
+    *,
+    expected_sha256: str | None = None,
+) -> Path:
     resolved_root = root.resolve()
     path = (local_path or resolved_root / ".harness" / "config.local.json").resolve(strict=True)
-    metadata = path.stat()
+    allowed = {
+        (resolved_root / ".harness" / "config.local.json").resolve(),
+        (resolved_root / ".harness" / "config.json").resolve(),
+    }
+    if path not in allowed:
+        raise ValueError(f"Refusing to trust a config outside this project's exact .harness files: {path}")
+    with path.open("rb") as handle:
+        before = os.fstat(handle.fileno())
+        contents = handle.read()
+        after = os.fstat(handle.fileno())
+    digest = hashlib.sha256(contents).hexdigest()
+    if expected_sha256 is not None:
+        wanted = expected_sha256.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", wanted) or not secrets.compare_digest(digest, wanted):
+            raise ValueError("The settings file changed after review; nothing was trusted.")
+    current = path.stat()
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    identity_current = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+    if identity_before != identity_after or identity_after != identity_current:
+        raise ValueError("The settings file changed while trust was being recorded; nothing was trusted.")
     store_path = project_trust_store_path()
     try:
         store = json.loads(store_path.read_text(encoding="utf-8")) if store_path.is_file() else {}
@@ -303,11 +339,11 @@ def trust_project_local_config(root: Path, local_path: Path | None = None) -> Pa
     kept = dict(kept) if isinstance(kept, dict) else {}
     shared = resolved_root / ".harness" / "config.json"
     if path == shared.resolve():
-        kept["shared_sha256"] = _file_sha256(path)
-        kept["shared_size"] = metadata.st_size
+        kept["shared_sha256"] = digest
+        kept["shared_size"] = len(contents)
     else:
-        kept["config_sha256"] = _file_sha256(path)
-        kept["config_size"] = metadata.st_size
+        kept["config_sha256"] = digest
+        kept["config_size"] = len(contents)
     projects[_project_trust_key(resolved_root)] = kept
     store = {"schema_version": 1, "projects": projects}
     store_path.parent.mkdir(parents=True, exist_ok=True)
@@ -701,7 +737,7 @@ def _validate_capability_provenance(
             raise HarnessError(
                 "workflow.name cannot select an untrusted or weaker workflow policy from shareable project config"
             )
-    for key in ("test_commands", "lint_commands", "build_commands", "security_commands", "performance_commands"):
+    for key in ("test_commands", "test_evidence_contracts", "lint_commands", "build_commands", "security_commands", "performance_commands"):
         dotted = f"project.{key}"
         if project_changed(dotted):
             raise HarnessError(
@@ -1043,6 +1079,41 @@ def validate_config(data: dict[str, Any]) -> None:
     _require_int(project["max_file_bytes"], "project.max_file_bytes", 1, RESOURCE_LIMIT_MAXIMA["project.max_file_bytes"])
     for group in ("test_commands", "lint_commands", "build_commands", "security_commands", "performance_commands"):
         _require_commands(project[group], f"project.{group}")
+    contracts = project["test_evidence_contracts"]
+    if not isinstance(contracts, list) or len(contracts) > 64:
+        raise HarnessError("project.test_evidence_contracts must be an array of at most 64 contracts")
+    contract_commands: set[tuple[str, ...]] = set()
+    for index, contract in enumerate(contracts):
+        name = f"project.test_evidence_contracts[{index}]"
+        required_contract_fields = {"command", "format", "total_field", "failed_field"}
+        if (
+            not isinstance(contract, dict)
+            or not required_contract_fields.issubset(contract)
+            or set(contract) - required_contract_fields != ({"requirement_probes"} if "requirement_probes" in contract else set())
+        ):
+            raise HarnessError(
+                f"{name} must contain command, format, total_field, failed_field, and optionally requirement_probes"
+            )
+        _require_commands([contract["command"]], f"{name}.command")
+        if contract["format"] != "json-stdout":
+            raise HarnessError(f"{name}.format must be json-stdout")
+        for field in ("total_field", "failed_field"):
+            value = _require_string(contract[field], f"{name}.{field}", allow_empty=False)
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){0,7}", value):
+                raise HarnessError(f"{name}.{field} must be a dotted JSON object field path")
+        probes = contract.get("requirement_probes", {})
+        if not isinstance(probes, dict) or len(probes) > 64 or not all(
+            isinstance(requirement_id, str)
+            and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,127}", requirement_id))
+            and isinstance(field, str)
+            and bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){0,7}", field))
+            for requirement_id, field in probes.items()
+        ):
+            raise HarnessError(f"{name}.requirement_probes must map requirement IDs to dotted JSON fields")
+        key = tuple(contract["command"])
+        if key in contract_commands:
+            raise HarnessError("project.test_evidence_contracts may name each exact command only once")
+        contract_commands.add(key)
 
     execution = data["execution"]
     if data["execution"]["mode"] not in ("process", "docker"):

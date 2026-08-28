@@ -1051,6 +1051,7 @@ body.workspace-is-fullscreen { overflow: hidden; }
     var(--panel-strong) 72%);
   box-shadow: 0 10px 28px color-mix(in srgb, var(--agent-colour, var(--cyan)) 16%, transparent);
 }
+.runtime-identity { margin: .35rem 0 0; color: var(--muted); font-size: .76rem; }
 .swarm-box.agent.not-ready .swarm-box-pick {
   box-shadow: inset 0 3px 0 var(--yellow),
     0 10px 28px color-mix(in srgb, var(--agent-colour, var(--cyan)) 16%, transparent);
@@ -1166,6 +1167,33 @@ body.workspace-is-fullscreen { overflow: hidden; }
   color: var(--red, #ff7f8e); background: none; animation: none;
 }
 .swarm-chat-activity { margin: 1px 0 2px; }
+.work-recovery {
+  display: grid; gap: 7px; margin: 2px 0; padding: 10px 12px;
+  border: 1px solid var(--yellow, #ffd166); border-left-width: 4px; border-radius: 11px;
+  background: color-mix(in srgb, var(--yellow, #ffd166) 10%, var(--panel, #0f2430));
+}
+.work-recovery[hidden] { display: none !important; }
+.work-recovery[data-status="needs_verification"] {
+  border-color: var(--red, #ff7f8e);
+  background: color-mix(in srgb, var(--red, #ff7f8e) 9%, var(--panel, #0f2430));
+}
+.work-recovery-title { margin: 0; font-size: .9rem; color: var(--yellow, #ffd166); }
+.work-recovery[data-status="needs_verification"] .work-recovery-title {
+  color: var(--red, #ff7f8e);
+}
+.work-recovery-status { margin: 0; font-size: .78rem; line-height: 1.4; }
+.work-recovery-items, .work-recovery-roots {
+  display: grid; gap: 3px; margin: 0; padding-left: 20px; font-size: .76rem;
+  overflow-wrap: anywhere;
+}
+.work-recovery-scope { font-size: .76rem; }
+.work-recovery-scope summary { cursor: pointer; font-weight: 700; }
+.work-recovery-scope p { margin: 5px 0; }
+.work-recovery-answer-label { display: grid; gap: 4px; margin: 0; font-size: .78rem; font-weight: 700; }
+.work-recovery-answer { width: 100%; min-height: 58px; resize: vertical; }
+.work-recovery-actions { margin-top: 1px; }
+.swarm-chat-work-recovery { max-height: 42vh; overflow-y: auto; overscroll-behavior: contain; }
+.the-big-chat-work-recovery { margin-bottom: 8px; }
 @keyframes chat-activity-spin { to { transform: rotate(360deg); } }
 @keyframes chat-activity-shimmer { 0%, 15% { background-position: 100% 0; } 75%, 100% { background-position: -100% 0; } }
 @keyframes chat-activity-travel { from { transform: translateX(-110%); } to { transform: translateX(350%); } }

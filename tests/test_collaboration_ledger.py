@@ -83,6 +83,17 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         self.assertIn('"speaker": "User"', codex)
         self.assertIn("The new tokenizer tests pass.", codex)
 
+    def test_200k_goal_is_canonical_and_projection_is_chunked_not_corrupted(self) -> None:
+        goal = "long-goal:" + ("g" * 200_000)
+        ledger = CollaborationLedger(
+            self.config, "claude", "pair-chat-long", session_id="session-long"
+        ).begin(goal, self.participants, mode="project_work")
+        events = self.events(ledger)
+        self.assertEqual(events[0]["text"], goal)
+        projection = ledger.projection_for("agent-1")
+        self.assertIn("chunk_total", projection)
+        self.assertLessEqual(len(projection), 123_000)
+
     def test_recipient_privacy_uses_a_nonleaking_cursor_tombstone(self) -> None:
         ledger = self.ledger()
         ledger.record_contribution({

@@ -138,6 +138,29 @@ class StagedCodingWorkspaceTests(unittest.TestCase):
             captured = len(result.stdout.encode("utf-8")) + len(result.stderr.encode("utf-8"))
             self.assertLessEqual(captured, 1024)
             self.assertTrue(result.output_truncated)
+            self.assertTrue(result.passed)
+            self.assertFalse(result.complete_success)
+
+    def test_finalize_rejects_real_exit_zero_check_truncated_from_10k_to_1k(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "module.py").write_text("value = 1\n", encoding="utf-8")
+            action = python_check("loud", "import sys; sys.stdout.write('x' * 10000)")
+            config = config_for(
+                root,
+                execution__max_output_bytes=1024,
+                workflow__max_tool_output_bytes=1024,
+                workflow__max_tool_total_bytes=2048,
+            )
+            with StagedCodingWorkspace(config, ["module.py"], [action]) as staged:
+                baseline = staged.file_state("module.py")["sha256"]
+                staged.replace_file("edit", "module.py", baseline, "value = 2\n")
+                verification = staged.run_verification("loud-1", "loud").result
+                self.assertEqual(verification.exit_code, 0)
+                self.assertTrue(verification.output_truncated)
+                self.assertEqual(len(verification.stdout.encode("utf-8")), 1024)
+                with self.assertRaisesRegex(HarnessError, "checks that did not pass: loud"):
+                    staged.finalize()
 
     def test_temp_snapshot_is_removed_on_close(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

@@ -746,7 +746,11 @@ class ResidentDaemon:
         command, environment = _resident_child_launch(
             "worker", "--project", str(self.root), "--job", job["id"], "--lease", lease_id,
         )
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        flags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if os.name == "nt" else 0
+        )
         process = subprocess.Popen(
             command, cwd=self.root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, shell=False, creationflags=flags, start_new_session=os.name != "nt",
@@ -988,7 +992,11 @@ def start_daemon(config: LoadedConfig, port: int = 0) -> dict[str, Any]:
         "stderr": subprocess.DEVNULL, "shell": False, "env": environment,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
     else:
         kwargs["start_new_session"] = True
     process = subprocess.Popen(command, **kwargs)

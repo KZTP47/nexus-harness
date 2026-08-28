@@ -9,6 +9,10 @@ class HarnessError(RuntimeError):
     """Expected user-facing failure."""
 
 
+class DeadlineExpired(HarnessError):
+    """A bounded operation exhausted its owning workflow or tool clock."""
+
+
 class Deadline(Protocol):
     """Shared workflow clock accepted by bounded subsystems."""
 
@@ -43,6 +47,11 @@ class CommandResult:
     @property
     def passed(self) -> bool:
         return self.exit_code == 0 and not self.timed_out
+
+    @property
+    def complete_success(self) -> bool:
+        """True only when a successful command's complete output was captured."""
+        return self.passed and not self.output_truncated
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

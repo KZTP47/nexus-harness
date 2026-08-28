@@ -378,7 +378,7 @@ class StagedCodingWorkspace:
             for name in self._actions
             if name not in self._verifications
             or self._verifications[name].revision != self._revision
-            or not self._verifications[name].result.passed
+            or not self._verifications[name].result.complete_success
         ]
         if missing:
             raise HarnessError(f"Staged candidate has checks that did not pass: {', '.join(missing)}")

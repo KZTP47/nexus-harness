@@ -57,6 +57,21 @@ def witness(path: str) -> dict[str, str]:
     }
 
 
+TEST_EVIDENCE_JSON = '{"summary":{"executed":1,"failed":0}}'
+
+
+def verified_test_project(command: list[str]) -> dict:
+    return {
+        "test_commands": [command],
+        "test_evidence_contracts": [{
+            "command": command,
+            "format": "json-stdout",
+            "total_field": "summary.executed",
+            "failed_field": "summary.failed",
+        }],
+    }
+
+
 class StreamTests(unittest.TestCase):
     def test_split_utf8_and_line_frames(self) -> None:
         decoder = StreamDecoder()
@@ -1123,7 +1138,7 @@ class WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / ".harness").mkdir()
-            command = [sys.executable, "-c", "print('ok')"]
+            command = [sys.executable, "-m", "unittest", "discover"]
             (root / ".harness" / "config.local.json").write_text(json.dumps({"project": {"test_commands": [command]}}), encoding="utf-8")
             provider = FakeProvider([{"ok": True}])
             seen_requests = []
@@ -1139,7 +1154,7 @@ class WorkflowTests(unittest.TestCase):
             class CapturingRunner:
                 def run(self, argv, cwd=".", timeout=None):
                     seen_timeouts.append(timeout)
-                    return CommandResult(argv, ".", 0, "ok", "", 1)
+                    return CommandResult(argv, ".", 0, "Ran 1 test in 0.001s\n\nOK\n", "", 1)
 
             with HarnessApplication(load_config(root)) as app:
                 app.provider = provider
@@ -1283,9 +1298,9 @@ class WorkflowTests(unittest.TestCase):
             root = Path(temporary)
             (root / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='1'\n", encoding="utf-8")
             (root / ".harness").mkdir()
-            check = [sys.executable, "-c", "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'"]
+            check = [sys.executable, "-c", "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'; print('" + TEST_EVIDENCE_JSON + "')"]
             (root / ".harness" / "config.local.json").write_text(
-                json.dumps({"project": {"test_commands": [check]}, "workflow": {"max_iterations": 3}}), encoding="utf-8"
+                json.dumps({"project": verified_test_project(check), "workflow": {"max_iterations": 3}}), encoding="utf-8"
             )
             bad = "VALUE = 1\n"
             good = "VALUE = 2\n"
@@ -1340,14 +1355,14 @@ class WorkflowTests(unittest.TestCase):
                 "def plugin(): return Plugin()\n",
                 encoding="utf-8",
             )
-            check = [sys.executable, "-c", "print('ok')"]
+            check = [sys.executable, "-c", "print('" + TEST_EVIDENCE_JSON + "')"]
             (root / ".harness" / "config.json").write_text(
                 "{}",
                 encoding="utf-8",
             )
             (root / ".harness" / "config.local.json").write_text(
                 json.dumps({
-                    "project": {"test_commands": [check]},
+                    "project": verified_test_project(check),
                     "workflow": {"name": "plugin-flow"},
                     "plugins": {"enabled": ["plugin_fixture"], "paths": ["plugin_fixture.py"]},
                 }),
@@ -1386,10 +1401,10 @@ class WorkflowTests(unittest.TestCase):
             automatic = [
                 sys.executable,
                 "-c",
-                "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'; print('automatic check ran')",
+                "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'; print('" + TEST_EVIDENCE_JSON + "')",
             ]
             (root / ".harness" / "config.local.json").write_text(
-                json.dumps({"project": {"test_commands": [automatic]}}),
+                json.dumps({"project": verified_test_project(automatic)}),
                 encoding="utf-8",
             )
             plan = {
@@ -1426,15 +1441,15 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(
                 any(stage.get("kind") == "counterexample" for stage in result["verification"]["stages"])
             )
-            self.assertIn("automatic check ran", result["verification"]["results"][0]["stdout"])
+            self.assertIn('"executed":1', result["verification"]["results"][0]["stdout"])
 
     def test_review_verdict_is_invalidated_when_file_changes_during_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='1'\n", encoding="utf-8")
             (root / ".harness").mkdir()
-            check = [sys.executable, "-c", "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'"]
-            (root / ".harness" / "config.local.json").write_text(json.dumps({"project": {"test_commands": [check]}}), encoding="utf-8")
+            check = [sys.executable, "-c", "from pathlib import Path; assert Path('value.py').read_text() == 'VALUE = 2\\n'; print('" + TEST_EVIDENCE_JSON + "')"]
+            (root / ".harness" / "config.local.json").write_text(json.dumps({"project": verified_test_project(check)}), encoding="utf-8")
             target = root / "value.py"
             provider = MutatingReviewProvider(
                 [
@@ -1502,11 +1517,11 @@ class WorkflowTests(unittest.TestCase):
             root = Path(temporary)
             (root / "pyproject.toml").write_text("[project]\nname='fixture'\nversion='1'\n", encoding="utf-8")
             (root / ".harness").mkdir()
-            check = [sys.executable, "-c", "from pathlib import Path; assert Path('value.py').is_file()"]
+            check = [sys.executable, "-c", "from pathlib import Path; assert Path('value.py').is_file(); print('" + TEST_EVIDENCE_JSON + "')"]
             (root / ".harness" / "config.local.json").write_text(
                 json.dumps(
                     {
-                        "project": {"test_commands": [check]},
+                        "project": verified_test_project(check),
                         "workflow": {
                             "reviewers": 2,
                             "review_parallelism": 2,

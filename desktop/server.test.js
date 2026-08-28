@@ -363,6 +363,60 @@ test("what the app carries comes before anything in the project", () => {
   fs.rmSync(folder, { recursive: true, force: true });
 });
 
+test("desktop trust passes the exact reviewed path and digest to Python", async () => {
+  let seen = null;
+  const reviewedConfig = path.resolve("demo project", ".harness", "config.local.json");
+  const child = fakeChild((process) => process.emit("exit", 0));
+  const server = new HarnessServer({
+    candidates: [["python", []]],
+    spawn: (command, argv, options) => { seen = { command, argv, options }; return child; },
+  });
+  await server.trustProject("demo project", {
+    reviewedConfig,
+    expectedSha256: "a".repeat(64),
+  });
+  assert.deepStrictEqual(seen.argv.slice(-6), [
+    "trust", "--yes", "--reviewed-config", reviewedConfig,
+    "--expected-sha256", "a".repeat(64),
+  ]);
+  await assert.rejects(() => server.trustProject("demo project"), /exact reviewed config path/);
+});
+
+test("a packaged app uses only its private runtime even when the environment names Python", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-private-python-"));
+  const runtime = path.join(folder, "runtime", "python.exe");
+  fs.mkdirSync(path.dirname(runtime), { recursive: true });
+  fs.writeFileSync(runtime, "stand-in");
+  assert.deepStrictEqual(
+    pythonCandidates({ HARNESS_PYTHON: "untrusted-system-python" }, folder, true),
+    [[runtime, []]],
+  );
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("an incomplete packaged app does not silently fall back to system Python", async () => {
+  const server = new HarnessServer({ resources: "missing-resources", bundledRequired: true });
+  await assert.rejects(
+    () => server.start("demo-project"),
+    /package is incomplete.*runtime\/python\.exe.*do not install a separate system Python/i,
+  );
+});
+
+test("a packaged app uses its private supported Python before machine Python", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-runtime-"));
+  try {
+    const runtime = path.join(folder, "runtime");
+    fs.mkdirSync(runtime);
+    const executable = path.join(runtime, "python.exe");
+    fs.writeFileSync(executable, "fixture");
+    const found = pythonCandidates({}, folder);
+    assert.strictEqual(found[0][0], executable);
+    assert.deepStrictEqual(found[0][1], []);
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
 test("a repair retry can put the project's newer harness first", () => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-repair-order-"));
   const carried = path.join(folder, "resources");
@@ -379,6 +433,24 @@ test("a repair retry can put the project's newer harness first", () => {
   );
   assert.strictEqual(found[0], path.join(project, "src"));
   assert.strictEqual(found[1], path.join(carried, "harness", "src"));
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("a packaged private runtime never mixes in project harness source", () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "harness-bundled-order-"));
+  const carried = path.join(folder, "resources");
+  const project = path.join(folder, "project");
+  for (const where of [
+    path.join(carried, "harness", "src", "our_harness"),
+    path.join(project, "src", "our_harness"),
+  ]) {
+    fs.mkdirSync(where, { recursive: true });
+    fs.writeFileSync(path.join(where, "__init__.py"), "");
+  }
+  const found = whereTheHarnessLives(path.join(folder, "app"), project, carried, {
+    preferProjectHarness: true, bundledRequired: true,
+  });
+  assert.deepStrictEqual(found, [path.join(carried, "harness", "src")]);
   fs.rmSync(folder, { recursive: true, force: true });
 });
 

@@ -572,9 +572,12 @@ class WhenItIsTurnedDownTests(AgainstAStandInMicrosoft):
     def test_a_fault_at_their_end_says_so(self) -> None:
         self.assertIn("Microsoft's end", self.refused(503))
 
-    def test_microsofts_own_words_are_kept_but_not_a_whole_page_of_them(self) -> None:
-        said = self.refused(403, "x" * 5000)
-        self.assertLess(len(said), 1200)
+    def test_long_microsoft_cause_keeps_bounded_head_tail_and_digest(self) -> None:
+        said = self.refused(403, "MICROSOFT-HEAD " + ("x" * 5000) + " MICROSOFT-TAIL")
+        self.assertIn("MICROSOFT-HEAD", said)
+        self.assertIn("MICROSOFT-TAIL", said)
+        self.assertIn("NEXUS_REDACTED_CAUSE_BOUNDARY", said)
+        self.assertLess(len(said), 5000)
 
 
 class WhatIsMissingTests(AgainstAStandInMicrosoft):

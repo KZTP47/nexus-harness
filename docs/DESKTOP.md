@@ -7,7 +7,21 @@ and stops the server when you close the window.
 It lives in `desktop/` and is separate from the Python package. You do not need
 it to use the harness.
 
-## What you need first
+## Installing the released app
+
+Stable Windows releases contain a signed versioned per-user NSIS installer, a
+private Python 3.11 runtime with exact locked dependencies, and a matching
+SHA-256 file. They are built and smoke-tested on a clean GitHub-hosted Windows
+runner. Use the release page directly, or double-click
+`Install Nexus Harness.cmd` in a clone to download and verify the stable
+release automatically without system Python. The installer creates desktop
+and Start menu shortcuts.
+
+Only use `python scripts/put_it_on_your_desktop.py` when developing from a
+checkout. Its source fallback is intentionally described as a development
+window, not as an installed Electron release.
+
+## What source development needs first
 
 - Python 3.11 or newer, with the harness installed for it (`python -m pip install .`)
 - Node.js 18 or newer, to build or run the window
@@ -43,17 +57,22 @@ run time: the installed app dies on start with no window and no message. That
 happened once here, so `npm test` now also checks the list against what the code
 actually loads, and fails before anything is built.
 
-The installer carries the window only. Python and the harness package stay a
-separate install, because the harness is meant to run against the Python you
-already use for your project.
+The installer carries the Electron window, a compatible Nexus Harness source
+snapshot, and its own private supported Python. Installed mode never substitutes
+`py`, `python`, `HARNESS_PYTHON`, or another checkout for that private runtime.
 
-## How it finds Python
+## How source mode finds Python
 
-It tries, in order: `py -3`, `python`, then `python3` on Windows, and `python3`
+Only source development does this. It tries, in order: `py -3`, `python`, then `python3` on Windows, and `python3`
 then `python` elsewhere. If your Python lives somewhere unusual, set
 `HARNESS_PYTHON` to its full path before starting the app. When that variable is
 set, no other command is tried, so a typo is reported instead of quietly running
 a different Python.
+
+Python below 3.11 is rejected before Nexus imports the application. If an
+installed build reports a missing `resources/runtime/python.exe`, that package
+is incomplete: reinstall the same signed release rather than installing a
+system Python.
 
 ## What it does at start
 
@@ -67,11 +86,25 @@ Once a folder is chosen:
 2. Waits for the server to print the address it bound to.
 3. Checks that address is on this machine, then loads it.
 
-Port `0` asks the system for any free port, so two projects can be open at once
-without clashing.
+Port `0` asks the system for any free port, so a restart or an intentional
+source-development window cannot collide with a stale fixed port. One installed
+desktop-app instance owns one selected project and one server process; launching
+Nexus again focuses the existing window. Switch projects from the Project menu.
+**Help → About and
+diagnostics** shows the exact Nexus version, executable, selected project root,
+server address, port, and process ID, which prevents a stale checkout from
+masquerading as the current app.
 
 If the server does not start within 45 seconds, or stops on its own, the window
 shows what it printed and offers to try again.
+
+The first project screen checks the exact routes used by the workflow and its
+configured agents. One unrelated healthy provider cannot make Start look
+ready. A machine-local executable config is never trusted silently: the native
+error page shows its exact path and contents, lists the command/model/MCP/plugin
+consequences, and records trust only after the user presses the explicit trust
+button. A project without tests can select bootstrap mode; Nexus then creates
+maintainable test infrastructure first and must run it before claiming success.
 
 If an installed app is older than the project's settings, the error page also
 offers **Fix and start**. That action uses `src/our_harness` from the chosen

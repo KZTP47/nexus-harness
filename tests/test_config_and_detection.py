@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import tempfile
 import unittest
@@ -22,6 +23,63 @@ from our_harness.providers import create_embedding_provider
 
 
 class ConfigTests(unittest.TestCase):
+    def test_custom_test_evidence_contract_is_strict_and_requires_local_trust(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / ".harness"
+            harness.mkdir()
+            contract = {
+                "command": ["company-test", "--json"],
+                "format": "json-stdout",
+                "total_field": "summary.executed",
+                "failed_field": "summary.failed",
+            }
+            shared = harness / "config.json"
+            shared.write_text(json.dumps({"project": {"test_evidence_contracts": [contract]}}), encoding="utf-8")
+            with self.assertRaisesRegex(HarnessError, "test_evidence_contracts.*not been told to trust"):
+                load_config(root)
+            local = harness / "config.local.json"
+            local.write_text(json.dumps({"project": {"test_evidence_contracts": [contract]}}), encoding="utf-8")
+            loaded = load_config(root, explicit=local)
+            self.assertEqual(loaded.get("project.test_evidence_contracts"), [contract])
+            probed = {
+                **contract,
+                "requirement_probes": {
+                    "langgraph_enforcement": "summary.langgraph_enforced",
+                },
+            }
+            valid = json.loads(json.dumps(DEFAULT_CONFIG))
+            valid["project"]["test_evidence_contracts"] = [probed]
+            from our_harness.config import validate_config
+            validate_config(valid)
+            broken = json.loads(json.dumps(DEFAULT_CONFIG))
+            broken["project"]["test_evidence_contracts"] = [{**contract, "format": "regex"}]
+            with self.assertRaisesRegex(HarnessError, "format must be json-stdout"):
+                validate_config(broken)
+
+    def test_digest_bound_trust_refuses_changed_or_noncanonical_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "project"
+            local = root / ".harness" / "config.local.json"
+            local.parent.mkdir(parents=True)
+            reviewed = b'{"provider":{"name":"ollama"}}'
+            local.write_bytes(reviewed)
+            trust_store = Path(temporary) / "user" / "trusted-projects.json"
+            with patch("our_harness.config.project_trust_store_path", return_value=trust_store):
+                with self.assertRaisesRegex(ValueError, "changed after review"):
+                    trust_project_local_config(root, local, expected_sha256="0" * 64)
+                self.assertFalse(trust_store.exists())
+                trust_project_local_config(
+                    root, local, expected_sha256=hashlib.sha256(reviewed).hexdigest()
+                )
+                self.assertTrue(load_config(root))
+                outside = root / "reviewed-copy.json"
+                outside.write_bytes(reviewed)
+                with self.assertRaisesRegex(ValueError, "exact .harness"):
+                    trust_project_local_config(
+                        root, outside, expected_sha256=hashlib.sha256(reviewed).hexdigest()
+                    )
+
     def test_shipped_local_config_has_no_authority_without_user_trust_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -661,6 +719,13 @@ class ConfigTests(unittest.TestCase):
 
 
 class DetectionTests(unittest.TestCase):
+    def test_go_detection_requests_machine_readable_test_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "go.mod").write_text("module example\n", encoding="utf-8")
+            stacks = detect_project(root)
+            self.assertEqual(combined_commands(stacks, "test"), [["go", "test", "-json", "./..."]])
+
     def test_polyglot_detection_uses_manifest_scripts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -670,7 +735,7 @@ class DetectionTests(unittest.TestCase):
             stacks = detect_project(root)
             self.assertEqual([item.stack for item in stacks], ["typescript", "go"])
             self.assertIn(["npm", "run", "test"], combined_commands(stacks, "test"))
-            self.assertIn(["go", "test", "./..."], combined_commands(stacks, "test"))
+            self.assertIn(["go", "test", "-json", "./..."], combined_commands(stacks, "test"))
 
     def test_a_beginner_project_with_only_test_files_is_still_python(self) -> None:
         """Someone learning has a couple of files and a test, and no packaging file."""

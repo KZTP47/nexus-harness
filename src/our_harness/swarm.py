@@ -1213,6 +1213,12 @@ class Running:
             # Nexus process can therefore stop the exact board run it can see;
             # the owning worker observes this barrier before its next effect.
             durable = self._run_store.request_stop(wanted)
+            if durable["status"] == "stopped":
+                # The owner may observe the committed Stop barrier and publish
+                # its terminal state before request_stop projects the row back
+                # to this process. That is successful monotonic completion,
+                # including for a repeated exact Stop, not a failed request.
+                return "Stopped. This Swarm run is already stopped."
             if durable["status"] != "stopping":
                 raise SwarmError("That Swarm run is already over; nothing was stopped.")
         with self._lock:

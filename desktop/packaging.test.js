@@ -116,6 +116,49 @@ test("the version-mismatch page cannot ship without its repair button wiring", (
   assert.match(main, /ipcMain\.handle\(["']harness:repairVersionMismatch["']/);
 });
 
+test("untrusted machine-local settings have native exact review and trust wiring", () => {
+  const html = fs.readFileSync(path.join(__dirname, "pages", "problem.html"), "utf8");
+  const page = fs.readFileSync(path.join(__dirname, "pages", "problem.js"), "utf8");
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  assert.match(html, /id=["']trustContents["']/);
+  assert.match(html, /Trust this exact file and start/);
+  assert.match(page, /harnessDesktop\.reviewTrust\(\)/);
+  assert.match(page, /harnessDesktop\.trustProject\(\)/);
+  assert.match(preload, /reviewTrust.*harness:reviewTrust/);
+  assert.match(preload, /trustProject.*harness:trustProject/);
+  assert.match(main, /config\.local\.json/);
+  assert.match(main, /consequences/);
+});
+
+test("the private Python runtime and harness source are packaged together", () => {
+  const resources = PACKAGE.build.extraResources;
+  assert.ok(resources.some((item) => item.from === "runtime" && item.to === "runtime"));
+  assert.ok(resources.some((item) => item.from === "../src" && item.to === "harness/src"));
+  assert.ok(shipped("build-info.json"), "the exact commit/build label must ship with the app");
+  assert.match(PACKAGE.scripts.prebuild, /prepare_build_info\.py/);
+  assert.match(PACKAGE.scripts.prebuild, /prepare_windows_runtime\.py/);
+  assert.match(PACKAGE.scripts.prebuild, /smoke_bundled_playwright\.py/,
+    "a release must prove its bundled browser in AppContainer before packaging");
+});
+
+test("the private runtime lock includes exact Node, Playwright, and Chromium identities", () => {
+  const locked = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "runtime-playwright.lock.json"), "utf8"));
+  assert.strictEqual(locked.schema_version, 1);
+  assert.match(locked.node.version, /^\d+\.\d+\.\d+$/);
+  assert.match(locked.node.sha256, /^[0-9a-f]{64}$/);
+  assert.strictEqual(locked.chromium.name, "chromium-headless-shell");
+  assert.match(locked.chromium.sha256, /^[0-9a-f]{64}$/);
+  assert.deepStrictEqual(new Set(locked.packages.map((one) => one.version)), new Set(["1.62.1"]));
+  assert.deepStrictEqual(
+    new Set(locked.packages.map((one) => one.name)),
+    new Set(["playwright", "playwright-core", "@playwright/test"])
+  );
+  for (const dependency of locked.packages) assert.match(dependency.integrity, /^sha512-/);
+  assert.strictEqual(PACKAGE.dependencies["playwright-core"], "1.62.1",
+    "desktop Playwright code must not float independently of the bundled runtime");
+});
+
 test("test and smoke files stay out of the installer", () => {
   for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js"]) {
     assert.ok(!shipped(name), `${name} should not be shipped`);
@@ -138,4 +181,25 @@ test("the pattern matcher treats stars the way the builder does", () => {
   assert.ok(matches("**/*.test.js", "server.test.js"), "a leading two stars must also match no folder");
   assert.ok(matches("**/*.test.js", "pages/deep/a.test.js"));
   assert.ok(!matches("**/*.test.js", "server.js"));
+});
+
+test("the desktop app owns one server process and exposes exact diagnostics", () => {
+  const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
+  assert.match(main, /requestSingleInstanceLock\(\)/);
+  assert.match(main, /["']second-instance["']/);
+  assert.match(main, /harness:diagnostics/);
+  assert.match(main, /project:\s*projectPath/);
+  assert.match(main, /serverUrl:\s*server\.url/);
+  assert.match(preload, /diagnostics.*harness:diagnostics/);
+});
+
+test("the release is a versioned per-user NSIS installer", () => {
+  assert.strictEqual(PACKAGE.build.win.target, "nsis");
+  assert.match(PACKAGE.build.win.artifactName, /\$\{version\}/);
+  assert.match(PACKAGE.build.win.artifactName, /UNSIGNED-DEV/,
+    "an unsigned local build must not look like a signed public release");
+  assert.strictEqual(PACKAGE.build.nsis.perMachine, false);
+  assert.strictEqual(PACKAGE.build.nsis.createDesktopShortcut, true);
+  assert.strictEqual(PACKAGE.build.nsis.createStartMenuShortcut, true);
 });

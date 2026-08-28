@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import pathlib
@@ -327,3 +328,52 @@ class CredentialRedactor:
         if isinstance(value, tuple):
             return tuple(self.value(child) for child in value)
         return copy.deepcopy(value)
+
+
+def bounded_redacted_text(
+    redactor: CredentialRedactor,
+    value: object,
+    max_chars: int = 65_536,
+) -> str:
+    """Redact a diagnostic completely, then bound it without hiding the cut.
+
+    Redacting *after* a prefix slice is unsafe: ``Bearer `` can land at the end
+    of the slice while its credential stays outside the text the redactor ever
+    saw.  The full value is therefore redacted first.  If a durable/UI boundary
+    still needs a cap, both ends survive and a machine-readable marker records
+    the redacted length, omitted length, and digest.
+    """
+
+    safe = redactor.text(str(value or ""))
+    limit = max(512, int(max_chars))
+    if len(safe) <= limit:
+        return safe
+    digest = hashlib.sha256(safe.encode("utf-8")).hexdigest()
+    marker_value = {
+        "redacted_characters": len(safe),
+        "omitted_characters": 0,
+        "sha256": digest,
+    }
+    marker = "\n[NEXUS_REDACTED_CAUSE_BOUNDARY " + json.dumps(
+        marker_value, sort_keys=True, separators=(",", ":")
+    ) + "]\n"
+    available = max(0, limit - len(marker))
+    head = available // 2
+    tail = available - head
+    marker_value["omitted_characters"] = len(safe) - available
+    marker = "\n[NEXUS_REDACTED_CAUSE_BOUNDARY " + json.dumps(
+        marker_value, sort_keys=True, separators=(",", ":")
+    ) + "]\n"
+    # The omitted count can add a few digits to the marker. Recalculate once
+    # so the returned value never exceeds the declared storage boundary.
+    available = max(0, limit - len(marker))
+    head = available // 2
+    tail = available - head
+    marker_value["omitted_characters"] = len(safe) - available
+    marker = "\n[NEXUS_REDACTED_CAUSE_BOUNDARY " + json.dumps(
+        marker_value, sort_keys=True, separators=(",", ":")
+    ) + "]\n"
+    available = max(0, limit - len(marker))
+    head = available // 2
+    tail = available - head
+    return safe[:head] + marker + (safe[-tail:] if tail else "")

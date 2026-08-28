@@ -217,7 +217,8 @@ def _run(parts: list[str], seconds: float) -> tuple[int, str]:
 
     try:
         finished = subprocess.run(
-            parts, capture_output=True, text=True, timeout=seconds, check=False
+            parts, capture_output=True, text=True, timeout=seconds, check=False,
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
         )
     except FileNotFoundError:
         return 127, "The command went away between finding it and running it."
@@ -417,6 +418,7 @@ def _do_ollama(job: Job, config: LoadedConfig, plan: Plan) -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
             )
         except OSError as exc:
             starting.state = CANNOT

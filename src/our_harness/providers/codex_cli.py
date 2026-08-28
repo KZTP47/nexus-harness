@@ -13,7 +13,7 @@ from typing import Any
 from .. import cancellation
 from ..execution import _BoundedCapture, _ProcessTree, _reap_process, _wait_for_terminated_process, _write_stdin
 from ..models import CommandResult, HarnessError, ProviderRequest, ProviderResponse
-from ..redaction import CredentialRedactor
+from ..redaction import CredentialRedactor, bounded_redacted_text
 from .base import Provider
 
 
@@ -90,7 +90,15 @@ def _run_bounded(
 ) -> CommandResult:
     if timeout_seconds <= 0:
         raise HarnessError("Codex CLI wall-clock deadline expired")
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    # Provider calls are always headless.  CREATE_NEW_PROCESS_GROUP preserves
+    # cancellation while CREATE_NO_WINDOW prevents a black console flashing in
+    # front of the desktop app for every turn.  Interactive sign-in/repair
+    # launchers live elsewhere and deliberately keep their visible console.
+    flags = (
+        subprocess.CREATE_NEW_PROCESS_GROUP
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if os.name == "nt" else 0
+    )
     started = time.monotonic()
     try:
         process = subprocess.Popen(
@@ -164,6 +172,60 @@ def _run_bounded(
     )
 
 
+def _schema_capture_bytes(schema: object) -> int | None:
+    """Conservative UTF-8 JSON size for a fully bounded response schema.
+
+    Twelve bytes per declared string character covers a non-BMP character
+    escaped as a JSON surrogate pair.  This is deliberately more conservative
+    than raw UTF-8 because subscription CLIs may wrap the model's JSON inside
+    another JSON result object. Unknown or unbounded shapes return None rather
+    than pretending they fit.
+    """
+
+    if not isinstance(schema, dict):
+        return None
+    kind = schema.get("type")
+    if kind == "string":
+        maximum = schema.get("maxLength")
+        return (int(maximum) * 12 + 2) if isinstance(maximum, int) else None
+    if kind in {"integer", "number"}:
+        return 64
+    if kind == "boolean":
+        return 5
+    if kind == "null":
+        return 4
+    if kind == "array":
+        maximum = schema.get("maxItems")
+        child = _schema_capture_bytes(schema.get("items"))
+        if not isinstance(maximum, int) or child is None:
+            return None
+        return 2 + maximum * child + max(0, maximum - 1)
+    if kind == "object":
+        properties = schema.get("properties")
+        if not isinstance(properties, dict) or schema.get("additionalProperties") is not False:
+            return None
+        total = 2
+        for index, (name, child_schema) in enumerate(properties.items()):
+            child = _schema_capture_bytes(child_schema)
+            if child is None:
+                return None
+            total += len(json.dumps(str(name), ensure_ascii=False).encode("utf-8")) + 1 + child
+            if index:
+                total += 1
+        return total
+    return None
+
+
+def _provider_capture_limit(configured: int, schema: object | None) -> int:
+    required = _schema_capture_bytes(schema) if schema is not None else None
+    if required is None:
+        return max(2_000_000, configured)
+    # Small explicitly configured limits remain testable/enforceable. Large
+    # bounded contracts receive exactly the capacity their worst valid JSON
+    # needs, plus framing/telemetry headroom.
+    return max(configured, required + 1_024)
+
+
 def _as_words(raw: bytes) -> str:
     """What a tool printed, turned back into letters.
 
@@ -219,7 +281,9 @@ def _bundled_model_catalog(
     if result.output_truncated:
         raise HarnessError("Codex CLI bundled model catalog exceeded its byte limit")
     if result.exit_code != 0:
-        detail = CredentialRedactor().text((result.stderr or result.stdout).strip()[:2_000])
+        detail = bounded_redacted_text(
+            CredentialRedactor(), (result.stderr or result.stdout).strip(), 2_000
+        )
         raise HarnessError(f"Codex CLI bundled model catalog failed ({result.exit_code}): {detail}")
     try:
         value = _load_json(result.stdout)
@@ -263,7 +327,9 @@ def codex_cli_preflight(
         if version.output_truncated:
             raise HarnessError("Codex CLI --version output exceeded its byte limit")
         if version.exit_code != 0:
-            detail = CredentialRedactor().text((version.stderr or version.stdout).strip()[:2_000])
+            detail = bounded_redacted_text(
+                CredentialRedactor(), (version.stderr or version.stdout).strip(), 2_000
+            )
             raise HarnessError(f"Codex CLI --version failed ({version.exit_code}): {detail}")
         login = _run_bounded(
             [*command, "login", "status"], cwd=cwd, stdin_text=None,
@@ -274,7 +340,9 @@ def codex_cli_preflight(
         if login.output_truncated:
             raise HarnessError("Codex CLI login status output exceeded its byte limit")
         if login.exit_code != 0:
-            detail = CredentialRedactor().text((login.stderr or login.stdout).strip()[:2_000])
+            detail = bounded_redacted_text(
+                CredentialRedactor(), (login.stderr or login.stdout).strip(), 2_000
+            )
             raise HarnessError(f"Codex CLI login status failed ({login.exit_code}): {detail}")
         status = f"{login.stdout}\n{login.stderr}".strip()
         if auth_mode == _AUTH_MODE and "chatgpt" not in status.casefold():
@@ -379,6 +447,8 @@ class CodexCLIProvider(Provider):
         super().__init__(config)
         self._preflight_complete = False
 
+    structured_retry_is_safe = True
+
     def _command(self) -> list[str]:
         command = self.settings.get("command", [])
         if not isinstance(command, list) or not command or any(not isinstance(part, str) or not part for part in command):
@@ -400,7 +470,16 @@ class CodexCLIProvider(Provider):
         deadline_at = time.monotonic() + timeout
         command = self._command()
         auth_mode = str(self.settings.get("auth_mode") or "")
-        output_limit = min(2_000_000, int(self.config.get("execution.max_output_bytes")))
+        fallback = request.response_format is None
+        contract_schema = _FALLBACK_SCHEMA if fallback else request.response_format.schema
+        # Command/test output and provider-result transport are different
+        # budgets.  The old min() silently made a valid multi-file response
+        # impossible whenever execution.max_output_bytes kept its 250 KB
+        # default. The bounded schema now determines the safe capture size;
+        # larger explicitly configured values remain honoured.
+        output_limit = _provider_capture_limit(
+            int(self.config.get("execution.max_output_bytes")), contract_schema
+        )
         if not self._preflight_complete:
             codex_cli_preflight(
                 command,
@@ -410,8 +489,6 @@ class CodexCLIProvider(Provider):
                 max_output_bytes=min(32_000, output_limit),
             )
             self._preflight_complete = True
-        fallback = request.response_format is None
-        contract_schema = _FALLBACK_SCHEMA if fallback else request.response_format.schema
         schema = _codex_output_schema(contract_schema)
         with tempfile.TemporaryDirectory(prefix="our-harness-codex-") as temporary:
             cwd = Path(temporary)
@@ -472,7 +549,9 @@ class CodexCLIProvider(Provider):
             if result.output_truncated:
                 raise HarnessError(f"Codex CLI output exceeded its {output_limit}-byte limit")
             if result.exit_code != 0:
-                detail = self._redactor.text((result.stderr or result.stdout).strip()[:8_000])
+                detail = bounded_redacted_text(
+                    self._redactor, (result.stderr or result.stdout).strip(), 8_000
+                )
                 raise HarnessError(f"Codex CLI exited {result.exit_code}: {detail}")
             usage: dict[str, int | None] = {
                 "input_tokens": None,

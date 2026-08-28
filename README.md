@@ -193,25 +193,38 @@ are still documented below, but these two workspaces are the main product.
 
 ## Start here, on Windows
 
-**Double-click `Install Nexus Harness.cmd`** in this folder.
+The easiest route is the checksummed, versioned installer on the
+**[GitHub Releases page](https://github.com/KZTP47/nexus-harness/releases/latest)**.
+Download `Nexus-Harness-Setup-<version>.exe`, compare it with the `.sha256`
+file beside it, confirm Windows shows the expected signed publisher, and run
+it. It installs for your Windows account, creates Start menu and desktop
+shortcuts, and needs neither administrator access nor a separate Python.
 
-That is the whole thing. It puts a **Nexus Harness** on your desktop with an
-icon of its own, and from then on you double-click that. You never need this
-file, or a terminal, again.
+Already cloned the source? **Double-click `Install Nexus Harness.cmd`**. It
+downloads that same stable release, verifies both the published SHA-256 and
+the Windows Authenticode signature, and starts the Windows installer. It uses
+Windows' own PowerShell downloader, so a clean machine does not need Python.
+It does not disguise a browser shortcut as the desktop app.
 
-It only touches your own desktop, so nothing here needs an administrator. If
-Python is not on the machine yet it says so, and where to get it, rather than
-failing at you.
+The self-contained download is currently about 126 MiB, the unpacked app is
+about 434 MiB, and installation should have at least 600 MiB free for installed
+and temporary files. It includes a private Python 3.11 runtime and locked
+dependencies. Nexus does not silently auto-update. **About
+and diagnostics** shows the exact installed version and commit; install a newer
+signed version from the same Releases page when one is published. Until the
+repository's pinned publisher file names a real certificate subject, the
+double-click installer stops safely instead of accepting an arbitrary valid
+Windows signer.
 
-The icon opens the desktop app if somebody has installed it, and otherwise the
-panel in your browser - and it says which of those you got. Prefer to type it?
-The same thing, and it works on macOS and Linux as well:
+Source developers who intentionally want an uninstalled browser
+window can create a development shortcut with:
 
 ```bash
 python scripts/put_it_on_your_desktop.py
 ```
 
-See [THE_THING_ON_YOUR_DESKTOP.md](docs/THE_THING_ON_YOUR_DESKTOP.md).
+That shortcut remains tied to the cloned folder and is labelled as a source
+fallback. See [THE_THING_ON_YOUR_DESKTOP.md](docs/THE_THING_ON_YOUR_DESKTOP.md).
 
 ---
 
@@ -239,34 +252,37 @@ first.
 
 ## Install
 
-Python 3.11+ must already be on the machine. Nothing else is needed.
+The released Windows app is self-contained. Source development requires
+Python 3.11+; building Electron also requires Node.js.
 
 ```bash
 git clone https://github.com/KZTP47/nexus-harness.git
 cd nexus-harness
 ```
 
-### Put an icon on your desktop
+### Install the released Windows app
 
 **Double-click `Install Nexus Harness.cmd`** in the folder you just cloned.
 
-That is the whole thing. It puts a Nexus Harness icon on your desktop, with its
-own picture, and that icon opens the panel. Nothing is installed anywhere else
-and nothing outside your desktop is changed; to undo it, delete the icon.
+The helper downloads the latest stable NSIS installer from GitHub Releases,
+requires exactly one installer and matching checksum asset, verifies both the
+checksum and Windows code signature, and only then starts it. The app is
+installed below your own account and can be removed from Windows Installed
+apps or with the repository uninstaller.
 
 It is at the top of the project with a name that says what it does, because the
 one thing somebody who has just downloaded this cannot be expected to know is
 which command to type first.
 
-Not on Windows, or would rather type it:
+If you are developing Nexus itself and deliberately want to run this checkout
+instead of the release:
 
 ```bash
 python scripts/put_it_on_your_desktop.py
 ```
 
-The icon opens the best thing on your machine: the desktop app if you have it,
-and otherwise the panel in your browser, started by Python straight out of this
-folder. It says which one you got.
+That development shortcut opens a local source fallback when no built app is
+present. It is not an installation and it stops working if the checkout moves.
 
 ### Uninstall on Windows
 

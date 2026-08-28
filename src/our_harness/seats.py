@@ -369,6 +369,7 @@ def _a_model_codex_really_has(where: str) -> str:
             [where, "debug", "models", "--bundled"],
             capture_output=True, text=True, timeout=VERSION_TIMEOUT_SECONDS,
             encoding="utf-8", errors="replace",
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
         )
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -506,6 +507,7 @@ def _really_ask_its_version(command: str, arguments: tuple[str, ...]) -> tuple[s
             text=True,
             timeout=VERSION_TIMEOUT_SECONDS,
             check=False,
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
         )
     except FileNotFoundError:
         return "", "The command went away between finding it and running it."

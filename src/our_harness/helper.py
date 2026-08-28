@@ -39,7 +39,7 @@ from .redaction import CredentialRedactor
 LONGEST_QUESTION = 4000
 # And an answer is an answer. This is far above a useful one and far below
 # anything that would fill a screen.
-LONGEST_ANSWER = 20_000
+LONGEST_ANSWER = 8_000_000
 # How long one helper may take. Long enough for a real answer on a slow
 # morning, short enough that a job does not sit waiting on it.
 LONGEST_WAIT_SECONDS = 180.0
@@ -170,7 +170,7 @@ def ask_for_help(
         messages=[{"role": "user", "content": redactor.text(asked)}],
         model=model,
         temperature=0.2,
-        max_output_tokens=1024,
+        max_output_tokens=max(1, int(routed.get("provider.max_output_tokens") or 65_536)),
         timeout_seconds=seconds,
     )
     started = time.monotonic()
@@ -190,9 +190,14 @@ def ask_for_help(
         raise HelperError(
             f"{route or 'The assistant'} answered with nothing at all."
         )
+    if len(said) > LONGEST_ANSWER:
+        raise HelperError(
+            f"{route or 'The assistant'} returned {len(said):,} characters, above "
+            f"the disclosed {LONGEST_ANSWER:,}-character helper limit. Nexus did not truncate it."
+        )
     return Answer(
         question=asked,
-        answer=said[:LONGEST_ANSWER],
+        answer=said,
         who=route or str(config.get("provider.name") or "the usual one"),
         model=model,
         milliseconds=int((time.monotonic() - started) * 1000),

@@ -72,6 +72,7 @@ from .runstate import (
 from .safety import confined_path
 from .staged_coding import VerificationAction
 from .usage import PriceCatalog
+from .verification import analyze_verification
 
 
 EventSink = Callable[[dict[str, Any]], None]
@@ -1041,19 +1042,21 @@ class HarnessApplication:
     ) -> dict[str, Any]:
         detections = self._detections()
         kinds = check_kinds or tuple(kind for kind, enabled in (("test", True), ("lint", include_lint), ("build", include_build)) if enabled)
-        commands: list[list[str]] = []
+        selected: list[tuple[list[str], str]] = []
         for kind in kinds:
-            commands.extend(list(self.config.get(f"project.{kind}_commands", [])) or combined_commands(detections, kind))
+            for command in list(self.config.get(f"project.{kind}_commands", [])) or combined_commands(detections, kind):
+                selected.append((command, kind))
         if extra_commands:
-            commands.extend(extra_commands)
-        unique: list[list[str]] = []
+            selected.extend((command, "test") for command in extra_commands)
+        unique: list[tuple[list[str], str]] = []
         seen: set[tuple[str, ...]] = set()
-        for command in commands:
+        for command, kind in selected:
             key = tuple(command)
             if key not in seen:
-                unique.append(command)
+                unique.append((command, kind))
                 seen.add(key)
-        commands = unique
+        commands = [command for command, _kind in unique]
+        test_indexes = {index for index, (_command, kind) in enumerate(unique) if kind == "test"}
         results = []
         for command in commands:
             timeout = None
@@ -1062,12 +1065,17 @@ class HarnessApplication:
             results.append(self.runner.run(command, timeout=timeout).to_dict())
             if deadline is not None:
                 deadline.check("after a verification command")
+        analysis = analyze_verification(
+            commands,
+            results,
+            test_indexes=test_indexes,
+            evidence_contracts=list(self.config.get("project.test_evidence_contracts", [])),
+        )
         return {
             "detections": [item.to_dict() for item in detections],
             "commands": commands,
             "results": results,
-            "passed": bool(commands) and all(item["exit_code"] == 0 and not item["timed_out"] for item in results),
-            "no_commands": not commands,
+            **analysis,
         }
 
     def _counterexample_specs(self, plan: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:

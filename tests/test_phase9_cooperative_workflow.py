@@ -14,6 +14,26 @@ from our_harness.models import CommandResult, HarnessError, ProviderResponse
 from our_harness.workflow import HarnessApplication
 
 
+POSITIVE_TEST_COMMAND = [
+    "py", "-c",
+    "import json; print(json.dumps({'summary': {'executed': 1, 'failed': 0}}))",
+]
+POSITIVE_TEST_STDOUT = '{"summary": {"executed": 1, "failed": 0}}\n'
+
+
+def positive_test_project() -> dict:
+    """Trusted fixture contract proving that one custom-runner test executed."""
+    return {
+        "test_commands": [list(POSITIVE_TEST_COMMAND)],
+        "test_evidence_contracts": [{
+            "command": list(POSITIVE_TEST_COMMAND),
+            "format": "json-stdout",
+            "total_field": "summary.executed",
+            "failed_field": "summary.failed",
+        }],
+    }
+
+
 def agent(route: str, role: str) -> dict:
     return {
         "provider_route": route,
@@ -155,7 +175,7 @@ class RoutedFixtureProvider:
                     "category": "behavior", "counterexample": "R1: the fixture tests fail",
                 }],
                 "non_goals": [], "files": list(self.tracker.get("files", ["fixture.py"])),
-                "verification_commands": [] if self.tracker.get("empty_verification") else [["py", "-c", "print('ok')"]], "risks": [],
+                "verification_commands": [] if self.tracker.get("empty_verification") else [list(POSITIVE_TEST_COMMAND)], "risks": [],
             }
         elif name.startswith("harness_merge_"):
             prompt = request.messages[-1]["content"]
@@ -166,7 +186,7 @@ class RoutedFixtureProvider:
                     "category": "behavior", "counterexample": "R1: the fixture tests fail",
                 }],
                 "non_goals": [], "files": list(self.tracker.get("files", ["fixture.py"])),
-                "verification_commands": [] if self.tracker.get("empty_verification") else [["py", "-c", "print('ok')"]], "risks": [],
+                "verification_commands": [] if self.tracker.get("empty_verification") else [list(POSITIVE_TEST_COMMAND)], "risks": [],
             }}
         elif name.startswith("harness_coder_wire_v3"):
             paths = list(self.tracker.get("files", ["fixture.py"]))
@@ -287,7 +307,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                 "route_a": {"kind": "ollama", "model": "route-a-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                 "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
             },
-            "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+            "project": positive_test_project(),
             "workflow": {"require_review": True, "reviewers": 1},
             "memory": {"embedding_model": ""},
         })
@@ -432,7 +452,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_a": {"kind": "ollama", "model": "route-a-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                     "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                 },
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             })
@@ -468,7 +488,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                 },
                 "agents": {"limited_coder": {"provider_ref": "route_b", "role": "Coder", "capabilities": ["workspace.read"]}},
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             }
@@ -495,7 +515,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_a": {"kind": "ollama", "model": "route-a-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                     "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                 },
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             })
@@ -517,7 +537,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_a": {"kind": "ollama", "model": "route-a-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                     "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                 },
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             })
@@ -558,7 +578,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_a": {"kind": "ollama", "model": "route-a-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                     "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                 },
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             })
@@ -584,7 +604,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_a": {"kind": "ollama", "model": "route-a-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                     "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
                 },
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             })
@@ -635,7 +655,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_a": {"kind": "local", "model": "route-a-model", "endpoint": "http://127.0.0.1:1", "command": ["fixture"], "max_concurrency": 1, "allow_project_graphs": True},
                     "route_b": {"kind": "local", "model": "route-b-model", "endpoint": "http://127.0.0.1:1", "command": ["fixture"], "max_concurrency": 1, "allow_project_graphs": True},
                 },
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             })
@@ -658,7 +678,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     raise KeyboardInterrupt("fixture crash after staged commit")
 
             def isolated_run(_runner, argv, cwd=".", timeout=None, stdin_text=None, max_output_bytes=None):
-                return CommandResult(list(argv), str(cwd), 0, "ok\n", "", 1)
+                return CommandResult(list(argv), str(cwd), 0, POSITIVE_TEST_STDOUT, "", 1)
 
             with patch("our_harness.workflow.create_provider", side_effect=lambda _config: StagedFixtureProvider(tracker)), patch(
                 "our_harness.execution.CommandRunner.run", autospec=True, side_effect=isolated_run,
@@ -704,7 +724,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     "route_a": {"kind": "local", "model": "route-a-model", "endpoint": "http://127.0.0.1:1", "command": ["fixture"], "max_concurrency": 1, "allow_project_graphs": True},
                     "route_b": {"kind": "local", "model": "route-b-model", "endpoint": "http://127.0.0.1:1", "command": ["fixture"], "max_concurrency": 1, "allow_project_graphs": True},
                 },
-                "project": {"test_commands": [["py", "-c", "print('ok')"]]},
+                "project": positive_test_project(),
                 "workflow": {"require_review": True, "reviewers": 1},
                 "memory": {"embedding_model": ""},
             })
@@ -728,7 +748,7 @@ class CooperativeWorkflowTests(unittest.TestCase):
                     raise KeyboardInterrupt("fixture crash after durable stage edit")
 
             def isolated_run(_runner, argv, cwd=".", timeout=None, stdin_text=None, max_output_bytes=None):
-                return CommandResult(list(argv), str(cwd), 0, "ok\n", "", 1)
+                return CommandResult(list(argv), str(cwd), 0, POSITIVE_TEST_STDOUT, "", 1)
 
             with patch("our_harness.workflow.create_provider", side_effect=lambda _config: StagedFixtureProvider(tracker)), patch(
                 "our_harness.execution.CommandRunner.run", autospec=True, side_effect=isolated_run,

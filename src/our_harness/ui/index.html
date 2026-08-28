@@ -53,6 +53,7 @@
           </svg>
         </span>
       </button>
+      <p id="runtimeIdentity" class="runtime-identity" title="The exact local Nexus process serving this project">Reading the local Nexus version.</p>
     </div>
     <div id="workflowActions" class="top-actions" aria-label="Workflow actions" hidden>
       <button id="addAgentButton" class="primary" type="button">Add agent</button>
@@ -178,6 +179,9 @@
       </div>
       <label for="quickTask">What should the harness do?</label>
       <textarea id="quickTask" rows="3" placeholder="Fix the failing parser test"></textarea>
+      <p id="quickReadiness" class="callout" role="status">Nexus is checking whether this project can run and verify a change.</p>
+      <label class="check-row"><input id="quickBootstrap" type="checkbox"> This project has no tests yet — create the test infrastructure first</label>
+      <p class="field-help">Bootstrap mode does not waive verification. Nexus must create a runnable test command and checks, then use them before it can claim the goal is complete.</p>
       <div class="example-row">
         <p id="exampleLabel">Examples you can click:</p>
         <ul class="example-list" aria-labelledby="exampleLabel">
@@ -191,7 +195,7 @@
         <button id="quickRun" class="primary" type="button">Start</button>
         <button id="quickChecks" type="button">Run the checks instead</button>
       </div>
-      <p class="field-help">A run stops on its own if it fails twice or runs out of time. Files are restored when a run fails.</p>
+      <p class="field-help">Nexus keeps planning, implementing, checking, and repairing while useful progress is possible. If it cannot continue safely, it says exactly what is needed instead of claiming success.</p>
     </section>
 
     <section class="glass data-panel" aria-labelledby="tabsTitle">
@@ -770,7 +774,7 @@
 
       <form id="talkForm" class="talk-form">
         <label class="sr-only" for="talkBox">What to say</label>
-        <textarea id="talkBox" rows="3" maxlength="6000"
+        <textarea id="talkBox" rows="3"
           placeholder="Is the old parser still used anywhere?"></textarea>
         <div class="button-row">
           <button id="talkSend" class="primary" type="submit">Send</button>
@@ -780,8 +784,8 @@
             title="Put the same thing to every assistant that is ready, all at once">Ask all of them</button>
           <span id="talkCount" class="hint" aria-live="polite"></span>
         </div>
-        <p class="field-help">Enter sends it. Shift and Enter starts a new line.
-          It cannot read your files or run anything - paste what you want it to see.</p>
+        <p id="talkBudget" class="field-help">Enter sends it. Shift and Enter starts a new line.
+          Nexus validates the complete message and never silently truncates it.</p>
       </form>
 
       <section id="talkEveryone" class="talk-everyone" aria-labelledby="talkEveryoneTitle" hidden>
@@ -978,6 +982,8 @@
               <p class="chat-activity-detail">Nexus is preparing the agent connection.</p>
               <div class="chat-activity-track" aria-hidden="true"><span></span></div>
             </section>
+            <section id="theBigChatWorkRecovery" class="work-recovery the-big-chat-work-recovery"
+              hidden aria-live="polite" aria-label="Saved project-work run"></section>
             <div class="the-big-chat-project-row">
               <label for="theBigChatProject">This chat writes to</label>
               <select id="theBigChatProject" aria-describedby="theBigChatProjectHelp"></select>
@@ -997,7 +1003,7 @@
               </span>
             </div>
             <label class="sr-only" for="theBigChatBox">What to say to this agent</label>
-            <textarea id="theBigChatBox" rows="3" maxlength="6000"
+            <textarea id="theBigChatBox" rows="3"
               placeholder="Type here to talk to this agent."></textarea>
             <div id="theBigChatAttachments" class="chat-attachments" aria-live="polite"></div>
             <input id="theBigChatFiles" class="sr-only" type="file" multiple
@@ -1015,6 +1021,7 @@
               <button id="theBigChatAttach" type="button">Attach files or screenshots</button>
               <button id="theBigChatCollaborate" type="button">Ask connected agents</button>
               <button id="theBigChatWork" type="button">Work together on project files</button>
+              <span id="theBigChatCount" class="hint" aria-live="polite"></span>
               <span id="theBigChatSaidBack" class="hint" role="status" aria-live="polite"></span>
             </div>
               </div>

@@ -373,6 +373,19 @@ class SwarmRunStoreTests(unittest.TestCase):
         self.assertNotIn(secret, projected)
         self.assertIn("[REDACTED]", projected)
 
+    def test_long_failure_keeps_redacted_head_tail_and_digest_marker(self) -> None:
+        store, run_id = self._running("long-cause")
+        secret = "swarm-bearer-secret-0123456789"
+        cause = "SWARM-CAUSE-HEAD " + ("z" * 70_000) + f" Bearer {secret} SWARM-CAUSE-TAIL"
+        store.fail(run_id, cause)
+        saved = store.get(run_id)["error"]
+        self.assertNotIn(secret, saved)
+        self.assertIn("[REDACTED]", saved)
+        self.assertIn("NEXUS_REDACTED_CAUSE_BOUNDARY", saved)
+        self.assertIn("SWARM-CAUSE-HEAD", saved)
+        self.assertIn("SWARM-CAUSE-TAIL", saved)
+        self.assertLessEqual(len(saved), 65_536)
+
     def test_runtime_must_not_be_inside_or_own_the_project(self) -> None:
         os.environ["OUR_HARNESS_SWARM_RUN_DIR"] = str(self.root / ".runtime")
         with self.assertRaises(HarnessError):
@@ -490,10 +503,37 @@ class SwarmRunStoreTests(unittest.TestCase):
         run_id = marker.read_text(encoding="utf-8")
         controller = SwarmRunStore(self.config)
         stopped = controller.request_stop(run_id)
-        self.assertEqual(stopped["status"], "stopping")
+        # The owner can observe the durable stop request and finish between the
+        # request transaction and this projection. Both values are truthful,
+        # monotonic snapshots; a terminal ``stopped`` result is not a lost
+        # fence or a reason to report stale ``stopping`` to the caller.
+        self.assertIn(stopped["status"], {"stopping", "stopped"})
         process.join(10)
         self.assertEqual(process.exitcode, 0)
         self.assertEqual(controller.get(run_id)["status"], "stopped")
+
+    def test_running_stop_accepts_owner_terminalizing_before_projection_returns(self) -> None:
+        store, run_id = self._running("running-stop-terminal-race")
+        running = swarm.Running(store)
+        request_stop = store.request_stop
+
+        def owner_finishes_during_projection(identity: str) -> dict:
+            request_stop(identity)
+            store.fail(run_id, "stopped by owner", stopped=True)
+            return store.get(run_id)
+
+        with mock.patch.object(
+            store, "request_stop", side_effect=owner_finishes_during_projection,
+        ):
+            note = running.stop(run_id)
+
+        self.assertIn("already stopped", note)
+        self.assertEqual(store.get(run_id)["status"], "stopped")
+
+        completed, completed_run = self._running("running-stop-completed")
+        completed.finish(completed_run, {"complete": True})
+        with self.assertRaisesRegex(swarm.SwarmError, "already over"):
+            swarm.Running(completed).stop(completed_run)
 
     def test_busy_local_runner_refuses_before_it_creates_a_durable_command(self) -> None:
         store = SwarmRunStore(self.config)

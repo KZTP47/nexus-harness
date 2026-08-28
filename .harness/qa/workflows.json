@@ -2805,10 +2805,10 @@
         },
         {
           "do": "run",
-          "script": "window.__asked = []; document.getElementById('quickDryRun').checked = true; document.getElementById('quickRun').click(); for (let tries = 0; tries < 60 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === true   ? 'it asked to plan only' : 'it asked for ' + window.__asked[0].dry_run",
-          "text": "it asked to plan only",
+          "script": "window.__asked = []; document.getElementById('quickDryRun').checked = true; document.getElementById('quickBootstrap').checked = true; document.getElementById('quickBootstrap').dispatchEvent(new Event('change')); document.getElementById('quickRun').click(); for (let tries = 0; tries < 60 && !window.__asked.length; tries += 1)   await new Promise(r => setTimeout(r, 100)); if (!window.__asked.length) return 'nothing was asked for'; return window.__asked[0].dry_run === true && window.__asked[0].bootstrap_tests === true   ? 'it asked to plan and bootstrap tests' : 'it asked for ' + JSON.stringify(window.__asked[0])",
+          "text": "it asked to plan and bootstrap tests",
           "timeout_ms": 15000,
-          "note": "With the box ticked it asks to plan only and change nothing"
+          "note": "With both boxes ticked it asks to plan only and explicitly bootstrap test infrastructure"
         },
         {
           "do": "click",

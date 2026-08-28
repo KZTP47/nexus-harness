@@ -14,13 +14,19 @@ const LOG_LINES = 200;
 
 // The first command that answers is the one we use. A user can name their own
 // with HARNESS_PYTHON when they keep Python somewhere unusual.
-function pythonCandidates(environment = process.env) {
+function pythonCandidates(environment = process.env, resources = "", bundledRequired = false) {
+  if (bundledRequired && os.platform() === "win32") {
+    const privateRuntime = resources ? path.resolve(resources, "runtime", "python.exe") : "";
+    return privateRuntime && fs.existsSync(privateRuntime) ? [[privateRuntime, []]] : [];
+  }
   const named = String(environment.HARNESS_PYTHON || "").trim();
   // When someone names their own Python, use that one and no other. A silent
   // fall back to a different interpreter would be very confusing.
   if (named) return [[named, []]];
   const found = [];
   if (os.platform() === "win32") {
+    const bundled = resources ? path.resolve(resources, "runtime", "python.exe") : "";
+    if (bundled && fs.existsSync(bundled)) return [[bundled, []]];
     found.push(["py", ["-3"]], ["python", []], ["python3", []]);
   } else {
     found.push(["python3", []], ["python", []]);
@@ -49,7 +55,7 @@ function whereTheHarnessLives(
   // user can explicitly ask to use the newer harness source in the project.
   // This is the same code `python scripts/harness.py ui` would use, without
   // making them leave the error screen and type the command themselves.
-  if (options.preferProjectHarness && projectSource) looking.push(projectSource);
+  if (!options.bundledRequired && options.preferProjectHarness && projectSource) looking.push(projectSource);
   // An installed app has no src folder beside it - it has a resources folder,
   // and the harness is put in there when the app is built. Without this the
   // installed app was an empty window: it could only ever work if the project
@@ -57,7 +63,7 @@ function whereTheHarnessLives(
   const carried = resources || process.resourcesPath || "";
   if (carried) looking.push(path.resolve(carried, "harness", "src"));
   looking.push(path.resolve(appFolder, "..", "src"));
-  if (projectSource && !options.preferProjectHarness) looking.push(projectSource);
+  if (!options.bundledRequired && projectSource && !options.preferProjectHarness) looking.push(projectSource);
   return looking.filter((one) => {
     try {
       return fs.existsSync(path.join(one, "our_harness", "__init__.py"));
@@ -153,7 +159,9 @@ class HarnessServer {
     this.environment = options.environment || process.env;
     this.appFolder = options.appFolder || __dirname;
     this.resources = options.resources || process.resourcesPath || "";
-    this.candidates = options.candidates || pythonCandidates(this.environment);
+    this.bundledRequired = Boolean(options.bundledRequired);
+    this.candidates = options.candidates || pythonCandidates(
+      this.environment, this.resources, this.bundledRequired);
     this.timeoutMs = options.timeoutMs || START_TIMEOUT_MS;
     this.child = null;
     this.url = "";
@@ -181,6 +189,12 @@ class HarnessServer {
   // and "not on this machine" is only the answer when that was true of all of
   // them.
   async start(projectPath, options = {}) {
+    if (!this.candidates.length && this.bundledRequired) {
+      throw new Error(
+        "This installed Nexus package is incomplete: resources/runtime/python.exe is missing. "
+        + "Reinstall the same signed release; do not install a separate system Python."
+      );
+    }
     const missing = [];
     let realProblem = null;
     for (const [command, leadingArguments] of this.candidates) {
@@ -193,9 +207,47 @@ class HarnessServer {
     }
     if (realProblem) throw realProblem;
     throw new Error(
-      `No Python was found on this machine. Tried: ${missing.join(", ")}. `
-      + "Install Python 3.11 or newer, or name yours with HARNESS_PYTHON."
+      `No Python was found on this machine for supported source mode. Tried: ${missing.join(", ")}. `
+      + "Install Python 3.11 or newer, or name yours with HARNESS_PYTHON. "
+      + "The installed Nexus release uses its own private runtime instead."
     );
+  }
+
+  async trustProject(projectPath, options = {}) {
+    if (!options.reviewedConfig || !/^[0-9a-f]{64}$/i.test(String(options.expectedSha256 || ""))) {
+      throw new Error("Trust requires the exact reviewed config path and its SHA-256 digest.");
+    }
+    let last = null;
+    for (const [command, leadingArguments] of this.candidates) {
+      try {
+        return await new Promise((resolve, reject) => {
+          const child = this.spawnProcess(command, [
+            ...leadingArguments, "-m", "our_harness", "--project", projectPath,
+            "trust", "--yes", "--reviewed-config", options.reviewedConfig,
+            "--expected-sha256", options.expectedSha256,
+          ], {
+            cwd: projectPath,
+            env: environmentForStarting(
+              this.environment,
+              whereTheHarnessLives(this.appFolder, projectPath, this.resources, {
+                ...options, bundledRequired: this.bundledRequired,
+              })
+            ),
+            windowsHide: true,
+          });
+          let output = "";
+          const remember = (chunk) => { output = (output + String(chunk)).slice(-64000); };
+          child.stdout?.on("data", remember);
+          child.stderr?.on("data", remember);
+          child.once("error", reject);
+          child.once("exit", (code) => {
+            if (code === 0) resolve(output.trim() || "Trusted.");
+            else reject(new Error(output.trim() || `${command} stopped with code ${code}`));
+          });
+        });
+      } catch (error) { last = error; }
+    }
+    throw last || new Error("No supported Nexus runtime was available to record trust.");
   }
 
   startOnce(command, leadingArguments, projectPath, options = {}) {
@@ -217,10 +269,12 @@ class HarnessServer {
       try {
         child = this.spawnProcess(command, argv, {
           cwd: projectPath,
-          env: environmentForStarting(
-            this.environment,
-            whereTheHarnessLives(this.appFolder, projectPath, this.resources, options)
-          ),
+      env: environmentForStarting(
+        this.environment,
+        whereTheHarnessLives(this.appFolder, projectPath, this.resources, {
+          ...options, bundledRequired: this.bundledRequired,
+        })
+      ),
           windowsHide: true,
         });
       } catch (error) {

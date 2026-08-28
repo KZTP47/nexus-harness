@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import stat
@@ -280,6 +281,11 @@ class RecipeTests(unittest.TestCase):
             with self.subTest(name=name):
                 recipe_for(name).check()
 
+    def test_copilot_ordinary_prompt_never_grants_all_tools(self) -> None:
+        argv = COPILOT_RECIPE.argv(["copilot"], "gpt-5")
+        self.assertNotIn("--allow-all-tools", argv)
+        self.assertNotIn("-p", argv, "the dynamic prompt value is inserted at runtime")
+
     def test_every_shipped_recipe_says_how_to_install_its_tool(self) -> None:
         for name in subscription_cli.SUBSCRIPTION_KINDS:
             with self.subTest(name=name):
@@ -359,6 +365,20 @@ class RunningTests(unittest.TestCase):
         tool = fake_tool(self.folder, "plaintool", PLAIN_TEXT_TOOL)
         answer = self.provider("copilot-cli", tool).complete(self.request())
         self.assertEqual(answer.text, '{"ok": true}', "a fenced block should be unwrapped")
+
+    def test_one_large_outer_fence_preserves_nested_source_fences(self) -> None:
+        source = "before\n```typescript\nconst result = `ok`;\n```\nafter"
+        payload = json.dumps({"files": [{"path": "demo.md", "content": source}],
+                              "padding": "x" * 35_700})
+        wrapped = f"```json\n{payload}\n```"
+        self.assertGreater(len(wrapped), 35_789)
+        decoded = subscription_cli._plain_text(wrapped)
+        self.assertEqual(decoded, payload)
+        self.assertEqual(json.loads(decoded)["files"][0]["content"], source)
+
+    def test_leading_prose_is_not_mistaken_for_an_outer_fence(self) -> None:
+        raw = "Here is the answer:\n```json\n{\"ok\": true}\n```"
+        self.assertEqual(subscription_cli._plain_text(raw), raw)
 
     def test_a_tool_that_never_asked_anybody_is_not_the_service_saying_no(self) -> None:
         """The one the person in front of it was right about. Claude answers with
@@ -587,7 +607,7 @@ class RunningTests(unittest.TestCase):
         answer = self.provider("claude-cli", tool).complete(self.request())
         self.assertEqual(
             json.loads(answer.text),
-            ["-p", "--output-format", "json", "--model", "fake-model"],
+            ["-p", "--output-format", "json", "--model", "fake-model", "--tools", ""],
         )
 
     def test_an_argument_shape_that_cannot_be_dropped_is_refused(self) -> None:
@@ -607,20 +627,50 @@ class RunningTests(unittest.TestCase):
     def test_the_prompt_carries_the_system_text_and_the_conversation(self) -> None:
         seen = self.folder / "seen.txt"
         recorder = (
-            "import sys\n"
+            "import json, sys\n"
             "if '--version' in sys.argv[1:]:\n"
             "    print('1.0')\n"
             "    raise SystemExit(0)\n"
-            f"open({str(seen)!r}, 'w', encoding='utf-8').write(sys.stdin.read())\n"
+            f"open({str(seen)!r}, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
             "print('done')\n"
         )
         tool = fake_tool(self.folder, "recorder", recorder)
         self.provider("copilot-cli", tool).complete(self.request("Fix the parser"))
-        prompt = seen.read_text(encoding="utf-8")
+        argv = json.loads(seen.read_text(encoding="utf-8"))
+        self.assertIn("-p", argv)
+        prompt = argv[argv.index("-p") + 1]
         self.assertIn("SYSTEM INSTRUCTIONS", prompt)
         self.assertIn("SYSTEM", prompt)
         self.assertIn("UNTRUSTED DATA", prompt)
         self.assertIn("Fix the parser", prompt)
+        self.assertIn("-s", argv)
+        self.assertIn("--available-tools=", argv)
+        self.assertIn("--deny-tool=read,write,shell,url,memory", argv)
+        self.assertIn("--disable-builtin-mcps", argv)
+
+    def test_only_verified_answer_only_claude_is_schema_retry_safe(self) -> None:
+        tool = fake_tool(self.folder, "plain", "print('done')\n")
+        self.assertTrue(self.provider("claude-cli", tool).structured_retry_is_safe)
+        self.assertFalse(self.provider("gemini-cli", tool).structured_retry_is_safe)
+        self.assertFalse(self.provider("copilot-cli", tool).structured_retry_is_safe)
+
+    def test_gemini_does_not_mislabel_an_empty_approval_list_as_no_tools(self) -> None:
+        seen = self.folder / "gemini-argv.json"
+        recorder = (
+            "import json, sys\n"
+            "if '--version' in sys.argv[1:]:\n"
+            "    print('1.0')\n"
+            "    raise SystemExit(0)\n"
+            f"open({str(seen)!r}, 'w', encoding='utf-8').write(json.dumps(sys.argv[1:]))\n"
+            "sys.stdin.read()\n"
+            "print(json.dumps({'response': 'done'}))\n"
+        )
+        tool = fake_tool(self.folder, "gemini-recorder", recorder)
+        provider = self.provider("gemini-cli", tool)
+        self.assertEqual(provider.complete(self.request()).text, "done")
+        argv = json.loads(seen.read_text(encoding="utf-8"))
+        self.assertNotIn("--allowed-tools", argv)
+        self.assertFalse(provider.structured_retry_is_safe)
 
 
 class WhatCountsAsTheToolTalkingTests(unittest.TestCase):
@@ -1224,6 +1274,21 @@ class TrustCommandTests(unittest.TestCase):
         self.assertIn("claude-cli", output, "the file should be shown before it is trusted")
         self.assertIn("Trusted.", output)
         self.assertEqual(len(recorded), 1)
+
+    def test_digest_bound_cli_refuses_bytes_changed_after_native_review(self) -> None:
+        reviewed = b'{"provider":{"name":"claude-cli"}}'
+        self.local.write_bytes(reviewed)
+        store = self.root / "user" / "trusted-projects.json"
+        digest = hashlib.sha256(reviewed).hexdigest()
+        self.local.write_bytes(b'{"provider":{"name":"gemini-cli"}}')
+        with mock.patch("our_harness.config.project_trust_store_path", return_value=store):
+            code, _output, errors = self.run_cli(
+                "trust", "--yes", "--reviewed-config", str(self.local),
+                "--expected-sha256", digest,
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("changed after review", errors)
+        self.assertFalse(store.exists())
 
     def test_saying_no_changes_nothing(self) -> None:
         self.local.write_text("{}", encoding="utf-8")

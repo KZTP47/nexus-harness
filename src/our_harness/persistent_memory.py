@@ -9,6 +9,7 @@ one of the mandatory pre-work (consult) and post-work (record) hooks.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -31,6 +32,105 @@ SESSIONS_FOLDER = "Sessions"
 PINNED_NOTE = "Project Memory.md"
 MAX_NOTES = 2_000
 MAX_NOTE_CHARS = 20_000
+DEPLOYMENT_LOCK = Path(".harness") / "desktop-deployment.lock"
+DEPLOYMENT_LOCK_OWNER = Path(".harness") / "desktop-deployment.owner.json"
+
+
+def _is_owned_build_lock_failure(detail: str) -> bool:
+    """Recognize Windows' equivalent wordings for a locked unpacked build."""
+
+    folded = detail.casefold()
+    lock_wording = (
+        "access is denied" in folded
+        or "being used by another process" in folded
+        or "cannot access the file" in folded
+    )
+    return lock_wording and "win-unpacked" in folded
+
+
+def _deployment_lock_owner(project_root: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(read_this_file_patiently(project_root / DEPLOYMENT_LOCK_OWNER))
+        return value if isinstance(value, dict) else {}
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+
+
+@contextmanager
+def _checkout_deployment_lock(
+    project_root: Path,
+    timeout_seconds: float,
+    *,
+    purpose: str = "persistent-memory desktop closeout",
+):
+    """Serialize the complete checkout-owned desktop deployment across processes.
+
+    The OS lock is authoritative. Metadata is deliberately not used to break a
+    lock: after a crash the kernel releases the lock with the dead process, and
+    only then may the next owner overwrite the stale diagnostic record.
+    """
+
+    if timeout_seconds <= 0:
+        raise HarnessError("Desktop deployment lock timeout must be greater than zero")
+    root = project_root.resolve()
+    lock_path = root / DEPLOYMENT_LOCK
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    stream = lock_path.open("a+b")
+    stream.seek(0, os.SEEK_END)
+    if stream.tell() == 0:
+        stream.write(b"\0")
+        stream.flush()
+    started = time.monotonic()
+    acquired = False
+    try:
+        while not acquired:
+            try:
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (OSError, BlockingIOError):
+                if time.monotonic() - started >= timeout_seconds:
+                    owner = _deployment_lock_owner(root)
+                    detail = json.dumps(owner, sort_keys=True) if owner else "unreadable owner metadata"
+                    raise HarnessError(
+                        "Timed out waiting for this checkout's desktop deployment lock; "
+                        f"the live OS lock was not broken. Current owner: {detail}"
+                    )
+                time.sleep(0.1)
+        owner = {
+            "schema_version": 1,
+            "state": "owning",
+            "pid": os.getpid(),
+            "project_root": str(root),
+            "purpose": purpose,
+            "acquired_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        put_this_file_in_place(
+            root / DEPLOYMENT_LOCK_OWNER,
+            json.dumps(owner, indent=2, sort_keys=True) + "\n",
+        )
+        yield owner
+        owner["state"] = "released"
+        owner["released_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        put_this_file_in_place(
+            root / DEPLOYMENT_LOCK_OWNER,
+            json.dumps(owner, indent=2, sort_keys=True) + "\n",
+        )
+    finally:
+        if acquired:
+            stream.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        stream.close()
 
 
 class MemoryHookState(TypedDict, total=False):
@@ -270,6 +370,16 @@ class PersistentMemoryHooks:
     def _deploy_desktop(self, project_root: Path) -> dict[str, Any]:
         if os.name != "nt":
             raise HarnessError("The enforced Nexus Harness desktop closeout is Windows-only")
+        timeout = float(self.config.get("execution.timeout_seconds", 3_600))
+        with _checkout_deployment_lock(
+            project_root, timeout,
+            purpose="runtime preparation, Electron packaging, NSIS, and shortcut refresh",
+        ):
+            return self._deploy_desktop_while_locked(project_root, timeout)
+
+    def _deploy_desktop_while_locked(
+        self, project_root: Path, timeout: float,
+    ) -> dict[str, Any]:
         desktop = project_root / "desktop"
         package = desktop / "package.json"
         shortcut_script = project_root / "scripts" / "put_it_on_your_desktop.py"
@@ -280,29 +390,61 @@ class PersistentMemoryHooks:
         npm = shutil.which("npm.cmd") or shutil.which("npm")
         if not npm:
             raise HarnessError("Desktop closeout requires npm on PATH")
-        timeout = float(self.config.get("execution.timeout_seconds", 3_600))
         started = time.time()
-        try:
-            built = subprocess.run(
+        output = desktop / "build-output"
+        application = output / "win-unpacked" / "Nexus Harness.exe"
+
+        def build() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
                 [npm, "run", "build"],
                 cwd=str(desktop),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
                 check=False,
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
             )
+
+        try:
+            built = build()
         except (OSError, subprocess.SubprocessError) as exc:
             raise HarnessError(f"Electron app and installer rebuild could not start: {exc}") from exc
+        build_detail = f"{built.stdout}\n{built.stderr}".strip()
+        if built.returncode != 0 and _is_owned_build_lock_failure(build_detail):
+            # Electron Builder cannot replace its unpacked app while that exact
+            # development executable is open. Close only processes whose
+            # resolved executable path equals this checkout's owned artifact;
+            # never kill by display name, which could hit an installed app or
+            # another checkout. Then retry the gate once.
+            powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+            if powershell and application.is_file():
+                environment = dict(os.environ)
+                environment["NEXUS_CLOSEOUT_OWNED_EXE"] = str(application.resolve())
+                close_owned = subprocess.run(
+                    [
+                        powershell, "-NoProfile", "-NonInteractive", "-Command",
+                        "$expected=[IO.Path]::GetFullPath($env:NEXUS_CLOSEOUT_OWNED_EXE); "
+                        "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and "
+                        "([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $expected) } | "
+                        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }",
+                    ],
+                    cwd=str(project_root), env=environment, capture_output=True,
+                    text=True, timeout=30, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                if close_owned.returncode == 0:
+                    time.sleep(0.5)
+                    built = build()
         if built.returncode != 0:
             detail = f"{built.stdout}\n{built.stderr}".strip()[-4_000:]
             raise HarnessError(
                 f"Electron app and installer rebuild failed with exit code {built.returncode}:\n{detail}"
             )
-
-        output = desktop / "build-output"
-        application = output / "win-unpacked" / "Nexus Harness.exe"
         installers = sorted(
-            output.glob("Nexus Harness Setup *.exe"),
+            [
+                *output.glob("Nexus-Harness-Setup-*.exe"),
+                *output.glob("Nexus Harness Setup *.exe"),
+            ],
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
@@ -321,6 +463,7 @@ class PersistentMemoryHooks:
                 text=True,
                 timeout=min(timeout, 300.0),
                 check=False,
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise HarnessError(f"Desktop shortcut refresh could not start: {exc}") from exc

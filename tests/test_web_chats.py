@@ -56,6 +56,47 @@ class WebChatBrokerTests(unittest.TestCase):
         thread.join(2)
         self.assertEqual(result, ["The visible provider reply"])
 
+    def test_incident_sized_web_answer_is_not_sliced_at_200k(self) -> None:
+        result: list[str] = []
+        answer = "web-result:" + ("x" * 250_000)
+        thread = threading.Thread(target=lambda: result.append(
+            self.broker.provider("web:claude-abcdef123456").complete(self.request()).text
+        ))
+        thread.start()
+        for _ in range(100):
+            pending = self.broker.pending()
+            if pending:
+                break
+            time.sleep(0.01)
+        self.broker.complete(pending[0]["request_id"], answer=answer)
+        thread.join(2)
+        self.assertEqual(result, [answer])
+
+    def test_long_web_failure_is_redacted_before_bounded_head_and_tail_storage(self) -> None:
+        errors: list[str] = []
+        thread = threading.Thread(target=lambda: self._capture_failure(errors))
+        thread.start()
+        for _ in range(100):
+            pending = self.broker.pending()
+            if pending:
+                break
+            time.sleep(0.01)
+        secret = "bearer-secret-value-0123456789"
+        cause = "CAUSE-HEAD " + ("x" * 70_000) + f" Bearer {secret} CAUSE-TAIL"
+        self.broker.complete(pending[0]["request_id"], error=cause)
+        thread.join(2)
+        self.assertNotIn(secret, errors[0])
+        self.assertIn("[REDACTED]", errors[0])
+        self.assertIn("NEXUS_REDACTED_CAUSE_BOUNDARY", errors[0])
+        self.assertIn("CAUSE-HEAD", errors[0])
+        self.assertIn("CAUSE-TAIL", errors[0])
+
+    def _capture_failure(self, errors: list[str]) -> None:
+        try:
+            self.broker.provider("web:claude-abcdef123456").complete(self.request())
+        except Exception as exc:
+            errors.append(str(exc))
+
     def test_standalone_display_identity_is_mapped_to_a_safe_stable_channel(self) -> None:
         request = replace(
             self.request(),
