@@ -140,6 +140,41 @@ def _is_direct_reparse_point(path: Path) -> bool:
     return os.path.normcase(str(actual)) != os.path.normcase(str(expected))
 
 
+def _same_existing_path(left: Path, right: Path) -> bool:
+    """Compare one filesystem object without trusting its Windows spelling.
+
+    A hosted runner can hand Python an 8.3 ancestor such as ``RUNNER~1`` and
+    later expand the same object to ``runneradmin``.  String and ``Path``
+    equality therefore are not authority checks on Windows.  ``samefile``
+    compares the underlying object; the lexical fallback is useful only while
+    a path is missing and cannot broaden access beyond an exact spelling.
+    """
+
+    try:
+        return os.path.samefile(left, right)
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+            os.path.abspath(right)
+        )
+
+
+def _owned_runtime_relative(selected: Path) -> str:
+    """Return the stable selector path for one direct, owned runtime root."""
+
+    lexical = Path(os.path.abspath(selected))
+    if lexical.name == "runtime" and _same_existing_path(lexical.parent, DESKTOP):
+        return "runtime"
+    identity = lexical.name
+    published = Path(os.path.abspath(_published_runtimes_path()))
+    if (
+        len(identity) == 64
+        and all(one in "0123456789abcdef" for one in identity)
+        and _same_existing_path(lexical.parent, published)
+    ):
+        return f".runtime-published/{identity}"
+    raise RuntimeError(f"Refusing unsafe private-runtime selection: {selected}")
+
+
 def runtime_tree_digest(root: Path) -> str:
     """Bind a prepared runtime to every relative path and file byte.
 
@@ -186,17 +221,11 @@ def _runtime_input_identity() -> str:
 
 
 def _selection_payload(selected: Path, *, tree_sha256: str | None = None) -> dict[str, object]:
-    desktop = DESKTOP.resolve()
     lexical = Path(os.path.abspath(selected))
-    resolved = selected.resolve()
     if _is_direct_reparse_point(selected):
         raise RuntimeError(f"Selected private runtime is a link or reparse point: {selected}")
-    relative = resolved.relative_to(desktop).as_posix()
-    if relative != "runtime" and not (
-        relative.startswith(".runtime-published/") and len(relative.split("/")) == 2
-    ):
-        raise RuntimeError(f"Refusing unsafe private-runtime selection: {selected}")
-    manifest = resolved / "NEXUS_RUNTIME.json"
+    relative = _owned_runtime_relative(lexical)
+    manifest = lexical / "NEXUS_RUNTIME.json"
     if not manifest.is_file():
         raise RuntimeError(f"Selected private runtime has no manifest: {selected}")
     try:
@@ -277,14 +306,11 @@ def _selected_runtime_from_payload(
         raise RuntimeError(
             "The private-runtime publication root is a link or reparse point"
         )
-    selected = lexical.resolve()
-    desktop = DESKTOP.resolve()
-    if (
-        _is_direct_reparse_point(lexical)
-        or selected == desktop or desktop not in selected.parents
-    ):
+    if _is_direct_reparse_point(lexical):
         raise RuntimeError("Private-runtime selection escapes the desktop directory")
-    manifest = selected / "NEXUS_RUNTIME.json"
+    if _owned_runtime_relative(lexical) != relative.replace("\\", "/"):
+        raise RuntimeError("Private-runtime selection escapes the desktop directory")
+    manifest = lexical / "NEXUS_RUNTIME.json"
     expected_manifest = payload.get("manifest_sha256")
     if not isinstance(expected_manifest, str) or len(expected_manifest) != 64:
         raise RuntimeError("Private-runtime selection manifest identity is invalid")
@@ -314,7 +340,10 @@ def _selected_runtime_from_payload(
         raise RuntimeError("Private-runtime selection tree identity is invalid")
     if verify_tree and runtime_tree_digest(lexical) != expected_tree:
         raise RuntimeError("Selected private-runtime tree does not match its selection")
-    return selected
+    # Preserve DESKTOP's caller-visible spelling.  Validation above uses file
+    # identity, so returning an arbitrary long/short expansion would only make
+    # clean-runner results differ for the same verified directory.
+    return lexical
 
 
 def selected_runtime(*, verify_tree: bool = True) -> Path:
@@ -588,7 +617,8 @@ def _remove_abandoned_runtime_trees() -> None:
             resolved = candidate.resolve()
             if (
                 _is_direct_reparse_point(candidate)
-                or resolved.parent != desktop or not resolved.is_dir()
+                or not _same_existing_path(candidate.parent, desktop)
+                or not resolved.is_dir()
             ):
                 raise RuntimeError(f"Refusing unsafe abandoned runtime path: {candidate}")
             try:
@@ -647,13 +677,13 @@ def _reuse_current_candidate() -> Path | None:
         payload = json.loads(source.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise RuntimeError("candidate receipt must be a JSON object")
-        expected_relative = destination.relative_to(DESKTOP.resolve()).as_posix()
+        expected_relative = f".runtime-published/{identity}"
         if payload.get("runtime_path") != expected_relative:
             raise RuntimeError("candidate receipt selects a different runtime")
         verified = _selected_runtime_from_payload(
             payload, allow_legacy_input_identity=source == _runtime_selection_path(),
         )
-        if os.path.normcase(str(verified)) != os.path.normcase(str(destination.resolve())):
+        if not _same_existing_path(verified, destination):
             raise RuntimeError("candidate receipt resolved to a different runtime")
         tree_sha256 = str(payload["tree_sha256"])
     except (OSError, KeyError, json.JSONDecodeError, RuntimeError) as error:
@@ -694,12 +724,12 @@ def _publish_immutable_candidate(staging: Path) -> Path:
 def _prepare_locked(output: Path) -> Path:
     output = Path(os.path.abspath(output))
     allowed = Path(os.path.abspath(DESKTOP / "runtime"))
-    if os.path.normcase(str(output)) != os.path.normcase(str(allowed)):
-        raise RuntimeError(f"Runtime output must be exactly {allowed}")
     if output.exists() and (
         _is_direct_reparse_point(output)
     ):
         raise RuntimeError("Runtime output is a link or reparse point")
+    if output.name != "runtime" or not _same_existing_path(output.parent, allowed.parent):
+        raise RuntimeError(f"Runtime output must be exactly {allowed}")
     _remove_abandoned_runtime_trees()
     reused = _reuse_current_candidate()
     if reused is not None:

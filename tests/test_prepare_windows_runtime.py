@@ -135,7 +135,8 @@ class RuntimePreparationTests(unittest.TestCase):
             ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage):
                 prepared = runtime.prepare(output)
 
-            self.assertEqual(prepared, output.resolve())
+            self.assertEqual(prepared, Path(os.path.abspath(output)))
+            self.assertTrue(prepared.samefile(output))
             self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "new")
             self.assertFalse(any(desktop.glob(".runtime-stage-*")))
             self.assertFalse(any(desktop.glob(".runtime-previous-*")))
@@ -321,6 +322,32 @@ class RuntimePreparationTests(unittest.TestCase):
             self.assertEqual(
                 len([one for one in (desktop / ".runtime-published").iterdir() if one.is_dir()]), 1
             )
+
+    def test_runtime_selection_preserves_a_safe_ancestor_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            real_parent = base / "real-parent"
+            real_desktop = real_parent / "desktop"
+            real_desktop.mkdir(parents=True)
+            alias_parent = base / "ancestor-alias"
+            self._make_directory_link(alias_parent, real_parent)
+            desktop = alias_parent / "desktop"
+            output = desktop / "runtime"
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("verified", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage):
+                prepared = runtime.prepare(output)
+                selected = runtime.selected_runtime()
+
+            self.assertEqual(prepared, Path(os.path.abspath(output)))
+            self.assertEqual(selected, prepared)
+            self.assertTrue(prepared.samefile(real_desktop / "runtime"))
 
     def test_candidate_collision_fails_without_mutating_old_or_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
