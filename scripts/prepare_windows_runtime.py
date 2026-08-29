@@ -46,6 +46,10 @@ def _published_runtimes_path() -> Path:
     return DESKTOP / ".runtime-published"
 
 
+def _candidate_receipt_path(identity: str) -> Path:
+    return _published_runtimes_path() / f"{identity}.receipt.json"
+
+
 def retry_owned_windows_operation(operation, description: str, timeout_seconds: float = 30.0):
     """Retry short-lived loader/AV locks on builder-owned staging artifacts."""
 
@@ -129,8 +133,13 @@ def runtime_tree_digest(root: Path) -> str:
     held = hashlib.sha256()
     paths = sorted(canonical.rglob("*"), key=lambda one: one.relative_to(canonical).as_posix())
     for path in paths:
-        if path.is_symlink():
-            raise RuntimeError(f"Private runtime contains a link: {path}")
+        lexical_path = Path(os.path.abspath(path))
+        resolved_path = path.resolve()
+        if (
+            path.is_symlink()
+            or os.path.normcase(str(lexical_path)) != os.path.normcase(str(resolved_path))
+        ):
+            raise RuntimeError(f"Private runtime contains a link or reparse point: {path}")
         relative = path.relative_to(canonical).as_posix().encode("utf-8")
         if path.is_dir():
             held.update(b"D\0" + relative + b"\0")
@@ -191,12 +200,11 @@ def _selection_payload(selected: Path, *, tree_sha256: str | None = None) -> dic
         "python_sha256": PYTHON_SHA256,
         "requirements_sha256": expected_requirements,
         "playwright_lock_sha256": expected_playwright,
+        "input_identity": _runtime_input_identity(),
     }
 
 
-def _write_runtime_selection(selected: Path, *, tree_sha256: str | None = None) -> None:
-    payload = _selection_payload(selected, tree_sha256=tree_sha256)
-    destination = _runtime_selection_path()
+def _write_json_atomically(destination: Path, payload: dict[str, object]) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -206,13 +214,16 @@ def _write_runtime_selection(selected: Path, *, tree_sha256: str | None = None) 
         temporary.unlink(missing_ok=True)
 
 
-def selected_runtime(*, verify_tree: bool = True) -> Path:
-    """Resolve the prepared runtime selected for source smokes and packaging."""
+def _write_runtime_selection(selected: Path, *, tree_sha256: str | None = None) -> None:
+    _write_json_atomically(
+        _runtime_selection_path(), _selection_payload(selected, tree_sha256=tree_sha256)
+    )
 
-    try:
-        payload = json.loads(_runtime_selection_path().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError("Private-runtime selection is missing or unreadable") from error
+
+def _selected_runtime_from_payload(
+    payload: dict[str, object], *, verify_tree: bool = True,
+    allow_legacy_input_identity: bool = False,
+) -> Path:
     if payload.get("schema_version") != 1:
         raise RuntimeError("Unsupported private-runtime selection schema")
     relative = payload.get("runtime_path")
@@ -224,6 +235,16 @@ def selected_runtime(*, verify_tree: bool = True) -> Path:
         and len(parts[1]) == 64 and all(one in "0123456789abcdef" for one in parts[1])
     ):
         raise RuntimeError("Private-runtime selection path is outside the owned runtime roots")
+    expected_input_identity = _runtime_input_identity()
+    if payload.get("input_identity") != expected_input_identity:
+        legacy_current_candidate = (
+            allow_legacy_input_identity
+            and payload.get("input_identity") is None
+            and len(parts) == 2 and parts[0] == ".runtime-published"
+            and parts[1] == expected_input_identity
+        )
+        if not legacy_current_candidate:
+            raise RuntimeError("Private-runtime selection input identity is invalid")
     lexical = Path(os.path.abspath(DESKTOP / relative))
     selected = lexical.resolve()
     desktop = DESKTOP.resolve()
@@ -244,7 +265,11 @@ def selected_runtime(*, verify_tree: bool = True) -> Path:
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError("Selected private-runtime manifest is unreadable") from error
     if (
-        payload.get("python") != PYTHON_VERSION
+        payload.get("input_identity") not in (
+            expected_input_identity,
+            None if allow_legacy_input_identity else expected_input_identity,
+        )
+        or payload.get("python") != PYTHON_VERSION
         or payload.get("python_sha256") != PYTHON_SHA256
         or payload.get("requirements_sha256") != digest(LOCK)
         or payload.get("playwright_lock_sha256") != digest(PLAYWRIGHT_LOCK)
@@ -260,6 +285,18 @@ def selected_runtime(*, verify_tree: bool = True) -> Path:
     if verify_tree and runtime_tree_digest(lexical) != expected_tree:
         raise RuntimeError("Selected private-runtime tree does not match its selection")
     return selected
+
+
+def selected_runtime(*, verify_tree: bool = True) -> Path:
+    """Resolve the prepared runtime selected for source smokes and packaging."""
+
+    try:
+        payload = json.loads(_runtime_selection_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("Private-runtime selection is missing or unreadable") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("Private-runtime selection must be a JSON object")
+    return _selected_runtime_from_payload(payload, verify_tree=verify_tree)
 
 
 def sri_digest(path: Path, integrity: str) -> bool:
@@ -554,10 +591,7 @@ def _cleanup_unreferenced_runtime_tree(path: Path, description: str) -> None:
             raise
 
 
-def _publish_immutable_candidate(staging: Path) -> Path:
-    """Publish one deterministic candidate for the exact locked inputs."""
-
-    identity = _runtime_input_identity()
+def _owned_published_root() -> Path:
     published = _published_runtimes_path()
     expected_published = Path(os.path.abspath(DESKTOP / ".runtime-published"))
     if published.exists() and (
@@ -565,22 +599,70 @@ def _publish_immutable_candidate(staging: Path) -> Path:
         or os.path.normcase(str(published.resolve())) != os.path.normcase(str(expected_published))
     ):
         raise RuntimeError("The private-runtime publication root is a link or reparse point")
+    return published
+
+
+def _reuse_current_candidate() -> Path | None:
+    """Fully verify and select the exact cached runtime without network work."""
+
+    identity = _runtime_input_identity()
+    published = _owned_published_root()
     destination = published / identity
-    tree_sha256 = runtime_tree_digest(staging)
-    published.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        if runtime_tree_digest(destination) != tree_sha256:
-            raise RuntimeError(
-                "The immutable private-runtime candidate for these locked inputs already exists "
-                "with different bytes; the current runtime and candidate were left untouched"
-            )
-        _cleanup_unreferenced_runtime_tree(staging, "remove duplicate private-runtime staging tree")
-    else:
-        retry_owned_windows_operation(
-            lambda: staging.replace(destination), "publish immutable private-runtime candidate",
-            timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+    if not destination.exists():
+        return None
+    receipt_path = _candidate_receipt_path(identity)
+    try:
+        source = receipt_path if receipt_path.exists() else _runtime_selection_path()
+        lexical_receipt = Path(os.path.abspath(source))
+        if (
+            source.is_symlink()
+            or os.path.normcase(str(source.resolve())) != os.path.normcase(str(lexical_receipt))
+        ):
+            raise RuntimeError("candidate receipt is a link or reparse point")
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("candidate receipt must be a JSON object")
+        expected_relative = destination.relative_to(DESKTOP.resolve()).as_posix()
+        if payload.get("runtime_path") != expected_relative:
+            raise RuntimeError("candidate receipt selects a different runtime")
+        verified = _selected_runtime_from_payload(
+            payload, allow_legacy_input_identity=source == _runtime_selection_path(),
         )
-    _write_runtime_selection(destination, tree_sha256=tree_sha256)
+        if os.path.normcase(str(verified)) != os.path.normcase(str(destination.resolve())):
+            raise RuntimeError("candidate receipt resolved to a different runtime")
+        tree_sha256 = str(payload["tree_sha256"])
+    except (OSError, KeyError, json.JSONDecodeError, RuntimeError) as error:
+        raise RuntimeError(
+            "The immutable private-runtime candidate for these locked inputs already exists "
+            "but failed complete receipt, manifest, lock, or tree verification; the current "
+            "runtime and candidate were left untouched"
+        ) from error
+    if not receipt_path.exists():
+        payload = _selection_payload(destination, tree_sha256=tree_sha256)
+        _write_json_atomically(receipt_path, payload)
+    _write_json_atomically(_runtime_selection_path(), payload)
+    return destination
+
+
+def _publish_immutable_candidate(staging: Path) -> Path:
+    """Publish one deterministic candidate for the exact locked inputs."""
+
+    existing = _reuse_current_candidate()
+    if existing is not None:
+        _cleanup_unreferenced_runtime_tree(staging, "remove duplicate private-runtime staging tree")
+        return existing
+    identity = _runtime_input_identity()
+    published = _owned_published_root()
+    destination = published / identity
+    published.mkdir(parents=True, exist_ok=True)
+    tree_sha256 = runtime_tree_digest(staging)
+    retry_owned_windows_operation(
+        lambda: staging.replace(destination), "publish immutable private-runtime candidate",
+        timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+    )
+    payload = _selection_payload(destination, tree_sha256=tree_sha256)
+    _write_json_atomically(_candidate_receipt_path(identity), payload)
+    _write_json_atomically(_runtime_selection_path(), payload)
     return destination
 
 
@@ -595,6 +677,9 @@ def _prepare_locked(output: Path) -> Path:
     ):
         raise RuntimeError("Runtime output is a link or reparse point")
     _remove_abandoned_runtime_trees()
+    reused = _reuse_current_candidate()
+    if reused is not None:
+        return reused
     staging = DESKTOP / f".runtime-stage-{uuid.uuid4().hex}"
     previous = DESKTOP / f".runtime-previous-{uuid.uuid4().hex}"
     try:

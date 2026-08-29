@@ -302,7 +302,9 @@ class RuntimePreparationTests(unittest.TestCase):
             self.assertEqual((selected / "identity.txt").read_text(encoding="utf-8"), "fresh")
             self.assertFalse(any(desktop.glob(".runtime-stage-*")))
             self.assertFalse(any(desktop.glob(".runtime-previous-*")))
-            self.assertEqual(len(list((desktop / ".runtime-published").iterdir())), 1)
+            self.assertEqual(
+                len([one for one in (desktop / ".runtime-published").iterdir() if one.is_dir()]), 1
+            )
 
     def test_candidate_collision_fails_without_mutating_old_or_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -331,12 +333,135 @@ class RuntimePreparationTests(unittest.TestCase):
             ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
                 runtime, "retry_owned_windows_operation", side_effect=locked_previous
             ), mock.patch.object(runtime.os, "name", "nt"):
-                with self.assertRaisesRegex(RuntimeError, "different bytes"):
+                with self.assertRaisesRegex(RuntimeError, "failed complete"):
                     runtime.prepare(output)
 
             self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
             self.assertEqual((published / "identity.txt").read_text(encoding="utf-8"), "unrelated")
             self.assertFalse((desktop / ".runtime-selection.json").exists())
+
+    def test_repeat_build_reuses_verified_candidate_despite_nondeterministic_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("locked old", encoding="utf-8")
+            assemblies = iter(("first-wheel-metadata", "second-wheel-metadata"))
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "functional.txt").write_text("same behavior", encoding="utf-8")
+                (destination / "installer-metadata.txt").write_text(next(assemblies), encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            def locked_previous(operation, description: str, timeout_seconds: float = 30.0):
+                if description == "preserve previous private runtime":
+                    error = PermissionError("watched directory")
+                    error.winerror = 32
+                    raise error
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=locked_previous
+            ), mock.patch.object(runtime.os, "name", "nt"):
+                first = runtime.prepare(output)
+                first_digest = runtime.runtime_tree_digest(first)
+                second_staging = desktop / ".runtime-stage-manual-second-assembly"
+                stage(second_staging)
+                second = runtime._publish_immutable_candidate(second_staging)
+                self.assertEqual(runtime.selected_runtime(), first)
+
+            self.assertEqual(first, second)
+            self.assertEqual(runtime.runtime_tree_digest(first), first_digest)
+            self.assertEqual(
+                (first / "installer-metadata.txt").read_text(encoding="utf-8"),
+                "first-wheel-metadata",
+            )
+            self.assertFalse(any(desktop.glob(".runtime-stage-*")))
+            self.assertEqual(
+                len([one for one in (desktop / ".runtime-published").iterdir() if one.is_dir()]), 1
+            )
+
+    def test_repeat_prepare_reuses_legacy_candidate_before_offline_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("locked old", encoding="utf-8")
+            stage_calls = 0
+
+            def stage(destination: Path) -> None:
+                nonlocal stage_calls
+                stage_calls += 1
+                destination.mkdir(parents=True)
+                (destination / "payload.txt").write_text("verified", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            def locked_previous(operation, description: str, timeout_seconds: float = 30.0):
+                if description == "preserve previous private runtime":
+                    error = PermissionError("watched directory")
+                    error.winerror = 32
+                    raise error
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=locked_previous
+            ), mock.patch.object(runtime.os, "name", "nt"):
+                first = runtime.prepare(output)
+                receipt = runtime._candidate_receipt_path(runtime._runtime_input_identity())
+                receipt.unlink()
+                legacy = json.loads(runtime._runtime_selection_path().read_text(encoding="utf-8"))
+                legacy.pop("input_identity")
+                runtime._runtime_selection_path().write_text(json.dumps(legacy), encoding="utf-8")
+                with mock.patch.object(
+                    runtime, "_prepare_staging", side_effect=RuntimeError("offline")
+                ) as offline_stage:
+                    second = runtime.prepare(output)
+                self.assertTrue(receipt.is_file())
+                self.assertEqual(runtime.selected_runtime(), first)
+
+            self.assertEqual(second, first)
+            self.assertEqual(stage_calls, 1)
+            offline_stage.assert_not_called()
+
+    def test_repeat_build_rejects_tampered_existing_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("locked old", encoding="utf-8")
+            turn = 0
+
+            def stage(destination: Path) -> None:
+                nonlocal turn
+                turn += 1
+                destination.mkdir(parents=True)
+                (destination / "payload.txt").write_text(f"assembly {turn}", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            def locked_previous(operation, description: str, timeout_seconds: float = 30.0):
+                if description == "preserve previous private runtime":
+                    error = PermissionError("watched directory")
+                    error.winerror = 32
+                    raise error
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=locked_previous
+            ), mock.patch.object(runtime.os, "name", "nt"):
+                selected = runtime.prepare(output)
+                (selected / "payload.txt").write_text("tampered", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "failed complete"):
+                    runtime.prepare(output)
+
+            self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "locked old")
+            self.assertEqual((selected / "payload.txt").read_text(encoding="utf-8"), "tampered")
 
     def test_runtime_selection_rejects_traversal_and_tree_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
