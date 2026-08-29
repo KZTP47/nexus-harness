@@ -188,6 +188,21 @@ class PackagingTests(unittest.TestCase):
             self.assertFalse(result["passed"])
             self.assertTrue(any(item["message"] == "machine-specific absolute path" for item in result["findings"]))
 
+    def test_distribution_audit_ignores_generated_published_runtime_vendor_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "src" / "our_harness"
+            package.mkdir(parents=True)
+            (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+            vendor = root / "desktop" / ".runtime-published" / ("a" * 64)
+            vendor.mkdir(parents=True)
+            (vendor / "third_party.py").write_text(
+                'UPSTREAM_EXAMPLE = "C:/Users/vendor/example"\n', encoding="utf-8"
+            )
+
+            result = audit_distribution(root)
+            self.assertTrue(result["passed"], result["findings"])
+
     def test_installed_resource_audit_scans_package(self) -> None:
         result = audit_installed_distribution()
         self.assertTrue(result["passed"], result["findings"])

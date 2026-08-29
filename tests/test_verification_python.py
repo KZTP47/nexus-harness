@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from our_harness import swarm_work
+from our_harness import swarm_work, windows_containment
 from our_harness import verification_python as runtime
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 
@@ -49,11 +49,124 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         self.cache = self.root / "private-cache"
         self.snapshot = self.root / "snapshot"
         self.snapshot.mkdir()
-        self.guard = self.snapshot / ".nexus-verification"
+        self.guard = self.root / "host-engine"
         self.guard.mkdir()
 
     def release(self, raw: bytes):
         return mock.patch.object(runtime, "PYTHON_SHA256", hashlib.sha256(raw).hexdigest())
+
+    def test_partial_appcontainer_acl_grants_are_rolled_back(self) -> None:
+        read_root = self.root / "read-runtime"
+        read_root.mkdir()
+
+        def completed(command: list[str]) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        scenarios = ("snapshot", "ancestor", "read")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                commands: list[list[str]] = []
+                failed = False
+
+                def bounded(command: list[str], *, text: bool = False):
+                    nonlocal failed
+                    commands.append(command)
+                    joined = " ".join(command)
+                    should_fail = (
+                        (scenario == "snapshot" and "/grant" in command and "(OI)(IO)" in joined)
+                        or (scenario == "ancestor" and "(S,RA,X)" in joined)
+                        or (scenario == "read" and "(OI)(CI)(RX)" in joined)
+                    )
+                    if should_fail and not failed:
+                        failed = True
+                        raise OSError("injected authority fault")
+                    return completed(command)
+
+                lease = windows_containment._AppContainerAuthorityLease(
+                    self.snapshot, "S-1-15-2-123",
+                    read_execute_roots=(read_root,) if scenario == "read" else (),
+                    transient_read_execute_roots=(read_root,),
+                    grant_traverse_ancestors=scenario == "ancestor",
+                    map_authorized_roots=False,
+                )
+                with mock.patch.object(
+                    windows_containment, "_bounded_command", side_effect=bounded,
+                ):
+                    with self.assertRaisesRegex(OSError, "injected authority fault"):
+                        lease.prepare()
+                self.assertTrue(failed)
+                self.assertTrue(any("/remove:g" in command for command in commands), commands)
+                if scenario == "snapshot":
+                    self.assertTrue(any("/reset" in command for command in commands), commands)
+                if scenario == "read":
+                    self.assertFalse(any(
+                        key[0] == "S-1-15-2-123"
+                        for key in windows_containment._PERSISTENT_RX_GRANTS
+                    ))
+
+    def test_post_mapping_failure_uses_the_same_authority_rollback_owner(self) -> None:
+        commands: list[list[str]] = []
+
+        def bounded(command: list[str], *, text: bool = False):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        lease = windows_containment._AppContainerAuthorityLease(
+            self.snapshot, "S-1-15-2-456",
+            read_execute_roots=(), transient_read_execute_roots=(),
+            grant_traverse_ancestors=False, map_authorized_roots=True,
+        )
+        with mock.patch.object(
+            windows_containment, "_bounded_command", side_effect=bounded,
+        ), mock.patch.object(
+            windows_containment, "_map_roots_to_private_drives",
+            return_value=({str(self.snapshot): "Z:\\"}, 77),
+        ), mock.patch.object(
+            windows_containment, "_unmap_private_drives",
+        ) as unmap:
+            lease.prepare()
+            # Simulate any computation/launch fault immediately after mapping.
+            lease.cleanup(process_started=False)
+        unmap.assert_called_once_with({str(self.snapshot): "Z:\\"}, 77)
+        self.assertTrue(any("/remove:g" in command for command in commands), commands)
+
+    def test_nonzero_acl_cleanup_is_reported_and_rx_lease_is_retained(self) -> None:
+        read_root = self.root / "transient-runtime"
+        read_root.mkdir()
+        grant_key = ("S-1-15-2-789", str(read_root.resolve()).casefold())
+        lease = windows_containment._AppContainerAuthorityLease(
+            self.snapshot, grant_key[0], read_execute_roots=(read_root,),
+            transient_read_execute_roots=(read_root,),
+            grant_traverse_ancestors=False, map_authorized_roots=False,
+        )
+        lease.new_read_grants.append((grant_key, read_root.resolve()))
+        windows_containment._PERSISTENT_RX_GRANTS.add(grant_key)
+        self.addCleanup(windows_containment._PERSISTENT_RX_GRANTS.discard, grant_key)
+        failed = subprocess.CompletedProcess(
+            ["icacls"], 5, "", "Access is denied."
+        )
+        with mock.patch.object(
+            windows_containment, "_bounded_command", return_value=failed,
+        ):
+            lease.cleanup(process_started=False)
+        self.assertTrue(lease.cleanup_errors)
+        self.assertIn("Access is denied", " | ".join(lease.cleanup_errors))
+        # A failed removal must remain registered for the process-exit retry.
+        self.assertIn(grant_key, windows_containment._PERSISTENT_RX_GRANTS)
+
+    @unittest.skipUnless(os.name == "nt", "Windows mapping mutex cleanup")
+    def test_drive_unmap_releases_mutex_even_when_subst_cleanup_times_out(self) -> None:
+        kernel32 = mock.Mock()
+        with mock.patch.object(
+            windows_containment, "_bounded_command",
+            side_effect=subprocess.TimeoutExpired(["subst"], 1),
+        ), mock.patch.object(
+            windows_containment.ctypes.windll, "kernel32", kernel32,
+        ):
+            with self.assertRaisesRegex(OSError, "could not be removed"):
+                windows_containment._unmap_private_drives({"root": "Z:\\"}, 99)
+        kernel32.ReleaseMutex.assert_called_once_with(99)
+        kernel32.CloseHandle.assert_called_once_with(99)
 
     def test_packaged_runtime_is_preferred_only_when_its_core_and_manifest_agree(self) -> None:
         packaged = self.root / "packaged"
@@ -176,17 +289,19 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         self.assertFalse(list(self.guard.glob(".runtime-stage-*")))
         self.assertFalse(list(self.guard.glob(".runtime-previous-*")))
 
-    def test_guard_and_dependency_paths_must_belong_to_the_exact_snapshot(self) -> None:
+    def test_guard_must_be_external_and_dependencies_must_belong_to_snapshot(self) -> None:
         outside = self.root / "outside"
         outside.mkdir()
+        snapshot_guard = self.snapshot / ".nexus-verification"
+        snapshot_guard.mkdir()
         with mock.patch.object(
             runtime, "_verified_archive_bytes",
             side_effect=AssertionError("validation must precede cache or network access"),
         ):
             with self.assertRaisesRegex(runtime.VerificationPythonUnavailable, "guard"):
                 runtime.stage_source_runtime(
-                    self.guard / "runtime", snapshot=self.snapshot,
-                    python_guard_parent=outside, cache_root=self.cache,
+                    snapshot_guard / "runtime", snapshot=self.snapshot,
+                    python_guard_parent=snapshot_guard, cache_root=self.cache,
                 )
             with self.assertRaisesRegex(runtime.VerificationPythonUnavailable, "dependency"):
                 runtime.stage_source_runtime(
@@ -342,10 +457,10 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         launch.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("node"), "Windows Node runtime probe")
-    def test_node_runtime_collision_is_replaced_before_contained_launch(self) -> None:
+    def test_snapshot_node_runtime_collision_is_scrubbed_and_external_runtime_runs(self) -> None:
         config = LoadedConfig(dict(DEFAULT_CONFIG), self.root, [], {})
-        runtime_root = self.guard / "runtime"
-        runtime_root.mkdir()
+        runtime_root = self.snapshot / ".nexus-verification" / "runtime"
+        runtime_root.mkdir(parents=True)
         (runtime_root / "node.exe").write_bytes(b"project supplied node")
         result = swarm_work._contained_snapshot_command(
             config, self.snapshot,
@@ -354,11 +469,10 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         )
         self.assertEqual(0, result["exit_code"], result)
         self.assertIn("contained node", result["stdout"])
-        copied = self.guard / "runtime" / "node.exe"
-        self.assertEqual(
-            swarm_work.file_sha256(Path(shutil.which("node") or "node")),
-            swarm_work.file_sha256(copied),
-        )
+        contained = Path(result["contained_argv"][0])
+        self.assertEqual("node.exe", contained.name.casefold())
+        self.assertFalse(contained.is_relative_to(self.snapshot.resolve()))
+        self.assertFalse(runtime_root.exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows contained dependency probe")
     def test_bare_pytest_uses_prepared_snapshot_dependency_without_installing(self) -> None:
@@ -375,8 +489,14 @@ class LightweightVerificationPythonTests(unittest.TestCase):
             "Path(os.environ['NEXUS_VERIFICATION_ROOT'], 'pytest-dependency-ok.txt').write_text(VALUE, encoding='utf-8')\n",
             encoding="utf-8",
         )
+        # Make the cache precondition explicit and private to this test.  A
+        # developer machine usually already has the pinned archive, which hid
+        # the clean-runner dependency on mutable per-user state.
+        runtime._verified_archive_bytes(self.cache)
         with mock.patch.object(
             swarm_work, "packaged_runtime_if_usable", return_value=None,
+        ), mock.patch.object(
+            runtime, "default_cache_root", return_value=self.cache,
         ), mock.patch.object(
             runtime, "_download_official_archive",
             side_effect=AssertionError("the already verified cache should satisfy this probe"),
@@ -439,6 +559,68 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         self.assertFalse(sibling.exists(), result)
         self.assertEqual("windows-appcontainer-job-v1", result["containment_profile"])
         self.assertTrue(result["containment_attestation"]["child_inherited_boundary"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows contained reparse cleanup probe")
+    def test_project_created_reparse_is_unlinked_before_bounded_acl_cleanup(self) -> None:
+        target = self.root / "unrelated-reparse-target"
+        target.mkdir()
+        sentinel = target / "sentinel.txt"
+        sentinel.write_text("unrelated target must survive", encoding="utf-8")
+        link = self.snapshot / "project-created-junction"
+        system_root = Path(os.environ.get("SystemRoot", "C:\\Windows"))
+        environment = {
+            key: os.environ[key] for key in (
+                "SystemRoot", "WINDIR", "COMSPEC", "PATH", "PATHEXT",
+                "SYSTEMDRIVE", "LOCALAPPDATA", "APPDATA", "USERNAME",
+            ) if key in os.environ
+        }
+        result = windows_containment.run_appcontainer(
+            self.snapshot,
+            [
+                str(system_root / "System32" / "cmd.exe"),
+                "/d", "/s", "/c", "echo ok>ordinary-after-link.txt",
+            ],
+            environment, 20.0, reparse_probe=(link, target),
+        )
+        self.assertEqual(0, result["exit_code"], result)
+        self.assertFalse(result["containment_cleanup_error"], result)
+        self.assertTrue(result["reparse_created"], result)
+        self.assertIn(
+            "project-created-junction",
+            result["cleanup_reparse_entries_removed"],
+        )
+        self.assertFalse(link.exists())
+        self.assertEqual(
+            "unrelated target must survive", sentinel.read_text(encoding="utf-8"),
+        )
+        self.assertTrue((self.snapshot / "ordinary-after-link.txt").is_file())
+
+    @unittest.skipUnless(os.name == "nt", "Windows hard-link ACL cleanup probe")
+    def test_snapshot_hardlink_is_unlinked_before_recursive_acl_cleanup(self) -> None:
+        external_engine_file = self.guard / "immutable-engine.py"
+        original = b"host-owned immutable engine content\r\n"
+        external_engine_file.write_bytes(original)
+        snapshot_alias = self.snapshot / "project-engine-alias.py"
+        os.link(external_engine_file, snapshot_alias)
+        self.assertGreater(external_engine_file.stat().st_nlink, 1)
+        before_acl = subprocess.run(
+            ["icacls", str(external_engine_file)], capture_output=True,
+            text=True, check=True,
+        ).stdout
+
+        removed = windows_containment._remove_snapshot_reparse_entries(
+            self.snapshot
+        )
+
+        self.assertIn("project-engine-alias.py", removed)
+        self.assertFalse(snapshot_alias.exists())
+        self.assertEqual(original, external_engine_file.read_bytes())
+        self.assertEqual(1, external_engine_file.stat().st_nlink)
+        after_acl = subprocess.run(
+            ["icacls", str(external_engine_file)], capture_output=True,
+            text=True, check=True,
+        ).stdout
+        self.assertEqual(before_acl, after_acl)
 
 
 if __name__ == "__main__":

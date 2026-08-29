@@ -4218,7 +4218,12 @@ async function runStep(page, step) {
     });
     page.on('console', (message) => {
       if (message.type() === 'error') {
-        report.consoleErrors.push({ route: current, text: message.text().slice(0, 500) });
+        const location = message.location() || {};
+        const source = location.url ? ' [' + String(location.url).slice(0, 300) + ']' : '';
+        report.consoleErrors.push({
+          route: current,
+          text: (message.text() + source).slice(0, 500),
+        });
       }
     });
     page.on('pageerror', (error) => {

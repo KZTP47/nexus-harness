@@ -2221,6 +2221,17 @@ def _without_markup(said: str) -> str:
     # about half tags that had no business being applied to it.
     if not _OPENS_A_DOCUMENT.match(said):
         return said
+    # HTMLParser has a deliberately careful incomplete-tag path that becomes
+    # expensive for a page ending in tens of thousands of opening brackets.
+    # With no later closing bracket there is no second complete tag to remove,
+    # so preserve the full diagnostic verbatim without feeding that hostile
+    # tail through the parser. This is a fast path, not a length cap.
+    opening = said.find(">")
+    if opening < 0:
+        return said
+    tail = said[opening + 1:]
+    if ">" not in tail and tail.count("<") > 4_096:
+        return said
     words = _the_words_in(said)
     if words is None:
         return said

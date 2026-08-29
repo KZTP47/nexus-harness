@@ -8,11 +8,23 @@ function sha256(filename) {
   return crypto.createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
 }
 
+function comparable(filename) {
+  const normalized = path.normalize(filename);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function isDirectReparsePoint(filename) {
+  const lexical = path.resolve(filename);
+  const metadata = fs.lstatSync(lexical);
+  const actual = fs.realpathSync.native(lexical);
+  const expected = path.join(fs.realpathSync.native(path.dirname(lexical)), path.basename(lexical));
+  return metadata.isSymbolicLink() || comparable(actual) !== comparable(expected);
+}
+
 function runtimeTreeSha256(runtime) {
   const root = path.resolve(runtime);
   const rootReal = fs.realpathSync.native(root);
-  if (path.normalize(rootReal).toLowerCase() !== path.normalize(root).toLowerCase()
-      || fs.lstatSync(root).isSymbolicLink()) {
+  if (isDirectReparsePoint(root)) {
     throw new Error("The selected private runtime is a reparse point");
   }
   const entries = [];
@@ -71,6 +83,10 @@ function resolveSelectedRuntime(desktop = __dirname) {
   const selected = path.resolve(root, ...relative.split("/"));
   if (selected === root || !selected.startsWith(root + path.sep)) {
     throw new Error("The private-runtime selection escapes the desktop directory");
+  }
+  if (relative.startsWith(".runtime-published/")
+      && isDirectReparsePoint(path.join(root, ".runtime-published"))) {
+    throw new Error("The private-runtime publication root is a reparse point");
   }
   const manifest = path.join(selected, "NEXUS_RUNTIME.json");
   if (!fs.statSync(selected, { throwIfNoEntry: false })?.isDirectory()

@@ -431,6 +431,12 @@ class TellingAPageFromASentence(unittest.TestCase):
                 chat._without_markup(nasty)
                 self.assertLess(time.monotonic() - began, 1.0)
 
+    def test_an_incomplete_prefixed_document_opener_is_never_clipped(self) -> None:
+        for opener in ("<!doctype html", "<html lang='en'"):
+            with self.subTest(opener=opener):
+                original = "prefix " + opener + ("<" * 60_000)
+                self.assertEqual(chat._without_markup(original), original)
+
     def test_a_piece_of_a_page_is_left_alone_on_purpose(self) -> None:
         """A fragment is not a page, and guessing which is which is what went wrong.
 

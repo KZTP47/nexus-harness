@@ -394,6 +394,38 @@ class BuiltButtonTests(unittest.TestCase):
         self.assertLess(function.index("window.confirm"), function.index("/api/team/repair-claude"))
         self.assertIn("Nexus will not see your account or credentials", function)
 
+    def test_starter_checks_answer_the_real_unsaved_drawing_guard(self) -> None:
+        flows = json.loads(FLOWS.read_text(encoding="utf-8"))
+        selecting_starters: list[tuple[str, str]] = []
+        for case in flows.get("cases", []):
+            for step in case.get("steps") or []:
+                script = str(step.get("script") or "")
+                if "starter.click()" in script:
+                    selecting_starters.append((str(case.get("id") or ""), script))
+
+        self.assertGreaterEqual(len(selecting_starters), 5, selecting_starters)
+        for case_id, script in selecting_starters:
+            with self.subTest(case=case_id):
+                self.assertIn("pipelineUnsavedDialog", script)
+                self.assertIn("pipelineUnsavedDiscard", script)
+                self.assertIn("pipelineName", script)
+                self.assertNotIn("window.confirm", script)
+
+    def test_shared_page_check_is_an_in_memory_transaction(self) -> None:
+        flows = json.loads(FLOWS.read_text(encoding="utf-8"))
+        case = next(
+            one for one in flows["cases"]
+            if one["id"] == "the-page-the-agents-share-is-on-the-board"
+        )
+        scripts = "\n".join(str(step.get("script") or "") for step in case["steps"])
+        self.assertIn("window.__pageRequestWas = window.request", scripts)
+        self.assertIn("window.__pageFake = structuredClone(thePage)", scripts)
+        self.assertIn("the page update did not name the exact page version", scripts)
+        self.assertIn("window.request = window.__pageRequestWas", scripts)
+        self.assertIn("window.__boardSnapshotCaptured = true", scripts)
+        self.assertIn("if (!window.__boardSnapshotCaptured || !window.__boardWas)", scripts)
+        self.assertTrue(case["steps"][-1].get("always"))
+
 
 class TickBoxTests(unittest.TestCase):
     """A box you tick changes what the harness is asked to do."""

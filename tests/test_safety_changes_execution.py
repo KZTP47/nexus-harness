@@ -8,6 +8,7 @@ import os
 import stat
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -17,7 +18,59 @@ from our_harness.checkpoints import CheckpointManager
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
 from our_harness.execution import CommandRunner
 from our_harness.models import ChangePlan, HarnessError
-from our_harness.safety import confined_path, confined_walk_files, validate_portable_relative_path
+from our_harness.safety import (
+    ProjectTransactionLock,
+    confined_path,
+    confined_walk_files,
+    validate_portable_relative_path,
+)
+
+
+class ProjectTransactionLockTests(unittest.TestCase):
+    def test_cross_instance_thread_wait_honors_the_whole_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            holder = ProjectTransactionLock(root)
+            waiter = ProjectTransactionLock(root)
+            result: list[str] = []
+
+            def wait_briefly() -> None:
+                started = time.monotonic()
+                try:
+                    with waiter.held(0.1):
+                        result.append("acquired")
+                except HarnessError as error:
+                    result.append(str(error))
+                finally:
+                    result.append(f"elapsed:{time.monotonic() - started:.3f}")
+
+            with holder.held():
+                thread = threading.Thread(target=wait_briefly)
+                thread.start()
+                thread.join(timeout=0.5)
+                self.assertFalse(thread.is_alive(), "the in-process lock ignored its timeout")
+            thread.join(timeout=1)
+
+            self.assertIn("Another harness process holds the project transaction lock", result)
+            elapsed = float(next(one.split(":", 1)[1] for one in result if one.startswith("elapsed:")))
+            self.assertGreaterEqual(elapsed, 0.08)
+            self.assertLess(elapsed, 0.5)
+
+    def test_one_lock_instance_remains_reentrant_on_one_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transaction = ProjectTransactionLock(root)
+            with transaction.held(0.2):
+                with transaction.held(0.2):
+                    self.assertTrue((root / ".harness" / "transaction.lock").is_file())
+
+    def test_distinct_lock_instances_on_one_thread_are_not_treated_as_reentrant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with ProjectTransactionLock(root).held(0.2):
+                with self.assertRaisesRegex(HarnessError, "project transaction lock"):
+                    with ProjectTransactionLock(root).held(0.2):
+                        self.fail("a separate application lock entered the transaction")
 
 
 class PathSafetyTests(unittest.TestCase):

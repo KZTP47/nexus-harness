@@ -3460,8 +3460,8 @@ def _snapshot_command(command: list[str], root: Path, snapshot: Path) -> list[st
     return rebased
 
 
-def _verification_guard_files(snapshot: Path) -> tuple[Path, Path]:
-    """Install engine-owned language guards inside one disposable snapshot.
+def _verification_guard_files(snapshot: Path, engine_root: Path) -> tuple[Path, Path]:
+    """Install engine-owned language guards outside one disposable snapshot.
 
     The guards are a launch precondition for the supported language runtimes.
     They deliberately fail closed on process/native escape rather than trying
@@ -3476,7 +3476,7 @@ def _verification_guard_files(snapshot: Path) -> tuple[Path, Path]:
     # so a caller that did not come through the normal copy path still cannot
     # substitute an executable, guard, home, or lock artifact.
     for name in (
-        "sitecustomize.py", "node-guard.cjs", "runtime", "node-workspace",
+        "engine", "sitecustomize.py", "node-guard.cjs", "runtime", "node-workspace",
         "home", "tmp", ".source-python-stage.lock",
     ):
         target = guard_root / name
@@ -3485,34 +3485,61 @@ def _verification_guard_files(snapshot: Path) -> tuple[Path, Path]:
     for pattern in (".runtime-stage-*", ".runtime-previous-*"):
         for abandoned in guard_root.glob(pattern):
             _remove_verification_path(abandoned)
-    python_guard = guard_root / "sitecustomize.py"
+    engine_root = Path(os.path.abspath(engine_root))
+    engine_resolved = engine_root.resolve()
+    if (
+        _verification_is_reparse(engine_root)
+        or engine_resolved == snapshot
+        or snapshot in engine_resolved.parents
+        or engine_resolved in snapshot.parents
+    ):
+        raise HarnessError(
+            "Verification engine code must use a direct host-owned root outside the writable snapshot"
+        )
+    _recreate_verification_directory(engine_root)
+    python_guard = engine_root / "sitecustomize.py"
     python_source = r'''import builtins,os,sys
 _ROOT=os.path.realpath(os.environ['NEXUS_VERIFICATION_ROOT'])
+_APPROVED_ENGINE_ROOT=os.path.realpath(os.environ['NEXUS_VERIFICATION_ENGINE_ROOT'])
 _EXEC_ROOTS=tuple(os.path.realpath(one) for one in os.environ.get('NEXUS_ALLOWED_EXEC_ROOTS','').split(os.pathsep) if one)
 _WRITE_FLAGS=(getattr(os,'O_WRONLY',1)|getattr(os,'O_RDWR',2)|getattr(os,'O_APPEND',8)|getattr(os,'O_CREAT',64)|getattr(os,'O_TRUNC',512))
-def _inside(value):
-    if isinstance(value,int): return True
+def _same_component(left,right):
     try:
-        path=os.path.realpath(os.fspath(value))
-        return os.path.normcase(os.path.commonpath([_ROOT,path]))==os.path.normcase(_ROOT)
+        if os.path.normcase(os.path.abspath(left))==os.path.normcase(os.path.abspath(right)): return True
+        return os.path.samefile(left,right)
     except Exception:
         return False
-def _deny_path(value,operation):
-    if not _inside(value): raise PermissionError('Nexus verification containment denied '+operation+' outside its disposable snapshot')
 def _under(path,roots):
     try:
-        resolved=os.path.realpath(os.fspath(path))
-        return any(os.path.normcase(os.path.commonpath([root,resolved]))==os.path.normcase(root) for root in roots)
+        current=os.path.realpath(os.fspath(path))
     except Exception:
         return False
+    while True:
+        if any(_same_component(current,root) for root in roots): return True
+        parent=os.path.dirname(current)
+        if parent==current: return False
+        current=parent
+_ENGINE_ROOT=os.path.dirname(os.path.realpath(__file__))
+_SELF_EXECUTABLE=os.path.realpath(sys.executable)
+_SYSTEM_ROOT=os.path.realpath(os.environ.get('SystemRoot','')) if os.name=='nt' else ''
+if not _same_component(_ENGINE_ROOT,_APPROVED_ENGINE_ROOT) or _under(_ENGINE_ROOT,(_ROOT,)):
+    raise RuntimeError('Nexus verification guard is outside its approved immutable engine root')
+if not os.path.isabs(_SELF_EXECUTABLE) or not os.path.isfile(_SELF_EXECUTABLE):
+    raise RuntimeError('Nexus verification interpreter identity is invalid')
+_SYSTEM_ROOTS=(_SYSTEM_ROOT,) if os.path.isabs(_SYSTEM_ROOT) and os.path.isdir(_SYSTEM_ROOT) and not _under(_SYSTEM_ROOT,(_ROOT,)) else ()
+def _inside(value):
+    return isinstance(value,int) or _under(value,(_ROOT,))
+def _deny_path(value,operation):
+    if not isinstance(value,int) and _under(value,(_ENGINE_ROOT,)): raise PermissionError('Nexus verification containment denied '+operation+' in its immutable engine namespace')
+    if not _inside(value): raise PermissionError('Nexus verification containment denied '+operation+' outside its disposable snapshot')
 def _allow_child(executable):
     try:
         resolved=os.path.realpath(os.fspath(executable or sys.executable))
     except Exception:
         return False
-    return os.path.normcase(resolved)==os.path.normcase(os.path.realpath(sys.executable)) or _under(resolved,_EXEC_ROOTS)
+    return _same_component(resolved,_SELF_EXECUTABLE) or _under(resolved,_EXEC_ROOTS)
 def _loopback(address):
-    if isinstance(address,str): return address.startswith(_ROOT+os.sep)
+    if isinstance(address,str): return _inside(address)
     if not isinstance(address,tuple) or not address: return False
     return str(address[0]).casefold() in {'127.0.0.1','::1','localhost'}
 def _audit(event,args):
@@ -3531,9 +3558,8 @@ def _audit(event,args):
         raise PermissionError('Nexus verification containment denied shell or unbound child execution')
     elif event=='ctypes.dlopen' and args:
         library=args[0]
-        system_root=os.path.realpath(os.environ.get('SystemRoot',''))
         bare=isinstance(library,str) and not os.path.dirname(library) and library.casefold() in {'kernel32','kernel32.dll','user32','user32.dll','advapi32','advapi32.dll'}
-        if not bare and not _under(library,(*_EXEC_ROOTS,system_root)):
+        if not bare and not _under(library,(*_EXEC_ROOTS,*_SYSTEM_ROOTS)):
             raise PermissionError('Nexus verification containment denied unapproved native library')
     elif event=='import' and len(args)>1 and args[1]:
         origin=str(args[1])
@@ -3545,7 +3571,7 @@ def _audit(event,args):
 sys.addaudithook(_audit)
 '''
     atomic_write(python_guard, python_source.encode("utf-8"))
-    node_guard = guard_root / "node-guard.cjs"
+    node_guard = engine_root / "node-guard.cjs"
     node_source = r'''const cp=require('node:child_process');const path=require('node:path');
 const root=path.resolve(process.env.NEXUS_VERIFICATION_ROOT);const original={};
 const allowedBrowser=/^(?:chrome|chromium|msedge|firefox|webkit)(?:\.exe)?$/i;
@@ -4098,6 +4124,42 @@ def _contained_snapshot_command(
     timeout: float | None = None,
     denied_root: Path | None = None,
 ) -> dict[str, Any]:
+    """Run a command with its trusted runtime outside the writable snapshot."""
+
+    with tempfile.TemporaryDirectory(prefix="nexus-verification-engine-") as temporary:
+        engine_root = Path(temporary).resolve()
+        selected_root = (denied_root or config.project_root).resolve()
+        if (
+            _verification_is_reparse(engine_root)
+            or engine_root == selected_root
+            or selected_root in engine_root.parents
+            or engine_root in selected_root.parents
+        ):
+            return {
+                "argv": command, "cwd": ".", "exit_code": -2,
+                "stdout": "", "stderr": (
+                    "Verification containment infrastructure could not allocate a "
+                    "host-owned engine root outside selected-project data. "
+                    "Nexus did not run project code."
+                ),
+                "timed_out": False, "output_truncated": False,
+                "containment_unavailable": True,
+            }
+        return _contained_snapshot_command_with_engine(
+            config, snapshot, command, timeout=timeout, denied_root=denied_root,
+            engine_root=engine_root,
+        )
+
+
+def _contained_snapshot_command_with_engine(
+    config: LoadedConfig,
+    snapshot: Path,
+    command: list[str],
+    *,
+    timeout: float | None = None,
+    denied_root: Path | None = None,
+    engine_root: Path,
+) -> dict[str, Any]:
     """Run only commands with a supported fail-closed containment profile."""
 
     argv = list(command)
@@ -4112,7 +4174,7 @@ def _contained_snapshot_command(
         argv = ["python", "-m", "pytest", *argv[1:]]
         name = "python"
     try:
-        python_guard, node_guard = _verification_guard_files(snapshot)
+        python_guard, node_guard = _verification_guard_files(snapshot, engine_root)
     except (HarnessError, OSError) as error:
         return {
             "argv": command, "cwd": ".", "exit_code": -2,
@@ -4125,6 +4187,7 @@ def _contained_snapshot_command(
         }
     environment = {
         "NEXUS_VERIFICATION_ROOT": str(snapshot.resolve()),
+        "NEXUS_VERIFICATION_ENGINE_ROOT": str(engine_root.resolve()),
         "HOME": str((snapshot / ".nexus-verification" / "home").resolve()),
         "USERPROFILE": str((snapshot / ".nexus-verification" / "home").resolve()),
         "TEMP": str((snapshot / ".nexus-verification" / "tmp").resolve()),
@@ -4295,8 +4358,8 @@ def _contained_snapshot_command(
                 "timed_out": False, "output_truncated": False,
                 "containment_unavailable": True, "containment_attestation": canary,
             }
-        runtime_root = snapshot / ".nexus-verification" / "runtime"
-        contained_read_roots: tuple[Path, ...] = ()
+        runtime_root = python_guard.parent / "runtime"
+        contained_read_roots: tuple[Path, ...] = (python_guard.parent,)
         if name in {"python", "python3", "py"}:
             candidate = Path(__file__).resolve().parents[2] / "desktop" / "runtime"
             bundled = packaged_runtime_if_usable(candidate)
@@ -4330,7 +4393,8 @@ def _contained_snapshot_command(
                     "containment_unavailable": True,
                 }
             argv[0] = str(runtime_root / "python.exe")
-            contained_read_roots = (bundled,) if bundled is not None else ()
+            if bundled is not None:
+                contained_read_roots += (bundled,)
             # Child Python processes and vetted native dependencies may run,
             # but only from engine-owned immutable runtime roots.  They inherit
             # the same AppContainer token and no-breakaway Job.  Project-owned
@@ -4346,7 +4410,7 @@ def _contained_snapshot_command(
             try:
                 argv[0] = str(_stage_node_runtime(node_source, runtime_root))
                 if bundled_playwright is not None:
-                    contained_read_roots = (bundled_playwright.root,)
+                    contained_read_roots += (bundled_playwright.root,)
                 node_workspace = snapshot / ".nexus-verification" / "node-workspace"
                 _recreate_verification_directory(node_workspace)
                 (node_workspace / ".nexus-verification").mkdir()
@@ -4398,6 +4462,7 @@ def _contained_snapshot_command(
         }, effective_timeout,
             persistent_profile=verification_runtime_profile(),
             read_execute_roots=contained_read_roots,
+            transient_read_execute_roots=(python_guard.parent,),
             # PrivateNetworkClientServer permits only contained local-service
             # coordination.  Python's engine guard restricts socket endpoints
             # to loopback; native libraries and child executables are accepted
@@ -4508,7 +4573,20 @@ def _windows_containment_canary(
     escaped = [str(one) for one in targets if directory_contains(one)]
     local_present = directory_contains(local)
     child_local_present = directory_contains(child_local)
-    passed = local_present and child_local_present and not escaped
+    cleanup_removed = list(results[0].get("cleanup_reparse_entries_removed") or [])
+    cleanup_error = str(results[0].get("containment_cleanup_error") or "")
+    reparse_removed = (
+        results[0].get("reparse_created") is True
+        and junction.name in cleanup_removed
+    )
+    # The canary deliberately asks cmd.exe to perform denied redirections.  A
+    # non-zero cmd exit is therefore expected evidence of containment, not a
+    # failed canary.  Cleanup itself must still be completely successful.
+    execution_clean = not cleanup_error
+    passed = (
+        local_present and child_local_present and not escaped
+        and execution_clean and reparse_removed
+    )
     local.unlink(missing_ok=True)
     child_local.unlink(missing_ok=True)
     for one in targets:
@@ -4531,9 +4609,11 @@ def _windows_containment_canary(
         "escaped_paths": escaped,
         "child_inherited_boundary": child_local_present and str(sibling) not in escaped,
         "child_process_started": child_local_present,
-        "reparse_checked": results[0].get("reparse_created") is True,
+        "reparse_checked": reparse_removed,
+        "cleanup_reparse_entries_removed": cleanup_removed,
+        "containment_cleanup_error": cleanup_error,
         "reason": "" if passed else (
-            "native canary escaped or could not write its private snapshot: "
+            "native canary escaped, cleanup failed, or could not write its private snapshot: "
             + " | ".join(
                 "exit=" + str(one.get("exit_code")) + " "
                 + str(one.get("stderr") or one.get("stdout") or "no process output")[:250]

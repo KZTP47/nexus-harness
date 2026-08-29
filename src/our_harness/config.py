@@ -1463,6 +1463,7 @@ def ensure_private_runtime_ignores(root: Path) -> Path:
     # directory or reading a byte.  A cloned project may contain a symlink,
     # junction, or other reparse point named .harness or .gitignore; normal
     # startup must never turn that into authority to read/write elsewhere.
+    lexical_ignore = Path(os.path.abspath(root)) / ".harness" / ".gitignore"
     local_ignore = confined_path(
         root, ".harness/.gitignore", allow_missing=True, allow_control=True,
     )
@@ -1488,7 +1489,11 @@ def ensure_private_runtime_ignores(root: Path) -> Path:
             updated_ignore += "\n"
         updated_ignore += managed
         put_this_file_in_place(local_ignore, updated_ignore)
-    return local_ignore
+    # Preserve the caller-visible spelling (including a harmless Windows 8.3
+    # ancestor alias). Validation and I/O use the canonical confined path
+    # above; returning that canonical spelling made clean-runner results differ
+    # from the exact path the caller supplied.
+    return lexical_ignore
 
 
 def write_default_project_config(

@@ -6,6 +6,7 @@ import stat
 import threading
 import time
 import unicodedata
+import weakref
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -77,27 +78,76 @@ def validate_portable_relative_path(relative: str | Path, *, allow_control: bool
             raise HarnessError(f"Git and harness control paths are not accepted: {relative}")
 
 
+class _ProjectTransactionState:
+    def __init__(self) -> None:
+        self.thread_lock = threading.RLock()
+        self.depth = 0
+        self.stream = None
+        self.owner = None
+
+
+_PROJECT_TRANSACTION_STATES_GUARD = threading.Lock()
+_PROJECT_TRANSACTION_STATES: weakref.WeakValueDictionary[str, _ProjectTransactionState] = (
+    weakref.WeakValueDictionary()
+)
+
+
 class ProjectTransactionLock:
     """A re-entrant, cross-process lock for mutations within one project."""
 
     def __init__(self, root: Path):
         self.root = root.resolve()
-        self._thread_lock = threading.RLock()
-        self._depth = 0
-        self._stream = None
+        self._owner_token = object()
+        key = filesystem_case_key(str(self.root))
+        with _PROJECT_TRANSACTION_STATES_GUARD:
+            state = _PROJECT_TRANSACTION_STATES.get(key)
+            if state is None:
+                state = _ProjectTransactionState()
+                _PROJECT_TRANSACTION_STATES[key] = state
+            self._state = state
 
     @contextmanager
     def held(self, timeout_seconds: float | None = None) -> Iterator[None]:
-        with self._thread_lock:
-            if self._depth == 0:
-                self._acquire_file_lock(timeout_seconds)
-            self._depth += 1
+        deadline = (
+            None if timeout_seconds is None
+            else time.monotonic() + max(0.0, timeout_seconds)
+        )
+        if deadline is None:
+            acquired = self._state.thread_lock.acquire()
+        else:
+            acquired = self._state.thread_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            )
+        if not acquired:
+            raise HarnessError("Another harness process holds the project transaction lock")
+        try:
+            if self._state.depth > 0 and self._state.owner is not self._owner_token:
+                # A different application/transaction lock on this thread is
+                # not a nested use of this lock. Waiting would deadlock the
+                # thread, while treating it as re-entrant would let two app
+                # instances mutate one project concurrently.
+                raise HarnessError(
+                    "Another harness process holds the project transaction lock"
+                )
+            if self._state.depth == 0:
+                remaining = (
+                    None if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+                self._acquire_file_lock(remaining)
+                self._state.owner = self._owner_token
+            self._state.depth += 1
             try:
                 yield
             finally:
-                self._depth -= 1
-                if self._depth == 0:
-                    self._release_file_lock()
+                self._state.depth -= 1
+                if self._state.depth == 0:
+                    try:
+                        self._release_file_lock()
+                    finally:
+                        self._state.owner = None
+        finally:
+            self._state.thread_lock.release()
 
     def _acquire_file_lock(self, timeout_seconds: float | None) -> None:
         harness_root = confined_path(self.root, ".harness", allow_control=True)
@@ -122,7 +172,7 @@ class ProjectTransactionLock:
                         import fcntl
 
                         fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    self._stream = stream
+                    self._state.stream = stream
                     return
                 except OSError as exc:
                     if timeout_seconds is not None and time.monotonic() - started >= timeout_seconds:
@@ -133,8 +183,8 @@ class ProjectTransactionLock:
             raise
 
     def _release_file_lock(self) -> None:
-        stream = self._stream
-        self._stream = None
+        stream = self._state.stream
+        self._state.stream = None
         if stream is None:
             return
         try:

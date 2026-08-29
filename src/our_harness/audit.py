@@ -34,7 +34,7 @@ EXCLUDED_PARTS = {
     # Generated, ignored release input. Its exact locked distributions and
     # imports are validated by prepare_windows_runtime.py; scanning vendor
     # source as if Nexus authored it creates false machine-path findings.
-    "runtime",
+    "runtime", ".runtime-published",
     # What a build put there, including the copy of this very code that the
     # desktop app carries. Read as source, the audit was reading its own output
     # and telling us off for it.

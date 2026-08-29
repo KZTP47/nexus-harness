@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 import threading
@@ -18,6 +19,96 @@ from typing import Any
 _PERSISTENT_RX_GRANTS: set[tuple[str, str]] = set()
 _PERSISTENT_GRANT_LOCK = threading.Lock()
 _PROCESS_RUNTIME_PROFILE = "NexusHarness.Verify." + uuid.uuid4().hex[:20]
+_ACL_COMMAND_TIMEOUT_SECONDS = 15.0
+_REPARSE_SCAN_TIMEOUT_SECONDS = 10.0
+_REPARSE_SCAN_MAX_ENTRIES = 100_000
+
+
+def _bounded_command(command: list[str], *, text: bool = False) -> subprocess.CompletedProcess:
+    """Run one ACL/drive command with a hard wall-clock bound."""
+
+    return subprocess.run(
+        command, capture_output=True, text=text, check=False,
+        timeout=_ACL_COMMAND_TIMEOUT_SECONDS,
+    )
+
+
+def _checked_bounded_command(
+    command: list[str], *, label: str, text: bool = False,
+) -> subprocess.CompletedProcess:
+    """Run a bounded authority command and make non-zero cleanup fail closed."""
+
+    result = _bounded_command(command, text=text)
+    if result.returncode != 0:
+        detail = result.stderr or result.stdout or "unknown command failure"
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        raise OSError(f"{label}: {str(detail).strip()}")
+    return result
+
+
+def _remove_snapshot_reparse_entries(snapshot: Path) -> list[str]:
+    """Unlink unsafe aliases lexically without ever walking their targets.
+
+    Reparse nodes can redirect a recursive privileged ACL operation outside
+    the disposable tree.  A non-directory hard link is equally unsafe: its
+    lexical snapshot name refers to the same file object (and DACL) as an
+    external authorized runtime file.  Both must disappear before icacls /T.
+    """
+
+    root = Path(os.path.abspath(snapshot))
+    root_metadata = root.stat(follow_symlinks=False)
+    if (
+        root.is_symlink()
+        or getattr(root_metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    ):
+        raise OSError("The disposable snapshot root became a reparse point")
+    deadline = time.monotonic() + _REPARSE_SCAN_TIMEOUT_SECONDS
+    visited = 0
+    removed: list[str] = []
+    pending = [root]
+    while pending:
+        if time.monotonic() > deadline or visited > _REPARSE_SCAN_MAX_ENTRIES:
+            raise TimeoutError("Timed out sanitizing disposable snapshot reparse entries")
+        folder = pending.pop()
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                visited += 1
+                if (
+                    time.monotonic() > deadline
+                    or visited > _REPARSE_SCAN_MAX_ENTRIES
+                ):
+                    raise TimeoutError(
+                        "Timed out sanitizing disposable snapshot reparse entries"
+                    )
+                lexical = Path(entry.path)
+                # CPython's Windows DirEntry.stat() currently reports
+                # st_nlink=0 even for a real hard link.  A direct no-follow
+                # stat on the lexical entry preserves the actual link count.
+                metadata = os.stat(lexical, follow_symlinks=False)
+                attributes = getattr(metadata, "st_file_attributes", 0)
+                reparse = bool(
+                    attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                ) or stat.S_ISLNK(metadata.st_mode)
+                external_file_alias = (
+                    not stat.S_ISDIR(metadata.st_mode)
+                    and getattr(metadata, "st_nlink", 1) > 1
+                )
+                if reparse or external_file_alias:
+                    relative = os.path.relpath(lexical, root).replace("\\", "/")
+                    if (
+                        reparse
+                        and attributes
+                        & getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+                    ):
+                        os.rmdir(lexical)
+                    else:
+                        os.unlink(lexical)
+                    removed.append(relative)
+                elif stat.S_ISDIR(metadata.st_mode):
+                    pending.append(lexical)
+    return sorted(removed)
 
 
 def verification_runtime_profile() -> str:
@@ -29,9 +120,8 @@ def _delete_process_runtime_profile() -> None:
         return
     try:
         for sid_value, read_root in list(_PERSISTENT_RX_GRANTS):
-            subprocess.run(
+            _bounded_command(
                 ["icacls", read_root, "/remove:g", f"*{sid_value}", "/T", "/C", "/Q"],
-                capture_output=True, check=False,
             )
         ctypes.WinDLL("userenv", use_last_error=True).DeleteAppContainerProfile(
             _PROCESS_RUNTIME_PROFILE
@@ -69,26 +159,207 @@ def _map_roots_to_private_drives(roots: tuple[Path, ...]) -> tuple[dict[str, str
         if len(letters) < len(unique):
             raise OSError("No private drive letters are available for contained verification")
         for root, letter in zip(unique, letters):
-            result = subprocess.run(
-                ["subst", letter + ":", root], capture_output=True, text=True, check=False,
-            )
+            result = _bounded_command(["subst", letter + ":", root], text=True)
             if result.returncode != 0:
                 raise OSError("Could not map a contained verification root: " + result.stderr)
             mappings[root] = letter + ":\\"
         return mappings, int(mutex)
-    except Exception:
-        for drive in reversed(list(mappings.values())):
-            subprocess.run(["subst", drive[:2], "/D"], capture_output=True, check=False)
-        kernel32.ReleaseMutex(mutex)
-        kernel32.CloseHandle(mutex)
+    except BaseException as error:
+        cleanup_errors: list[str] = []
+        try:
+            for drive in reversed(list(mappings.values())):
+                try:
+                    _checked_bounded_command(
+                        ["subst", drive[:2], "/D"],
+                        label="Could not roll back a contained drive mapping",
+                    )
+                except Exception as cleanup_error:
+                    cleanup_errors.append(str(cleanup_error))
+        finally:
+            kernel32.ReleaseMutex(mutex)
+            kernel32.CloseHandle(mutex)
+        if cleanup_errors:
+            raise OSError(
+                "Drive-map setup failed and rollback was incomplete: "
+                + " | ".join(cleanup_errors)
+            ) from error
         raise
 
 
 def _unmap_private_drives(mappings: dict[str, str], mutex: int) -> None:
-    for drive in reversed(list(mappings.values())):
-        subprocess.run(["subst", drive[:2], "/D"], capture_output=True, check=False)
-    ctypes.windll.kernel32.ReleaseMutex(mutex)
-    ctypes.windll.kernel32.CloseHandle(mutex)
+    cleanup_errors: list[str] = []
+    try:
+        for drive in reversed(list(mappings.values())):
+            try:
+                _checked_bounded_command(
+                    ["subst", drive[:2], "/D"],
+                    label="Could not remove a contained drive mapping",
+                )
+            except Exception as error:
+                cleanup_errors.append(str(error))
+    finally:
+        ctypes.windll.kernel32.ReleaseMutex(mutex)
+        ctypes.windll.kernel32.CloseHandle(mutex)
+    if cleanup_errors:
+        raise OSError(
+            "One or more private drive mappings could not be removed: "
+            + " | ".join(cleanup_errors)
+        )
+
+
+class _AppContainerAuthorityLease:
+    """Own every ACL/drive mutation and roll back partial acquisition."""
+
+    def __init__(
+        self,
+        snapshot: Path,
+        sid_value: str,
+        *,
+        read_execute_roots: tuple[Path, ...],
+        transient_read_execute_roots: tuple[Path, ...],
+        grant_traverse_ancestors: bool,
+        map_authorized_roots: bool,
+    ) -> None:
+        self.snapshot = snapshot
+        self.sid_value = sid_value
+        self.read_execute_roots = read_execute_roots
+        self.transient_read_execute_roots = transient_read_execute_roots
+        self.grant_traverse_ancestors = grant_traverse_ancestors
+        self.map_authorized_roots = map_authorized_roots
+        self.snapshot_granted = False
+        self.traversed_ancestors: list[Path] = []
+        self.new_read_grants: list[tuple[tuple[str, str], Path]] = []
+        self.drive_mappings: dict[str, str] = {}
+        self.drive_mutex = 0
+        self.removed_reparse_entries: list[str] = []
+        self.cleanup_errors: list[str] = []
+        self.closed = False
+
+    def prepare(self) -> "_AppContainerAuthorityLease":
+        try:
+            snapshot_grants = (
+                ["icacls", str(self.snapshot), "/grant:r", f"*{self.sid_value}:(RX,W,D,DC)", "/C", "/Q"],
+                ["icacls", str(self.snapshot), "/grant", f"*{self.sid_value}:(OI)(IO)(R,W,D)", "/C", "/Q"],
+                ["icacls", str(self.snapshot), "/grant", f"*{self.sid_value}:(CI)(IO)(RX,W,D,DC)", "/C", "/Q"],
+            )
+            for index, grant_command in enumerate(snapshot_grants):
+                if index == 0:
+                    self.snapshot_granted = True
+                grant = _bounded_command(grant_command, text=True)
+                if grant.returncode != 0:
+                    raise OSError(
+                        "Could not grant the disposable AppContainer access to its snapshot: "
+                        + grant.stderr
+                    )
+            if self.grant_traverse_ancestors:
+                candidates: list[Path] = []
+                for authorized_root in (self.snapshot, *self.read_execute_roots):
+                    cursor = authorized_root.resolve().parent
+                    while cursor != cursor.parent:
+                        candidates.append(cursor)
+                        cursor = cursor.parent
+                    candidates.append(cursor)
+                for ancestor in dict.fromkeys(candidates):
+                    self.traversed_ancestors.append(ancestor)
+                    traverse_grant = _bounded_command([
+                        "icacls", str(ancestor), "/grant",
+                        f"*{self.sid_value}:(S,RA,X)", "/C", "/Q",
+                    ], text=True)
+                    if traverse_grant.returncode != 0:
+                        raise OSError(
+                            "Could not grant metadata/traverse-only ancestor access: "
+                            + traverse_grant.stderr
+                        )
+            with _PERSISTENT_GRANT_LOCK:
+                for read_root in self.read_execute_roots:
+                    resolved_read = read_root.resolve()
+                    grant_key = (self.sid_value, str(resolved_read).casefold())
+                    if grant_key in _PERSISTENT_RX_GRANTS:
+                        continue
+                    self.new_read_grants.append((grant_key, resolved_read))
+                    read_grant = _bounded_command([
+                        "icacls", str(resolved_read), "/grant",
+                        f"*{self.sid_value}:(OI)(CI)(RX)", "/T", "/C", "/Q",
+                    ], text=True)
+                    if read_grant.returncode != 0:
+                        raise OSError(
+                            "Could not grant the contained runtime read/execute access: "
+                            + read_grant.stderr
+                        )
+                    _PERSISTENT_RX_GRANTS.add(grant_key)
+            if self.map_authorized_roots:
+                self.drive_mappings, self.drive_mutex = _map_roots_to_private_drives(
+                    (self.snapshot, *self.read_execute_roots)
+                )
+            return self
+        except BaseException as error:
+            self.cleanup(process_started=False)
+            if self.cleanup_errors:
+                raise OSError(
+                    "AppContainer authority setup failed and rollback was incomplete: "
+                    + " | ".join(self.cleanup_errors)
+                ) from error
+            raise
+
+    def cleanup(self, *, process_started: bool) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.drive_mutex:
+            try:
+                _unmap_private_drives(self.drive_mappings, self.drive_mutex)
+            except Exception as error:
+                self.cleanup_errors.append("drive cleanup: " + str(error))
+            self.drive_mappings = {}
+            self.drive_mutex = 0
+        for ancestor in reversed(self.traversed_ancestors):
+            try:
+                _checked_bounded_command(
+                    [
+                        "icacls", str(ancestor), "/remove:g",
+                        f"*{self.sid_value}", "/C", "/Q",
+                    ],
+                    label="Could not remove an ancestor traversal grant",
+                )
+            except Exception as error:
+                self.cleanup_errors.append("ancestor ACL cleanup: " + str(error))
+        transient = {
+            str(one.resolve()).casefold() for one in self.transient_read_execute_roots
+        }
+        for grant_key, read_root in reversed(self.new_read_grants):
+            if process_started and str(read_root).casefold() not in transient:
+                continue
+            removed = False
+            try:
+                _checked_bounded_command(
+                    [
+                        "icacls", str(read_root), "/remove:g", f"*{self.sid_value}",
+                        "/T", "/C", "/Q",
+                    ],
+                    label="Could not remove a runtime read/execute grant",
+                )
+                removed = True
+            except Exception as error:
+                self.cleanup_errors.append("runtime ACL cleanup: " + str(error))
+            if removed:
+                with _PERSISTENT_GRANT_LOCK:
+                    _PERSISTENT_RX_GRANTS.discard(grant_key)
+        if self.snapshot_granted:
+            try:
+                self.removed_reparse_entries = _remove_snapshot_reparse_entries(
+                    self.snapshot
+                )
+            except Exception as error:
+                self.cleanup_errors.append("snapshot reparse cleanup: " + str(error))
+                return
+            for command, label in (
+                (["icacls", str(self.snapshot), "/remove:g", f"*{self.sid_value}", "/T", "/C", "/Q"], "snapshot ACL cleanup"),
+                (["icacls", str(self.snapshot), "/reset", "/T", "/C", "/Q"], "snapshot ACL reset"),
+            ):
+                try:
+                    _checked_bounded_command(command, label=label)
+                except Exception as error:
+                    self.cleanup_errors.append(label + ": " + str(error))
 
 
 def run_appcontainer(
@@ -100,6 +371,7 @@ def run_appcontainer(
     reparse_probe: tuple[Path, Path] | None = None,
     persistent_profile: str | None = None,
     read_execute_roots: tuple[Path, ...] = (),
+    transient_read_execute_roots: tuple[Path, ...] = (),
     capability_sids: tuple[str, ...] = (),
     grant_traverse_ancestors: bool = False,
     map_authorized_roots: bool = False,
@@ -114,6 +386,9 @@ def run_appcontainer(
 
     if not appcontainer_available():
         raise OSError("Windows AppContainer APIs are unavailable")
+    stdout_path = snapshot / ".nexus-verification" / "contained-stdout.txt"
+    stderr_path = snapshot / ".nexus-verification" / "contained-stderr.txt"
+    stdout_path.parent.mkdir(parents=True, exist_ok=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     userenv = ctypes.WinDLL("userenv", use_last_error=True)
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -144,112 +419,86 @@ def run_appcontainer(
     advapi32.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
     advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
     if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
-        userenv.DeleteAppContainerProfile(name)
+        if created_profile:
+            userenv.DeleteAppContainerProfile(name)
+        advapi32.FreeSid(sid)
         raise _last_error("ConvertSidToStringSidW failed")
     sid_value = sid_text.value
-    stdout_path = snapshot / ".nexus-verification" / "contained-stdout.txt"
-    stderr_path = snapshot / ".nexus-verification" / "contained-stderr.txt"
-    stdout_path.parent.mkdir(parents=True, exist_ok=True)
-    grant = subprocess.run(
-        ["icacls", str(snapshot), "/grant", f"*{sid_value}:(OI)(CI)(M)", "/T", "/C", "/Q"],
-        capture_output=True, text=True, check=False,
-    )
-    if grant.returncode != 0:
-        if created_profile and not persistent_profile:
+    identity_released = False
+
+    def release_identity(*, rollback_profile: bool) -> None:
+        nonlocal identity_released
+        if identity_released:
+            return
+        identity_released = True
+        if not persistent_profile or (rollback_profile and created_profile):
             userenv.DeleteAppContainerProfile(name)
-        raise OSError("Could not grant the disposable AppContainer access to its snapshot: " + grant.stderr)
-    traversed_ancestors: list[Path] = []
-    if grant_traverse_ancestors:
-        candidates: list[Path] = []
-        for authorized_root in (snapshot, *read_execute_roots):
-            cursor = authorized_root.resolve().parent
-            while cursor != cursor.parent:
-                candidates.append(cursor)
-                cursor = cursor.parent
-            candidates.append(cursor)
-        for ancestor in dict.fromkeys(candidates):
-            traverse_grant = subprocess.run(
-                ["icacls", str(ancestor), "/grant", f"*{sid_value}:(S,RA,X)", "/C", "/Q"],
-                capture_output=True, text=True, check=False,
-            )
-            if traverse_grant.returncode != 0:
-                raise OSError(
-                    "Could not grant metadata/traverse-only ancestor access: "
-                    + traverse_grant.stderr
-                )
-            traversed_ancestors.append(ancestor)
-    with _PERSISTENT_GRANT_LOCK:
-        for read_root in read_execute_roots:
-            resolved_read = str(read_root.resolve())
-            grant_key = (sid_value, resolved_read.casefold())
-            if grant_key in _PERSISTENT_RX_GRANTS:
-                continue
-            read_grant = subprocess.run(
-                ["icacls", resolved_read, "/grant", f"*{sid_value}:(OI)(CI)(RX)",
-                 "/T", "/C", "/Q"],
-                capture_output=True, text=True, check=False,
-            )
-            if read_grant.returncode != 0:
-                raise OSError(
-                    "Could not grant the contained runtime read/execute access: "
-                    + read_grant.stderr
-                )
-            _PERSISTENT_RX_GRANTS.add(grant_key)
-    drive_mappings: dict[str, str] = {}
-    drive_mutex = 0
-    if map_authorized_roots:
-        drive_mappings, drive_mutex = _map_roots_to_private_drives(
-            (snapshot, *read_execute_roots)
-        )
+        kernel32.LocalFree(sid_text)
+        advapi32.FreeSid(sid)
 
-    def remap(value: str) -> str:
-        output = str(value)
-        for root, drive in sorted(
-            drive_mappings.items(), key=lambda one: len(one[0]), reverse=True,
-        ):
-            def replacement(match: re.Match[str], mapped: str = drive) -> str:
-                return mapped if match.end() == len(output) else mapped.rstrip("\\")
-            output = re.sub(
-                re.escape(root), replacement,
-                output, flags=re.I,
-            )
-        return output
-
-    executable = str(argv[0]) if argv else ""
-    executable_in_immutable_root = any(
-        executable.casefold() == str(root.resolve()).casefold()
-        or executable.casefold().startswith(str(root.resolve()).casefold().rstrip("\\/") + os.sep)
-        for root in read_execute_roots
+    authority = _AppContainerAuthorityLease(
+        snapshot, sid_value,
+        read_execute_roots=read_execute_roots,
+        transient_read_execute_roots=transient_read_execute_roots,
+        grant_traverse_ancestors=grant_traverse_ancestors,
+        map_authorized_roots=map_authorized_roots,
     )
-    effective_argv = [
-        executable if executable_in_immutable_root else remap(executable),
-        *[remap(one) for one in argv[1:]],
-    ] if argv else []
-    effective_environment = {key: remap(value) for key, value in environment.items()}
-    effective_cwd = drive_mappings.get(str(snapshot.resolve()), str(snapshot))
-    cwd_junction: Path | None = None
-    if nested_mapped_cwd and drive_mappings:
-        cwd_junction = snapshot / ".nexus-verification" / "node-workspace"
-        if not cwd_junction.is_dir() or cwd_junction.is_symlink():
-            raise OSError("Contained Node workspace was not prepared")
-        effective_cwd = (
-            drive_mappings[str(snapshot.resolve())]
-            + ".nexus-verification\\node-workspace"
+    try:
+        authority.prepare()
+    except BaseException:
+        release_identity(rollback_profile=True)
+        raise
+    drive_mappings = authority.drive_mappings
+    drive_mutex = authority.drive_mutex
+
+    def prepare_effective_launch() -> tuple[list[str], dict[str, str], str]:
+        def remap(value: str) -> str:
+            output = str(value)
+            for root, drive in sorted(
+                drive_mappings.items(), key=lambda one: len(one[0]), reverse=True,
+            ):
+                def replacement(match: re.Match[str], mapped: str = drive) -> str:
+                    return mapped if match.end() == len(output) else mapped.rstrip("\\")
+                output = re.sub(
+                    re.escape(root), replacement,
+                    output, flags=re.I,
+                )
+            return output
+
+        executable = str(argv[0]) if argv else ""
+        executable_in_immutable_root = any(
+            executable.casefold() == str(root.resolve()).casefold()
+            or executable.casefold().startswith(
+                str(root.resolve()).casefold().rstrip("\\/") + os.sep
+            )
+            for root in read_execute_roots
         )
+        effective_argv = [
+            executable if executable_in_immutable_root else remap(executable),
+            *[remap(one) for one in argv[1:]],
+        ] if argv else []
+        effective_environment = {
+            key: remap(value) for key, value in environment.items()
+        }
+        effective_cwd = drive_mappings.get(str(snapshot.resolve()), str(snapshot))
+        if nested_mapped_cwd and drive_mappings:
+            cwd_junction = snapshot / ".nexus-verification" / "node-workspace"
+            if not cwd_junction.is_dir() or cwd_junction.is_symlink():
+                raise OSError("Contained Node workspace was not prepared")
+            effective_cwd = (
+                drive_mappings[str(snapshot.resolve())]
+                + ".nexus-verification\\node-workspace"
+            )
+        return effective_argv, effective_environment, effective_cwd
+
+    try:
+        effective_argv, effective_environment, effective_cwd = prepare_effective_launch()
+    except BaseException:
+        authority.cleanup(process_started=False)
+        release_identity(rollback_profile=True)
+        raise
     reparse_created = False
     reparse_path: Path | None = None
-    if reparse_probe is not None:
-        reparse_path, reparse_target = reparse_probe
-        try:
-            os.symlink(reparse_target, reparse_path, target_is_directory=True)
-            reparse_created = True
-        except OSError:
-            made = subprocess.run(
-                [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "mklink", "/J",
-                 str(reparse_path), str(reparse_target)],
-                capture_output=True, check=False,
-            )
-            reparse_created = made.returncode == 0 and reparse_path.is_dir()
 
     class SECURITY_ATTRIBUTES(ctypes.Structure):
         _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", wintypes.LPVOID), ("bInheritHandle", wintypes.BOOL)]
@@ -324,6 +573,17 @@ def run_appcontainer(
     started = time.monotonic()
     timed_out = False
     try:
+        if reparse_probe is not None:
+            reparse_path, reparse_target = reparse_probe
+            try:
+                os.symlink(reparse_target, reparse_path, target_is_directory=True)
+                reparse_created = True
+            except OSError:
+                made = _bounded_command([
+                    os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", "mklink", "/J",
+                    str(reparse_path), str(reparse_target),
+                ])
+                reparse_created = made.returncode == 0 and reparse_path.is_dir()
         stdout_file = open(stdout_path, "wb")
         stderr_file = open(stderr_path, "wb")
         stdin_file = open(os.devnull, "rb")
@@ -418,43 +678,19 @@ def run_appcontainer(
                 pass
         for allocation in capability_allocations:
             kernel32.LocalFree(allocation)
-        # Remove the host-created reparse entry before recursive ACL cleanup;
-        # otherwise icacls could traverse the denied target and mutate its ACL.
-        if reparse_created and reparse_path is not None:
-            try:
-                reparse_path.unlink(missing_ok=True)
-            except OSError:
-                try:
-                    reparse_path.rmdir()
-                except OSError:
-                    pass
-        for ancestor in reversed(traversed_ancestors):
-            subprocess.run(
-                ["icacls", str(ancestor), "/remove:g", f"*{sid_value}", "/C", "/Q"],
-                capture_output=True, check=False,
-            )
-        if drive_mutex:
-            _unmap_private_drives(drive_mappings, drive_mutex)
-        subprocess.run(
-            ["icacls", str(snapshot), "/remove:g", f"*{sid_value}", "/T", "/C", "/Q"],
-            capture_output=True, check=False,
-        )
-        # Files created by an AppContainer otherwise retain an owner-only low
-        # integrity ACL after the ephemeral profile is deleted. Restore the
-        # disposable tree's inherited host ACL so it can be inspected and
-        # removed; this never touches the real selected project.
-        subprocess.run(
-            ["icacls", str(snapshot), "/reset", "/T", "/C", "/Q"],
-            capture_output=True, check=False,
-        )
-        if not persistent_profile:
-            userenv.DeleteAppContainerProfile(name)
-        kernel32.LocalFree(sid_text)
-        advapi32.FreeSid(sid)
+        process_started = bool(process.hProcess)
+        authority.cleanup(process_started=process_started)
+        release_identity(rollback_profile=not process_started)
     stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
+    cleanup_error = " | ".join(authority.cleanup_errors)
+    if cleanup_error:
+        stderr += (
+            "\nVerification containment cleanup failed closed: " + cleanup_error
+        )
     return {
-        "argv": argv, "cwd": ".", "exit_code": int(exit_code.value),
+        "argv": argv, "cwd": ".",
+        "exit_code": -2 if cleanup_error else int(exit_code.value),
         "effective_argv": effective_argv,
         "stdout": stdout, "stderr": stderr,
         "duration_ms": int((time.monotonic() - started) * 1000),
@@ -467,4 +703,8 @@ def run_appcontainer(
         "job_policy": "kill-on-close-no-breakaway",
         "ancestor_authority": "synchronize-read_attributes-traverse-only" if grant_traverse_ancestors else "none",
         "private_drive_roots": sorted(drive_mappings.values()),
+        "snapshot_file_execute_denied": True,
+        "cleanup_reparse_entries_removed": authority.removed_reparse_entries,
+        "containment_cleanup_error": cleanup_error,
+        "containment_unavailable": bool(cleanup_error),
     }

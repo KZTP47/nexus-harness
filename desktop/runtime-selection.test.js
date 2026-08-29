@@ -119,3 +119,25 @@ test("published runtime junctions are rejected", (context) => {
     fs.rmSync(held.repository, { recursive: true, force: true });
   }
 });
+
+test("a legitimate runner ancestor junction does not make the owned runtime a reparse point", (context) => {
+  const held = fixture();
+  const aliases = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-runtime-ancestor-"));
+  const alias = path.join(aliases, "checkout-alias");
+  try {
+    try {
+      fs.symlinkSync(held.repository, alias, "junction");
+    } catch (error) {
+      if (["EPERM", "EACCES"].includes(error.code)) return context.skip("junction creation denied");
+      throw error;
+    }
+    const selected = resolveSelectedRuntime(path.join(alias, "desktop"));
+    assert.equal(
+      fs.realpathSync.native(selected).toLowerCase(),
+      fs.realpathSync.native(held.selected).toLowerCase(),
+    );
+  } finally {
+    fs.rmSync(aliases, { recursive: true, force: true });
+    fs.rmSync(held.repository, { recursive: true, force: true });
+  }
+});

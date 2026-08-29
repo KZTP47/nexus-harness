@@ -913,6 +913,17 @@ class ConfigTests(unittest.TestCase):
                 set(),
             )
 
+    def test_ignore_migration_preserves_a_safe_ancestor_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            real = base / "real-project"
+            (real / ".harness").mkdir(parents=True)
+            alias = base / "project-alias"
+            self._make_directory_link(alias, real)
+            path = ensure_private_runtime_ignores(alias)
+            self.assertEqual(path, alias / ".harness" / ".gitignore")
+            self.assertTrue((real / ".harness" / ".gitignore").is_file())
+
     def test_repository_gitignore_matches_the_init_privacy_contract(self) -> None:
         repository_ignore = (
             Path(__file__).resolve().parents[1] / ".harness" / ".gitignore"

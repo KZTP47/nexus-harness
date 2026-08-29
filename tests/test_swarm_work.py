@@ -4655,6 +4655,222 @@ os._exit(23)
         self.assertEqual("kill-on-close-no-breakaway", result["job_policy"])
         self.assertTrue(result["containment_attestation"]["child_inherited_boundary"])
 
+    @unittest.skipUnless(os.name == "nt", "Windows immutable engine containment probe")
+    def test_python_engine_runtime_blocks_native_laundering_and_mutable_anchors(self) -> None:
+        snapshot = self.project / "python-engine-immutable-snapshot"
+        snapshot.mkdir()
+        local = snapshot / "ordinary-project-write.txt"
+        source = r'''
+import ctypes, json, os, pathlib, shutil, subprocess, sys
+from ctypes import wintypes
+root=pathlib.Path(os.environ['NEXUS_VERIFICATION_ROOT'])
+engine=pathlib.Path(os.environ['NEXUS_VERIFICATION_ENGINE_ROOT'])
+runtime=pathlib.Path(os.environ['NEXUS_ALLOWED_EXEC_ROOTS'].split(os.pathsep)[0])
+actual_system_root=pathlib.Path(os.environ['SystemRoot'])
+
+# Ordinary interpreted project mutation, including rename and delete, remains
+# available in the disposable snapshot.
+pathlib.Path('ordinary-project-write.txt').write_text('allowed',encoding='utf-8')
+rename_source=pathlib.Path('ordinary-rename-source.txt')
+rename_target=pathlib.Path('ordinary-rename-target.txt')
+rename_source.write_text('rename',encoding='utf-8')
+os.replace(rename_source,rename_target)
+rename_target.unlink()
+
+# Use real, valid Windows images so an access-denied loader/process result
+# proves the snapshot FILE_EXECUTE denial rather than malformed test bytes.
+project_native=pathlib.Path('project-native.pyd').resolve()
+project_child=pathlib.Path('project-child.exe').resolve()
+shutil.copyfile(actual_system_root/'System32'/'winmm.dll',project_native)
+shutil.copyfile(actual_system_root/'System32'/'cmd.exe',project_child)
+nested=pathlib.Path('nested-project-output');nested.mkdir()
+nested_native=(nested/'nested-native.dll').resolve()
+nested_child=(nested/'nested-child.exe').resolve()
+shutil.copyfile(actual_system_root/'System32'/'winmm.dll',nested_native)
+shutil.copyfile(actual_system_root/'System32'/'cmd.exe',nested_child)
+
+# Mutable Python globals must not redefine either trust anchor after the hook
+# has captured the approved interpreter and actual Windows directory.
+approved_executable=sys.executable
+sys.executable=str(project_child)
+try:
+    subprocess.run([sys.executable,'/d','/c','exit','0'],check=False)
+except PermissionError:
+    pass
+else:
+    raise AssertionError('mutated sys.executable became an approved child')
+finally:
+    sys.executable=approved_executable
+os.environ['SystemRoot']=str(root)
+try:
+    ctypes.CDLL(str(project_native))
+except PermissionError:
+    pass
+else:
+    raise AssertionError('mutated SystemRoot approved a project native library')
+
+# Audit-hook globals can themselves be changed by the process, so everything
+# below calls kernel32 directly after deliberately broadening those globals.
+guard=sys.modules['sitecustomize']
+guard._SELF_EXECUTABLE=str(project_child)
+guard._SYSTEM_ROOTS=(str(root),)
+guard._EXEC_ROOTS=(str(root),)
+kernel32=ctypes.WinDLL('kernel32',use_last_error=True)
+kernel32.CreateFileW.argtypes=[ctypes.c_wchar_p,ctypes.c_uint32,ctypes.c_uint32,ctypes.c_void_p,ctypes.c_uint32,ctypes.c_uint32,ctypes.c_void_p]
+kernel32.CreateFileW.restype=ctypes.c_void_p
+kernel32.CopyFileW.argtypes=[ctypes.c_wchar_p,ctypes.c_wchar_p,ctypes.c_int]
+kernel32.CopyFileW.restype=ctypes.c_int
+kernel32.MoveFileW.argtypes=[ctypes.c_wchar_p,ctypes.c_wchar_p]
+kernel32.MoveFileW.restype=ctypes.c_int
+kernel32.MoveFileExW.argtypes=[ctypes.c_wchar_p,ctypes.c_wchar_p,ctypes.c_uint32]
+kernel32.MoveFileExW.restype=ctypes.c_int
+kernel32.CreateHardLinkW.argtypes=[ctypes.c_wchar_p,ctypes.c_wchar_p,ctypes.c_void_p]
+kernel32.CreateHardLinkW.restype=ctypes.c_int
+kernel32.LoadLibraryW.argtypes=[ctypes.c_wchar_p]
+kernel32.LoadLibraryW.restype=ctypes.c_void_p
+invalid=ctypes.c_void_p(-1).value
+
+# Native writes/copies cannot alter or add bytes below the external RX engine.
+for target in (runtime/'laundered-native.dll',engine/'sitecustomize.py'):
+    handle=kernel32.CreateFileW(str(target),0x40000000,7,None,2,0x80,None)
+    assert handle == invalid and ctypes.get_last_error()==5, ('engine write unexpectedly succeeded',target,ctypes.get_last_error())
+assert not kernel32.CopyFileW(str(project_native),str(runtime/'copied-native.dll'),False)
+assert ctypes.get_last_error()==5 and not (runtime/'copied-native.dll').exists()
+assert not kernel32.CopyFileW(str(project_child),str(runtime/'copied-child.exe'),False)
+assert ctypes.get_last_error()==5 and not (runtime/'copied-child.exe').exists()
+
+# Writable snapshot parents cannot rename the engine, runtime, or guard away
+# and recreate their formerly trusted lexical paths.
+move_targets=(
+    (engine/'sitecustomize.py',root/'stolen-sitecustomize.py'),
+    (runtime,root/'stolen-runtime'),
+    (engine,root/'stolen-engine'),
+)
+for source_path,destination in move_targets:
+    assert not kernel32.MoveFileW(str(source_path),str(destination))
+    assert ctypes.get_last_error()==5 and source_path.exists() and not destination.exists()
+assert not kernel32.MoveFileExW(str(engine),str(root/'replaced-engine'),1)
+assert ctypes.get_last_error()==5 and engine.is_dir()
+
+# A hard link is an ACL alias rather than a pathname traversal.  Attempt the
+# attack from the real AppContainer.  If Windows permits the link, Nexus must
+# remove its snapshot name before privileged recursive ACL cleanup; if source
+# file permissions deny creation, record the kernel denial for host-side
+# sanitizer coverage to complement.
+engine_hardlink=root/'project-engine-hardlink.py'
+hardlink_created=bool(kernel32.CreateHardLinkW(
+    str(engine_hardlink),str(engine/'sitecustomize.py'),None
+))
+hardlink_error=0 if hardlink_created else ctypes.get_last_error()
+assert hardlink_created or hardlink_error==5, ('unexpected hard-link result',hardlink_error)
+pathlib.Path('hardlink-attempt.json').write_text(json.dumps({
+    'created':hardlink_created,'error':hardlink_error,
+}),encoding='utf-8')
+
+# Even fully valid images copied into project-writable space have no
+# FILE_EXECUTE for the package SID: direct native loading and process creation
+# fail at the OS boundary after the hook's Python globals were compromised.
+for library in (project_native,nested_native):
+    assert not kernel32.LoadLibraryW(str(library))
+    assert ctypes.get_last_error()==5
+class STARTUPINFO(ctypes.Structure):
+    _fields_=[('cb',wintypes.DWORD),('lpReserved',wintypes.LPWSTR),('lpDesktop',wintypes.LPWSTR),('lpTitle',wintypes.LPWSTR),('dwX',wintypes.DWORD),('dwY',wintypes.DWORD),('dwXSize',wintypes.DWORD),('dwYSize',wintypes.DWORD),('dwXCountChars',wintypes.DWORD),('dwYCountChars',wintypes.DWORD),('dwFillAttribute',wintypes.DWORD),('dwFlags',wintypes.DWORD),('wShowWindow',wintypes.WORD),('cbReserved2',wintypes.WORD),('lpReserved2',ctypes.POINTER(ctypes.c_byte)),('hStdInput',wintypes.HANDLE),('hStdOutput',wintypes.HANDLE),('hStdError',wintypes.HANDLE)]
+class PROCESS_INFORMATION(ctypes.Structure):
+    _fields_=[('hProcess',wintypes.HANDLE),('hThread',wintypes.HANDLE),('dwProcessId',wintypes.DWORD),('dwThreadId',wintypes.DWORD)]
+kernel32.CreateProcessW.argtypes=[wintypes.LPCWSTR,wintypes.LPWSTR,ctypes.c_void_p,ctypes.c_void_p,wintypes.BOOL,wintypes.DWORD,ctypes.c_void_p,wintypes.LPCWSTR,ctypes.POINTER(STARTUPINFO),ctypes.POINTER(PROCESS_INFORMATION)]
+kernel32.CreateProcessW.restype=wintypes.BOOL
+startup=STARTUPINFO();startup.cb=ctypes.sizeof(startup)
+for executable in (project_child,nested_child):
+    process=PROCESS_INFORMATION()
+    command=ctypes.create_unicode_buffer('"'+str(executable)+'" /d /c exit 0')
+    assert not kernel32.CreateProcessW(str(executable),command,None,None,False,0,None,str(root),ctypes.byref(startup),ctypes.byref(process))
+    assert ctypes.get_last_error()==5
+'''
+        result = swarm_work._contained_snapshot_command(
+            self.config, snapshot, ["python", "-c", source],
+            timeout=25, denied_root=self.project,
+        )
+        self.assertEqual(0, result["exit_code"], result)
+        self.assertTrue(local.is_file(), result)
+        self.assertEqual("windows-appcontainer-job-v1", result["containment_profile"])
+        self.assertTrue(result["snapshot_file_execute_denied"])
+        self.assertTrue(result["containment_attestation"]["private_write_allowed"])
+        hardlink_attempt = json.loads(
+            (snapshot / "hardlink-attempt.json").read_text(encoding="utf-8")
+        )
+        if hardlink_attempt["created"]:
+            self.assertIn(
+                "project-engine-hardlink.py",
+                result["cleanup_reparse_entries_removed"],
+            )
+        else:
+            self.assertEqual(5, hardlink_attempt["error"])
+        self.assertFalse((snapshot / "project-engine-hardlink.py").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows 8.3 path-alias containment probe")
+    def test_verification_guard_accepts_true_short_alias_but_denies_project_native(self) -> None:
+        import ctypes
+
+        snapshot = self.project / "verification alias snapshot"
+        snapshot.mkdir()
+        engine_root = self.root / "verification-alias-engine"
+        python_guard, _ = swarm_work._verification_guard_files(snapshot, engine_root)
+        runtime = python_guard.parent / "runtime"
+        runtime.mkdir()
+        allowed_native = runtime / "allowed-native.pyd"
+        allowed_native.write_bytes(b"not loaded; only its containment identity is checked")
+        denied_native = snapshot / "project-native.pyd"
+        denied_native.write_bytes(b"project native extensions must remain denied")
+        inside_write = snapshot / "inside-write.txt"
+        outside_write = snapshot.parent / "outside-write.txt"
+
+        def short_path(path: Path) -> Path:
+            buffer = ctypes.create_unicode_buffer(32768)
+            copied = ctypes.windll.kernel32.GetShortPathNameW(
+                str(path), buffer, len(buffer),
+            )
+            if copied == 0 or copied >= len(buffer):
+                self.skipTest("this Windows volume does not expose an 8.3 alias")
+            return Path(buffer.value)
+
+        short_snapshot = short_path(snapshot)
+        short_runtime = short_path(runtime)
+        self.assertTrue(snapshot.samefile(short_snapshot))
+        self.assertTrue(runtime.samefile(short_runtime))
+        if os.path.normcase(str(short_runtime)) == os.path.normcase(str(runtime)):
+            self.skipTest("this Windows volume does not expose a distinct 8.3 alias")
+
+        probe = (
+            "import runpy\n"
+            f"guard=runpy.run_path({str(python_guard)!r})\n"
+            f"guard['_deny_path']({str(inside_write)!r},'write')\n"
+            "try:\n"
+            f"    guard['_deny_path']({str(outside_write)!r},'write')\n"
+            "except PermissionError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise SystemExit('outside write was accepted')\n"
+            f"guard['_audit']('import',('allowed',{str(allowed_native)!r}))\n"
+            "try:\n"
+            f"    guard['_audit']('import',('denied',{str(denied_native)!r}))\n"
+            "except PermissionError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise SystemExit('project native extension was accepted')\n"
+        )
+        environment = dict(os.environ)
+        environment.update({
+            "NEXUS_VERIFICATION_ROOT": str(short_snapshot),
+            "NEXUS_VERIFICATION_ENGINE_ROOT": str(engine_root),
+            "NEXUS_ALLOWED_EXEC_ROOTS": str(short_runtime),
+        })
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", probe],
+            cwd=str(snapshot), env=environment, capture_output=True, text=True,
+            timeout=20, check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stderr or result.stdout)
+
     @unittest.skipUnless(os.name == "nt", "Windows brokered Playwright verification")
     def test_loop16_brokered_playwright_proves_real_route_dom_observable(self) -> None:
         runtime = swarm_work.discover_bundled_playwright_runtime()

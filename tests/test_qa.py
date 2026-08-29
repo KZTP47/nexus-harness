@@ -52,6 +52,10 @@ class SuiteParsingTests(unittest.TestCase):
         self.assertEqual(case.expect.max_page_errors, 0)
         self.assertEqual(case.viewport, (1280, 800))
 
+    def test_browser_console_errors_name_the_resource_that_failed(self) -> None:
+        self.assertIn("const location = message.location()", qa._BROWSER_SCRIPT)
+        self.assertIn("String(location.url).slice(0, 300)", qa._BROWSER_SCRIPT)
+
     def test_browser_steps_are_read_and_kept_in_order(self) -> None:
         suite = qa.parse_suite({
             "name": "d",

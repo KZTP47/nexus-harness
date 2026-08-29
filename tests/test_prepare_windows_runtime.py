@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import re
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -26,6 +27,21 @@ def write_runtime_manifest(destination: Path) -> None:
 
 
 class RuntimePreparationTests(unittest.TestCase):
+    @staticmethod
+    def _make_directory_link(link: Path, target: Path) -> None:
+        if os.name == "nt":
+            made = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if made.returncode:
+                raise unittest.SkipTest(
+                    "This Windows host cannot create a directory reparse point: "
+                    + made.stderr.decode(errors="replace")
+                )
+        else:
+            link.symlink_to(target, target_is_directory=True)
+
     def test_owned_windows_loader_lock_is_retried(self) -> None:
         attempts = 0
 
@@ -565,6 +581,82 @@ class RuntimePreparationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "unsafe abandoned"):
                     runtime._remove_abandoned_runtime_trees()
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "must survive")
+
+    def test_runtime_digest_allows_safe_ancestor_alias_but_rejects_nested_link(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            real = base / "real-parent"
+            runtime_root = real / "desktop" / "candidate"
+            runtime_root.mkdir(parents=True)
+            (runtime_root / "one.txt").write_text("one", encoding="utf-8")
+            alias = base / "runner-alias"
+            self._make_directory_link(alias, real)
+            aliased_runtime = alias / "desktop" / "candidate"
+            self.assertEqual(
+                runtime.runtime_tree_digest(aliased_runtime),
+                runtime.runtime_tree_digest(runtime_root),
+            )
+
+            victim = base / "victim"
+            victim.mkdir()
+            (victim / "sentinel.txt").write_text("outside", encoding="utf-8")
+            self._make_directory_link(runtime_root / "nested-link", victim)
+            with self.assertRaisesRegex(RuntimeError, "link or reparse|escapes"):
+                runtime.runtime_tree_digest(aliased_runtime)
+            self.assertEqual((victim / "sentinel.txt").read_text(encoding="utf-8"), "outside")
+
+    def test_runtime_selection_rejects_a_reparse_publication_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            desktop.mkdir()
+            real_published = desktop / ".published-real"
+            identity = runtime._runtime_input_identity()
+            candidate = real_published / identity
+            candidate.mkdir(parents=True)
+            write_runtime_manifest(candidate)
+            (candidate / "identity.txt").write_text("owned elsewhere", encoding="utf-8")
+            self._make_directory_link(desktop / ".runtime-published", real_published)
+            payload = {
+                "schema_version": 1,
+                "runtime_path": f".runtime-published/{identity}",
+                "manifest_sha256": runtime.digest(candidate / "NEXUS_RUNTIME.json"),
+                "tree_sha256": runtime.runtime_tree_digest(candidate),
+                "python": runtime.PYTHON_VERSION,
+                "python_sha256": runtime.PYTHON_SHA256,
+                "requirements_sha256": runtime.digest(runtime.LOCK),
+                "playwright_lock_sha256": runtime.digest(runtime.PLAYWRIGHT_LOCK),
+                "input_identity": identity,
+            }
+
+            with mock.patch.object(runtime, "DESKTOP", desktop):
+                with self.assertRaisesRegex(RuntimeError, "publication root.*reparse"):
+                    runtime._selected_runtime_from_payload(payload)
+
+    def test_prepare_and_selection_allow_a_safe_ancestor_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            real = base / "real-parent"
+            desktop = real / "desktop"
+            desktop.mkdir(parents=True)
+            alias = base / "runner-alias"
+            self._make_directory_link(alias, real)
+            aliased_desktop = alias / "desktop"
+            output = aliased_desktop / "runtime"
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("fresh", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            with mock.patch.object(runtime, "DESKTOP", aliased_desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", aliased_desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage):
+                prepared = runtime.prepare(output)
+                payload = runtime._selection_payload(prepared)
+
+            self.assertEqual(prepared, output)
+            self.assertEqual(payload["runtime_path"], "runtime")
+            self.assertEqual((desktop / "runtime" / "identity.txt").read_text(), "fresh")
 
     def test_runtime_output_link_is_rejected_without_mutating_victim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

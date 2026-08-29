@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -116,6 +117,29 @@ def digest(path: Path) -> str:
     return held.hexdigest()
 
 
+def _is_direct_reparse_point(path: Path) -> bool:
+    """Reject this component, while allowing harmless aliases in its ancestors."""
+
+    lexical = Path(os.path.abspath(path))
+    try:
+        metadata = lexical.stat(follow_symlinks=False)
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        if lexical.is_symlink() or bool(
+            attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        ):
+            return True
+        actual = lexical.resolve()
+        expected = lexical.parent.resolve() / lexical.name
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # A component whose own metadata cannot be inspected is not safe to
+        # rename, delete, or package. Missing paths are handled separately by
+        # their callers, but access/metadata failures must remain fail-closed.
+        return True
+    return os.path.normcase(str(actual)) != os.path.normcase(str(expected))
+
+
 def runtime_tree_digest(root: Path) -> str:
     """Bind a prepared runtime to every relative path and file byte.
 
@@ -124,22 +148,19 @@ def runtime_tree_digest(root: Path) -> str:
     rejected so publication cannot make the packager follow another tree.
     """
 
-    lexical = Path(os.path.abspath(root))
     canonical = root.resolve()
-    if root.is_symlink() or os.path.normcase(str(lexical)) != os.path.normcase(str(canonical)):
+    if _is_direct_reparse_point(root):
         raise RuntimeError(f"Private runtime root is a link or reparse point: {root}")
     if not canonical.is_dir():
         raise RuntimeError(f"Private runtime is not a directory: {root}")
     held = hashlib.sha256()
     paths = sorted(canonical.rglob("*"), key=lambda one: one.relative_to(canonical).as_posix())
     for path in paths:
-        lexical_path = Path(os.path.abspath(path))
         resolved_path = path.resolve()
-        if (
-            path.is_symlink()
-            or os.path.normcase(str(lexical_path)) != os.path.normcase(str(resolved_path))
-        ):
+        if _is_direct_reparse_point(path):
             raise RuntimeError(f"Private runtime contains a link or reparse point: {path}")
+        if resolved_path != canonical and canonical not in resolved_path.parents:
+            raise RuntimeError(f"Private runtime entry escapes its root: {path}")
         relative = path.relative_to(canonical).as_posix().encode("utf-8")
         if path.is_dir():
             held.update(b"D\0" + relative + b"\0")
@@ -168,7 +189,7 @@ def _selection_payload(selected: Path, *, tree_sha256: str | None = None) -> dic
     desktop = DESKTOP.resolve()
     lexical = Path(os.path.abspath(selected))
     resolved = selected.resolve()
-    if selected.is_symlink() or os.path.normcase(str(lexical)) != os.path.normcase(str(resolved)):
+    if _is_direct_reparse_point(selected):
         raise RuntimeError(f"Selected private runtime is a link or reparse point: {selected}")
     relative = resolved.relative_to(desktop).as_posix()
     if relative != "runtime" and not (
@@ -246,11 +267,20 @@ def _selected_runtime_from_payload(
         if not legacy_current_candidate:
             raise RuntimeError("Private-runtime selection input identity is invalid")
     lexical = Path(os.path.abspath(DESKTOP / relative))
+    if (
+        len(parts) == 2
+        and parts[0] == ".runtime-published"
+        and _is_direct_reparse_point(
+            Path(os.path.abspath(DESKTOP / ".runtime-published"))
+        )
+    ):
+        raise RuntimeError(
+            "The private-runtime publication root is a link or reparse point"
+        )
     selected = lexical.resolve()
     desktop = DESKTOP.resolve()
     if (
-        lexical.is_symlink()
-        or os.path.normcase(str(lexical)) != os.path.normcase(str(selected))
+        _is_direct_reparse_point(lexical)
         or selected == desktop or desktop not in selected.parents
     ):
         raise RuntimeError("Private-runtime selection escapes the desktop directory")
@@ -557,8 +587,7 @@ def _remove_abandoned_runtime_trees() -> None:
             lexical = Path(os.path.abspath(candidate))
             resolved = candidate.resolve()
             if (
-                candidate.is_symlink()
-                or os.path.normcase(str(lexical)) != os.path.normcase(str(resolved))
+                _is_direct_reparse_point(candidate)
                 or resolved.parent != desktop or not resolved.is_dir()
             ):
                 raise RuntimeError(f"Refusing unsafe abandoned runtime path: {candidate}")
@@ -593,10 +622,8 @@ def _cleanup_unreferenced_runtime_tree(path: Path, description: str) -> None:
 
 def _owned_published_root() -> Path:
     published = _published_runtimes_path()
-    expected_published = Path(os.path.abspath(DESKTOP / ".runtime-published"))
     if published.exists() and (
-        published.is_symlink()
-        or os.path.normcase(str(published.resolve())) != os.path.normcase(str(expected_published))
+        _is_direct_reparse_point(published)
     ):
         raise RuntimeError("The private-runtime publication root is a link or reparse point")
     return published
@@ -613,10 +640,8 @@ def _reuse_current_candidate() -> Path | None:
     receipt_path = _candidate_receipt_path(identity)
     try:
         source = receipt_path if receipt_path.exists() else _runtime_selection_path()
-        lexical_receipt = Path(os.path.abspath(source))
         if (
-            source.is_symlink()
-            or os.path.normcase(str(source.resolve())) != os.path.normcase(str(lexical_receipt))
+            _is_direct_reparse_point(source)
         ):
             raise RuntimeError("candidate receipt is a link or reparse point")
         payload = json.loads(source.read_text(encoding="utf-8"))
@@ -672,8 +697,7 @@ def _prepare_locked(output: Path) -> Path:
     if os.path.normcase(str(output)) != os.path.normcase(str(allowed)):
         raise RuntimeError(f"Runtime output must be exactly {allowed}")
     if output.exists() and (
-        output.is_symlink()
-        or os.path.normcase(str(output.resolve())) != os.path.normcase(str(output))
+        _is_direct_reparse_point(output)
     ):
         raise RuntimeError("Runtime output is a link or reparse point")
     _remove_abandoned_runtime_trees()

@@ -3,7 +3,8 @@
 The installed desktop carries a complete private runtime.  A Git checkout does
 not, and building that complete runtime also downloads Playwright and Chromium.
 For Python-only project verification, cache the official embeddable archive and
-stage its verified contents inside the disposable AppContainer snapshot.
+stage its verified contents in a host-owned engine root outside the writable
+AppContainer snapshot.
 """
 
 from __future__ import annotations
@@ -411,19 +412,26 @@ def stage_source_runtime(
     cache_root: Path | None = None,
     dependency_paths: Iterable[Path] = (),
 ) -> Path:
-    """Atomically stage verified Python inside one disposable snapshot."""
+    """Atomically stage verified Python in one external host-owned engine root."""
 
     snapshot = snapshot.resolve()
-    destination = destination.resolve()
-    guard_parent = python_guard_parent.resolve()
-    expected_guard_parent = snapshot / ".nexus-verification"
-    if guard_parent != expected_guard_parent:
+    lexical_guard_parent = Path(os.path.abspath(python_guard_parent))
+    guard_parent = lexical_guard_parent.resolve()
+    lexical_destination = Path(os.path.abspath(destination))
+    destination = lexical_destination.resolve()
+    if (
+        not guard_parent.is_dir()
+        or _is_reparse(lexical_guard_parent)
+        or guard_parent == snapshot
+        or snapshot in guard_parent.parents
+        or guard_parent in snapshot.parents
+    ):
         raise VerificationPythonUnavailable(
-            "the Python guard directory is not inside the exact disposable snapshot"
+            "the Python guard directory is not a direct external host-owned engine root"
         )
     if destination != guard_parent / "runtime":
         raise VerificationPythonUnavailable(
-            "the verification runtime destination is not the engine-owned snapshot runtime"
+            "the verification runtime destination is not the exact external engine runtime"
         )
     dependencies: list[Path] = []
     for dependency in dependency_paths:
