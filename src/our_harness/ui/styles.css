@@ -84,6 +84,7 @@ button.danger { border-color: var(--red); color: #ffe9ed; }
 .palette, .inspector { align-self: start; position: sticky; top: 12px; max-height: calc(100vh - 106px); overflow: auto; padding: 16px; }
 h2 { margin: 0 0 8px; font-size: 1rem; }
 .hint, .field-help, .section-heading p, .keyboard-note { color: var(--muted); font-size: .84rem; }
+.prompt-count.over-limit { color: #fecaca; border-left: 3px solid var(--red); padding-left: 8px; }
 .palette-list { display: grid; gap: 8px; }
 .palette-list button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 9px 11px; text-align: left; }
 .node-dot { width: 12px; height: 12px; border-radius: 50%; box-shadow: 0 0 12px currentColor; }
@@ -579,6 +580,8 @@ dialog form { display: grid; gap: 8px; padding: 18px; }
 
 /* Ready-made pipelines, above the steps you can add one at a time. */
 .pipeline-starters { list-style: none; margin: 0 0 4px; padding: 0; display: grid; gap: 8px; }
+.pipeline-dirty-state { margin: 0; font-size: .78rem; font-weight: 700; color: #64748b; }
+.pipeline-dirty-state.is-dirty { color: #b42318; }
 .pipeline-starters .field-help { margin: 2px 0 0; color: #64748b; font-size: .76rem; }
 .pipeline-starter { width: 100%; text-align: left; background: #fff; border: 1px solid #cbd2db; color: #1f2933; border-radius: 8px; padding: 7px 10px; font-size: .84rem; font-weight: 600; }
 .pipeline-starter:hover { border-color: #2563eb; color: #1d4ed8; }

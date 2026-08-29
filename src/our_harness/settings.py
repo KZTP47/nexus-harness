@@ -91,6 +91,10 @@ MEANS: dict[str, str] = {
     "execution.inherit_environment": "Which of your environment variables programs are handed.",
     "execution.mode": "Whether work runs on this machine or inside a container.",
     "workflow.reviewers": "How many agents review a change before you see it.",
+    "workflow.context_tool_execution_seconds": (
+        "Total time actually spent running long-horizon context tools. "
+        "Zero means no aggregate time ceiling; individual programs still have their own timeout."
+    ),
     "workflow.max_repair_attempts": "How many times the harness tries again after a check fails.",
     "git.enabled": "Whether the harness looks at your repository at all.",
     "git.allow_commit": "Whether the harness may commit.",

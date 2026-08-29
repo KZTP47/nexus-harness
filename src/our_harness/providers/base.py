@@ -418,6 +418,11 @@ def _ensure_responses_status(response: dict[str, Any]) -> None:
         error = response.get("error", {})
         message = error.get("message", "unknown provider failure") if isinstance(error, dict) else str(error)
         raise HarnessError(f"OpenAI Responses request failed: {message}")
+    if status != "completed":
+        raise HarnessError(
+            "OpenAI Responses output has no explicit successful completion "
+            f"status (received {status!r})"
+        )
 
 
 def _chat_tool_calls(fragments: object) -> list[dict[str, Any]]:
@@ -716,7 +721,7 @@ class OpenAIProvider(Provider):
             usage = _openai_usage(data.get("usage"))
             return ProviderResponse(
                 text=text,
-                finish_reason=str(data.get("status") or "completed"),
+                finish_reason=str(data["status"]),
                 raw={**data, "tool_call_deltas": tool_calls, "continuation_mode": continuation_mode},
                 responses_continuation=continuation,
                 **usage,
@@ -731,7 +736,12 @@ class OpenAIProvider(Provider):
             tool_calls = _chat_tool_calls(message.get("tool_calls", []))
         except (KeyError, IndexError, TypeError) as exc:
             raise HarnessError("OpenAI-compatible response is missing choices[0].message.content") from exc
-        finish_reason = str(choice.get("finish_reason") or "stop")
+        terminal = choice.get("finish_reason")
+        if not isinstance(terminal, str) or not terminal.strip():
+            raise HarnessError(
+                "OpenAI Chat Completions output has no explicit finish_reason"
+            )
+        finish_reason = terminal.strip()
         if finish_reason in {"length", "content_filter"}:
             raise HarnessError(f"OpenAI Chat Completions output is incomplete: {finish_reason}")
         if not isinstance(text, str) or (not text and not tool_calls):
@@ -824,7 +834,7 @@ class OpenAIProvider(Provider):
                 return
 
     def _stream_chat_completions(self, request: ProviderRequest, key: str) -> Iterator[dict[str, Any]]:
-        finish_reason = "stop"
+        finish_reason = ""
         text_parts: list[str] = []
         tool_fragments: list[dict[str, Any]] = []
         sent_messages = self._chat_messages(request)
@@ -840,6 +850,11 @@ class OpenAIProvider(Provider):
             if not data:
                 continue
             if data == "[DONE]":
+                if not finish_reason:
+                    raise HarnessError(
+                        "OpenAI Chat Completions stream ended without an explicit "
+                        "finish_reason"
+                    )
                 tool_calls = _chat_tool_calls(tool_fragments)
                 continuation = self._chat_continuation(sent_messages, "".join(text_parts), tool_calls)
                 if continuation is not None:
@@ -1010,7 +1025,9 @@ class AnthropicProvider(Provider):
 
     @staticmethod
     def _check_stop(stop_reason: object) -> str:
-        reason = str(stop_reason or "end_turn")
+        if not isinstance(stop_reason, str) or not stop_reason.strip():
+            raise HarnessError("Anthropic output has no explicit stop_reason")
+        reason = stop_reason.strip()
         if reason in {"max_tokens", "refusal", "model_context_window_exceeded"}:
             raise HarnessError(f"Anthropic output is incomplete: {reason}")
         return reason
@@ -1060,7 +1077,7 @@ class AnthropicProvider(Provider):
         url = endpoint if endpoint.endswith("/messages") else f"{endpoint}/messages"
         payload, sent_messages = self._payload(request, stream=True)
         blocks: dict[int, dict[str, Any]] = {}
-        stop_reason = "end_turn"
+        stop_reason = ""
         for line in self._stream_lines(
             url,
             payload,
@@ -1272,6 +1289,11 @@ class OllamaProvider(Provider):
         calls, names = self._tool_calls(message)
         if not isinstance(text, str) or (not text and not calls):
             raise HarnessError("Ollama response contains no text or tool call")
+        if data.get("done") is not True:
+            raise HarnessError(
+                "Ollama response was nonterminal (done was not true); partial "
+                "output was not accepted"
+            )
         continuation = None
         if calls:
             continuation = NativeToolContinuation(
@@ -1281,7 +1303,7 @@ class OllamaProvider(Provider):
             )
         return ProviderResponse(
             text=text,
-            finish_reason="stop" if data.get("done") else "unknown",
+            finish_reason="stop",
             input_tokens=data.get("prompt_eval_count"),
             output_tokens=data.get("eval_count"),
             billed_output_tokens=data.get("eval_count"),
@@ -1529,7 +1551,12 @@ def collect_stream(
                 raise HarnessError("Provider native continuation pending call IDs are invalid")
             native_continuation = NativeToolContinuation(provider_name, copy.deepcopy(state), list(pending_call_ids))
         elif event_type == "done":
-            finish_reason = str(event.get("finish_reason") or "stop")
+            terminal = event.get("finish_reason")
+            if not isinstance(terminal, str) or not terminal.strip():
+                raise HarnessError(
+                    "Provider completion event has no explicit finish_reason"
+                )
+            finish_reason = terminal.strip()
             done = True
         else:
             raise HarnessError(f"Unknown provider stream event: {event_type}")

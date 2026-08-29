@@ -1,3 +1,4 @@
+# Nexus private runtime state (managed; keep last)
 config.local.json
 project-authority.json
 memory/
@@ -5,8 +6,29 @@ runs/
 backups/
 checkpoints/
 cache/
+runtime/
+bundles/
+chats/
+pages/
+vault/
+swarm-mutation-sagas/
+transaction.lock
+desktop-deployment.lock
+desktop-deployment.owner.json
 qa/runs/
 qa/tmp/
 qa/history.json
 qa/candidates.json
+qa/pipeline-preservation.lock
+qa/pipelines-before-checks/
+qa/*report*.json
 pipelines/last-run.json
+pipelines/evidence/
+pipelines/drafts/
+timers/.what-happened.json
+timers/what-happened.json
+timers/.what-happened.json.could-not-be-read
+timers/running.lock
+*.part
+*.tmp
+# End Nexus private runtime state

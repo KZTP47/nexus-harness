@@ -70,7 +70,7 @@ function whyItReallyIs(said, options = {}) {
       return (
         "This installed app carries one matched, private Python and harness version, and your settings "
         + "need a newer one. Nexus will not mix project source into that private runtime because that "
-        + "would make the displayed build identity untrue. Install a newer signed Nexus release from "
+        + "would make the displayed build identity untrue. Install a newer verified Nexus release from "
         + "the official GitHub Releases page; your project files and local settings stay in place."
       );
     }

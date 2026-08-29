@@ -37,6 +37,7 @@ let projectPath = "";
 let repairAvailable = false;
 let webChatManager = null;
 let reviewedTrust = null;
+const pendingJsonExports = new Map();
 const ownsApplicationInstance = app.requestSingleInstanceLock();
 
 if (!ownsApplicationInstance) {
@@ -305,7 +306,20 @@ function createWindow() {
     },
   });
   window.once("ready-to-show", () => window.show());
+  const harnessRendererId = window.webContents.id;
+  const abandonRendererExports = () => {
+    for (const [identity, held] of pendingJsonExports.entries()) {
+      if (held.sender === harnessRendererId) {
+        try { closeLargeJsonExport(identity); } catch (_error) { /* target stayed untouched */ }
+      }
+    }
+  };
+  window.webContents.on("render-process-gone", abandonRendererExports);
+  window.webContents.on("did-start-navigation", (_event, _url, _inPlace, mainFrame) => {
+    if (mainFrame) abandonRendererExports();
+  });
   window.on("closed", () => {
+    abandonRendererExports();
     if (webChatManager) webChatManager.close();
     webChatManager = null;
     window = null;
@@ -501,6 +515,102 @@ ipcMain.handle("harness:saveJsonFile", (event, suggestedName, contents) => {
   }
   return {saved: true, filename: path.basename(chosen)};
 });
+
+function closeLargeJsonExport(identity, removeTemporary = true) {
+  const held = pendingJsonExports.get(identity);
+  if (!held) return;
+  pendingJsonExports.delete(identity);
+  try { fs.closeSync(held.file); } catch (_error) { /* already closed */ }
+  if (removeTemporary) {
+    try { fs.unlinkSync(held.beside); } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+}
+
+ipcMain.handle("harness:beginLargeJsonFile", (event, suggestedName) => {
+  if (!fromHarnessWindow(event)) throw new Error("Only the Nexus Harness window may save an export.");
+  let safe = path.basename(String(suggestedName || "nexus-saved-board.json"))
+    .replace(/[^A-Za-z0-9._ -]/g, "-");
+  if (!safe.toLowerCase().endsWith(".json")) safe += ".json";
+  const chosen = dialog.showSaveDialogSync(window || undefined, {
+    title: "Export Nexus board JSON",
+    defaultPath: path.join(app.getPath("downloads"), safe),
+    buttonLabel: "Export JSON",
+    filters: [{name: "JSON files", extensions: ["json"]}],
+    properties: ["showOverwriteConfirmation", "createDirectory"],
+  });
+  if (!chosen) return {saved: false};
+  const identity = crypto.randomUUID();
+  const beside = `${chosen}.${process.pid}-${identity}.part`;
+  const file = fs.openSync(beside, "wx");
+  pendingJsonExports.set(identity, {
+    sender: event.sender.id, chosen, beside, file, bytes: 0, sequence: 0,
+  });
+  return {saved: true, identity};
+});
+
+ipcMain.handle("harness:appendLargeJsonFile", (event, identity, sequence, chunk) => {
+  const held = pendingJsonExports.get(String(identity || ""));
+  if (!fromHarnessWindow(event) || !held || held.sender !== event.sender.id) {
+    throw new Error("That board export is no longer active.");
+  }
+  try {
+    if (sequence !== held.sequence) throw new Error("Board export chunks arrived out of order.");
+    const bytes = Buffer.from(String(chunk || ""), "utf8");
+    if (!bytes.length || bytes.length > 8_000_000) {
+      throw new Error("A board export chunk must contain 1 to 8000000 UTF-8 bytes.");
+    }
+    if (held.bytes + bytes.length > 768_000_000) {
+      throw new Error("A board JSON export may be at most 768000000 UTF-8 bytes.");
+    }
+    let written = 0;
+    while (written < bytes.length) {
+      const count = fs.writeSync(
+        held.file, bytes, written, bytes.length - written,
+      );
+      if (!Number.isInteger(count) || count <= 0) {
+        throw new Error("The board export stopped before the complete chunk was written.");
+      }
+      written += count;
+    }
+    held.bytes += bytes.length;
+    held.sequence += 1;
+    return {sequence: held.sequence, bytes: held.bytes};
+  } catch (error) {
+    closeLargeJsonExport(String(identity || ""));
+    throw error;
+  }
+});
+
+ipcMain.handle("harness:finishLargeJsonFile", (event, identity, sequence) => {
+  const key = String(identity || "");
+  const held = pendingJsonExports.get(key);
+  if (!fromHarnessWindow(event) || !held || held.sender !== event.sender.id) {
+    throw new Error("That board export is no longer active.");
+  }
+  try {
+    if (sequence !== held.sequence || !held.bytes) {
+      throw new Error("The board export is incomplete; the destination was not replaced.");
+    }
+    fs.fsyncSync(held.file);
+    fs.closeSync(held.file);
+    fs.renameSync(held.beside, held.chosen);
+    pendingJsonExports.delete(key);
+    return {saved: true, filename: path.basename(held.chosen), bytes: held.bytes};
+  } catch (error) {
+    closeLargeJsonExport(key);
+    throw error;
+  }
+});
+
+ipcMain.handle("harness:abortLargeJsonFile", (event, identity) => {
+  const key = String(identity || "");
+  const held = pendingJsonExports.get(key);
+  if (!fromHarnessWindow(event) || !held || held.sender !== event.sender.id) return false;
+  closeLargeJsonExport(key);
+  return true;
+});
 ipcMain.handle("harness:setFullScreen", (_event, on) => {
   if (!window || window.isDestroyed()) return false;
   window.setFullScreen(Boolean(on));
@@ -631,5 +741,10 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => server.stop());
+app.on("before-quit", () => {
+  for (const identity of [...pendingJsonExports.keys()]) {
+    try { closeLargeJsonExport(identity); } catch (_error) { /* target was never replaced */ }
+  }
+  server.stop();
+});
 process.on("exit", () => server.stop());

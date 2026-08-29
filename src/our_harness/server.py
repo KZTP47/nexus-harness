@@ -35,6 +35,7 @@ from . import swarm as swarm_lab
 from . import swarm_chats
 from . import swarm_work
 from . import swarm_runs
+from . import swarm_goal_queue
 from . import web_chats
 from . import projects as projects_lab
 from . import tell_somebody as telling_lab
@@ -311,6 +312,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self.events = EventBus(redactor=CredentialRedactor(config))
         self._swarm_runs: swarm_runs.SwarmRunStore | None = None
         self._swarm_runner: swarm_lab.Running | None = None
+        self._swarm_goal_queue: swarm_goal_queue.SwarmGoalQueueStore | None = None
         self.authority_lock = threading.Lock()
         self.chat_activities = ChatActivities()
         self.chat_cancellations = cancellation.ChatCancellationRegistry()
@@ -417,6 +419,22 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 held = swarm_lab.Running(store)
                 self._swarm_runner = held
             return held
+
+    @property
+    def swarm_goal_queue(self) -> swarm_goal_queue.SwarmGoalQueueStore:
+        with self.authority_lock:
+            held = self._swarm_goal_queue
+            if held is None:
+                held = swarm_goal_queue.SwarmGoalQueueStore(self.config)
+                self._swarm_goal_queue = held
+            return held
+
+    def swarm_goal_queue_status(self) -> dict[str, Any] | None:
+        """Reconcile an interrupted HTTP response before exposing its cursor."""
+
+        return self.swarm_goal_queue.reconcile(
+            self.swarm_runs.get_by_request_any_authority
+        )
 
     def project_authority_status(self) -> dict[str, Any]:
         try:
@@ -550,6 +568,11 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             ]
         standing["provider_status_stale"] = provider_status_stale
         self.web_chats.decorate_swarm(standing)
+        standing["verification_command_approvals"] = [
+            swarm_work.verification_command_approval(self.config, project)
+            for project in standing.get("board", {}).get("projects", [])
+            if isinstance(project, dict)
+        ]
         return standing
 
     def move_to(self, where: str) -> dict[str, Any]:
@@ -676,6 +699,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
     # who actually opened it.
     timeout = 30
 
+    def handle_one_request(self) -> None:
+        """Never let a QA capability leak to the next keep-alive request."""
+
+        swarm_lab._set_board_qa_request_capability("")  # noqa: SLF001
+        try:
+            super().handle_one_request()
+        finally:
+            swarm_lab._set_board_qa_request_capability("")  # noqa: SLF001
+
     def log_message(self, format: str, *args: object) -> None:
         if args and isinstance(args[0], str) and args[0].startswith("GET /api/events"):
             return
@@ -780,11 +812,22 @@ class HarnessHandler(BaseHTTPRequestHandler):
             # trusted to be the right length, so this connection ends here.
             self.close_connection = True
             raise HarnessError("Invalid Content-Length") from exc
-        if length <= 0 or length > 12_000_000:
+        maximum = (
+            swarm_lab.MAX_SAVED_BOARD_DOCUMENT_BYTES
+            if self.path.startswith("/api/swarm/") else 12_000_000
+        )
+        if length <= 0 or length > maximum:
             self.close_connection = True
-            raise HarnessError("Request body must contain 1 to 12000000 bytes")
+            raise HarnessError(
+                f"Request body must contain 1 to {maximum} bytes. Nexus did not "
+                "truncate or partially apply it."
+            )
         try:
             value = json.loads(self.rfile.read(length))
+        except UnicodeDecodeError as exc:
+            raise HarnessError(
+                "Request body is not valid UTF-8. Nexus did not decode replacement characters."
+            ) from exc
         except json.JSONDecodeError as exc:
             raise HarnessError("Request body is not valid JSON") from exc
         except RecursionError as exc:
@@ -1111,6 +1154,13 @@ class HarnessHandler(BaseHTTPRequestHandler):
     def _require_token(self) -> None:
         if not secrets.compare_digest(self._single_header("X-Harness-Token"), self.server.token):
             raise HarnessError("Missing or invalid session token")
+        board_capability = self._single_header(qalab.BOARD_QA_CAPABILITY_HEADER)
+        if board_capability:
+            if not qalab.board_qa_capability_is_active(
+                board_capability, swarm_lab.where_it_lives(),
+            ):
+                raise HarnessError("Missing or invalid board QA transaction capability")
+            swarm_lab._set_board_qa_request_capability(board_capability)  # noqa: SLF001
 
     def _authorize(self) -> None:
         self._validate_authority()
@@ -1327,11 +1377,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 config = self.server.config
                 query = urllib.parse.parse_qs(parsed.query)
                 wanted = (query.get("name", [""])[0] or "").strip()
+                recover_missing = (
+                    (query.get("recover_missing", [""])[0] or "").strip() == "1"
+                )
                 # Reading takes the lock as well. A read that does not wait for
                 # a write is a read that can see half of one.
                 with self.server.pipelines_lock:
                     saved_now, saved_problems = pipeline_lab.saved_inventory(config)
-                    selected_name = wanted or (saved_now[0] if saved_now else "")
+                    selected_name = wanted
+                    if not selected_name or (
+                        recover_missing and selected_name not in saved_now
+                    ):
+                        selected_name = saved_now[0] if saved_now else ""
                     kept_now = (
                         pipeline_lab.older_ones(config, selected_name)
                         if selected_name else []
@@ -1568,6 +1625,23 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     else None
                 )
                 self._json({"doing": doing})
+            elif parsed.path == "/api/swarm/goal-queue":
+                self._require_token()
+                self._json({"queue": self.server.swarm_goal_queue_status()})
+            elif parsed.path == "/api/swarm/event-payload":
+                self._require_token()
+                query = urllib.parse.parse_qs(parsed.query)
+                run_id = str(query.get("run_id", [""])[0] or "").strip()
+                if not run_id:
+                    raise HarnessError("An exact durable Swarm run ID is required.")
+                try:
+                    seq = int(query.get("seq", [""])[0])
+                    offset = int(query.get("offset", ["0"])[0])
+                except (TypeError, ValueError) as exc:
+                    raise HarnessError(
+                        "The exact Swarm event sequence and byte offset must be whole numbers."
+                    ) from exc
+                self._json(self.server.swarm_runs.event_payload(run_id, seq, offset))
             elif parsed.path == "/api/swarm/attachment":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -2048,7 +2122,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         name="",
                         title=str(body.get("title") or ""),
                         kind=str(body.get("kind") or "about-this-project"),
-                        body=str(body.get("body") or "")[:vault_lab.MOST_LETTERS],
+                        # Validation belongs in vault.write_one.  Slicing here
+                        # used to report success after silently discarding the
+                        # tail of a long note.
+                        body=str(body.get("body") or ""),
                         tags=[str(tag) for tag in (body.get("tags") or [])][:12],
                         sure=float(body.get("sure") or 0.5),
                         learned=str(body.get("learned") or ""),
@@ -2098,7 +2175,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # What a failure means, in words. Nothing is looked up
                 # anywhere: it reads what the check already said.
                 self._json(explainer.what_it_means(
-                    str(body.get("said") or "")[:20000], kind=str(body.get("kind") or "")
+                    # The request-body boundary is already explicit. Do not
+                    # silently discard the tail here: a recognisable failure
+                    # marker may occur after a long build log.
+                    str(body.get("said") or ""), kind=str(body.get("kind") or "")
                 ).to_dict())
             elif self.path == "/api/projects/add":
                 one = projects_lab.add(str(body.get("path") or ""))
@@ -2184,6 +2264,79 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self.server.swarm_lock.release()
                     self.server.run_lock.release()
                     self.server.pipeline_lock.release()
+            elif self.path == "/api/swarm/verification-approval":
+                # This is deliberately separate from the general board-save
+                # endpoint. A visible approval press names the exact project,
+                # path, board version, and freshly discovered command digest;
+                # a portable/imported JSON field is never sufficient by itself.
+                with self.server.swarm_lock:
+                    stopping = self.server.swarm_change_pause_reason()
+                    if stopping:
+                        raise swarm_lab.SwarmError(stopping)
+                    project_id = str(body.get("project_id") or "").strip()
+                    project_path = str(body.get("project_path") or "")
+                    approved_value = body.get("approved")
+                    board_version = body.get("board_version")
+                    if (
+                        not project_id
+                        or not project_path
+                        or not isinstance(approved_value, bool)
+                        or isinstance(board_version, bool)
+                        or not isinstance(board_version, int)
+                    ):
+                        raise swarm_lab.SwarmError(
+                            "Choose one current board project and whether to approve or revoke its exact test commands."
+                        )
+                    board = swarm_lab.load()
+                    if board.version != board_version:
+                        raise swarm_lab.SwarmError(
+                            "The board changed before this command decision landed. Review the current project commands again."
+                        )
+                    project = next(
+                        (one for one in board.projects if one.id == project_id), None
+                    )
+                    if project is None or project.path != project_path:
+                        raise swarm_lab.SwarmError(
+                            "That project or its folder path changed. Review the current project commands again."
+                        )
+                    if approved_value:
+                        proposal = swarm_work.verification_command_approval(
+                            self.server.config, project.to_dict()
+                        )
+                        supplied = str(body.get("approval_digest") or "").lower()
+                        current = str(proposal.get("approval_digest") or "")
+                        if (
+                            not proposal.get("requires_approval")
+                            or not proposal.get("can_approve")
+                            or not supplied
+                            or not secrets.compare_digest(supplied, current)
+                        ):
+                            raise swarm_lab.SwarmError(
+                                "The project path or discovered test commands changed. Nothing was approved; refresh and review the exact commands again."
+                            )
+                        project.approved_test_command_digest = current
+                        note = (
+                            "Approved only the exact test commands shown for "
+                            f"{project_path}. A path or command change revokes this automatically."
+                        )
+                    else:
+                        project.approved_test_command_digest = ""
+                        note = (
+                            f"Revoked discovered test-command approval for {project_path}. "
+                            "Nexus will not run those commands until they are reviewed and approved again."
+                        )
+                    swarm_lab.save(
+                        board.to_dict(),
+                        self.server.config,
+                        allow_command_approval_changes=True,
+                    )
+                    said = self.server.swarm_standing(refresh_providers=False)
+                    said["what_is_not_ready"] = swarm_lab.what_is_not_ready(
+                        self.server.config, said
+                    )
+                    said["verification_command_approval_note"] = note
+                    self.server.decorate_swarm_authority(said)
+                self._json(said)
             elif self.path == "/api/swarm/save":
                 # The whole board at once. It is one small picture, and saving
                 # it whole means the panel can never leave a line pointing at a
@@ -2250,6 +2403,19 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         str(body.get("chat") or ""),
                     )
                 self._json(said)
+            elif self.path == "/api/swarm/goal-queue/start":
+                request_id = str(body.get("request_id") or uuid.uuid4().hex)
+                with self.server.swarm_lock:
+                    standing = self.server.swarm_standing(refresh_providers=False)
+                    queue = self.server.swarm_goal_queue.start(
+                        standing["board"], request_id
+                    )
+                self._json({"queue": queue})
+            elif self.path == "/api/swarm/goal-queue/cancel":
+                queue = self.server.swarm_goal_queue.cancel(
+                    str(body.get("queue_id") or "")
+                )
+                self._json({"queue": queue})
             elif self.path == "/api/swarm/say":
                 # No board lock while it waits for an answer: an assistant can
                 # take a minute, and holding the lock that long would freeze
@@ -2292,6 +2458,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 requested_mode = str(body.get("mode") or "auto")
                 work_text = None
                 work_answers = body.get("user_answers")
+                goal_queue_id = str(body.get("goal_queue_id") or "")
+                goal_item_id = str(body.get("goal_item_id") or "")
+                goal_queue_claimed = False
                 try:
                     # Project-work text is domain authority for mutation and
                     # resume. Reject it before accepting a durable run,
@@ -2336,6 +2505,53 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             str(conversation.get("filed_as") or "") if conversation
                             else one.filed_as_name or swarm_lab.filed_as(one.name)
                         )
+                        if (
+                            requested_mode == "work"
+                            and not goal_queue_id
+                            and str(body.get("resume_session_id") or "")
+                        ):
+                            # A freshly reloaded renderer may expose the signed
+                            # per-chat recovery before its independent queue
+                            # status request finishes. Reattach that resume on
+                            # the server by exact token/objective/team/project;
+                            # never depend on browser timing to advance the
+                            # board-wide cursor.
+                            active_queue = self.server.swarm_goal_queue_status()
+                            queued = (active_queue or {}).get("current") or {}
+                            if (
+                                (active_queue or {}).get("status") == "paused"
+                                and str(queued.get("resume_token") or "")
+                                == str(body.get("resume_session_id") or "")
+                                and str(queued.get("objective") or "") == str(work_text)
+                                and str(queued.get("lead_id") or "") == agent_id
+                                and str(queued.get("peer_id") or "") == peer_id
+                                and str(queued.get("project_id") or "") == project_id
+                            ):
+                                goal_queue_id = str(active_queue["queue_id"])
+                                goal_item_id = str(queued["id"])
+                                body["board_goal"] = True
+                        if goal_queue_id or goal_item_id:
+                            if (
+                                requested_mode != "work"
+                                or body.get("board_goal") is not True
+                                or not goal_queue_id
+                                or not goal_item_id
+                            ):
+                                raise swarm_lab.SwarmError(
+                                    "A durable board-goal identity is valid only for explicit board project work."
+                                )
+                            self.server.swarm_goal_queue.claim(
+                                goal_queue_id,
+                                goal_item_id,
+                                objective=str(work_text),
+                                agent_id=agent_id,
+                                peer_id=peer_id,
+                                project_id=project_id,
+                                conversation_id=str(conversation.get("id") or "")
+                                if conversation else "",
+                                request_id=request_id,
+                            )
+                            goal_queue_claimed = True
                         objective = CredentialRedactor(config).text(
                             str(body.get("text") or "")
                         )
@@ -2357,6 +2573,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         run_id = str(accepted["run_id"])
                         if not created:
                             if accepted.get("result") is not None:
+                                if goal_queue_claimed:
+                                    self.server.swarm_goal_queue.record_result(
+                                        goal_queue_id, goal_item_id,
+                                        accepted["result"],
+                                        run_id=str(accepted.get("run_id") or ""),
+                                    )
                                 self._json(accepted["result"])
                             else:
                                 self._json({
@@ -2414,8 +2636,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         allow_partial_lead_answer = bool(
                             decision.get("pair_chat_implicit_collaboration")
                         )
-                    elif mode == "work" and not swarm_work.mentions_project_scope(
-                        str(body.get("text") or "")
+                    elif (
+                        mode == "work"
+                        and body.get("board_goal") is not True
+                        and not swarm_work.mentions_project_scope(
+                            str(body.get("text") or "")
+                        )
                     ):
                         # The project-work button grants mutation authority; it
                         # cannot turn an unrelated identity/message question
@@ -2491,6 +2717,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             resume_session_id=str(body.get("resume_session_id") or ""),
                             user_answers=work_answers,
                             allowed_write_roots=body.get("allowed_write_roots"),
+                            reset_context_tool_execution_budget=(
+                                body.get("reset_context_tool_execution_budget") is True
+                            ),
                         )
                     elif mode == "chat":
                         progress(
@@ -2543,6 +2772,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         run_id, "response_ready", response
                     )
                     run_store.finish(run_id, response)
+                    if goal_queue_claimed:
+                        self.server.swarm_goal_queue.record_result(
+                            goal_queue_id, goal_item_id, response, run_id=run_id
+                        )
                     self._json(response)
                 except Exception as exc:
                     if isinstance(exc, swarm_work.ResumableSwarmError):
@@ -2561,6 +2794,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         if run_id:
                             run_store.checkpoint(run_id, "paused", response)
                             run_store.finish(run_id, response)
+                        if goal_queue_claimed:
+                            self.server.swarm_goal_queue.record_result(
+                                goal_queue_id, goal_item_id, response, run_id=run_id
+                            )
                         self._json(response)
                         return
                     stopped = isinstance(exc, cancellation.ChatCancelled)
@@ -2572,6 +2809,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     )
                     if run_id:
                         run_store.fail(run_id, str(exc), stopped=stopped)
+                    if goal_queue_claimed:
+                        self.server.swarm_goal_queue.record_failure(
+                            goal_queue_id, goal_item_id, str(exc)
+                        )
                     if (
                         chat_owned and not answer_saved
                         and config is not None and one is not None
@@ -2710,9 +2951,33 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 folder = str(body.get("folder") or "").strip()
                 if not folder:
                     raise HarnessError("Which project folder's page? None was named.")
-                held = pages_lab.read_the_page(
-                    self.server.config, folder, str(body.get("name") or ""))
-                self._json(held.to_dict())
+                try:
+                    before = int(body.get("before") or 0)
+                    page_limit = int(body.get("limit") or 20)
+                except (TypeError, ValueError) as exc:
+                    raise HarnessError("The shared-page window is invalid.") from exc
+                held = pages_lab.page_window(
+                    self.server.config,
+                    folder,
+                    str(body.get("name") or ""),
+                    before=before,
+                    limit=page_limit,
+                )
+                self._json(held)
+            elif self.path == "/api/swarm/page-part":
+                from . import pages as pages_lab
+
+                folder = str(body.get("folder") or "").strip()
+                if not folder:
+                    raise HarnessError("Which project folder's page? None was named.")
+                try:
+                    number = int(body.get("number") or 0)
+                except (TypeError, ValueError) as exc:
+                    raise HarnessError("The shared-page part number is invalid.") from exc
+                self._json(pages_lab.page_part(
+                    self.server.config, folder, number,
+                    str(body.get("name") or ""),
+                ))
             elif self.path == "/api/swarm/where-it-stands":
                 from . import pages as pages_lab
 
@@ -2732,6 +2997,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     self.server.config,
                     str(body.get("folder") or "").strip(),
                     who=str(body.get("who") or "You"),
+                    author_id="person",
                     text=str(body.get("text") or ""),
                     what_they_were_doing="typed in by the person",
                     after=int(body.get("after") or 0),
@@ -2760,7 +3026,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     ) from exc
                 if len(raw_bytes) > swarm_lab.MAX_SAVED_BOARD_DOCUMENT_BYTES:
                     raise HarnessError(
-                        "A saved-board JSON file may be at most 10000000 UTF-8 bytes. "
+                        f"A saved-board JSON file may be at most "
+                        f"{swarm_lab.MAX_SAVED_BOARD_DOCUMENT_BYTES:,} UTF-8 bytes. "
                         "Nothing was imported."
                     )
                 try:

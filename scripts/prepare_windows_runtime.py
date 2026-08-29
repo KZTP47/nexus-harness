@@ -24,9 +24,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DESKTOP = ROOT / "desktop"
 LOCK = ROOT / "requirements-runtime.lock"
 PLAYWRIGHT_LOCK = ROOT / "runtime-playwright.lock.json"
-PYTHON_VERSION = "3.11.9"
-PYTHON_URL = f"https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-embed-amd64.zip"
-PYTHON_SHA256 = "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b"
+sys.path.insert(0, str(ROOT / "src"))
+from our_harness.verification_python import (  # noqa: E402
+    PYTHON_SHA256, PYTHON_URL, PYTHON_VERSION,
+)
 RUNTIME_LOCK = DESKTOP / ".runtime-build.lock"
 RUNTIME_PUBLISH_TIMEOUT_SECONDS = 300.0
 
@@ -293,6 +294,7 @@ for dist in importlib.metadata.distributions(path=[site]):
 if missing:
     raise SystemExit("\n".join(sorted(missing)))
 from langgraph.graph import StateGraph
+import pytest
 print(f"private runtime imports ok: {len(installed)} locked distributions")
 '''
     probe = output / "validate_runtime.py"

@@ -164,6 +164,28 @@ class InPlainWordsTests(TeamTestCase):
 
 
 class WhatIsInTheWayTests(TeamTestCase):
+    def test_a_custom_prompt_beyond_the_old_limit_is_kept_exactly(self) -> None:
+        prompt = "  " + ("work carefully 🧭\n" * 3_000) + "  "
+        self.assertGreater(len(prompt), 4_000)
+        checked = team.check_a_custom_member({
+            "label": "Planner", "job": "planner", "asking": "set-prompt",
+            "prompt": prompt,
+        })
+        self.assertEqual(checked["prompt"], prompt)
+
+    def test_an_over_limit_custom_prompt_is_rejected_without_mutation(self) -> None:
+        prompt = "x" * 100_001
+        given = {
+            "label": "Planner", "job": "planner", "asking": "set-prompt",
+            "prompt": prompt,
+        }
+        with self.assertRaises(team.TeamError) as caught:
+            team.check_a_custom_member(given)
+        self.assertIn("100,001", str(caught.exception))
+        self.assertIn("100,000", str(caught.exception))
+        self.assertIn("did not truncate", str(caught.exception))
+        self.assertEqual(given["prompt"], prompt)
+
     def test_a_job_given_to_nobody_is_named(self) -> None:
         with self.both():
             graph = team.a_starting_team(self.config)

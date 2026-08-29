@@ -21,7 +21,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from our_harness import pipelines, server
+from our_harness import pipelines, qa, server
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 
 
@@ -293,6 +293,36 @@ class KeepingThemThroughThePanelTests(PanelTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(gone["saved"], [])
 
+    def test_inventory_endpoint_recovers_dead_qa_and_surfaces_displaced_bytes(self) -> None:
+        original = pipelines.a_starting_pipeline()
+        original["name"] = "Before QA"
+        pipelines.save(self.panel.config, original)
+        transaction = qa._begin_pipeline_preservation(self.root, "dead-panel-qa")
+        changed = copy.deepcopy(original)
+        changed["name"] = "Edited while QA was dead"
+        pipelines.file_for(self.panel.config, "Before QA").write_text(
+            json.dumps(changed), encoding="utf-8"
+        )
+        added = pipelines.a_starting_pipeline()
+        added["name"] = "Saved after QA died"
+        pipelines.save(self.panel.config, added)
+
+        status, listed = self.ask("/api/pipelines")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["saved"], ["Before QA"])
+        self.assertEqual(len(listed["saved_problems"]), 1)
+        self.assertIn(str(transaction), listed["saved_problems"][0])
+        displaced = transaction / "displaced-after-interruption"
+        self.assertEqual(
+            json.loads((displaced / "before-qa.json").read_text(encoding="utf-8"))["name"],
+            "Edited while QA was dead",
+        )
+        self.assertEqual(
+            json.loads((displaced / "saved-after-qa-died.json").read_text(encoding="utf-8"))["name"],
+            "Saved after QA died",
+        )
+
     def test_reopening_the_panel_selects_and_loads_a_real_saved_automation(self) -> None:
         existing = pipelines.a_starting_pipeline()
         existing["name"] = "Already on disk"
@@ -392,6 +422,34 @@ class KeepingThemThroughThePanelTests(PanelTestCase):
         status, said = self.ask("/api/pipelines?name=Nothing")
         self.assertEqual(status, 400)
         self.assertIn("no pipeline called", said["error"])
+
+    def test_panel_can_recover_when_its_selected_automation_was_removed(self) -> None:
+        first = pipelines.a_starting_pipeline()
+        first["name"] = "First survivor"
+        second = pipelines.a_starting_pipeline()
+        second["name"] = "Selected elsewhere"
+        pipelines.save(self.panel.config, first)
+        pipelines.save(self.panel.config, second)
+        pipelines.remove(self.panel.config, second["name"])
+
+        status, recovered = self.ask(
+            "/api/pipelines?recover_missing=1&name=Selected%20elsewhere"
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(recovered["saved"], ["First survivor"])
+        self.assertEqual(recovered["selected_name"], "First survivor")
+        self.assertEqual(recovered["pipeline"]["name"], "First survivor")
+
+    def test_panel_recovers_to_the_starter_when_no_saved_automation_survives(self) -> None:
+        status, recovered = self.ask(
+            "/api/pipelines?recover_missing=1&name=Removed%20elsewhere"
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(recovered["saved"], [])
+        self.assertEqual(recovered["selected_name"], "")
+        self.assertEqual(recovered["pipeline"]["name"], "First pipeline")
 
     def test_a_name_that_would_climb_out_of_the_folder_is_refused(self) -> None:
         for bad in ("../escape", "/etc/passwd", "a/b"):

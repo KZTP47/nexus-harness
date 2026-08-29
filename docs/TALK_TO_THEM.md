@@ -25,8 +25,19 @@ If the list is empty, open **Your team** and press **Set them up**.
 It is a conversation, not a row of unrelated questions: what was said before
 goes with the next thing you say, so "and in three words?" means something.
 
-It is kept, so you can close the panel and carry on tomorrow. The last forty
-turns are held; older ones drop off the top.
+It is kept, so you can close the panel and carry on tomorrow. Every canonical
+turn remains on disk. The ordinary chat panel and its next provider request use
+the most recent 40 complete turns as a projection; that display/request bound
+does not delete the older turns.
+
+Long-horizon team work keeps its full canonical history in the append-only,
+paged collaboration ledger. Every discussion, planning, execution,
+verification, and final-synthesis request uses the same disclosed projection:
+up to 120,000 characters of the newest complete turns plus a deterministic
+semantic summary of older requirements, decisions, facts, blockers, paths, and
+checkpoints, bounded at 40,000 characters. Those two numbers bound what is sent
+to a provider in one request; they are not retention limits and Nexus never
+clips a turn in the middle.
 
 **Enter** sends. **Shift and Enter** starts a new line.
 
@@ -51,7 +62,9 @@ what went wrong.
 
 ## What it will not do
 
-- **It cannot read your files.** Paste what you want it to see.
+- **It reads only what you explicitly give it authority to read.** Attach a
+  file, point it at project material through a project-working feature, or
+  paste the relevant text. It does not silently roam outside that boundary.
 - **It cannot run anything, or change anything.** Everything that changes your
   project goes through a run, where there is a record of it.
 - **It never keeps a credential.** Everything you type and everything it says
@@ -65,10 +78,15 @@ what went wrong.
 
 | | |
 | --- | --- |
-| One message | 6,000 letters. Longer belongs in the project, with the message pointing at it |
-| One conversation | The last 40 turns |
-| One answer | 20,000 letters, and 3 minutes to arrive |
+| One message | 200,000 characters. An over-limit message is rejected with its measured size and is never silently shortened; attach or point at a file for larger source material |
+| Stored conversation | Every canonical turn remains durable. Ordinary Talk projects the newest 40 complete turns into its screen/provider request; long-horizon work uses the disclosed 120,000-character recent projection plus 40,000-character semantic summary while preserving the full ledger |
+| One canonical answer | 8,000,000 characters. Overflow is a visible failure, never a plausible-looking truncated success |
+| Time to answer | The effective timeout comes from the selected route/provider configuration and is shown by Nexus. The current global safety maximum is 600 seconds; web-chat bridges use their own disclosed configured wait. There is no universal short cutoff |
 | Ask all of them | Up to 6 at once |
+
+A provider or model can have a smaller context or output window than Nexus.
+Nexus cannot enlarge that external limit, but it reports the provider's
+redacted reason instead of hiding the failure or silently discarding text.
 
 ---
 

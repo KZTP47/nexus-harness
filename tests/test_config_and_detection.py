@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,9 +11,12 @@ from unittest.mock import patch
 
 from our_harness.config import (
     DEFAULT_CONFIG,
+    PROJECT_RUNTIME_IGNORE_FOOTER,
+    PROJECT_RUNTIME_IGNORE_LINES,
     RESOURCE_LIMIT_MAXIMA,
     SHARED_NON_ESCALATING_LIMITS,
     HarnessError,
+    ensure_private_runtime_ignores,
     load_config,
     load_isolated_config,
     trust_project_local_config,
@@ -23,6 +27,21 @@ from our_harness.providers import create_embedding_provider
 
 
 class ConfigTests(unittest.TestCase):
+    @staticmethod
+    def _make_directory_link(link: Path, target: Path) -> None:
+        if os.name == "nt":
+            made = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+            if made.returncode != 0:
+                raise unittest.SkipTest(
+                    "This Windows host cannot create a directory reparse point: "
+                    + made.stderr.decode(errors="replace")
+                )
+        else:
+            link.symlink_to(target, target_is_directory=True)
+
     def test_custom_test_evidence_contract_is_strict_and_requires_local_trust(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -245,6 +264,29 @@ class ConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(HarnessError, "must not exceed"):
+                load_config(root)
+
+    def test_context_tool_execution_time_is_unlimited_by_default_and_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".harness").mkdir()
+            self.assertEqual(
+                load_config(root).get("workflow.context_tool_execution_seconds"), 0
+            )
+            shared = root / ".harness" / "config.json"
+            shared.write_text(json.dumps({
+                "workflow": {"context_tool_execution_seconds": 7200}
+            }), encoding="utf-8")
+            self.assertEqual(
+                load_config(root).get("workflow.context_tool_execution_seconds"),
+                7200,
+            )
+            shared.write_text(json.dumps({
+                "workflow": {"context_tool_execution_seconds": -1}
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(
+                HarnessError, "workflow.context_tool_execution_seconds"
+            ):
                 load_config(root)
 
     def test_project_local_environment_and_cli_precedence(self) -> None:
@@ -661,6 +703,223 @@ class ConfigTests(unittest.TestCase):
             self.assertIn("custom-entry", ignore_text)
             self.assertIn("config.local.json", ignore_text)
             self.assertIn("checkpoints/", ignore_text)
+
+    def test_init_gitignore_keeps_runtime_private_and_definitions_trackable(self) -> None:
+        """Every known in-project writer is classified on a fresh checkout."""
+
+        private = (
+            "config.local.json",
+            "project-authority.json",
+            "memory/harness.db",
+            "runs/run.json",
+            "backups/tx/manifest.json",
+            "checkpoints/resume.zip",
+            "cache/provider.json",
+            "runtime/resident.sqlite3",
+            "bundles/evidence.zip",
+            "chats/agent.json",
+            "pages/shared.json",
+            "vault/lesson.md",
+            "swarm-mutation-sagas/saga.json",
+            "transaction.lock",
+            "desktop-deployment.lock",
+            "desktop-deployment.owner.json",
+            "qa/runs/run/result.json",
+            "qa/tmp/browser.js",
+            "qa/history.json",
+            "qa/candidates.json",
+            "qa/pipeline-preservation.lock",
+            "qa/pipelines-before-checks/tx/journal.json",
+            "qa/final-swarm-report.json",
+            "pipelines/last-run.json",
+            "pipelines/evidence/run/assistant-output.json",
+            "pipelines/drafts/generated.json",
+            "timers/.what-happened.json",
+            "timers/what-happened.json",
+            "timers/.what-happened.json.could-not-be-read",
+            "timers/running.lock",
+            "pipelines/nightly.json.123.part",
+            "workflows/release.tmp",
+        )
+        shared = (
+            "config.json",
+            "project.json",
+            "qa/suite.json",
+            "qa/workflows.json",
+            "qa/environments.json",
+            "qa/baselines/home.png",
+            "pipelines/nightly.json",
+            "pipelines/before/nightly.json",
+            "timers/nightly.json",
+            "telling/ops.json",
+            "workflows/release.json",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(
+                ["git", "init", "--quiet", str(root)], check=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            with patch(
+                "our_harness.config.project_trust_store_path",
+                return_value=root / "test-trust.json",
+            ):
+                write_default_project_config(
+                    root, "ollama", "coder", "http://127.0.0.1:11434",
+                )
+
+            for relative in (*private, *shared):
+                path = root / ".harness" / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    path.write_text("private or shared fixture\n", encoding="utf-8")
+
+            def is_ignored(relative: str) -> bool:
+                checked = subprocess.run(
+                    [
+                        "git", "-C", str(root), "check-ignore", "--quiet",
+                        "--no-index", "--", f".harness/{relative}",
+                    ],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+                self.assertIn(checked.returncode, (0, 1), checked.stderr.decode(errors="replace"))
+                return checked.returncode == 0
+
+            for relative in private:
+                with self.subTest(private=relative):
+                    self.assertTrue(is_ignored(relative))
+            for relative in shared:
+                with self.subTest(shared=relative):
+                    self.assertFalse(is_ignored(relative))
+
+    def test_init_reasserts_private_rule_after_existing_negation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / ".harness"
+            harness.mkdir()
+            (harness / ".gitignore").write_text(
+                "custom-entry\npipelines/evidence/\n!pipelines/evidence/\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "our_harness.config.project_trust_store_path",
+                return_value=root / "test-trust.json",
+            ):
+                write_default_project_config(
+                    root, "ollama", "coder", "http://127.0.0.1:11434",
+                )
+            lines = (harness / ".gitignore").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[-1], PROJECT_RUNTIME_IGNORE_FOOTER)
+            self.assertGreater(
+                max(index for index, line in enumerate(lines) if line == "pipelines/evidence/"),
+                max(index for index, line in enumerate(lines) if line == "!pipelines/evidence/"),
+            )
+
+    def test_loading_existing_project_migrates_ignore_append_only_and_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            harness = root / ".harness"
+            harness.mkdir()
+            config_path = harness / "config.json"
+            config_path.write_text("{}\n", encoding="utf-8")
+            ignore_path = harness / ".gitignore"
+            original = (
+                "# Keep this project-specific comment\n"
+                "custom-private-folder/\n"
+                "pipelines/evidence/\n"
+                "!pipelines/evidence/\n"
+            )
+            ignore_path.write_text(original, encoding="utf-8")
+            missing_user = root / "missing-user-config.json"
+            with (
+                patch("our_harness.config.user_config_path", return_value=missing_user),
+                patch(
+                    "our_harness.config.project_trust_store_path",
+                    return_value=root / "missing-trust.json",
+                ),
+            ):
+                loaded = load_config(root)
+                self.assertEqual(loaded.project_root, root.resolve())
+                first = ignore_path.read_text(encoding="utf-8")
+                self.assertTrue(first.startswith(original))
+                self.assertIn("custom-private-folder/", first)
+                self.assertGreater(
+                    first.rfind("pipelines/evidence/"),
+                    first.rfind("!pipelines/evidence/"),
+                )
+                self.assertEqual(config_path.read_text(encoding="utf-8"), "{}\n")
+                load_config(root)
+                self.assertEqual(ignore_path.read_text(encoding="utf-8"), first)
+
+    def test_existing_project_migration_rejects_linked_harness_before_any_io(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "project"
+            external = base / "external-harness"
+            root.mkdir()
+            external.mkdir()
+            sentinel = external / ".gitignore"
+            original = b"EXTERNAL SENTINEL\x00must stay byte-identical\n"
+            sentinel.write_bytes(original)
+            (external / "config.json").write_text("{}\n", encoding="utf-8")
+            self._make_directory_link(root / ".harness", external)
+
+            with self.assertRaisesRegex(HarnessError, "Linked path components"):
+                load_config(root)
+            self.assertEqual(sentinel.read_bytes(), original)
+            self.assertFalse(list(external.glob(".gitignore.*.part")))
+            with self.assertRaisesRegex(HarnessError, "Linked path components"):
+                write_default_project_config(
+                    root, "ollama", "coder", "http://127.0.0.1:11434",
+                )
+            self.assertEqual(sentinel.read_bytes(), original)
+            self.assertFalse(list(external.glob(".gitignore.*.part")))
+
+    def test_existing_project_migration_rejects_linked_ignore_before_read_or_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "project"
+            harness = root / ".harness"
+            external = base / "external-ignore"
+            harness.mkdir(parents=True)
+            external.mkdir()
+            (harness / "config.json").write_text("{}\n", encoding="utf-8")
+            sentinel = external / "sentinel.bin"
+            original = b"EXTERNAL IGNORE SENTINEL\x00must stay byte-identical\n"
+            sentinel.write_bytes(original)
+            linked_ignore = harness / ".gitignore"
+            if os.name == "nt":
+                # A junction is a Windows reparse point and does not require
+                # Developer Mode or symlink privileges on supported hosts.
+                self._make_directory_link(linked_ignore, external)
+            else:
+                linked_ignore.symlink_to(sentinel)
+
+            with self.assertRaisesRegex(HarnessError, "Linked path components"):
+                load_config(root)
+            self.assertEqual(sentinel.read_bytes(), original)
+            self.assertTrue(linked_ignore.is_symlink() or linked_ignore.exists())
+            self.assertFalse(list(harness.glob(".gitignore.*.part")))
+
+    def test_ignore_migration_can_be_called_directly_for_an_existing_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".harness").mkdir()
+            path = ensure_private_runtime_ignores(root)
+            self.assertEqual(path, root / ".harness" / ".gitignore")
+            self.assertEqual(
+                set(PROJECT_RUNTIME_IGNORE_LINES)
+                - set(path.read_text(encoding="utf-8").splitlines()),
+                set(),
+            )
+
+    def test_repository_gitignore_matches_the_init_privacy_contract(self) -> None:
+        repository_ignore = (
+            Path(__file__).resolve().parents[1] / ".harness" / ".gitignore"
+        ).read_text(encoding="utf-8").splitlines()
+        for entry in PROJECT_RUNTIME_IGNORE_LINES:
+            with self.subTest(entry=entry):
+                self.assertIn(entry, repository_ignore)
 
     def test_init_keeps_remote_provider_route_only_in_ignored_local_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

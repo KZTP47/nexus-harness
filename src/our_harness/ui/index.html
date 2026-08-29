@@ -398,7 +398,8 @@
           <label for="nodeProvider">Provider route</label><select id="nodeProvider"></select>
           <label for="nodeModel">Model</label><input id="nodeModel" type="text" list="modelSuggestions" maxlength="256">
           <label for="nodeRoleName">Role</label><input id="nodeRoleName" type="text" maxlength="256">
-          <label for="nodePrompt">System prompt</label><textarea id="nodePrompt" rows="6" maxlength="32000"></textarea>
+          <label for="nodePrompt">System prompt</label><textarea id="nodePrompt" rows="6" aria-describedby="nodePromptCount"></textarea>
+          <p id="nodePromptCount" class="field-help prompt-count" role="status">0 / 100,000 characters. Text is never clipped.</p>
           <fieldset><legend>Capabilities</legend><div id="nodeCapabilities" class="check-list"></div></fieldset>
           <div id="mergeFields" hidden><label for="mergeSlots">Required merge slots</label><input id="mergeSlots" type="text" placeholder="implementation, review"><label for="mergeOutput">Output state field</label><input id="mergeOutput" type="text"></div>
         </div>
@@ -453,10 +454,11 @@
           <button id="pipelineImport" type="button">Import JSON</button>
           <button id="pipelineExport" type="button">Export JSON</button>
           <input id="pipelineImportFile" class="sr-only" type="file"
-                 accept="application/json,.json" tabindex="-1" aria-hidden="true">
+                 accept="application/json,.json" tabindex="-1" aria-hidden="true"
+                 aria-label="Choose an automation JSON file to import">
           <button id="pipelineRun" class="primary" type="button">Run</button>
           <button id="pipelineStop" type="button" disabled>Stop</button>
-          <button id="pipelineDelete" class="danger" type="button">Delete saved automation</button>
+          <button id="pipelineDelete" class="danger" type="button" disabled>Delete saved automation</button>
         </div>
         <p class="hint">Automation JSON files can be up to 10 MB.</p>
       </div>
@@ -509,6 +511,7 @@
         <div class="pipeline-bar-fields">
           <label for="pipelineName">Name</label>
           <input id="pipelineName" type="text" maxlength="64" value="First pipeline">
+          <p id="pipelineDirtyState" class="pipeline-dirty-state" role="status">Loading automation…</p>
           <button id="pipelineCheck" type="button">Check it</button>
         </div>
       </div>
@@ -716,6 +719,21 @@
     </form>
   </dialog>
 
+  <dialog id="longTextDialog" aria-labelledby="longTextDialogTitle">
+    <form method="dialog" class="dialog-form">
+      <h2 id="longTextDialogTitle">Add to the page</h2>
+      <p id="longTextDialogWhy" class="hint"></p>
+      <label for="longTextDialogInput">What you want to add</label>
+      <textarea id="longTextDialogInput" rows="10"
+        aria-describedby="longTextDialogCount"></textarea>
+      <p id="longTextDialogCount" class="field-help" role="status"></p>
+      <div class="button-row">
+        <button id="longTextDialogOk" class="primary" type="submit" value="ok">Add it</button>
+        <button id="longTextDialogCancel" type="submit" value="cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="pipelineAskDialog" aria-labelledby="pipelineAskDialogTitle">
     <form id="pipelineAskForm" method="dialog">
       <h2 id="pipelineAskDialogTitle">Before this runs</h2>
@@ -725,6 +743,20 @@
       <div class="dialog-buttons">
         <button id="pipelineAskCancel" type="button">Cancel</button>
         <button id="pipelineAskRun" class="primary" type="button">Run it</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="pipelineUnsavedDialog" aria-labelledby="pipelineUnsavedTitle"
+          aria-describedby="pipelineUnsavedWhy">
+    <form method="dialog">
+      <h2 id="pipelineUnsavedTitle">Unsaved changes</h2>
+      <p id="pipelineUnsavedWhy">Save this automation before replacing the drawing?</p>
+      <p id="pipelineUnsavedSaid" class="form-error" role="alert" tabindex="-1" hidden></p>
+      <div class="dialog-buttons">
+        <button id="pipelineUnsavedCancel" value="cancel" type="submit">Cancel</button>
+        <button id="pipelineUnsavedDiscard" value="discard" class="danger" type="submit">Discard changes</button>
+        <button id="pipelineUnsavedSave" class="primary" type="button">Save and continue</button>
       </div>
     </form>
   </dialog>
@@ -820,7 +852,8 @@
       <h2 id="swarmSideTitle">The board</h2>
       <p class="hint">Your agents, the projects they work on, and which of them may talk
         to each other. Every box has its own settings and its own chat. Every line has a
-        gear. Nothing reaches an assistant until you press Set them going.</p>
+        gear. Nothing reaches an assistant until you deliberately start goal work, advice,
+        or a chat.</p>
 
       <h3 id="swarmKeptTitle">Saved boards</h3>
     <p class="hint">The board you have open comes back the next time Nexus starts,
@@ -831,24 +864,34 @@
       <button id="swarmKeep" type="button">Save this board</button>
       <button id="swarmImport" type="button">Import JSON</button>
       <input id="swarmImportFile" class="sr-only" type="file"
-             accept="application/json,.json" tabindex="-1" aria-hidden="true">
+             accept="application/json,.json" tabindex="-1" aria-hidden="true"
+             aria-label="Choose a board JSON file to import">
     </div>
     <ul id="swarmKept" class="swarm-kept" aria-labelledby="swarmKeptTitle"></ul>
     <p id="swarmKeptProblems" class="swarm-kept-problems" role="status" hidden></p>
-    <p class="hint">Board JSON files can be up to 10 MB.</p>
+    <p class="hint">Board JSON files can be up to 768 MB, enough for every valid board field.</p>
 
     <h3 id="swarmChatsTitle">Chats</h3>
       <p class="hint">Every conversation on this board: yours with each agent, and
         what the agents passed to each other. Press one to open it.</p>
       <ul id="swarmChats" class="swarm-chats" aria-labelledby="swarmChatsTitle"></ul>
 
-      <h3 id="swarmSetGoingTitle">Set them going</h3>
-      <p class="hint">Every agent is asked about the projects it is on, one at a
-        time. Those allowed to talk are then shown what the others said and asked
-        again. What each one says lands in its own chat.</p>
+      <h3 id="swarmGoalWorkTitle">Achieve the goals</h3>
+      <p class="hint">Connected agents plan, edit, test, review, and repair each written
+        project goal. Nexus keeps the run resumable and does not call it complete until
+        deterministic verification passes.</p>
       <div class="button-row">
-        <button id="swarmStart" class="primary" type="button">Set them going</button>
-        <button id="swarmStop" type="button">Stop</button>
+        <button id="swarmWorkGoals" class="primary" type="button">Work until the goals are achieved</button>
+        <button id="swarmCancelGoals" type="button">Cancel remaining goals</button>
+      </div>
+      <p id="swarmGoalWorkSaid" class="hint operational-status" role="status" aria-live="polite"></p>
+
+      <h3 id="swarmSetGoingTitle">Get advice only</h3>
+      <p class="hint">This optional mode asks every agent for an independent opinion,
+        then shows connected agents what the others said. It does not edit or test files.</p>
+      <div class="button-row">
+        <button id="swarmStart" type="button">Get two-round advice</button>
+        <button id="swarmStop" type="button">Stop advice run</button>
       </div>
       <p id="swarmDoingSaid" class="hint operational-status" role="status" aria-live="polite"></p>
       <p id="swarmScopePreview" class="scope-preview">Nothing is included until an agent and its project are ready.</p>
@@ -1060,9 +1103,11 @@
 
       <details id="thePage" class="swarm-exchange">
         <summary id="thePageTitle">The page they share</summary>
-        <p class="hint">One page for each project folder. Every agent reads the
-          whole page before it says anything and adds to the bottom, so nobody
-          is ever talking over anybody. Nothing on it is written over.</p>
+        <p class="hint">One canonical page for each project folder. Nothing on it is
+          deleted or written over. Agents receive every authorised part when it fits; for
+          larger histories Nexus supplies complete recent parts plus the exact immutable,
+          filtered page path and SHA-256 so the rest is recoverable without leaking a
+          disconnected agent's words.</p>
         <div class="button-row">
           <label class="sr-only" for="thePageWhich">Which project's page</label>
           <select id="thePageWhich"></select>
@@ -1071,8 +1116,10 @@
         </div>
         <p id="thePageSaid" class="hint" role="status" aria-live="polite"></p>
         <label for="thePageStands">Where it stands - your block, and every agent reads it</label>
-        <textarea id="thePageStands" rows="2" maxlength="2000"
+        <textarea id="thePageStands" rows="4"
+          aria-describedby="thePageStandsCount"
           placeholder="One sentence to steer all of them at once."></textarea>
+        <p id="thePageStandsCount" class="field-help" role="status"></p>
         <div class="button-row">
           <button id="thePageStandsSave" type="button">Save where it stands</button>
           <button id="thePageAdd" type="button">Add something of my own</button>
@@ -1118,8 +1165,9 @@
         <p id="swarmAgentSessionStatus" class="field-help" role="status" aria-live="polite"></p>
 
         <label for="swarmAgentJob">What it is for</label>
-        <input id="swarmAgentJob" type="text" maxlength="300"
-          placeholder="Reads the change and says what is wrong with it">
+        <textarea id="swarmAgentJob" rows="4" aria-describedby="swarmAgentJobCount"
+          placeholder="Reads the change and says what is wrong with it"></textarea>
+        <p id="swarmAgentJobCount" class="field-help" role="status"></p>
         <p id="swarmAgentSaveState" class="swarm-agent-save-state" role="status"
           aria-live="polite">Changes save automatically.</p>
 
@@ -1199,17 +1247,40 @@
       <div id="swarmProjectPanel" hidden>
         <label for="swarmProjectPath">Folder</label>
         <input id="swarmProjectPath" type="text" readonly>
+        <div class="button-row">
+          <button id="swarmProjectRebind" type="button">Use a different folder on this computer</button>
+        </div>
+        <p class="field-help">Use this after importing a board on another computer. It keeps this project’s tasks, agent assignments, connections, and project identity, but clears machine-local test-command approval.</p>
         <p id="swarmProjectWho" class="hint"></p>
+
+        <fieldset id="swarmProjectVerification" class="swarm-set">
+          <legend>Project test commands</legend>
+          <p class="field-help">Nexus may discover tests from this folder, but it never
+            runs discovered project code until you approve the exact commands below.
+            Approval is tied to this path and command digest; moving the project or
+            changing its test configuration makes Nexus ask again.</p>
+          <p id="swarmProjectVerificationStatus" role="status"></p>
+          <pre id="swarmProjectVerificationCommands" tabindex="0"></pre>
+          <p id="swarmProjectVerificationDigest" class="hint"></p>
+          <div class="button-row">
+            <button id="swarmProjectVerificationApprove" class="primary" type="button">Approve these exact commands</button>
+            <button id="swarmProjectVerificationRevoke" type="button">Revoke approval</button>
+            <button id="swarmProjectVerificationRefresh" type="button">Refresh command list</button>
+          </div>
+          <p class="field-help">Approval stays on this local board. Imported board JSON
+            never carries permission to execute commands.</p>
+        </fieldset>
 
         <fieldset class="swarm-set">
           <legend>Jobs wanted here</legend>
           <ul id="swarmTasks" class="swarm-tasks"></ul>
           <label class="sr-only" for="swarmTaskText">A job to add</label>
-          <div class="button-row">
-            <input id="swarmTaskText" type="text" maxlength="300"
-              placeholder="Make every check pass">
+          <div class="button-row swarm-long-task-row">
+            <textarea id="swarmTaskText" rows="6" aria-describedby="swarmTaskTextCount"
+              placeholder="Describe the complete long-horizon goal. Formatting and line breaks are kept."></textarea>
             <button id="swarmAddTask" type="button">Add this job</button>
           </div>
+          <p id="swarmTaskTextCount" class="field-help" role="status"></p>
         </fieldset>
 
         <div class="button-row">
@@ -1386,8 +1457,9 @@
       <select id="teamCustomAsking"></select>
       <p id="teamCustomAskingMeans" class="hint"></p>
       <label for="teamCustomPrompt">What to tell it</label>
-      <textarea id="teamCustomPrompt" rows="5" maxlength="4000"
+      <textarea id="teamCustomPrompt" rows="5" aria-describedby="teamCustomPromptCount"
         placeholder="Read the change and say whether it really does what was asked."></textarea>
+      <p id="teamCustomPromptCount" class="field-help prompt-count" role="status">0 / 100,000 characters. Text is never clipped.</p>
       <p id="teamCustomSaid" class="hint" role="status"></p>
       <div class="dialog-buttons">
         <button id="teamCustomCancel" type="button">Cancel</button>
@@ -1508,7 +1580,10 @@
       <label for="vaultFormSure">How sure the harness is</label>
       <input id="vaultFormSure" type="range" min="0" max="1" step="0.05" value="0.5">
       <label for="vaultFormBody">The note itself. Link to another with [[its name]].</label>
-      <textarea id="vaultFormBody" rows="10" placeholder="They asked twice for shorter answers. See [[how-this-vault-works]]."></textarea>
+      <textarea id="vaultFormBody" rows="10" aria-describedby="vaultFormBodyCount"
+        placeholder="They asked twice for shorter answers. See [[how-this-vault-works]]."></textarea>
+      <p id="vaultFormBodyCount" class="field-help prompt-count" role="status">0 / 200,000 characters. Text is never clipped.</p>
+      <div id="vaultFormError" class="form-error" role="alert" tabindex="-1" hidden></div>
       <div class="dialog-buttons">
         <button id="vaultFormCancel" type="button">Cancel</button>
         <button id="vaultFormSave" class="primary" type="button">Save the note</button>
@@ -1561,7 +1636,8 @@
       <label for="agentModel">Model</label><input id="agentModel" type="text" list="modelSuggestions" maxlength="256" required>
       <datalist id="modelSuggestions"></datalist>
       <label for="agentRoleName">Role</label><input id="agentRoleName" type="text" maxlength="256" required>
-      <label for="agentPrompt">System prompt</label><textarea id="agentPrompt" rows="7" maxlength="32000"></textarea>
+      <label for="agentPrompt">System prompt</label><textarea id="agentPrompt" rows="7" aria-describedby="agentPromptCount"></textarea>
+      <p id="agentPromptCount" class="field-help prompt-count" role="status">0 / 100,000 characters. Text is never clipped.</p>
       <fieldset><legend>Capabilities</legend><div id="agentCapabilities" class="check-list"></div></fieldset>
       <div id="agentMergeFields" hidden><label for="agentMergeSlots">Required merge slots</label><input id="agentMergeSlots" type="text" value="implementation, review"><label for="agentMergeOutput">Output state field</label><input id="agentMergeOutput" type="text" value="merged_output"></div>
       <div class="dialog-actions"><button id="cancelAgent" type="button">Cancel</button><button class="primary" type="submit">Add agent</button></div>

@@ -5,6 +5,12 @@ can find it. That stops one step short: you still have to go and look. This is
 the last step — a line in the place you already watch, the moment something
 needs you.
 
+Timer history shows a compact result. When a persisted pipeline run is longer
+than 400 characters, the visible text says it was shortened, gives the original
+character count, and names the exact `pipeline-run:<id>` holding the complete
+result. If no durable run reference exists, Nexus keeps the whole safe text
+instead of hiding an unrecoverable tail.
+
 ---
 
 ## This part needs a key. There is no way around that
@@ -104,7 +110,13 @@ Only when a run does **not** pass. A run at two in the morning that went fine is
 not news, and something that tells you every night is something you stop reading
 by the end of the week.
 
-The message is short: what ran, that it did not pass, and one line of why.
+The message is short: what ran, that it did not pass, and one line of why. The
+full result remains in the immutable automation-run record. If a safe message
+is longer than the channel budget, Nexus marks the message as shortened, gives
+the original character count, and includes the exact `pipeline-run:<run-id>`
+reference plus where to open it in **Visual test automation**. It never presents
+a silently clipped message as the complete result. The general message budget
+is 3,000 characters; Discord uses 1,900 characters including its heading.
 
 ---
 
@@ -125,7 +137,10 @@ The message is short: what ran, that it did not pass, and one line of why.
   or somebody moving your reports somewhere you did not agree to.
 - **Stop a run.** Being unable to reach Slack is not a reason to lose the record
   of what your suite did.
-- **Send a whole log.** Three thousand letters, and it says it was cut short.
+- **Send a whole log.** Three thousand characters (1,900 including the heading
+  for Discord), and it says explicitly that it was shortened, how long the full
+  safe result is, and which immutable run to open. If no persisted full-result
+  reference exists, Nexus refuses to shorten and send it.
 - **Hold up your run.** A far end that never answers is given up on after
   twenty-five seconds. The waiting is done from outside, not by the socket,
   because a socket's own limit does not cover looking the name up — and a

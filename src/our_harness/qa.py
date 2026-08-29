@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import errno
+import hashlib
+import hmac
 import html
 import json
 import math
@@ -19,11 +22,13 @@ import os
 import re
 import socket
 import ssl
+import stat
 import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -36,6 +41,7 @@ from .models import HarnessError
 from .redaction import CredentialRedactor
 from .safety import confined_path
 from .safety import put_this_file_in_place
+from .safety import take_the_file_away
 
 SUITE_SCHEMA_VERSION = 1
 CASE_KINDS = ("command", "file", "http", "browser", "visual", "secrets", "crawl")
@@ -68,6 +74,14 @@ class QaError(HarnessError):
 
 class QaSkipped(HarnessError):
     """A case cannot run here for a stated reason, and is not counted as a failure."""
+
+
+class PipelinePreservationBusy(QaError):
+    """A live QA run owns the pipeline-preservation transaction."""
+
+
+class BoardPreservationBusy(QaError):
+    """A live QA run owns the saved-board preservation transaction."""
 
 
 @dataclass(frozen=True)
@@ -1483,13 +1497,1092 @@ def visual_reasons(case: QaCase, difference: images.Difference, baseline: str) -
 # rather than tidied away: a run that is killed outright never reaches any
 # putting-back, and the whole reason this exists is that one was.
 WHERE_THE_BOARD_IS_COPIED = "boards-before-checks"
+BOARD_RECOVERY_NOTICE_INDEX = "recovery-notices.index"
+BOARD_RECOVERY_NOTICE_INDEX_SCHEMA = 1
 # How many copies to keep. One per run, and a run is a thing somebody starts, so
 # this is weeks of them and still a number.
 MOST_BOARD_COPIES = 30
+# A displaced copy may be the only surviving bytes of a save made while a
+# killed check was being recovered.  Those are never aged out automatically.
+# Once this many need human review, starting another board-touching check is
+# refused instead of silently deleting evidence to make room.
+MOST_RETAINED_BOARD_RECOVERIES = 30
+_BOARD_PRESERVATION_LOCK = threading.RLock()
+BOARD_QA_CAPABILITY_HEADER = "X-Nexus-Board-QA-Capability"
+BOARD_QA_CAPABILITY_SCHEMA = 1
+BOARD_QA_CAPABILITY_DIRECTORY = "board-qa-capabilities"
+# The lease on disk is deliberately brief.  A heartbeat keeps it alive while
+# a genuinely long QA run still owns both proof locks, so long checks are not
+# cut off merely because they are long.  A killed issuer becomes unusable as
+# soon as its OS lock is released, and no later than this lease even on a
+# filesystem whose locking implementation unexpectedly fails closed.
+BOARD_QA_CAPABILITY_LEASE_SECONDS = 120.0
+BOARD_QA_CAPABILITY_HEARTBEAT_SECONDS = 30.0
+BOARD_QA_CAPABILITY_CLOCK_SLOP_SECONDS = 5.0
+_ACTIVE_BOARD_QA_CAPABILITIES: dict[str, tuple[str, float]] = {}
+_ACTIVE_BOARD_QA_CAPABILITIES_LOCK = threading.Lock()
+
+
+def _board_qa_identity(live: Path) -> str:
+    """The exact local board authority a QA capability belongs to."""
+
+    return os.path.normcase(os.path.abspath(str(live)))
+
+
+def _board_qa_identity_digest(live: Path) -> str:
+    return hashlib.sha256(_board_qa_identity(live).encode("utf-8")).hexdigest()
+
+
+def _board_qa_capability_paths(token: str, live: Path) -> tuple[Path, Path]:
+    token_digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    where = live.parent / BOARD_QA_CAPABILITY_DIRECTORY
+    return where / f"{token_digest}.json", where / f"{token_digest}.lock"
+
+
+def _lock_board_qa_proof(stream, *, blocking: bool) -> bool:
+    """Lock one proof byte, returning false only for ordinary contention."""
+
+    stream.seek(0, os.SEEK_END)
+    if stream.tell() == 0:
+        stream.write(b"\0")
+        stream.flush()
+    stream.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(
+                stream.fileno(),
+                msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK,
+                1,
+            )
+        else:
+            import fcntl
+
+            operation = fcntl.LOCK_EX
+            if not blocking:
+                operation |= fcntl.LOCK_NB
+            fcntl.flock(stream.fileno(), operation)
+        return True
+    except (OSError, BlockingIOError) as exc:
+        if not blocking and getattr(exc, "errno", None) in {
+            errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK,
+        }:
+            return False
+        raise
+
+
+def _unlock_board_qa_proof(stream) -> None:
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _write_board_qa_capability_record(
+    record: Path, token: str, live: Path, issued_at: float,
+) -> float:
+    expires_at = time.time() + BOARD_QA_CAPABILITY_LEASE_SECONDS
+    document = {
+        "schema_version": BOARD_QA_CAPABILITY_SCHEMA,
+        "token_sha256": hashlib.sha256(token.encode("ascii")).hexdigest(),
+        "board_sha256": _board_qa_identity_digest(live),
+        "issuer_pid": os.getpid(),
+        "issued_at": issued_at,
+        "expires_at": expires_at,
+    }
+    put_this_file_in_place(
+        record, json.dumps(document, ensure_ascii=False, sort_keys=True) + "\n",
+    )
+    with _ACTIVE_BOARD_QA_CAPABILITIES_LOCK:
+        _ACTIVE_BOARD_QA_CAPABILITIES[token] = (
+            _board_qa_identity(live), expires_at,
+        )
+    return expires_at
+
+
+def _board_qa_capability_record_is_current(
+    record: Path, proof: Path, token: str, live: Path,
+) -> bool:
+    """Validate an authenticated live lease issued by another QA process."""
+
+    try:
+        metadata = record.stat(follow_symlinks=False)
+        proof_metadata = proof.stat(follow_symlinks=False)
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or not stat.S_ISREG(proof_metadata.st_mode)
+            or record.is_symlink()
+            or proof.is_symlink()
+            or bool(getattr(metadata, "st_file_attributes", 0) & reparse)
+            or bool(getattr(proof_metadata, "st_file_attributes", 0) & reparse)
+            or metadata.st_size > 4096
+        ):
+            return False
+        held = json.loads(record.read_text(encoding="utf-8", errors="strict"))
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return False
+    if not isinstance(held, dict) or held.get("schema_version") != BOARD_QA_CAPABILITY_SCHEMA:
+        return False
+    token_digest = hashlib.sha256(token.encode("ascii")).hexdigest()
+    board_digest = _board_qa_identity_digest(live)
+    if not (
+        isinstance(held.get("token_sha256"), str)
+        and isinstance(held.get("board_sha256"), str)
+        and hmac.compare_digest(held["token_sha256"], token_digest)
+        and hmac.compare_digest(held["board_sha256"], board_digest)
+    ):
+        return False
+    try:
+        issued_at = float(held["issued_at"])
+        expires_at = float(held["expires_at"])
+        issuer_pid = int(held["issuer_pid"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    now = time.time()
+    if (
+        not math.isfinite(issued_at)
+        or not math.isfinite(expires_at)
+        or issuer_pid <= 0
+        or issued_at > now + BOARD_QA_CAPABILITY_CLOCK_SLOP_SECONDS
+        or expires_at <= now
+        or expires_at > now + BOARD_QA_CAPABILITY_LEASE_SECONDS
+        + BOARD_QA_CAPABILITY_CLOCK_SLOP_SECONDS
+    ):
+        return False
+    # The digest-bearing record alone is not authority: the issuing process
+    # must still hold this second, token-specific OS lock.  Thus a copied,
+    # stale, or crash-left record cannot reopen the board transaction.
+    try:
+        with proof.open("r+b") as stream:
+            acquired = _lock_board_qa_proof(stream, blocking=False)
+            if acquired:
+                _unlock_board_qa_proof(stream)
+                return False
+            return True
+    except (OSError, BlockingIOError):
+        return False
 
 
 @contextlib.contextmanager
-def _the_board_put_back_afterwards(cases, run_id: str = "") -> "Iterator[None]":
+def _active_board_qa_capability(live: Path) -> "Iterator[str]":
+    """Issue a revocable cross-process lease for exactly one preserved board."""
+
+    # Two UUID4 values provide 244 random bits. The token is never written to a
+    # suite, artifact, board, response body, or generated browser script; only
+    # real case workers and requests belonging to this transaction receive it.
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    record, proof = _board_qa_capability_paths(token, live)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    issued_at = time.time()
+    stop_heartbeat = threading.Event()
+    proof_stream = proof.open("x+b")
+    proof_locked = False
+    try:
+        if not _lock_board_qa_proof(proof_stream, blocking=False):
+            raise QaError("Nexus could not acquire its unique board-check proof lock.")
+        proof_locked = True
+        _write_board_qa_capability_record(record, token, live, issued_at)
+
+        def keep_the_lease_live() -> None:
+            while not stop_heartbeat.wait(BOARD_QA_CAPABILITY_HEARTBEAT_SECONDS):
+                try:
+                    _write_board_qa_capability_record(record, token, live, issued_at)
+                except BaseException:  # fail closed when the old lease expires
+                    return
+
+        heartbeat = threading.Thread(
+            target=keep_the_lease_live,
+            name="nexus-board-qa-capability-heartbeat",
+            daemon=True,
+        )
+        heartbeat.start()
+        try:
+            yield token
+        finally:
+            stop_heartbeat.set()
+            heartbeat.join(BOARD_QA_CAPABILITY_HEARTBEAT_SECONDS + 1.0)
+    finally:
+        with _ACTIVE_BOARD_QA_CAPABILITIES_LOCK:
+            _ACTIVE_BOARD_QA_CAPABILITIES.pop(token, None)
+        try:
+            record.unlink(missing_ok=True)
+        finally:
+            try:
+                if proof_locked:
+                    _unlock_board_qa_proof(proof_stream)
+            finally:
+                proof_stream.close()
+                proof.unlink(missing_ok=True)
+                try:
+                    record.parent.rmdir()
+                except OSError:
+                    pass
+
+
+def board_qa_capability_is_active(token: str, live: Path) -> bool:
+    """Validate a request capability against the still-live transaction."""
+
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token):
+        return False
+    now = time.time()
+    with _ACTIVE_BOARD_QA_CAPABILITIES_LOCK:
+        held = _ACTIVE_BOARD_QA_CAPABILITIES.get(token)
+    if held is not None:
+        held_identity, expires_at = held
+        return expires_at > now and hmac.compare_digest(
+            held_identity, _board_qa_identity(live)
+        )
+    record, proof = _board_qa_capability_paths(token, live)
+    return _board_qa_capability_record_is_current(
+        record, proof, token, live,
+    )
+
+
+def _a_case_can_touch_the_board(case: QaCase) -> bool:
+    return any("board" in str(thing).lower() for thing in case.touches)
+
+
+def _board_notice_index_path(where: Path) -> Path:
+    return where / BOARD_RECOVERY_NOTICE_INDEX
+
+
+def _write_board_notice_index(where: Path, names: Iterable[str]) -> None:
+    clean = sorted({
+        str(name) for name in names
+        if isinstance(name, str)
+        and Path(name).name == name
+        and name.endswith("-transaction.json")
+    })
+    put_this_file_in_place(
+        _board_notice_index_path(where),
+        json.dumps({
+            "schema_version": BOARD_RECOVERY_NOTICE_INDEX_SCHEMA,
+            "retained_transactions": clean,
+        }, ensure_ascii=False, sort_keys=True) + "\n",
+    )
+
+
+def _read_board_notice_index(where: Path) -> list[str]:
+    path = _board_notice_index_path(where)
+    try:
+        if path.stat().st_size > 64_000:
+            raise ValueError("the index is unexpectedly large")
+        held = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise QaError(
+            f"The compact saved-board recovery notice index at {path} cannot be read."
+        ) from exc
+    names = held.get("retained_transactions") if isinstance(held, dict) else None
+    if (
+        not isinstance(held, dict)
+        or held.get("schema_version") != BOARD_RECOVERY_NOTICE_INDEX_SCHEMA
+        or not isinstance(names, list)
+        or len(names) > MOST_RETAINED_BOARD_RECOVERIES
+        or any(
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not name.endswith("-transaction.json")
+            for name in names
+        )
+    ):
+        raise QaError(
+            f"The compact saved-board recovery notice index at {path} is invalid."
+        )
+    return list(dict.fromkeys(names))
+
+
+def _remember_board_recovery_notice(transaction: Path, retained: bool) -> None:
+    where = transaction.parent
+    try:
+        names = _read_board_notice_index(where)
+    except QaError:
+        # Rebuilding is deliberately exceptional. Ordinary status polling never
+        # opens the payload-bearing journals.
+        names = []
+        for candidate in sorted(where.glob("*-transaction.json")):
+            if _read_board_transaction(candidate).get("displaced_copy_retained"):
+                names.append(candidate.name)
+    if retained and transaction.name not in names:
+        names.append(transaction.name)
+    elif not retained:
+        names = [name for name in names if name != transaction.name]
+    _write_board_notice_index(where, names)
+
+
+@contextlib.contextmanager
+def _board_preservation_file_lock(
+    live: Path, timeout_seconds: float = 30.0,
+) -> "Iterator[None]":
+    """Serialize board QA preservation across Nexus processes."""
+
+    lock_path = live.parent / "board-qa-preservation.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    wait_for = max(0.0, float(timeout_seconds))
+    acquired_thread = _BOARD_PRESERVATION_LOCK.acquire(timeout=wait_for)
+    if not acquired_thread:
+        raise BoardPreservationBusy(
+            "Another board-touching check is still preserving the saved boards."
+        )
+    try:
+        with lock_path.open("a+b") as stream:
+            if stream.seek(0, os.SEEK_END) == 0:
+                stream.write(b"\0")
+                stream.flush()
+            acquired = False
+            deadline = time.monotonic() + wait_for
+            try:
+                while not acquired:
+                    try:
+                        stream.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+                            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                    except (OSError, BlockingIOError):
+                        if time.monotonic() >= deadline:
+                            raise BoardPreservationBusy(
+                                "Another Nexus process is still preserving boards for "
+                                "a visual check. Wait for it to finish and try again."
+                            )
+                        time.sleep(0.05)
+                yield
+            finally:
+                if acquired:
+                    stream.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    finally:
+        _BOARD_PRESERVATION_LOCK.release()
+
+# A browser check drives the real Automations page, so Save and Delete act on
+# the same project library as the person running the check. Keep a durable
+# transaction outside that library. If the runner is killed, the OS releases
+# the lock and the next pipeline check restores this journal before it opens
+# the page or takes a new snapshot.
+WHERE_PIPELINES_ARE_COPIED = ".harness/qa/pipelines-before-checks"
+PIPELINE_PRESERVATION_SCHEMA = 1
+MAX_RETAINED_PIPELINE_RECOVERIES = 20
+MAX_PIPELINE_RECOVERY_COPY_BYTES = 512_000_000
+MAX_DISPLACED_COPIES_PER_RECOVERY = 8
+PIPELINE_DIRECTORY_REPLACE_RETRY_SECONDS = (
+    0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2,
+)
+_TRANSIENT_WINDOWS_DIRECTORY_REPLACE_ERRORS = {5, 32, 33}
+_PIPELINE_PRESERVATION_LOCK = threading.RLock()
+
+
+def _a_case_can_touch_pipelines(case: QaCase) -> bool:
+    return (
+        "pipelines" in {str(tag).lower() for tag in case.tags}
+        or any(
+            word in str(thing).lower()
+            for thing in case.touches
+            for word in ("pipeline", "automation")
+        )
+    )
+
+
+@contextlib.contextmanager
+def _pipeline_preservation_file_lock(
+    root: Path, timeout_seconds: float = 30.0
+) -> "Iterator[None]":
+    """Serialize snapshots and recovery across QA processes."""
+
+    lock_path = _control_path(root, ".harness/qa/pipeline-preservation.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    wait_for = max(0.0, float(timeout_seconds))
+    thread_acquired = _PIPELINE_PRESERVATION_LOCK.acquire(timeout=wait_for)
+    if not thread_acquired:
+        raise PipelinePreservationBusy(
+            "A pipeline check is actively preserving the saved automation library."
+        )
+    try:
+        with lock_path.open("a+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            acquired = False
+            deadline = time.monotonic() + wait_for
+            try:
+                while not acquired:
+                    try:
+                        stream.seek(0)
+                        if os.name == "nt":
+                            import msvcrt
+
+                            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            import fcntl
+
+                            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        acquired = True
+                    except (OSError, BlockingIOError):
+                        if time.monotonic() >= deadline:
+                            raise PipelinePreservationBusy(
+                                "Another pipeline check is still preserving the saved "
+                                "automation library. Wait for it to finish and try again."
+                            )
+                        time.sleep(0.05)
+                yield
+            finally:
+                # A timeout/error before acquisition must not be hidden by an
+                # attempted unlock of a lock this process never held.
+                if acquired:
+                    stream.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    finally:
+        _PIPELINE_PRESERVATION_LOCK.release()
+
+
+def _pipeline_tree(where: Path) -> tuple[bool, tuple[str, ...], dict[str, bytes]]:
+    """Read one exact regular-file tree without following links or reparses."""
+
+    if not where.exists():
+        return False, (), {}
+    try:
+        root_stat = where.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise QaError(f"The saved automation library could not be inspected: {exc}") from exc
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if where.is_symlink() or bool(getattr(root_stat, "st_file_attributes", 0) & reparse):
+        raise QaError("The saved automation library is a link or reparse point; checks left it alone.")
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise QaError("The saved automation library is not a folder; checks left it alone.")
+
+    dirs: list[str] = []
+    files: dict[str, bytes] = {}
+    pending = [where]
+    while pending:
+        folder = pending.pop()
+        try:
+            with os.scandir(folder) as found:
+                entries = sorted(found, key=lambda item: item.name)
+        except OSError as exc:
+            raise QaError(f"The saved automation library could not be read: {exc}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(where).as_posix()
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise QaError(f"Saved automation path {relative} could not be inspected: {exc}") from exc
+            if entry.is_symlink() or bool(
+                getattr(metadata, "st_file_attributes", 0) & reparse
+            ):
+                raise QaError(
+                    f"Saved automation path {relative} is a link or reparse point; "
+                    "checks left the library alone."
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                dirs.append(relative)
+                pending.append(path)
+            elif stat.S_ISREG(metadata.st_mode):
+                try:
+                    files[relative] = path.read_bytes()
+                except OSError as exc:
+                    raise QaError(f"Saved automation file {relative} could not be read: {exc}") from exc
+            else:
+                raise QaError(
+                    f"Saved automation path {relative} is not a regular file or folder; "
+                    "checks left the library alone."
+                )
+    return True, tuple(sorted(dirs)), dict(sorted(files.items()))
+
+
+def _put_pipeline_bytes(where: Path, body: bytes) -> None:
+    where.parent.mkdir(parents=True, exist_ok=True)
+    beside = where.with_name(f"{where.name}.{os.getpid()}-{uuid.uuid4().hex}.part")
+    try:
+        beside.write_bytes(body)
+        for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2):
+            try:
+                os.replace(beside, where)
+                return
+            except PermissionError:
+                time.sleep(wait)
+        os.replace(beside, where)
+    finally:
+        try:
+            beside.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _replace_pipeline_directory_once(stage: Path, destination: Path) -> None:
+    """One atomic same-volume placement, split out for failure-injected tests."""
+
+    os.replace(stage, destination)
+
+
+def _transient_pipeline_directory_replace_error(exc: OSError) -> bool:
+    winerror = getattr(exc, "winerror", None)
+    if isinstance(exc, PermissionError):
+        # An injected/portable PermissionError has no Windows number. Real
+        # Windows access/sharing/lock denials use only this bounded allowlist.
+        return winerror is None or winerror in _TRANSIENT_WINDOWS_DIRECTORY_REPLACE_ERRORS
+    return (
+        os.name == "nt"
+        and winerror in _TRANSIENT_WINDOWS_DIRECTORY_REPLACE_ERRORS
+    )
+
+
+def _put_pipeline_directory_in_place(stage: Path, destination: Path) -> None:
+    """Atomically place a completed recovery tree without overwriting evidence.
+
+    Windows virus scanners and indexers can briefly retain a handle after the
+    last file is closed. Retry only those known transient denials. The unique
+    ``.incomplete`` tree remains byte-for-byte recoverable if all attempts are
+    exhausted, and a destination which appears is never replaced or guessed at.
+    """
+
+    delays = (*PIPELINE_DIRECTORY_REPLACE_RETRY_SECONDS, None)
+    last_error: OSError | None = None
+    for delay in delays:
+        if os.path.lexists(destination):
+            raise QaError(
+                "Nexus found an existing pipeline recovery destination while "
+                f"placing {stage}. It kept both paths and did not overwrite either."
+            )
+        try:
+            _replace_pipeline_directory_once(stage, destination)
+            return
+        except OSError as exc:
+            if not _transient_pipeline_directory_replace_error(exc):
+                raise
+            last_error = exc
+            # A move can become externally visible even when a platform API
+            # reports failure. Never retry over that evidence.
+            if os.path.lexists(destination):
+                raise QaError(
+                    "The pipeline recovery destination appeared while Windows "
+                    f"reported a move failure. Nexus kept {stage} and {destination} "
+                    "for review and did not overwrite either."
+                ) from exc
+            if delay is None:
+                break
+            time.sleep(delay)
+    raise QaError(
+        "Windows kept denying the atomic placement of a verified pipeline "
+        f"recovery copy. The exact incomplete evidence remains at {stage}; "
+        "the live automation library was not changed. Retry recovery after "
+        "the scanner or file handle releases it."
+    ) from last_error
+
+
+def _pipeline_manifest(
+    exists: bool, dirs: tuple[str, ...], files: Mapping[str, bytes]
+) -> dict[str, Any]:
+    return {
+        "original_exists": exists,
+        "directories": list(dirs),
+        "files": {
+            name: {"bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()}
+            for name, body in files.items()
+        },
+    }
+
+
+def _pipeline_manifest_bytes(manifest: Mapping[str, Any]) -> int:
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise QaError("A pipeline-check recovery manifest has no valid file inventory.")
+    try:
+        total = sum(int(item["bytes"]) for item in files.values())
+    except (KeyError, TypeError, ValueError) as exc:
+        raise QaError("A pipeline-check recovery manifest has an invalid byte inventory.") from exc
+    if total < 0:
+        raise QaError("A pipeline-check recovery manifest has an invalid byte inventory.")
+    return total
+
+
+def _write_pipeline_copy(
+    where: Path, tree: tuple[bool, tuple[str, ...], dict[str, bytes]]
+) -> None:
+    _exists, dirs, files = tree
+    where.mkdir(parents=True, exist_ok=False)
+    for directory in dirs:
+        (where / Path(directory)).mkdir(parents=True, exist_ok=True)
+    for name, body in files.items():
+        _put_pipeline_bytes(where / Path(name), body)
+
+
+def _manifest_matches(
+    manifest: Mapping[str, Any], tree: tuple[bool, tuple[str, ...], dict[str, bytes]]
+) -> bool:
+    exists, dirs, files = tree
+    return dict(manifest) == _pipeline_manifest(exists, dirs, files)
+
+
+def _pipeline_manifest_fingerprint(manifest: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        dict(manifest), ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _save_displaced_pipeline_copy(
+    transaction: Path,
+    destination: Path,
+    current: tuple[bool, tuple[str, ...], dict[str, bytes]],
+    expected_copy: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Place or validate one copy while bounding interrupted full-tree stages."""
+
+    if os.path.lexists(destination):
+        return _pipeline_manifest(*_pipeline_tree(destination))
+
+    # Deterministic on purpose. Repeated startup recovery while an indexer
+    # keeps the move denied reuses these exact verified bytes rather than
+    # accumulating a new up-to-512MB UUID tree on every attempt.
+    stage = transaction / f".{destination.name}.incomplete"
+    if os.path.lexists(stage):
+        if not _manifest_matches(expected_copy, _pipeline_tree(stage)):
+            raise QaError(
+                "An earlier incomplete pipeline recovery copy contains different "
+                f"bytes at {stage}. Nexus kept that evidence and the live library "
+                "unchanged; review it before retrying recovery."
+            )
+    else:
+        _write_pipeline_copy(stage, current)
+        if not _manifest_matches(expected_copy, _pipeline_tree(stage)):
+            raise QaError(
+                "The incomplete pipeline recovery copy failed validation; the live "
+                "automation library was not changed."
+            )
+    _put_pipeline_directory_in_place(stage, destination)
+    return _pipeline_manifest(*_pipeline_tree(destination))
+
+
+def _begin_pipeline_preservation(root: Path, run_id: str) -> Path:
+    """Create a recoverable snapshot; callers serialize this with the file lock."""
+
+    live = _control_path(root, ".harness/pipelines")
+    # Reading twice means an actively changing library does not get blessed as
+    # a half-old, half-new snapshot. Nothing has been changed by QA yet.
+    stable = None
+    for _attempt in range(3):
+        first = _pipeline_tree(live)
+        second = _pipeline_tree(live)
+        if first == second:
+            stable = second
+            break
+    if stable is None:
+        raise QaError(
+            "The saved automation library was changing while checks tried to preserve it. "
+            "No pipeline check was started; try again when the current save has finished."
+        )
+    exists, dirs, files = stable
+    snapshot_size = _pipeline_manifest_bytes(_pipeline_manifest(exists, dirs, files))
+    if snapshot_size > MAX_PIPELINE_RECOVERY_COPY_BYTES:
+        raise QaError(
+            f"The saved automation tree is {snapshot_size:,} bytes, larger than the "
+            f"{MAX_PIPELINE_RECOVERY_COPY_BYTES:,}-byte recoverable QA boundary. "
+            "No pipeline check was started and the library was not changed."
+        )
+    safe_run = re.sub(r"[^A-Za-z0-9_.-]", "-", str(run_id or "checks"))[:80]
+    transaction = _control_path(
+        root, f"{WHERE_PIPELINES_ARE_COPIED}/{safe_run}-{uuid.uuid4().hex}"
+    )
+    backup = transaction / "tree"
+    _write_pipeline_copy(backup, stable)
+    journal = {
+        "schema_version": PIPELINE_PRESERVATION_SCHEMA,
+        "state": "prepared",
+        "run_id": str(run_id or ""),
+        "live": ".harness/pipelines",
+        "manifest": _pipeline_manifest(exists, dirs, files),
+    }
+    put_this_file_in_place(
+        transaction / "journal.json", json.dumps(journal, indent=2, sort_keys=True) + "\n"
+    )
+    return transaction
+
+
+def _read_pipeline_journal(transaction: Path) -> dict[str, Any]:
+    try:
+        journal = json.loads((transaction / "journal.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise QaError(
+            f"The interrupted pipeline-check recovery journal at {transaction} is unreadable; "
+            "the saved automation library was not changed."
+        ) from exc
+    if (
+        not isinstance(journal, dict)
+        or journal.get("schema_version") != PIPELINE_PRESERVATION_SCHEMA
+        or journal.get("live") != ".harness/pipelines"
+        or not isinstance(journal.get("manifest"), dict)
+    ):
+        raise QaError(
+            f"The interrupted pipeline-check recovery journal at {transaction} is not valid; "
+            "the saved automation library was not changed."
+        )
+    return journal
+
+
+def _remove_pipeline_tree(where: Path) -> None:
+    exists, dirs, files = _pipeline_tree(where)
+    if not exists:
+        return
+    for name in files:
+        take_the_file_away(where / Path(name), missing_ok=True)
+    for directory in sorted(dirs, key=lambda item: (item.count("/"), item), reverse=True):
+        (where / Path(directory)).rmdir()
+    where.rmdir()
+
+
+def _retained_pipeline_recoveries(root: Path) -> int:
+    where = _control_path(root, WHERE_PIPELINES_ARE_COPIED)
+    if not where.is_dir():
+        return 0
+    retained = 0
+    for transaction in (one for one in where.iterdir() if one.is_dir()):
+        journal_path = transaction / "journal.json"
+        if not journal_path.is_file():
+            continue
+        journal = _read_pipeline_journal(transaction)
+        if bool(journal.get("keep_recovery_copy")):
+            _validate_displaced_pipeline_metadata(journal)
+            retained += 1
+    return retained
+
+
+def _validate_displaced_pipeline_metadata(journal: Mapping[str, Any]) -> None:
+    copies = journal.get("displaced_copies") or []
+    if not isinstance(copies, list) or len(copies) > MAX_DISPLACED_COPIES_PER_RECOVERY:
+        raise QaError("A retained pipeline recovery has an invalid displaced-copy inventory.")
+    for held in copies:
+        if not isinstance(held, dict):
+            raise QaError("A retained pipeline recovery has an invalid displaced copy.")
+        name = held.get("path")
+        source_manifest = held.get("source_manifest")
+        copy_manifest = held.get("copy_manifest")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not name.startswith("displaced-after-interruption")
+            or not isinstance(source_manifest, dict)
+            or not isinstance(copy_manifest, dict)
+        ):
+            raise QaError("A retained pipeline recovery has an invalid displaced copy.")
+        if _pipeline_manifest_bytes(source_manifest) > MAX_PIPELINE_RECOVERY_COPY_BYTES:
+            raise QaError("A retained pipeline recovery exceeds its disclosed byte boundary.")
+
+
+def _validate_displaced_pipeline_copies(
+    transaction: Path, journal: Mapping[str, Any]
+) -> None:
+    """Explicit deep validation; ordinary inventory uses journal metadata only."""
+
+    _validate_displaced_pipeline_metadata(journal)
+    for held in journal.get("displaced_copies") or []:
+        name = held["path"]
+        copy_manifest = held["copy_manifest"]
+        if not _manifest_matches(copy_manifest, _pipeline_tree(transaction / name)):
+            raise QaError(
+                f"The retained post-interruption copy at {transaction / name} failed its checksum."
+            )
+
+
+def _preserve_displaced_pipeline_tree(
+    root: Path,
+    transaction: Path,
+    journal: dict[str, Any],
+    current: tuple[bool, tuple[str, ...], dict[str, bytes]],
+) -> dict[str, Any]:
+    """Keep post-crash bytes before an old journal overwrites or removes them."""
+
+    source_manifest = _pipeline_manifest(*current)
+    copies = journal.get("displaced_copies") or []
+    if not isinstance(copies, list):
+        raise QaError("A pipeline-check recovery journal has an invalid displaced-copy list.")
+    for held in copies:
+        if not isinstance(held, dict) or not isinstance(held.get("source_manifest"), dict):
+            raise QaError("A pipeline-check recovery journal has an invalid displaced copy.")
+        if held["source_manifest"] == source_manifest:
+            return journal
+    if len(copies) >= MAX_DISPLACED_COPIES_PER_RECOVERY:
+        raise QaError(
+            "This interrupted pipeline check already has the maximum of "
+            f"{MAX_DISPLACED_COPIES_PER_RECOVERY} preserved post-crash variants. "
+            f"Resolve the copies at {transaction} before retrying; live files were not changed."
+        )
+    if not copies and _retained_pipeline_recoveries(root) >= MAX_RETAINED_PIPELINE_RECOVERIES:
+        raise QaError(
+            "Nexus is already retaining the maximum of "
+            f"{MAX_RETAINED_PIPELINE_RECOVERIES} interrupted pipeline recovery copies. "
+            "Resolve those copies before retrying; live files were not changed."
+        )
+    size = _pipeline_manifest_bytes(source_manifest)
+    if size > MAX_PIPELINE_RECOVERY_COPY_BYTES:
+        raise QaError(
+            f"The current saved automation tree is {size:,} bytes, larger than the "
+            f"{MAX_PIPELINE_RECOVERY_COPY_BYTES:,}-byte recovery-copy boundary. "
+            "It was not overwritten or removed."
+        )
+
+    number = len(copies) + 1
+    name = "displaced-after-interruption" + (f"-{number}" if number > 1 else "")
+    destination = transaction / name
+    expected_copy = dict(source_manifest)
+    expected_copy["original_exists"] = True
+    # A killed copy attempt may have reached the atomic directory move before
+    # its journal update. Preserve and validate that evidence instead of
+    # replacing it; a later distinct live variant receives the next name.
+    copy_manifest = _save_displaced_pipeline_copy(
+        transaction, destination, current, expected_copy,
+    )
+    if copy_manifest != expected_copy:
+        # Do not guess that an unjournaled folder is the current variant. Give
+        # the current bytes another durable name and retain both. The suffix is
+        # content-derived so the same interrupted attempt is also bounded.
+        fingerprint = _pipeline_manifest_fingerprint(expected_copy)[:12]
+        destination = transaction / f"{name}-{fingerprint}"
+        copy_manifest = _save_displaced_pipeline_copy(
+            transaction, destination, current, expected_copy,
+        )
+        if copy_manifest != expected_copy:
+            raise QaError(
+                "The post-crash pipeline recovery copy failed validation; live files were not changed."
+            )
+    copies.append({
+        "path": destination.name,
+        "source_manifest": source_manifest,
+        "copy_manifest": expected_copy,
+    })
+    journal["displaced_copies"] = copies
+    journal["keep_recovery_copy"] = True
+    journal["recovery_note"] = (
+        "The pre-check automation library was restored. Files found when QA ended or "
+        "recovered are retained in the displaced-after-interruption folder(s) and are never "
+        "automatically deleted."
+    )
+    put_this_file_in_place(
+        transaction / "RECOVERY_NOTICE.txt",
+        "Nexus preserved the automation library found when pipeline QA ended or recovered.\n\n"
+        "It restored the verified automation library from before the check. The folder(s) "
+        "named displaced-after-interruption contain the complete bytes found immediately "
+        "before restoration, including any legitimate work saved while QA was active or "
+        "after an interruption. They can also contain artifacts made by the check. "
+        "Nexus will not delete this evidence automatically. Compare or copy out what you "
+        "need, then remove this recovery folder yourself when satisfied.\n",
+    )
+    put_this_file_in_place(
+        transaction / "journal.json", json.dumps(journal, indent=2, sort_keys=True) + "\n"
+    )
+    return journal
+
+
+def _restore_pipeline_transaction(
+    root: Path, transaction: Path, *, preserve_displaced: bool = False
+) -> None:
+    journal = _read_pipeline_journal(transaction)
+    if journal.get("state") == "restored":
+        return
+    if journal.get("state") != "prepared":
+        raise QaError(
+            f"The interrupted pipeline-check recovery at {transaction} has an unknown state; "
+            "the saved automation library was not changed."
+        )
+    manifest = journal["manifest"]
+    backup = transaction / "tree"
+    copied = _pipeline_tree(backup)
+    expected_backup = dict(manifest)
+    expected_backup["original_exists"] = True
+    if not _manifest_matches(expected_backup, copied):
+        raise QaError(
+            f"The pipeline-check recovery copy at {transaction} failed its checksum; "
+            "the saved automation library was not changed."
+        )
+
+    live = _control_path(root, ".harness/pipelines")
+    original_exists = bool(manifest.get("original_exists"))
+    current = _pipeline_tree(live)
+    if preserve_displaced and not _manifest_matches(manifest, current):
+        journal = _preserve_displaced_pipeline_tree(
+            root, transaction, journal, current
+        )
+    if not original_exists:
+        _remove_pipeline_tree(live)
+    else:
+        _exists, wanted_dirs, wanted_files = copied
+        current_exists, current_dirs, current_files = current
+        if not current_exists:
+            live.mkdir(parents=True, exist_ok=True)
+        # Restore file/folder type changes before ordinary content changes.
+        # These paths had the opposite type in the verified snapshot, so the
+        # transaction proves they cannot be pre-existing user definitions.
+        file_type_conflicts = set(current_files) & set(wanted_dirs)
+        for name in sorted(file_type_conflicts):
+            take_the_file_away(live / Path(name), missing_ok=True)
+        directory_type_conflicts = set(current_dirs) & set(wanted_files)
+        for directory in sorted(
+            directory_type_conflicts,
+            key=lambda item: (item.count("/"), item), reverse=True,
+        ):
+            prefix = directory + "/"
+            for name in sorted(
+                (item for item in current_files if item.startswith(prefix)), reverse=True
+            ):
+                take_the_file_away(live / Path(name), missing_ok=True)
+            for child in sorted(
+                (item for item in current_dirs if item.startswith(prefix)),
+                key=lambda item: (item.count("/"), item), reverse=True,
+            ):
+                (live / Path(child)).rmdir()
+            (live / Path(directory)).rmdir()
+        for directory in wanted_dirs:
+            (live / Path(directory)).mkdir(parents=True, exist_ok=True)
+        for name, body in wanted_files.items():
+            if current_files.get(name) != body:
+                _put_pipeline_bytes(live / Path(name), body)
+        # Existing user files are restored byte-for-byte. Only paths absent
+        # from the before-check manifest qualify as transaction artifacts.
+        for name in sorted(set(current_files) - set(wanted_files) - file_type_conflicts):
+            take_the_file_away(live / Path(name), missing_ok=True)
+        for directory in sorted(
+            set(current_dirs) - set(wanted_dirs) - directory_type_conflicts,
+            key=lambda item: (item.count("/"), item), reverse=True,
+        ):
+            try:
+                (live / Path(directory)).rmdir()
+            except FileNotFoundError:
+                pass
+        if not _manifest_matches(manifest, _pipeline_tree(live)):
+            raise QaError(
+                "The saved automation library could not be restored exactly after the checks. "
+                f"The verified recovery copy remains at {transaction}."
+            )
+    journal["state"] = "restored"
+    put_this_file_in_place(
+        transaction / "journal.json", json.dumps(journal, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def _recover_pipeline_transactions(root: Path) -> None:
+    where = _control_path(root, WHERE_PIPELINES_ARE_COPIED)
+    if not where.is_dir():
+        return
+    for transaction in sorted(one for one in where.iterdir() if one.is_dir()):
+        if not (transaction / "journal.json").is_file():
+            continue
+        journal = _read_pipeline_journal(transaction)
+        if journal.get("state") == "restored" and journal.get("keep_recovery_copy"):
+            _validate_displaced_pipeline_metadata(journal)
+            continue
+        _restore_pipeline_transaction(root, transaction, preserve_displaced=True)
+        journal = _read_pipeline_journal(transaction)
+        if journal.get("keep_recovery_copy"):
+            continue
+        try:
+            _remove_pipeline_tree(transaction)
+        except (OSError, HarnessError):
+            # Its journal says restored, so retrying cannot alter the library.
+            # Leaving a verified copy is safer than making cleanup destructive.
+            continue
+
+
+def recover_abandoned_pipeline_transactions(root: Path) -> bool:
+    """Recover dead QA transactions during an ordinary library refresh.
+
+    Return false immediately when a live QA run owns the lock. A panel refresh
+    must never wait for or interfere with the browser check which is currently
+    using the temporary library state.
+    """
+
+    try:
+        with _pipeline_preservation_file_lock(root, timeout_seconds=0.0):
+            _recover_pipeline_transactions(root)
+    except PipelinePreservationBusy:
+        return False
+    return True
+
+
+def retained_pipeline_recovery_notices(root: Path) -> list[str]:
+    """Actionable inventory warnings for displaced bytes awaiting review."""
+
+    try:
+        with _pipeline_preservation_file_lock(root, timeout_seconds=0.0):
+            where = _control_path(root, WHERE_PIPELINES_ARE_COPIED)
+            if not where.is_dir():
+                return []
+            notices: list[str] = []
+            for transaction in sorted(one for one in where.iterdir() if one.is_dir()):
+                if not (transaction / "journal.json").is_file():
+                    continue
+                journal = _read_pipeline_journal(transaction)
+                if not journal.get("keep_recovery_copy"):
+                    continue
+                _validate_displaced_pipeline_metadata(journal)
+                notice = transaction / "RECOVERY_NOTICE.txt"
+                notices.append(
+                    "Recovered automation changes need review at "
+                    f"{transaction}. Open {notice.name}, then copy or import any wanted "
+                    "automation JSON from its displaced-after-interruption folder(s). "
+                    "Remove the recovery folder only after you have reviewed it."
+                )
+            return notices
+    except PipelinePreservationBusy:
+        return []
+
+
+@contextlib.contextmanager
+def _pipeline_definitions_put_back_afterwards(
+    root: Path, cases: Sequence[QaCase], run_id: str = ""
+) -> "Iterator[None]":
+    if not any(_a_case_can_touch_pipelines(case) for case in cases):
+        yield
+        return
+    with _pipeline_preservation_file_lock(root):
+        _recover_pipeline_transactions(root)
+        retained = _retained_pipeline_recoveries(root)
+        if retained >= MAX_RETAINED_PIPELINE_RECOVERIES:
+            raise QaError(
+                "Nexus is already retaining the maximum of "
+                f"{MAX_RETAINED_PIPELINE_RECOVERIES} pipeline recovery copies. "
+                "Resolve those copies before starting another pipeline check; "
+                "no check was run and the saved automation library was not changed."
+            )
+        transaction = _begin_pipeline_preservation(root, run_id)
+        try:
+            yield
+        finally:
+            _restore_pipeline_transaction(
+                root, transaction, preserve_displaced=True
+            )
+            journal = _read_pipeline_journal(transaction)
+            if not journal.get("keep_recovery_copy"):
+                try:
+                    _remove_pipeline_tree(transaction)
+                except (OSError, HarnessError):
+                    pass
+
+
+@contextlib.contextmanager
+def _the_board_put_back_afterwards(cases, run_id: str = "") -> "Iterator[str]":
     """Keep the agent board safe while checks run against it.
 
     A copy is written first and left there afterwards. Then the board is put
@@ -1503,38 +2596,92 @@ def _the_board_put_back_afterwards(cases, run_id: str = "") -> "Iterator[None]":
 
     from . import swarm as swarm_lab
 
-    if not any("board" in str(thing).lower() for case in cases for thing in case.touches):
-        yield
+    if not any(_a_case_can_touch_the_board(case) for case in cases):
+        yield ""
         return
     live = swarm_lab.where_it_lives()
     kept_ones = swarm_lab.where_the_kept_ones_live()
-    was = _read_or_nothing(live)
-    # The boards somebody saved under a name, which a check can delete as easily
-    # as it can change the live one.
-    saved_was = {}
-    try:
-        saved_was = {one.name: one.read_text(encoding="utf-8")
-                     for one in sorted(kept_ones.glob("*.json"))}
-    except OSError:
-        saved_was = {}
-    _keep_a_copy_of_the_board(live, was, saved_was, run_id)
-    try:
-        yield
-    finally:
-        _put_the_board_back(live, was)
-        _put_the_saved_boards_back(kept_ones, saved_was)
+    with _board_preservation_file_lock(live):
+        _recover_board_transactions(live, kept_ones)
+        was = _read_or_nothing(live)
+        saved_directory_existed, saved_was = _snapshot_saved_boards(kept_ones)
+        transaction = _keep_a_copy_of_the_board(
+            live, was, saved_was, run_id,
+            saved_directory_existed=saved_directory_existed,
+        )
+        try:
+            # The file lock deliberately is not re-entrant across threads. A
+            # browser/HTTP check reaches the server on a different worker, so
+            # only requests carrying this exact live transaction capability
+            # may cross the lock they are testing behind.
+            with _active_board_qa_capability(live) as capability:
+                yield capability
+        finally:
+            displaced_live = _read_or_nothing(live)
+            displaced_exists, displaced_saved = _snapshot_saved_boards(kept_ones)
+            _record_displaced_boards(
+                transaction,
+                displaced_live,
+                displaced_saved,
+                saved_directory_existed=displaced_exists,
+                differs=(
+                    displaced_live != was
+                    or displaced_exists != saved_directory_existed
+                    or displaced_saved != saved_was
+                ),
+            )
+            _put_the_board_back(live, was)
+            _put_the_saved_boards_back(
+                kept_ones, saved_was,
+                directory_existed=saved_directory_existed,
+            )
+            _mark_board_transaction_restored(transaction)
 
 
 def _read_or_nothing(where: "Path") -> str | None:
     try:
         return where.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise QaError(
+            f"The existing agent-board file at {where} cannot be read. Nexus "
+            "refused to run a board-touching check because absence and unreadable "
+            "data are not the same thing."
+        ) from exc
+
+
+def _snapshot_saved_boards(where: "Path") -> tuple[bool, dict[str, str]]:
+    try:
+        if not where.exists():
+            return False, {}
+        if not where.is_dir():
+            raise QaError(
+                f"The saved-board location {where} is not a folder. No check was run."
+            )
+        saved: dict[str, str] = {}
+        for one in sorted(where.iterdir()):
+            if one.suffix.lower() != ".json":
+                continue
+            if not one.is_file() or one.is_symlink():
+                raise QaError(
+                    f"Saved board {one} is not a regular local JSON file. No check was run."
+                )
+            saved[one.name] = one.read_text(encoding="utf-8")
+        return True, saved
+    except QaError:
+        raise
+    except (OSError, UnicodeDecodeError) as exc:
+        raise QaError(
+            f"The saved-board library at {where} cannot be snapshotted exactly. "
+            "Nexus refused to run a board-touching check."
+        ) from exc
 
 
 def _keep_a_copy_of_the_board(
-    live: "Path", was: str | None, saved_was: dict, run_id: str
-) -> None:
+    live: "Path", was: str | None, saved_was: dict, run_id: str, *,
+    saved_directory_existed: bool,
+) -> "Path":
     """Write the board aside before anything runs, and leave it there.
 
     This is the part that holds when nothing else does. A run killed outright
@@ -1543,37 +2690,287 @@ def _keep_a_copy_of_the_board(
     tidied away afterwards.
     """
 
-    if was is None and not saved_was:
-        return
     try:
         where = live.parent / WHERE_THE_BOARD_IS_COPIED
         where.mkdir(parents=True, exist_ok=True)
+        _throw_away_the_oldest_copies(where)
+        _refuse_when_retained_board_recovery_is_full(where)
         stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
-        name = f"{stamp}-{run_id or 'checks'}.json"
-        put_this_file_in_place(where / name, json.dumps({
+        identity = f"{time.time_ns():020d}"
+        safe_run = re.sub(r"[^A-Za-z0-9._-]+", "-", run_id or "checks")[:80]
+        path = where / f"{stamp}-{identity}-{safe_run}-transaction.json"
+        put_this_file_in_place(path, json.dumps({
+            "schema_version": 1,
+            "kind": "saved-board-check-preservation",
+            "state": "active",
             "why": "Copied before checks ran, in case they leave it wrong.",
             "when": stamp,
             "run": run_id,
+            "live_existed": was is not None,
             "board": was,
+            "saved_directory_existed": bool(saved_directory_existed),
             "saved_boards": saved_was,
-        }, indent=2) + "\n")
+        }, ensure_ascii=False, indent=2) + "\n")
         _throw_away_the_oldest_copies(where)
-    except (OSError, HarnessError, ValueError):
-        # Worth trying and not worth stopping a run of checks over. The putting
-        # back afterwards still happens either way.
-        return
+        return path
+    except QaError:
+        raise
+    except (OSError, HarnessError, ValueError) as exc:
+        raise QaError(
+            "Nexus could not create and verify the pre-check saved-board backup. "
+            "No board-touching check was run."
+        ) from exc
 
 
 def _throw_away_the_oldest_copies(where: "Path") -> None:
+    """Prune only settled backups that contain no displaced user candidate."""
+
     try:
-        held = sorted(where.glob("*.json"))
+        held = sorted(where.glob("*-transaction.json"))
     except OSError:
         return
-    for one in held[:max(0, len(held) - MOST_BOARD_COPIES)]:
+    ordinary: list[Path] = []
+    for one in held:
+        try:
+            record = _read_board_transaction(one)
+        except QaError:
+            # An unknown journal is evidence, not disposable cache.
+            continue
+        if (
+            record["state"] == "restored"
+            and not record.get("displaced_copy_retained")
+            and not record.get("displaced_copies")
+        ):
+            ordinary.append(one)
+    for one in ordinary[:max(0, len(ordinary) - MOST_BOARD_COPIES + 1)]:
         try:
             one.unlink()
         except OSError:
             continue
+
+
+def _refuse_when_retained_board_recovery_is_full(where: "Path") -> None:
+    try:
+        transactions = sorted(where.glob("*-transaction.json"))
+    except OSError as exc:
+        raise QaError(
+            f"Nexus cannot inspect saved-board recovery journals at {where}."
+        ) from exc
+    retained = 0
+    for transaction in transactions:
+        record = _read_board_transaction(transaction)
+        if record.get("displaced_copy_retained") or record.get("displaced_copies"):
+            retained += 1
+    if retained >= MOST_RETAINED_BOARD_RECOVERIES:
+        raise QaError(
+            "Nexus retained the maximum number of board recovery candidates "
+            f"({MOST_RETAINED_BOARD_RECOVERIES}). Review and deliberately archive "
+            f"or remove resolved journals in {where} before running another "
+            "board-touching check; Nexus will not discard possible user saves."
+        )
+
+
+def _read_board_transaction(where: "Path") -> dict[str, Any]:
+    try:
+        held = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QaError(
+            f"Saved-board preservation journal {where} cannot be read. Nexus "
+            "refused to guess whether a check had finished restoring data."
+        ) from exc
+    saved = held.get("saved_boards") if isinstance(held, dict) else None
+    displaced_copies = held.get("displaced_copies", []) if isinstance(held, dict) else []
+    if (
+        not isinstance(held, dict)
+        or held.get("schema_version") != 1
+        or held.get("kind") != "saved-board-check-preservation"
+        or held.get("state") not in {"active", "restored"}
+        or not isinstance(held.get("live_existed"), bool)
+        or not isinstance(held.get("saved_directory_existed"), bool)
+        or not isinstance(saved, dict)
+        or any(
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not name.lower().endswith(".json")
+            or not isinstance(body, str)
+            for name, body in saved.items()
+        )
+        or (held["live_existed"] and not isinstance(held.get("board"), str))
+        or (not held["live_existed"] and held.get("board") is not None)
+        or not isinstance(displaced_copies, list)
+        or any(
+            not isinstance(copy, dict)
+            or not isinstance(copy.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", copy["sha256"]) is None
+            or not isinstance(copy.get("live_existed"), bool)
+            or not isinstance(copy.get("saved_directory_existed"), bool)
+            or not isinstance(copy.get("saved_boards"), dict)
+            or any(
+                not isinstance(name, str)
+                or Path(name).name != name
+                or not name.lower().endswith(".json")
+                or not isinstance(body, str)
+                for name, body in copy["saved_boards"].items()
+            )
+            or (copy["live_existed"] and not isinstance(copy.get("board"), str))
+            or (not copy["live_existed"] and copy.get("board") is not None)
+            for copy in displaced_copies
+        )
+    ):
+        raise QaError(
+            f"Saved-board preservation journal {where} is invalid. Nexus refused "
+            "to perform a partial recovery."
+        )
+    for copy in displaced_copies:
+        without_digest = {key: value for key, value in copy.items() if key != "sha256"}
+        digest = hashlib.sha256(json.dumps(
+            without_digest, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(copy["sha256"], digest):
+            raise QaError(
+                f"Saved-board recovery candidate in {where} failed its SHA-256 "
+                "integrity check. Nexus preserved it and refused to guess."
+            )
+    return held
+
+
+def _mark_board_transaction_restored(where: "Path") -> dict[str, Any]:
+    held = _read_board_transaction(where)
+    held["state"] = "restored"
+    held["restored_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    put_this_file_in_place(
+        where, json.dumps(held, ensure_ascii=False, indent=2) + "\n",
+    )
+    return held
+
+
+def _record_displaced_boards(
+    where: "Path", live: str | None, saved: dict[str, str], *,
+    saved_directory_existed: bool, differs: bool,
+) -> dict[str, Any]:
+    """Keep any bytes a check/concurrent UI save left before restoration."""
+
+    held = _read_board_transaction(where)
+    if differs:
+        candidate = {
+            "live_existed": live is not None,
+            "board": live,
+            "saved_directory_existed": bool(saved_directory_existed),
+            "saved_boards": saved,
+        }
+        canonical = json.dumps(
+            candidate, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        candidate["sha256"] = hashlib.sha256(canonical).hexdigest()
+        copies = list(held.get("displaced_copies") or [])
+        # Migrate the original single-copy field without changing or replacing
+        # its bytes.  Older callers may still inspect displaced_after_check.
+        previous = held.get("displaced_after_check")
+        if isinstance(previous, dict) and not copies:
+            legacy = dict(previous)
+            legacy_canonical = json.dumps(
+                legacy, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            legacy["sha256"] = hashlib.sha256(legacy_canonical).hexdigest()
+            copies.append(legacy)
+        if not any(one.get("sha256") == candidate["sha256"] for one in copies):
+            copies.append(candidate)
+        held["displaced_copies"] = copies
+        held.setdefault("displaced_after_check", {
+            key: value for key, value in candidate.items() if key != "sha256"
+        })
+        held["displaced_copy_retained"] = True
+        held["recovery_note"] = (
+            "The exact board state present when the check ended is retained here. "
+            "It may contain check fixtures or a concurrent user save; review/import "
+            "wanted saved-board JSON instead of guessing."
+        )
+    put_this_file_in_place(
+        where, json.dumps(held, ensure_ascii=False, indent=2) + "\n",
+    )
+    _remember_board_recovery_notice(
+        where, bool(held.get("displaced_copy_retained")),
+    )
+    return held
+
+
+def _recover_board_transactions(live: "Path", saved_folder: "Path") -> None:
+    where = live.parent / WHERE_THE_BOARD_IS_COPIED
+    try:
+        transactions = sorted(where.glob("*-transaction.json"))
+    except OSError as exc:
+        raise QaError(
+            f"Nexus cannot inspect saved-board recovery journals at {where}. "
+            "No board-touching check was run."
+        ) from exc
+    retained: list[str] = []
+    for transaction in transactions:
+        held = _read_board_transaction(transaction)
+        if held["state"] == "active":
+            displaced_live = _read_or_nothing(live)
+            displaced_exists, displaced_saved = _snapshot_saved_boards(saved_folder)
+            held = _record_displaced_boards(
+                transaction, displaced_live, displaced_saved,
+                saved_directory_existed=displaced_exists,
+                differs=(
+                    displaced_live != (held["board"] if held["live_existed"] else None)
+                    or displaced_exists != held["saved_directory_existed"]
+                    or displaced_saved != held["saved_boards"]
+                ),
+            )
+            _put_the_board_back(
+                live, held["board"] if held["live_existed"] else None,
+            )
+            _put_the_saved_boards_back(
+                saved_folder, held["saved_boards"],
+                directory_existed=held["saved_directory_existed"],
+            )
+            held = _mark_board_transaction_restored(transaction)
+        if held.get("displaced_copy_retained"):
+            retained.append(transaction.name)
+    where.mkdir(parents=True, exist_ok=True)
+    _write_board_notice_index(where, retained)
+
+
+def recover_abandoned_board_transactions() -> bool:
+    """Recover killed board QA on ordinary startup without racing a live check."""
+
+    from . import swarm as swarm_lab
+
+    live = swarm_lab.where_it_lives()
+    saved = swarm_lab.where_the_kept_ones_live()
+    try:
+        with _board_preservation_file_lock(live, timeout_seconds=0.0):
+            _recover_board_transactions(live, saved)
+    except BoardPreservationBusy:
+        return False
+    return True
+
+
+def retained_board_recovery_notices() -> list[str]:
+    """Name preserved post-check bytes that may include a concurrent user save."""
+
+    from . import swarm as swarm_lab
+
+    live = swarm_lab.where_it_lives()
+    where = live.parent / WHERE_THE_BOARD_IS_COPIED
+    try:
+        names = _read_board_notice_index(where)
+    except QaError as exc:
+        return [
+            f"{exc} Review the recovery folder at {where}; Nexus did not hide "
+            "the recovery problem."
+        ]
+    return [
+        "A board-touching check restored your pre-check boards and retained "
+        f"the exact displaced state for review at {where / name}. It may "
+        "contain check fixtures or a concurrent save."
+        for name in names
+        if (where / name).is_file()
+    ]
 
 
 def _put_the_board_back(live: "Path", was: str | None) -> None:
@@ -1585,14 +2982,20 @@ def _put_the_board_back(live: "Path", was: str | None) -> None:
     left as the check left it.
     """
 
-    now = _read_or_nothing(live)
+    try:
+        now = _read_or_nothing(live)
+    except QaError:
+        now = object()
     if now == was:
         return
     if was is None:
         try:
             live.unlink(missing_ok=True)
-        except OSError:
-            return
+        except OSError as exc:
+            _say_it_could_not_be_put_back(live)
+            raise QaError(
+                f"The check-created live board at {live} could not be removed."
+            ) from exc
         return
     try:
         put_this_file_in_place(live, was)
@@ -1601,25 +3004,50 @@ def _put_the_board_back(live: "Path", was: str | None) -> None:
         # gone for good. Said out loud rather than swallowed: somebody has to
         # know their board is not what they left it.
         _say_it_could_not_be_put_back(live)
+        raise QaError(
+            f"The agent board at {live} could not be restored automatically."
+        )
 
 
-def _put_the_saved_boards_back(where: "Path", saved_was: dict) -> None:
+def _put_the_saved_boards_back(
+    where: "Path", saved_was: dict, *, directory_existed: bool = True,
+) -> None:
     """Put back any board somebody had saved under a name.
 
     A check can delete one of these as easily as it can change the live board,
     and deleting somebody's saved arrangement is the worse of the two.
     """
 
-    if not saved_was:
-        return
     try:
-        where.mkdir(parents=True, exist_ok=True)
+        current = set()
+        if where.exists():
+            if not where.is_dir():
+                raise OSError(f"{where} is not a folder")
+            current = {
+                one.name for one in where.iterdir()
+                if one.suffix.lower() == ".json"
+            }
+        elif saved_was or directory_existed:
+            where.mkdir(parents=True, exist_ok=True)
+        for extra in current - set(saved_was):
+            (where / extra).unlink()
         for name, held in saved_was.items():
             one = where / name
-            if _read_or_nothing(one) != held:
+            try:
+                current_text = one.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                current_text = None
+            except (OSError, UnicodeDecodeError):
+                current_text = object()
+            if current_text != held:
                 put_this_file_in_place(one, held)
-    except (OSError, HarnessError):
+        if not directory_existed and where.exists() and not any(where.iterdir()):
+            where.rmdir()
+    except (OSError, HarnessError) as exc:
         _say_it_could_not_be_put_back(where)
+        raise QaError(
+            f"The saved-board library at {where} could not be restored exactly."
+        ) from exc
 
 
 def _say_it_could_not_be_put_back(where: "Path") -> None:
@@ -1666,6 +3094,7 @@ class QaRunner:
         self.extra_kinds = validated_kinds(extra_kinds)
         self.environment_name, self.environment = datasets.chosen_environment(config, environment)
         self.update_baselines = bool(update_baselines)
+        self._board_qa_capability = ""
         self._browser_ready: bool | None = None
         self._browser_why = ""
         # Screenshot checks save pictures while they run. Cases run side by side,
@@ -1825,15 +3254,22 @@ class QaRunner:
         # that is no help at all when a check is killed part way through: the
         # step that puts it back never runs, and somebody's agents are gone. It
         # cost a real person their board once, which is once too often.
-        with _the_board_put_back_afterwards(selected, identifier):
-            with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
-                futures = {
-                    pool.submit(self._run_case, case, artifacts_root, held): case
-                    for case in selected
-                }
-                for future in concurrent.futures.as_completed(futures):
-                    case = futures[future]
-                    results[case.id] = future.result()
+        with _the_board_put_back_afterwards(selected, identifier) as board_capability:
+            self._board_qa_capability = board_capability
+            try:
+                with _pipeline_definitions_put_back_afterwards(
+                    self.root, selected, identifier
+                ):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+                        futures = {
+                            pool.submit(self._run_case, case, artifacts_root, held): case
+                            for case in selected
+                        }
+                        for future in concurrent.futures.as_completed(futures):
+                            case = futures[future]
+                            results[case.id] = future.result()
+            finally:
+                self._board_qa_capability = ""
         duration = int((self.clock() - started) * 1000)
         ordered = tuple(results[case.id] for case in selected)
         result = QaRunResult(
@@ -1905,6 +3341,12 @@ class QaRunner:
         with contextlib.ExitStack() as waiting:
             for lock in locks:
                 waiting.enter_context(lock)
+            if _a_case_can_touch_the_board(case) and self._board_qa_capability:
+                from . import swarm as swarm_lab
+
+                waiting.enter_context(swarm_lab._using_board_qa_request_capability(  # noqa: SLF001
+                    self._board_qa_capability
+                ))
             return self._really_run_case(case, artifacts_root)
 
     def _really_run_case(self, case: QaCase, artifacts_root: Path | None) -> QaCaseResult:
@@ -2181,7 +3623,7 @@ class QaRunner:
         return tuple(reasons), summary, json.dumps(report.to_dict(), indent=2)
 
     def _browser_plan(self, case: QaCase, timeout: float) -> dict[str, Any]:
-        return {
+        plan = {
             "url": case.url,
             "routes": list(case.routes) or ["/"],
             "viewport": {"width": case.viewport[0], "height": case.viewport[1]},
@@ -2197,6 +3639,15 @@ class QaRunner:
             "picturesFolder": "",
             "attempt": 1,
         }
+        if _a_case_can_touch_the_board(case) and self._board_qa_capability:
+            plan["boardQaCapability"] = {
+                "origin": urllib.parse.urlsplit(case.url)._replace(
+                    path="", query="", fragment=""
+                ).geturl().rstrip("/"),
+                "header": BOARD_QA_CAPABILITY_HEADER,
+                "token": self._board_qa_capability,
+            }
+        return plan
 
     def _ready_for_browser(self) -> None:
         if not self.browser_available():
@@ -2226,10 +3677,25 @@ class QaRunner:
         folder = keep or Path(tempfile.mkdtemp(prefix=f"{case.id}-", dir=base))
         folder.mkdir(parents=True, exist_ok=True)
         script = folder / "browser.js"
-        script.write_text(browser_script(plan), encoding="utf-8")
+        browser_plan = dict(plan)
+        environment_overrides: dict[str, str] | None = None
+        capability = browser_plan.get("boardQaCapability")
+        if isinstance(capability, dict) and capability.get("token"):
+            token = str(capability["token"])
+            capability = dict(capability)
+            capability.pop("token", None)
+            capability["tokenEnvironment"] = "NEXUS_BOARD_QA_CAPABILITY"
+            browser_plan["boardQaCapability"] = capability
+            environment_overrides = {"NEXUS_BOARD_QA_CAPABILITY": token}
+        script.write_text(browser_script(browser_plan), encoding="utf-8")
         try:
+            run_arguments: dict[str, Any] = {
+                "cwd": ".", "timeout": timeout,
+            }
+            if environment_overrides:
+                run_arguments["environment_overrides"] = environment_overrides
             result = self.commands.run(
-                ["node", script.relative_to(self.root).as_posix()], cwd=".", timeout=timeout
+                ["node", script.relative_to(self.root).as_posix()], **run_arguments
             )
         finally:
             # Tidying up must never be the thing that fails a check. On Windows
@@ -2503,6 +3969,8 @@ class QaRunner:
         request = urllib.request.Request(case.url, data=data, method=case.method)
         for name, value in case.headers:
             request.add_header(name, value)
+        if _a_case_can_touch_the_board(case) and self._board_qa_capability:
+            request.add_header(BOARD_QA_CAPABILITY_HEADER, self._board_qa_capability)
         limit = max(1, int(self.config.get("qa.max_response_bytes", 1_000_000)))
         opener = urllib.request.build_opener(
             _NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())
@@ -2712,7 +4180,31 @@ async function runStep(page, step) {
   let browser;
   try {
     browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage({ viewport: plan.viewport });
+    const context = await browser.newContext({ viewport: plan.viewport });
+    const page = await context.newPage();
+    if (plan.boardQaCapability) {
+      // Route only requests to the checked Nexus origin. A page that reaches
+      // elsewhere must never carry this local board-transaction capability.
+      await page.route('**/*', async route => {
+        const request = route.request();
+        let sameOrigin = false;
+        try {
+          sameOrigin = new URL(request.url()).origin === plan.boardQaCapability.origin;
+        } catch (_) {}
+        if (!sameOrigin) {
+          await route.continue();
+          return;
+        }
+        const capabilityToken = process.env[plan.boardQaCapability.tokenEnvironment] || '';
+        if (!capabilityToken) {
+          throw new Error('board QA capability was not supplied to the browser worker');
+        }
+        await route.continue({ headers: {
+          ...request.headers(),
+          [plan.boardQaCapability.header]: capabilityToken,
+        }});
+      });
+    }
     // The panel is used in the desktop app, and the app does not have prompt:
     // it is the one browser thing Electron takes out on purpose. A check that
     // runs somewhere more forgiving than where people use it is worse than no

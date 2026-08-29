@@ -7,12 +7,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
-from our_harness import chat
+from our_harness import chat, collaboration_ledger as collaboration_ledger_module
 from our_harness.collaboration_ledger import CollaborationLedger, ledger_paths
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
@@ -23,6 +24,12 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        runtime_environment = mock.patch.dict(
+            os.environ,
+            {"OUR_HARNESS_SWARM_RUN_DIR": str(self.root / ".runtime")},
+        )
+        runtime_environment.start()
+        self.addCleanup(runtime_environment.stop)
         (self.root / ".harness").mkdir()
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
         self.participants = [
@@ -165,6 +172,47 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         self.assertEqual([one["seq"] for one in events], list(range(1, 34)))
         self.assertEqual(len({one["hash"] for one in events}), 33)
 
+    def test_contribution_read_waits_until_jsonl_and_integrity_anchor_are_both_published(self) -> None:
+        ledger = self.ledger()
+        first_reached_anchor = threading.Event()
+        allow_first_anchor = threading.Event()
+        real_write_anchor = collaboration_ledger_module._write_ledger_anchor
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def delayed_write_anchor(path: Path, events: list[dict]) -> None:
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+                this_call = calls
+            if this_call == 1:
+                first_reached_anchor.set()
+                self.assertTrue(allow_first_anchor.wait(10))
+            real_write_anchor(path, events)
+
+        def append(number: int) -> dict:
+            return ledger.record_contribution({
+                "speaker_id": "agent-1", "phase": "agent_reply",
+                "text": f"turn {number}",
+            })
+
+        with mock.patch(
+            "our_harness.collaboration_ledger._write_ledger_anchor",
+            side_effect=delayed_write_anchor,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(append, 1)
+                self.assertTrue(first_reached_anchor.wait(10))
+                second = pool.submit(append, 2)
+                # The second contribution must wait for the atomic ledger
+                # transaction instead of validating JSONL against an old anchor.
+                self.assertFalse(second.done())
+                allow_first_anchor.set()
+                self.assertEqual(first.result(timeout=10)["seq"], 2)
+                self.assertEqual(second.result(timeout=10)["seq"], 3)
+
+        self.assertEqual([one["seq"] for one in self.events(ledger)], [1, 2, 3])
+
     def test_credentials_are_redacted_before_they_reach_disk_or_a_projection(self) -> None:
         data = copy.deepcopy(DEFAULT_CONFIG)
         data["providers"] = {
@@ -193,8 +241,198 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         ledger = self.ledger()
         with ledger.paths.jsonl.open("a", encoding="utf-8") as stream:
             stream.write('{"seq": 999, "text": "forged"}\n')
-        with self.assertRaisesRegex(HarnessError, "damaged|modified"):
+        with self.assertRaisesRegex(HarnessError, "keyed integrity|quarantined"):
             ledger.record_state("round", {"round": 2})
+
+    def test_a_crash_after_event_fsync_recovers_only_the_valid_authenticated_extension(self) -> None:
+        ledger = self.ledger()
+        anchor_path = collaboration_ledger_module._ledger_anchor_path(ledger.paths.jsonl)
+        prefix_anchor = anchor_path.read_text(encoding="utf-8")
+        real_write_anchor = collaboration_ledger_module._write_ledger_anchor
+
+        def crash_before_anchor(path: Path, events: list[dict]) -> None:
+            if len(events) == 2:
+                raise OSError("simulated process loss before anchor publication")
+            real_write_anchor(path, events)
+
+        with mock.patch(
+            "our_harness.collaboration_ledger._write_ledger_anchor",
+            side_effect=crash_before_anchor,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated process loss"):
+                ledger.record_state("durable-before-crash", {"round": 1})
+
+        self.assertEqual(2, len(self.events(ledger)))
+        self.assertEqual(prefix_anchor, anchor_path.read_text(encoding="utf-8"))
+        reopened = CollaborationLedger(
+            self.config, "claude", "pair-chat-1", session_id="session-one"
+        )
+        recovered = reopened._read()
+        self.assertEqual([1, 2], [one["seq"] for one in recovered])
+        repaired_anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        self.assertEqual(2, repaired_anchor["value"]["count"])
+        self.assertEqual(recovered[-1]["integrity_mac"], repaired_anchor["value"]["head"])
+
+    def test_the_first_fsynced_event_also_recovers_from_an_authenticated_empty_prefix(self) -> None:
+        ledger = CollaborationLedger(
+            self.config, "claude", "first-event-crash", session_id="session-one"
+        )
+        ledger._generation = collaboration_ledger_module._rotate_generation(ledger.paths)
+        real_write_anchor = collaboration_ledger_module._write_ledger_anchor
+
+        def crash_after_first_fsync(path: Path, events: list[dict]) -> None:
+            if len(events) == 1:
+                raise OSError("simulated first-event anchor loss")
+            real_write_anchor(path, events)
+
+        with mock.patch(
+            "our_harness.collaboration_ledger._write_ledger_anchor",
+            side_effect=crash_after_first_fsync,
+        ):
+            with self.assertRaisesRegex(OSError, "first-event anchor loss"):
+                ledger.append(kind="user_goal", phase="user_goal", text="Keep this")
+
+        reopened = CollaborationLedger(
+            self.config, "claude", "first-event-crash", session_id="session-one"
+        )
+        recovered = reopened._read()
+        self.assertEqual(1, len(recovered))
+        self.assertEqual("Keep this", recovered[0]["text"])
+
+    def test_a_missing_jsonl_cannot_erase_an_authenticated_nonempty_history(self) -> None:
+        ledger = self.ledger()
+        anchor_path = collaboration_ledger_module._ledger_anchor_path(
+            ledger.paths.jsonl
+        )
+        anchor_before = anchor_path.read_text(encoding="utf-8")
+        ledger.paths.jsonl.unlink()
+
+        reopened = CollaborationLedger(
+            self.config, "claude", "pair-chat-1", session_id="session-one"
+        )
+        with self.assertRaisesRegex(HarnessError, "keyed integrity|quarantined"):
+            reopened._read()
+        self.assertEqual(anchor_before, anchor_path.read_text(encoding="utf-8"))
+
+    def test_an_authenticated_empty_anchor_is_the_only_recoverable_missing_jsonl(self) -> None:
+        ledger = CollaborationLedger(
+            self.config, "claude", "empty-prefix", session_id="session-one"
+        )
+        ledger._generation = collaboration_ledger_module._rotate_generation(
+            ledger.paths
+        )
+        collaboration_ledger_module._write_ledger_anchor(ledger.paths.jsonl, [])
+
+        self.assertEqual([], ledger._read())
+        appended = ledger.append(
+            kind="user_goal", phase="user_goal", text="First durable event"
+        )
+        self.assertEqual(1, appended["seq"])
+
+    def test_stripping_every_mac_and_the_anchor_is_not_blessed_as_legacy(self) -> None:
+        ledger = self.ledger()
+        ledger.record_state("durable-event", {"round": 1})
+        events = self.events(ledger)
+        for event in events:
+            event.pop("previous_mac", None)
+            event.pop("integrity_mac", None)
+        ledger.paths.jsonl.write_text(
+            "".join(
+                collaboration_ledger_module._canonical(one) + "\n"
+                for one in events
+            ),
+            encoding="utf-8",
+        )
+        anchor_path = collaboration_ledger_module._ledger_anchor_path(
+            ledger.paths.jsonl
+        )
+        anchor_path.unlink()
+
+        reopened = CollaborationLedger(
+            self.config, "claude", "pair-chat-1", session_id="session-one"
+        )
+        with self.assertRaisesRegex(HarnessError, "keyed integrity|quarantined"):
+            reopened._read()
+        self.assertFalse(anchor_path.exists())
+
+    def test_an_empty_jsonl_without_an_authenticated_anchor_is_not_no_state(self) -> None:
+        ledger = CollaborationLedger(
+            self.config, "claude", "unanchored-empty", session_id="session-one"
+        )
+        ledger.paths.jsonl.parent.mkdir(parents=True, exist_ok=True)
+        ledger.paths.jsonl.write_text("", encoding="utf-8")
+
+        with self.assertRaisesRegex(HarnessError, "keyed integrity|quarantined"):
+            ledger._read()
+
+    def test_a_valid_anchor_never_blesses_an_invalid_appended_suffix(self) -> None:
+        for damage in ("event_hash", "event_mac", "mac_link"):
+            with self.subTest(damage=damage):
+                filed_as = "damaged-" + damage
+                ledger = CollaborationLedger(
+                    self.config, "claude", filed_as, session_id="session-one"
+                ).begin("Build safely", self.participants, mode="project_work")
+                anchor_path = collaboration_ledger_module._ledger_anchor_path(
+                    ledger.paths.jsonl
+                )
+                prefix_anchor = anchor_path.read_text(encoding="utf-8")
+                ledger.record_state("durable-event", {"round": 1})
+                events = self.events(ledger)
+                anchor_path.write_text(prefix_anchor, encoding="utf-8")
+                if damage == "event_hash":
+                    events[1]["text"] = "rewritten without its public hash"
+                elif damage == "event_mac":
+                    events[1]["integrity_mac"] = "0" * 64
+                else:
+                    events[1]["previous_mac"] = "0" * 64
+                    events[1]["integrity_mac"] = (
+                        collaboration_ledger_module._event_integrity(events[1])
+                    )
+                ledger.paths.jsonl.write_text(
+                    "".join(
+                        collaboration_ledger_module._canonical(one) + "\n"
+                        for one in events
+                    ),
+                    encoding="utf-8",
+                )
+
+                reopened = CollaborationLedger(
+                    self.config, "claude", filed_as, session_id="session-one"
+                )
+                with self.assertRaisesRegex(HarnessError, "keyed integrity|quarantined"):
+                    reopened._read()
+                self.assertEqual(prefix_anchor, anchor_path.read_text(encoding="utf-8"))
+
+    def test_missing_invalid_divergent_or_ahead_anchor_is_quarantined(self) -> None:
+        cases = ("missing", "invalid", "divergent", "ahead")
+        for damage in cases:
+            with self.subTest(damage=damage):
+                filed_as = "anchor-" + damage
+                ledger = CollaborationLedger(
+                    self.config, "claude", filed_as, session_id="session-one"
+                ).begin("Build safely", self.participants, mode="project_work")
+                anchor_path = collaboration_ledger_module._ledger_anchor_path(
+                    ledger.paths.jsonl
+                )
+                if damage == "missing":
+                    anchor_path.unlink()
+                elif damage == "invalid":
+                    anchor_path.write_text("{}\n", encoding="utf-8")
+                elif damage == "divergent":
+                    alternate = CollaborationLedger(
+                        self.config, "claude", filed_as + "-other", session_id="other"
+                    ).begin("A different history", self.participants, mode="project_work")
+                    ledger.paths.jsonl.write_bytes(alternate.paths.jsonl.read_bytes())
+                else:
+                    ledger.record_state("second", {"round": 2})
+                    lines = ledger.paths.jsonl.read_text(encoding="utf-8").splitlines()
+                    ledger.paths.jsonl.write_text(lines[0] + "\n", encoding="utf-8")
+
+                reopened = CollaborationLedger(
+                    self.config, "claude", filed_as, session_id="session-one"
+                )
+                with self.assertRaisesRegex(HarnessError, "keyed integrity|quarantined"):
+                    reopened._read()
 
     def test_starting_chat_again_removes_transcript_mirror_ledger_and_cursors(self) -> None:
         ledger = self.ledger()

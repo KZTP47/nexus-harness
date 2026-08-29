@@ -373,16 +373,18 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         swarm.open_this_board("Friday work", self.config)
         self.assertEqual([one.name for one in swarm.load().agents], ["The reviewer"])
 
-    def test_there_is_a_lid_on_how_many_are_kept(self) -> None:
-        """Remembered between sessions and never tidied, this is somewhere a
-        folder quietly fills up."""
-
+    def test_more_than_sixty_boards_can_be_saved_and_imported(self) -> None:
+        """A person's library is not silently capped at the former sixty."""
         self.a_board_with("The planner")
-        for number in range(swarm.MOST_KEPT_BOARDS):
+        for number in range(65):
             swarm.keep_this_board(f"Board {number}", self.config)
-        with self.assertRaises(swarm.SwarmError) as caught:
-            swarm.keep_this_board("One too many", self.config)
-        self.assertIn("which is the most", str(caught.exception))
+        document = swarm.export_kept_board("Board 0")
+        document["name"] = "Imported after sixty"
+        imported = swarm.import_kept_board(document)
+        self.assertEqual(imported["name"], "Imported after sixty")
+        names = [one["name"] for one in swarm.every_kept_board()]
+        self.assertEqual(len(names), 66)
+        self.assertIn("Imported after sixty", names)
 
     def test_a_saved_board_that_cannot_be_read_does_not_hide_the_others(self) -> None:
         self.a_board_with("The planner")
@@ -459,6 +461,20 @@ class BoardsKeptUnderANameTests(unittest.TestCase):
         with self.assertRaisesRegex(swarm.SwarmError, "not on the board"):
             swarm.import_kept_board(dangling)
         self.assertEqual(swarm.every_kept_board(), [])
+
+    def test_escaped_lone_surrogate_import_is_a_domain_error_and_changes_no_inventory(self) -> None:
+        document = json.loads(
+            '{"format":"nexus-harness.saved-board.v1","name":"Broken Unicode",'
+            '"board":{"agents":[{"id":"agent-1","name":"Planner",'
+            '"job":"\\ud800"}]}}'
+        )
+        before = swarm.kept_board_inventory()
+
+        with self.assertRaisesRegex(swarm.SwarmError, "lone Unicode surrogate"):
+            swarm.import_kept_board(document)
+
+        self.assertEqual(swarm.kept_board_inventory(), before)
+        self.assertEqual(list((self.home / "swarms").glob("*.json")), [])
 
     def test_import_rejects_unknown_fields_instead_of_silently_losing_them(self) -> None:
         examples = (
@@ -717,12 +733,16 @@ class TheBoardSurvivesTheChecksTests(unittest.TestCase):
 
         self.where.write_text('{"agents": [{"name": "Yours"}]}', encoding="utf-8")
 
+        real = self.qa.put_this_file_in_place
+
         def refuse(path, written):
-            raise OSError("something has it open")
+            if path == self.where:
+                raise OSError("something has it open")
+            return real(path, written)
 
         said = io.StringIO()
         with mock.patch.object(self.qa, "put_this_file_in_place", refuse), \
-             ctx.redirect_stderr(said):
+             ctx.redirect_stderr(said), self.assertRaises(self.qa.QaError):
             with self.qa._the_board_put_back_afterwards(
                     [self.a_case("the board of agents")], "a-run"):
                 self.where.write_text('{"agents": []}', encoding="utf-8")
@@ -761,17 +781,209 @@ class TheBoardSurvivesTheChecksTests(unittest.TestCase):
             (kept / "friday-abc123.json").write_text('{"name": "Not Friday"}', encoding="utf-8")
         self.assertIn("\"Friday\"", (kept / "friday-abc123.json").read_text(encoding="utf-8"))
 
+    def test_saved_boards_created_by_a_check_are_removed_again(self) -> None:
+        kept = self.where.parent / "swarms"
+        kept.mkdir(parents=True, exist_ok=True)
+        original = kept / "friday-abc123.json"
+        original.write_text('{"name": "Friday"}', encoding="utf-8")
+        held = mock.patch.object(swarm, "where_the_kept_ones_live", lambda: kept)
+        held.start()
+        self.addCleanup(held.stop)
+
+        with self.qa._the_board_put_back_afterwards(
+                [self.a_case("the board of agents")], "a-run"):
+            (kept / "check-created.json").write_text("{}", encoding="utf-8")
+
+        self.assertEqual([one.name for one in kept.glob("*.json")], [original.name])
+
+    def test_an_unreadable_existing_live_board_stops_the_check_before_it_runs(self) -> None:
+        self.where.mkdir()
+        entered = False
+        with self.assertRaisesRegex(self.qa.QaError, "absence and unreadable"):
+            with self.qa._the_board_put_back_afterwards(
+                    [self.a_case("the board of agents")], "a-run"):
+                entered = True
+        self.assertFalse(entered)
+
+    def test_an_unreadable_saved_board_stops_the_check_before_it_runs(self) -> None:
+        kept = self.where.parent / "swarms"
+        kept.mkdir(parents=True)
+        (kept / "broken.json").mkdir()
+        held = mock.patch.object(swarm, "where_the_kept_ones_live", lambda: kept)
+        held.start()
+        self.addCleanup(held.stop)
+        entered = False
+
+        with self.assertRaisesRegex(self.qa.QaError, "not a regular local JSON file"):
+            with self.qa._the_board_put_back_afterwards(
+                    [self.a_case("the board of agents")], "a-run"):
+                entered = True
+        self.assertFalse(entered)
+
+    def test_an_interrupted_check_is_recovered_before_the_next_one_starts(self) -> None:
+        kept = self.where.parent / "swarms"
+        kept.mkdir(parents=True)
+        original = kept / "friday-abc123.json"
+        self.where.write_text('{"agents": [{"name": "Yours"}]}', encoding="utf-8")
+        original.write_text('{"name": "Friday"}', encoding="utf-8")
+        held = mock.patch.object(swarm, "where_the_kept_ones_live", lambda: kept)
+        held.start()
+        self.addCleanup(held.stop)
+
+        directory_existed, saved = self.qa._snapshot_saved_boards(kept)
+        transaction = self.qa._keep_a_copy_of_the_board(
+            self.where, self.where.read_text(encoding="utf-8"), saved,
+            "interrupted-run", saved_directory_existed=directory_existed,
+        )
+        self.where.write_text('{"agents": []}', encoding="utf-8")
+        original.unlink()
+        (kept / "check-created.json").write_text("{}", encoding="utf-8")
+
+        self.assertTrue(self.qa.recover_abandoned_board_transactions())
+        self.assertIn("Yours", self.where.read_text(encoding="utf-8"))
+        self.assertIn("Friday", original.read_text(encoding="utf-8"))
+        self.assertFalse((kept / "check-created.json").exists())
+        restored = json.loads(transaction.read_text(encoding="utf-8"))
+        self.assertEqual(restored["state"], "restored")
+        self.assertTrue(restored["displaced_copy_retained"])
+        self.assertIn("check-created.json", restored["displaced_after_check"]["saved_boards"])
+
+    def test_a_failed_restore_retry_never_overwrites_the_first_displaced_save(self) -> None:
+        kept = self.where.parent / "swarms"
+        kept.mkdir(parents=True)
+        self.where.write_text('{"agents": [{"name": "Original"}]}', encoding="utf-8")
+        directory_existed, saved = self.qa._snapshot_saved_boards(kept)
+        transaction = self.qa._keep_a_copy_of_the_board(
+            self.where, self.where.read_text(encoding="utf-8"), saved,
+            "interrupted-run", saved_directory_existed=directory_existed,
+        )
+        first_displaced = '{"agents": [{"name": "User save U"}]}'
+        self.where.write_text(first_displaced, encoding="utf-8")
+
+        with mock.patch.object(
+            self.qa, "_put_the_saved_boards_back",
+            side_effect=self.qa.QaError("saved board is locked"),
+        ), self.assertRaisesRegex(self.qa.QaError, "locked"):
+            self.qa._recover_board_transactions(self.where, kept)
+
+        # The first restore partially completed.  A later retry therefore sees
+        # different current bytes, but those must not replace U in the journal.
+        self.where.write_text('{"agents": [{"name": "Retry state"}]}', encoding="utf-8")
+        self.qa._recover_board_transactions(self.where, kept)
+
+        restored = json.loads(transaction.read_text(encoding="utf-8"))
+        self.assertEqual(restored["state"], "restored")
+        candidates = [one["board"] for one in restored["displaced_copies"]]
+        self.assertIn(first_displaced, candidates)
+        self.assertIn('{"agents": [{"name": "Retry state"}]}', candidates)
+        self.assertEqual(
+            restored["displaced_after_check"]["board"], first_displaced,
+            "the compatibility field overwrote the first displaced user save",
+        )
+
+    def test_a_live_board_preservation_lock_refuses_an_overlapping_qa_process(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            with self.qa._board_preservation_file_lock(self.where):
+                entered.set()
+                release.wait(5)
+
+        worker = threading.Thread(target=hold)
+        worker.start()
+        self.assertTrue(entered.wait(2))
+        try:
+            with self.assertRaises(self.qa.BoardPreservationBusy):
+                with self.qa._board_preservation_file_lock(
+                    self.where, timeout_seconds=0.05,
+                ):
+                    pass
+        finally:
+            release.set()
+            worker.join(2)
+
+    def test_capability_is_cross_process_board_bound_and_revoked(self) -> None:
+        other_board = self.where.parent / "somebody-elses-board.json"
+        program = (
+            "import json,sys\n"
+            "from pathlib import Path\n"
+            "from our_harness import qa\n"
+            "print(json.dumps([qa.board_qa_capability_is_active(sys.argv[1], Path(sys.argv[2])), "
+            "qa.board_qa_capability_is_active(sys.argv[1], Path(sys.argv[3]))]))\n"
+        )
+        environment = dict(os.environ)
+        source = str(Path(__file__).resolve().parents[1] / "src")
+        environment["PYTHONPATH"] = source + os.pathsep + environment.get("PYTHONPATH", "")
+
+        with self.qa._active_board_qa_capability(self.where) as token:
+            record, _proof = self.qa._board_qa_capability_paths(token, self.where)
+            self.assertNotIn(token, record.read_text(encoding="utf-8"))
+            answer = subprocess.run(
+                [sys.executable, "-c", program, token, str(self.where), str(other_board)],
+                env=environment, capture_output=True, text=True, timeout=20, check=False,
+            )
+            self.assertEqual(answer.returncode, 0, answer.stderr)
+            self.assertEqual(json.loads(answer.stdout), [True, False])
+
+        revoked = subprocess.run(
+            [sys.executable, "-c", program, token, str(self.where), str(other_board)],
+            env=environment, capture_output=True, text=True, timeout=20, check=False,
+        )
+        self.assertEqual(revoked.returncode, 0, revoked.stderr)
+        self.assertEqual(json.loads(revoked.stdout), [False, False])
+
     def test_the_copies_do_not_pile_up_for_ever(self) -> None:
         self.where.write_text('{"agents": []}', encoding="utf-8")
         where = self.where.parent / self.qa.WHERE_THE_BOARD_IS_COPIED
-        where.mkdir(parents=True, exist_ok=True)
         for number in range(self.qa.MOST_BOARD_COPIES + 8):
-            (where / f"2020010{number:04}-old.json").write_text("{}", encoding="utf-8")
-        with self.qa._the_board_put_back_afterwards(
-                [self.a_case("the board of agents")], "a-run"):
-            pass
+            transaction = self.qa._keep_a_copy_of_the_board(
+                self.where, self.where.read_text(encoding="utf-8"), {},
+                f"old-{number}", saved_directory_existed=False,
+            )
+            self.qa._mark_board_transaction_restored(transaction)
         self.assertLessEqual(
             len(list(where.glob("*.json"))), self.qa.MOST_BOARD_COPIES)
+
+    def test_retained_user_candidates_are_never_aged_out(self) -> None:
+        self.where.write_text('{"agents": []}', encoding="utf-8")
+        where = self.where.parent / self.qa.WHERE_THE_BOARD_IS_COPIED
+        for number in range(self.qa.MOST_RETAINED_BOARD_RECOVERIES):
+            transaction = self.qa._keep_a_copy_of_the_board(
+                self.where, self.where.read_text(encoding="utf-8"), {},
+                f"retained-{number}", saved_directory_existed=False,
+            )
+            self.qa._record_displaced_boards(
+                transaction,
+                f'{{"agents": [{{"name": "User save {number}"}}]}}',
+                {}, saved_directory_existed=False, differs=True,
+            )
+            self.qa._mark_board_transaction_restored(transaction)
+
+        before = {one.name: one.read_bytes() for one in where.glob("*.json")}
+        with self.assertRaisesRegex(self.qa.QaError, "will not discard"):
+            self.qa._keep_a_copy_of_the_board(
+                self.where, self.where.read_text(encoding="utf-8"), {},
+                "one-too-many", saved_directory_existed=False,
+            )
+        after = {one.name: one.read_bytes() for one in where.glob("*.json")}
+        self.assertEqual(after, before)
+
+    def test_recovery_notice_poll_reads_only_the_compact_index(self) -> None:
+        where = self.where.parent / self.qa.WHERE_THE_BOARD_IS_COPIED
+        where.mkdir(parents=True)
+        transaction = where / "20260829-000000-run-transaction.json"
+        transaction.write_text("x" * 2_000_000, encoding="utf-8")
+        self.qa._write_board_notice_index(where, [transaction.name])
+
+        with mock.patch.object(
+            self.qa, "_read_board_transaction",
+            side_effect=AssertionError("status polling parsed a payload journal"),
+        ):
+            notices = self.qa.retained_board_recovery_notices()
+
+        self.assertEqual(len(notices), 1)
+        self.assertIn(str(transaction), notices[0])
 
     def test_the_runner_really_wraps_a_run_in_it(self) -> None:
         """Having the safety net and using it are two different things, and only

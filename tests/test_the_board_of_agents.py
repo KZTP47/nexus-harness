@@ -19,8 +19,10 @@ be wrong.
 from __future__ import annotations
 
 import copy
+import base64
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -31,7 +33,10 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from our_harness import cancellation, chat, server, swarm, swarm_runs, swarm_work
+from our_harness import (
+    agent_mailbox, cancellation, chat, pages, server, swarm, swarm_runs,
+    swarm_work,
+)
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
 
 
@@ -99,6 +104,44 @@ class WhatABoardIs(BoardTestCase):
         )
         self.assertEqual([one.name for one in board.agents], ["The reviewer"])
         self.assertEqual(board.projects[0].tasks, ["Make it pass"])
+        self.assertEqual(board.projects[0].approved_test_command_digest, "")
+
+    def test_a_valid_project_command_approval_survives_live_board_serialization(self) -> None:
+        digest = "a" * 64
+        board = self.a_board(projects=[{
+            "path": str(self.a_project()),
+        }])
+        board.projects[0].approved_test_command_digest = digest
+        board = swarm.save(
+            board.to_dict(),
+            self.config,
+            allow_command_approval_changes=True,
+        )
+        # A later ordinary layout save keeps existing local authority, without
+        # requiring the panel to send or understand a private approval field.
+        board = swarm.save(board.to_dict(), self.config)
+        self.assertEqual(board.projects[0].approved_test_command_digest, digest)
+        self.assertEqual(board.to_dict()["projects"][0]["approved_test_command_digest"], digest)
+
+    def test_local_named_board_keeps_prior_explicit_command_approval(self) -> None:
+        digest = "d" * 64
+        project = self.a_project("approved-saved-board")
+        board = self.a_board(projects=[{
+            "id": "project-approved", "path": str(project),
+        }])
+        board.projects[0].approved_test_command_digest = digest
+        swarm.save(
+            board.to_dict(), self.config, allow_command_approval_changes=True,
+        )
+        swarm.keep_this_board("Approved work", self.config)
+        self.a_board(projects=[{
+            "id": "project-other", "path": str(self.a_project("other-board")),
+        }])
+
+        opened = swarm.open_this_board("Approved work", self.config)
+
+        self.assertEqual(opened.projects[0].id, "project-approved")
+        self.assertEqual(opened.projects[0].approved_test_command_digest, digest)
 
     def test_reusing_known_provider_status_does_not_probe_installed_clis(self) -> None:
         self.a_board(agents=[{"name": "The reviewer", "who": "claude"}])
@@ -163,6 +206,126 @@ class WhatABoardIs(BoardTestCase):
             [one.id for one in again.agents], [one.id for one in board.agents])
         self.assertEqual(again.projects[0].tasks, ["Do it"])
 
+    def test_ordinary_board_load_runs_abandoned_qa_recovery_first(self) -> None:
+        with mock.patch(
+            "our_harness.qa.recover_abandoned_board_transactions", return_value=True,
+        ) as recovered:
+            board = swarm.load()
+
+        self.assertEqual(board.agents, [])
+        recovered.assert_called_once_with()
+
+    def test_recovery_scan_is_once_per_board_but_live_lock_is_still_checked(self) -> None:
+        from our_harness import qa
+
+        holding = threading.Event()
+        release = threading.Event()
+        with mock.patch(
+            "our_harness.qa.recover_abandoned_board_transactions", return_value=True,
+        ) as recovered:
+            self.assertEqual(swarm.load().agents, [])
+            self.assertEqual(swarm.load().agents, [])
+
+            def hold_board_qa() -> None:
+                with qa._board_preservation_file_lock(
+                    swarm.where_it_lives(), timeout_seconds=1.0,
+                ):
+                    holding.set()
+                    release.wait(10)
+
+            thread = threading.Thread(target=hold_board_qa)
+            thread.start()
+            self.assertTrue(holding.wait(5))
+            try:
+                with self.assertRaisesRegex(swarm.SwarmError, "board check is in progress"):
+                    swarm.load()
+            finally:
+                release.set()
+                thread.join(10)
+
+        recovered.assert_called_once_with()
+        self.assertFalse(thread.is_alive())
+
+    def test_board_touching_plugin_case_gets_only_its_worker_capability(self) -> None:
+        from our_harness import qa
+
+        self.a_board(agents=[{"name": "Original agent"}])
+        seen: list[str] = []
+
+        def mutate_through_swarm(_case: qa.QaCase, _runner: qa.QaRunner):
+            seen.append(swarm.load().agents[0].name)
+            swarm.save({
+                "agents": [{"id": "agent-1", "name": "Plugin temporary agent"}],
+            }, self.config)
+            seen.append(swarm.load().agents[0].name)
+            return (), "mutated through the real board API", ""
+
+        kind = qa.CheckKind(
+            name="board_plugin", summary="Touches the real board",
+            run=mutate_through_swarm,
+        )
+        case = qa.QaCase(
+            index=0, id="plugin-board", title="Plugin board", kind="board_plugin",
+            touches=("the board",), expect=qa.QaExpectation(),
+        )
+        result = qa.QaRunner(
+            self.config, extra_kinds={kind.name: kind},
+        ).run(
+            qa.QaSuite("plugin board isolation", (case,)), workers=1,
+            run_id="plugin-board-isolation", write_artifacts=False,
+        )
+
+        self.assertTrue(result.passed, result.to_dict())
+        self.assertEqual(seen, ["Original agent", "Plugin temporary agent"])
+        self.assertEqual(swarm.load().agents[0].name, "Original agent")
+
+    def test_live_board_qa_lock_never_exposes_its_temporary_board(self) -> None:
+        with mock.patch(
+            "our_harness.qa.recover_abandoned_board_transactions", return_value=False,
+        ), self.assertRaisesRegex(swarm.SwarmError, "board check is in progress"):
+            swarm.load()
+
+    def test_live_qa_lock_refuses_load_export_and_delete_without_mutation(self) -> None:
+        from our_harness import qa
+
+        self.a_board(agents=[{"name": "Kept agent", "job": " exact role "}])
+        swarm.keep_this_board("Protected", self.config)
+        # Establish that abandoned recovery completed once before the other
+        # thread begins a real preservation transaction.
+        self.assertEqual(swarm.load().agents[0].name, "Kept agent")
+        active_before = swarm.where_it_lives().read_bytes()
+        saved_path = swarm.where_the_kept_ones_live() / swarm._filed_under("Protected")
+        saved_before = saved_path.read_bytes()
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold_board_qa() -> None:
+            with qa._board_preservation_file_lock(
+                swarm.where_it_lives(), timeout_seconds=1.0,
+            ):
+                holding.set()
+                release.wait(10)
+
+        thread = threading.Thread(target=hold_board_qa)
+        thread.start()
+        self.assertTrue(holding.wait(5), "the QA preservation lock was not acquired")
+        try:
+            for action in (
+                swarm.load,
+                lambda: swarm.export_kept_board("Protected"),
+                lambda: swarm.forget_this_board("Protected", self.config),
+            ):
+                with self.subTest(action=action), self.assertRaisesRegex(
+                    swarm.SwarmError, "board check is in progress",
+                ):
+                    action()
+            self.assertEqual(swarm.where_it_lives().read_bytes(), active_before)
+            self.assertEqual(saved_path.read_bytes(), saved_before)
+        finally:
+            release.set()
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+
     def test_jobs_are_lines_of_text_and_are_kept(self) -> None:
         """Read as a list of objects, every job was quietly dropped and the
         board said the project had nothing to do in it."""
@@ -173,24 +336,106 @@ class WhatABoardIs(BoardTestCase):
         self.assertEqual(board.projects[0].tasks, ["First", "Second"])
         self.assertEqual(swarm.load().projects[0].tasks, ["First", "Second"])
 
-    def test_something_that_is_not_a_job_is_left_out(self) -> None:
-        board = self.a_board(projects=[
-            {"path": str(self.a_project()), "tasks": ["First", {"nonsense": 1}, None]},
-        ])
-        self.assertEqual(board.projects[0].tasks, ["First"])
+    def test_something_that_is_not_a_job_is_refused_instead_of_dropped(self) -> None:
+        with self.assertRaisesRegex(swarm.SwarmError, "Nothing was dropped"):
+            self.a_board(projects=[
+                {"path": str(self.a_project()), "tasks": ["First", {"nonsense": 1}, None]},
+            ])
 
-    def test_a_file_nobody_can_read_starts_empty(self) -> None:
-        """Rather than a panel that will not open at all."""
+    def test_whitespace_only_project_job_is_refused_instead_of_dropped(self) -> None:
+        with self.assertRaisesRegex(swarm.SwarmError, "Nothing was dropped"):
+            self.a_board(projects=[{
+                "path": str(self.a_project()), "tasks": ["Keep me", " \r\n\t "],
+            }])
+
+    def test_long_formatted_roles_and_goals_round_trip_exactly_at_the_boundary(self) -> None:
+        role = "Role heading\n\n" + "r" * (swarm.LONGEST_JOB - 14)
+        goal = "Goal heading\n\n" + "g" * (swarm.LONGEST_TASK - 14)
+        self.assertEqual(len(role), swarm.LONGEST_JOB)
+        self.assertEqual(len(goal), swarm.LONGEST_TASK)
+        board = self.a_board(
+            agents=[{"name": "Planner", "job": role}],
+            projects=[{"path": str(self.a_project()), "tasks": [goal]}],
+        )
+        again = swarm.load()
+        self.assertEqual(board.agents[0].job, role)
+        self.assertEqual(board.projects[0].tasks[0], goal)
+        self.assertEqual(again.agents[0].job, role)
+        self.assertEqual(again.projects[0].tasks[0], goal)
+
+    def test_instruction_edges_and_crlf_round_trip_without_hidden_normalisation(self) -> None:
+        role = " \r\n" + ("r" * (swarm.LONGEST_JOB - 6)) + "\r\n "
+        goal = "\t\r\n" + ("g" * (swarm.LONGEST_TASK - 6)) + "\r\n\t"
+        self.assertEqual(len(role), swarm.LONGEST_JOB)
+        self.assertEqual(len(goal), swarm.LONGEST_TASK)
+
+        self.a_board(
+            agents=[{"name": "Planner", "job": role}],
+            projects=[{"path": str(self.a_project()), "tasks": [goal]}],
+        )
+        again = swarm.load()
+
+        self.assertEqual(again.agents[0].job, role)
+        self.assertEqual(again.projects[0].tasks[0], goal)
+
+    def test_outer_whitespace_counts_toward_the_raw_instruction_limit(self) -> None:
+        project = self.a_project()
+        original = self.a_board(
+            agents=[{"name": "Planner", "job": "Keep exact"}],
+            projects=[{"path": str(project), "tasks": ["Keep exact goal"]}],
+        )
+        changed = original.to_dict()
+        changed["agents"][0]["job"] = " " + ("r" * swarm.LONGEST_JOB) + " "
+
+        with self.assertRaisesRegex(swarm.SwarmError, "did not truncate"):
+            swarm.save(changed, self.config)
+
+        kept = swarm.load()
+        self.assertEqual(kept.agents[0].job, "Keep exact")
+        self.assertEqual(kept.projects[0].tasks, ["Keep exact goal"])
+
+    def test_oversized_roles_and_goals_are_rejected_without_replacing_the_board(self) -> None:
+        project = self.a_project()
+        original = self.a_board(
+            agents=[{"name": "Planner", "job": "Keep this role"}],
+            projects=[{"path": str(project), "tasks": ["Keep this goal"]}],
+        )
+        for changed in (
+            {
+                "agents": [{"id": "agent-1", "name": "Planner", "job": "r" * (swarm.LONGEST_JOB + 1)}],
+                "projects": original.to_dict()["projects"],
+            },
+            {
+                "agents": original.to_dict()["agents"],
+                "projects": [{
+                    "id": "project-1", "path": str(project),
+                    "tasks": ["g" * (swarm.LONGEST_TASK + 1)],
+                }],
+            },
+        ):
+            with self.subTest(kind="role" if changed["agents"][0].get("job", "").startswith("r") else "goal"), \
+                    self.assertRaisesRegex(swarm.SwarmError, "did not truncate"):
+                swarm.save(changed, self.config)
+            kept = swarm.load()
+            self.assertEqual(kept.agents[0].job, "Keep this role")
+            self.assertEqual(kept.projects[0].tasks, ["Keep this goal"])
+
+    def test_a_file_nobody_can_read_is_not_pretended_to_be_empty(self) -> None:
 
         swarm.where_it_lives().parent.mkdir(parents=True, exist_ok=True)
         swarm.where_it_lives().write_text("{ not json", encoding="utf-8")
-        self.assertEqual(swarm.load().agents, [])
+        with self.assertRaisesRegex(swarm.SwarmError, "did not pretend"):
+            swarm.load()
+        self.assertEqual(swarm.where_it_lives().read_text(encoding="utf-8"), "{ not json")
 
-    def test_a_board_that_makes_no_sense_starts_empty(self) -> None:
+    def test_an_invalid_active_board_is_preserved_and_refused(self) -> None:
         swarm.where_it_lives().parent.mkdir(parents=True, exist_ok=True)
         swarm.where_it_lives().write_text(
             json.dumps({"agents": [{"name": "!!! no"}]}), encoding="utf-8")
-        self.assertEqual(swarm.load().agents, [])
+        before = swarm.where_it_lives().read_bytes()
+        with self.assertRaisesRegex(swarm.SwarmError, "did not replace"):
+            swarm.load()
+        self.assertEqual(swarm.where_it_lives().read_bytes(), before)
 
 
 class TwoWindowsOnOneBoard(BoardTestCase):
@@ -279,9 +524,9 @@ class NamesAreWhereConversationsAreKept(BoardTestCase):
             with self.subTest(said=said), self.assertRaises(swarm.SwarmError):
                 self.a_board(agents=[{"name": said}])
 
-    def test_a_name_written_as_an_essay_is_cut_short(self) -> None:
-        board = self.a_board(agents=[{"name": "a" * 500}])
-        self.assertEqual(len(board.agents[0].name), swarm.LONGEST_NAME)
+    def test_a_name_written_as_an_essay_is_refused_not_cut_short(self) -> None:
+        with self.assertRaisesRegex(swarm.SwarmError, "did not truncate"):
+            self.a_board(agents=[{"name": "a" * 500}])
 
     def test_what_it_is_filed_under_is_stable_when_the_agent_is_renamed(self) -> None:
         """A display-name edit must not orphan the direct-chat history."""
@@ -493,17 +738,24 @@ class WhoWorksOnWhat(BoardTestCase):
 
 
 class HowMuchFitsOnIt(BoardTestCase):
-    def test_more_agents_than_fit_are_left_off(self) -> None:
-        board = self.a_board(
-            agents=[{"name": f"Agent {n}"} for n in range(swarm.MOST_AGENTS + 6)])
-        self.assertEqual(len(board.agents), swarm.MOST_AGENTS)
+    def test_more_agents_than_fit_are_refused_not_left_off(self) -> None:
+        with self.assertRaisesRegex(swarm.SwarmError, "did not drop any agents"):
+            self.a_board(
+                agents=[{"name": f"Agent {n}"} for n in range(swarm.MOST_AGENTS + 1)])
 
-    def test_more_jobs_than_fit_are_left_off(self) -> None:
-        board = self.a_board(projects=[{
-            "path": str(self.a_project()),
-            "tasks": [f"Job {n}" for n in range(swarm.MOST_TASKS + 6)],
-        }])
-        self.assertEqual(len(board.projects[0].tasks), swarm.MOST_TASKS)
+    def test_more_projects_than_fit_are_refused_not_left_off(self) -> None:
+        with self.assertRaisesRegex(swarm.SwarmError, "did not drop any projects"):
+            self.a_board(projects=[
+                {"path": str(self.a_project(f"project-{one}"))}
+                for one in range(swarm.MOST_PROJECTS + 1)
+            ])
+
+    def test_more_jobs_than_fit_are_refused_not_left_off(self) -> None:
+        with self.assertRaisesRegex(swarm.SwarmError, "did not drop any jobs"):
+            self.a_board(projects=[{
+                "path": str(self.a_project()),
+                "tasks": [f"Job {n}" for n in range(swarm.MOST_TASKS + 1)],
+            }])
 
     def test_a_box_cannot_be_dragged_off_the_board(self) -> None:
         """A box at minus four thousand is a box nobody can find again."""
@@ -599,6 +851,18 @@ class WhatIsNotReady(BoardTestCase):
         self.assertEqual(
             swarm.what_is_not_ready(self.config, stands),
             swarm.what_is_not_ready(self.config),
+        )
+
+    def test_retained_qa_board_recovery_is_visible_in_board_inventory(self) -> None:
+        with mock.patch(
+            "our_harness.qa.retained_board_recovery_notices",
+            return_value=["Recovered concurrent board bytes are retained for review."],
+        ):
+            standing = swarm.how_it_stands(self.config, known_routes=[])
+
+        self.assertEqual(
+            standing["board_recovery_notices"],
+            ["Recovered concurrent board bytes are retained for review."],
         )
 
 
@@ -697,6 +961,18 @@ class SettingThemGoing(BoardTestCase):
             with self.subTest(filed=one):
                 self.assertNotEqual(one, one.replace(" on the board", ""))
 
+    def test_sixty_character_agent_name_keeps_a_distinct_hashed_board_namespace(self) -> None:
+        first = "A" * 59 + "1"
+        second = "A" * 59 + "2"
+        private = swarm.filed_as(first)
+        board_first = swarm.filed_as(swarm.filed_as_on_the_board(first))
+        board_second = swarm.filed_as(swarm.filed_as_on_the_board(second))
+        self.assertEqual(len(private), swarm.LONGEST_NAME)
+        self.assertLessEqual(len(board_first), swarm.LONGEST_NAME)
+        self.assertTrue(board_first.endswith(" on the board"))
+        self.assertNotEqual(board_first, private)
+        self.assertNotEqual(board_first, board_second)
+
     def test_each_agent_is_still_asked_under_a_name_of_its_own(self) -> None:
         """Apart from the person's chat, and apart from each other's."""
 
@@ -786,6 +1062,25 @@ class SettingThemGoing(BoardTestCase):
         reviewer_second_round = self.asked[3][2]
         self.assertIn("Writer on the board says so", reviewer_second_round)
         self.assertNotIn("Private researcher on the board says so", reviewer_second_round)
+
+    def test_a_broken_shared_page_stops_advice_before_provider_contact(self) -> None:
+        self.a_working_board()
+        with mock.patch.object(
+            pages, "read_the_page",
+            side_effect=pages.PageError("segment digest did not match"),
+        ):
+            doing = self.a_run()
+
+        later = [
+            one for one in doing["turns"] if one["round"] == swarm.AFTER_THE_OTHERS
+        ]
+        self.assertEqual(len(self.asked), 2, "an advice provider saw incomplete evidence")
+        self.assertEqual([one["state"] for one in later], ["not done", "not done"])
+        self.assertTrue(all(
+            "instead of silently omitting" in one["why_not"]
+            and "segment digest did not match" in one["why_not"]
+            for one in later
+        ))
 
     def test_a_project_with_no_jobs_is_left_alone(self) -> None:
         self.a_board(
@@ -911,6 +1206,401 @@ class SettingThemGoing(BoardTestCase):
     def test_nothing_has_been_run_yet_is_an_answer_too(self) -> None:
         self.assertIsNone(swarm.Running().how_it_is_going())
 
+    def test_paged_advice_processes_every_source_character_in_bounded_reductions(self) -> None:
+        source = ("ordinary evidence line\n\n" * 25_000) + "exact tail"
+
+        class AdviceChat:
+            MOST_LETTERS = 200_000
+
+            def __init__(self) -> None:
+                self.ingests: list[tuple[str, str, str]] = []
+                self.final_prompt = ""
+
+            def chat_destination(self, _config, route):
+                return {"route": route, "provider_kind": "test", "model": "advice"}
+
+            def ask_once(
+                self, config, route, prompt, *, context="", conversation_key="",
+            ):
+                self.ingests.append((prompt, context, conversation_key))
+                if "NEXUS PAGED ADVICE INGEST source " in prompt:
+                    return {"text": "source ledger\n" + ("s" * 19_980)}
+                return {"text": "bounded reduction ledger"}
+
+            def say(self, config, route, prompt, *, filed_as=""):
+                self.final_prompt = prompt
+                return {"answer": {"text": "final advice"}}
+
+        fake = AdviceChat()
+        result = swarm._say_with_paged_advice_context(
+            self.config, fake, "claude", source, filed_under="board advice",
+        )
+        source_chunks = [
+            context for prompt, context, _key in fake.ingests
+            if "NEXUS PAGED ADVICE INGEST source " in prompt
+        ]
+        reductions = [
+            context for prompt, context, _key in fake.ingests
+            if "NEXUS PAGED ADVICE INGEST reduction-" in prompt
+        ]
+
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        receipt = json.loads(next(folder.glob("advice-receipt-*.json")).read_text(
+            encoding="utf-8",
+        ))
+        reconstructed = "".join(
+            (folder / "chunks" / f"{digest}.txt").read_text(encoding="utf-8")
+            for digest in receipt["storage_block_sha256"]
+        )
+        self.assertEqual(reconstructed, source)
+        self.assertGreater(len(source_chunks), 0)
+        self.assertTrue(reductions, "the oversized ledgers never entered reduction")
+        self.assertTrue(all(
+            len(context) <= swarm.ADVICE_INGEST_CHARS
+            for _prompt, context, _key in fake.ingests
+        ))
+        self.assertLessEqual(len(fake.final_prompt), fake.MOST_LETTERS)
+        self.assertEqual(result["answer"]["text"], "final advice")
+
+    def test_paged_advice_refuses_a_tampered_hash_block_before_any_publication(self) -> None:
+        source = "A" * 250_000
+        block = swarm._advice_storage_blocks(source)[0]
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        chunks = folder / "chunks"
+        chunks.mkdir(parents=True)
+        corrupt = chunks / f"{swarm._advice_sha(block)}.txt"
+        corrupt.write_text("different UTF-8 content", encoding="utf-8")
+
+        class NeverAsked:
+            MOST_LETTERS = 200_000
+
+            def ask_once(self, *_args, **_kwargs):
+                self.fail("provider must not be asked")
+
+            def say(self, *_args, **_kwargs):
+                self.fail("provider must not be asked")
+
+        with self.assertRaisesRegex(swarm.SwarmError, "integrity check"):
+            swarm._say_with_paged_advice_context(
+                self.config, NeverAsked(), "claude", source,
+                filed_under="tampered block", audit_scope="tampered-block-test",
+            )
+
+        self.assertEqual(corrupt.read_text(encoding="utf-8"), "different UTF-8 content")
+        self.assertEqual(list(folder.glob("advice-active-*.json")), [])
+        self.assertEqual(list(folder.glob("advice-receipt-*.json")), [])
+
+    def test_paged_advice_refuses_a_non_utf8_hash_block_before_publication(self) -> None:
+        source = "B" * 250_000
+        block = swarm._advice_storage_blocks(source)[0]
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        chunks = folder / "chunks"
+        chunks.mkdir(parents=True)
+        corrupt = chunks / f"{swarm._advice_sha(block)}.txt"
+        corrupt.write_bytes(b"\xff\xfe\xfa")
+
+        class NeverAsked:
+            MOST_LETTERS = 200_000
+
+        with self.assertRaisesRegex(swarm.SwarmError, "unreadable as exact UTF-8"):
+            swarm._say_with_paged_advice_context(
+                self.config, NeverAsked(), "claude", source,
+                filed_under="non UTF-8 block", audit_scope="non-utf8-block-test",
+            )
+
+        self.assertEqual(corrupt.read_bytes(), b"\xff\xfe\xfa")
+        self.assertEqual(list(folder.glob("advice-active-*.json")), [])
+        self.assertEqual(list(folder.glob("advice-receipt-*.json")), [])
+
+    def test_failed_provider_work_keeps_an_exact_reconstructable_manifest(self) -> None:
+        source = ("first exact evidence\n" * 8_000) + ("second tail" * 12_000)
+
+        class FailedChat:
+            MOST_LETTERS = 150_000
+
+            def chat_destination(self, _config, route):
+                return {"route": route, "provider_kind": "test", "model": "failed"}
+
+            def ask_once(self, *_args, **_kwargs):
+                raise swarm.SwarmError("provider stopped during extraction")
+
+        with self.assertRaisesRegex(swarm.SwarmError, "stopped during extraction"):
+            swarm._say_with_paged_advice_context(
+                self.config, FailedChat(), "claude", source,
+                filed_under="failed extraction", audit_scope="failed-extraction-test",
+            )
+
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        manifest = json.loads(next(folder.glob("advice-active-*.json")).read_text(
+            encoding="utf-8",
+        ))
+        reconstructed = "".join(
+            (folder / "chunks" / entry["file"]).read_text(encoding="utf-8")
+            for entry in manifest["chunks"]
+        )
+        self.assertEqual(reconstructed, source)
+        self.assertEqual(manifest["source_sha256"], swarm._advice_sha(source))
+        self.assertEqual(list(folder.glob("advice-receipt-*.json")), [])
+
+    def test_paged_advice_reuses_settled_source_and_reduction_caches(self) -> None:
+        class CacheChat:
+            MOST_LETTERS = 200_000
+
+            def __init__(self, model="model-a") -> None:
+                self.model = model
+                self.calls: list[tuple[str, str]] = []
+
+            def chat_destination(self, _config, route):
+                return {
+                    "route": route, "provider_kind": "test", "model": self.model,
+                }
+
+            def ask_once(
+                self, _config, _route, prompt, *, context="", conversation_key="",
+            ):
+                self.calls.append((prompt, context))
+                if "NEXUS PAGED ADVICE INGEST source " in prompt:
+                    return {
+                        "text": f"source {_sha(context)}\n" + ("s" * 20_100),
+                    }
+                return {"text": f"reduced {_sha(context)}"}
+
+            def say(self, _config, _route, _prompt, *, filed_as=""):
+                return {"answer": {"text": "final advice"}}
+
+        def _sha(text):
+            return swarm._advice_sha(text)
+
+        settled = "".join(letter * swarm.ADVICE_INGEST_CHARS for letter in "ABCDE")
+        grown = settled + ("F" * swarm.ADVICE_INGEST_CHARS)
+        first = CacheChat()
+        swarm._say_with_paged_advice_context(
+            self.config, first, "claude", settled,
+            filed_under="cached advice", audit_scope="cache-reuse",
+        )
+        self.assertEqual(
+            sum(" INGEST source " in prompt for prompt, _context in first.calls), 5,
+        )
+        self.assertGreater(
+            sum(" INGEST reduction-" in prompt for prompt, _context in first.calls), 0,
+        )
+
+        changed_tail = CacheChat()
+        swarm._say_with_paged_advice_context(
+            self.config, changed_tail, "claude", grown,
+            filed_under="cached advice", audit_scope="cache-reuse",
+        )
+        self.assertEqual(
+            ["source" if " INGEST source " in prompt else "reduction"
+             for prompt, _context in changed_tail.calls],
+            ["source", "reduction"],
+        )
+
+        after_reload = CacheChat()
+        swarm._say_with_paged_advice_context(
+            self.config, after_reload, "claude", grown,
+            filed_under="cached advice", audit_scope="cache-reuse",
+        )
+        self.assertEqual(after_reload.calls, [])
+
+        other_model = CacheChat("model-b")
+        swarm._say_with_paged_advice_context(
+            self.config, other_model, "claude", grown,
+            filed_under="cached advice", audit_scope="cache-reuse",
+        )
+        self.assertTrue(other_model.calls, "a different model reused another model's cache")
+
+    def test_paged_advice_cache_tampering_fails_closed(self) -> None:
+        source = "source context " * 20_000
+
+        class CacheChat:
+            MOST_LETTERS = 200_000
+
+            def chat_destination(self, _config, route):
+                return {"route": route, "provider_kind": "test", "model": "same"}
+
+            def ask_once(self, *_args, **_kwargs):
+                return {"text": "verified summary"}
+
+            def say(self, *_args, **_kwargs):
+                return {"answer": {"text": "done"}}
+
+        swarm._say_with_paged_advice_context(
+            self.config, CacheChat(), "claude", source,
+            filed_under="cache integrity", audit_scope="cache-integrity",
+        )
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        cached = next((folder / "provider-cache").glob("source-*.json"))
+        record = json.loads(cached.read_text(encoding="utf-8"))
+        record["summary"] = "substituted summary"
+        record["summary_characters"] = len(record["summary"])
+        record["summary_sha256"] = swarm._advice_sha(record["summary"])
+        # A self-contained checksum is forgeable beside the substituted value;
+        # the unchanged app-owned keyed MAC must still make this fail closed.
+        cached.write_text(json.dumps(record), encoding="utf-8")
+
+        with self.assertRaisesRegex(swarm.SwarmError, "cache .* integrity"):
+            swarm._say_with_paged_advice_context(
+                self.config, CacheChat(), "claude", source,
+                filed_under="cache integrity", audit_scope="cache-integrity",
+            )
+
+    def test_paged_advice_does_not_cache_under_an_unresolved_route_identity(self) -> None:
+        source = "unresolved route evidence\n" * 10_000
+
+        class UnresolvedChat:
+            MOST_LETTERS = 150_000
+
+            def chat_destination(self, _config, _route):
+                raise swarm.SwarmError("route changed while resolving")
+
+        with self.assertRaisesRegex(swarm.SwarmError, "exact provider route/model"):
+            swarm._say_with_paged_advice_context(
+                self.config, UnresolvedChat(), "claude", source,
+                filed_under="unresolved route", audit_scope="unresolved-route",
+            )
+
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        self.assertEqual(list((folder / "provider-cache").glob("*.json")), [])
+        self.assertEqual(list(folder.glob("advice-receipt-*.json")), [])
+        self.assertEqual(len(list(folder.glob("advice-active-*.json"))), 1)
+
+    def test_growing_advice_tails_keep_storage_and_receipts_bounded(self) -> None:
+        class ShortChat:
+            MOST_LETTERS = 150_000
+
+            def __init__(self):
+                self.calls = []
+
+            def chat_destination(self, _config, route):
+                return {"route": route, "provider_kind": "test", "model": "bounded"}
+
+            def ask_once(self, *_args, **kwargs):
+                self.calls.append(kwargs.get("context", ""))
+                return {"text": "complete ledger"}
+
+            def say(self, *_args, **_kwargs):
+                return {"answer": {"text": "done"}}
+
+        base = "0123456789abcdef" * 12_500
+        final = ""
+        with mock.patch.object(swarm, "ADVICE_RECEIPTS_TO_KEEP", 5), \
+                mock.patch.object(swarm, "ADVICE_CACHE_FILES_TO_KEEP", 8):
+            for turn in range(20):
+                final = base + ("tail" * (turn + 1))
+                swarm._say_with_paged_advice_context(
+                    self.config, ShortChat(), "claude", final,
+                    filed_under="growing advice", audit_scope=f"growing-{turn}",
+                )
+
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        chunk_files = list((folder / "chunks").glob("*.txt"))
+        receipt_files = list(folder.glob("advice-receipt-*.json"))
+        cache_files = list((folder / "provider-cache").glob("*.json"))
+        self.assertLessEqual(len(receipt_files), 5)
+        self.assertLessEqual(len(cache_files), 8)
+        self.assertLessEqual(
+            sum(one.stat().st_size for one in chunk_files),
+            len(final) + (5 * swarm.ADVICE_STORAGE_MAX_CHARS),
+        )
+
+    def test_content_defined_blocks_reuse_a_large_suffix_after_an_insertion(self) -> None:
+        def varied(size, seed):
+            state = seed
+            letters = []
+            for _index in range(size):
+                state = (1_103_515_245 * state + 12_345) & 0x7fffffff
+                letters.append(chr(32 + (state % 90)))
+            return "".join(letters)
+
+        prefix = varied(90_000, 7)
+        suffix = varied(500_000, 19)
+        before = prefix + suffix
+        after = prefix + varied(7_000, 31) + suffix
+        before_hashes = {swarm._advice_sha(one) for one in swarm._advice_storage_blocks(before)}
+        after_hashes = {swarm._advice_sha(one) for one in swarm._advice_storage_blocks(after)}
+        self.assertGreater(len(before_hashes & after_hashes), len(before_hashes) * 0.7)
+
+        class ShortChat:
+            MOST_LETTERS = 150_000
+
+            def __init__(self):
+                self.calls = []
+
+            def chat_destination(self, _config, route):
+                return {"route": route, "provider_kind": "test", "model": "cdc"}
+
+            def ask_once(self, *_args, **kwargs):
+                self.calls.append(kwargs.get("context", ""))
+                return {"text": "complete ledger"}
+
+            def say(self, *_args, **_kwargs):
+                return {"answer": {"text": "done"}}
+
+        first_chat = ShortChat()
+        swarm._say_with_paged_advice_context(
+            self.config, first_chat, "claude", before,
+            filed_under="inserted context", audit_scope="insert-before",
+        )
+        second_chat = ShortChat()
+        swarm._say_with_paged_advice_context(
+            self.config, second_chat, "claude", after,
+            filed_under="inserted context", audit_scope="insert-after",
+        )
+        self.assertGreater(len(second_chat.calls), 0)
+        self.assertLess(
+            len(second_chat.calls), len(first_chat.calls) / 2,
+            "an insertion before the fixed suffix invalidated settled provider caches",
+        )
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        stored = sum(one.stat().st_size for one in (folder / "chunks").glob("*.txt"))
+        self.assertLessEqual(
+            stored, len(after) + len(prefix) + (4 * swarm.ADVICE_STORAGE_MAX_CHARS),
+        )
+
+    def test_repeated_provider_failures_still_bound_noncanonical_caches(self) -> None:
+        class FailsAfterExtraction:
+            MOST_LETTERS = 150_000
+
+            def chat_destination(self, _config, route):
+                return {"route": route, "provider_kind": "test", "model": "failure-cache"}
+
+            def ask_once(self, *_args, **_kwargs):
+                return {"text": "complete ledger"}
+
+            def say(self, *_args, **_kwargs):
+                raise swarm.SwarmError("final provider failed")
+
+        base = "stable evidence" * 14_000
+        with mock.patch.object(swarm, "ADVICE_CACHE_FILES_TO_KEEP", 4):
+            for turn in range(12):
+                with self.assertRaisesRegex(swarm.SwarmError, "final provider failed"):
+                    swarm._say_with_paged_advice_context(
+                        self.config, FailsAfterExtraction(), "claude",
+                        base + (str(turn) * 10_000),
+                        filed_under="failed cache", audit_scope=f"failed-cache-{turn}",
+                    )
+
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        self.assertLessEqual(len(list((folder / "provider-cache").glob("*.json"))), 4)
+        self.assertEqual(len(list(folder.glob("advice-receipt-*.json"))), 0)
+        self.assertEqual(len(list(folder.glob("advice-active-*.json"))), 12)
+
+    def test_malformed_active_manifest_does_not_disable_cache_pruning(self) -> None:
+        folder = swarm.where_it_lives().with_name("swarm-context")
+        cache = folder / "provider-cache"
+        cache.mkdir(parents=True)
+        malformed = folder / "advice-active-malformed.json"
+        malformed.write_text("{ broken", encoding="utf-8")
+        for number in range(10):
+            (cache / f"old-{number}.json").write_text("{}", encoding="utf-8")
+
+        with mock.patch.object(swarm, "ADVICE_CACHE_FILES_TO_KEEP", 3):
+            swarm._advice_prune_success(folder)
+
+        self.assertTrue(malformed.exists())
+        self.assertLessEqual(len(list(cache.glob("*.json"))), 3)
+
 
 class WhatTheySaidToEachOther(BoardTestCase):
     """The exchange, kept where somebody watching can read it.
@@ -994,6 +1684,47 @@ class WhatTheySaidToEachOther(BoardTestCase):
         self.assertEqual(said["delivery"]["retrying"], 1)
         self.assertIn("queued", {one["status"] for one in said["notes"]})
 
+    def test_a_broken_mailbox_stops_receiving_turns_visibly(self) -> None:
+        self.a_working_board()
+        with mock.patch.object(
+            agent_mailbox, "pending",
+            side_effect=agent_mailbox.MailboxError("payload digest failed"),
+        ):
+            doing = self.a_run().how_it_is_going()
+
+        later = [
+            one for one in doing["turns"] if one["round"] == swarm.AFTER_THE_OTHERS
+        ]
+        self.assertEqual([one["state"] for one in later], ["not done", "not done"])
+        self.assertTrue(all(
+            "instead of silently omitting" in one["why_not"]
+            and "payload digest failed" in one["why_not"]
+            for one in later
+        ))
+
+    def test_oversized_advice_summary_failure_does_not_acknowledge_incoming_mail(self) -> None:
+        self.a_working_board()
+        direct_calls = 0
+
+        def long_first_round(config, route, text, filed_as="", **_context):
+            nonlocal direct_calls
+            direct_calls += 1
+            return {"answer": {"text": "evidence " + ("x" * 40_000)}}
+
+        with mock.patch.object(chat, "MOST_LETTERS", 15_000), \
+                mock.patch.object(swarm, "ADVICE_SUMMARY_CHARS", 1_000), \
+                mock.patch.object(chat, "say", long_first_round), \
+                mock.patch.object(
+                    chat, "ask_once", return_value={"text": "s" * 15_001},
+                ):
+            said = self.a_run().what_they_said()
+
+        self.assertEqual(direct_calls, 2)
+        self.assertEqual(said["delivery"]["acknowledged"], 0)
+        self.assertEqual(said["delivery"]["queued"], 2)
+        self.assertEqual(said["delivery"]["retrying"], 2)
+        self.assertTrue(all(one["status"] == "queued" for one in said["notes"]))
+
     def test_what_was_passed_is_the_words_themselves(self) -> None:
         """Not a count of them. Reading what was passed is the whole point."""
 
@@ -1072,6 +1803,31 @@ class WhatTheySaidToEachOther(BoardTestCase):
         with mock.patch.object(chat, "say", instead):
             said = self.a_run().what_they_said()
         self.assertEqual(len(said["notes"][0]["text"]), swarm.LONGEST_NOTE)
+        self.assertIn("Display shortened", said["notes"][0]["text"])
+        self.assertIn("Full answer:", said["notes"][0]["text"])
+        self.assertEqual(said["notes"][0]["original_characters"], len(long_one))
+        self.assertIn("sender", said["notes"][0]["projection_source"])
+        self.assertIn("project", said["notes"][0]["projection_source"])
+
+    def test_shortened_handoff_does_not_claim_a_failed_page_write_succeeded(self) -> None:
+        long_one = "exact handoff " + ("x" * (swarm.LONGEST_NOTE + 500))
+
+        def instead(config, route, text, filed_as=""):
+            return {"answer": {"who": "them", "text": long_one, "at": ""}}
+
+        self.a_working_board()
+        with mock.patch.object(chat, "say", instead), mock.patch.object(
+            pages, "add_to_the_page",
+            side_effect=pages.PageError("notebook append failed"),
+        ):
+            said = self.a_run().what_they_said()
+
+        projection = said["notes"][0]["text"]
+        self.assertIn("sender's saved board chat", projection)
+        self.assertIn("exact mailbox until acknowledgement", projection)
+        self.assertIn("shared page only when", projection)
+        self.assertNotIn("also remains in the sender's chat and shared page", projection)
+        self.assertGreater(said["delivery"]["queued"], 0)
 
     def test_a_list_cut_short_says_so_where_it_is_written_down(self) -> None:
         """A list that has been cut short and does not say so reads like the
@@ -1475,6 +2231,10 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('id="swarmRefresh"', stage)
         self.assertIn(".swarm-stage:fullscreen", self.styles)
 
+    def test_paused_goal_button_honestly_opens_resume_controls(self) -> None:
+        self.assertIn('"Open the saved goal\'s Resume controls"', self.script)
+        self.assertNotIn('"Resume the exact saved goal"', self.script)
+
     def test_board_has_a_semantic_structure_scope_and_named_destructive_actions(self) -> None:
         self.assertIn('id="swarmStructure"', self.markup)
         self.assertIn('id="swarmScopePreview"', self.markup)
@@ -1503,17 +2263,76 @@ class MovingAroundTheBoard(unittest.TestCase):
     def test_saved_boards_have_visible_json_import_and_per_board_export(self) -> None:
         for element in ("swarmImport", "swarmImportFile"):
             self.assertIn(f'id="{element}"', self.markup)
+        self.assertIn('aria-label="Choose a board JSON file to import"', self.markup)
         self.assertIn("async function importKeptBoard(file)", self.script)
         self.assertIn("async function exportKeptBoard(name)", self.script)
         self.assertIn('request("/api/swarm/import-kept"', self.script)
         self.assertIn("/api/swarm/export-kept?name=", self.script)
         self.assertIn("It has not replaced the board on screen", self.script)
         self.assertIn('id="swarmKeptProblems"', self.markup)
-        self.assertIn("MAX_SAVED_BOARD_IMPORT_BYTES = 10_000_000", self.script)
+        self.assertIn("MAX_SAVED_BOARD_IMPORT_BYTES = 768_000_000", self.script)
         self.assertIn('$("swarmStart").disabled = held || Boolean(swarmSaid.cannot_run) || swarmGoing', self.script)
         self.assertIn('id="authorityRepairButton"', self.markup)
         self.assertIn("USE THIS FOLDER AS A NEW LOCAL PROJECT", self.script)
         self.assertIn("swarmKeptProblems = said.kept_problems || []", self.script)
+
+    def test_renderer_refuses_non_utf8_board_before_json_or_server_import(self) -> None:
+        imported = self.script[self.script.index("async function importKeptBoard"):
+                               self.script.index("async function exportKeptBoard")]
+        decoder = imported.index('new TextDecoder("utf-8", {fatal: true})')
+        parsed = imported.index("JSON.parse(written)")
+        sent = imported.index('request("/api/swarm/import-kept"')
+        self.assertLess(decoder, parsed)
+        self.assertLess(parsed, sent)
+        self.assertIn(
+            "That saved-board file is not valid UTF-8. Nothing was imported.", imported,
+        )
+
+    def test_board_export_uses_the_chunked_desktop_bridge(self) -> None:
+        exported = self.script[self.script.index("async function exportKeptBoard"):
+                               self.script.index("function readTheBigChatLayout")]
+        self.assertIn("window.harnessDesktop?.saveLargeJsonFile", exported)
+        self.assertIn("window.harnessDesktop.saveLargeJsonFile(", exported)
+        self.assertNotIn("window.harnessDesktop.saveJsonFile(", exported)
+
+    def test_project_rebind_preserves_identity_tasks_and_assignments_but_clears_approval(self) -> None:
+        rebound = self.script[self.script.index("async function rebindTheSwarmProject"):
+                              self.script.index("async function addOneSwarmTask")]
+        self.assertIn("board.projects.find((one) => one.id === project.id)", rebound)
+        self.assertIn("held.path = wanted", rebound)
+        self.assertIn('held.approved_test_command_digest = ""', rebound)
+        self.assertIn('pickSwarmBox("project", project.id)', rebound)
+        self.assertNotIn("held.id =", rebound)
+        self.assertNotIn("held.tasks =", rebound)
+        self.assertNotIn("board.works_on =", rebound)
+        self.assertIn("Tasks, agents, links, and its board identity were kept", rebound)
+
+    def test_project_gear_has_a_visible_exact_test_command_approval_flow(self) -> None:
+        for element in (
+            "swarmProjectVerificationStatus",
+            "swarmProjectVerificationCommands",
+            "swarmProjectVerificationDigest",
+            "swarmProjectVerificationApprove",
+            "swarmProjectVerificationRevoke",
+            "swarmProjectVerificationRefresh",
+        ):
+            self.assertIn(f'id="{element}"', self.markup)
+        self.assertIn("runs discovered project code until you approve", self.markup)
+        self.assertIn("Imported board JSON", self.markup)
+        self.assertIn("commands.map((command) => JSON.stringify(command))", self.script)
+        self.assertIn('request("/api/swarm/verification-approval"', self.script)
+        self.assertIn("project_path: project.path", self.script)
+        self.assertIn("board_version: theSwarmBoard().version", self.script)
+        self.assertIn("approval_digest: approved ? proposal.approval_digest", self.script)
+        self.assertIn("Changing the path or test configuration makes Nexus ask again", self.script)
+
+    def test_every_hidden_board_file_picker_has_an_accessible_name(self) -> None:
+        self.assertIn(
+            'files.setAttribute("aria-label", `Attach files or screenshots to ${agent.name}\'s chat`)',
+            self.script,
+        )
+        self.assertIn('aria-label="Attach files or screenshots to this chat"', self.markup)
+        self.assertIn('aria-label="Choose this agent\'s profile picture"', self.markup)
 
     def test_startup_draws_saved_boards_before_refreshing_provider_status(self) -> None:
         refresh = self.script[
@@ -1561,6 +2380,27 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('JSON.stringify({run_id: swarmBoardRunId})', self.script)
         self.assertIn("window.harnessDesktop.stopWebChat(", self.script)
         self.assertIn('agent.who, conversation?.filed_as || ""', self.script)
+
+    def test_board_goal_sequence_is_server_owned_resumable_and_cancellable(self) -> None:
+        self.assertIn('id="swarmWorkGoals"', self.markup)
+        self.assertIn('id="swarmCancelGoals"', self.markup)
+        self.assertIn('request("/api/swarm/goal-queue/start"', self.script)
+        self.assertIn('request("/api/swarm/goal-queue")', self.script)
+        self.assertIn('request("/api/swarm/goal-queue/cancel"', self.script)
+        self.assertIn('goal_queue_id: goalQueueItem.queueId', self.script)
+        self.assertIn('goal_item_id: goalQueueItem.itemId', self.script)
+        self.assertIn('goal_queue_id: swarmGoalQueue.queue_id', self.script)
+        self.assertIn('void continueBoardGoalQueue();', self.script)
+        self.assertIn('SWARM_GOAL_QUEUE_REQUEST_KEY', self.script)
+
+    def test_unknown_mailbox_counts_are_not_rendered_as_zero(self) -> None:
+        exchange = self.script[
+            self.script.index("function renderWhatTheySaidToEachOther(said)"):
+            self.script.index("function showEveryPairAgain()")
+        ]
+        self.assertIn("delivery.counts_known !== false", exchange)
+        self.assertIn("said.delivery_trouble || delivery.trouble", exchange)
+        self.assertIn('make("li", "warning-one", deliveryTrouble)', exchange)
 
     def test_full_screen_is_a_toggle_and_says_when_it_is_on(self) -> None:
         self.assertIn('$("swarmStage").requestFullscreen()', self.script)
@@ -1691,6 +2531,8 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('event.key === "Escape" && theBigOne', self.script)
 
     def test_removing_agents_and_projects_confirms_impact_before_mutating(self) -> None:
+        restore = self.script[self.script.index("function restoreSwarmRemovalFocus"):
+                              self.script.index("async function removeTheSwarmAgent")]
         agent = self.script[self.script.index("async function removeTheSwarmAgent"):
                             self.script.index("async function removeTheSwarmProject")]
         project = self.script[self.script.index("async function removeTheSwarmProject"):
@@ -1701,7 +2543,9 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertLess(project.index("window.confirm"), project.index("changeTheSwarmBoard"))
         self.assertIn("board task", project)
         self.assertIn("Nothing in the project folder is changed", project)
-        self.assertIn("invoker?.focus?", agent + project)
+        self.assertIn("current?.focus?", restore)
+        self.assertIn("restoreSwarmRemovalFocus(invoker)", agent)
+        self.assertIn("restoreSwarmRemovalFocus(invoker)", project)
 
     def test_start_again_does_not_read_a_nonexistent_acceptance_response(self) -> None:
         start_again = self.script[self.script.index("async function startTalkingAgain"):
@@ -1852,7 +2696,7 @@ class MovingAroundTheBoard(unittest.TestCase):
 
         self.assertIn('id="theBigChatWorkRecovery"', self.markup)
         self.assertIn('"nexus.swarm.work-recoveries.v1"', self.script)
-        self.assertIn('"paused_provider", "paused_for_user", "incomplete"',
+        self.assertIn('"paused_provider", "paused_for_user", "paused_tool_budget", "incomplete"',
                       self.script)
         self.assertIn('request("/api/swarm/recoveries")', self.script)
         self.assertIn("resolved_recovery_keys", self.script)
@@ -1865,6 +2709,8 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("writeScopeRestricted: Boolean", self.script)
         self.assertIn("contextToolBudget: Object.freeze", self.script)
         self.assertIn("answered?.context_tool_budget?.summary", self.script)
+        self.assertIn('"Reset tool time and resume"', self.script)
+        self.assertIn("reset_context_tool_execution_budget: true", self.script)
         self.assertIn("Questions from the team", self.script)
         self.assertIn("Locked write destinations", self.script)
         self.assertIn(".work-recovery", self.styles)
@@ -1873,7 +2719,7 @@ class MovingAroundTheBoard(unittest.TestCase):
         """A resume is a continuation, not a fresh mutable file request."""
 
         resume = self.script[
-            self.script.index("async function resumeSwarmWork(agentId)"):
+            self.script.index("async function resumeSwarmWork(agentId, resetToolExecutionBudget = false)"):
             self.script.index("async function sendWhatIsTypedTo(agentId)")
         ]
         self.assertIn('request("/api/swarm/say"', resume)
@@ -1891,11 +2737,12 @@ class MovingAroundTheBoard(unittest.TestCase):
     def test_incident_unverified_work_never_uses_the_applied_success_message(self) -> None:
         reporting = self.script[
             self.script.index("function workResponseWords(answered"):
-            self.script.index("async function resumeSwarmWork(agentId)")
+            self.script.index("async function resumeSwarmWork(agentId, resetToolExecutionBudget = false)")
         ]
         self.assertIn('status === "needs_verification"', reporting)
         self.assertIn('status === "applied_unverified"', reporting)
         self.assertIn('status === "paused_provider"', reporting)
+        self.assertIn('status === "paused_tool_budget"', reporting)
         self.assertIn('status === "incomplete"', reporting)
         self.assertIn("Nexus has not claimed completion", self.script)
         self.assertLess(reporting.index('status === "applied_unverified"'),
@@ -2045,6 +2892,131 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('who: route', adding)
 
 
+class CrossProcessBoardQaCapabilityTests(BoardTestCase):
+    """A real separately launched panel accepts only its live QA transaction."""
+
+    def test_separate_server_accepts_qa_while_ordinary_request_stays_blocked(self) -> None:
+        from our_harness import qa
+
+        project = self.a_project("cross-process-panel")
+        ready = self.root / "separate-panel-ready.json"
+        program = "\n".join((
+            "import json, sys",
+            "from pathlib import Path",
+            "from our_harness.config import load_config",
+            "from our_harness.server import HarnessHTTPServer",
+            "root, ready = Path(sys.argv[1]), Path(sys.argv[2])",
+            "panel = HarnessHTTPServer(('127.0.0.1', 0), load_config(root))",
+            "ready.write_text(json.dumps({'port': panel.server_port, 'token': panel.token}), encoding='utf-8')",
+            "try:",
+            "    panel.serve_forever(poll_interval=0.02)",
+            "finally:",
+            "    panel.server_close()",
+        ))
+        environment = dict(os.environ)
+        source = str(Path(__file__).resolve().parents[1] / "src")
+        environment["PYTHONPATH"] = source + os.pathsep + environment.get("PYTHONPATH", "")
+        child = subprocess.Popen(
+            [sys.executable, "-c", program, str(project), str(ready)],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        def stop_child() -> None:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(10)
+            if child.stdout is not None:
+                child.stdout.close()
+            if child.stderr is not None:
+                child.stderr.close()
+
+        self.addCleanup(stop_child)
+        deadline = time.monotonic() + 20
+        while not ready.is_file() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not ready.is_file():
+            stdout, stderr = child.communicate(timeout=5)
+            self.fail(f"separate panel did not start: {stdout}\n{stderr}")
+        connection = json.loads(ready.read_text(encoding="utf-8"))
+        origin = f"http://127.0.0.1:{connection['port']}"
+        session_token = connection["token"]
+
+        def ask(path: str, body: dict | None = None) -> tuple[int, dict]:
+            request = urllib.request.Request(
+                origin + path,
+                data=json.dumps(body).encode("utf-8") if body is not None else None,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Harness-Token": session_token,
+                },
+                method="POST" if body is not None else "GET",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                with exc:
+                    return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        self.a_board(agents=[{"id": "agent-1", "name": "Original agent"}])
+        case = qa.QaCase(
+            index=0, id="separate-server-board-transaction",
+            title="Separate server board transaction", kind="http",
+            touches=("the board of agents",),
+            url=origin + "/api/swarm/save", method="POST",
+            headers=(("Content-Type", "application/json"),
+                     ("X-Harness-Token", session_token)),
+            body=json.dumps({"board": {
+                "agents": [{"id": "agent-1", "name": "Temporary QA agent"}],
+            }}),
+            expect=qa.QaExpectation(status=200),
+        )
+        runner = qa.QaRunner(load_config(project))
+        real_fetch = runner._fetch_http
+        transaction_live = threading.Event()
+        continue_request = threading.Event()
+        observed: dict[str, object] = {}
+
+        def delayed_fetch(selected: qa.QaCase, timeout: float) -> tuple[int, str, int]:
+            transaction_live.set()
+            if not continue_request.wait(10):
+                raise qa.QaError("test did not release the separate-server request")
+            return real_fetch(selected, timeout)
+
+        runner.http_fetch = delayed_fetch
+
+        def run_check() -> None:
+            try:
+                observed["result"] = runner.run(
+                    qa.QaSuite("cross-process board QA", (case,)), workers=1,
+                    run_id="cross-process-board-qa", write_artifacts=False,
+                )
+            except BaseException as exc:
+                observed["error"] = exc
+
+        check = threading.Thread(target=run_check)
+        check.start()
+        self.assertTrue(transaction_live.wait(5), "QA never acquired its board transaction")
+        try:
+            blocked_status, blocked = ask("/api/swarm?refresh_providers=false")
+            self.assertEqual(blocked_status, 400, blocked)
+            self.assertIn("board check is in progress", blocked["error"])
+        finally:
+            continue_request.set()
+            check.join(20)
+
+        self.assertFalse(check.is_alive())
+        self.assertNotIn("error", observed, observed.get("error"))
+        self.assertTrue(observed["result"].passed, observed["result"].to_dict())
+        restored_status, restored = ask("/api/swarm?refresh_providers=false")
+        self.assertEqual(restored_status, 200, restored)
+        self.assertEqual(restored["board"]["agents"][0]["name"], "Original agent")
+
+
 class _BoundedTestHTTPServer(server.HarnessHTTPServer):
     """Track daemon request workers so fixture teardown can wait, but not hang."""
 
@@ -2136,6 +3108,222 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertIn("agents", said["most"])
         self.assertIn("no agents yet", " ".join(said["what_is_not_ready"]))
 
+    def test_real_board_qa_api_can_mutate_and_restore_while_ordinary_api_is_blocked(self) -> None:
+        from our_harness import qa
+
+        original_status, original = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"id": "agent-1", "name": "Original agent"}],
+        }})
+        self.assertEqual(original_status, 200, original)
+        case = qa.QaCase(
+            index=0,
+            id="board-api-transaction",
+            title="Board API transaction",
+            kind="http",
+            touches=("the board of agents",),
+            url=f"http://127.0.0.1:{self.port}/api/swarm/save",
+            method="POST",
+            headers=(
+                ("Content-Type", "application/json"),
+                ("X-Harness-Token", self.panel.token),
+            ),
+            body=json.dumps({"board": {
+                "agents": [{"id": "agent-1", "name": "QA temporary agent"}],
+            }}),
+            expect=qa.QaExpectation(status=200),
+        )
+        suite = qa.QaSuite("board API isolation", (case,))
+        runner = qa.QaRunner(self.panel.config)
+        real_fetch = runner._fetch_http
+        preservation_is_live = threading.Event()
+        let_check_continue = threading.Event()
+        observed: dict[str, object] = {}
+
+        def delayed_real_fetch(
+            selected: qa.QaCase, timeout: float,
+        ) -> tuple[int, str, int]:
+            preservation_is_live.set()
+            if not let_check_continue.wait(10):
+                raise qa.QaError("test did not release the real request")
+            answer = real_fetch(selected, timeout)
+            observed["during"] = json.loads(
+                swarm.where_it_lives().read_text(encoding="utf-8")
+            )["agents"][0]["name"]
+            return answer
+
+        runner.http_fetch = delayed_real_fetch
+
+        def run_check() -> None:
+            try:
+                observed["result"] = runner.run(
+                    suite, workers=1, run_id="board-api-isolation", write_artifacts=False,
+                )
+            except BaseException as exc:  # surfaced in the test thread below
+                observed["error"] = exc
+
+        check = threading.Thread(target=run_check)
+        check.start()
+        self.assertTrue(preservation_is_live.wait(5), "QA never acquired preservation")
+        try:
+            blocked_status, blocked = self.ask("/api/swarm?refresh_providers=false")
+            self.assertEqual(blocked_status, 400, blocked)
+            self.assertIn("board check is in progress", blocked["error"])
+        finally:
+            let_check_continue.set()
+            check.join(15)
+
+        self.assertFalse(check.is_alive())
+        self.assertNotIn("error", observed, observed.get("error"))
+        self.assertTrue(observed["result"].passed)
+        self.assertEqual(observed["during"], "QA temporary agent")
+        restored_status, restored = self.ask("/api/swarm?refresh_providers=false")
+        self.assertEqual(restored_status, 200, restored)
+        self.assertEqual(restored["board"]["agents"][0]["name"], "Original agent")
+
+    def test_mailbox_status_failure_is_reported_as_unknown_over_http(self) -> None:
+        with mock.patch.object(
+            agent_mailbox, "status",
+            side_effect=agent_mailbox.MailboxError("mailbox digest failed"),
+        ):
+            status, said = self.ask("/api/swarm/what-they-said")
+
+        self.assertEqual(status, 200)
+        self.assertFalse(said["delivery"]["counts_known"])
+        self.assertIsNone(said["delivery"]["queued"])
+        self.assertIsNone(said["delivery"]["acknowledged"])
+        self.assertIsNone(said["delivery"]["retrying"])
+        self.assertIn("counts are unknown", said["delivery_trouble"])
+        self.assertIn("mailbox digest failed", said["delivery"]["trouble"])
+
+    def test_exact_durable_event_payload_is_recoverable_in_authenticated_chunks(self) -> None:
+        snapshot = {
+            "schema_version": 1, "project_root": str(self.panel.config.project_root),
+            "board": {}, "conversation": None, "agent_id": "agent-1",
+            "chat_key": "event-payload", "filed_as": "event-payload",
+            "requested_mode": "chat", "objective": "test",
+            "objective_generation": "fixture",
+        }
+        run, created = self.panel.swarm_runs.accept("event-payload-request", snapshot)
+        self.assertTrue(created)
+        self.panel.swarm_runs.start(run["run_id"])
+        seq = self.panel.swarm_runs.event(
+            run["run_id"], "agent_turn", {"text": "ü" * 5000}
+        )
+        status, chunk = self.ask(
+            f"/api/swarm/event-payload?run_id={run['run_id']}&seq={seq}&offset=7"
+        )
+        self.assertEqual(status, 200, chunk)
+        self.assertEqual(chunk["run_id"], run["run_id"])
+        self.assertEqual(chunk["seq"], seq)
+        self.assertEqual(chunk["offset"], 7)
+        self.assertTrue(base64.b64decode(chunk["payload_base64"]))
+
+        status, refused = self.ask(
+            f"/api/swarm/event-payload?seq={seq}&offset=0"
+        )
+        self.assertEqual(status, 400, refused)
+        self.assertIn("exact durable Swarm run ID", refused["error"])
+        self.panel.swarm_runs.finish(run["run_id"], {"said": []})
+
+    def test_external_project_command_approval_is_visible_exact_persisted_and_revocable(self) -> None:
+        external = self.a_project("external-command-approval")
+        manifest = external / "pyproject.toml"
+        manifest.write_text(
+            "[project]\nname = 'external-command-approval'\nversion = '1.0.0'\n",
+            encoding="utf-8",
+        )
+        (external / "test_external.py").write_text(
+            "import unittest\nclass External(unittest.TestCase):\n"
+            "    def test_external(self): self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        status, saved = self.ask("/api/swarm/save", {"board": {"projects": [{
+            "id": "project-external", "path": str(external), "tasks": ["Create feature.py"],
+        }]}})
+        self.assertEqual(status, 200, saved)
+        proposal = saved["verification_command_approvals"][0]
+        self.assertEqual(proposal["project_path"], str(external))
+        self.assertEqual(
+            proposal["commands"], [["python", "-m", "unittest", "discover"]]
+        )
+        self.assertTrue(proposal["can_approve"])
+        self.assertFalse(proposal["approved"])
+        original_digest = proposal["approval_digest"]
+
+        # The ordinary board endpoint is not an alternative approval API.
+        # Even a caller that copies the current computed digest into the JSON
+        # cannot make Nexus execute project code without the explicit action.
+        injected_board = copy.deepcopy(saved["board"])
+        injected_board["projects"][0]["approved_test_command_digest"] = original_digest
+        injection_status, injection = self.ask(
+            "/api/swarm/save", {"board": injected_board}
+        )
+        self.assertEqual(injection_status, 200, injection)
+        self.assertFalse(injection["verification_command_approvals"][0]["approved"])
+        self.assertEqual(swarm.load().projects[0].approved_test_command_digest, "")
+        saved = injection
+
+        wrong_path, refused = self.ask("/api/swarm/verification-approval", {
+            "project_id": "project-external",
+            "project_path": str(external) + "-different",
+            "board_version": saved["board"]["version"],
+            "approved": True,
+            "approval_digest": original_digest,
+        })
+        self.assertEqual(wrong_path, 400, refused)
+        self.assertIn("path changed", refused["error"])
+
+        # A manifest change between review and click invalidates the shown
+        # digest. The stale POST cannot bless the newly discovered authority.
+        manifest.write_text(
+            "[project]\nname = 'external-command-approval'\nversion = '2.0.0'\n",
+            encoding="utf-8",
+        )
+        stale_status, stale_refused = self.ask(
+            "/api/swarm/verification-approval", {
+                "project_id": "project-external",
+                "project_path": str(external),
+                "board_version": saved["board"]["version"],
+                "approved": True,
+                "approval_digest": original_digest,
+            },
+        )
+        self.assertEqual(stale_status, 400, stale_refused)
+        self.assertIn("commands changed", stale_refused["error"])
+
+        refreshed_status, refreshed = self.ask("/api/swarm?refresh_providers=false")
+        self.assertEqual(refreshed_status, 200, refreshed)
+        current = refreshed["verification_command_approvals"][0]
+        self.assertNotEqual(current["approval_digest"], original_digest)
+        approved_status, approved = self.ask(
+            "/api/swarm/verification-approval", {
+                "project_id": "project-external",
+                "project_path": str(external),
+                "board_version": refreshed["board"]["version"],
+                "approved": True,
+                "approval_digest": current["approval_digest"],
+            },
+        )
+        self.assertEqual(approved_status, 200, approved)
+        self.assertTrue(approved["verification_command_approvals"][0]["approved"])
+        self.assertEqual(
+            swarm.load().projects[0].approved_test_command_digest,
+            current["approval_digest"],
+        )
+
+        revoked_status, revoked = self.ask(
+            "/api/swarm/verification-approval", {
+                "project_id": "project-external",
+                "project_path": str(external),
+                "board_version": approved["board"]["version"],
+                "approved": False,
+                "approval_digest": "",
+            },
+        )
+        self.assertEqual(revoked_status, 200, revoked)
+        self.assertFalse(revoked["verification_command_approvals"][0]["approved"])
+        self.assertEqual(swarm.load().projects[0].approved_test_command_digest, "")
+
     def test_recoverable_work_inventory_survives_backend_restart_and_is_bounded(self) -> None:
         def finish_recovery(chat_id: str, status: str, token: str, objective: str) -> None:
             snapshot = {
@@ -2164,6 +3352,15 @@ class WhatThePanelIsTold(BoardTestCase):
                 "remaining": ["valid remaining", {"not": "text"}],
                 "context_tool_budget": {
                     "epoch": 2, "summary": "bounded", "unknown": "x" * 100_000,
+                    **({
+                        "tool_execution_mode": "configured",
+                        "tool_execution_ceiling_seconds": 30.0,
+                        "tool_execution_consumed_seconds": 30.25,
+                        "tool_execution_remaining_seconds": 0.0,
+                        "tool_execution_exhausted": True,
+                        "tool_execution_accounting": "active time only",
+                        "tool_execution_recovery": "reset or extend",
+                    } if status == "paused_tool_budget" else {}),
                 },
                 "project": {"id": "project-1", "name": "Chosen"},
             })
@@ -2176,13 +3373,21 @@ class WhatThePanelIsTold(BoardTestCase):
             "incomplete-chat", "incomplete", "incomplete-resume-123",
             "Continue the unfinished goal",
         )
+        finish_recovery(
+            "tool-budget-chat", "paused_tool_budget", "tool-budget-resume-123",
+            "Continue after explicit tool-budget recovery",
+        )
         # A new store performs full integrity verification, as a restarted
         # desktop backend does, before serving the recovery projection.
         self.panel._swarm_runs = None
         status, saved = self.ask("/api/swarm/recoveries")
         self.assertEqual(status, 200, saved)
         by_status = {one["status"]: one for one in saved["recoveries"]}
-        self.assertEqual(set(by_status), {"paused_provider", "incomplete"}, saved)
+        self.assertEqual(
+            set(by_status),
+            {"paused_provider", "paused_tool_budget", "incomplete"},
+            saved,
+        )
         self.assertTrue(by_status["paused_provider"]["objective_truncated"])
         self.assertLessEqual(len(by_status["paused_provider"]["objective"]), 2_000)
         self.assertEqual(by_status["incomplete"]["allowed_write_roots"], [])
@@ -2191,6 +3396,20 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(by_status["incomplete"]["context_tool_budget"], {
             "epoch": 2, "summary": "bounded",
         })
+        self.assertEqual(
+            by_status["paused_tool_budget"]["context_tool_budget"],
+            {
+                "epoch": 2,
+                "summary": "bounded",
+                "tool_execution_mode": "configured",
+                "tool_execution_ceiling_seconds": 30.0,
+                "tool_execution_consumed_seconds": 30.25,
+                "tool_execution_remaining_seconds": 0.0,
+                "tool_execution_exhausted": True,
+                "tool_execution_accounting": "active time only",
+                "tool_execution_recovery": "reset or extend",
+            },
+        )
         self.assertLessEqual(
             saved["projection_bytes"], saved["projection_limit_bytes"],
         )
@@ -2317,10 +3536,20 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(self.panel.swarm_runs.authority, repaired["project_authority_id"])
 
     def test_saved_board_json_api_imports_lists_and_exports(self) -> None:
+        role = " \r\n" + ("r" * (swarm.LONGEST_JOB - 6)) + "\r\n "
+        goal = "\t\r\n" + ("g" * (swarm.LONGEST_TASK - 6)) + "\r\n\t"
         document = {
             "format": swarm.SAVED_BOARD_DOCUMENT,
             "name": "Portable",
-            "board": {"agents": [{"name": "The planner"}]},
+            "board": {
+                "agents": [{"name": "The planner", "job": role}],
+                "projects": [{
+                    "path": str(self.where),
+                    "tasks": [goal],
+                    # Portable JSON is layout, not local execution authority.
+                    "approved_test_command_digest": "b" * 64,
+                }],
+            },
         }
         status, imported = self.ask(
             "/api/swarm/import-kept", {"document": document, "name": "Portable"}
@@ -2331,6 +3560,12 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(exported["document"]["format"], swarm.SAVED_BOARD_DOCUMENT)
         self.assertEqual(exported["document"]["board"]["agents"][0]["name"], "The planner")
+        self.assertEqual(exported["document"]["board"]["agents"][0]["job"], role)
+        self.assertEqual(exported["document"]["board"]["projects"][0]["tasks"], [goal])
+        self.assertEqual(
+            exported["document"]["board"]["projects"][0]["approved_test_command_digest"],
+            "",
+        )
         duplicate, refused = self.ask(
             "/api/swarm/import-kept", {"json": json.dumps(document), "name": "Portable"}
         )
@@ -2938,6 +4173,102 @@ class WhatThePanelIsTold(BoardTestCase):
         )
         self.assertEqual(work.call_args.kwargs["round_limit"], 37)
         self.assertIsNone(work.call_args.kwargs["allowed_write_roots"])
+
+    def test_board_goal_queue_api_advances_only_after_verified_exact_work(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [{
+                "name": "Chosen", "path": str(self.root),
+                "tasks": ["First exact goal", "Second exact goal"],
+            }],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        status, started = self.ask(
+            "/api/swarm/goal-queue/start", {"request_id": "board-goals-http-1"}
+        )
+        self.assertEqual(status, 200, started)
+        queue = started["queue"]
+        self.assertEqual(queue["current"]["objective"], "First exact goal")
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        conversation = next(
+            one for one in listed["chats"] if one["pair"] == ["agent-1", "agent-2"]
+        )
+        _status, selected = self.ask("/api/swarm/chats/project", {
+            "agent": "agent-1", "chat": conversation["id"], "project": "project-1",
+        })
+        conversation = next(
+            one for one in selected["chats"] if one["id"] == conversation["id"]
+        )
+        answer = {
+            "said": [], "changed": ["done.txt"], "status": "complete",
+            "goal_complete": True, "verified": True,
+        }
+        with mock.patch.object(swarm_work, "work_together", return_value=answer) as worked:
+            status, said = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "First exact goal", "mode": "work",
+                "allow_project_changes": True, "board_goal": True,
+                "goal_queue_id": queue["queue_id"],
+                "goal_item_id": queue["current"]["id"],
+                "activity": "goal-http-work-1",
+            })
+        self.assertEqual(status, 200, said)
+        worked.assert_called_once()
+        status, after = self.ask("/api/swarm/goal-queue")
+        self.assertEqual(status, 200, after)
+        self.assertEqual(after["queue"]["completed"], 1)
+        self.assertEqual(after["queue"]["current"]["objective"], "Second exact goal")
+
+        # A late response for the completed item is idempotent and cannot move
+        # the cursor past the second, still-unrun goal.
+        replay = self.panel.swarm_goal_queue.record_result(
+            queue["queue_id"], queue["current"]["id"], answer,
+        )
+        self.assertEqual(replay["cursor"], 1)
+        self.assertEqual(replay["current"]["objective"], "Second exact goal")
+
+        second = after["queue"]["current"]
+        paused_answer = {
+            "said": [], "changed": [], "status": "paused_provider",
+            "goal_complete": False, "verified": False,
+            "resume_token": "resume-http-second",
+        }
+        with mock.patch.object(swarm_work, "work_together", return_value=paused_answer):
+            status, paused = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "Second exact goal", "mode": "work",
+                "allow_project_changes": True, "board_goal": True,
+                "goal_queue_id": queue["queue_id"], "goal_item_id": second["id"],
+                "activity": "goal-http-work-2",
+            })
+        self.assertEqual(status, 200, paused)
+        status, held = self.ask("/api/swarm/goal-queue")
+        self.assertEqual(held["queue"]["status"], "paused")
+
+        resumed_answer = dict(answer, changed=["second.txt"])
+        with mock.patch.object(swarm_work, "work_together", return_value=resumed_answer):
+            status, resumed = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": conversation["id"],
+                "text": "Second exact goal", "mode": "work",
+                "allow_project_changes": True,
+                "resume_session_id": "resume-http-second",
+                "activity": "goal-http-resume-2",
+            })
+        self.assertEqual(status, 200, resumed)
+        status, done = self.ask("/api/swarm/goal-queue")
+        self.assertEqual(done["queue"]["status"], "complete")
+        self.assertEqual(done["queue"]["completed"], 2)
 
     def test_project_work_http_boundary_rejects_oversized_goal_and_resume_answer_before_dispatch(self) -> None:
         self.ask("/api/swarm/save", {"board": {
@@ -3578,6 +4909,66 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertLess(release, provider_wait)
         self.assertIn("claimed = pending.requests || [];", bridge)
         self.assertNotIn("await Promise.all((pending.requests || []).map", bridge)
+
+    def test_human_page_entry_gets_stable_person_authority_and_reaches_agents(self) -> None:
+        status, added = self.ask("/api/swarm/add-to-the-page", {
+            "folder": str(self.root), "who": "You", "text": "human steering evidence",
+        })
+        self.assertEqual(status, 200, added)
+        page = pages.read_the_page(self.panel.config, str(self.root))
+        self.assertEqual(page.parts[-1].author_id, "person")
+        shown = pages.complete_page_for_transfer(
+            page, only_from={"person", "agent-1"},
+        )
+        self.assertIn("human steering evidence", shown)
+
+    def test_shared_page_http_loads_a_bounded_latest_window(self) -> None:
+        for number in range(1, 26):
+            pages.add_to_the_page(
+                self.panel.config, str(self.root), who=f"Agent {number}",
+                text=f"part {number}", author_id=f"agent-{number}",
+            )
+        status, latest = self.ask("/api/swarm/the-page", {
+            "folder": str(self.root), "limit": 7,
+        })
+        self.assertEqual(status, 200, latest)
+        self.assertEqual(
+            [one["number"] for one in latest["parts"]], list(range(19, 26)),
+        )
+        self.assertEqual(latest["how_many"], 25)
+        self.assertTrue(latest["window"]["has_older"])
+
+    def test_shared_page_ui_offers_incremental_older_history(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8",
+        )
+        self.assertIn("const THE_PAGE_WINDOW = 20;", script)
+        self.assertIn('"Load 20 older parts"', script)
+        self.assertIn("async function loadOlderPageParts", script)
+        self.assertIn("before: thePage.window.next_before", script)
+        self.assertIn("async function toggleCompletePagePart", script)
+        self.assertIn('request("/api/swarm/page-part"', script)
+        self.assertIn("Collapse to the 20,000-character preview", script)
+
+    def test_shared_page_http_returns_a_complete_explicit_part(self) -> None:
+        exact = "begin\r\n" + ("x" * 25_000) + "\r\nend"
+        pages.add_to_the_page(
+            self.panel.config, str(self.root), who="Agent",
+            text=exact, author_id="agent-1",
+        )
+        status, window = self.ask("/api/swarm/the-page", {
+            "folder": str(self.root), "limit": 20,
+        })
+        self.assertEqual(status, 200, window)
+        self.assertFalse(window["parts"][0]["text_complete"])
+        self.assertEqual(len(window["parts"][0]["text"]), 20_000)
+
+        status, complete = self.ask("/api/swarm/page-part", {
+            "folder": str(self.root), "number": 1,
+        })
+        self.assertEqual(status, 200, complete)
+        self.assertTrue(complete["text_complete"])
+        self.assertEqual(complete["text"], exact)
 
 
 if __name__ == "__main__":

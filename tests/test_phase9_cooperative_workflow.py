@@ -170,7 +170,7 @@ class RoutedFixtureProvider:
             with self.tracker["lock"]:
                 self.tracker["active"] -= 1
             value = {
-                "summary": f"plan from {request.model}", "requirement_ledger": [{
+                "summary": self.tracker.get("planner_summary", f"plan from {request.model}"), "requirement_ledger": [{
                     "id": "R1", "requirement": "tests pass",
                     "category": "behavior", "counterexample": "R1: the fixture tests fail",
                 }],
@@ -567,6 +567,53 @@ class CooperativeWorkflowTests(unittest.TestCase):
             planner_prefixes = [prefix for _model, name, prefix, _prompt in tracker["requests"] if name == "harness_planner_wire_v3"]
             self.assertTrue(any("Planner A" in prefix and "Planner B" not in prefix for prefix in planner_prefixes))
             self.assertTrue(any("Planner B" in prefix and "Planner A" not in prefix for prefix in planner_prefixes))
+
+    def test_long_planner_observation_is_canonical_and_points_to_run_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "fixture.py").write_text("def fixture():\n    return True\n", encoding="utf-8")
+            config = load_isolated_config(root, {
+                "provider": {"name": "ollama", "model": "fallback", "endpoint": "http://127.0.0.1:11434"},
+                "providers": {
+                    "route_a": {"kind": "ollama", "model": "route-a-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
+                    "route_b": {"kind": "ollama", "model": "route-b-model", "endpoint": "http://127.0.0.1:11434", "max_concurrency": 1, "allow_project_graphs": True},
+                },
+                "project": positive_test_project(),
+                "workflow": {"require_review": True, "reviewers": 1},
+                "memory": {"embedding_model": ""},
+            })
+            tail = "-planner-tail-sentinel"
+            tracker = {
+                "lock": threading.Lock(), "active": 0, "max_active": 0,
+                "requests": [], "merge_prompt": "",
+                "planner_summary": "p" * 15_000 + tail,
+            }
+            task = "long cooperative task " + "t" * 180
+            with patch("our_harness.workflow.create_provider", side_effect=lambda _config: RoutedFixtureProvider(tracker)):
+                with HarnessApplication(config) as app:
+                    result = app.run_task(task, graph=cooperative_graph())
+                    rows = app.memory.connection.execute(
+                        "SELECT title,body,metadata_json FROM episodes "
+                        "WHERE namespace='agent_observation' ORDER BY id"
+                    ).fetchall()
+
+            self.assertEqual(result["state"], "complete")
+            self.assertEqual(len(rows), 2)
+            for row in rows:
+                self.assertIn(tail, row["body"])
+                body = json.loads(row["body"])
+                self.assertEqual(body["plan"]["summary"], tracker["planner_summary"])
+                metadata = json.loads(row["metadata_json"])
+                self.assertEqual(metadata["canonical_source"], "episode.body")
+                self.assertEqual(metadata["canonical_body_characters"], len(row["body"]))
+                self.assertEqual(
+                    metadata["canonical_body_sha256"],
+                    hashlib.sha256(row["body"].encode("utf-8")).hexdigest(),
+                )
+                self.assertFalse(metadata["body_projection"])
+                self.assertTrue(metadata["title_projection"])
+                self.assertIn(result["run_id"], metadata["full_plan_source"])
+                self.assertIn("full task in run", row["title"])
 
     def test_same_route_max_concurrency_one_serializes_ready_planners(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

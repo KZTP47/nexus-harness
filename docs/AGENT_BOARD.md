@@ -61,8 +61,10 @@ usually the other's. If you want them talking, tick the box and mean it.
 ## Nothing happens until you press the button
 
 Adding an agent starts nothing. Drawing a line starts nothing. Writing a job
-down starts nothing. The board is what you want; **Set them going** is when any
-of it happens, and it is the only thing on the tab that reaches an assistant.
+down starts nothing. The board is what you want; **Work until the goals are
+achieved** starts project work, and **Get two-round advice** starts optional
+discussion without changing files. Those are the deliberate actions on this
+tab that reach assistants.
 
 A board that set twelve assistants going the moment you dragged a line would be
 a board nobody would dare touch.
@@ -142,8 +144,10 @@ later agent sees the real files produced by earlier turns, so a task such as
 “Claude creates the file, then Codex populates it” is performed by those two
 agents rather than repeatedly sent to whichever agent happened to lead the
 chat. Every participant verifies the final on-disk state. Identical file
-proposals do not count as progress, and two complete no-change team passes stop
-the loop even when provider feedback is paraphrased.
+proposals do not count as progress. The project-work guard stops only after
+fourteen consecutive identical engine-attested end-of-pass states, or after
+four complete two-state oscillations (eight alternating states). Provider
+paraphrasing and repeated reads are excluded from that progress identity.
 
 The original user request is sent as the active prompt only for the independent
 first round. After that, it remains authoritative goal context while each model
@@ -162,12 +166,15 @@ Nexus still stops a proven no-progress cycle.
 
 Cycle detection follows actionable state rather than comparing whole replies.
 For every participant it tracks completion, structured remaining work,
-requested files, and whether the provider failed its structured turn. Two
-repeat hits stop both a stable cycle (`A → A → A`) and a two-state oscillation
-(`A → B → A → B`). Cosmetic paraphrasing therefore cannot keep a dead loop
-alive, while a new fact, decision, output, requested file, resolved item, or
-completion change reflected in the structured progress ledger resets the guard
-and permits the conversation to continue.
+requested files, and whether the provider failed its structured turn. Planning
+and discussion use the same deliberately patient thresholds: fourteen
+identical actionable states for a stable loop, or eight alternating states for
+four full `A → B → A` cycles. Project execution uses an even stricter
+engine-owned identity: the actual relevant project-state digest, deterministic
+verification result and unmet requirements, sealed causal receipts, and
+authenticated transaction evidence. Cosmetic paraphrasing therefore cannot
+keep dead work alive, while real file/evidence progress resets the guard and
+permits the collaboration to continue.
 
 Inside the maximised view, each connected pair has its own list of saved chats.
 The transcript file name is generated from the stable pair and chat ID, so two
@@ -236,33 +243,67 @@ It is kept after the run finishes, so it is still there when you come back to
 the panel tomorrow. Only the last run is kept: it is there to be read, not as a
 history of everything that ever ran.
 
-## Setting them going
+## Achieving the written goals
 
-**Set them going** acts on the board.
+**Work until the goals are achieved** is the primary board action. Each project
+needs at least two ready assigned agents connected by a green communication
+line. Nexus shows the exact project folders and goal count before asking for
+confirmation. It then opens or reuses a durable project chat for the pair and
+runs each written goal through the long-horizon project-work engine.
 
-Every agent is asked about each project it is on, one at a time, and told the
-folder and the jobs wanted there. That is the first round, and every agent takes
-it on its own: nobody has read anybody else's answer yet.
+This mode works on the real goal: agents plan, inspect and edit authorised
+project files, run deterministic checks, review the result, and repair what is
+still wrong. Nexus starts the next goal only when the current result says both
+`goal_complete` and `verified`. If it pauses on a provider, tool budget, user
+question, failing verification, or remaining work, the exact run stays in the
+lead agent's chat. Use its **Resume** action; Nexus does not call the goal done
+or move on merely because a turn ended.
 
-Then the second round. Each agent that is allowed to talk to somebody else on
-the same project is shown what those agents said, and asked again - to take
-their answer into account and to say plainly where it disagrees. An agent that
-read the others before writing its own answer is not a second opinion; it is the
-first opinion agreeing with itself, which is why the rounds are that way round.
+## Getting advice without changing files
 
-Everything each agent says lands in its own conversation, so you can pick its
-box afterwards and read the whole thing, or carry on talking to it.
+**Get two-round advice** is a separate optional mode. First, every agent is
+asked about each assigned project independently. Then each agent that may talk
+to another agent on the same project is shown those agents' answers and asked
+again, including where it disagrees. This is useful for opinions and planning,
+but it does not inspect, edit, or test project files.
 
-One at a time, on purpose. These are command line tools signed in to somebody's
-subscription, and six at once is six ways to be turned away.
+Advice runs one assistant at a time to avoid avoidable subscription throttling.
+**Stop advice run** lets the already-started turn finish and asks nothing after
+it. Every successfully accepted answer lands in a durable board conversation
+and, when the project page accepts the write, on the shared page. A stopped turn
+or page-write failure is labelled explicitly rather than described as landed.
 
-**Stop** stops it. The turn already asked for finishes, because there is no way
-to un-ask it, and nothing after it is asked. The list says which turns were
-never taken.
+Direct board requests accept up to 200,000 characters and saved agent answers
+up to 8,000,000. If the complete authorised page and handoffs exceed one direct
+request, Nexus ingests every character in ordered 100,000-character chunks,
+reduces complete evidence ledgers to at most 30,000 characters, and keeps a
+hash receipt. Exact source is stored in independently verified, content-defined
+8,192-to-32,768-character blocks whose rolling boundaries resynchronise after
+local insertions. Extractions are reused only when exact chunk,
+route, model, and policy identities match; reductions require the same ordered
+input hashes and reduction policy. Successful turns collect obsolete tail blocks,
+bound completed receipts and caches, and remove their working manifest. Failed
+turns retain an exact reconstruction manifest instead of silently omitting or
+overwriting context. The profile keeps the newest 128 completed advice receipts
+and up to 4,096 provider-cache records or 256 MiB; active failed-turn manifests
+are exempt from that success-only retention. These are disclosed processing
+boundaries, not hidden truncation.
 
-If there is nothing to do - no agent with an assistant, no project with jobs, or
-nobody on a project - the press is turned down with the reason, before any
-assistant is asked.
+An agent role description accepts up to 100,000 characters. Each project goal
+and direct board request accepts up to 200,000. Text at either exact boundary is
+preserved—including outer whitespace and line endings; over-limit input is
+measured and rejected visibly, never silently shortened.
+
+Durable agent-to-agent mail has explicit flow-control boundaries rather than a
+hidden text cut-off. A mailbox holds at most 2,000 queued records; if all 2,000
+are still undelivered, a new send is rejected visibly and nothing existing is
+discarded. One receiving turn takes at most 50 messages and 10,000,000 exact
+characters. Additional queued mail remains durable and is reported as deferred
+for the next turn—it is not shortened or acknowledged early.
+
+If either action is not ready, the panel says why before contacting an
+assistant—for example, a missing provider, missing project goals, or no
+connected pair assigned to a project.
 
 ## Coming to this from a fresh download
 
@@ -271,6 +312,34 @@ yours (`python scripts/harness.py trust` - the harness asks for this the first
 time, because a settings file can name commands to run), start the panel with
 `python scripts/harness.py ui`, and the tab is there - the yellow one, second
 from the left.
+
+The installed app carries its own contained Python verification runtime,
+including a pinned pytest runner. When
+running straight from a source checkout on Windows, the first task that needs a
+contained Python test downloads the pinned official CPython 3.11.9 embeddable
+archive from `python.org`, verifies its SHA-256, and caches the verified archive
+in the current user's local app data. This is the only automatic setup for that
+path: it installs no project packages and no browser. If it cannot be verified, Nexus
+states that plainly and does not run project code outside containment.
+Bare `pytest`/`py.test` commands use the engine-owned interpreter with
+already-prepared pure-Python packages copied inside conventional project
+`.venv`, `venv`, `__pypackages__/3.11`, `vendor`, or `src` locations. Nexus
+does not run the project's interpreter or silently install project packages.
+Native-extension incompatibilities are reported as limitations, never accepted
+as successful verification.
+
+For a project folder outside the Nexus checkout, press the project's **gear**
+and open **Project test commands**. Nexus shows each discovered command as its
+exact argument array and does not run it until you approve the displayed
+fingerprint. The approval is kept on the local board and is bound to that
+project path, command set, and the project files that selected the commands.
+A path or test-configuration change expires it visibly; use the same panel to
+review and approve the new fingerprint or to revoke approval. Exported or
+imported board JSON never carries permission to execute project code.
+Because portable boards contain absolute local project paths, another computer
+may show those folders as unavailable. Press that project's gear and **Use a
+different folder on this computer** to preserve its tasks, assignments, lines,
+stable project/chat identity, and clear the old machine's command approval.
 
 It will say what is not ready, which on a machine with nothing set up is: no
 assistant is set up to be used by name. Open **Your team** and press **Set them

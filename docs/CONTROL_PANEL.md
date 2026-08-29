@@ -51,11 +51,16 @@ both using Claude never read each other's words. A pair with no line between
 them never hears from each other at all: off is the answer when nothing was
 said.
 
-**Set them going** acts on the board. Every agent is asked about the projects it
-is on, one at a time and on its own; then the ones allowed to talk are shown
-what the others said and asked again. While it is going the board cannot be
-changed, and the panel says why. **What they said to each other**, under the
-board, is every answer that was passed between agents.
+**Work until the goals are achieved** is the primary action. For every written
+goal, two ready connected agents assigned to that project use a durable project
+chat to plan, edit, test, review, and repair the real files. The next goal does
+not start until deterministic verification says the current one is complete.
+Paused or incomplete work remains resumable in the lead agent's chat.
+
+**Get two-round advice** is the optional no-file-changes mode. It asks each
+agent independently, then shows connected agents what the others said and asks
+again. **What they said to each other**, under the board, is every answer that
+was passed between agents.
 See [AGENT_BOARD.md](AGENT_BOARD.md).
 
 ## Look it up
@@ -80,7 +85,10 @@ Select **Add agent**, then set:
 - Provider route: a named entry from `providers`.
 - Model: the configured model or an explicit override.
 - Role: a short name shown in run and usage records.
-- System prompt: instructions specific to this node.
+- System prompt: instructions specific to this node, up to 100,000 characters.
+  The editor shows a live count and never clips pasted text. If it is over the
+  disclosed limit, Nexus leaves the complete text in the editor and tells you
+  exactly how much to shorten before it can be saved.
 - Capabilities: `workspace.read` for repository evidence and `workspace.write` for a coder's staged edits.
 
 Planner, evaluator, and merge nodes are read-only. Only coder nodes may request staged writes. Verification commands come from configured or detected project commands; the UI does not grant arbitrary shell or Git access. API-key values never enter the graph. The provider catalog reports only the environment-variable name and whether a value is present.

@@ -150,9 +150,13 @@ class OneConversation(TalkingTestCase):
         self.assertEqual(len(saved), chat.MOST_KEPT + 12)
         self.assertEqual(saved[0].text, "historical-0")
         self.assertEqual(saved[-1].text, "new answer")
-        self.assertEqual(len(answering.asked[-1].messages), chat.MOST_KEPT + 1)
+        self.assertEqual(len(answering.asked[-1].messages), chat.MOST_KEPT + 2)
+        self.assertIn(
+            "NEXUS CHAT-HISTORY PROJECTION",
+            answering.asked[-1].messages[0]["content"],
+        )
         self.assertEqual(
-            answering.asked[-1].messages[0]["content"], "historical-10"
+            answering.asked[-1].messages[1]["content"], "historical-10"
         )
         self.assertEqual(len(result["said"]), chat.MOST_KEPT)
 
@@ -173,6 +177,49 @@ class OneConversation(TalkingTestCase):
         self.assertEqual([one.text for one in chat.read_it(self.config, "")], [
             "legacy", "question", "new",
         ])
+
+    def test_corrupt_legacy_chat_is_preserved_without_a_partial_migration(self) -> None:
+        where = chat.where_it_is_kept(self.config, "")
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps([
+            chat.Said("you", "valid first turn", "2026-01-01T00:00:00Z").to_dict(),
+            {"who": "unknown", "text": "invalid second turn", "at": "later"},
+        ]), encoding="utf-8")
+        before = where.read_bytes()
+        events = where.with_suffix(".events.jsonl")
+        anchor = chat._transcript_anchor_path(events)
+
+        with self.assertRaisesRegex(chat.ChatError, "turn 2 has no valid speaker/text"):
+            chat.read_it(self.config, "")
+
+        self.assertEqual(where.read_bytes(), before)
+        self.assertFalse(events.exists())
+        self.assertFalse(anchor.exists())
+
+    def test_missing_anchor_after_migration_crash_recovers_without_duplicate_turns(self) -> None:
+        where = chat.where_it_is_kept(self.config, "")
+        where.parent.mkdir(parents=True, exist_ok=True)
+        legacy = chat.Said(
+            "you", "one legacy turn", "2026-01-01T00:00:00Z"
+        )
+        where.write_text(json.dumps([legacy.to_dict()]), encoding="utf-8")
+        events = where.with_suffix(".events.jsonl")
+        anchor = chat._transcript_anchor_path(events)
+
+        with mock.patch.object(
+            chat, "_write_transcript_anchor",
+            side_effect=OSError("crash before anchor replace"),
+        ), self.assertRaisesRegex(OSError, "crash before anchor replace"):
+            chat.read_it(self.config, "")
+
+        event_bytes = events.read_bytes()
+        self.assertFalse(anchor.exists())
+        recovered = chat.read_it(self.config, "")
+
+        self.assertEqual([one.to_dict() for one in recovered], [legacy.to_dict()])
+        self.assertEqual(events.read_bytes(), event_bytes)
+        self.assertTrue(anchor.is_file())
+        self.assertEqual(len(events.read_text(encoding="utf-8").splitlines()), 1)
 
     def test_rehashed_transcript_rewrite_fails_keyed_integrity_without_repair(self) -> None:
         with self.standing_in(Answering("answer")):
@@ -341,8 +388,30 @@ for n in range(8):
                 chat.say(self.config, "", f"Message {number}")
         kept = chat.read_it(self.config, "")
         self.assertEqual(len(kept), chat.MOST_KEPT * 2)
-        self.assertEqual(len(answering.asked[-1].messages), chat.MOST_KEPT + 1)
+        self.assertEqual(len(answering.asked[-1].messages), chat.MOST_KEPT + 2)
+        self.assertIn(
+            "NEXUS CHAT-HISTORY PROJECTION",
+            answering.asked[-1].messages[0]["content"],
+        )
         self.assertIn(f"Message {chat.MOST_KEPT - 1}", kept[-2].text)
+
+    def test_history_character_budget_omits_only_complete_turns_with_a_reference(self) -> None:
+        huge = "begin-very-long-turn\n" + (
+            "x" * (chat.CHAT_HISTORY_PROMPT_CHARACTERS + 1)
+        ) + "\nend-very-long-turn"
+        eligible = [
+            chat.Said("them", huge, "now"),
+            chat.Said("you", "small complete turn", "now"),
+        ]
+        messages = chat._project_chat_history(
+            eligible, speaker=None, filed_as="history-budget", route="claude"
+        )
+        shown = "\n".join(one["content"] for one in messages)
+        self.assertIn("NEXUS CHAT-HISTORY PROJECTION", shown)
+        self.assertIn("No turn was sliced", shown)
+        self.assertIn("small complete turn", shown)
+        self.assertNotIn("begin-very-long-turn", shown)
+        self.assertNotIn("end-very-long-turn", shown)
 
     def test_it_is_told_it_cannot_do_anything(self) -> None:
         """An assistant that thinks it can read files offers to read files."""
@@ -529,14 +598,20 @@ class WhatItRefuses(TalkingTestCase):
         self.assertIn("does not have access", said)
         self.assertNotIn("input_tokens", said)
 
-    def test_an_unreadable_conversation_starts_a_new_one(self) -> None:
+    def test_an_unreadable_conversation_is_preserved_and_fails_visibly(self) -> None:
         where = chat.where_it_is_kept(self.config, "")
         where.parent.mkdir(parents=True, exist_ok=True)
         where.write_text("this is not json at all", encoding="utf-8")
-        self.assertEqual(chat.read_it(self.config, ""), [])
-        with self.standing_in(Answering()):
-            got = chat.say(self.config, "", "Carry on anyway")
-        self.assertEqual(len(got["said"]), 2)
+        before = where.read_bytes()
+        with self.assertRaisesRegex(
+            chat.ChatError, "did not pretend the chat was empty",
+        ):
+            chat.read_it(self.config, "")
+        with self.standing_in(Answering()), self.assertRaisesRegex(
+            chat.ChatError, "did not pretend the chat was empty",
+        ):
+            chat.say(self.config, "", "Carry on anyway")
+        self.assertEqual(where.read_bytes(), before)
 
 
 class NothingLeaks(TalkingTestCase):
@@ -1016,6 +1091,38 @@ class TwoAtOnce(TalkingTestCase):
             stop.set()
             reader.join(timeout=5)
         self.assertTrue(seen, "the reader never got a look in")
+
+
+class TalkDocumentationLimitTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.guide = (
+            Path(__file__).resolve().parents[1] / "docs" / "TALK_TO_THEM.md"
+        ).read_text(encoding="utf-8")
+
+    def test_the_guide_discloses_current_canonical_and_projection_bounds(self) -> None:
+        for disclosure in (
+            "200,000 characters",
+            "8,000,000 characters",
+            "120,000 characters",
+            "40,000 characters",
+            "Every canonical turn",
+            "full canonical history",
+            "600 seconds",
+            "route/provider configuration",
+        ):
+            self.assertIn(disclosure, self.guide)
+
+    def test_the_guide_no_longer_promises_obsolete_hidden_limits(self) -> None:
+        for obsolete in (
+            "6,000 letters",
+            "20,000 letters",
+            "last forty turns are held",
+            "older ones drop off",
+            "3 minutes to arrive",
+            "3-minute",
+        ):
+            self.assertNotIn(obsolete.lower(), self.guide.lower())
 
 
 if __name__ == "__main__":

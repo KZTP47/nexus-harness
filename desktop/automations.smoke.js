@@ -89,9 +89,18 @@ async function main() {
     await page.click("#askDialogOk");
     await page.waitForFunction(
       (wanted) => [...document.querySelectorAll("#pipelineList .pipeline-saved-one")]
-        .some((one) => one.textContent === wanted && one.classList.contains("chosen")),
+        .some((one) => one.textContent === wanted),
       `${ORIGINAL} copy`, {timeout: 30000},
     );
+    const selectionAfterImport = await page.evaluate(() => ({
+      drawing: document.getElementById("pipelineName").value,
+      chosen: document.querySelector("#pipelineList .pipeline-saved-one.chosen")?.textContent || "",
+    }));
+    if (selectionAfterImport.drawing !== ORIGINAL || selectionAfterImport.chosen !== ORIGINAL) {
+      throw new Error(
+        `duplicate import unexpectedly replaced the current drawing: ${JSON.stringify(selectionAfterImport)}`
+      );
+    }
     console.log("pass  importing a duplicate asks for a new name and preserves both");
 
     const namesBeforeBadImport = await page.locator("#pipelineList .pipeline-saved-one").allTextContents();

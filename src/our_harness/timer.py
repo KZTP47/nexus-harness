@@ -72,6 +72,7 @@ WHAT_HAPPENED_WAS = ".harness/timers/what-happened.json"
 LONGEST_RUN_SECONDS = 3600.0
 # How many runs are remembered per timer.
 HOW_MANY_KEPT = 20
+RUN_HISTORY_SAID_CHARACTERS = 400
 # How far the missed ones are counted before it stops counting. Past this the
 # number is said as "more than", because it would not be the real one.
 MOST_COUNTED = 1000
@@ -497,11 +498,28 @@ def write_down_a_run(
     # Cleaned again here even though the runner cleans it too: this is called
     # from the panel as well, and the file is the one thing that keeps it.
     said = in_safe_words(config, said)
+    original_characters = len(said)
+    said_truncated = original_characters > RUN_HISTORY_SAID_CHARACTERS and bool(run_id)
+    full_result_reference = f"pipeline-run:{run_id}" if said_truncated else ""
+    if said_truncated:
+        marker = (
+            f"… [shortened from {original_characters:,} characters; "
+            f"full result: {full_result_reference}]"
+        )
+        kept = max(0, RUN_HISTORY_SAID_CHARACTERS - len(marker))
+        said_for_history = said[:kept] + marker
+    else:
+        # Without a durable run ID there is nowhere honest to point for the
+        # omitted tail. Keep it all rather than silently losing it.
+        said_for_history = said
     ran = {
         "at": _in_words(when),
         "run_id": run_id,
         "passed": passed,
-        "said": said[:400],
+        "said": said_for_history,
+        "said_truncated": said_truncated,
+        "said_original_characters": original_characters,
+        "full_result_reference": full_result_reference,
         "missed": missed,
     }
     path = _where_it_lives(config, timer.name)
@@ -862,7 +880,9 @@ def run_what_is_due(
                 "passed": passed,
                 "said": said,
                 "missed": missed,
-                "told": _tell_somebody_about_it(config, timer, passed, said),
+                "told": _tell_somebody_about_it(
+                    config, timer, passed, said, run_id=run_id
+                ),
             })
     finally:
         still_going.set()
@@ -1022,7 +1042,7 @@ def _is_it_still_going(process: int) -> bool:
 
 
 def _tell_somebody_about_it(
-    config: LoadedConfig, timer: Timer, passed: bool, said: str
+    config: LoadedConfig, timer: Timer, passed: bool, said: str, *, run_id: str = ""
 ) -> list[dict[str, Any]]:
     """Say what happened, wherever somebody asked to be told.
 
@@ -1048,6 +1068,11 @@ def _tell_somebody_about_it(
                 f"{timer.automation}, run by the timer.\n\n{said}",
                 passed=passed,
                 only_when_it_fails=True,
+                full_result_reference=(
+                    "Nexus → Visual test automation → run "
+                    f"{run_id} (pipeline-run:{run_id})"
+                    if run_id else ""
+                ),
             )
         ]
     except HarnessError as exc:

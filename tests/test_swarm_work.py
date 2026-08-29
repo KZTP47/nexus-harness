@@ -600,7 +600,7 @@ class SwarmWorkTests(unittest.TestCase):
         class Provider:
             def complete(self, request):
                 seen.extend(request.messages)
-                return ProviderResponse(text="the follow-up answer")
+                return ProviderResponse(text="the follow-up answer", finish_reason="stop")
 
         with mock.patch.object(chat, "create_provider", return_value=Provider()):
             chat.say(self.config, "claude", "What about the follow-up?", filed_as="Claude")
@@ -2703,6 +2703,61 @@ os._exit(23)
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["basis"], "missing_runner")
 
+    def test_empty_host_path_never_preempts_containment_owned_runners(self) -> None:
+        (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+
+        def contained(_config, _root, command, **_kwargs):
+            return {
+                "argv": list(command), "cwd": ".", "exit_code": 0,
+                "stdout": "Ran 1 test\nOK\n", "stderr": "", "duration_ms": 1,
+                "timed_out": False, "output_truncated": False,
+                "disposable_snapshot": True,
+                "containment_profile": "bounded-test-containment",
+            }
+
+        cases = (
+            ["python", "-m", "unittest", "discover"],
+            ["python3", "-m", "unittest", "discover"],
+            ["py", "-m", "unittest", "discover"],
+            ["pytest", "-q"],
+            ["py.test", "-q"],
+            ["node", "--test"],
+            ["nodejs", "--test"],
+        )
+        for command in cases:
+            with self.subTest(command=command):
+                project = copy.deepcopy(self.board["projects"][0])
+                project["test_commands"] = [command]
+                with mock.patch.object(
+                    swarm_work.shutil, "which", return_value=None,
+                ), mock.patch.object(
+                    swarm_work, "_run_disposable_verification_command",
+                    side_effect=contained,
+                ) as run_contained:
+                    result = swarm_work._run_selected_project_verification(
+                        self.config, self.project, project,
+                        "Create feature.py", ["feature.py"], None,
+                    )
+                self.assertNotEqual("missing_runner", result.get("basis"), result)
+                run_contained.assert_called()
+
+    def test_empty_host_path_leaves_node_availability_to_containment_broker(self) -> None:
+        (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        project = copy.deepcopy(self.board["projects"][0])
+        project["test_commands"] = [["node", "--test"]]
+        with mock.patch.object(
+            swarm_work.shutil, "which", return_value=None,
+        ), mock.patch.object(
+            swarm_work, "discover_bundled_playwright_runtime", return_value=None,
+        ):
+            result = swarm_work._run_selected_project_verification(
+                self.config, self.project, project,
+                "Create feature.py", ["feature.py"], None,
+            )
+        self.assertEqual("unavailable", result["status"], result)
+        self.assertEqual("verification_containment_unavailable", result["basis"], result)
+        self.assertIn("Node", result["commands"][0]["stderr"])
+
     def test_prompt_summary_is_bounded_while_canonical_history_stays_full(self) -> None:
         contributions = [
             {
@@ -2738,6 +2793,25 @@ os._exit(23)
         self.assertEqual(
             checkpoint["context_policy"], chat.LONG_HORIZON_CONTEXT_POLICY,
         )
+
+    def test_prompt_summary_prioritizes_recent_omitted_decisions(self) -> None:
+        contributions = [
+            {
+                "speaker_name": "Agent", "speaker_route": "route", "phase": "work",
+                "text": f"old discussion {index} " + ("x" * 1_000),
+            }
+            for index in range(80)
+        ]
+        contributions[-2]["text"] = (
+            "LATEST OMITTED BLOCKER SENTINEL: never publish until browser E2E passes. "
+            + ("y" * 1_000)
+        )
+
+        summary = swarm_work._semantic_history_summary(contributions, 4_000)
+
+        self.assertIn("LATEST OMITTED BLOCKER SENTINEL", summary)
+        self.assertIn("MOST RECENT OMITTED EVIDENCE FIRST", summary)
+        self.assertLessEqual(len(summary), 4_000)
 
     def test_every_long_horizon_phase_uses_the_disclosed_projection(self) -> None:
         source = Path(swarm_work.__file__).read_text(encoding="utf-8")
@@ -2782,6 +2856,59 @@ os._exit(23)
         self.assertEqual(result["basis"], "read_only_zero_write")
         self.assertEqual(result["commands"], [])
         self.assertFalse(marker.exists())
+
+    def test_external_discovered_commands_need_visible_path_bound_approval_and_expire(self) -> None:
+        (self.project / "pyproject.toml").write_text(
+            "[project]\nname = 'approval-fixture'\nversion = '1.0.0'\n",
+            encoding="utf-8",
+        )
+        (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        project = {"id": "external-project", "path": str(self.project)}
+
+        proposal = swarm_work.verification_command_approval(self.config, project)
+        self.assertTrue(proposal["requires_approval"], proposal)
+        self.assertFalse(proposal["approved"])
+        self.assertEqual(
+            proposal["commands"], [["python", "-m", "unittest", "discover"]]
+        )
+        blocked = swarm_work._run_selected_project_verification(
+            self.config, self.project, project,
+            "Create feature.py", ["feature.py"], None,
+        )
+        self.assertEqual(blocked["status"], "unavailable", blocked)
+        self.assertEqual(blocked["basis"], "discovered_command_approval_required")
+        self.assertEqual(blocked["proposed_commands"], proposal["commands"])
+
+        project["approved_test_command_digest"] = proposal["approval_digest"]
+        approved = swarm_work.verification_command_approval(self.config, project)
+        self.assertTrue(approved["approved"], approved)
+        # The engine-owned packaged/source Python staging does not depend on a
+        # host PATH entry. This is a real contained execution, not a runner
+        # mock: the approved external project can still become verified.
+        with mock.patch.object(swarm_work.shutil, "which", return_value=None):
+            passed = swarm_work._run_selected_project_verification(
+                self.config, self.project, project,
+                "Create feature.py", ["feature.py"], None,
+            )
+        self.assertEqual(passed["status"], "passed", passed)
+
+        # The argv remains the same, but changing a command-selection manifest
+        # changes the digest and expires the old approval before project code.
+        (self.project / "pyproject.toml").write_text(
+            "[project]\nname = 'approval-fixture'\nversion = '2.0.0'\n",
+            encoding="utf-8",
+        )
+        stale = swarm_work.verification_command_approval(self.config, project)
+        self.assertTrue(stale["stale_approval"], stale)
+        self.assertNotEqual(stale["approval_digest"], proposal["approval_digest"])
+        blocked_again = swarm_work._run_selected_project_verification(
+            self.config, self.project, project,
+            "Create feature.py", ["feature.py"], None,
+        )
+        self.assertEqual(
+            blocked_again["basis"], "discovered_command_approval_required",
+            blocked_again,
+        )
 
     def test_cancel_during_deterministic_verification_rolls_back(self) -> None:
         def answer(_config, route, _text, **kwargs):
@@ -3101,7 +3228,113 @@ os._exit(23)
         finally:
             over.close()
 
-    def test_selected_verification_is_cancelled_at_agent_tool_deadline(self) -> None:
+    def test_context_tool_execution_budget_ignores_idle_time_and_process_downtime(self) -> None:
+        now = [100.0]
+        clock = lambda: now[0]
+        budget = swarm_work._SwarmToolExecutionBudget(20, clock=clock)
+
+        # Provider/model thinking and any other time between tool calls are not
+        # active accounting intervals.
+        now[0] += 600
+        self.assertEqual(budget.remaining_seconds("after provider wait"), 20)
+        budget.begin_tool_execution()
+        now[0] += 3.25
+        budget.check("during a tool")
+        budget.finish_tool_execution()
+        state = budget.budget_state()
+        self.assertAlmostEqual(state["consumed_seconds"], 3.25)
+        self.assertAlmostEqual(state["remaining_seconds"], 16.75)
+
+        # A restart restores consumed active time, not an absolute timestamp.
+        now[0] += 86_400
+        resumed = swarm_work._SwarmToolExecutionBudget(20, clock=clock)
+        resumed.restore_budget_state(state)
+        self.assertAlmostEqual(resumed.remaining_seconds("after process downtime"), 16.75)
+        resumed.begin_tool_execution()
+        now[0] += 17
+        with self.assertRaisesRegex(
+            swarm_work.ContextToolBudgetExhausted, "execution budget exhausted"
+        ):
+            resumed.check("during a long tool")
+        resumed.finish_tool_execution()
+        self.assertTrue(resumed.budget_state()["remaining_seconds"] == 0)
+        resumed.reset_by_user()
+        self.assertEqual(resumed.remaining_seconds("after explicit reset"), 20)
+
+        unlimited = swarm_work._SwarmToolExecutionBudget(0, clock=clock)
+        unlimited.begin_tool_execution()
+        now[0] += 1_000_000
+        unlimited.finish_tool_execution()
+        self.assertIsNone(unlimited.budget_state()["remaining_seconds"])
+        unlimited.check("after an unlimited active interval")
+
+    def test_context_tool_execution_budget_persists_and_has_explicit_user_reset(self) -> None:
+        config = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
+        config.data["workflow"]["context_tool_execution_seconds"] = 20
+        ledger = CollaborationLedger(config, "claude", "time-budget").begin(
+            "Inspect the project", self.board["agents"], mode="project_work"
+        )
+        tools = swarm_work._ProjectContextTools(
+            config, self.project, ledger, self.board["projects"][0],
+            "Inspect the project", [], None,
+        )
+        tools.execution_budget.consumed_seconds = 4.5
+        tools._record_budget()
+        tools.close()
+
+        reopened = swarm_work._ProjectContextTools(
+            config, self.project, ledger, self.board["projects"][0],
+            "Inspect the project", [], None,
+        )
+        try:
+            self.assertAlmostEqual(
+                reopened.disclosure()["tool_execution_remaining_seconds"], 15.5
+            )
+        finally:
+            reopened.close()
+        reset = swarm_work._ProjectContextTools(
+            config, self.project, ledger, self.board["projects"][0],
+            "Inspect the project", [], None, reset_execution_budget=True,
+        )
+        try:
+            disclosed = reset.disclosure()
+            self.assertEqual(disclosed["tool_execution_consumed_seconds"], 0)
+            self.assertEqual(disclosed["tool_execution_remaining_seconds"], 20)
+            self.assertTrue(any(
+                event.get("phase") == "context_tool_budget_reset"
+                for event in ledger._read()
+            ))
+        finally:
+            reset.close()
+
+    def test_context_tool_exhaustion_is_not_classified_as_provider_outage(self) -> None:
+        ledger = CollaborationLedger(self.config, "claude", "tool-pause").begin(
+            "Inspect the project", self.board["agents"], mode="project_work"
+        )
+        budget = {
+            "tool_execution_mode": "configured",
+            "tool_execution_ceiling_seconds": 10.0,
+            "tool_execution_consumed_seconds": 10.0,
+            "tool_execution_remaining_seconds": 0.0,
+            "tool_execution_exhausted": True,
+            "summary": "No tool execution time remains.",
+        }
+        with self.assertRaises(swarm_work.ResumableSwarmError) as paused:
+            swarm_work._pause_context_tool_budget(
+                ledger, budget, "execution",
+                checkpoint={"allowed_write_roots": [], "write_scope_restricted": False},
+                cause=swarm_work.ContextToolBudgetExhausted("spent"),
+            )
+        self.assertEqual(paused.exception.payload["status"], "paused_tool_budget")
+        self.assertEqual(
+            paused.exception.payload["stopped_because"],
+            "context_tool_budget_exhausted",
+        )
+        phases = {event.get("phase") for event in ledger._read()}
+        self.assertIn("context_tool_budget_exhausted", phases)
+        self.assertNotIn("provider_transport_failure", phases)
+
+    def test_selected_verification_is_cancelled_at_context_tool_execution_budget(self) -> None:
         marker = self.project / "deadline-child.txt"
         child = (
             "import time,pathlib; time.sleep(.55); "
@@ -3122,7 +3355,7 @@ os._exit(23)
             self.config, self.project, ledger, project,
             "Update parser.py", ["parser.py"], None,
         )
-        tools.deadline.shorten(0.150)
+        tools.execution_budget.shorten(0.150)
         started = time.monotonic()
         try:
             try:
@@ -3132,9 +3365,9 @@ os._exit(23)
                     "arguments": {},
                 })
             except HarnessError as exc:
-                self.assertIn("deadline expired", str(exc))
+                self.assertIn("execution budget exhausted", str(exc))
             else:
-                self.fail(f"verification returned instead of reporting its tool deadline: {returned!r}")
+                self.fail(f"verification returned instead of reporting its tool budget: {returned!r}")
         finally:
             tools.close()
         elapsed = time.monotonic() - started
@@ -3147,20 +3380,15 @@ os._exit(23)
         ]
         self.assertTrue(budget_events)
         self.assertEqual(budget_events[-1]["state"]["budget"]["calls"], 1)
-        self.assertIn("deadline", budget_events[-1]["state"])
+        self.assertIn("tool_execution_budget", budget_events[-1]["state"])
         resumed = swarm_work._ProjectContextTools(
             self.config, self.project, ledger, project,
             "Update parser.py", ["parser.py"], None,
         )
         try:
             self.assertEqual(resumed.session.calls, 1)
-            with self.assertRaisesRegex(HarnessError, "deadline expired"):
-                resumed.execute("agent-1", {
-                    "call_id": "deadline-after-resume",
-                    "name": "run_selected_verification",
-                    "arguments": {},
-                })
-            self.assertEqual(resumed.session.calls, 1)
+            self.assertTrue(resumed.execution_budget.unlimited)
+            resumed.execution_budget.check("after resume and process downtime")
         finally:
             resumed.close()
 
@@ -3194,11 +3422,14 @@ os._exit(23)
     def test_search_preparation_exceptions_are_counted_persisted_and_restored(self) -> None:
         for error in (
             cancellation.ChatCancelled("Stopped by you."),
-            swarm_work.DeadlineExpired("Project context-tool deadline expired during indexing"),
+            swarm_work.ContextToolBudgetExhausted(
+                "Project context-tool execution budget exhausted during indexing"
+            ),
         ):
             with self.subTest(error=type(error).__name__):
                 config = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
                 config.data["workflow"]["max_tool_calls"] = 1
+                config.data["workflow"]["context_tool_execution_seconds"] = 30
                 ledger = CollaborationLedger(config, "claude", type(error).__name__).begin(
                     "Inspect project", self.board["agents"], mode="project_work"
                 )
@@ -3206,7 +3437,7 @@ os._exit(23)
                     config, self.project, ledger, self.board["projects"][0],
                     "Inspect project", [], None,
                 )
-                original_expiry = tools.deadline.expires_unix
+                original_budget = tools.execution_budget.budget_state()
                 try:
                     with mock.patch.object(swarm_work.WorkspaceIndexer, "scan", side_effect=error):
                         with self.assertRaises(type(error)):
@@ -3222,8 +3453,12 @@ os._exit(23)
                     if event.get("phase") == "context_tool_budget"
                 ]
                 self.assertEqual(budgets[-1]["state"]["budget"]["calls"], 1)
-                persisted_expiry = budgets[-1]["state"]["deadline"]["expires_unix"]
-                self.assertAlmostEqual(persisted_expiry, original_expiry, delta=0.01)
+                persisted_budget = budgets[-1]["state"]["tool_execution_budget"]
+                self.assertGreaterEqual(
+                    persisted_budget["consumed_seconds"],
+                    original_budget["consumed_seconds"],
+                )
+                self.assertGreater(persisted_budget["remaining_seconds"], 0)
 
                 resumed = swarm_work._ProjectContextTools(
                     config, self.project, ledger, self.board["projects"][0],
@@ -3231,7 +3466,17 @@ os._exit(23)
                 )
                 try:
                     self.assertEqual(resumed.session.calls, 1)
-                    self.assertLessEqual(resumed.deadline.expires_unix, persisted_expiry)
+                    restored = resumed.execution_budget.budget_state()
+                    self.assertAlmostEqual(
+                        restored["consumed_seconds"],
+                        persisted_budget["consumed_seconds"],
+                        delta=0.01,
+                    )
+                    self.assertAlmostEqual(
+                        restored["remaining_seconds"],
+                        persisted_budget["remaining_seconds"],
+                        delta=0.01,
+                    )
                     with self.assertRaisesRegex(HarnessError, "tool call limit"):
                         resumed.execute("agent-1", {
                             "call_id": "search-after-reopen",

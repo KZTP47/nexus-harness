@@ -50,7 +50,9 @@ class ResponsesToolLoopTests(unittest.TestCase):
                 },
                 responses_continuation=continuation,
             )
-            second = ProviderResponse(json.dumps({"answer": "done"}), raw={})
+            second = ProviderResponse(
+                json.dumps({"answer": "done"}), finish_reason="stop", raw={},
+            )
             captured: list[tuple[tuple, dict]] = []
 
             def fake_response(*args, **kwargs):

@@ -122,7 +122,7 @@ test("a repairable mismatch explains what the repair button will do", () => {
 test("an installed mismatch tells the truth about its immutable private bundle", () => {
   const said = whyItReallyIs("error: Unknown config key: newer", { installed: true });
   assert.match(said, /will not mix project source/);
-  assert.match(said, /newer signed Nexus release/);
+  assert.match(said, /newer verified Nexus release/);
   assert.doesNotMatch(said, /python scripts\/harness\.py/);
 });
 

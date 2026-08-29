@@ -93,6 +93,9 @@ nothing else. It does not fetch, pull, commit, or push.
 
 The AI step uses whichever model you have connected, which may be a
 subscription you already pay for. See [SUBSCRIPTIONS.md](SUBSCRIPTIONS.md).
+Its instruction field accepts up to 200,000 characters. Nexus sends an accepted
+instruction exactly, including leading indentation, trailing spaces, and line
+breaks; an over-boundary value is rejected visibly and never shortened.
 
 What it writes goes into `.harness/pipelines/drafts`, and nowhere else. That is
 deliberate. Writing straight into `tests/` was the obvious thing to do and it
@@ -100,6 +103,14 @@ was wrong: `tests/` is exactly where every test runner goes looking, so a
 pipeline could ask a model for a "test" and have the very next step run
 whatever came back. A draft sits where nothing runs it until you have read it
 and moved it yourself.
+
+The step uses the selected provider's displayed `max_output_tokens` setting; it
+does not impose a hidden 4,096-token cap. A draft is saved only when the provider
+explicitly reports a successful terminal completion. A length/filter outcome,
+missing or unknown completion reason, nonterminal status, or stream that ends
+without a completion event saves no partial file. Nexus tells you to raise that
+budget, retry the provider, or split the request into several explicit
+test-file steps.
 
 ---
 
@@ -230,6 +241,15 @@ Open `harness ui` and go to **Pipelines**.
   underneath says what each step said.
 - **Stop** asks the run to stop after the step it is on.
 - **Save**, **Save as**, and **Delete** keep pipelines by name.
+- A visible **Unsaved changes** status appears as soon as the name, steps,
+  connections, positions, or step settings differ from the last saved/opened
+  version. Opening another automation, starting a new one, choosing a starter,
+  or opening a run snapshot then asks you to **Save and continue**, **Discard
+  changes**, or **Cancel**. Cancel keeps the exact drawing open.
+- **Import JSON** validates and saves the imported automation into the library
+  without replacing the drawing you are editing. Open it from **Your
+  automations** when you are ready. **Export JSON** exports the selected saved
+  automation.
 
 One pipeline runs at a time. A pipeline starts real suites and real commands,
 and two at once would fight over the same project.

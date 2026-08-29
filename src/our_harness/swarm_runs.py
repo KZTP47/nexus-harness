@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextvars
 from contextlib import contextmanager
 import hashlib
+import base64
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1326,6 +1328,34 @@ class SwarmRunStore:
             self._verify_run(db, row)
             return self._row(row)
 
+    def get_by_request_any_authority(self, request_id: str) -> dict[str, Any]:
+        """Find one queue-owned request after the control-panel project changed.
+
+        Board goals may target folders other than the project currently shown
+        in the first tab. The queue's random request identity is global, while
+        ordinary chat lookup remains scoped to this store's project authority.
+        Reconciliation needs this narrow cross-authority read so an ambiguous
+        app-close response cannot strand or replay an already verified goal.
+        """
+
+        wanted = str(request_id or "").strip()
+        if not wanted:
+            raise HarnessError("A board-goal work request ID is required")
+        with self._read() as db:
+            rows = db.execute(
+                "SELECT * FROM runs WHERE request_id=? ORDER BY updated_ms DESC LIMIT 2",
+                (wanted,),
+            ).fetchall()
+            for row in rows:
+                self._verify_run(db, row)
+        if not rows:
+            raise HarnessError("That Swarm run does not exist")
+        if len(rows) != 1:
+            raise HarnessError(
+                "That board-goal request identity is ambiguous across project authorities."
+            )
+        return self._row(rows[0])
+
     def active(self) -> dict[str, Any] | None:
         """Return this project's current durable command, if one is active.
 
@@ -1381,19 +1411,40 @@ class SwarmRunStore:
             for key in (
                 "epoch", "epoch_call_limit", "epoch_calls_used",
                 "epoch_calls_remaining", "lifetime_calls_used",
-                "absolute_call_limit",
+                "absolute_call_limit", "tool_execution_ceiling_seconds",
+                "tool_execution_consumed_seconds",
+                "tool_execution_remaining_seconds",
             ):
                 held = value.get(key)
-                if isinstance(held, int) and not isinstance(held, bool):
+                if (
+                    isinstance(held, (int, float))
+                    and not isinstance(held, bool)
+                    and math.isfinite(float(held))
+                ):
                     projected[key] = held
-            for key, bound in (("renewal_policy", 1_000), ("summary", 2_000)):
+            if (
+                "tool_execution_remaining_seconds" in value
+                and value.get("tool_execution_remaining_seconds") is None
+            ):
+                projected["tool_execution_remaining_seconds"] = None
+            if isinstance(value.get("tool_execution_exhausted"), bool):
+                projected["tool_execution_exhausted"] = value[
+                    "tool_execution_exhausted"
+                ]
+            for key, bound in (
+                ("tool_execution_mode", 32),
+                ("tool_execution_accounting", 1_000),
+                ("tool_execution_recovery", 1_000),
+                ("renewal_policy", 1_000),
+                ("summary", 2_000),
+            ):
                 held = value.get(key)
                 if isinstance(held, str):
                     projected[key] = held[:bound]
             return projected
 
         recoverable = {
-            "paused_provider", "paused_for_user", "incomplete",
+            "paused_provider", "paused_for_user", "paused_tool_budget", "incomplete",
             "applied_unverified", "needs_verification",
         }
         seen: set[str] = set()
@@ -1523,6 +1574,11 @@ class SwarmRunStore:
                             "sha256": hashlib.sha256(
                                 row["payload_json"].encode("utf-8")
                             ).hexdigest(),
+                            "recover_with": (
+                                f"/api/swarm/event-payload?run_id={run['run_id']}"
+                                f"&seq={row['seq']}&offset=0"
+                            ),
+                            "chunk_encoding": "base64_utf8_json",
                         }
                         events.append(event)
                     break
@@ -1536,6 +1592,40 @@ class SwarmRunStore:
             "cursor": next_cursor,
             "next_cursor": next_cursor,
             "has_more": has_more,
+        }
+
+    def event_payload(
+        self, identity: str, seq: int, offset: int = 0,
+        limit: int = MAX_EVENT_PAGE_BYTES,
+    ) -> dict[str, Any]:
+        """One exact resumable byte chunk of an oversized canonical event payload."""
+
+        run = self.get(identity)
+        start = max(0, int(offset))
+        maximum = max(1, min(int(limit), MAX_EVENT_PAGE_BYTES))
+        with self._read() as db:
+            row = db.execute(
+                "SELECT * FROM events WHERE run_id=? AND seq=?",
+                (run["run_id"], int(seq)),
+            ).fetchone()
+            if row is None:
+                raise HarnessError("That durable Swarm event does not exist.")
+            self._verify_event(row)
+            raw = str(row["payload_json"]).encode("utf-8")
+        if start > len(raw):
+            raise HarnessError("That Swarm event payload offset is past the end.")
+        chunk = raw[start:start + maximum]
+        end = start + len(chunk)
+        return {
+            "run_id": run["run_id"],
+            "seq": int(seq),
+            "offset": start,
+            "next_offset": end,
+            "total_bytes": len(raw),
+            "has_more": end < len(raw),
+            "encoding": "base64_utf8_json",
+            "payload_base64": base64.b64encode(chunk).decode("ascii"),
+            "payload_sha256": hashlib.sha256(raw).hexdigest(),
         }
 
     def latest_event(self, identity: str, kind: str) -> dict[str, Any] | None:

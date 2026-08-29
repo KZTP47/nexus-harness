@@ -484,6 +484,14 @@ class NewPanelEndpointTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("may not open", body["error"])
 
+    def test_explanation_reads_a_failure_marker_after_the_former_hidden_cutoff(self) -> None:
+        said = ("ordinary build output\n" * 1_100) + "connection refused"
+        self.assertGreater(len(said), 20_000)
+        status, body = self.call("POST", "/api/explain", {"said": said, "kind": "command"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["sure"])
+        self.assertIn("Nothing was listening", body["headline"])
+
 
 class RunPictureTests(unittest.TestCase):
     """Pictures a check kept can be looked at, and nothing else can."""

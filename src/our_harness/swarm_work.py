@@ -13,9 +13,11 @@ import copy
 import ast
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -44,6 +46,12 @@ from .verification import analyze_verification
 from .windows_containment import (
     appcontainer_available, run_appcontainer, verification_runtime_profile,
 )
+from .verification_python import (
+    VerificationPythonUnavailable,
+    packaged_runtime_if_usable,
+    snapshot_dependency_paths,
+    stage_source_runtime,
+)
 from .playwright_runtime import (
     discover_bundled_playwright_runtime,
     extract_safe_playwright_scenario,
@@ -65,6 +73,10 @@ class ResumableSwarmError(SwarmError):
     def __init__(self, message: str, payload: dict[str, Any]) -> None:
         super().__init__(message)
         self.payload = payload
+
+
+class ContextToolBudgetExhausted(DeadlineExpired):
+    """Only active context-tool execution time exhausted its user-set budget."""
 
 
 def _report(progress: Progress | None, stage: str, detail: str = "") -> None:
@@ -185,6 +197,98 @@ def _pause_provider_failure(
             checkpoint.get("write_scope_restricted", False)
         ) if isinstance(checkpoint, dict) else False,
         "partial_provider_failure": report,
+    }
+    if cause is not None:
+        raise ResumableSwarmError(report, payload) from cause
+    raise ResumableSwarmError(report, payload)
+
+
+def _pause_context_tool_budget(
+    ledger: CollaborationLedger,
+    budget: dict[str, Any],
+    stage: str,
+    *,
+    checkpoint: dict[str, Any] | None = None,
+    cause: Exception | None = None,
+    mutation_root: Path | None = None,
+    transaction_ids: list[str] | None = None,
+    mutation_saga: _MutationSaga | None = None,
+) -> None:
+    """Pause a resumable run without misreporting tool time as provider failure."""
+
+    state: dict[str, Any] = {
+        "stage": stage,
+        "status": "paused_tool_budget",
+        "context_tool_budget": copy.deepcopy(budget),
+    }
+    state.update(checkpoint or {})
+    provisional_paths = _transaction_paths(mutation_root, transaction_ids or [])
+    if mutation_saga is not None:
+        state["mutation_recovery"] = mutation_saga.compensate(
+            "context_tool_budget_exhausted"
+        )
+    elif mutation_root is not None and transaction_ids:
+        state["mutation_recovery"] = _rollback_transactions(
+            mutation_root, transaction_ids
+        )
+    if provisional_paths:
+        state["provisional_paths"] = provisional_paths
+    ledger.record_state("context_tool_budget_exhausted", state)
+    remaining = [
+        "Use Reset tool time and resume on this saved run, or raise the displayed "
+        "Context tool execution seconds setting (zero means unlimited), then resume."
+    ]
+    report = (
+        "Nexus paused because the user-configured context-tool execution budget "
+        "was exhausted. Provider thinking, network waits, user pauses, and time "
+        "while Nexus was closed were not charged. The exact run remains resumable."
+    )
+    recovery = state.get("mutation_recovery")
+    if isinstance(recovery, dict) and recovery.get("status") == "rolled_back":
+        report += " Nexus safely rolled back provisional changes from the interrupted pass."
+    elif isinstance(recovery, dict) and recovery.get("status") == "rollback_conflict":
+        report += (
+            " Nexus could not safely roll back every provisional change because a file "
+            "changed outside this run; reconcile the recorded conflict before continuing."
+        )
+    finish_state = {
+        "resume_token": ledger.session_id,
+        "checkpoint": dict(checkpoint or {}),
+        "context_tool_budget": copy.deepcopy(budget),
+        "write_scope_restricted": bool(
+            checkpoint.get("write_scope_restricted", False)
+        ) if isinstance(checkpoint, dict) else False,
+        **({
+            "allowed_write_roots": list(checkpoint.get("allowed_write_roots", []))
+        } if isinstance(checkpoint, dict) and isinstance(
+            checkpoint.get("allowed_write_roots"), list
+        ) else {}),
+    }
+    ledger.finish(
+        report,
+        complete=False,
+        stopped_because="context_tool_budget_exhausted",
+        remaining=remaining,
+        status="paused_tool_budget",
+        state=finish_state,
+    )
+    payload = {
+        "status": "paused_tool_budget",
+        "stopped_because": "context_tool_budget_exhausted",
+        "goal_complete": False,
+        "verified": False,
+        "resume_token": ledger.session_id,
+        "questions": [],
+        "remaining": remaining,
+        "checkpoint": dict(checkpoint or {}),
+        "context_tool_budget": copy.deepcopy(budget),
+        "allowed_write_roots": list(checkpoint.get("allowed_write_roots", []))
+        if isinstance(checkpoint, dict) and isinstance(
+            checkpoint.get("allowed_write_roots"), list
+        ) else [],
+        "write_scope_restricted": bool(
+            checkpoint.get("write_scope_restricted", False)
+        ) if isinstance(checkpoint, dict) else False,
     }
     if cause is not None:
         raise ResumableSwarmError(report, payload) from cause
@@ -1001,8 +1105,9 @@ def _semantic_history_summary(
     of replacing their meaning with only a hash and a count.
     """
 
-    candidates: list[str] = []
+    candidates_by_turn: list[list[str]] = []
     for index, one in enumerate(contributions, start=1):
+        turn_candidates: list[str] = []
         identity = (
             f"turn {index} · {one.get('speaker_name') or 'unknown'} · "
             f"{one.get('phase') or 'unknown'}"
@@ -1017,7 +1122,7 @@ def _semantic_history_summary(
                         value, sort_keys=True, separators=(",", ":"),
                         ensure_ascii=False,
                     )
-                    candidates.append(
+                    turn_candidates.append(
                         f"- {identity} structured {key}[{value_index}]: {encoded}"
                     )
         text = re.sub(r"\s+", " ", str(one.get("text") or "")).strip()
@@ -1032,32 +1137,73 @@ def _semantic_history_summary(
                 excerpt = "…" + excerpt
             if end < len(text):
                 excerpt += "…"
-            candidates.append(f"- {identity} quoted semantic excerpt: {excerpt}")
+            turn_candidates.append(
+                f"- {identity} quoted semantic excerpt: {excerpt}"
+            )
         if not matches:
             # Even an unlabelled early decision must leave semantic content,
             # not merely a digest. Bound the excerpt and keep it clearly quoted.
             excerpt = text[:500] + ("…" if len(text) > 500 else "")
-            candidates.append(f"- {identity} quoted excerpt: {excerpt}")
+            turn_candidates.append(f"- {identity} quoted excerpt: {excerpt}")
+        candidates_by_turn.append(turn_candidates)
 
-    unique: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        folded = candidate.casefold()
-        if folded in seen:
-            continue
-        seen.add(folded)
-        unique.append(candidate)
+    # Current decisions and blockers must not disappear behind stale early
+    # discussion.  Spend most of the fixed projection on omitted turns from
+    # newest to oldest, while reserving a smaller foundation section for the
+    # original requirements/constraints.  The canonical paged ledger remains
+    # the complete authority for everything not projected here.
+    recent_candidates = [
+        candidate
+        for turn_candidates in reversed(candidates_by_turn)
+        for candidate in turn_candidates
+    ]
+    foundation_candidates = [
+        candidate
+        for turn_candidates in candidates_by_turn
+        for candidate in turn_candidates
+    ]
     header = (
         "DETERMINISTIC SEMANTIC SUMMARY OF OLDER TURNS "
         "(quoted untrusted history; canonical ledger remains authoritative)"
     )
-    result = header
-    for candidate in unique:
-        addition = "\n" + candidate
-        if len(result) + len(addition) > maximum:
-            result += "\n[semantic summary cap reached; retrieve the canonical paged ledger for more]"
-            break
-        result += addition
+    foundation_budget = max(0, min(maximum // 4, 10_000))
+    recent_budget = max(0, maximum - len(header) - foundation_budget - 180)
+    seen: set[str] = set()
+
+    def select(candidates: list[str], budget: int) -> tuple[list[str], bool]:
+        selected: list[str] = []
+        used = 0
+        capped = False
+        for candidate in candidates:
+            folded = candidate.casefold()
+            if folded in seen:
+                continue
+            addition = "\n" + candidate
+            if used + len(addition) > budget:
+                capped = True
+                continue
+            seen.add(folded)
+            selected.append(candidate)
+            used += len(addition)
+        return selected, capped
+
+    newest, newest_capped = select(recent_candidates, recent_budget)
+    foundation, foundation_capped = select(
+        foundation_candidates, foundation_budget,
+    )
+    sections: list[str] = [header, "MOST RECENT OMITTED EVIDENCE FIRST"]
+    sections.extend(newest)
+    if foundation:
+        sections.append("FOUNDATIONAL EARLY REQUIREMENTS AND CONSTRAINTS")
+        sections.extend(foundation)
+    result = "\n".join(sections)
+    if newest_capped or foundation_capped:
+        marker = (
+            "\n[semantic summary cap reached; retrieve the canonical paged "
+            "ledger for more]"
+        )
+        if len(result) + len(marker) <= maximum:
+            result += marker
     return result
 
 
@@ -3206,8 +3352,59 @@ def _copy_verification_snapshot(root: Path, destination: Path) -> None:
 
     shutil.copytree(
         root, destination, dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns(".git", ".harness"),
+        ignore=shutil.ignore_patterns(".git", ".harness", ".nexus-verification"),
     )
+    # This namespace is executable verification infrastructure.  It must be
+    # newly owned by Nexus even when copytree writes into an existing target;
+    # no file supplied by the selected project may become a guard or runtime.
+    _recreate_verification_directory(destination / ".nexus-verification")
+
+
+def _verification_lstat(path: Path) -> os.stat_result | None:
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+
+
+def _verification_is_reparse(path: Path) -> bool:
+    held = _verification_lstat(path)
+    return bool(
+        held is not None
+        and getattr(held, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _verification_path_exists(path: Path) -> bool:
+    return _verification_lstat(path) is not None
+
+
+def _remove_verification_path(path: Path) -> None:
+    """Remove one exact engine-owned path without assuming its current type."""
+
+    held = _verification_lstat(path)
+    if held is None:
+        return
+    attributes = getattr(held, "st_file_attributes", 0)
+    if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400):
+        if attributes & getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10):
+            path.rmdir()
+        else:
+            path.unlink(missing_ok=True)
+    elif stat.S_ISLNK(held.st_mode) or stat.S_ISREG(held.st_mode):
+        path.unlink(missing_ok=True)
+    elif stat.S_ISDIR(held.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _recreate_verification_directory(path: Path) -> Path:
+    if _verification_path_exists(path):
+        _remove_verification_path(path)
+    path.mkdir(parents=True, exist_ok=False)
+    return path
 
 
 def _restore_verification_escape(
@@ -3271,8 +3468,23 @@ def _verification_guard_files(snapshot: Path) -> tuple[Path, Path]:
     to repair the user's machine after an untrusted test has run.
     """
 
+    snapshot = snapshot.resolve()
     guard_root = snapshot / ".nexus-verification"
-    guard_root.mkdir(parents=True, exist_ok=True)
+    if _verification_is_reparse(guard_root) or not guard_root.is_dir():
+        _recreate_verification_directory(guard_root)
+    # These names are never project data.  Recreate them before every launch
+    # so a caller that did not come through the normal copy path still cannot
+    # substitute an executable, guard, home, or lock artifact.
+    for name in (
+        "sitecustomize.py", "node-guard.cjs", "runtime", "node-workspace",
+        "home", "tmp", ".source-python-stage.lock",
+    ):
+        target = guard_root / name
+        if _verification_path_exists(target):
+            _remove_verification_path(target)
+    for pattern in (".runtime-stage-*", ".runtime-previous-*"):
+        for abandoned in guard_root.glob(pattern):
+            _remove_verification_path(abandoned)
     python_guard = guard_root / "sitecustomize.py"
     python_source = r'''import builtins,os,sys
 _ROOT=os.path.realpath(os.environ['NEXUS_VERIFICATION_ROOT'])
@@ -3343,8 +3555,131 @@ for(const name of ['spawn','spawnSync','execFile','execFileSync']){original[name
 for(const name of ['exec','execSync','fork']){cp[name]=function(){throw new Error('Nexus verification containment denied shell/fork escape');};}
 '''
     atomic_write(node_guard, node_source.encode("utf-8"))
-    (guard_root / "tmp").mkdir(exist_ok=True)
+    (guard_root / "tmp").mkdir()
+    (guard_root / "home").mkdir()
     return python_guard, node_guard
+
+
+def _copy_verified_runtime_file(source: Path, destination: Path) -> None:
+    """Copy one engine-selected runtime file and detect source replacement."""
+
+    source = source.resolve()
+    if _verification_is_reparse(source) or not source.is_file():
+        raise VerificationPythonUnavailable(
+            "an engine-selected runtime file is missing or redirected: " + source.name
+        )
+    before = file_sha256(source)
+    shutil.copy2(source, destination)
+    if before is None or file_sha256(source) != before or file_sha256(destination) != before:
+        raise VerificationPythonUnavailable(
+            "an engine-selected runtime file changed while it was being staged: " + source.name
+        )
+
+
+def _stage_packaged_python_runtime(
+    bundled: Path,
+    runtime_root: Path,
+    *,
+    snapshot: Path,
+    python_guard_parent: Path,
+    dependency_paths: tuple[Path, ...],
+) -> Path:
+    """Recreate a snapshot runtime from the validated private app runtime."""
+
+    try:
+        _recreate_verification_directory(runtime_root)
+        for runtime_name in (
+            "python.exe", "python3.dll", "python311.dll",
+            "vcruntime140.dll", "vcruntime140_1.dll",
+        ):
+            _copy_verified_runtime_file(bundled / runtime_name, runtime_root / runtime_name)
+        pth = runtime_root / "python311._pth"
+        atomic_write(pth, (
+            str((bundled / "python311.zip").resolve()) + "\n"
+            + str(bundled.resolve()) + "\n"
+            + str((bundled / "Lib" / "site-packages").resolve()) + "\n"
+            + str(python_guard_parent.resolve()) + "\n"
+            + "".join(str(one.resolve()) + "\n" for one in dependency_paths)
+            + str(snapshot.resolve()) + "\nimport site\n"
+        ).encode("utf-8"))
+        if not (runtime_root / "python.exe").is_file() or not pth.is_file():
+            raise VerificationPythonUnavailable(
+                "the packaged Python runtime copy is incomplete"
+            )
+        return runtime_root
+    except VerificationPythonUnavailable:
+        raise
+    except OSError as error:
+        raise VerificationPythonUnavailable(
+            "the packaged Python runtime could not be staged safely: " + str(error)
+        ) from error
+
+
+def _trusted_host_node(
+    requested: str,
+    *,
+    snapshot: Path,
+    denied_root: Path,
+) -> Path:
+    """Resolve Node from the host toolchain, never from selected-project data."""
+
+    found = shutil.which(requested)
+    if not found:
+        found = shutil.which(Path(requested).name)
+    if not found:
+        raise VerificationPythonUnavailable("Node is not installed on this computer")
+    requested_path = Path(found).absolute()
+    lexical_forbidden = (snapshot.absolute(), denied_root.absolute())
+    try:
+        if any(
+            os.path.normcase(os.path.commonpath([str(root), str(requested_path)]))
+            == os.path.normcase(str(root))
+            for root in lexical_forbidden
+        ):
+            raise VerificationPythonUnavailable(
+                "the selected Node executable belongs to project-controlled data"
+            )
+    except ValueError:
+        pass
+    candidate = Path(found).resolve()
+    forbidden = (snapshot.resolve(), denied_root.resolve())
+    if (
+        _verification_is_reparse(candidate)
+        or not candidate.is_file()
+        or any(candidate == root or root in candidate.parents for root in forbidden)
+    ):
+        raise VerificationPythonUnavailable(
+            "the selected Node executable belongs to project-controlled data"
+        )
+    return candidate
+
+
+def _runtime_is_selected_project_data(runtime_root: Path, project_root: Path) -> bool:
+    """Reject runtime roots supplied through or located in the selected project."""
+
+    runtime = runtime_root.resolve()
+    project = project_root.resolve()
+    engine_location = Path(__file__).resolve().parents[2]
+    return bool(
+        runtime == project or project in runtime.parents
+        or engine_location == project or project in engine_location.parents
+    )
+
+
+def _stage_node_runtime(source: Path, runtime_root: Path) -> Path:
+    """Recreate and verify the snapshot Node runtime from an engine-selected file."""
+
+    try:
+        _recreate_verification_directory(runtime_root)
+        destination = runtime_root / "node.exe"
+        _copy_verified_runtime_file(source, destination)
+        return destination
+    except VerificationPythonUnavailable:
+        raise
+    except OSError as error:
+        raise VerificationPythonUnavailable(
+            "the Node containment runtime could not be staged safely: " + str(error)
+        ) from error
 
 
 def _playwright_static_browser_scenario(source: str) -> dict[str, Any] | None:
@@ -3548,6 +3883,7 @@ const server=http.createServer((req,res)=>{let file='';try{const pathname=new UR
 
 def _run_brokered_playwright_scenario(
     snapshot: Path, scenario: dict[str, Any], *, timeout: float,
+    runtime: Any = None,
 ) -> dict[str, Any]:
     """Run one engine-compiled route/DOM scenario in two contained processes."""
 
@@ -3557,7 +3893,7 @@ def _run_brokered_playwright_scenario(
         if not isinstance(safe, dict):
             raise ValueError("Exact-origin Playwright scenario has no validated safe IR")
         result = run_safe_playwright_scenario(
-            snapshot, safe, approved_base_url, timeout=timeout,
+            snapshot, safe, approved_base_url, timeout=timeout, runtime=runtime,
         )
         evidence = result.get("evidence_receipt")
         valid = bool(
@@ -3600,6 +3936,7 @@ def _run_brokered_playwright_scenario(
     atomic_write(runner, _brokered_playwright_runner_source().encode("utf-8"))
     payload = run_brokered_playwright_appcontainer(
         snapshot, runner, timeout=timeout,
+        runtime=runtime,
         environment={
             "NEXUS_VERIFICATION_ROOT": str(snapshot.resolve()),
             "NEXUS_E2E_SCENARIO": json.dumps(
@@ -3647,6 +3984,7 @@ def _playwright_spec_files(snapshot: Path, command: list[str]) -> list[Path]:
 
 def _run_brokered_playwright_specs(
     snapshot: Path, command: list[str], *, timeout: float,
+    runtime: Any = None,
 ) -> dict[str, Any]:
     """Replace Playwright's uncontained worker fork with engine-owned probes."""
 
@@ -3672,7 +4010,7 @@ def _run_brokered_playwright_specs(
         selected = [path.relative_to(snapshot).as_posix() for path, _source in sources]
         observation = run_brokered_playwright_suite(
             snapshot, ["test", *selected], approved_urls[0],
-            environment=exact_environment, timeout=timeout,
+            environment=exact_environment, timeout=timeout, runtime=runtime,
         )
         receipt = {
             "passed": observation.get("passed") is True,
@@ -3729,7 +4067,7 @@ def _run_brokered_playwright_specs(
                 "timed_out": True, "output_truncated": False,
             }
         observation = _run_brokered_playwright_scenario(
-            snapshot, scenario, timeout=remaining,
+            snapshot, scenario, timeout=remaining, runtime=runtime,
         )
         observation["test_file"] = path.relative_to(snapshot).as_posix()
         observations.append(observation)
@@ -3762,9 +4100,29 @@ def _contained_snapshot_command(
 ) -> dict[str, Any]:
     """Run only commands with a supported fail-closed containment profile."""
 
-    python_guard, node_guard = _verification_guard_files(snapshot)
     argv = list(command)
-    name = Path(argv[0]).name.casefold().removesuffix(".exe") if argv else ""
+    name = Path(argv[0]).name.casefold() if argv else ""
+    for executable_suffix in (".exe", ".cmd", ".bat"):
+        name = name.removesuffix(executable_suffix)
+    requested_pytest = name in {"pytest", "py.test"}
+    if requested_pytest:
+        # Console-script shims live in a project venv and are executable
+        # project data.  Use the engine-owned interpreter with the same module
+        # entry point instead; no project interpreter or shim is launched.
+        argv = ["python", "-m", "pytest", *argv[1:]]
+        name = "python"
+    try:
+        python_guard, node_guard = _verification_guard_files(snapshot)
+    except (HarnessError, OSError) as error:
+        return {
+            "argv": command, "cwd": ".", "exit_code": -2,
+            "stdout": "", "stderr": (
+                "Verification containment infrastructure could not be prepared: "
+                + str(error) + ". Nexus did not run project code."
+            ),
+            "timed_out": False, "output_truncated": False,
+            "containment_unavailable": True,
+        }
     environment = {
         "NEXUS_VERIFICATION_ROOT": str(snapshot.resolve()),
         "HOME": str((snapshot / ".nexus-verification" / "home").resolve()),
@@ -3772,7 +4130,6 @@ def _contained_snapshot_command(
         "TEMP": str((snapshot / ".nexus-verification" / "tmp").resolve()),
         "TMP": str((snapshot / ".nexus-verification" / "tmp").resolve()),
     }
-    (snapshot / ".nexus-verification" / "home").mkdir(exist_ok=True)
     joined_initial = " ".join(str(one).replace("\\", "/").casefold() for one in argv)
     if name in {"node", "nodejs"} and "playwright" in joined_initial:
         CommandRunner(config)._check(command)
@@ -3784,9 +4141,18 @@ def _contained_snapshot_command(
                 "containment_unavailable": True,
             }
         try:
+            brokered_runtime = discover_bundled_playwright_runtime(required=True)
+            assert brokered_runtime is not None
+            project_root = (denied_root or config.project_root).resolve()
+            brokered_root = brokered_runtime.root.resolve()
+            if _runtime_is_selected_project_data(brokered_root, project_root):
+                raise RuntimeError(
+                    "the bundled Playwright runtime belongs to selected-project data"
+                )
             payload = _run_brokered_playwright_specs(
                 snapshot, command,
                 timeout=float(timeout or config.get("execution.timeout_seconds")),
+                runtime=brokered_runtime,
             )
         except (HarnessError, OSError, RuntimeError, ValueError) as error:
             return {
@@ -3798,8 +4164,11 @@ def _contained_snapshot_command(
         payload["argv"] = list(command)
         return payload
     if name in {"python", "python3", "py"}:
+        python_dependencies = snapshot_dependency_paths(snapshot)
         environment["PYTHONPATH"] = os.pathsep.join([
-            str(python_guard.parent.resolve()), str(snapshot.resolve()),
+            str(python_guard.parent.resolve()),
+            *(str(one) for one in python_dependencies),
+            str(snapshot.resolve()),
         ])
         profile = "python-audit-deny-external-write-v1"
     elif name in {"node", "nodejs"}:
@@ -3809,7 +4178,13 @@ def _contained_snapshot_command(
             if "playwright" in joined else None
         )
         if bundled_playwright is not None:
-            argv[0] = str(bundled_playwright.node)
+            project_root = (denied_root or config.project_root).resolve()
+            bundled_root = bundled_playwright.root.resolve()
+            if _runtime_is_selected_project_data(bundled_root, project_root):
+                bundled_playwright = None
+        if bundled_playwright is not None:
+            node_source = bundled_playwright.node.resolve()
+            argv[0] = str(node_source)
             # An approved Playwright command uses the pinned engine-owned CLI;
             # project test/config arguments remain unchanged and are copied in
             # the disposable snapshot.
@@ -3822,9 +4197,26 @@ def _contained_snapshot_command(
             environment["NODE_PATH"] = str(
                 (bundled_playwright.root / "node_modules").resolve()
             )
+        else:
+            try:
+                node_source = _trusted_host_node(
+                    argv[0], snapshot=snapshot,
+                    denied_root=denied_root or config.project_root,
+                )
+            except VerificationPythonUnavailable as error:
+                return {
+                    "argv": command, "cwd": ".", "exit_code": -2,
+                    "stdout": "", "stderr": (
+                        "Node permission-model containment is unavailable: "
+                        + str(error) + ". Nexus did not run project code."
+                    ),
+                    "timed_out": False, "output_truncated": False,
+                    "containment_unavailable": True,
+                }
+            argv[0] = str(node_source)
         try:
             version = subprocess.run(
-                [argv[0], "--version"], check=False, capture_output=True,
+                [str(node_source), "--version"], check=False, capture_output=True,
                 text=True, timeout=5,
             ).stdout.strip()
             major = int(version.lstrip("v").split(".", 1)[0])
@@ -3906,64 +4298,76 @@ def _contained_snapshot_command(
         runtime_root = snapshot / ".nexus-verification" / "runtime"
         contained_read_roots: tuple[Path, ...] = ()
         if name in {"python", "python3", "py"}:
-            bundled = Path(__file__).resolve().parents[2] / "desktop" / "runtime"
-            if not (bundled / "python.exe").is_file():
+            candidate = Path(__file__).resolve().parents[2] / "desktop" / "runtime"
+            bundled = packaged_runtime_if_usable(candidate)
+            project_root = (denied_root or config.project_root).resolve()
+            if bundled is not None:
+                bundled_root = bundled.resolve()
+                if _runtime_is_selected_project_data(bundled_root, project_root):
+                    bundled = None
+            try:
+                if bundled is None:
+                    stage_source_runtime(
+                        runtime_root,
+                        snapshot=snapshot,
+                        python_guard_parent=python_guard.parent,
+                        dependency_paths=python_dependencies,
+                    )
+                else:
+                    _stage_packaged_python_runtime(
+                        bundled, runtime_root, snapshot=snapshot,
+                        python_guard_parent=python_guard.parent,
+                        dependency_paths=python_dependencies,
+                    )
+            except (VerificationPythonUnavailable, OSError) as error:
                 return {
                     "argv": command, "cwd": ".", "exit_code": -2,
-                    "stdout": "", "stderr": "Bundled Python containment runtime is unavailable",
+                    "stdout": "", "stderr": (
+                        "Lightweight Python containment runtime is unavailable: "
+                        + str(error) + ". Nexus did not run project code."
+                    ),
                     "timed_out": False, "output_truncated": False,
                     "containment_unavailable": True,
                 }
-            if not runtime_root.exists():
-                runtime_root.mkdir(parents=True, exist_ok=True)
-                for runtime_name in (
-                    "python.exe", "python3.dll", "python311.dll",
-                    "vcruntime140.dll", "vcruntime140_1.dll",
-                ):
-                    source = bundled / runtime_name
-                    if source.is_file():
-                        shutil.copy2(source, runtime_root / runtime_name)
-                pth = runtime_root / "python311._pth"
-                atomic_write(pth, (
-                    str((bundled / "python311.zip").resolve()) + "\n"
-                    + str(bundled.resolve()) + "\n"
-                    + str((bundled / "Lib" / "site-packages").resolve()) + "\n"
-                    + str(python_guard.parent.resolve()) + "\n"
-                    + str(snapshot.resolve()) + "\nimport site\n"
-                ).encode("utf-8"))
             argv[0] = str(runtime_root / "python.exe")
-            contained_read_roots = (bundled,)
+            contained_read_roots = (bundled,) if bundled is not None else ()
             # Child Python processes and vetted native dependencies may run,
             # but only from engine-owned immutable runtime roots.  They inherit
             # the same AppContainer token and no-breakaway Job.  Project-owned
             # executables remain outside this executable allowlist.
-            environment["NEXUS_ALLOWED_EXEC_ROOTS"] = os.pathsep.join((
-                str(runtime_root.resolve()), str(bundled.resolve()),
-                str((bundled / "Lib" / "site-packages").resolve()),
-            ))
+            allowed_roots = [str(runtime_root.resolve())]
+            if bundled is not None:
+                allowed_roots.extend((
+                    str(bundled.resolve()),
+                    str((bundled / "Lib" / "site-packages").resolve()),
+                ))
+            environment["NEXUS_ALLOWED_EXEC_ROOTS"] = os.pathsep.join(allowed_roots)
         else:
-            runtime_root.mkdir(parents=True, exist_ok=True)
-            if bundled_playwright is not None:
-                contained_read_roots = (bundled_playwright.root,)
-                argv[0] = str(bundled_playwright.node)
-            else:
-                copied_node = runtime_root / "node.exe"
-                if not copied_node.exists():
-                    shutil.copy2(argv[0], copied_node)
-                argv[0] = str(copied_node)
-            node_workspace = snapshot / ".nexus-verification" / "node-workspace"
-            if node_workspace.exists():
-                shutil.rmtree(node_workspace)
-            node_workspace.mkdir(parents=True)
-            (node_workspace / ".nexus-verification").mkdir()
-            for child in snapshot.iterdir():
-                if child.name == ".nexus-verification":
-                    continue
-                destination = node_workspace / child.name
-                if child.is_dir() and not child.is_symlink():
-                    shutil.copytree(child, destination, symlinks=True)
-                elif child.is_file() and not child.is_symlink():
-                    shutil.copy2(child, destination)
+            try:
+                argv[0] = str(_stage_node_runtime(node_source, runtime_root))
+                if bundled_playwright is not None:
+                    contained_read_roots = (bundled_playwright.root,)
+                node_workspace = snapshot / ".nexus-verification" / "node-workspace"
+                _recreate_verification_directory(node_workspace)
+                (node_workspace / ".nexus-verification").mkdir()
+                for child in snapshot.iterdir():
+                    if child.name == ".nexus-verification":
+                        continue
+                    destination = node_workspace / child.name
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.copytree(child, destination, symlinks=True)
+                    elif child.is_file() and not child.is_symlink():
+                        shutil.copy2(child, destination)
+            except (VerificationPythonUnavailable, OSError) as error:
+                return {
+                    "argv": command, "cwd": ".", "exit_code": -2,
+                    "stdout": "", "stderr": (
+                        "Node containment runtime is unavailable: " + str(error)
+                        + ". Nexus did not run project code."
+                    ),
+                    "timed_out": False, "output_truncated": False,
+                    "containment_unavailable": True,
+                }
             # Node canonicalizes script/argument paths by walking from the
             # drive root.  A zero-capability AppContainer intentionally cannot
             # enumerate that root, even though it has an ACE on the snapshot.
@@ -3978,6 +4382,8 @@ def _contained_snapshot_command(
                 except (OSError, ValueError):
                     continue
         CommandRunner(config)._check(command)
+        if requested_pytest:
+            CommandRunner(config)._check(["python", "-m", "pytest", *command[1:]])
         payload = run_appcontainer(snapshot, argv, {
             **{
                 key: os.environ[key] for key in (
@@ -4017,9 +4423,40 @@ def _contained_snapshot_command(
             "containment_unavailable": True,
         }
     payload["containment_profile"] = profile
+    if (
+        requested_pytest and payload.get("exit_code") not in {0, None}
+        and "no module named pytest" in str(payload.get("stderr") or "").casefold()
+    ):
+        payload["stderr"] = str(payload.get("stderr") or "") + (
+            "\nPytest is not present in the contained project snapshot. Prepare it "
+            "beforehand in .venv/Lib/site-packages, venv/Lib/site-packages, "
+            "__pypackages__/3.11/lib, or vendor. Nexus does not install packages silently."
+        )
     payload["contained_argv"] = argv
     payload["argv"] = list(command)
     return payload
+
+
+def _containment_owns_runner_availability(command: list[str]) -> bool:
+    """Whether the containment layer, not host PATH, selects this runtime.
+
+    Python and pytest are rewritten to an engine-staged interpreter. Node may
+    be replaced by the bundled Playwright runtime or resolved and staged by
+    the guarded Node profile. Rejecting any of those names with an outer
+    ``which`` probe defeats the exact portability boundary that owns them.
+    Absolute/package-private runtime paths are classified by basename because
+    the containment layer never launches the supplied Python/pytest binary and
+    independently validates any selected Node binary before staging it.
+    """
+
+    if not command:
+        return False
+    name = Path(str(command[0])).name.casefold()
+    for suffix in (".exe", ".cmd", ".bat"):
+        name = name.removesuffix(suffix)
+    return name in {
+        "python", "python3", "py", "pytest", "py.test", "node", "nodejs",
+    }
 
 
 def _windows_containment_canary(
@@ -4811,8 +5248,19 @@ def _verification_commands(
     return discovered, "discovered"
 
 
-def _command_approval_digest(root: Path, commands: list[list[str]]) -> str:
-    """Bind approval to both argv and the project files that selected it."""
+def _command_approval_digest(
+    root: Path,
+    commands: list[list[str]],
+    *,
+    declared_path: str = "",
+) -> str:
+    """Bind approval to path, argv, and the project files that selected it.
+
+    ``declared_path`` is included for user approvals so moving a board project
+    to another path cannot carry authority even when both folders happen to
+    contain byte-identical manifests. Internal execution receipts omit it and
+    remain bound to the canonical snapshot root.
+    """
 
     evidence: list[tuple[str, str | None]] = []
     for name in (
@@ -4823,10 +5271,103 @@ def _command_approval_digest(root: Path, commands: list[list[str]]) -> str:
         path = root / name
         if path.is_file() and not path.is_symlink():
             evidence.append((name, file_sha256(path)))
-    payload = {"commands": commands, "evidence": evidence}
+    payload: dict[str, Any] = {
+        "project_root": os.path.normcase(str(root.resolve())),
+        "commands": commands,
+        "evidence": evidence,
+    }
+    if declared_path:
+        payload["declared_path"] = os.path.normcase(os.path.abspath(
+            os.path.expanduser(str(declared_path))
+        ))
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def verification_command_approval(
+    config: LoadedConfig,
+    project: dict[str, Any],
+) -> dict[str, Any]:
+    """Describe the exact non-executed test-command approval for one project.
+
+    Discovery reads ordinary project metadata only. It never starts a runner;
+    the returned argv is the material the person must review before the exact
+    digest may be persisted on the board.
+    """
+
+    project_id = str(project.get("id") or "")
+    declared_path = str(project.get("path") or "").strip()
+    base = {
+        "project_id": project_id,
+        "project_path": declared_path,
+        "canonical_path": "",
+        "source": "unavailable",
+        "commands": [],
+        "approval_digest": "",
+        "approved_digest": str(
+            project.get("approved_test_command_digest") or ""
+        ).lower(),
+        "requires_approval": False,
+        "approved": False,
+        "stale_approval": False,
+        "can_approve": False,
+        "reason": "",
+    }
+    if not declared_path:
+        return dict(base, reason="This project has no folder path to verify.")
+    try:
+        root = Path(declared_path).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        return dict(base, reason=f"The project folder cannot be resolved: {exc}")
+    base["canonical_path"] = str(root)
+    if not root.is_dir():
+        return dict(base, reason="The project folder is not available on this machine.")
+    try:
+        commands, source = _verification_commands(config, root, project)
+    except (OSError, HarnessError) as exc:
+        return dict(base, reason=f"Test commands could not be discovered safely: {exc}")
+    shown = [[str(part) for part in command] for command in commands]
+    base["source"] = source
+    base["commands"] = shown
+    if source != "discovered":
+        return dict(
+            base,
+            reason=(
+                "These test commands were configured explicitly; discovered-command "
+                "approval is not needed."
+            ),
+        )
+    if not shown:
+        return dict(
+            base,
+            reason="Nexus did not discover a deterministic test command for this project.",
+        )
+    try:
+        digest = _command_approval_digest(
+            root, shown, declared_path=declared_path,
+        )
+    except (OSError, RuntimeError) as exc:
+        return dict(
+            base,
+            requires_approval=True,
+            reason=f"The exact command fingerprint could not be read safely: {exc}",
+        )
+    approved_digest = str(base["approved_digest"] or "")
+    approved = approved_digest == digest
+    return dict(
+        base,
+        approval_digest=digest,
+        requires_approval=True,
+        approved=approved,
+        stale_approval=bool(approved_digest and not approved),
+        can_approve=True,
+        reason=(
+            "The exact discovered commands are approved for this project path."
+            if approved else
+            "Review the exact discovered commands before allowing Nexus to run them."
+        ),
+    )
 
 
 _MUTATION_ACTIONS = {
@@ -7920,7 +8461,22 @@ def _run_selected_project_verification(
             "reason": "No deterministic test command is configured or discoverable for the selected project.",
         }
     if source == "discovered":
-        approval_digest = _command_approval_digest(root, commands)
+        try:
+            approval_digest = _command_approval_digest(
+                root,
+                commands,
+                declared_path=str(project.get("path") or ""),
+            )
+        except (OSError, RuntimeError) as exc:
+            return {
+                "status": "unavailable", "basis": "command_approval_fingerprint_unavailable",
+                "commands": [], "proposed_commands": commands,
+                "runnable_tests": static, "preflight": preflight, "goal_effect": effect,
+                "reason": (
+                    "Nexus did not run project code because it could not safely fingerprint "
+                    f"the exact discovered test commands: {exc}"
+                ),
+            }
         approved = str(project.get("approved_test_command_digest") or "")
         if approved != approval_digest:
             return {
@@ -7930,7 +8486,8 @@ def _run_selected_project_verification(
                 "preflight": preflight, "goal_effect": effect,
                 "reason": (
                     "Nexus discovered project test commands but did not execute untrusted project code. "
-                    "Review the exact commands and approve this digest, or configure selected-project test commands explicitly."
+                    "Open the gear on this project, review Project test commands, and approve "
+                    "the exact displayed fingerprint; or configure selected-project test commands explicitly."
                 ),
             }
 
@@ -7975,7 +8532,7 @@ def _run_selected_project_verification(
     for command in commands:
         executable_text = str(command[0]) if command else ""
         executable_path = Path(executable_text) if executable_text else Path()
-        executable_found = (
+        executable_found = _containment_owns_runner_availability(command) or (
             executable_path.is_file()
             if executable_path.is_absolute() or executable_path.parent != Path(".")
             else shutil.which(executable_text) is not None
@@ -7996,18 +8553,25 @@ def _run_selected_project_verification(
             timeout = None
             deadline_limited = False
             if deadline is not None:
-                remaining = deadline.remaining_seconds(
-                    "before a selected-project verification command"
+                configured_timeout = float(
+                    command_config.get("execution.timeout_seconds")
                 )
-                configured_timeout = float(command_config.get("execution.timeout_seconds"))
-                timeout = min(remaining, configured_timeout)
-                deadline_limited = remaining <= configured_timeout
+                remaining = deadline.remaining_seconds(
+                    "before a selected-project verification command",
+                    configured_timeout,
+                )
+                timeout = remaining
+                deadline_limited = (
+                    deadline.limits(configured_timeout)
+                    if isinstance(deadline, _SwarmToolExecutionBudget)
+                    else remaining <= configured_timeout
+                )
             payload = _run_disposable_verification_command(
                 command_config, root, command, timeout=timeout,
             )
             if payload.get("timed_out") and deadline_limited:
-                raise DeadlineExpired(
-                    "Project context-tool deadline expired during selected-project verification"
+                raise ContextToolBudgetExhausted(
+                    "Project context-tool execution budget exhausted during selected-project verification"
                 )
             if deadline is not None:
                 deadline.check("during selected-project verification")
@@ -8329,47 +8893,132 @@ def _verified_net_semantic_deltas(
     return verified
 
 
-class _SwarmToolDeadline:
-    def __init__(self, seconds: float = 300.0) -> None:
-        self.expires_at = time.monotonic() + seconds
-        self.expires_unix = time.time() + seconds
+class _SwarmToolExecutionBudget:
+    """Durable aggregate budget charged only while a context tool is executing.
+
+    It deliberately has no absolute expiry timestamp. Provider thinking,
+    network waits between tool calls, user pauses, and process downtime cannot
+    spend this budget. A zero configured ceiling means unlimited aggregate tool
+    time; each subprocess and MCP call still receives its ordinary local cap.
+    """
+
+    def __init__(
+        self,
+        configured_seconds: float = 0,
+        *,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if (
+            isinstance(configured_seconds, bool)
+            or not isinstance(configured_seconds, (int, float))
+            or not math.isfinite(float(configured_seconds))
+            or float(configured_seconds) < 0
+        ):
+            raise HarnessError(
+                "Project context-tool execution budget must be zero or a positive number"
+            )
+        self.configured_seconds = float(configured_seconds)
+        self.consumed_seconds = 0.0
+        self._clock = clock or time.monotonic
+        self._active_started: float | None = None
+
+    @property
+    def unlimited(self) -> bool:
+        return self.configured_seconds == 0
+
+    def _consumed_now(self) -> float:
+        active = (
+            max(0.0, float(self._clock()) - self._active_started)
+            if self._active_started is not None else 0.0
+        )
+        return self.consumed_seconds + active
 
     def _remaining(self) -> float:
-        return min(self.expires_at - time.monotonic(), self.expires_unix - time.time())
+        if self.unlimited:
+            return math.inf
+        return max(0.0, self.configured_seconds - self._consumed_now())
+
+    def begin_tool_execution(self) -> None:
+        if self._active_started is not None:
+            raise HarnessError("Project context-tool execution accounting is already active")
+        self.check("before a context tool call")
+        self._active_started = float(self._clock())
+
+    def finish_tool_execution(self) -> None:
+        if self._active_started is None:
+            return
+        finished = float(self._clock())
+        self.consumed_seconds += max(0.0, finished - self._active_started)
+        self._active_started = None
 
     def check(self, operation: str) -> None:
         if self._remaining() <= 0:
-            raise DeadlineExpired(f"Project context-tool deadline expired {operation}")
+            raise ContextToolBudgetExhausted(
+                f"Project context-tool execution budget exhausted {operation}"
+            )
 
     def remaining_seconds(self, operation: str, cap: float | None = None) -> float:
         self.check(operation)
         remaining = self._remaining()
-        return remaining if cap is None else min(remaining, cap)
+        return remaining if cap is None else min(remaining, float(cap))
+
+    def limits(self, cap: float) -> bool:
+        """Whether the aggregate budget, rather than the local cap, is tighter."""
+
+        return not self.unlimited and self._remaining() <= float(cap)
 
     def shorten(self, seconds: float) -> None:
-        if seconds <= 0:
-            raise HarnessError("Project context-tool deadline must be greater than zero")
-        self.expires_at = min(self.expires_at, time.monotonic() + seconds)
-        self.expires_unix = min(self.expires_unix, time.time() + seconds)
+        """Test/embedding hook: cap future active execution to this much more time."""
+
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+            raise HarnessError(
+                "Project context-tool execution budget must be greater than zero"
+            )
+        shortened = self._consumed_now() + float(seconds)
+        self.configured_seconds = (
+            shortened if self.unlimited else min(self.configured_seconds, shortened)
+        )
 
     def budget_state(self) -> dict[str, Any]:
-        return {"schema_version": 1, "expires_unix": self.expires_unix}
+        consumed = self._consumed_now()
+        remaining = None if self.unlimited else max(
+            0.0, self.configured_seconds - consumed
+        )
+        return {
+            "schema_version": 2,
+            "accounting": "active_context_tool_execution_only",
+            "configured_ceiling_seconds": self.configured_seconds,
+            "consumed_seconds": consumed,
+            "remaining_seconds": remaining,
+            "unlimited": self.unlimited,
+        }
 
     def restore_budget_state(self, state: object) -> None:
-        if not isinstance(state, dict) or state.get("schema_version") != 1:
-            raise HarnessError("Run checkpoint context-tool deadline has an unsupported schema")
-        expires_unix = state.get("expires_unix")
-        if isinstance(expires_unix, bool) or not isinstance(expires_unix, (int, float)):
-            raise HarnessError("Run checkpoint context-tool deadline is invalid")
-        remaining = float(expires_unix) - time.time()
-        self.expires_unix = min(self.expires_unix, float(expires_unix))
-        self.expires_at = min(self.expires_at, time.monotonic() + max(0.0, remaining))
+        if not isinstance(state, dict) or state.get("schema_version") != 2:
+            raise HarnessError(
+                "Run checkpoint context-tool execution budget has an unsupported schema"
+            )
+        consumed = state.get("consumed_seconds")
+        prior_ceiling = state.get("configured_ceiling_seconds")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+            for value in (consumed, prior_ceiling)
+        ):
+            raise HarnessError("Run checkpoint context-tool execution budget is invalid")
+        if self._active_started is not None:
+            raise HarnessError("Cannot restore context-tool execution budget during a call")
+        # The authenticated ledger owns consumed time. The current setting owns
+        # the ceiling, so a user can explicitly extend it or switch to zero
+        # (unlimited) before resuming without erasing what was already charged.
+        self.consumed_seconds = float(consumed)
 
-    def renew_after_progress(self, seconds: float = 300.0) -> None:
-        """Open a new bounded epoch only after a durable semantic checkpoint."""
-
-        self.expires_at = time.monotonic() + seconds
-        self.expires_unix = time.time() + seconds
+    def reset_by_user(self) -> None:
+        if self._active_started is not None:
+            raise HarnessError("Cannot reset context-tool execution budget during a call")
+        self.consumed_seconds = 0.0
 
 
 class _ProjectContextTools:
@@ -8380,6 +9029,8 @@ class _ProjectContextTools:
         project: dict[str, Any], goal: str, changed: list[str], progress: Progress | None,
         required_effect_paths: list[str] | None = None,
         requirement_contract: dict[str, Any] | None = None,
+        *,
+        reset_execution_budget: bool = False,
     ) -> None:
         data = copy.deepcopy(config.data)
         # Long-horizon exploration gets a useful epoch rather than the generic
@@ -8402,7 +9053,9 @@ class _ProjectContextTools:
         self.memory.ensure_external_run(
             ledger.session_id, "Nexus project-work context tools", "swarm-tools-v1"
         )
-        self.deadline = _SwarmToolDeadline()
+        self.execution_budget = _SwarmToolExecutionBudget(
+            float(data["workflow"].get("context_tool_execution_seconds", 0))
+        )
         self.ledger = ledger
         self.project = project
         self.goal = goal
@@ -8421,10 +9074,15 @@ class _ProjectContextTools:
         self.renewal_checkpoints: list[str] = []
         self.semantic_path_hashes: dict[str, str | None] = {}
         self.semantic_state_history: list[str] = []
-        self.absolute_call_limit = 2_000
-        self.absolute_byte_limit = 20_000_000
+        # Per-epoch call/output bounds remain finite and renew only after a
+        # verified semantic project-state change. A second lifetime wall made
+        # a genuinely progressing run terminal after enough good work, even
+        # across resumes. Zero means no lifetime ceiling; unchanged retries
+        # still cannot renew the finite epoch.
+        self.absolute_call_limit = 0
+        self.absolute_byte_limit = 0
         self.session = AgentToolSession(
-            self.config, self.memory, self.deadline,
+            self.config, self.memory, self.execution_budget,
             lambda kind, node, payload: ledger.record_state(
                 "context_tool_event", {"kind": kind, "node": node, "payload": payload}
             ),
@@ -8443,8 +9101,13 @@ class _ProjectContextTools:
         ), None)
         if isinstance(prior_state, dict) and isinstance(prior_state.get("budget"), dict):
             self.session.restore_budget_state(prior_state["budget"])
-            if "deadline" in prior_state:
-                self.deadline.restore_budget_state(prior_state["deadline"])
+            execution_budget = prior_state.get("tool_execution_budget")
+            if isinstance(execution_budget, dict):
+                self.execution_budget.restore_budget_state(execution_budget)
+            # Schema-1 checkpoints stored an absolute Unix expiry. They cannot
+            # be converted into active execution time safely and, critically,
+            # must not make a run permanently expired merely because the app
+            # was closed. They migrate with zero consumed execution seconds.
             epoch_state = prior_state.get("epoch", {})
             if isinstance(epoch_state, dict):
                 self.epoch = max(1, int(epoch_state.get("number", 1)))
@@ -8472,6 +9135,17 @@ class _ProjectContextTools:
                         str(one) for one in state_history
                         if re.fullmatch(r"[0-9a-f]{64}", str(one))
                     ]
+        if reset_execution_budget:
+            self.execution_budget.reset_by_user()
+            self.ledger.record_state("context_tool_budget_reset", {
+                "status": "reset_by_user",
+                "configured_ceiling_seconds": self.execution_budget.configured_seconds,
+                "recovery": (
+                    "unlimited" if self.execution_budget.unlimited
+                    else "a fresh configured execution allowance"
+                ),
+            })
+            self._record_budget()
         _report(
             self.progress, "Project context-tool budget",
             self.disclosure()["summary"],
@@ -8486,7 +9160,7 @@ class _ProjectContextTools:
         return _run_selected_project_verification(
             self.config, self.config.project_root, self.project,
             self.goal, self.changed, self.progress, self.required_effect_paths,
-            self.deadline,
+            self.execution_budget,
             self.requirement_contract,
             verification_session_id=self.ledger.session_id,
         )
@@ -8500,21 +9174,35 @@ class _ProjectContextTools:
         call_id = str(call.get("call_id") or "")
         name = str(call.get("name") or "")
         arguments = call.get("arguments", {})
-        if self.lifetime_calls_before_epoch + self.session.calls >= self.absolute_call_limit:
+        if (
+            self.absolute_call_limit > 0
+            and self.lifetime_calls_before_epoch + self.session.calls >= self.absolute_call_limit
+        ):
             raise HarnessError("Absolute long-horizon context-tool safety ceiling reached")
         # Bound this very result by the lifetime ceiling. AgentToolSession
         # accounts and exposes truncation before it persists/returns a result;
         # an absolute-ceiling truncation is rejected below rather than being
         # silently accepted as useful context.
-        absolute_remaining_before = max(
-            0,
-            self.absolute_byte_limit
-            - self.lifetime_bytes_before_epoch
-            - self.session.total_bytes,
-        )
-        absolute_epoch_cap = max(0, self.absolute_byte_limit - self.lifetime_bytes_before_epoch)
-        self.session.total_bytes_limit = min(self.epoch_byte_limit, absolute_epoch_cap)
-        lifetime_limited_this_result = absolute_remaining_before <= self.session.per_call_bytes
+        if self.absolute_byte_limit > 0:
+            absolute_remaining_before = max(
+                0,
+                self.absolute_byte_limit
+                - self.lifetime_bytes_before_epoch
+                - self.session.total_bytes,
+            )
+            absolute_epoch_cap = max(
+                0, self.absolute_byte_limit - self.lifetime_bytes_before_epoch
+            )
+            self.session.total_bytes_limit = min(
+                self.epoch_byte_limit, absolute_epoch_cap
+            )
+            lifetime_limited_this_result = (
+                absolute_remaining_before <= self.session.per_call_bytes
+            )
+        else:
+            self.session.total_bytes_limit = self.epoch_byte_limit
+            lifetime_limited_this_result = False
+        self.execution_budget.begin_tool_execution()
         try:
             result = self.session.execute(node, call_id, name, arguments)
             if lifetime_limited_this_result and result.get("truncated"):
@@ -8529,6 +9217,7 @@ class _ProjectContextTools:
                     "Absolute long-horizon context-tool output safety ceiling reached during this result"
                 )
         except BaseException as original:
+            self.execution_budget.finish_tool_execution()
             try:
                 self._record_budget()
             except BaseException as checkpoint_error:
@@ -8537,6 +9226,7 @@ class _ProjectContextTools:
                     + str(checkpoint_error)
                 )
             raise
+        self.execution_budget.finish_tool_execution()
         self.ledger.record_state("context_tool_result", {
             "call_id": call_id,
             "name": name,
@@ -8551,7 +9241,7 @@ class _ProjectContextTools:
     def _record_budget(self) -> None:
         self.ledger.record_state("context_tool_budget", {
             "budget": self.session.budget_state(),
-            "deadline": self.deadline.budget_state(),
+            "tool_execution_budget": self.execution_budget.budget_state(),
             "epoch": {
                 "number": self.epoch,
                 "prior_calls": self.lifetime_calls_before_epoch,
@@ -8658,7 +9348,10 @@ class _ProjectContextTools:
             return False
         self.lifetime_calls_before_epoch += self.session.calls
         self.lifetime_bytes_before_epoch += self.session.total_bytes
-        if self.lifetime_calls_before_epoch >= self.absolute_call_limit:
+        if (
+            self.absolute_call_limit > 0
+            and self.lifetime_calls_before_epoch >= self.absolute_call_limit
+        ):
             return False
         self.session.calls = 0
         self.session.total_bytes = 0
@@ -8668,7 +9361,6 @@ class _ProjectContextTools:
             self.semantic_state_history.append(before_digest)
         self.semantic_state_history.append(after_digest)
         self.semantic_path_hashes = after_state
-        self.deadline.renew_after_progress()
         self._record_budget()
         self.ledger.record_state("context_tool_epoch_renewed", {
             "epoch": self.epoch,
@@ -8685,6 +9377,23 @@ class _ProjectContextTools:
     def disclosure(self) -> dict[str, Any]:
         remaining = max(0, self.session.max_calls - self.session.calls)
         lifetime = self.lifetime_calls_before_epoch + self.session.calls
+        execution = self.execution_budget.budget_state()
+        execution_ceiling = float(execution["configured_ceiling_seconds"])
+        execution_used = float(execution["consumed_seconds"])
+        execution_remaining = execution["remaining_seconds"]
+        execution_mode = "unlimited" if execution["unlimited"] else "configured"
+        time_words = (
+            f"Tool execution time is unlimited in aggregate; {execution_used:.3f} seconds "
+            "have been charged so far"
+            if execution["unlimited"] else
+            f"{float(execution_remaining):.3f} of {execution_ceiling:.3f} configured "
+            f"tool-execution seconds remain; {execution_used:.3f} seconds have been charged"
+        )
+        lifetime_words = (
+            f"{lifetime} lifetime calls used with no terminal lifetime ceiling"
+            if self.absolute_call_limit == 0 else
+            f"{lifetime} of {self.absolute_call_limit} absolute calls used"
+        )
         return {
             "epoch": self.epoch,
             "epoch_call_limit": self.session.max_calls,
@@ -8692,11 +9401,26 @@ class _ProjectContextTools:
             "epoch_calls_remaining": remaining,
             "lifetime_calls_used": lifetime,
             "absolute_call_limit": self.absolute_call_limit,
+            "tool_execution_mode": execution_mode,
+            "tool_execution_ceiling_seconds": execution_ceiling,
+            "tool_execution_consumed_seconds": execution_used,
+            "tool_execution_remaining_seconds": execution_remaining,
+            "tool_execution_exhausted": (
+                not execution["unlimited"] and float(execution_remaining) <= 0
+            ),
+            "tool_execution_accounting": (
+                "Only time inside a Nexus context-tool call is charged. Provider/model "
+                "thinking, network waits between calls, user pauses, and process downtime are not."
+            ),
+            "tool_execution_recovery": (
+                "Use the saved run's Reset tool time and resume action, or change Context "
+                "tool execution seconds in Settings; zero means unlimited."
+            ),
             "renewal_policy": "Renews only after Nexus records durable semantic project progress; restart/resume alone never renews it.",
             "summary": (
                 f"Exploration epoch {self.epoch}: {remaining} of {self.session.max_calls} calls remain; "
-                f"{lifetime} of {self.absolute_call_limit} absolute calls used. "
-                "The epoch renews only after durable semantic project progress, never merely on restart or resume."
+                f"{lifetime_words}. {time_words}. The call/output epoch renews only after durable semantic "
+                "project progress, never merely on restart or resume."
             ),
         }
 
@@ -8718,6 +9442,7 @@ def work_together(
     resume_session_id: str = "",
     user_answers: object = None,
     allowed_write_roots: object = None,
+    reset_context_tool_execution_budget: bool = False,
 ) -> dict[str, Any]:
     # Validate user-controlled prose before opening a ledger, contacting a
     # provider, or inspecting/mutating the selected project.  Resume validates
@@ -8727,6 +9452,10 @@ def work_together(
             user_answers = chat_lab._check_what_was_typed(user_answers)
     else:
         text = chat_lab._check_what_was_typed(text)
+    if not isinstance(reset_context_tool_execution_budget, bool):
+        raise SwarmError("The context-tool budget reset choice must be true or false.")
+    if reset_context_tool_execution_budget and not resume_session_id:
+        raise SwarmError("Context-tool time can be reset only for an exact saved run.")
     round_limit = user_round_limit(round_limit)
     lead = _agent(board, agent_id)
     project = _one_project(board, lead, project_id)
@@ -8758,6 +9487,7 @@ def work_together(
     resumed_changed_paths: list[str] = []
     previous_write_roots: list[str] = []
     previous_scope_restricted = False
+    previous_status = ""
     if resume_session_id:
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", resume_session_id):
             raise SwarmError("The project-work resume token is invalid.")
@@ -8776,7 +9506,7 @@ def work_together(
             ), None)
         resumable_statuses = {
             "paused_provider", "paused_for_user", "applied_unverified",
-            "needs_verification", "incomplete",
+            "needs_verification", "incomplete", "paused_tool_budget",
         }
         previous_status = (
             str(last_outcome.get("state", {}).get("status") or "")
@@ -8799,6 +9529,10 @@ def work_together(
         if previous_status == "paused":
             raise SwarmError(
                 "That legacy paused session does not say whether a user answer or provider retry is required. Start a new run instead."
+            )
+        if reset_context_tool_execution_budget and previous_status != "paused_tool_budget":
+            raise SwarmError(
+                "Context-tool time can be reset only after that exact saved run stopped on its tool-execution budget."
             )
         prior_roots = (
             last_outcome.get("state", {}).get("allowed_write_roots", [])
@@ -8845,15 +9579,22 @@ def work_together(
             )
         else:
             provider_retry = previous_status == "paused_provider"
+            tool_budget_reset = (
+                previous_status == "paused_tool_budget"
+                and reset_context_tool_execution_budget
+            )
             ledger.append(
                 kind="nexus_state",
                 phase=(
                     "provider_recovery_resume" if provider_retry
+                    else "context_tool_budget_reset_authorized" if tool_budget_reset
                     else "saved_work_resume"
                 ),
                 text=(
                     "Provider recovery was requested without a user answer."
                     if provider_retry else
+                    "The user explicitly reset consumed context-tool execution time and resumed the saved run."
+                    if tool_budget_reset else
                     "Saved incomplete or unverified work was resumed without an optional note."
                 ),
                 state={
@@ -9022,11 +9763,11 @@ def work_together(
             "round_limit": round_limit, "plan_rounds": 0,
             "work_passes": 0, "remaining": [question],
         }
-    common = (
+    common_without_goal = (
         f"EXPLICIT PROJECT-WORK REQUEST\nProject: {project.get('name')}\n"
         "Nexus, not the provider process, owns the project-file transaction. "
         "Paths must be relative to this project. Do not propose .git or .harness files.\n"
-        f"Team: {roster}\nORIGINAL USER GOAL\n{text}"
+        f"Team: {roster}"
         + ("\n\nUSER ANSWERS THAT RESUMED THIS PAUSED RUN\n" + resumed_answers if resumed_answers else "")
         + destination_contract
         + "\nPROJECT TREE\n" + _tree(root)
@@ -9034,6 +9775,11 @@ def work_together(
           "Nexus reports every retrieval omission explicitly."
         + ("\n\n" + attachment_text if attachment_text else "")
     )
+    # The first planning request already carries the exact goal as its user
+    # message. Do not duplicate a maximum-size goal in that request. Later
+    # continuation turns need it in context because their user message is a
+    # short stage instruction and some provider routes are stateless.
+    common = common_without_goal + f"\nORIGINAL USER GOAL\n{text}"
 
     def context_for(one: dict[str, Any]) -> str:
         paired_with = (
@@ -9050,7 +9796,7 @@ def work_together(
                 config,
                 str(one.get("who") or ""),
                 text,
-                context=context_for(one) + "\n\n" + common
+                context=context_for(one) + "\n\n" + common_without_goal
                 + "\nPlan your contribution and write a message to the lead. Request only existing files you truly need. "
                   "List every project-relative file that this contribution must create, modify, or delete in effect_paths; an explicitly read-only goal may leave it empty."
                 + _shared_context(ledger, one, {"stage": "independent_planning"}),
@@ -9507,6 +10253,7 @@ def work_together(
                             config, root, ledger, project, text, all_changed, progress,
                             required_effect_paths,
                             requirement_contract,
+                            reset_execution_budget=reset_context_tool_execution_budget,
                         )
                     for call in calls:
                         if not isinstance(call, dict):
@@ -9517,6 +10264,9 @@ def work_together(
                             "result": result,
                         })
             except cancellation.ChatCancelled:
+                if context_tools is not None:
+                    context_tools.close()
+                    context_tools = None
                 recovery = mutation_saga.compensate("user_cancelled")
                 try:
                     ledger.record_state("cancelled", {
@@ -9526,7 +10276,27 @@ def work_together(
                 except HarnessError:
                     pass
                 raise
+            except ContextToolBudgetExhausted as exc:
+                budget = (
+                    context_tools.disclosure() if context_tools is not None else {}
+                )
+                if context_tools is not None:
+                    context_tools.close()
+                    context_tools = None
+                _pause_context_tool_budget(
+                    ledger,
+                    budget,
+                    "execution",
+                    checkpoint={"pass": pass_number, **write_authority_state},
+                    cause=exc,
+                    mutation_root=root,
+                    transaction_ids=transaction_ids,
+                    mutation_saga=mutation_saga,
+                )
             except HarnessError as exc:
+                if context_tools is not None:
+                    context_tools.close()
+                    context_tools = None
                 _pause_provider_failure(
                     ledger,
                     executor,
@@ -9897,8 +10667,40 @@ def work_together(
         "epoch_call_limit": int(config.get("workflow.max_tool_calls")),
         "epoch_calls_used": 0,
         "epoch_calls_remaining": int(config.get("workflow.max_tool_calls")),
+        "lifetime_calls_used": 0,
+        "absolute_call_limit": 0,
+        "tool_execution_mode": (
+            "unlimited"
+            if int(config.get("workflow.context_tool_execution_seconds", 0)) == 0
+            else "configured"
+        ),
+        "tool_execution_ceiling_seconds": float(
+            config.get("workflow.context_tool_execution_seconds", 0)
+        ),
+        "tool_execution_consumed_seconds": 0.0,
+        "tool_execution_remaining_seconds": (
+            None
+            if int(config.get("workflow.context_tool_execution_seconds", 0)) == 0
+            else float(config.get("workflow.context_tool_execution_seconds", 0))
+        ),
+        "tool_execution_exhausted": False,
+        "tool_execution_accounting": (
+            "Only time inside a Nexus context-tool call is charged. Provider/model "
+            "thinking, network waits between calls, user pauses, and process downtime are not."
+        ),
+        "tool_execution_recovery": (
+            "Use the saved run's Reset tool time and resume action, or change Context "
+            "tool execution seconds in Settings; zero means unlimited."
+        ),
         "renewal_policy": "Renews only after Nexus records durable semantic project progress; restart/resume alone never renews it.",
-        "summary": "No project context tools were requested in this run.",
+        "summary": (
+            "No project context tools were requested in this run. Aggregate tool execution "
+            + (
+                "time is unlimited; individual subprocess timeouts still apply."
+                if int(config.get("workflow.context_tool_execution_seconds", 0)) == 0
+                else "has the displayed configured ceiling; only active tool time is charged."
+            )
+        ),
     }
     if context_tools is not None:
         context_tools.close()

@@ -36,15 +36,19 @@ jobs:
           $version = (Get-Content -Raw -LiteralPath desktop/package.json | ConvertFrom-Json).version
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag $env:GITHUB_REF_NAME does not match desktop version $version." }
 
-      - name: Prepare Authenticode signing or label an unsigned development build
+      - name: Prepare Authenticode signing or an explicitly unsigned release
         shell: pwsh
         env:
           WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
+          $expectedPublisher = (Get-Content -Raw -LiteralPath release/windows-authenticode-publisher.txt).Trim()
+          $publisherConfigured = $expectedPublisher -and -not $expectedPublisher.StartsWith('UNCONFIGURED')
+          if ([bool]$env:WINDOWS_CERTIFICATE_BASE64 -xor [bool]$env:WINDOWS_CERTIFICATE_PASSWORD) {
+            throw 'Authenticode configuration is partial: set both certificate secrets or neither.'
+          }
           if ($env:WINDOWS_CERTIFICATE_BASE64 -and $env:WINDOWS_CERTIFICATE_PASSWORD) {
-            $expectedPublisher = (Get-Content -Raw -LiteralPath release/windows-authenticode-publisher.txt).Trim()
-            if (-not $expectedPublisher -or $expectedPublisher.StartsWith('UNCONFIGURED')) {
+            if (-not $publisherConfigured) {
               throw 'Set release/windows-authenticode-publisher.txt to the certificate exact Subject before signing.'
             }
             $certificate = Join-Path $env:RUNNER_TEMP 'nexus-authenticode.pfx'
@@ -52,8 +56,11 @@ jobs:
             "CSC_LINK=$certificate" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "CSC_KEY_PASSWORD=$env:WINDOWS_CERTIFICATE_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "NEXUS_SIGNED_BUILD=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } elseif ($publisherConfigured) {
+            throw 'A Windows publisher is pinned, so release builds require both Authenticode certificate secrets.'
           } elseif ($env:GITHUB_REF -like 'refs/tags/v*') {
-            throw 'A release tag requires WINDOWS_CERTIFICATE_BASE64 and WINDOWS_CERTIFICATE_PASSWORD. No unsigned public release will be created.'
+            "NEXUS_UNSIGNED_RELEASE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "NEXUS_UNSIGNED_DEV=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           } else {
             "NEXUS_UNSIGNED_DEV=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
@@ -77,6 +84,14 @@ jobs:
           $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED-DEV.exe')
           if ($installers.Count -ne 1) { throw "Expected one signed release candidate, found $($installers.Count)." }
           Rename-Item -LiteralPath $installers[0].FullName -NewName ($installers[0].Name -replace '-UNSIGNED-DEV\.exe$', '.exe')
+
+      - name: Give a checksum-only release an honest public filename
+        if: env.NEXUS_UNSIGNED_RELEASE == '1'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED-DEV.exe')
+          if ($installers.Count -ne 1) { throw "Expected one unsigned release candidate, found $($installers.Count)." }
+          Rename-Item -LiteralPath $installers[0].FullName -NewName ($installers[0].Name -replace '-UNSIGNED-DEV\.exe$', '-UNSIGNED.exe')
 
       - name: Smoke-test the unpacked clean-machine app
         working-directory: desktop
@@ -107,6 +122,17 @@ jobs:
           $expectedPublisher = (Get-Content -Raw -LiteralPath release/windows-authenticode-publisher.txt).Trim()
           if ($signature.SignerCertificate.Subject -cne $expectedPublisher) {
             throw "Installer publisher '$($signature.SignerCertificate.Subject)' does not match pinned publisher '$expectedPublisher'."
+          }
+
+      - name: Verify an unsigned release is actually unsigned
+        if: env.NEXUS_UNSIGNED_RELEASE == '1'
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED.exe')
+          if ($installers.Count -ne 1) { throw "Expected one explicitly unsigned installer, found $($installers.Count)." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
+          if ($signature.Status -ne 'NotSigned' -or $signature.SignerCertificate.Subject) {
+            throw "Explicitly unsigned installer has an unexpected signature state: $($signature.Status)."
           }
 
       - name: Write installer SHA-256
@@ -154,4 +180,8 @@ jobs:
             echo "Expected exactly the installer and checksum, found ${#assets[@]}." >&2
             exit 1
           fi
-          gh release create "$tag" "${assets[@]}" --verify-tag --generate-notes --title "Nexus Harness $tag"
+          notes="Windows installer: exact bytes are protected by the accompanying SHA-256. This release is not Authenticode-signed, so Windows may show an unknown-publisher warning."
+          if [[ ! "${assets[*]}" =~ -UNSIGNED\.exe ]]; then
+            notes="Windows installer: SHA-256 and the pinned Authenticode publisher are both verified by the release workflow."
+          fi
+          gh release create "$tag" "${assets[@]}" --verify-tag --generate-notes --notes "$notes" --title "Nexus Harness $tag"

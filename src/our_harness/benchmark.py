@@ -354,7 +354,10 @@ def _case_stream_protocol(rng: random.Random) -> dict[str, Any]:
 
     class AfterDone:
         def stream(self, _request: ProviderRequest):
-            yield {"type": "done"}
+            # The completion itself must be valid so this fixture isolates the
+            # separate protocol violation it is meant to exercise: data after
+            # an explicit terminal event.
+            yield {"type": "done", "finish_reason": "stop"}
             yield {"type": "text_delta", "text": "late"}
 
     response = collect_stream(Good(), request, max_text_chars=5)

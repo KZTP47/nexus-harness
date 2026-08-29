@@ -12,6 +12,11 @@ lines at the top and links written `[[like this]]`. Open the folder in any
 editor and it is a set of notes about your project — readable, correctable,
 deletable, and yours to hand to somebody else.
 
+The note editor shows a live character count. A note body can contain up to
+200,000 characters. Nexus never clips a longer note: the editor keeps the full
+text and asks you to shorten it before saving, and the server enforces the same
+disclosed limit.
+
 ---
 
 ## The four kinds

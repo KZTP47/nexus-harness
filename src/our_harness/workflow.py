@@ -79,6 +79,44 @@ EventSink = Callable[[dict[str, Any]], None]
 
 
 _CHECKPOINT_CONTENT_SCHEMA = "harness-candidate-content-v1"
+_SUCCESS_EMBEDDING_PROJECTION_CHARACTERS = 20_000
+
+
+def _explicit_episode_embedding_projection(
+    body: str, record_kind: str,
+) -> tuple[str, bool]:
+    """Bound semantic-index input without altering the stored episode body."""
+
+    if len(body) <= _SUCCESS_EMBEDDING_PROJECTION_CHARACTERS:
+        return body, False
+    marker = (
+        "\n[Embedding projection only: the full "
+        f"{len(body):,}-character {record_kind} record is stored in this episode body.]"
+    )
+    kept = max(0, _SUCCESS_EMBEDDING_PROJECTION_CHARACTERS - len(marker))
+    return body[:kept] + marker, True
+
+
+def _explicit_success_embedding_projection(body: str) -> tuple[str, bool]:
+    return _explicit_episode_embedding_projection(body, "success")
+
+
+def _success_episode_title(task: str, run_id: str) -> tuple[str, bool]:
+    """Make a bounded index title that points at the canonical run task."""
+
+    if len(task) <= 120:
+        return task, False
+    marker = f"… [title projection; full task in run {run_id}]"
+    return task[:max(0, 120 - len(marker))] + marker, True
+
+
+def _failure_episode_title(task: str) -> tuple[str, bool]:
+    """Bound only the index title; the full task remains in the episode body."""
+
+    if len(task) <= 120:
+        return task, False
+    marker = "… [title projection; full task in episode body]"
+    return task[:max(0, 120 - len(marker))] + marker, True
 
 
 def _programmatic_workspace_session_id(run_id: str, node_id: str, attempt: int) -> str:
@@ -2418,15 +2456,30 @@ class HarnessApplication:
                             {"plan": output["plan"], "delegated_by": dispatch.inputs.get("delegated_by")},
                             sort_keys=True,
                             ensure_ascii=False,
-                        )[:12_000]
+                        )
+                        observation_body = self.memory.redact_text(observation_body)
+                        observation_title, observation_title_projected = _success_episode_title(
+                            self.memory.redact_text(task), run_id,
+                        )
                         episode_id = self.memory.add_episode(
                             "agent_observation",
-                            task[:120],
+                            observation_title,
                             observation_body,
                             {
                                 "run_id": run_id,
                                 "node_id": dispatch.node_id,
                                 "provider_route": route.profile_id,
+                                "canonical_source": "episode.body",
+                                "canonical_body_characters": len(observation_body),
+                                "canonical_body_sha256": hashlib.sha256(
+                                    observation_body.encode("utf-8")
+                                ).hexdigest(),
+                                "body_projection": False,
+                                "title_projection": observation_title_projected,
+                                "full_task_source": f"run:{run_id}.task",
+                                "full_plan_source": (
+                                    f"run:{run_id}.event:decision:{dispatch.node_id}"
+                                ),
                             },
                             vector=query_vector,
                             trust=0.55,
@@ -4029,12 +4082,33 @@ class HarnessApplication:
         return verdict
 
     def _record_failure(self, task: str, failure: dict[str, Any], deadline: WorkflowDeadline | None = None) -> str:
-        body = json.dumps(failure, sort_keys=True)[:12_000]
-        signature = str(failure.get("signature") or hashlib.sha256(body.encode()).hexdigest())
+        failure_json = json.dumps(failure, sort_keys=True)
+        signature = str(
+            failure.get("signature")
+            or hashlib.sha256(failure_json.encode("utf-8")).hexdigest()
+        )
+        body = self.memory.redact_text(json.dumps(
+            {"task": task, "failure": failure}, sort_keys=True,
+        ))
+        projection, projected = _explicit_episode_embedding_projection(body, "failure")
+        title, title_projected = _failure_episode_title(
+            self.memory.redact_text(task)
+        )
         episode_id = self.memory.add_episode(
-            "failure", task[:120], body,
-            {"task_sha256": hashlib.sha256(task.encode()).hexdigest(), "failure_signature": signature},
-            vector=self._embedding(body, deadline), trust=0.4,
+            "failure", title, body,
+            {
+                "task_sha256": hashlib.sha256(task.encode("utf-8")).hexdigest(),
+                "failure_signature": signature,
+                "canonical_source": "episode.body",
+                "canonical_body_characters": len(body),
+                "canonical_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                "embedding_projection": projected,
+                "embedding_projection_characters": len(projection),
+                "title_projection": title_projected,
+                "full_task_source": "episode.body.task",
+                "full_failure_source": "episode.body.failure",
+            },
+            vector=self._embedding(projection, deadline), trust=0.4,
         )
         rows = self.memory.connection.execute(
             "SELECT metadata_json FROM episodes WHERE namespace='failure' ORDER BY created_at DESC LIMIT 200"
@@ -4053,11 +4127,40 @@ class HarnessApplication:
         deadline: WorkflowDeadline | None = None,
         verify_scope: Callable[[], None] | None = None,
     ) -> str:
-        body = json.dumps({"plan": plan, "result": result, "summary": candidate.get("summary", "")}, sort_keys=True)[:20_000]
-        vector = self._embedding(body, deadline)
+        # The episode body is canonical operational memory, not a display
+        # excerpt. Keep the complete credential-redacted record. Only the
+        # optional embedding input is projected, with an explicit marker and
+        # metadata that points back to the full body in this same episode.
+        body = json.dumps(
+            {"plan": plan, "result": result, "summary": candidate.get("summary", "")},
+            sort_keys=True,
+        )
+        body = self.memory.redact_text(body)
+        projection, projected = _explicit_success_embedding_projection(body)
+        run_id = str(result["run_id"])
+        title, title_projected = _success_episode_title(
+            self.memory.redact_text(task), run_id
+        )
+        vector = self._embedding(projection, deadline)
         if verify_scope is not None:
             verify_scope()
-        return self.memory.add_episode("success", task[:120], body, {"run_id": result["run_id"]}, vector=vector, trust=0.8)
+        return self.memory.add_episode(
+            "success",
+            title,
+            body,
+            {
+                "run_id": run_id,
+                "canonical_source": "episode.body",
+                "canonical_body_characters": len(body),
+                "canonical_body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                "embedding_projection": projected,
+                "embedding_projection_characters": len(projection),
+                "title_projection": title_projected,
+                "full_task_source": f"run:{run_id}.task",
+            },
+            vector=vector,
+            trust=0.8,
+        )
 
     def _embedding(self, text: str, deadline: WorkflowDeadline | None = None) -> list[float] | None:
         if not self.config.get("memory.enabled") or not self.config.get("memory.embedding_model"):

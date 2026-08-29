@@ -10,7 +10,7 @@ import unittest
 from importlib.resources import files
 from pathlib import Path
 
-from our_harness.config import DEFAULT_CONFIG, LoadedConfig
+from our_harness.config import DEFAULT_CONFIG, LoadedConfig, SYSTEM_PROMPT_MAX_CHARACTERS
 from our_harness.cooperation import CooperativeScheduler
 from our_harness.graphs import migrate_graph, uses_cooperative_execution, validate_graph
 from our_harness.memory import MemoryStore
@@ -94,6 +94,36 @@ def repair_graph() -> dict:
 
 
 class GraphV2Tests(unittest.TestCase):
+    def test_graph_and_provider_configuration_share_one_prompt_limit(self) -> None:
+        from our_harness.graphs import GRAPH_MAX_PROMPT_CHARS
+        from our_harness.team import MOST_PROMPT_LETTERS
+
+        self.assertEqual(
+            {GRAPH_MAX_PROMPT_CHARS, MOST_PROMPT_LETTERS, SYSTEM_PROMPT_MAX_CHARACTERS},
+            {100_000},
+        )
+
+    def test_system_prompts_beyond_the_old_hidden_limit_are_kept_exactly(self) -> None:
+        graph = cooperative_graph()
+        prompt = "  " + ("plan carefully 🧭\n" * 3_000) + "  "
+        self.assertGreater(len(prompt), 32_000)
+        graph["nodes"][1]["config"]["system_prompt"] = prompt
+        self.assertEqual(validate_graph(graph), [])
+        self.assertEqual(graph["nodes"][1]["config"]["system_prompt"], prompt)
+
+    def test_system_prompt_over_disclosed_limit_is_rejected_without_mutation(self) -> None:
+        graph = cooperative_graph()
+        prompt = "x" * 100_001
+        graph["nodes"][1]["config"]["system_prompt"] = prompt
+        issues = validate_graph(graph)
+        self.assertTrue(any(
+            "100,001" in issue.message
+            and "100,000" in issue.message
+            and "did not truncate" in issue.message
+            for issue in issues
+        ), issues)
+        self.assertEqual(graph["nodes"][1]["config"]["system_prompt"], prompt)
+
     def test_v1_migration_is_detached_and_typed(self) -> None:
         source = {"schema_version": 1, "entry": "agent", "nodes": [{"id": "agent", "type": "planner", "label": "Plan"}], "edges": []}
         migrated = migrate_graph(source)
@@ -396,6 +426,26 @@ class Phase9ReadAPITests(unittest.TestCase):
 
 
 class Phase9StaticUITests(unittest.TestCase):
+    def test_system_prompt_editors_disclose_one_lossless_limit(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src" / "our_harness" / "ui"
+        html = (root / "index.html").read_text(encoding="utf-8")
+        script = (root / "app.js").read_text(encoding="utf-8")
+        for field, count in (
+            ("nodePrompt", "nodePromptCount"),
+            ("agentPrompt", "agentPromptCount"),
+            ("teamCustomPrompt", "teamCustomPromptCount"),
+        ):
+            start = html.index(f'<textarea id="{field}"')
+            tag = html[start:html.index(">", start)]
+            self.assertNotIn("maxlength", tag)
+            self.assertIn(f'aria-describedby="{count}"', tag)
+            self.assertIn(f'id="{count}"', html)
+        self.assertIn("const SYSTEM_PROMPT_CHARACTER_LIMIT = 100000", script)
+        self.assertIn("Nothing was clipped", script)
+        self.assertIn("Nexus did not truncate it", script)
+        self.assertIn("system_prompt: one.prompt,", script)
+        self.assertNotIn("system_prompt: one.prompt.trim()", script)
+
     def test_phase9_controls_and_accessibility_contract_exist(self) -> None:
         root = Path(__file__).resolve().parents[1] / "src" / "our_harness" / "ui"
         html = (root / "index.html").read_text(encoding="utf-8")

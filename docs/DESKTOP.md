@@ -9,7 +9,7 @@ it to use the harness.
 
 ## Installing the released app
 
-Stable Windows releases contain a signed versioned per-user NSIS installer, a
+Stable Windows releases contain a versioned per-user NSIS installer, a
 private Python 3.11 runtime with exact locked dependencies, and a matching
 SHA-256 file. They are built and smoke-tested on a clean GitHub-hosted Windows
 runner. Use the release page directly, or double-click
@@ -17,13 +17,27 @@ runner. Use the release page directly, or double-click
 release automatically without system Python. The installer creates desktop
 and Start menu shortcuts.
 
+When an Authenticode publisher is configured, both CI and the bootstrap require
+that exact valid signer. Until then, the published asset is visibly named
+`*-UNSIGNED.exe`; CI verifies it is actually unsigned, and the bootstrap
+requires its published SHA-256 and declared unsigned mode before running it.
+Windows may show an unknown-publisher warning. Untagged local/development
+builds remain `*-UNSIGNED-DEV.exe` and are not accepted as public releases.
+
+While the repository is private, the bootstrap reuses an existing GitHub CLI
+or non-interactive Git Credential Manager login, or a process-scoped
+`GH_TOKEN`. It never prints or stores the token. A machine with no GitHub login
+must download the installer and checksum through a signed-in browser. Truly
+anonymous installation requires a public repository or separate public
+distribution repository.
+
 Only use `python scripts/put_it_on_your_desktop.py` when developing from a
 checkout. Its source fallback is intentionally described as a development
 window, not as an installed Electron release.
 
 ## What source development needs first
 
-- Python 3.11 or newer, with the harness installed for it (`python -m pip install .`)
+- Python 3.11 or newer, with the harness and test runner installed for it (`python -m pip install ".[test]"`)
 - Node.js 18 or newer, to build or run the window
 
 ## Run it from source
@@ -71,7 +85,7 @@ a different Python.
 
 Python below 3.11 is rejected before Nexus imports the application. If an
 installed build reports a missing `resources/runtime/python.exe`, that package
-is incomplete: reinstall the same signed release rather than installing a
+is incomplete: reinstall the same checksummed release rather than installing a
 system Python.
 
 ## What it does at start

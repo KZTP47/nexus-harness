@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from .models import HarnessError
-from .safety import put_this_file_in_place, read_this_file_patiently
+from .safety import confined_path, put_this_file_in_place, read_this_file_patiently
+
+
+SYSTEM_PROMPT_MAX_CHARACTERS = 100_000
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -132,6 +135,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_iterations": 4,
         "max_elapsed_seconds": 1800,
         "repeat_failure_limit": 2,
+        # Long-horizon project work has no aggregate context-tool clock unless
+        # the user deliberately sets one. Individual commands and remote MCP
+        # calls still retain their own bounded timeouts.
+        "context_tool_execution_seconds": 0,
         "max_tool_calls": 48,
         "max_tool_output_bytes": 32_000,
         "max_tool_total_bytes": 512_000,
@@ -185,6 +192,7 @@ RESOURCE_LIMIT_MAXIMA: dict[str, int] = {
     "workflow.max_iterations": 100,
     "workflow.max_elapsed_seconds": 86_400,
     "workflow.repeat_failure_limit": 100,
+    "workflow.context_tool_execution_seconds": 86_400,
     "workflow.max_tool_calls": 100,
     "workflow.max_tool_output_bytes": 2_000_000,
     "workflow.max_tool_total_bytes": 20_000_000,
@@ -208,7 +216,13 @@ SHARED_NON_ESCALATING_LIMITS = frozenset(
     for key in RESOURCE_LIMIT_MAXIMA
     # Reviewer cardinality is a declared workflow shape, not a caller-sized
     # byte/deadline/tool budget. It remains subject to the global hard cap.
-    if key not in {"workflow.reviewers", "workflow.review_parallelism"}
+    if key not in {
+        "workflow.reviewers", "workflow.review_parallelism",
+        # Zero means unlimited for this one setting. Its shareable-layer
+        # tightening rule therefore needs semantic comparison below rather
+        # than the ordinary numeric `new <= inherited` comparison.
+        "workflow.context_tool_execution_seconds",
+    }
 )
 
 
@@ -652,6 +666,23 @@ def _validate_capability_provenance(
         section, key = dotted.split(".", 1)
         if data[section][key] > trusted_floor[section][key]:
             raise HarnessError(f"{dotted} cannot raise the trusted limit from shareable project config")
+    tool_seconds = data["workflow"]["context_tool_execution_seconds"]
+    inherited_tool_seconds = trusted_floor["workflow"][
+        "context_tool_execution_seconds"
+    ]
+    if (
+        project_controls("workflow.context_tool_execution_seconds")
+        and isinstance(tool_seconds, int)
+        and not isinstance(tool_seconds, bool)
+        and isinstance(inherited_tool_seconds, int)
+        and not isinstance(inherited_tool_seconds, bool)
+        and inherited_tool_seconds != 0
+        and (tool_seconds == 0 or tool_seconds > inherited_tool_seconds)
+    ):
+        raise HarnessError(
+            "workflow.context_tool_execution_seconds cannot raise or remove the "
+            "trusted context-tool execution limit from shareable project config"
+        )
 
     _validate_embedding_route(data, provenance, shared_source, trusted_floor)
 
@@ -1010,8 +1041,12 @@ def validate_config(data: dict[str, Any]) -> None:
             raise HarnessError(f"{dotted}.role must be at most 64 characters")
         _require_string(agent.get("model", ""), f"{dotted}.model")
         prompt = _require_string(agent.get("system_prompt", ""), f"{dotted}.system_prompt")
-        if len(prompt) > 100_000:
-            raise HarnessError(f"{dotted}.system_prompt must be at most 100000 characters")
+        if len(prompt) > SYSTEM_PROMPT_MAX_CHARACTERS:
+            raise HarnessError(
+                f"{dotted}.system_prompt is {len(prompt):,} characters; the disclosed "
+                f"limit is {SYSTEM_PROMPT_MAX_CHARACTERS:,}. Nexus did not truncate it. "
+                f"Shorten it by {len(prompt) - SYSTEM_PROMPT_MAX_CHARACTERS:,} characters."
+            )
         capabilities = _require_string_list(agent.get("capabilities", []), f"{dotted}.capabilities")
         if any(not re.fullmatch(r"[a-z][a-z0-9_.:-]{0,63}", item) for item in capabilities):
             raise HarnessError(f"{dotted}.capabilities entries must use lower-case capability names")
@@ -1182,6 +1217,12 @@ def validate_config(data: dict[str, Any]) -> None:
     _require_int(workflow["max_iterations"], "workflow.max_iterations", 1, RESOURCE_LIMIT_MAXIMA["workflow.max_iterations"])
     _require_int(workflow["max_elapsed_seconds"], "workflow.max_elapsed_seconds", 1, RESOURCE_LIMIT_MAXIMA["workflow.max_elapsed_seconds"])
     _require_int(workflow["repeat_failure_limit"], "workflow.repeat_failure_limit", 1, RESOURCE_LIMIT_MAXIMA["workflow.repeat_failure_limit"])
+    _require_int(
+        workflow["context_tool_execution_seconds"],
+        "workflow.context_tool_execution_seconds",
+        0,
+        RESOURCE_LIMIT_MAXIMA["workflow.context_tool_execution_seconds"],
+    )
     _require_int(workflow["max_tool_calls"], "workflow.max_tool_calls", 1, RESOURCE_LIMIT_MAXIMA["workflow.max_tool_calls"])
     _require_int(workflow["max_tool_output_bytes"], "workflow.max_tool_output_bytes", 1024, RESOURCE_LIMIT_MAXIMA["workflow.max_tool_output_bytes"])
     _require_int(workflow["max_tool_total_bytes"], "workflow.max_tool_total_bytes", 1024, RESOURCE_LIMIT_MAXIMA["workflow.max_tool_total_bytes"])
@@ -1264,14 +1305,27 @@ def validate_config(data: dict[str, Any]) -> None:
 
 def load_config(start: Path | None = None, explicit: Path | None = None, cli_overrides: dict[str, Any] | None = None) -> LoadedConfig:
     root = find_project_root(start)
+    project_config_paths = (
+        confined_path(
+            root, ".harness/config.json", allow_missing=True, allow_control=True,
+        ),
+        confined_path(
+            root, ".harness/config.local.json", allow_missing=True, allow_control=True,
+        ),
+    )
+    if any(path.is_file() for path in project_config_paths):
+        # Existing projects predate newer runtime stores.  Repair their local
+        # privacy boundary during normal startup instead of protecting only
+        # newly initialised projects.
+        ensure_private_runtime_ignores(root)
     data = copy.deepcopy(DEFAULT_CONFIG)
     provenance = {key: "default" for key in _flatten_keys(data)}
-    paths = [user_config_path(), root / ".harness" / "config.json", root / ".harness" / "config.local.json"]
+    paths = [user_config_path(), *project_config_paths]
     if explicit:
         paths.append(explicit.resolve())
     sources: list[Path] = []
-    shared_project_path = (root / ".harness" / "config.json").resolve()
-    local_project_path = (root / ".harness" / "config.local.json").resolve()
+    shared_project_path = project_config_paths[0].resolve()
+    local_project_path = project_config_paths[1].resolve()
     trusted_local = is_project_local_config_trusted(root, local_project_path) or (
         explicit is not None and explicit.resolve() == local_project_path
     )
@@ -1338,6 +1392,105 @@ def _flatten_keys(value: dict[str, Any], prefix: str = "") -> list[str]:
     return output
 
 
+# Project definitions deliberately live in ``.harness`` so they can travel with
+# a repository.  Runtime state in that same folder can contain prompts, model
+# replies, local paths, test output, recovery copies, and evidence.  Keep the
+# complete local-only contract in one place so ``harness init`` cannot quietly
+# fall behind a new runtime writer.
+#
+# Deliberately *not* ignored here: config.json, project.json, QA suites,
+# workflows, environments and baselines, saved pipeline definitions, timer
+# definitions, notification definitions, and saved cooperative workflows.
+PROJECT_RUNTIME_IGNORE_LINES: tuple[str, ...] = (
+    "config.local.json",
+    "project-authority.json",
+    "memory/",
+    "runs/",
+    "backups/",
+    "checkpoints/",
+    "cache/",
+    "runtime/",
+    "bundles/",
+    "chats/",
+    "pages/",
+    "vault/",
+    "swarm-mutation-sagas/",
+    "transaction.lock",
+    "desktop-deployment.lock",
+    "desktop-deployment.owner.json",
+    "qa/runs/",
+    "qa/tmp/",
+    "qa/history.json",
+    "qa/candidates.json",
+    "qa/pipeline-preservation.lock",
+    "qa/pipelines-before-checks/",
+    # Reports contain command output and machine-local paths.  A user can still
+    # deliberately version one with ``git add -f``; privacy is the safe default.
+    "qa/*report*.json",
+    "pipelines/last-run.json",
+    "pipelines/evidence/",
+    "pipelines/drafts/",
+    "timers/.what-happened.json",
+    "timers/what-happened.json",
+    "timers/.what-happened.json.could-not-be-read",
+    "timers/running.lock",
+    # Atomic writers use these suffixes.  A killed process must not leave a
+    # prompt/configuration fragment ready for an accidental commit.
+    "*.part",
+    "*.tmp",
+)
+PROJECT_RUNTIME_IGNORE_HEADER = "# Nexus private runtime state (managed; keep last)"
+PROJECT_RUNTIME_IGNORE_FOOTER = "# End Nexus private runtime state"
+
+
+def _private_runtime_ignore_block() -> str:
+    return "\n".join((
+        PROJECT_RUNTIME_IGNORE_HEADER,
+        *PROJECT_RUNTIME_IGNORE_LINES,
+        PROJECT_RUNTIME_IGNORE_FOOTER,
+    )) + "\n"
+
+
+def ensure_private_runtime_ignores(root: Path) -> Path:
+    """Append any missing runtime privacy rules without rewriting user rules.
+
+    This is intentionally idempotent and append-only.  It preserves comments
+    and unrelated custom entries, never unignores anything, and ensures a stale
+    exact negation cannot leave a newly private runtime path exposed.
+    """
+
+    # Resolve and validate the complete control path *before* creating a
+    # directory or reading a byte.  A cloned project may contain a symlink,
+    # junction, or other reparse point named .harness or .gitignore; normal
+    # startup must never turn that into authority to read/write elsewhere.
+    local_ignore = confined_path(
+        root, ".harness/.gitignore", allow_missing=True, allow_control=True,
+    )
+    folder = local_ignore.parent
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        existing_ignore = (
+            local_ignore.read_text(encoding="utf-8") if local_ignore.exists() else ""
+        )
+    except (OSError, UnicodeError) as exc:
+        raise HarnessError(
+            f"Cannot verify the private runtime ignore rules in {local_ignore}: {exc}"
+        ) from exc
+    managed = _private_runtime_ignore_block()
+    # Keeping the full managed block last makes every privacy rule later than
+    # arbitrary pre-existing negations, including wildcard negations that an
+    # exact-line parser cannot safely interpret.  If somebody later appends a
+    # custom rule, startup appends one fresh managed block once; unchanged
+    # projects are byte-for-byte idempotent.
+    if not existing_ignore.rstrip("\r\n").endswith(managed.rstrip("\r\n")):
+        updated_ignore = existing_ignore
+        if updated_ignore and not updated_ignore.endswith("\n"):
+            updated_ignore += "\n"
+        updated_ignore += managed
+        put_this_file_in_place(local_ignore, updated_ignore)
+    return local_ignore
+
+
 def write_default_project_config(
     root: Path,
     provider: str,
@@ -1348,7 +1501,9 @@ def write_default_project_config(
     lint_commands: list[list[str]] | None = None,
     build_commands: list[list[str]] | None = None,
 ) -> Path:
-    folder = root / ".harness"
+    folder = confined_path(
+        root, ".harness", allow_missing=True, allow_control=True,
+    )
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "config.json"
     if path.exists():
@@ -1356,21 +1511,9 @@ def write_default_project_config(
     local_path = folder / "config.local.json"
     if local_path.exists():
         raise HarnessError(f"Local config already exists: {local_path}")
-    local_ignore = folder / ".gitignore"
-    # Shared: config.json and the check suites. Ignored: everything a run writes.
-    ignore_lines = [
-        "config.local.json", "project-authority.json", "memory/", "runs/", "backups/", "checkpoints/", "cache/",
-        "qa/runs/", "qa/tmp/", "qa/history.json", "qa/candidates.json",
-    ]
-    existing_ignore = local_ignore.read_text(encoding="utf-8") if local_ignore.exists() else ""
-    existing_entries = {line.strip() for line in existing_ignore.splitlines()}
-    missing_entries = [line for line in ignore_lines if line not in existing_entries]
-    if missing_entries:
-        updated_ignore = existing_ignore
-        if updated_ignore and not updated_ignore.endswith("\n"):
-            updated_ignore += "\n"
-        updated_ignore += "\n".join(missing_entries) + "\n"
-        put_this_file_in_place(local_ignore, updated_ignore)
+    # Shared definitions stay trackable; private and transient runtime state
+    # uses the exhaustive contract above.
+    ensure_private_runtime_ignores(root)
     selected = copy.deepcopy(DEFAULT_CONFIG)
     provider_requires_trust = provider in CREDENTIAL_PROVIDER_NAMES or provider == "local" or not _is_loopback_endpoint(endpoint)
     if not provider_requires_trust:

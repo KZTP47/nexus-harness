@@ -406,7 +406,7 @@ class PairScopedChatsTests(unittest.TestCase):
 
         class Provider:
             def complete(self, _request):
-                return ProviderResponse(text="A labelled answer")
+                return ProviderResponse(text="A labelled answer", finish_reason="stop")
 
         with mock.patch.object(chat, "create_provider", return_value=Provider()):
             chat.say(

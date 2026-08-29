@@ -95,6 +95,12 @@ LONG_HORIZON_CONTEXT_POLICY: dict[str, Any] = {
     "newer_turns": "newest_complete_turns",
     "overflow_policy": "summarize_semantics_without_mid_turn_clipping",
 }
+# A turn can itself be much larger than a provider's useful context. Canonical
+# JSON keeps every turn; provider history is a disclosed projection of newest
+# complete turns and never slices the middle out of one.
+CHAT_HISTORY_PROMPT_CHARACTERS = int(
+    LONG_HORIZON_CONTEXT_POLICY["prompt_transcript_characters"]
+)
 LONGEST_WAIT_SECONDS = 600.0
 # Non-interactive CLI adapters use this as their minimum capture budget.  The
 # execution command limit is a different concern and used to truncate provider
@@ -904,12 +910,16 @@ def read_it(config: LoadedConfig, route: str, filed_as: str = "") -> list[Said]:
             return []
         try:
             held = json.loads(where.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            # A legacy projection is recreatable. A damaged canonical JSONL,
-            # by contrast, fails closed in _read_transcript_event_records.
-            return []
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ChatError(
+                f"The saved conversation at {where} cannot be read. Nexus preserved "
+                "it and did not pretend the chat was empty."
+            ) from exc
         if not isinstance(held, list):
-            return []
+            raise ChatError(
+                f"The saved conversation at {where} has an invalid legacy format. "
+                "Nexus preserved it and did not migrate a partial chat."
+            )
         kept = _said_from_dicts(held)
         # First read migrates the legacy snapshot while still holding the same
         # authority as an append.
@@ -921,24 +931,43 @@ def read_it(config: LoadedConfig, route: str, filed_as: str = "") -> list[Said]:
 
 
 def _said_from_dicts(held: object) -> list[Said]:
+    if not isinstance(held, list):
+        raise ChatError(
+            "A saved conversation event is not a turn list. Nexus did not skip it."
+        )
     kept: list[Said] = []
-    for one in held if isinstance(held, list) else []:
+    for index, one in enumerate(held):
         if not isinstance(one, dict):
-            continue
+            raise ChatError(
+                f"Saved conversation turn {index + 1} is malformed. Nexus did not "
+                "drop it or migrate the remaining turns."
+            )
         who = str(one.get("who") or "")
         text = str(one.get("text") or "")
         if who not in ("you", "them") or not text:
-            continue
+            raise ChatError(
+                f"Saved conversation turn {index + 1} has no valid speaker/text. "
+                "Nexus did not drop it or migrate a partial chat."
+            )
+        attachments = one.get("attachments", [])
+        if not isinstance(attachments, list) or any(
+            not isinstance(item, dict) for item in attachments
+        ):
+            raise ChatError(
+                f"Saved conversation turn {index + 1} has malformed attachments. "
+                "Nexus did not drop them."
+            )
+        try:
+            milliseconds = int(one.get("milliseconds") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ChatError(
+                f"Saved conversation turn {index + 1} has invalid timing metadata. "
+                "Nexus did not skip it."
+            ) from exc
         kept.append(Said(
-            who=who,
-            text=text,
-            at=str(one.get("at") or ""),
-            milliseconds=int(one.get("milliseconds") or 0),
-            model=str(one.get("model") or ""),
-            attachments=[
-                dict(item) for item in one.get("attachments", [])
-                if isinstance(item, dict)
-            ] if isinstance(one.get("attachments"), list) else [],
+            who=who, text=text, at=str(one.get("at") or ""),
+            milliseconds=milliseconds, model=str(one.get("model") or ""),
+            attachments=[dict(item) for item in attachments],
             speaker_id=str(one.get("speaker_id") or "")[:120],
             speaker_name=str(one.get("speaker_name") or "")[:240],
             speaker_route=str(one.get("speaker_route") or "")[:120],
@@ -1004,8 +1033,11 @@ def _read_transcript_event_records(path: Path) -> list[dict[str, Any]]:
     previous = ""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ChatError(
+            f"The append-only conversation record at {path} cannot be read. "
+            "Nexus did not pretend it was empty."
+        ) from exc
     for line in lines:
         try:
             event = json.loads(line)
@@ -1036,14 +1068,30 @@ def _read_transcript_event_records(path: Path) -> list[dict[str, Any]]:
         if (
             value["schema_version"] != 1
             or value["transcript"] != expected_identity
-            or value["count"] != len(records)
-            or value["head"] != (str(records[-1].get("integrity_mac") or "") if records else "")
+            or not isinstance(value["count"], int)
+            or value["count"] < 0
+            or value["count"] > len(records)
             or not compare("conversation-transcript-anchor-v1", value, anchor.get("integrity_mac"))
         ):
             _transcript_integrity_failure(path, "The transcript no longer matches its external anchor.")
         for event in records:
             if event.get("integrity_mac") != _transcript_event_integrity(event):
                 _transcript_integrity_failure(path, f"Transcript event {event.get('seq')} was rewritten.")
+        anchored_count = int(value["count"])
+        anchored_head = (
+            str(records[anchored_count - 1].get("integrity_mac") or "")
+            if anchored_count else ""
+        )
+        if value["head"] != anchored_head:
+            _transcript_integrity_failure(
+                path, "The transcript prefix no longer matches its external anchor."
+            )
+        if anchored_count < len(records):
+            # A valid keyed suffix with the old prefix anchor is the one safe
+            # crash state: append+fsync succeeded and the separate anchor move
+            # did not. Advance only after every suffix event and chain link has
+            # verified; rollback/rewrite still fails above.
+            _write_transcript_anchor(path, records)
     elif records:
         # One-time migration of a valid legacy public hash chain. Once the
         # external anchor exists, missing keyed fields are corruption and this
@@ -1236,8 +1284,8 @@ def remove_conversation(config: LoadedConfig, route: str, filed_as: str = "") ->
 
 
 def _check_what_was_typed(text: str) -> str:
-    said = str(text or "").strip()
-    if not said:
+    said = str(text or "")
+    if not said.strip():
         raise ChatError("Type something first.")
     if len(said) > MOST_LETTERS:
         raise ChatError(
@@ -1325,6 +1373,8 @@ def effective_limits(
         ),
         "output_token_control": token_control,
         "history_turns": MOST_KEPT,
+        "history_prompt_characters": CHAT_HISTORY_PROMPT_CHARACTERS,
+        "history_overflow_policy": "newest_complete_turns_with_canonical_reference",
         "attachments": {
             "count": MOST_ATTACHMENTS,
             "each_bytes": MOST_ATTACHMENT_BYTES,
@@ -1444,8 +1494,8 @@ def _complete_with_one_schema_repair(
 
 
 def _checked_answer(text: str, who: str = "The assistant") -> str:
-    held = str(text or "").strip()
-    if not held:
+    held = str(text or "")
+    if not held.strip():
         raise ChatError(f"{who} answered with nothing at all.")
     if len(held) > LONGEST_ANSWER:
         raise ChatError(
@@ -1536,6 +1586,47 @@ def say(
         )
 
 
+def _project_chat_history(
+    eligible: list[Any], *, speaker: Any, filed_as: str, route: str
+) -> list[dict[str, str]]:
+    """Newest complete canonical turns within the disclosed character budget."""
+
+    candidates = eligible[-MOST_KEPT:]
+    selected: list[Any] = []
+    used = 0
+    for one in reversed(candidates):
+        text = (
+            f"{one.speaker_name}: {one.text}"
+            if speaker and one.who == "them" and one.speaker_name else one.text
+        )
+        needed = len(text)
+        if needed > CHAT_HISTORY_PROMPT_CHARACTERS or used + needed > CHAT_HISTORY_PROMPT_CHARACTERS:
+            continue
+        selected.append((one, text))
+        used += needed
+    selected.reverse()
+    selected_ids = {id(one) for one, _text in selected}
+    omitted = [one for one in eligible if id(one) not in selected_ids]
+    messages: list[dict[str, str]] = []
+    if omitted:
+        omitted_characters = sum(len(str(one.text or "")) for one in omitted)
+        canonical = f"{WHERE_THEY_LIVE}/{_filed_under(filed_as or route)}.json"
+        messages.append({
+            "role": "user",
+            "content": (
+                "NEXUS CHAT-HISTORY PROJECTION — canonical conversation was not "
+                f"changed. {len(omitted)} complete earlier turn(s), "
+                f"{omitted_characters:,} characters, are omitted from this provider "
+                f"request only. Full Nexus history: {canonical}. No turn was sliced."
+            ),
+        })
+    messages.extend({
+        "role": "user" if one.who == "you" else "assistant",
+        "content": text,
+    } for one, text in selected)
+    return messages
+
+
 def _ask_and_keep(
     config,
     route,
@@ -1564,16 +1655,9 @@ def _ask_and_keep(
             "agent_verification",
         }
     ]
-    messages = [
-        {
-            "role": "user" if one.who == "you" else "assistant",
-            "content": (
-                f"{one.speaker_name}: {one.text}"
-                if speaker and one.who == "them" and one.speaker_name else one.text
-            ),
-        }
-        for one in eligible[-MOST_KEPT:]
-    ]
+    messages = _project_chat_history(
+        eligible, speaker=speaker, filed_as=filed_as, route=route
+    )
     messages.append({"role": "user", "content": redactor.text(asked)})
     # Built here rather than passed in, so everything that goes to an assistant
     # is built in the one place.

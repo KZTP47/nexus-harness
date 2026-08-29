@@ -369,6 +369,12 @@
           "minimum": 1,
           "maximum": 100
         },
+        "context_tool_execution_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 86400,
+          "description": "Aggregate seconds spent inside long-horizon context tools. Zero means unlimited; individual tool subprocess timeouts still apply."
+        },
         "max_tool_calls": {
           "type": "integer",
           "minimum": 1,

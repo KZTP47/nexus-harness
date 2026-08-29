@@ -42,6 +42,12 @@ _BUILT_BY_CLASS = re.compile(r'make\("button",\s*"([a-z][a-z -]*)"\)')
 # A control that is deliberately not pressed, and why. Nothing may sit here
 # without a real sentence.
 ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
+    "authorityRepairButton": (
+        "This deliberately replaces the selected project's local authority descriptor "
+        "and registry binding after an exact confirmation. Browser QA runs against the "
+        "real checkout and must not re-register it; the repair endpoint, rollback, race, "
+        "and UI wiring are exercised against isolated temporary projects in the authority tests."
+    ),
     "pipelineImport": (
         "This opens the operating system file picker. Browser QA cannot choose a "
         "portable user file safely; pipeline server, UI contract, and real Electron "
@@ -271,6 +277,13 @@ class WrittenButtonTests(unittest.TestCase):
 # The same thing for the buttons the panel builds while it runs, keyed by the
 # words on them rather than by a name in the page.
 BUILT_ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
+    "Load 20 older parts": (
+        "This appears only after a shared page contains more than twenty durable "
+        "parts. The bounded latest/older HTTP windows and the button's exact click "
+        "handler are exercised against isolated pages in the board and page tests; "
+        "making the release browser workflow manufacture twenty-one model turns "
+        "would add minutes and external-account dependence without more UI coverage."
+    ),
     "Export": (
         "This per-board action opens a native Save dialog or leaves a browser download. "
         "Browser QA must not write arbitrary user files; board API, UI contract, and "

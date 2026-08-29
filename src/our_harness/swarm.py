@@ -43,6 +43,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -64,8 +65,12 @@ MOST_NOTES = 200
 LONGEST_NOTE = 4000
 
 LONGEST_NAME = 60
-LONGEST_JOB = 300
-LONGEST_TASK = 300
+# A role description can contain real operating instructions, and a project
+# task is the long-horizon goal itself.  These are deliberately aligned with
+# the disclosed system-prompt and main-input boundaries.  The board reader
+# rejects anything larger; it never slices a saved or pasted instruction.
+LONGEST_JOB = 100_000
+LONGEST_TASK = 200_000
 
 # A name for an agent, which is also the name its conversation is filed under.
 # Letters, numbers, spaces, dashes and underscores: the same shape the chat
@@ -158,6 +163,11 @@ class OneProject:
     path: str
     tasks: list[str] = field(default_factory=list)
     at: dict[str, int] = field(default_factory=lambda: {"x": 40, "y": 320})
+    # Approval is deliberately attached to one exact project box. The digest
+    # also binds the canonical/declared path, discovered argv, and discovery
+    # files; swarm_work recomputes it immediately before any project code can
+    # run. An empty value is the fail-closed/default state for older boards.
+    approved_test_command_digest: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         from . import projects as projects_lab
@@ -170,6 +180,7 @@ class OneProject:
             "is_there": where.is_dir(),
             "tasks": list(self.tasks),
             "at": dict(self.at),
+            "approved_test_command_digest": self.approved_test_command_digest,
         }
 
 
@@ -223,7 +234,18 @@ def filed_as_on_the_board(name: str) -> str:
     never to them.
     """
 
-    return f"{name} on the board"
+    plain = " ".join(str(name or "").split()) or "an-agent"
+    suffix = " on the board"
+    if len(plain) + len(suffix) <= LONGEST_NAME:
+        return plain + suffix
+    # Preserve the namespace marker and the identity-bearing tail. Merely
+    # appending the suffix and then passing through filed_as() removed the
+    # suffix for a 60-character agent name, merging board-run traffic into the
+    # person's private chat. The digest also prevents two long names with the
+    # same visible prefix from sharing a board conversation.
+    marker = "~" + hashlib.sha256(plain.encode("utf-8")).hexdigest()[:12]
+    prefix = plain[:LONGEST_NAME - len(marker) - len(suffix)]
+    return prefix + marker + suffix
 
 
 def filed_as(name: str) -> str:
@@ -335,6 +357,30 @@ def _some_words(said: Any, longest: int) -> str:
     return " ".join(str(said or "").split())[:longest]
 
 
+def _bounded_words(said: Any, longest: int, what: str) -> str:
+    """Normalise a short identifier without silently cutting it."""
+
+    words = " ".join(str(said or "").split())
+    if len(words) > longest:
+        raise SwarmError(
+            f"{what} is {len(words):,} characters; the disclosed limit is "
+            f"{longest:,}. Nexus did not truncate it."
+        )
+    return words
+
+
+def _bounded_instruction(said: Any, longest: int, what: str) -> str:
+    """Keep every accepted instruction character exactly as the user supplied it."""
+
+    text = "" if said is None else str(said)
+    if len(text) > longest:
+        raise SwarmError(
+            f"{what} is {len(text):,} characters; the disclosed limit is "
+            f"{longest:,}. Nexus did not truncate it."
+        )
+    return text if text.strip() else ""
+
+
 def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
     """A board, from whatever was written down or sent.
 
@@ -348,14 +394,36 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
 
     if not isinstance(said, dict):
         raise SwarmError("A board is written as an object")
+    raw_agents_value = said.get("agents", [])
+    raw_projects_value = said.get("projects", [])
+    if not isinstance(raw_agents_value, list) or not all(
+        isinstance(one, dict) for one in raw_agents_value
+    ):
+        raise SwarmError("A board's agents must be a list of objects. Nothing was dropped.")
+    if not isinstance(raw_projects_value, list) or not all(
+        isinstance(one, dict) for one in raw_projects_value
+    ):
+        raise SwarmError("A board's projects must be a list of objects. Nothing was dropped.")
+    raw_agents = list(raw_agents_value)
+    raw_projects = list(raw_projects_value)
+    if len(raw_agents) > MOST_AGENTS:
+        raise SwarmError(
+            f"This board has {len(raw_agents)} agents; the visible limit is "
+            f"{MOST_AGENTS}. Nexus did not drop any agents."
+        )
+    if len(raw_projects) > MOST_PROJECTS:
+        raise SwarmError(
+            f"This board has {len(raw_projects)} projects; the visible limit is "
+            f"{MOST_PROJECTS}. Nexus did not drop any projects."
+        )
     agents: list[Agent] = []
     seen: set[str] = set()
     made_agents = _how_many_ever(
         "agent", said.get("made_agents"), said.get("agents"), made_agents)
     made_projects = _how_many_ever(
         "project", said.get("made_projects"), said.get("projects"), made_projects)
-    for one in _a_list(said.get("agents"))[:MOST_AGENTS]:
-        name = _some_words(one.get("name"), LONGEST_NAME)
+    for one in raw_agents:
+        name = _bounded_words(one.get("name"), LONGEST_NAME, "An agent name")
         if not name:
             raise SwarmError("Every agent needs a name")
         if not A_NAME.match(name):
@@ -364,7 +432,9 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
                 "numbers, spaces, dots, dashes and underscores."
             )
         held_filed_as = filed_as(
-            _some_words(one.get("filed_as"), LONGEST_NAME) or name
+            _bounded_words(
+                one.get("filed_as"), LONGEST_NAME, "A saved chat identity"
+            ) or name
         )
         if held_filed_as.casefold() in {
             (held.filed_as_name or filed_as(held.name)).casefold()
@@ -383,8 +453,10 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
         agents.append(Agent(
             id=held_id,
             name=name,
-            who=_some_words(one.get("who"), 64),
-            job=_some_words(one.get("job"), LONGEST_JOB),
+            who=_bounded_words(one.get("who"), 64, "An assistant route"),
+            job=_bounded_instruction(
+                one.get("job"), LONGEST_JOB, "An agent role description"
+            ),
             at=_a_place(one.get("at"), across, down),
             colour=_agent_colour(one.get("colour"), DEFAULT_AGENT_COLOUR),
             icon=_agent_icon(one.get("icon")),
@@ -401,7 +473,7 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
             filed_as_name=held_filed_as,
         ))
     projects: list[OneProject] = []
-    for one in _a_list(said.get("projects"))[:MOST_PROJECTS]:
+    for one in raw_projects:
         path = str(one.get("path") or "").strip()
         if not path:
             raise SwarmError("Every project on the board needs a folder")
@@ -416,19 +488,43 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
         # Jobs are lines of text, not objects. Read with the helper for lists of
         # objects, every one of them was quietly dropped and the board said the
         # project had nothing to do in it.
-        written = one.get("tasks")
-        written = written if isinstance(written, list) else []
+        written = one.get("tasks", [])
+        if not isinstance(written, list) or not all(
+            isinstance(task, str) for task in written
+        ):
+            raise SwarmError(
+                f"Every job for {path} must be text in a list. Nothing was dropped."
+            )
+        if len(written) > MOST_TASKS:
+            raise SwarmError(
+                f"{path} has {len(written)} jobs; the visible limit is "
+                f"{MOST_TASKS}. Nexus did not drop any jobs."
+            )
+        if any(not task.strip() for task in written):
+            raise SwarmError(
+                f"Every job for {path} must contain non-whitespace text. "
+                "Nothing was dropped."
+            )
         tasks = [
-            _some_words(task, LONGEST_TASK)
-            for task in written[:MOST_TASKS]
-            if isinstance(task, str)
+            _bounded_instruction(
+                task, LONGEST_TASK, f"A job for {path}"
+            )
+            for task in written
         ]
         across, down = _somewhere_free(len(projects), 320)
         projects.append(OneProject(
             id=held_id,
             path=str(where),
-            tasks=[task for task in tasks if task],
+            tasks=tasks,
             at=_a_place(one.get("at"), across, down),
+            approved_test_command_digest=(
+                str(one.get("approved_test_command_digest") or "").lower()
+                if re.fullmatch(
+                    r"[0-9a-fA-F]{64}",
+                    str(one.get("approved_test_command_digest") or ""),
+                )
+                else ""
+            ),
         ))
     known_agents = {one.id for one in agents}
     known_projects = {one.id for one in projects}
@@ -475,20 +571,136 @@ def _a_list(said: Any) -> list[dict[str, Any]]:
     return [one for one in said if isinstance(one, dict)] if isinstance(said, list) else []
 
 
-def load() -> Board:
+_recovering_board_qa = threading.local()
+_board_qa_access_state = threading.local()
+_board_qa_request = threading.local()
+_recovered_board_qa_authorities: set[str] = set()
+_recovered_board_qa_authorities_lock = threading.Lock()
+
+
+def _board_qa_authority() -> str:
+    return os.path.normcase(os.path.abspath(str(where_it_lives())))
+
+
+def _set_board_qa_request_capability(token: str) -> None:
+    """Set the capability validated for this one server request only."""
+
+    _board_qa_request.capability = token if isinstance(token, str) else ""
+
+
+@contextmanager
+def _using_board_qa_request_capability(token: str):
+    """Scope a real QA transaction capability to only this worker thread."""
+
+    previous = str(getattr(_board_qa_request, "capability", "") or "")
+    _set_board_qa_request_capability(token)
     try:
-        said = json.loads(where_it_lives().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        yield
+    finally:
+        _set_board_qa_request_capability(previous)
+
+
+def _recover_abandoned_board_qa() -> None:
+    """Run QA's own recovery before ordinary board reads, without an import loop."""
+
+    if bool(getattr(_recovering_board_qa, "active", False)):
+        return
+    authority = _board_qa_authority()
+    with _recovered_board_qa_authorities_lock:
+        if authority in _recovered_board_qa_authorities:
+            return
+        _recovering_board_qa.active = True
+        try:
+            from . import qa as qa_lab
+
+            recovered = qa_lab.recover_abandoned_board_transactions()
+            if recovered is False:
+                raise SwarmError(
+                    "A board check is in progress, so Nexus will not show or change its "
+                    "temporary or displaced board as your real one. Retry when that check finishes."
+                )
+            _recovered_board_qa_authorities.add(authority)
+        finally:
+            _recovering_board_qa.active = False
+
+
+@contextmanager
+def _board_qa_access():
+    """Hold the nonblocking board-QA isolation lock for one complete operation."""
+
+    if bool(getattr(_board_qa_access_state, "active", False)):
+        yield
+        return
+    from . import qa as qa_lab
+
+    capability = str(getattr(_board_qa_request, "capability", "") or "")
+    if capability:
+        if not qa_lab.board_qa_capability_is_active(capability, where_it_lives()):
+            raise SwarmError(
+                "The board-check transaction capability is no longer valid. "
+                "No board data was read or changed."
+            )
+        _board_qa_access_state.active = True
+        try:
+            yield
+        finally:
+            _board_qa_access_state.active = False
+        return
+
+    _recover_abandoned_board_qa()
+
+    try:
+        with qa_lab._board_preservation_file_lock(  # noqa: SLF001 - shared board authority
+            where_it_lives(), timeout_seconds=0.0,
+        ):
+            _board_qa_access_state.active = True
+            try:
+                yield
+            finally:
+                _board_qa_access_state.active = False
+    except qa_lab.BoardPreservationBusy as exc:
+        raise SwarmError(
+            "A board check is in progress, so Nexus will not show or change its "
+            "temporary or displaced board as your real one. Retry when that check finishes."
+        ) from exc
+
+
+def _requires_board_qa_access(function):
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        with _board_qa_access():
+            return function(*args, **kwargs)
+    return guarded
+
+
+@_requires_board_qa_access
+def load() -> Board:
+    where = where_it_lives()
+    if not where.exists():
         return Board()
+    try:
+        said = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SwarmError(
+            f"The active board at {where} cannot be read. Nexus preserved it and "
+            "did not pretend your agents, projects, or goals were gone."
+        ) from exc
     try:
         return read_it(said)
-    except SwarmError:
-        # One nobody can read is one that starts empty, rather than a panel
-        # that will not open at all.
-        return Board()
+    except SwarmError as exc:
+        raise SwarmError(
+            f"The active board at {where} is invalid. Nexus preserved it and did "
+            "not replace it with an empty board: {exc}"
+        ) from exc
 
 
-def save(said: Any, config: Any) -> Board:
+@_requires_board_qa_access
+def save(
+    said: Any,
+    config: Any,
+    *,
+    allow_command_approval_changes: bool = False,
+) -> Board:
     """Persist a board through the process-wide board authority.
 
     The authority lives outside every project and is shared with durable board
@@ -500,10 +712,19 @@ def save(said: Any, config: Any) -> Board:
     from .swarm_runs import global_board_mutation
 
     with global_board_mutation(config):
-        return _save_while_board_authority_is_held(said, config)
+        return _save_while_board_authority_is_held(
+            said,
+            config,
+            allow_command_approval_changes=allow_command_approval_changes,
+        )
 
 
-def _save_while_board_authority_is_held(said: Any, config: Any) -> Board:
+def _save_while_board_authority_is_held(
+    said: Any,
+    config: Any,
+    *,
+    allow_command_approval_changes: bool = False,
+) -> Board:
     """Write the whole board down, if it is still the board that was read.
 
     A whole board at a time, because it is one small picture and saving it
@@ -534,6 +755,22 @@ def _save_while_board_authority_is_held(said: Any, config: Any) -> Board:
     # something held around both of them the check below proves nothing.
     now = load()
     board = read_it(said, now.made_agents, now.made_projects)
+    if not allow_command_approval_changes:
+        # Execution approval is not ordinary board layout. A caller that can
+        # move boxes or save task text must not be able to smuggle a digest in
+        # through the JSON document and thereby cause project code to run.
+        # Preserve only approval already held by the same local project box at
+        # the exact same path. Only the dedicated, visibly confirmed approval
+        # route and a local named snapshot created after such approval may
+        # change it.
+        approvals = {
+            (one.id, one.path): one.approved_test_command_digest
+            for one in now.projects
+        }
+        for project in board.projects:
+            project.approved_test_command_digest = approvals.get(
+                (project.id, project.path), ""
+            )
     # An older panel knows nothing about the named-board identity. Treat an
     # omitted field as "leave it alone", not "forget it", so one stale window
     # cannot make startup lose the board somebody explicitly opened elsewhere.
@@ -651,6 +888,7 @@ def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -
     from . import chat as chat_lab
     from . import pages as pages_lab
     from . import projects as projects_lab
+    from . import qa as qa_lab
 
     board = load()
     # The one route with no name of its own - "the one this project uses" - is
@@ -720,6 +958,7 @@ def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -
         # so anything that changes the list has the new one in its answer.
         "kept": kept,
         "kept_problems": kept_problems,
+        "board_recovery_notices": qa_lab.retained_board_recovery_notices(),
         "who_can_be_used": can_talk,
         "projects_on_this_machine": [
             one.to_dict() for one in projects_lab.every_one(config.project_root)
@@ -900,6 +1139,8 @@ class OneNote:
     thread_id: str = ""
     status: str = "acknowledged"
     attempts: int = 0
+    original_characters: int = 0
+    projection_source: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -915,6 +1156,8 @@ class OneNote:
             "thread_id": self.thread_id,
             "status": self.status,
             "attempts": self.attempts,
+            "original_characters": self.original_characters or len(self.text),
+            "projection_source": self.projection_source,
         }
 
 
@@ -1089,10 +1332,625 @@ def _messages_for_a_prompt(notes: list[tuple[str, str]]) -> str:
     )
 
 
+def _note_for_the_screen(
+    text: str, *, run_id: str, message_id: str, sender: str, project: str
+) -> tuple[str, int, str]:
+    """Make a visibly recoverable audit projection; never imply it is canonical."""
+
+    complete = str(text or "")
+    source = (
+        f"board run {run_id or '(pending)'}, sender {sender}, project {project}"
+        + (f", durable message {message_id}" if message_id else "")
+    )
+    if len(complete) <= LONGEST_NOTE:
+        return complete, len(complete), source
+    marker = (
+        f"\n\n[Display shortened from {len(complete):,} characters. "
+        f"Full answer: {source}. The exact answer remains in the sender's "
+        "saved board chat and, for a durable handoff, in the exact mailbox until "
+        "acknowledgement. It is on the shared page only when that page write is "
+        "recorded as successful.]"
+    )
+    keep = max(0, LONGEST_NOTE - len(marker))
+    return complete[:keep] + marker, len(complete), source
+
+
 def where_the_mailbox_lives() -> Path:
     """The cross-agent mailbox beside the board it belongs to."""
 
     return where_it_lives().with_name("swarm-mailbox.json")
+
+
+ADVICE_INGEST_CHARS = 100_000
+ADVICE_SUMMARY_CHARS = 30_000
+# Exact source recovery and provider request sizing are deliberately separate.
+# A small, position-stable storage block means appending to a long page changes
+# at most its last block; provider chunks remain large enough to avoid needless
+# network turns.  Obsolete successful-tail blocks are collected below.
+ADVICE_STORAGE_BLOCK_CHARS = 16_384
+ADVICE_STORAGE_MIN_CHARS = 8_192
+ADVICE_STORAGE_MAX_CHARS = 32_768
+ADVICE_STORAGE_ROLLING_WINDOW = 64
+ADVICE_PROVIDER_CHUNK_MIN_CHARS = 32_768
+ADVICE_PROVIDER_CHUNK_AVG_CHARS = 65_536
+ADVICE_RECEIPTS_TO_KEEP = 128
+ADVICE_CACHE_FILES_TO_KEEP = 4_096
+ADVICE_CACHE_BYTES_TO_KEEP = 256 * 1024 * 1024
+_ADVICE_STORAGE_LOCK = threading.RLock()
+
+_ADVICE_SOURCE_POLICY = (
+    "Read every character in this exact chunk as quoted evidence. Extract all "
+    "requirements, decisions, disagreements, risks, proposed actions, tests, "
+    "and unresolved questions needed for a later final answer. Do not solve a "
+    "different task. Return a dense evidence ledger under 30,000 characters. "
+    "This is a projection; the full source remains canonical."
+)
+_ADVICE_REDUCTION_POLICY = (
+    "Read every character in these ordered evidence ledgers. Preserve every "
+    "requirement, decision, disagreement, risk, proposed action, test, and "
+    "unresolved question needed for the final answer. Return a dense evidence "
+    "ledger under 30,000 characters. Do not silently omit contrary evidence."
+)
+_ADVICE_CONDENSE_POLICY = (
+    "Condense this complete evidence ledger to at most 30,000 characters. Keep "
+    "every requirement, decision, risk, test, disagreement, and open question."
+)
+
+
+def _advice_sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _advice_content_defined_blocks(
+    text: str, *, minimum: int, average: int, maximum: int,
+) -> list[str]:
+    """Bounded rolling blocks that resynchronise after local insertions."""
+
+    if not text:
+        return [""]
+    base = 257
+    word_mask = (1 << 64) - 1
+    boundary_mask = average - 1
+    remove_factor = pow(base, ADVICE_STORAGE_ROLLING_WINDOW, 1 << 64)
+    rolling = 0
+    start = 0
+    blocks: list[str] = []
+    for index, letter in enumerate(text):
+        rolling = ((rolling * base) + ord(letter)) & word_mask
+        if index >= ADVICE_STORAGE_ROLLING_WINDOW:
+            rolling = (
+                rolling
+                - (ord(text[index - ADVICE_STORAGE_ROLLING_WINDOW]) * remove_factor)
+            ) & word_mask
+        size = index + 1 - start
+        if size >= maximum or (
+            size >= minimum and not (rolling & boundary_mask)
+        ):
+            blocks.append(text[start:index + 1])
+            start = index + 1
+    if start < len(text):
+        blocks.append(text[start:])
+    return blocks
+
+
+def _advice_storage_blocks(text: str) -> list[str]:
+    """Small exact recovery blocks, stable across appends and local insertions."""
+
+    return _advice_content_defined_blocks(
+        text, minimum=ADVICE_STORAGE_MIN_CHARS,
+        average=ADVICE_STORAGE_BLOCK_CHARS,
+        maximum=ADVICE_STORAGE_MAX_CHARS,
+    )
+
+
+def _advice_provider_chunks(text: str) -> list[str]:
+    """Large stable provider chunks, each within the disclosed ingest boundary."""
+
+    return _advice_content_defined_blocks(
+        text, minimum=ADVICE_PROVIDER_CHUNK_MIN_CHARS,
+        average=ADVICE_PROVIDER_CHUNK_AVG_CHARS,
+        maximum=ADVICE_INGEST_CHARS,
+    )
+
+
+def _advice_policy_id(kind: str) -> str:
+    policy = _ADVICE_SOURCE_POLICY if kind == "source" else _ADVICE_REDUCTION_POLICY
+    described = json.dumps({
+        "schema_version": 1,
+        "kind": kind,
+        "policy": policy,
+        "condense_policy": _ADVICE_CONDENSE_POLICY,
+        "summary_characters": ADVICE_SUMMARY_CHARS,
+    }, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return _advice_sha(described)
+
+
+def _advice_route_identity(config: Any, chat_lab: Any, route: str) -> dict[str, str]:
+    describe = getattr(chat_lab, "chat_destination", None)
+    if not callable(describe):
+        raise SwarmError(
+            "Nexus cannot resolve the exact provider route/model identity for "
+            "paged-advice caching, so it stopped instead of sharing an ambiguous cache."
+        )
+    try:
+        destination = describe(config, route)
+    except HarnessError as exc:
+        raise SwarmError(
+            "Nexus could not resolve the exact provider route/model identity for "
+            "paged-advice caching, so it stopped instead of sharing an ambiguous cache."
+        ) from exc
+    if (
+        not isinstance(destination, dict)
+        or not str(destination.get("provider_kind") or "")
+        or "model" not in destination
+    ):
+        raise SwarmError(
+            "Nexus received an incomplete provider route/model identity for paged-"
+            "advice caching, so it stopped instead of sharing an ambiguous cache."
+        )
+    return {
+        "route": str(route or ""),
+        "provider_kind": str(destination.get("provider_kind") or ""),
+        "model": str(destination.get("model") or ""),
+    }
+
+
+def _advice_existing_text(path: Path, expected: str, expected_sha: str) -> None:
+    """Verify, never trust or repair, an existing content-addressed block."""
+
+    try:
+        held = path.read_text(encoding="utf-8", errors="strict")
+    except (OSError, UnicodeError) as exc:
+        raise SwarmError(
+            f"Saved paged-advice block {path} is unreadable as exact UTF-8. "
+            "Nexus stopped before publishing a manifest or receipt."
+        ) from exc
+    actual_sha = _advice_sha(held)
+    if actual_sha != expected_sha or held != expected:
+        raise SwarmError(
+            f"Saved paged-advice block {path} failed its content-addressed "
+            "integrity check. Nexus stopped before publishing a manifest or receipt."
+        )
+
+
+def _advice_store_exact_block(path: Path, expected: str, expected_sha: str) -> None:
+    from .safety import put_this_file_in_place
+
+    if path.exists():
+        _advice_existing_text(path, expected, expected_sha)
+        return
+    put_this_file_in_place(path, expected)
+    # The atomic writer is trusted for publication, but verifying the result also
+    # closes an antivirus/filesystem race before a manifest can refer to it.
+    _advice_existing_text(path, expected, expected_sha)
+
+
+def _advice_cache_key(identity: dict[str, Any]) -> str:
+    exact = json.dumps(
+        identity, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return _advice_sha(exact)
+
+
+def _advice_cached_summary(path: Path, identity: dict[str, Any]) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8", errors="strict")
+        saved = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SwarmError(
+            f"Paged-advice provider cache {path} is unreadable or malformed. "
+            "Nexus did not reuse unverified evidence."
+        ) from exc
+    from .runtime_integrity import compare
+
+    summary = saved.get("summary") if isinstance(saved, dict) else None
+    expected_key = _advice_cache_key(identity)
+    material = {
+        key: value for key, value in saved.items() if key != "integrity_mac"
+    } if isinstance(saved, dict) else {}
+    valid = (
+        isinstance(saved, dict)
+        and saved.get("schema_version") == 1
+        and saved.get("kind") == "paged-advice-provider-summary"
+        and saved.get("cache_key") == expected_key
+        and saved.get("identity") == identity
+        and isinstance(summary, str)
+        and saved.get("summary_characters") == len(summary)
+        and saved.get("summary_sha256") == _advice_sha(summary)
+        and len(summary) <= ADVICE_SUMMARY_CHARS
+        and compare(
+            "paged-advice-provider-summary-v1", material,
+            saved.get("integrity_mac"),
+        )
+    )
+    if not valid:
+        raise SwarmError(
+            f"Paged-advice provider cache {path} failed its exact identity or "
+            "content integrity check. Nexus did not reuse unverified evidence."
+        )
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+    return summary
+
+
+def _advice_save_summary(
+    path: Path, identity: dict[str, Any], summary: str,
+) -> str:
+    """Publish one first-writer-wins provider result, verifying any race winner."""
+
+    from .safety import put_this_file_in_place
+    from .runtime_integrity import mac
+
+    with _ADVICE_STORAGE_LOCK:
+        held = _advice_cached_summary(path, identity)
+        if held is not None:
+            return held
+        saved = {
+            "schema_version": 1,
+            "kind": "paged-advice-provider-summary",
+            "cache_key": _advice_cache_key(identity),
+            "identity": identity,
+            "summary": summary,
+            "summary_characters": len(summary),
+            "summary_sha256": _advice_sha(summary),
+        }
+        saved["integrity_mac"] = mac("paged-advice-provider-summary-v1", saved)
+        put_this_file_in_place(
+            path, json.dumps(saved, ensure_ascii=False, indent=2) + "\n",
+        )
+        return _advice_cached_summary(path, identity) or ""
+
+
+def _advice_reduction_groups(
+    summaries: list[str],
+) -> list[tuple[str, list[str]]]:
+    """Group whole ledgers deterministically without cutting one or using totals."""
+
+    groups: list[tuple[str, list[str]]] = []
+    parts: list[str] = []
+    hashes: list[str] = []
+    for summary in summaries:
+        summary_sha = _advice_sha(summary)
+        part = f"EVIDENCE LEDGER SHA-256 {summary_sha}\n{summary}"
+        proposed = "\n\n".join([*parts, part])
+        if parts and len(proposed) > ADVICE_INGEST_CHARS:
+            groups.append(("\n\n".join(parts), hashes))
+            parts = [part]
+            hashes = [summary_sha]
+        else:
+            parts.append(part)
+            hashes.append(summary_sha)
+    if parts:
+        groups.append(("\n\n".join(parts), hashes))
+    if any(len(context) > ADVICE_INGEST_CHARS for context, _hashes in groups):
+        raise SwarmError(
+            "A complete paged-advice ledger exceeded the disclosed reduction "
+            "boundary. Nexus did not slice or silently omit it."
+        )
+    return groups
+
+
+def _advice_json(path: Path) -> dict[str, Any] | None:
+    try:
+        held = json.loads(path.read_text(encoding="utf-8", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return held if isinstance(held, dict) else None
+
+
+def _advice_prune_provider_cache(folder: Path) -> None:
+    """Bound noncanonical provider projections independently of source records."""
+
+    with _ADVICE_STORAGE_LOCK:
+        cache = folder / "provider-cache"
+        cached = [one for one in cache.glob("*.json") if one.is_file()]
+        cached.sort(key=lambda one: one.stat().st_mtime)
+        total = sum(one.stat().st_size for one in cached)
+        while cached and (
+            len(cached) > ADVICE_CACHE_FILES_TO_KEEP
+            or total > ADVICE_CACHE_BYTES_TO_KEEP
+        ):
+            old = cached.pop(0)
+            try:
+                size = old.stat().st_size
+                old.unlink()
+                total -= size
+            except OSError:
+                pass
+
+
+def _advice_prune_success(folder: Path) -> None:
+    """Bound success-only source projections while preserving active failures."""
+
+    _advice_prune_provider_cache(folder)
+    with _ADVICE_STORAGE_LOCK:
+        completed: list[Path] = []
+        for path in folder.glob("advice-receipt-*.json"):
+            saved = _advice_json(path)
+            if saved is not None and saved.get("status") == "completed":
+                completed.append(path)
+        completed.sort(key=lambda one: one.stat().st_mtime if one.exists() else 0)
+        for old in completed[:-ADVICE_RECEIPTS_TO_KEEP]:
+            try:
+                old.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        # Fail closed on cleanup if any surviving source/receipt is malformed:
+        # leaked disk is preferable to deleting an exact recovery block.
+        referenced: set[str] = set()
+        records = [*folder.glob("advice-active-*.json"), *folder.glob("advice-receipt-*.json")]
+        for record in records:
+            saved = _advice_json(record)
+            if saved is None:
+                return
+            entries = saved.get("chunks", [])
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        referenced.add(str(entry.get("sha256") or ""))
+            for field in ("storage_block_sha256", "chunk_sha256"):
+                values = saved.get(field, [])
+                if isinstance(values, list):
+                    referenced.update(str(one) for one in values)
+        chunks = folder / "chunks"
+        for path in chunks.glob("*.txt"):
+            if path.stem not in referenced:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+
+def _advice_chunks(text: str, limit: int = ADVICE_INGEST_CHARS) -> list[str]:
+    """Every character exactly once, preferring paragraph boundaries."""
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + limit)
+        if end < len(text):
+            boundary = text.rfind("\n\n", start + limit // 2, end)
+            if boundary > start:
+                end = boundary + 2
+        chunks.append(text[start:end])
+        start = end
+    return chunks or [""]
+
+
+def _say_with_paged_advice_context(
+    config: Any, chat_lab: Any, route: str, asking: str, *, filed_under: str,
+    audit_scope: str = "",
+) -> dict[str, Any]:
+    """Process an oversized advice prompt completely, then answer from reductions.
+
+    Advice is optional/non-mutating, but it must not fail merely because several
+    full agent handoffs no longer fit one provider request. Nexus persists the
+    complete redacted source, asks the provider to extract evidence from every
+    exact chunk, recursively reduces those summaries, and records only the final
+    answer in the visible board chat. No input chunk is silently discarded.
+    """
+
+    if len(asking) <= chat_lab.MOST_LETTERS:
+        return chat_lab.say(config, route, asking, filed_as=filed_under)
+
+    from .redaction import CredentialRedactor
+    from .safety import put_this_file_in_place
+
+    complete = CredentialRedactor(config).text(str(asking))
+    digest = _advice_sha(complete)
+    folder = where_it_lives().with_name("swarm-context")
+    folder.mkdir(parents=True, exist_ok=True)
+    # One active manifest per exact run/turn/project. Small exact storage blocks
+    # are independent from the larger provider chunks. A growing append-only
+    # page therefore reuses every settled block, while success-only obsolete tail
+    # blocks and old receipts can be collected without touching active failures.
+    scope = hashlib.sha256(
+        f"{audit_scope or filed_under}\0{route}".encode("utf-8")
+    ).hexdigest()[:24]
+    source = folder / f"advice-active-{scope}.json"
+    audit = folder / f"advice-active-{scope}-summaries.json"
+    receipt = folder / f"advice-receipt-{scope}.json"
+    chunks = _advice_provider_chunks(complete)
+    storage_blocks = _advice_storage_blocks(complete)
+    chunk_folder = folder / "chunks"
+    chunk_folder.mkdir(parents=True, exist_ok=True)
+    chunk_entries: list[dict[str, Any]] = []
+    # Verify every pre-existing hash object before publishing either manifest or
+    # receipt. Holding the short storage lock also prevents local cleanup from
+    # observing newly created blocks before their manifest exists.
+    with _ADVICE_STORAGE_LOCK:
+        for one in storage_blocks:
+            chunk_sha = _advice_sha(one)
+            chunk_path = chunk_folder / f"{chunk_sha}.txt"
+            _advice_store_exact_block(chunk_path, one, chunk_sha)
+            chunk_entries.append({
+                "file": chunk_path.name,
+                "sha256": chunk_sha,
+                "characters": len(one),
+            })
+        put_this_file_in_place(source, json.dumps({
+            "schema_version": 2,
+            "kind": "paged-advice-exact-source",
+            "source_sha256": digest,
+            "source_characters": len(complete),
+            "storage_block_characters": {
+                "minimum": ADVICE_STORAGE_MIN_CHARS,
+                "average": ADVICE_STORAGE_BLOCK_CHARS,
+                "maximum": ADVICE_STORAGE_MAX_CHARS,
+                "rolling_window": ADVICE_STORAGE_ROLLING_WINDOW,
+            },
+            "chunks_folder": str(chunk_folder),
+            "chunks": chunk_entries,
+            "provider_chunk_sha256": [_advice_sha(one) for one in chunks],
+            "reconstruction": (
+                "Verify each named storage-block SHA-256 and concatenate its exact "
+                "UTF-8 text in order. Provider grouping does not alter this source."
+            ),
+        }, ensure_ascii=False, indent=2) + "\n")
+    # Resolve the exact cache authority before publishing a processing receipt.
+    # An unresolved route still leaves the exact source manifest reconstructable.
+    try:
+        provider = _advice_route_identity(config, chat_lab, route)
+    except Exception:
+        _advice_prune_provider_cache(folder)
+        raise
+    put_this_file_in_place(receipt, json.dumps({
+        "schema_version": 2,
+        "status": "processing",
+        "source_sha256": digest,
+        "source_characters": len(complete),
+        "storage_block_sha256": [one["sha256"] for one in chunk_entries],
+        "provider_chunk_sha256": [_advice_sha(one) for one in chunks],
+    }, ensure_ascii=False, indent=2) + "\n")
+
+    cache_folder = folder / "provider-cache"
+    cache_folder.mkdir(parents=True, exist_ok=True)
+
+    def extract(context: str, kind: str, input_hashes: list[str]) -> str:
+        policy_id = _advice_policy_id(kind)
+        identity: dict[str, Any] = {
+            "schema_version": 1,
+            "kind": kind,
+            "input_sha256": list(input_hashes),
+            "route": provider["route"],
+            "provider_kind": provider["provider_kind"],
+            "model": provider["model"],
+            "policy_sha256": policy_id,
+        }
+        cache_key = _advice_cache_key(identity)
+        cache_path = cache_folder / f"{kind}-{cache_key}.json"
+        with _ADVICE_STORAGE_LOCK:
+            cached = _advice_cached_summary(cache_path, identity)
+        if cached is not None:
+            return cached
+        if kind == "source":
+            prompt = (
+                "NEXUS PAGED ADVICE INGEST source exact-chunk SHA-256 "
+                f"{input_hashes[0]}. {_ADVICE_SOURCE_POLICY}"
+            )
+        else:
+            prompt = (
+                "NEXUS PAGED ADVICE INGEST reduction-stable ordered-ledger "
+                f"SHA-256 values {', '.join(input_hashes)}. "
+                f"{_ADVICE_REDUCTION_POLICY}"
+            )
+        result = chat_lab.ask_once(
+            config, route, prompt, context=context,
+            conversation_key=f"advice-{kind}-{cache_key[:32]}",
+        )
+        summary = str(result.get("text") or "")
+        # Providers occasionally ignore a requested summary size. Loop on the
+        # complete result while it still fits the disclosed message boundary;
+        # never slice it into a plausible-looking summary.
+        for attempt in range(3):
+            if len(summary) <= ADVICE_SUMMARY_CHARS:
+                break
+            if len(summary) > chat_lab.MOST_LETTERS:
+                raw = folder / f"advice-active-{scope}-oversize.txt"
+                put_this_file_in_place(raw, summary)
+                raise SwarmError(
+                    f"{route or 'The assistant'} returned a {len(summary):,}-character "
+                    f"ingest summary. Nexus preserved it at {raw} and did not truncate "
+                    "it, but cannot safely use it as a bounded reduction."
+                )
+            result = chat_lab.ask_once(
+                config, route, _ADVICE_CONDENSE_POLICY, context=summary,
+                conversation_key=f"advice-condense-{cache_key[:32]}-{attempt}",
+            )
+            summary = str(result.get("text") or "")
+        if len(summary) > ADVICE_SUMMARY_CHARS:
+            raise SwarmError(
+                f"{route or 'The assistant'} repeatedly refused the disclosed "
+                "30,000-character evidence-ledger size. The full source remains saved; "
+                "Nexus did not truncate or pretend the reduction succeeded."
+            )
+        return _advice_save_summary(cache_path, identity, summary)
+
+    try:
+        summaries = [extract(chunk, "source", [_advice_sha(chunk)]) for chunk in chunks]
+        generation = 0
+        while len("\n\n".join(summaries)) > ADVICE_INGEST_CHARS:
+            generation += 1
+            groups = _advice_reduction_groups(summaries)
+            summaries = [
+                extract(group, "reduction", input_hashes)
+                for group, input_hashes in groups
+            ]
+            if generation > 20:
+                raise SwarmError(
+                    "The advice evidence reduction made no bounded progress after 20 "
+                    "passes. Nexus stopped visibly and kept the complete source."
+                )
+        put_this_file_in_place(audit, json.dumps({
+            "schema_version": 2,
+            "source": str(source),
+            "source_sha256": digest,
+            "source_characters": len(complete),
+            "provider": provider,
+            "source_policy_sha256": _advice_policy_id("source"),
+            "reduction_policy_sha256": _advice_policy_id("reduction"),
+            "summaries": summaries,
+        }, ensure_ascii=False, indent=2) + "\n")
+        final_prompt = (
+            "NEXUS PAGED ADVICE FINAL. Answer the original board request using the "
+            "evidence ledgers below. Every character of the complete redacted source "
+            f"was processed in ordered chunks. Verified source manifest: {source}; "
+            f"SHA-256: {digest}; {len(complete):,} characters. Durable receipt: "
+            f"{receipt}. Reduction working record: {audit}. State "
+            "uncertainty plainly; do not claim you edited or tested project files.\n\n"
+            + "\n\n".join(summaries)
+        )
+        if len(final_prompt) > chat_lab.MOST_LETTERS:
+            raise SwarmError(
+                "The final advice evidence projection still exceeds the disclosed chat "
+                "boundary. Nexus kept the complete source and reductions and did not "
+                "silently omit them."
+            )
+        answered = chat_lab.say(config, route, final_prompt, filed_as=filed_under)
+    except Exception:
+        # The active exact-source manifest is the reconstructable failure record.
+        # A second per-run processing receipt would grow without adding recovery
+        # authority, so only completed receipts are retained.
+        for redundant in (receipt, audit):
+            try:
+                redundant.unlink(missing_ok=True)
+            except OSError:
+                pass
+        _advice_prune_provider_cache(folder)
+        raise
+
+    put_this_file_in_place(receipt, json.dumps({
+        "schema_version": 2,
+        "status": "completed",
+        "source_sha256": digest,
+        "source_characters": len(complete),
+        "storage_block_sha256": [one["sha256"] for one in chunk_entries],
+        "provider_chunk_sha256": [_advice_sha(one) for one in chunks],
+        "summary_sha256": [_advice_sha(one) for one in summaries],
+        "provider": provider,
+        "source_policy_sha256": _advice_policy_id("source"),
+        "reduction_policy_sha256": _advice_policy_id("reduction"),
+        "canonical_inputs": (
+            "The board task, durable mailbox, and shared page remain canonical. "
+            "This bounded receipt and verified storage blocks reconstruct its exact "
+            "projection; provider summaries are integrity-checked caches only."
+        ),
+    }, ensure_ascii=False, indent=2) + "\n")
+    for temporary in (source, audit, folder / f"advice-active-{scope}-oversize.txt"):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            # Stable names bound storage even if antivirus holds one briefly;
+            # the next attempt atomically replaces the same file.
+            pass
+    _advice_prune_success(folder)
+    return answered
 
 
 class Running:
@@ -1185,14 +2043,26 @@ class Running:
 
         from . import agent_mailbox as mailbox
 
+        delivery_trouble = ""
         try:
             delivery = mailbox.status(where_the_mailbox_lives())
-        except (OSError, HarnessError):
-            delivery = {"queued": 0, "acknowledged": 0, "retrying": 0}
+            delivery["counts_known"] = True
+        except (OSError, HarnessError) as exc:
+            delivery_trouble = (
+                "Nexus could not verify the durable handoff mailbox, so delivery "
+                f"counts are unknown: {exc}"
+            )
+            delivery = {
+                "queued": None,
+                "acknowledged": None,
+                "retrying": None,
+                "counts_known": False,
+                "trouble": delivery_trouble,
+            }
         with self._lock:
             doing = self._doing
         if doing is not None:
-            return {
+            result = {
                 "note": doing.note,
                 "going": doing.going,
                 "dropped": doing.dropped,
@@ -1200,10 +2070,16 @@ class Running:
                 "delivery": delivery,
                 "notes": [one.to_dict() for one in doing.notes],
             }
-        return dict(
+            if delivery_trouble:
+                result["delivery_trouble"] = delivery_trouble
+            return result
+        result = dict(
             read_what_they_said(), going=False, most=MOST_NOTES,
             delivery=delivery,
         )
+        if delivery_trouble:
+            result["delivery_trouble"] = delivery_trouble
+        return result
 
     def stop(self, run_id: str = "") -> str:
         wanted = str(run_id or "").strip()
@@ -1465,11 +2341,19 @@ class Running:
                         receiver=turn.agent,
                         allowed_senders=allowed,
                     )
-                except (OSError, HarnessError):
-                    # The same-run answers remain a safe fallback. A mailbox is
-                    # resilience around the handoff, never a new single point
-                    # of failure for a run that could already proceed.
-                    incoming = []
+                except (OSError, HarnessError) as error:
+                    # A broken durable handoff is not the same thing as an
+                    # empty handoff.  Continuing from only the in-memory
+                    # fallback would silently omit evidence another agent had
+                    # queued and could let an incomplete turn look successful.
+                    turn.state = "not done"
+                    turn.why_not = (
+                        "The durable agent handoff could not be read, so Nexus "
+                        "stopped this turn instead of silently omitting another "
+                        f"agent's evidence: {error}"
+                    )
+                    self._record_progress(doing)
+                    continue
                 notes = [(one.sender_name, one.body) for one in incoming]
                 already = {one.sender for one in incoming}
                 notes.extend([
@@ -1494,19 +2378,33 @@ class Running:
                     try:
                         page_now = pages_lab.read_the_page(
                             config, project["path"], project["name"])
-                    except HarnessError:
-                        page_now = None
+                    except HarnessError as error:
+                        # A missing page is already represented by an empty
+                        # readable page. Corruption, tampering, or an I/O error
+                        # must not be relabelled as "no page" and answered from
+                        # only the notes, because that silently omits evidence.
+                        turn.state = "not done"
+                        turn.why_not = (
+                            "The shared project page could not be read, so Nexus "
+                            "stopped this turn instead of silently omitting its "
+                            f"evidence: {error}"
+                        )
+                        self._record_progress(doing)
+                        continue
                 if page_now is not None and page_now.parts:
                     turn.after = page_now.up_to
+                    allowed_page_writers = {"person", turn.agent, *allowed}
+                    # Advice agents have no project-file tool, so a raw path to
+                    # an overflow manifest would be operationally useless. Give
+                    # the paged-ingestion workflow the complete authorised page;
+                    # it processes every exact chunk and keeps its own audit.
+                    prompt_page = pages_lab.complete_page_for_transfer(
+                        page_now, only_from=allowed_page_writers
+                    )
                     asking = what_the_page_says(
                         agent,
                         project,
-                        pages_lab.the_page_for_a_prompt(
-                            page_now,
-                            only_from={agent["name"], *(
-                                agents[held]["name"] for held in allowed
-                            )},
-                        ),
+                        prompt_page,
                         notes,
                     )
                 else:
@@ -1525,6 +2423,14 @@ class Running:
                     sender = message.sender if message is not None else next(
                         (held for held, known in agents.items()
                          if known["name"] == sender_name), "")
+                    message_id = message.message_id if message is not None else ""
+                    shown_text, original_characters, projection_source = _note_for_the_screen(
+                        text,
+                        run_id=doing.run_id,
+                        message_id=message_id,
+                        sender=sender or sender_name,
+                        project=turn.project,
+                    )
                     doing.notes.append(OneNote(
                         said_by=sender,
                         said_by_name=sender_name,
@@ -1532,12 +2438,14 @@ class Running:
                         shown_to_name=agent["name"],
                         project=turn.project,
                         where=project["name"],
-                        text=text[:LONGEST_NOTE],
+                        text=shown_text,
                         at=_the_time_now(),
-                        message_id=(message.message_id if message is not None else ""),
+                        message_id=message_id,
                         thread_id=(message.thread_id if message is not None else ""),
                         status="queued" if message is not None else "acknowledged",
                         attempts=(message.attempts if message is not None else 0),
+                        original_characters=original_characters,
+                        projection_source=projection_source,
                     ))
                     # The oldest fall off the end rather than the newest never
                     # being written: what somebody reads this for is what just
@@ -1550,11 +2458,16 @@ class Running:
             self._record_progress(doing)
             started = time.monotonic()
             try:
-                answered = chat_lab.say(
-                    config, agent["who"], asking,
-                    filed_as=filed_as(filed_as_on_the_board(
+                answered = _say_with_paged_advice_context(
+                    config, chat_lab, agent["who"], asking,
+                    filed_under=filed_as(filed_as_on_the_board(
                         str(agent.get("filed_as") or agent["name"])
-                    )))
+                    )),
+                    audit_scope=(
+                        f"{doing.run_id}:{turn.project}:{turn.shared_goal}:"
+                        f"{turn.agent}:{turn.round}"
+                    ),
+                )
             except HarnessError as exc:
                 turn.state = "went wrong"
                 turn.why_not = str(exc)
@@ -1582,7 +2495,55 @@ class Running:
                     turn.milliseconds = int((time.monotonic() - started) * 1000)
                     self._record_progress(doing)
                     continue
-                if incoming:
+                # On the page, in the order the lock let it through. This is the
+                # part that makes two agents unable to talk over each other:
+                # nobody writes into anybody else's words, so there is nothing
+                # to interrupt.
+                handoff_is_durable = not (turn.said and project.get("path"))
+                if turn.said and project.get("path"):
+                    try:
+                        with self._post_provider_mutation(doing):
+                            landed = pages_lab.add_to_the_page(
+                                config, project["path"],
+                                who=agent["name"],
+                                text=turn.said,
+                                # Compared against the round itself rather than a
+                                # sentence typed out again here. Written twice, the
+                                # two drifted apart and every part on the page said
+                                # "after reading the page", including the first
+                                # round where nobody had read anything.
+                                what_they_were_doing=(
+                                    ON_ITS_OWN if turn.round == ON_ITS_OWN
+                                    else "after reading the page"),
+                                after=turn.after,
+                                author_id=turn.agent,
+                                name=project["name"],
+                            )
+                        turn.part = int(landed.get("number") or 0)
+                        handoff_is_durable = True
+                        # Said out loud when somebody got there first, because
+                        # that is the moment a person wants to know two of them
+                        # were working at once.
+                        if landed.get("note"):
+                            doing.note = str(landed["note"])
+                    except HarnessError as exc:
+                        if self._stop_was_requested(doing):
+                            doing.stopped = True
+                            turn.why_not = (
+                                "It answered after Stop. The answer was kept, but Nexus refused the shared-page write."
+                            )
+                            turn.milliseconds = int((time.monotonic() - started) * 1000)
+                            self._record_progress(doing)
+                            continue
+                        # The answer is not lost over this. It is in the turn,
+                        # it is on the screen, and the page is a record rather
+                        # than the only copy.
+                        turn.why_not = f"It answered, and the page would not take it: {exc}"
+                # A queued handoff is acknowledged only after the receiving
+                # answer is durably present in its chat and, when the project
+                # has a shared notebook, after that notebook accepted it. A
+                # page failure must leave the exact incoming message retryable.
+                if incoming and handoff_is_durable:
                     try:
                         with self._post_provider_mutation(doing):
                             mailbox.acknowledge(
@@ -1607,47 +2568,6 @@ class Running:
                             f"It answered, but its inbox acknowledgement could not be "
                             f"written: {exc}"
                         )
-                # On the page, in the order the lock let it through. This is the
-                # part that makes two agents unable to talk over each other:
-                # nobody writes into anybody else's words, so there is nothing
-                # to interrupt.
-                if turn.said and project.get("path"):
-                    try:
-                        with self._post_provider_mutation(doing):
-                            landed = pages_lab.add_to_the_page(
-                                config, project["path"],
-                                who=agent["name"],
-                                text=turn.said,
-                                # Compared against the round itself rather than a
-                                # sentence typed out again here. Written twice, the
-                                # two drifted apart and every part on the page said
-                                # "after reading the page", including the first
-                                # round where nobody had read anything.
-                                what_they_were_doing=(
-                                    ON_ITS_OWN if turn.round == ON_ITS_OWN
-                                    else "after reading the page"),
-                                after=turn.after,
-                                name=project["name"],
-                            )
-                        turn.part = int(landed.get("number") or 0)
-                        # Said out loud when somebody got there first, because
-                        # that is the moment a person wants to know two of them
-                        # were working at once.
-                        if landed.get("note"):
-                            doing.note = str(landed["note"])
-                    except HarnessError as exc:
-                        if self._stop_was_requested(doing):
-                            doing.stopped = True
-                            turn.why_not = (
-                                "It answered after Stop. The answer was kept, but Nexus refused the shared-page write."
-                            )
-                            turn.milliseconds = int((time.monotonic() - started) * 1000)
-                            self._record_progress(doing)
-                            continue
-                        # The answer is not lost over this. It is in the turn,
-                        # it is on the screen, and the page is a record rather
-                        # than the only copy.
-                        turn.why_not = f"It answered, and the page would not take it: {exc}"
                 heard[(turn.agent, turn.project)] = turn.said
                 # First-round answers are durable messages to every connected
                 # collaborator. If a receiving provider fails later, these are
@@ -1771,9 +2691,6 @@ def _how_it_went(doing: Doing) -> str:
 # Kept beside the working board rather than inside it, so nothing about saving
 # can damage the one you are actually using.
 
-# How many a person can keep. Far more than anybody has, low enough that this
-# cannot quietly become somewhere a folder fills up.
-MOST_KEPT_BOARDS = 60
 # How long a name may be, so it fits on a row and in a file name.
 LONGEST_BOARD_NAME = 48
 SAVED_BOARD_DOCUMENT = "nexus-harness.saved-board.v1"
@@ -1781,7 +2698,14 @@ SAVED_BOARD_DOCUMENT = "nexus-harness.saved-board.v1"
 # Keep the exchange boundary aligned with the server's ordinary request limit
 # so every valid board can be backed up instead of discovering a smaller,
 # hidden import/export limit later.
-MAX_SAVED_BOARD_DOCUMENT_BYTES = 10_000_000
+# All individually valid agents, role descriptions, pictures, and long-horizon
+# tasks must fit one portable saved-board document. This matches the dedicated
+# Swarm HTTP transport boundary; no lower hidden aggregate cap exists.
+# The field limits permit roughly 96 million task characters. UTF-8 and JSON
+# escaping can use more than one byte per character, so the transport envelope
+# must be substantially larger than the character count. This ceiling fits the
+# worst valid structured board; it is not a smaller hidden product limit.
+MAX_SAVED_BOARD_DOCUMENT_BYTES = 768_000_000
 
 
 def _portable_board_document(
@@ -1801,9 +2725,17 @@ def _portable_board_document(
         "board": board.to_dict(),
     }
     written = json.dumps(document, ensure_ascii=False, indent=2) + "\n"
-    if len(written.encode("utf-8")) > MAX_SAVED_BOARD_DOCUMENT_BYTES:
+    try:
+        written_bytes = written.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
         raise SwarmError(
-            "This board is larger than the visible 10 MB saved-board limit after "
+            "This board contains an invalid lone Unicode surrogate. Nexus did "
+            "not save, import, or partially rewrite it."
+        ) from exc
+    if len(written_bytes) > MAX_SAVED_BOARD_DOCUMENT_BYTES:
+        raise SwarmError(
+            f"This board is larger than the disclosed "
+            f"{MAX_SAVED_BOARD_DOCUMENT_BYTES:,}-byte saved-board limit after "
             "Nexus prepares its portable JSON. Shorten an unusually long project "
             "path or use smaller profile pictures; nothing was saved."
         )
@@ -1842,6 +2774,7 @@ def _filed_under(name: str) -> str:
     return f"{tidy}-{marked}.json"
 
 
+@_requires_board_qa_access
 def kept_board_inventory() -> tuple[list[dict[str, Any]], list[str]]:
     """Return healthy saved boards and honest, non-fatal file problems.
 
@@ -1892,6 +2825,7 @@ def every_kept_board() -> list[dict[str, Any]]:
     return kept_board_inventory()[0]
 
 
+@_requires_board_qa_access
 def export_kept_board(name: str) -> dict[str, Any]:
     """Return one validated, portable saved-board document."""
 
@@ -1920,13 +2854,17 @@ def export_kept_board(name: str) -> dict[str, Any]:
         raise SwarmError(f"The board saved as {name} cannot be read.")
     # Export only a board that this version can actually open. This prevents a
     # damaged local file becoming a convincing-looking backup that cannot be
-    # restored on the next computer.
+    # restored on the next computer. Command approval is local authority, not
+    # portable board content: another machine/path must ask explicitly again.
     checked = read_it(board)
+    for project in checked.projects:
+        project.approved_test_command_digest = ""
     return _portable_board_document(
         opened_as, str(held.get("saved_at") or ""), checked
     )
 
 
+@_requires_board_qa_access
 def import_kept_board(document: Any, name: str = "") -> dict[str, Any]:
     """Validate and save one portable board without opening it.
 
@@ -1952,6 +2890,11 @@ def import_kept_board(document: Any, name: str = "") -> dict[str, Any]:
     wanted = " ".join(str(name or document.get("name") or "").split())
     filed = _filed_under(wanted)
     checked = read_it(board_value)
+    # A JSON import is authority to preserve a layout, not authority to execute
+    # project-discovered commands. Even a correctly shaped imported digest is
+    # cleared so opening the snapshot requires a visible local approval.
+    for project in checked.projects:
+        project.approved_test_command_digest = ""
     # A board imported as a saved snapshot is not silently made the active
     # board. The person chooses when to replace the canvas by opening it.
     checked.active_saved_board = ""
@@ -1969,11 +2912,6 @@ def import_kept_board(document: Any, name: str = "") -> dict[str, Any]:
         ):
             raise SwarmError(
                 f'There is already a saved board called "{wanted}". Choose another name.'
-            )
-        if len(every_kept_board()) >= MOST_KEPT_BOARDS:
-            raise SwarmError(
-                f"There are already {MOST_KEPT_BOARDS} saved boards, which is the most. "
-                "Delete one you no longer want first."
             )
         held = {
             "name": wanted,
@@ -2098,12 +3036,17 @@ def _check_import_shape(board: dict[str, Any]) -> None:
             value = agent.get(key, "")
             if value is not None and not isinstance(value, str):
                 raise SwarmError(f"Every imported agent {key} must be text.")
-            if len(str(value or "").strip()) > maximum:
+            measured = str(value or "")
+            if len(measured if key == "job" else measured.strip()) > maximum:
                 raise SwarmError(
                     f"An imported agent {key} is longer than {maximum} characters. "
                     "Nothing was imported."
                 )
-            if isinstance(value, str) and " ".join(value.split()) != value:
+            if (
+                isinstance(value, str)
+                and key != "job"
+                and " ".join(value.split()) != value
+            ):
                 raise SwarmError(
                     f"An imported agent {key} contains leading or repeated whitespace. "
                     "Nothing was imported."
@@ -2149,7 +3092,10 @@ def _check_import_shape(board: dict[str, Any]) -> None:
                     )
     project_ids: set[str] = set()
     for project in board.get("projects", []):
-        if set(project) - {"id", "path", "name", "is_there", "tasks", "at"}:
+        if set(project) - {
+            "id", "path", "name", "is_there", "tasks", "at",
+            "approved_test_command_digest",
+        }:
             raise SwarmError(
                 "An imported project contains unsupported fields. Nothing was imported."
             )
@@ -2163,10 +3109,25 @@ def _check_import_shape(board: dict[str, Any]) -> None:
                 "Every imported project path must be non-empty text without surrounding whitespace. "
                 "Nothing was imported."
             )
-        for task in project.get("tasks", []):
-            if not task.strip() or " ".join(task.split()) != task:
+        approval = project.get("approved_test_command_digest", "")
+        if not isinstance(approval, str) or (
+            approval and not re.fullmatch(r"[0-9a-fA-F]{64}", approval)
+        ):
+            raise SwarmError(
+                "An imported project command approval digest is invalid. Nothing was imported."
+            )
+        tasks = project.get("tasks", [])
+        if not isinstance(tasks, list) or len(tasks) > MOST_TASKS or not all(
+            isinstance(task, str) for task in tasks
+        ):
+            raise SwarmError(
+                f"Every imported project may contain at most {MOST_TASKS} text jobs. "
+                "Nothing was imported."
+            )
+        for task in tasks:
+            if not task.strip():
                 raise SwarmError(
-                    "Every imported project task must be non-empty text without repeated whitespace. "
+                    "Every imported project task must contain non-whitespace text. "
                     "Nothing was imported."
                 )
             if len(task) > LONGEST_TASK:
@@ -2217,6 +3178,7 @@ def _check_import_shape(board: dict[str, Any]) -> None:
         seen_talk.add(pair)
 
 
+@_requires_board_qa_access
 def keep_this_board(name: str, config: Any) -> dict[str, Any]:
     """Save the board as it stands now, under a name.
 
@@ -2230,12 +3192,6 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
     where.mkdir(parents=True, exist_ok=True)
     with ProjectTransactionLock(where.parent).held(timeout_seconds=10):
         filed = _filed_under(name)
-        already = every_kept_board()
-        if len(already) >= MOST_KEPT_BOARDS and not (where / filed).is_file():
-            raise SwarmError(
-                f"There are already {MOST_KEPT_BOARDS} saved boards, which is the most. "
-                "Delete one you no longer want first."
-            )
         held = {
             "name": " ".join(str(name).split()),
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -2255,6 +3211,7 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
         return {"name": held["name"], "saved_at": held["saved_at"]}
 
 
+@_requires_board_qa_access
 def open_this_board(name: str, config: Any) -> Board:
     """Put a saved board back on the screen, as the one being worked on.
 
@@ -2281,9 +3238,10 @@ def open_this_board(name: str, config: Any) -> Board:
             board,
             version=None,
             active_saved_board=opened_as,
-        ), config)
+        ), config, allow_command_approval_changes=True)
 
 
+@_requires_board_qa_access
 def forget_this_board(name: str, config: Any) -> None:
     """Throw away one saved board."""
 

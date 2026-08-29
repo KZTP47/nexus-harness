@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from importlib.resources import files
 from typing import Any
 
+from .config import SYSTEM_PROMPT_MAX_CHARACTERS
 from .models import HarnessError
 
 
@@ -17,7 +18,10 @@ AGENT_NODE_TYPES = {"planner", "coder", "evaluator", "merge"}
 EDGE_MODES = {"state", "delegate", "merge_input"}
 GRAPH_MAX_NODES = 256
 GRAPH_MAX_EDGES = 1024
-GRAPH_MAX_PROMPT_CHARS = 32_000
+# Shared with provider configuration and both system-prompt editors. This is a
+# disclosed storage/validation boundary, not a browser maxlength: callers keep
+# the complete text and report an over-limit value instead of clipping it.
+GRAPH_MAX_PROMPT_CHARS = SYSTEM_PROMPT_MAX_CHARACTERS
 GRAPH_MAX_CAPABILITIES = 32
 IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 CONDITION = re.compile(r"^([A-Za-z_][\w.]*)\s*(==|!=)\s*(true|false|null|-?\d+(?:\.\d+)?|\"[^\"]*\")$", re.IGNORECASE)
@@ -626,8 +630,15 @@ def _validate_agent_node(node: dict[str, Any], index: int) -> list[GraphIssue]:
     if data_class not in {"public", "project_private", "restricted"}:
         issues.append(GraphIssue(f"{path}.data_class", "data_class must be public, project_private, or restricted"))
     prompt = config.get("system_prompt", "")
-    if not isinstance(prompt, str) or len(prompt) > GRAPH_MAX_PROMPT_CHARS:
-        issues.append(GraphIssue(f"{path}.system_prompt", f"system_prompt must contain at most {GRAPH_MAX_PROMPT_CHARS} characters"))
+    if not isinstance(prompt, str):
+        issues.append(GraphIssue(f"{path}.system_prompt", "system_prompt must be text"))
+    elif len(prompt) > GRAPH_MAX_PROMPT_CHARS:
+        issues.append(GraphIssue(
+            f"{path}.system_prompt",
+            f"system_prompt is {len(prompt):,} characters; the disclosed limit is "
+            f"{GRAPH_MAX_PROMPT_CHARS:,}. Nexus did not truncate it. Shorten it by "
+            f"{len(prompt) - GRAPH_MAX_PROMPT_CHARS:,} characters.",
+        ))
     capabilities = config.get("capabilities", [])
     if (
         not isinstance(capabilities, list)

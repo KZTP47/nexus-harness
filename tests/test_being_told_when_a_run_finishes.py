@@ -247,14 +247,59 @@ class WhatGoesOut(TellingTestCase):
         self.assertNotIn(self.A_KEY, json.dumps(self.sent))
         self.assertIn("it failed", json.dumps(self.sent))
 
-    def test_a_very_long_report_is_cut_short(self) -> None:
+    def test_a_very_long_report_is_visibly_shortened_with_its_full_run_reference(self) -> None:
         one = self.a_way()
+        original = "x" * 50_000
+        reference = "Nexus → Visual test automation → run abc123 (pipeline-run:abc123)"
         with self.with_the_key():
-            telling.tell_them(
-                self.config, one, "Nightly", "x" * 50_000, post=self.catching()
+            said = telling.tell_them(
+                self.config, one, "Nightly", original,
+                full_result_reference=reference, post=self.catching(),
             )
         _address, body = self.sent[-1]
         self.assertLessEqual(len(body["body"]), telling.MOST_LETTERS)
+        self.assertIn("Shortened notification", body["body"])
+        self.assertIn("50,000 characters", body["body"])
+        self.assertIn("pipeline-run:abc123", body["body"])
+        self.assertTrue(said.truncated)
+        self.assertEqual(said.original_characters, len(original))
+        self.assertEqual(said.full_result_reference, reference)
+
+    def test_a_long_report_without_a_persisted_full_result_is_refused(self) -> None:
+        one = self.a_way()
+        with self.with_the_key(), self.assertRaises(telling.TellingError) as caught:
+            telling.tell_them(
+                self.config, one, "Nightly", "x" * 50_000, post=self.catching()
+            )
+        self.assertIn("did not silently cut it", str(caught.exception))
+        self.assertIn("provide its reference", str(caught.exception))
+        self.assertEqual(self.sent, [])
+
+    def test_discord_has_no_second_unmarked_slice(self) -> None:
+        one = telling.read_it({
+            "name": "x", "kind": "discord", "secret_in": "A_PRETEND_KEY",
+        })
+        reference = "pipeline-run:discord123"
+        with self.with_the_key():
+            said = telling.tell_them(
+                self.config, one, "Nightly", "d" * 50_000,
+                full_result_reference=reference, post=self.catching(),
+            )
+        _address, payload = self.sent[-1]
+        self.assertLessEqual(len(payload["content"]), telling.DISCORD_MESSAGE_LETTERS)
+        self.assertIn("Shortened notification", payload["content"])
+        self.assertIn(reference, payload["content"])
+        self.assertTrue(said.truncated)
+
+    def test_a_heading_over_the_disclosed_limit_is_rejected_not_sliced(self) -> None:
+        one = self.a_way()
+        with self.with_the_key(), self.assertRaises(telling.TellingError) as caught:
+            telling.tell_them(
+                self.config, one, "h" * (telling.MOST_HEADING_LETTERS + 1),
+                "short body", post=self.catching(),
+            )
+        self.assertIn("did not truncate", str(caught.exception))
+        self.assertEqual(self.sent, [])
 
     def test_each_kind_is_sent_the_shape_it_expects(self) -> None:
         for kind, holds in (

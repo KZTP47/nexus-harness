@@ -13,7 +13,9 @@ harness redactor before it arrives here.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import threading
 import uuid
 from dataclasses import asdict, dataclass
@@ -28,7 +30,11 @@ from .safety import put_this_file_in_place
 SCHEMA_VERSION = 1
 MOST_MESSAGES = 2_000
 MOST_DELIVERED_AT_ONCE = 50
-LONGEST_BODY = 4_000
+MOST_DELIVERED_CHARACTERS = 10_000_000
+# Agent replies use the same disclosed canonical text boundary as a direct
+# Nexus prompt.  Handoffs are durable source data, not a display projection:
+# oversized text is refused with an explicit error and is never sliced.
+LONGEST_BODY = 8_000_000
 LONGEST_ERROR = 500
 
 
@@ -74,16 +80,114 @@ def _clean(value: object, limit: int = 100) -> str:
 def _read(where: Path) -> list[dict[str, Any]]:
     try:
         body = json.loads(where.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MailboxError(
+            f"The durable agent mailbox at {where} cannot be read: {exc}. "
+            "Nexus did not pretend it was empty."
+        ) from exc
     if not isinstance(body, dict) or body.get("schema_version") != SCHEMA_VERSION:
-        return []
+        raise MailboxError(
+            f"The durable agent mailbox at {where} has an unsupported format. "
+            "Nexus did not pretend it was empty."
+        )
     held = body.get("messages")
-    return [dict(one) for one in held if isinstance(one, dict)] if isinstance(held, list) else []
+    if not isinstance(held, list) or any(not isinstance(one, dict) for one in held):
+        raise MailboxError(
+            f"The durable agent mailbox at {where} has invalid messages. "
+            "Nexus did not drop them."
+        )
+    return [dict(one) for one in held]
+
+
+def _payload_folder(where: Path) -> Path:
+    return where.parent / f"{where.stem}-payloads"
+
+
+def _payload_body(where: Path, one: dict[str, Any]) -> str:
+    """Read and verify an external body, or a legacy inline body."""
+
+    reference = str(one.get("body_ref") or "").strip()
+    if not reference:
+        return str(one.get("body") or "")
+    if Path(reference).name != reference or reference in {".", ".."}:
+        raise MailboxError(
+            "An agent mailbox body reference is unsafe. Nexus did not read or "
+            "acknowledge the message."
+        )
+    payload = _payload_folder(where) / reference
+    try:
+        body = payload.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MailboxError(
+            f"The queued agent message payload {payload} cannot be read: {exc}. "
+            "Nexus did not pretend the message was empty."
+        ) from exc
+    expected = str(one.get("body_sha256") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise MailboxError(
+            f"The queued agent message payload {payload} has no valid SHA-256 "
+            "authority. Nexus did not deliver or acknowledge it."
+        )
+    actual = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    if expected != actual:
+        raise MailboxError(
+            f"The queued agent message payload {payload} failed its SHA-256 check. "
+            "Nexus did not deliver or acknowledge altered text."
+        )
+    return body
+
+
+def _externalize_body(where: Path, one: dict[str, Any]) -> dict[str, Any]:
+    """Move one queued canonical body out of the frequently rewritten index."""
+
+    if one.get("state") == "acknowledged":
+        held = dict(one)
+        if "body" in held:
+            body = str(held.pop("body") or "")
+            held["body_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            held["body_characters"] = len(body)
+            held["body_removed_after_acknowledgement"] = True
+        return held
+    if one.get("body_ref"):
+        # Rewriting index metadata must never silently carry forward a damaged
+        # shared payload just because its digest-shaped filename already exists.
+        _payload_body(where, one)
+        return one
+    body = str(one.get("body") or "")
+    if not body:
+        return one
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    filename = f"sha256-{digest}.txt"
+    folder = _payload_folder(where)
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = folder / filename
+    if not payload.exists():
+        put_this_file_in_place(payload, body)
+    else:
+        try:
+            existing = payload.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise MailboxError(
+                f"The shared agent-message payload {payload} cannot be verified."
+            ) from exc
+        if existing != body or hashlib.sha256(existing.encode("utf-8")).hexdigest() != digest:
+            raise MailboxError(
+                f"The shared agent-message payload {payload} failed its SHA-256 "
+                "identity. Nexus preserved it and refused to reuse or overwrite it."
+            )
+    held = dict(one)
+    held.pop("body", None)
+    held["body_ref"] = filename
+    held["body_sha256"] = digest
+    held["body_characters"] = len(body)
+    return held
 
 
 def _write(where: Path, messages: list[dict[str, Any]]) -> None:
     where.parent.mkdir(parents=True, exist_ok=True)
+    messages = [_externalize_body(where, dict(one)) for one in messages]
     put_this_file_in_place(where, json.dumps({
         "schema_version": SCHEMA_VERSION,
         "messages": messages,
@@ -121,9 +225,18 @@ def enqueue(
 ) -> AgentMessage:
     """Queue one handoff and return its durable identity."""
 
-    text = str(body or "").strip()[:LONGEST_BODY]
-    if not text:
+    # A handoff is canonical evidence, not a display field.  Preserve every
+    # character exactly as the sender produced it; using ``strip()`` here made
+    # leading indentation and trailing newlines disappear without warning.
+    text = str(body or "")
+    if not text.strip():
         raise MailboxError("An empty agent message cannot be queued.")
+    if len(text) > LONGEST_BODY:
+        raise MailboxError(
+            f"This agent handoff is {len(text):,} characters; the disclosed limit "
+            f"is {LONGEST_BODY:,}. Nexus did not truncate or acknowledge it. The "
+            "complete answer remains in the sending turn."
+        )
     required = {
         "shared goal": shared_goal_id,
         "sender": sender,
@@ -168,16 +281,28 @@ def pending(
     allowed = {_clean(one) for one in allowed_senders}
     maximum = max(1, min(int(limit), MOST_DELIVERED_AT_ONCE))
     with _lock:
-        selected = [
+        candidates = [
             one for one in _read(where)
             if one.get("state") == "queued"
             and one.get("shared_goal_id") == shared_goal_id
             and one.get("receiver") == receiver
             and one.get("sender") in allowed
-        ][:maximum]
+        ]
     answer: list[AgentMessage] = []
-    for one in selected:
+    delivered_characters = 0
+    for one in candidates:
+        if len(answer) >= maximum:
+            break
         try:
+            message_body = _payload_body(where, one)
+            if len(message_body) > LONGEST_BODY:
+                raise MailboxError(
+                    f"Agent message {_clean(one.get('message_id'), 100) or '(unknown)'} "
+                    f"contains {len(message_body):,} characters, over the disclosed "
+                    f"{LONGEST_BODY:,} limit. Nexus did not truncate or acknowledge it."
+                )
+            if answer and delivered_characters + len(message_body) > MOST_DELIVERED_CHARACTERS:
+                break
             answer.append(AgentMessage(
                 message_id=_clean(one.get("message_id"), 100),
                 thread_id=_clean(one.get("thread_id"), 100),
@@ -188,7 +313,7 @@ def pending(
                 receiver_name=_clean(one.get("receiver_name")),
                 project=_clean(one.get("project")),
                 where=_clean(one.get("where")),
-                body=str(one.get("body") or "")[:LONGEST_BODY],
+                body=message_body,
                 created_at=_clean(one.get("created_at"), 100),
                 expects_reply=bool(one.get("expects_reply", True)),
                 state="queued",
@@ -197,8 +322,13 @@ def pending(
                 acknowledged_at=_clean(one.get("acknowledged_at"), 100),
                 last_error=_clean(one.get("last_error"), LONGEST_ERROR),
             ))
-        except (TypeError, ValueError):
-            continue
+            delivered_characters += len(message_body)
+        except (TypeError, ValueError) as exc:
+            raise MailboxError(
+                f"Queued agent message {_clean(one.get('message_id'), 100) or '(unknown)'} "
+                "has invalid durable metadata. Nexus did not skip it or acknowledge "
+                "later messages out of order."
+            ) from exc
     return answer
 
 
@@ -234,13 +364,37 @@ def acknowledge(where: Path, message_ids: Iterable[str]) -> None:
         return
     with _lock:
         messages = _read(where)
+        payloads_to_remove: list[Path] = []
         for one in messages:
             if one.get("message_id") not in wanted:
                 continue
+            reference = str(one.get("body_ref") or "").strip()
+            if reference and Path(reference).name == reference:
+                payloads_to_remove.append(_payload_folder(where) / reference)
+            if "body" in one:
+                body = str(one.get("body") or "")
+                one["body_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                one["body_characters"] = len(body)
+            one.pop("body", None)
+            one.pop("body_ref", None)
+            one["body_removed_after_acknowledgement"] = True
             one["state"] = "acknowledged"
             one["acknowledged_at"] = _now()
             one["last_error"] = ""
         _write(where, _pruned(messages))
+        remaining_references = {
+            str(one.get("body_ref") or "") for one in messages
+            if one.get("state") != "acknowledged" and one.get("body_ref")
+        }
+        # Only after acknowledged metadata is durable, and only when no other
+        # queued fan-out delivery still refers to the same exact payload.
+        for payload in set(payloads_to_remove):
+            if payload.name in remaining_references:
+                continue
+            try:
+                payload.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def status(where: Path) -> dict[str, int]:

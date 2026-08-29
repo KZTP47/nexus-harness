@@ -192,7 +192,7 @@ class HarnessServer {
     if (!this.candidates.length && this.bundledRequired) {
       throw new Error(
         "This installed Nexus package is incomplete: resources/runtime/python.exe is missing. "
-        + "Reinstall the same signed release; do not install a separate system Python."
+        + "Reinstall the same checksummed release; do not install a separate system Python."
       );
     }
     const missing = [];

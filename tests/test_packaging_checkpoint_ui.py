@@ -397,6 +397,7 @@ class UITests(unittest.TestCase):
         server = SimpleNamespace(run_lock=threading.Lock())
         server.reserve_run = lambda: HarnessHTTPServer.reserve_run(server)
         server.release_run = lambda: HarnessHTTPServer.release_run(server)
+        server.require_project_execution_authority = lambda: None
         self.assertTrue(HarnessHTTPServer.reserve_run(server))
         self.assertFalse(HarnessHTTPServer.reserve_run(server))
 

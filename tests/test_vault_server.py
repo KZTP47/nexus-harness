@@ -134,6 +134,28 @@ class ReadingAndWritingAtOnceTests(PanelTestCase):
 
 
 class WritingThroughThePanelTests(PanelTestCase):
+    def test_a_note_beyond_the_old_hidden_limit_round_trips_exactly(self) -> None:
+        body = "  leading spaces\n" + ("project evidence 🧭\n" * 3_000) + "\n  trailing spaces  "
+        self.assertGreater(len(body), 20_000)
+        status, said = self.ask(
+            "/api/vault/write", {"title": "Large evidence", "kind": "lesson", "body": body}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(said["note"]["body"], body)
+        _status, opened = self.ask("/api/vault?name=large-evidence")
+        self.assertEqual(opened["open"]["note"]["body"], body)
+
+    def test_an_over_limit_note_is_explicitly_rejected_not_truncated(self) -> None:
+        body = "x" * (vault.MOST_LETTERS + 1)
+        status, said = self.ask(
+            "/api/vault/write", {"title": "Too much", "kind": "lesson", "body": body}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn(f"{len(body):,}", said["error"])
+        self.assertIn(f"{vault.MOST_LETTERS:,}", said["error"])
+        self.assertIn("did not truncate", said["error"])
+        self.assertFalse((self.root / ".harness" / "vault" / "too-much.md").exists())
+
     def test_changing_a_title_moves_the_note_rather_than_copying_it(self) -> None:
         # The one a person hits first: open a note, fix a typo in the title,
         # save. It used to leave the old file behind and make a second note.
@@ -225,6 +247,26 @@ class WritingThroughThePanelTests(PanelTestCase):
                         continue
                     self.assertEqual(caught.exception.code, 400)
                     break
+
+
+class VaultEditorContractTests(unittest.TestCase):
+    def test_note_editor_discloses_and_enforces_the_same_lossless_limit(self) -> None:
+        root = Path(__file__).resolve().parents[1] / "src" / "our_harness" / "ui"
+        markup = (root / "index.html").read_text(encoding="utf-8")
+        script = (root / "app.js").read_text(encoding="utf-8")
+        start = markup.index('<textarea id="vaultFormBody"')
+        tag = markup[start:markup.index(">", start)]
+        self.assertNotIn("maxlength", tag)
+        self.assertIn('aria-describedby="vaultFormBodyCount"', tag)
+        self.assertIn('id="vaultFormBodyCount"', markup)
+        self.assertIn('id="vaultFormError"', markup)
+        self.assertIn("const VAULT_BODY_CHARACTER_LIMIT = 200000", script)
+        self.assertIn("Nothing was clipped", script)
+        self.assertIn("Nexus did not truncate it", script)
+        saving = script[script.index("async function saveVaultNote"):
+                        script.index("async function removeVaultNote")]
+        self.assertLess(saving.index("vaultBodyProblem()"),
+                        saving.index('/api/vault/write'))
 
 
 class LearningFromTheRunsThroughThePanelTests(PanelTestCase):

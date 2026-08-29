@@ -72,6 +72,76 @@ def verified_test_project(command: list[str]) -> dict:
     }
 
 
+class SuccessEpisodeProjectionTests(unittest.TestCase):
+    def test_success_episode_keeps_full_body_and_marks_only_embedding_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / ".harness").mkdir()
+            captured: list[str] = []
+            with HarnessApplication(load_config(root)) as app:
+                app._embedding = lambda text, deadline=None: captured.append(text) or None
+                plan = {"detail": "p" * 25_000}
+                result = {"run_id": "long-success-run", "state": "complete"}
+                candidate = {"summary": "tail-sentinel"}
+                episode_id = app._record_success(
+                    "t" * 200, plan, result, candidate
+                )
+                row = app.memory.connection.execute(
+                    "SELECT title,body,metadata_json FROM episodes WHERE id=?",
+                    (episode_id,),
+                ).fetchone()
+
+            expected = json.dumps(
+                {"plan": plan, "result": result, "summary": "tail-sentinel"},
+                sort_keys=True,
+            )
+            self.assertEqual(row["body"], expected)
+            self.assertIn("tail-sentinel", row["body"])
+            metadata = json.loads(row["metadata_json"])
+            self.assertEqual(metadata["canonical_source"], "episode.body")
+            self.assertEqual(metadata["canonical_body_characters"], len(expected))
+            self.assertEqual(
+                metadata["canonical_body_sha256"],
+                hashlib.sha256(expected.encode("utf-8")).hexdigest(),
+            )
+            self.assertTrue(metadata["embedding_projection"])
+            self.assertEqual(len(captured[0]), 20_000)
+            self.assertIn("Embedding projection only", captured[0])
+            self.assertIn("full task in run long-success-run", row["title"])
+
+    def test_failure_episode_keeps_full_task_and_body_and_only_projects_embedding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / ".harness").mkdir()
+            captured: list[str] = []
+            with HarnessApplication(load_config(root)) as app:
+                app._embedding = lambda text, deadline=None: captured.append(text) or None
+                task = "t" * 200 + "-full-task-tail"
+                failure = {"detail": "f" * 25_000 + "-full-failure-tail"}
+                episode_id = app._record_failure(task, failure)
+                row = app.memory.connection.execute(
+                    "SELECT title,body,metadata_json FROM episodes WHERE id=?",
+                    (episode_id,),
+                ).fetchone()
+
+            canonical = json.loads(row["body"])
+            self.assertEqual(canonical["task"], task)
+            self.assertEqual(canonical["failure"], failure)
+            metadata = json.loads(row["metadata_json"])
+            self.assertEqual(metadata["canonical_source"], "episode.body")
+            self.assertEqual(metadata["canonical_body_characters"], len(row["body"]))
+            self.assertEqual(
+                metadata["canonical_body_sha256"],
+                hashlib.sha256(row["body"].encode("utf-8")).hexdigest(),
+            )
+            self.assertTrue(metadata["embedding_projection"])
+            self.assertEqual(len(captured[0]), 20_000)
+            self.assertIn("Embedding projection only", captured[0])
+            self.assertIn("failure record", captured[0])
+            self.assertNotIn("success record", captured[0])
+            self.assertIn("full task in episode body", row["title"])
+
+
 class StreamTests(unittest.TestCase):
     def test_split_utf8_and_line_frames(self) -> None:
         decoder = StreamDecoder()
@@ -106,6 +176,14 @@ class StreamTests(unittest.TestCase):
 
         with self.assertRaisesRegex(HarnessError, "completion"):
             collect_stream(MissingDone(), request)
+
+        class DoneWithoutReason:
+            def stream(self, _request):
+                yield {"type": "text_delta", "text": "plausible partial"}
+                yield {"type": "done"}
+
+        with self.assertRaisesRegex(HarnessError, "finish_reason"):
+            collect_stream(DoneWithoutReason(), request)
 
         class UnknownFrame:
             def stream(self, _request):
@@ -285,6 +363,49 @@ class OpenAIProviderTests(unittest.TestCase):
             self.assertNotIn(secret, body)
             self.assertNotIn("another-secret", body)
             self.assertIn("[REDACTED]", body)
+
+    def test_chat_completion_requires_explicit_terminal_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = OpenAIProvider(
+                self._config(Path(temporary), name="openai-compatible"),
+            )
+            provider._post = lambda *_args, **_kwargs: {
+                "choices": [{
+                    "message": {"content": "def test_partial():\n    assert "},
+                }],
+            }
+            with self.assertRaisesRegex(HarnessError, "finish_reason"):
+                provider.complete(ProviderRequest("policy", "", [], "model"))
+
+    def test_responses_completion_requires_explicit_completed_status(self) -> None:
+        for status in (None, "queued", "in_progress", "mystery"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                provider = OpenAIProvider(self._config(Path(temporary)))
+                response = {
+                    "output": [{
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "partial"}],
+                    }],
+                }
+                if status is not None:
+                    response["status"] = status
+                provider._post = lambda *_args, response=response, **_kwargs: response
+                with self.assertRaisesRegex(HarnessError, "completion status"):
+                    provider.complete(ProviderRequest("policy", "", [], "model"))
+
+    def test_chat_stream_done_marker_cannot_synthesize_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = OpenAIProvider(
+                self._config(Path(temporary), name="openai-compatible"),
+            )
+            provider._stream_lines = lambda *_args, **_kwargs: iter([
+                'data: {"choices":[{"delta":{"content":"partial"}}]}',
+                "data: [DONE]",
+            ])
+            with self.assertRaisesRegex(HarnessError, "finish_reason"):
+                collect_stream(
+                    provider, ProviderRequest("policy", "", [], "model"),
+                )
 
     def test_complete_and_embedding_http_errors_redact_named_profile_credentials(self) -> None:
         secret = "opaque-http-error-profile-value-12345"

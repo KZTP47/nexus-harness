@@ -81,7 +81,7 @@ You choose:
 | Who does it | Any assistant found on this machine, or any model you added yourself. |
 | Which model | Leave it empty for the usual one, or name a particular model. |
 | How it is asked | One set prompt, or a conversation you can carry on. |
-| What to tell it | The prompt itself. |
+| What to tell it | The prompt itself, up to 100,000 characters. The live count keeps pasted text intact and an over-limit prompt stays in the editor with a visible error instead of being clipped. |
 
 **One set prompt** is the ordinary one: the same instructions every time, the
 run does not stop. **A conversation you can carry on** is for work nobody can

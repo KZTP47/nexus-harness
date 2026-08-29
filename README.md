@@ -13,8 +13,12 @@ checks, tells you plainly what broke, and can ask a model to fix it — all on
 your own machine.
 
 Python 3.11 or newer. The core uses only the standard library: no packages to
-install, no account to create, nothing sent anywhere unless you set that up
-yourself.
+install and no account to create. The installed Windows app already contains
+its private verification runtime. A source checkout transparently downloads
+the pinned official CPython embeddable archive from `python.org` the first time
+it must run a contained Python verification, checks its SHA-256 before use, and
+caches it for that Windows user. No project code or project data is sent with
+that download.
 
 ## Two main workspaces
 
@@ -195,26 +199,37 @@ are still documented below, but these two workspaces are the main product.
 
 The easiest route is the checksummed, versioned installer on the
 **[GitHub Releases page](https://github.com/KZTP47/nexus-harness/releases/latest)**.
-Download `Nexus-Harness-Setup-<version>.exe`, compare it with the `.sha256`
-file beside it, confirm Windows shows the expected signed publisher, and run
-it. It installs for your Windows account, creates Start menu and desktop
+Download `Nexus-Harness-Setup-<version>-UNSIGNED.exe` and the `.sha256` file
+beside it, compare the SHA-256, and run it. This first packaged release is not
+Authenticode-signed, so Windows may show an unknown-publisher warning; the
+filename and release notes say that plainly. It installs for your Windows
+account, creates Start menu and desktop
 shortcuts, and needs neither administrator access nor a separate Python.
 
 Already cloned the source? **Double-click `Install Nexus Harness.cmd`**. It
 downloads that same stable release, verifies both the published SHA-256 and
-the Windows Authenticode signature, and starts the Windows installer. It uses
-Windows' own PowerShell downloader, so a clean machine does not need Python.
-It does not disguise a browser shortcut as the desktop app.
+the release's declared signature mode, and starts the Windows installer. With
+the current explicitly unsigned release it requires both the `-UNSIGNED.exe`
+name and Windows' `NotSigned` status; it will not mistake an arbitrary signed
+file for the release. It uses Windows' own PowerShell downloader, so a clean
+machine does not need Python. It does not disguise a browser shortcut as the
+desktop app.
 
-The self-contained download is currently about 126 MiB, the unpacked app is
-about 434 MiB, and installation should have at least 600 MiB free for installed
-and temporary files. It includes a private Python 3.11 runtime and locked
+This repository is currently private. The helper reuses an existing `gh auth`
+or non-interactive Git Credential Manager login (or a process-scoped
+`GH_TOKEN`) without printing or storing the credential. If the new computer is
+not signed in to GitHub yet, sign in once or download both assets from the
+Releases page in a signed-in browser. Anonymous one-click downloads require the
+repository—or a separate distribution repository—to be public.
+
+The current 0.2.0 build is about 234 MiB to download and about 810 MiB unpacked.
+Allow at least 2 GiB free while installing so the download, temporary unpacking,
+and installed app can coexist. It includes a private Python 3.11 runtime and locked
 dependencies. Nexus does not silently auto-update. **About
 and diagnostics** shows the exact installed version and commit; install a newer
-signed version from the same Releases page when one is published. Until the
-repository's pinned publisher file names a real certificate subject, the
-double-click installer stops safely instead of accepting an arbitrary valid
-Windows signer.
+version from the same Releases page when one is published. When the repository
+pins a real publisher certificate, the same bootstrap automatically requires
+that exact valid Authenticode signer and rejects unsigned assets.
 
 Source developers who intentionally want an uninstalled browser
 window can create a development shortcut with:
@@ -266,13 +281,22 @@ cd nexus-harness
 
 The helper downloads the latest stable NSIS installer from GitHub Releases,
 requires exactly one installer and matching checksum asset, verifies both the
-checksum and Windows code signature, and only then starts it. The app is
+checksum and the release's declared signature mode, and only then starts it.
+The current release is explicitly unsigned; Windows may display its normal
+unknown-publisher warning. A future signed release must match the exact pinned
+publisher. The app is
 installed below your own account and can be removed from Windows Installed
 apps or with the repository uninstaller.
 
 It is at the top of the project with a name that says what it does, because the
 one thing somebody who has just downloaded this cannot be expected to know is
 which command to type first.
+
+For the current private repository, the helper uses an existing GitHub CLI or
+Git Credential Manager login, or `GH_TOKEN` scoped to that process. It never
+writes or echoes that credential. Without an existing login, use the Releases
+page in a signed-in browser; a private GitHub release cannot be downloaded
+anonymously.
 
 If you are developing Nexus itself and deliberately want to run this checkout
 instead of the release:
@@ -301,7 +325,7 @@ it would remove without changing anything, use
 ### The other ways
 
 ```bash
-python -m pip install .
+python -m pip install ".[test]"
 ```
 
 Or build a single self-contained file and a launcher, with no pip and no
@@ -331,6 +355,24 @@ file is theirs. Read it, then:
 ```bash
 python scripts/harness.py trust
 ```
+
+On Windows, the first long-horizon task that needs a contained Python test may
+take a little longer in an unbuilt source checkout. Nexus downloads the exact
+official CPython 3.11.9 embeddable archive over HTTPS, verifies its pinned
+SHA-256, and keeps the verified archive under the current user's local app-data
+cache. It does not install packages, download a browser, execute the cached ZIP,
+or use an arbitrary system Python. The released desktop app bundles this
+runtime and a pinned pytest runner, so installed users do not make this
+download and ordinary detected Python suites work on a clean computer. If the download is
+offline or altered, Nexus reports that verification is unavailable and runs no
+project code. A bare `pytest` command is run as `python -m pytest` by this
+engine-owned interpreter. Nexus can reuse already-prepared, pure-Python
+packages copied with the project from `.venv/Lib/site-packages`,
+`venv/Lib/site-packages`, `__pypackages__/3.11/lib`, `vendor`, or `src`; it
+never runs the project's interpreter or silently installs dependencies. Native extension
+packages need the released runtime's locked dependencies or another explicitly
+configured verification environment; Nexus does not weaken containment to make
+an incompatible package appear to pass.
 
 Browser and screenshot checks additionally need Node.js and Playwright. Every
 other kind works without them, and a browser check says so plainly instead of
@@ -473,10 +515,17 @@ that chat may change. A pair with no line between them never hears from each
 other at all. **What they said to each other** lists every answer that was
 passed, so you can read what each of them was actually given.
 
-**Set them going** acts on it. Every agent is asked about the projects it is on,
-one at a time, on its own. Then the ones allowed to talk are shown what the
-others said and asked again, to say plainly where they disagree. That order is
-the point: an agent that read the others first is not a second opinion.
+**Work until the goals are achieved** is the primary action. For every written
+project goal, Nexus opens a durable chat for two connected agents assigned to
+that project, then lets the long-horizon work engine plan, edit, test, review,
+and repair the real project. It starts the next goal only after the current one
+has deterministic verification and a verified-complete result. If a provider,
+tool, or unresolved requirement pauses the work, the exact run stays resumable
+in the lead agent's chat instead of being declared complete or silently skipped.
+
+**Get two-round advice** is the optional discussion-only action. It asks each
+agent independently, then shows connected agents what the others said and asks
+again. It deliberately does not edit or test project files.
 
 See [AGENT_BOARD.md](docs/AGENT_BOARD.md).
 
@@ -581,6 +630,10 @@ when it did not, and dim when a gate stopped the work before it got there.
 | Keep the evidence | Writes what happened into one file you can send to somebody. |
 | Ask an assistant | Keeps a provider-neutral Nexus conversation, accepts explicit file/screenshot attachments, automatically relays when connected-agent expertise would help, provides per-block code copying, and can apply an explicit bounded project-file transaction. |
 | Run another pipeline | Runs one of your saved pipelines as a single step. |
+
+AI test drafts use the provider's displayed output-token budget. A provider-
+reported incomplete answer is a visible failed step and is never saved as a
+plausible-looking partial test file.
 
 Any step can be told to try again up to five times before it gives up, which is
 usually enough for the one test that fails on a slow morning. It can wait

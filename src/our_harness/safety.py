@@ -272,7 +272,14 @@ def put_this_file_in_place(path: Path, written: str) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     beside = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.part")
-    beside.write_text(written, encoding="utf-8")
+    # ``Path.write_text`` uses platform newline translation.  Several durable
+    # stores hash the exact UTF-8 bytes before this atomic move; on Windows the
+    # implicit LF -> CRLF rewrite made a freshly written file fail its own
+    # integrity check.  Preserve the caller's exact text bytes on every OS.
+    with beside.open("w", encoding="utf-8", newline="") as writing:
+        writing.write(written)
+        writing.flush()
+        os.fsync(writing.fileno())
     # Six and a bit seconds all told. A reader really does hold the move off on
     # Windows, and four checks running side by side hold it longer than one
     # does, so the waiting is longer than it looks like it needs to be.

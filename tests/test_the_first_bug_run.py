@@ -173,7 +173,10 @@ class NothingSneaksIntoTheTopOfANoteTests(ProjectTestCase):
         header = written.split("---")[1].strip().splitlines()
         self.assertEqual(
             [line.split(":")[0] for line in header],
-            ["title", "kind", "tags", "sure", "learned", "touched", "from", "uses", "worked"],
+            [
+                "title", "kind", "tags", "sure", "learned", "touched",
+                "from", "uses", "worked", "body-characters",
+            ],
             "something wrote a line of its own into the top of the note",
         )
 

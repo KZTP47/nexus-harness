@@ -12,11 +12,12 @@ import copy
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from our_harness import pipelines
+from our_harness import pipelines, qa
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
 
@@ -39,6 +40,399 @@ class PipelineTestCase(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         (self.root / ".harness").mkdir()
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+
+
+class PipelineQaPreservationTests(PipelineTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.library = self.root / ".harness" / "pipelines"
+        self.library.mkdir()
+        self._write_definition(self.library / "mine.json", "Mine")
+        (self.library / "nested").mkdir()
+        (self.library / "nested" / "note.bin").write_bytes(b"\x00\xffkept")
+        self.case = mock.Mock(tags=("pipelines",), touches=())
+
+    @staticmethod
+    def _write_definition(path: Path, name: str) -> None:
+        definition = pipelines.a_starting_pipeline()
+        definition["name"] = name
+        path.write_text(json.dumps(definition, indent=2) + "\n", encoding="utf-8")
+
+    def test_success_restores_every_original_byte_and_removes_only_new_artifacts(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        with qa._pipeline_definitions_put_back_afterwards(
+            self.root, [self.case], "success"
+        ):
+            (self.library / "mine.json").write_text("changed", encoding="utf-8")
+            (self.library / "nested" / "note.bin").unlink()
+            (self.library / "made-by-the-check.json").write_text(
+                '{"name":"Made by the check"}', encoding="utf-8"
+            )
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        self.assertFalse((self.library / "made-by-the-check.json").exists())
+        recoveries = list(
+            (self.root / qa.WHERE_PIPELINES_ARE_COPIED).glob("*/displaced-after-interruption")
+        )
+        self.assertEqual(len(recoveries), 1)
+        self.assertEqual(
+            (recoveries[0] / "made-by-the-check.json").read_text(encoding="utf-8"),
+            '{"name":"Made by the check"}',
+        )
+
+    def test_a_normal_save_while_browser_qa_is_active_is_never_discarded(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        wrote = threading.Event()
+
+        def user_saves() -> None:
+            self._write_definition(
+                self.library / "mine.json", "Mine edited while QA runs"
+            )
+            self._write_definition(
+                self.library / "user-saved-during-qa.json", "User saved during QA"
+            )
+            wrote.set()
+
+        with qa._pipeline_definitions_put_back_afterwards(
+            self.root, [self.case], "concurrent-user-save"
+        ):
+            writer = threading.Thread(target=user_saves)
+            writer.start()
+            writer.join(timeout=2)
+            self.assertTrue(wrote.is_set())
+
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        recovery_root = self.root / qa.WHERE_PIPELINES_ARE_COPIED
+        displaced = next(recovery_root.glob("*/displaced-after-interruption"))
+        self.assertEqual(
+            json.loads((displaced / "mine.json").read_text(encoding="utf-8"))["name"],
+            "Mine edited while QA runs",
+        )
+        self.assertEqual(json.loads(
+            (displaced / "user-saved-during-qa.json").read_text(encoding="utf-8")
+        )["name"], "User saved during QA")
+
+    def test_assertion_failure_still_restores_the_library(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        with self.assertRaisesRegex(AssertionError, "visual assertion"):
+            with qa._pipeline_definitions_put_back_afterwards(
+                self.root, [self.case], "failed"
+            ):
+                (self.library / "mine.json").unlink()
+                (self.library / "failed-check.json").write_text("test", encoding="utf-8")
+                raise AssertionError("visual assertion")
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        displaced = next(
+            (self.root / qa.WHERE_PIPELINES_ARE_COPIED)
+            .glob("*/displaced-after-interruption")
+        )
+        self.assertEqual(
+            (displaced / "failed-check.json").read_text(encoding="utf-8"), "test"
+        )
+
+    def test_file_and_folder_type_changes_are_restored_exactly(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        with qa._pipeline_definitions_put_back_afterwards(
+            self.root, [self.case], "type-changes"
+        ):
+            (self.library / "mine.json").unlink()
+            (self.library / "mine.json").mkdir()
+            (self.library / "mine.json" / "artifact.txt").write_text("test", encoding="utf-8")
+            (self.library / "nested" / "note.bin").unlink()
+            (self.library / "nested").rmdir()
+            (self.library / "nested").write_text("test", encoding="utf-8")
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+
+    def test_a_library_created_entirely_by_a_check_is_removed_afterwards(self) -> None:
+        qa._remove_pipeline_tree(self.library)
+        self.assertFalse(self.library.exists())
+        with qa._pipeline_definitions_put_back_afterwards(
+            self.root, [self.case], "originally-absent"
+        ):
+            self.library.mkdir(parents=True)
+            (self.library / "only-a-check.json").write_text("test", encoding="utf-8")
+        self.assertFalse(self.library.exists())
+
+    def test_an_interrupted_transaction_is_recovered_before_the_next_check(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        abandoned = qa._begin_pipeline_preservation(self.root, "interrupted")
+        (self.library / "mine.json").write_text("left wrong", encoding="utf-8")
+        (self.library / "interrupted-check.json").write_text("test", encoding="utf-8")
+        post_crash_mine = (self.library / "mine.json").read_bytes()
+        post_crash_extra = (self.library / "interrupted-check.json").read_bytes()
+
+        with qa._pipeline_definitions_put_back_afterwards(
+            self.root, [self.case], "next"
+        ):
+            self.assertEqual(qa._pipeline_tree(self.library), before)
+
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        self.assertTrue(abandoned.exists())
+        displaced = abandoned / "displaced-after-interruption"
+        self.assertEqual((displaced / "mine.json").read_bytes(), post_crash_mine)
+        self.assertEqual(
+            (displaced / "interrupted-check.json").read_bytes(), post_crash_extra
+        )
+        journal = json.loads((abandoned / "journal.json").read_text(encoding="utf-8"))
+        self.assertEqual(journal["state"], "restored")
+        self.assertTrue(journal["keep_recovery_copy"])
+        self.assertIn("never automatically deleted", journal["recovery_note"])
+        self.assertTrue((abandoned / "RECOVERY_NOTICE.txt").is_file())
+
+    def test_transient_windows_directory_denials_retry_without_overwriting_evidence(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        transaction = qa._begin_pipeline_preservation(self.root, "transient-directory")
+        self._write_definition(self.library / "mine.json", "Changed during QA")
+        current = qa._pipeline_tree(self.library)
+        # Simulate a move which reached the destination before its journal
+        # update, but whose bytes do not match this newly observed live tree.
+        existing = transaction / "displaced-after-interruption"
+        existing.mkdir()
+        (existing / "older-evidence.txt").write_text("keep me", encoding="utf-8")
+        real_replace = qa._replace_pipeline_directory_once
+        attempts = 0
+
+        def briefly_denied(stage: Path, destination: Path) -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise PermissionError(13, "transient access denied")
+            real_replace(stage, destination)
+
+        with mock.patch.object(
+            qa, "_replace_pipeline_directory_once", side_effect=briefly_denied,
+        ), mock.patch.object(qa.time, "sleep") as slept:
+            qa._restore_pipeline_transaction(
+                self.root, transaction, preserve_displaced=True,
+            )
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(slept.call_count, 2)
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        self.assertEqual(
+            (existing / "older-evidence.txt").read_text(encoding="utf-8"), "keep me",
+        )
+        journal = qa._read_pipeline_journal(transaction)
+        placed = transaction / journal["displaced_copies"][0]["path"]
+        self.assertNotEqual(placed, existing)
+        self.assertEqual(qa._pipeline_tree(placed), current)
+
+    def test_exhausted_directory_denial_keeps_incomplete_and_later_recovers(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        transaction = qa._begin_pipeline_preservation(self.root, "denied-directory")
+        self._write_definition(self.library / "mine.json", "Exact live variant")
+        self._write_definition(self.library / "new.json", "New during QA")
+        current = qa._pipeline_tree(self.library)
+
+        with mock.patch.object(
+            qa, "_replace_pipeline_directory_once",
+            side_effect=PermissionError(13, "persistent access denied"),
+        ) as replace, mock.patch.object(qa.time, "sleep"):
+            for _attempt in range(2):
+                with self.assertRaisesRegex(qa.QaError, "exact incomplete evidence remains"):
+                    qa._restore_pipeline_transaction(
+                        self.root, transaction, preserve_displaced=True,
+                    )
+                incomplete_now = list(transaction.glob(".*.incomplete"))
+                self.assertEqual(len(incomplete_now), 1)
+                self.assertEqual(qa._pipeline_tree(incomplete_now[0]), current)
+
+        self.assertEqual(
+            replace.call_count,
+            2 * (len(qa.PIPELINE_DIRECTORY_REPLACE_RETRY_SECONDS) + 1),
+        )
+        self.assertEqual(qa._pipeline_tree(self.library), current)
+        journal = qa._read_pipeline_journal(transaction)
+        self.assertEqual(journal["state"], "prepared")
+        self.assertFalse(journal.get("displaced_copies"))
+        incomplete = list(transaction.glob(".*.incomplete"))
+        self.assertEqual(len(incomplete), 1)
+        self.assertEqual(qa._pipeline_tree(incomplete[0]), current)
+        self.assertFalse((transaction / "displaced-after-interruption").exists())
+
+        # A later product recovery verifies the deterministic staged tree
+        # again before atomically placing it. It never rewrites those bytes or
+        # creates a second full stage.
+        qa._recover_pipeline_transactions(self.root)
+
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        self.assertFalse(incomplete[0].exists())
+        recovered = qa._read_pipeline_journal(transaction)
+        self.assertEqual(recovered["state"], "restored")
+        self.assertTrue(recovered["keep_recovery_copy"])
+        displaced = transaction / recovered["displaced_copies"][0]["path"]
+        self.assertEqual(qa._pipeline_tree(displaced), current)
+
+    def test_destination_appearing_during_retry_is_never_overwritten(self) -> None:
+        transaction = qa._begin_pipeline_preservation(self.root, "destination-race")
+        self._write_definition(self.library / "mine.json", "Current live bytes")
+        current = qa._pipeline_tree(self.library)
+        expected = qa._pipeline_manifest(*current)
+        expected["original_exists"] = True
+        destination = transaction / "displaced-after-interruption"
+        stage = transaction / ".displaced-after-interruption.incomplete"
+
+        def destination_appears(_stage: Path, where: Path) -> None:
+            where.mkdir()
+            (where / "somebody-elses-evidence.txt").write_text(
+                "do not overwrite", encoding="utf-8",
+            )
+            raise PermissionError(13, "access denied after destination appeared")
+
+        with mock.patch.object(
+            qa, "_replace_pipeline_directory_once", side_effect=destination_appears,
+        ), mock.patch.object(qa.time, "sleep") as slept:
+            with self.assertRaisesRegex(qa.QaError, "did not overwrite either"):
+                qa._save_displaced_pipeline_copy(
+                    transaction, destination, current, expected,
+                )
+
+        slept.assert_not_called()
+        self.assertTrue(stage.is_dir())
+        self.assertEqual(qa._pipeline_tree(stage), current)
+        self.assertEqual(
+            (destination / "somebody-elses-evidence.txt").read_text(encoding="utf-8"),
+            "do not overwrite",
+        )
+        self.assertEqual(qa._pipeline_tree(self.library), current)
+
+    def test_loading_inventory_recovers_a_stale_journal_without_waiting_for_qa(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        abandoned = qa._begin_pipeline_preservation(self.root, "stale-inventory")
+        self._write_definition(self.library / "mine.json", "Edited after crash")
+        self._write_definition(
+            self.library / "saved-after-crash.json", "Saved after crash"
+        )
+
+        saved, problems = pipelines.saved_inventory(self.config)
+
+        self.assertEqual(saved, ["Mine"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn(str(abandoned), problems[0])
+        self.assertIn("copy or import", problems[0])
+        self.assertIn("RECOVERY_NOTICE.txt", problems[0])
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        self.assertEqual(json.loads(
+            (abandoned / "displaced-after-interruption" / "saved-after-crash.json")
+            .read_text(encoding="utf-8")
+        )["name"], "Saved after crash")
+
+    def test_inventory_refresh_skips_active_qa_lock_without_blocking(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        abandoned = qa._begin_pipeline_preservation(self.root, "active-lock")
+        self._write_definition(self.library / "mine.json", "Temporary QA view")
+        outcome: list[tuple[list[str], list[str]]] = []
+
+        def refresh() -> None:
+            outcome.append(pipelines.saved_inventory(self.config))
+
+        started = time.monotonic()
+        with qa._pipeline_preservation_file_lock(self.root):
+            reader = threading.Thread(target=refresh)
+            reader.start()
+            reader.join(timeout=1)
+            self.assertFalse(reader.is_alive(), "inventory waited for active browser QA")
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(outcome, [(["Temporary QA view"], [])])
+        self.assertNotEqual(qa._pipeline_tree(self.library), before)
+        saved, problems = pipelines.saved_inventory(self.config)
+        self.assertEqual(saved, ["Mine"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn(str(abandoned), problems[0])
+        self.assertEqual(qa._pipeline_tree(self.library), before)
+        self.assertTrue((abandoned / "displaced-after-interruption").is_dir())
+
+    def test_recovery_retention_is_bounded_without_evicting_old_evidence(self) -> None:
+        retained = []
+        for number in range(qa.MAX_RETAINED_PIPELINE_RECOVERIES):
+            transaction = qa._begin_pipeline_preservation(self.root, f"held-{number}")
+            (self.library / "mine.json").write_text(f"variant {number}", encoding="utf-8")
+            qa._restore_pipeline_transaction(
+                self.root, transaction, preserve_displaced=True
+            )
+            retained.append(transaction)
+        victim = qa._begin_pipeline_preservation(self.root, "one-too-many")
+        (self.library / "mine.json").write_text("must stay live", encoding="utf-8")
+        current = qa._pipeline_tree(self.library)
+
+        with self.assertRaisesRegex(qa.QaError, "maximum of 20"):
+            qa._restore_pipeline_transaction(
+                self.root, victim, preserve_displaced=True
+            )
+
+        self.assertEqual(qa._pipeline_tree(self.library), current)
+        self.assertTrue(all(one.exists() for one in retained))
+
+    def test_retained_post_crash_bytes_are_checksum_validated(self) -> None:
+        transaction = qa._begin_pipeline_preservation(self.root, "retained-checksum")
+        (self.library / "mine.json").write_text("post-crash change", encoding="utf-8")
+        qa._restore_pipeline_transaction(
+            self.root, transaction, preserve_displaced=True
+        )
+        (transaction / "displaced-after-interruption" / "mine.json").write_text(
+            "tampered", encoding="utf-8"
+        )
+        live = qa._pipeline_tree(self.library)
+
+        journal = qa._read_pipeline_journal(transaction)
+        with self.assertRaisesRegex(qa.QaError, "failed its checksum"):
+            qa._validate_displaced_pipeline_copies(transaction, journal)
+
+        self.assertEqual(qa._pipeline_tree(self.library), live)
+
+    def test_inventory_does_not_read_retained_displaced_payloads(self) -> None:
+        transaction = qa._begin_pipeline_preservation(self.root, "cheap-inventory")
+        self._write_definition(self.library / "mine.json", "Post-QA bytes")
+        qa._restore_pipeline_transaction(
+            self.root, transaction, preserve_displaced=True
+        )
+        real_tree = qa._pipeline_tree
+
+        def no_displaced_payload_reads(path: Path):
+            if any(part.startswith("displaced-after-interruption") for part in path.parts):
+                raise AssertionError(f"inventory traversed retained payloads at {path}")
+            return real_tree(path)
+
+        with mock.patch.object(qa, "_pipeline_tree", side_effect=no_displaced_payload_reads):
+            saved, problems = pipelines.saved_inventory(self.config)
+
+        self.assertEqual(saved, ["Mine"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn(str(transaction), problems[0])
+
+    def test_a_corrupt_recovery_copy_fails_closed_before_touching_live_files(self) -> None:
+        transaction = qa._begin_pipeline_preservation(self.root, "corrupt")
+        (transaction / "tree" / "mine.json").write_text("corrupt", encoding="utf-8")
+        (self.library / "mine.json").write_text("current uncertain state", encoding="utf-8")
+        current = qa._pipeline_tree(self.library)
+
+        with self.assertRaisesRegex(qa.QaError, "failed its checksum"):
+            qa._recover_pipeline_transactions(self.root)
+
+        self.assertEqual(qa._pipeline_tree(self.library), current)
+        self.assertTrue(transaction.exists(), "the recovery evidence must remain")
+
+    def test_checks_unrelated_to_automations_do_not_snapshot_or_rewrite_them(self) -> None:
+        unrelated = mock.Mock(tags=("ui",), touches=("settings",))
+        with qa._pipeline_definitions_put_back_afterwards(
+            self.root, [unrelated], "unrelated"
+        ):
+            (self.library / "mine.json").write_text("user change", encoding="utf-8")
+        self.assertEqual(
+            (self.library / "mine.json").read_text(encoding="utf-8"), "user change"
+        )
+
+    def test_byte_identical_pipeline_qa_leaves_no_recovery_evidence(self) -> None:
+        before = qa._pipeline_tree(self.library)
+        with qa._pipeline_definitions_put_back_afterwards(
+            self.root, [self.case], "clean"
+        ):
+            self.assertEqual(qa._pipeline_tree(self.library), before)
+        recovery_root = self.root / qa.WHERE_PIPELINES_ARE_COPIED
+        self.assertEqual(
+            list(recovery_root.iterdir()) if recovery_root.is_dir() else [], []
+        )
 
 
 class PipelineFullScreenViewTests(unittest.TestCase):
@@ -70,22 +464,111 @@ class PipelineFullScreenViewTests(unittest.TestCase):
     def test_saved_automations_restore_visibly_and_disclose_unreadable_files(self) -> None:
         for element in ("pipelineSavedCount", "pipelineSavedProblems", "pipelineList"):
             self.assertIn(f'id="{element}"', self.markup)
-        self.assertIn("said.selected_name || requestedName", self.script)
+        self.assertIn(
+            "pipelineSaved.includes(requestedName) ? requestedName", self.script,
+        )
+        self.assertIn("/api/pipelines?recover_missing=1", self.script)
         self.assertIn("pipelineSavedProblems = said.saved_problems || []", self.script)
-        self.assertIn("saved JSON file", self.script)
+        self.assertIn("automation library notice", self.script)
         self.assertIn("name === pipelineSavedName", self.script)
         self.assertIn("pipelineCannotRun = String(said.cannot_run", self.script)
         self.assertIn('$("pipelineRun").disabled = Boolean(pipelineCannotRun)', self.script)
+        self.assertIn('$("pipelineDelete").disabled = !hasSavedSelection', self.script)
+
+    def test_delete_targets_only_the_exact_saved_selection_and_stale_empty_state_clears(self) -> None:
+        self.assertIn(
+            'id="pipelineDelete" class="danger" type="button" disabled', self.markup
+        )
+        refresh = self.script[self.script.index("async function refreshPipelines"):
+                              self.script.index("async function refreshAgentContract")]
+        self.assertIn("const resolvedName = pipelineSaved.length ?", refresh)
+        self.assertIn("pipelineSaved.includes(said.selected_name)", refresh)
+
+        delete = self.script[self.script.index("async function deletePipeline"):
+                             self.script.index("async function newPipeline")]
+        self.assertIn("const name = pipelineSavedName", delete)
+        self.assertIn("!pipelineSaved.includes(name)", delete)
+        self.assertIn('pipelineSavedName = ""', delete)
+        self.assertNotIn('$("pipelineName").value.trim()', delete)
 
     def test_visual_automations_have_intuitive_json_import_and_export_controls(self) -> None:
         for element in ("pipelineImport", "pipelineExport", "pipelineImportFile"):
             self.assertIn(f'id="{element}"', self.markup)
         self.assertIn('accept="application/json,.json"', self.markup)
+        self.assertIn('aria-label="Choose an automation JSON file to import"', self.markup)
         self.assertIn('request("/api/pipelines/import"', self.script)
         self.assertIn("/api/pipelines/export?name=", self.script)
         self.assertIn("nexus-harness.visual-automation", self.script)
         self.assertIn("is already saved. Choose a name for the imported copy", self.script)
         self.assertIn("Nothing was imported", self.script)
+
+    def test_renderer_refuses_non_utf8_automation_before_json_or_server_import(self) -> None:
+        imported = self.script[self.script.index("async function importPipeline"):
+                               self.script.index("async function exportPipeline")]
+        decoder = imported.index('new TextDecoder("utf-8", {fatal: true})')
+        parsed = imported.index("JSON.parse(written)")
+        sent = imported.index('request("/api/pipelines/import"')
+        self.assertLess(decoder, parsed)
+        self.assertLess(parsed, sent)
+        self.assertIn(
+            "That automation file is not valid UTF-8. Nothing was imported.", imported,
+        )
+
+    def test_unsaved_changes_are_visible_and_guard_every_drawing_replacement(self) -> None:
+        for element in (
+            "pipelineDirtyState", "pipelineUnsavedDialog", "pipelineUnsavedSave",
+            "pipelineUnsavedWhy", "pipelineUnsavedSaid",
+        ):
+            self.assertIn(f'id="{element}"', self.markup)
+        for choice in ('value="cancel"', 'value="discard"', "Save and continue"):
+            self.assertIn(choice, self.markup)
+        self.assertIn("function canonicalPipelineValue", self.script)
+        self.assertIn("function currentPipelineSnapshot", self.script)
+        self.assertIn('status.textContent = dirty ? "Unsaved changes" : "All changes saved"',
+                      self.script)
+
+        guarded = self.script[
+            self.script.index("function askHowToReplaceUnsavedPipeline"):
+            self.script.index("function applyAgentRunPanelPreference")
+        ]
+        self.assertNotIn("window.confirm", guarded)
+        self.assertNotIn("pipeline =", guarded,
+                         "Cancel must not alter the current automation object")
+        self.assertIn('choice === "save" || choice === "discard"', guarded)
+
+        opened = self.script[self.script.index("async function openSavedPipeline"):
+                             self.script.index("function renderPipelineStarters")]
+        self.assertLess(opened.index("mayReplacePipeline"),
+                        opened.index("refreshPipelines"))
+        created = self.script[self.script.index("async function newPipeline"):
+                              self.script.index("function pipelineImportName")]
+        self.assertLess(created.index("mayReplacePipeline"),
+                        created.index('/api/pipelines/create'))
+        starter = self.script[self.script.index("async function usePipelineStarter"):
+                              self.script.index("function renderPipelinePalette")]
+        self.assertLess(starter.index("mayReplacePipeline"),
+                        starter.index('/api/pipelines/starter'))
+
+    def test_import_saves_to_the_library_without_replacing_an_unsaved_drawing(self) -> None:
+        imported = self.script[self.script.index("async function importPipeline"):
+                               self.script.index("async function exportPipeline")]
+        self.assertIn('/api/pipelines/import', imported)
+        self.assertIn("pipelineSaved = said.saved || []", imported)
+        self.assertNotIn("pipeline = said.pipeline", imported)
+        self.assertNotIn("pipelineSavedName =", imported)
+        self.assertIn("The current drawing was not changed", imported)
+        self.assertIn(
+            'refreshPipelines(undefined, {replaceDrawing: !pipelineBaselineReady})',
+            self.script,
+        )
+        self.assertIn('refreshPipelines(name, {replaceDrawing: false})', self.script)
+        refresh = self.script[self.script.index("async function refreshPipelines"):
+                              self.script.index("async function refreshAgentContract")]
+        self.assertIn(
+            "if (pipelineSavedName && pipelineSaved.includes(pipelineSavedName))",
+            refresh,
+        )
+        self.assertIn("markPipelineDrawingUnsaved();", refresh)
 
     def test_pipeline_full_screen_uses_the_native_window_and_is_a_toggle(self) -> None:
         self.assertIn("window.harnessDesktop?.setFullScreen", self.script)
@@ -264,6 +747,25 @@ class ReadingOneTests(PipelineTestCase):
         with self.assertRaises(HarnessError):
             pipelines.read_it(drawn)
 
+    def test_ai_instructions_at_the_disclosed_boundary_are_preserved_exactly(self) -> None:
+        exact = "x" * pipelines.AI_UNIT_INSTRUCTION_CHARACTERS
+        drawn = a_line("start", "ai_unit_test")
+        drawn["nodes"][1]["settings"] = {
+            "instructions": exact,
+            "write_to": "generated_test.py",
+        }
+        read = pipelines.read_it(drawn)
+        self.assertEqual(read["nodes"][1]["settings"]["instructions"], exact)
+
+    def test_oversized_ai_instructions_are_rejected_not_truncated(self) -> None:
+        drawn = a_line("start", "ai_unit_test")
+        drawn["nodes"][1]["settings"] = {
+            "instructions": "x" * (pipelines.AI_UNIT_INSTRUCTION_CHARACTERS + 1),
+            "write_to": "generated_test.py",
+        }
+        with self.assertRaisesRegex(pipelines.PipelineError, "did not truncate"):
+            pipelines.read_it(drawn)
+
     def test_a_name_that_would_climb_out_of_the_folder_is_refused(self) -> None:
         for bad in ("../escape", "..", "/etc/passwd", "a/b", "", " ", "x" * 100):
             with self.subTest(bad=bad):
@@ -387,6 +889,19 @@ class MovingSavedAutomationsTests(PipelineTestCase):
             pipelines.import_document(self.config, '{"name": "Half written"')
         self.assertEqual(list(self.root.rglob("*")), before)
         self.assertEqual(pipelines.saved_ones(self.config), [])
+
+    def test_escaped_lone_surrogate_import_is_a_domain_error_and_changes_no_inventory(self) -> None:
+        definition = pipelines.a_starting_pipeline()
+        definition["name"] = "Broken Unicode"
+        definition["nodes"][0]["label"] = "lone surrogate: \ud800"
+        written = json.dumps(definition, ensure_ascii=True)
+        before = pipelines.saved_inventory(self.config)
+
+        with self.assertRaisesRegex(pipelines.PipelineError, "lone Unicode surrogate"):
+            pipelines.import_document(self.config, written)
+
+        self.assertEqual(pipelines.saved_inventory(self.config), before)
+        self.assertEqual(list(pipelines.folder(self.config).glob("*.json")), [])
 
     def test_duplicate_import_never_overwrites_and_an_explicit_new_name_works(self) -> None:
         original = pipelines.a_starting_pipeline()
@@ -865,7 +1380,7 @@ class WhatEachKindDoesTests(PipelineTestCase):
         # is exactly where every test runner looks, so a pipeline could have a
         # model write a "test" and have the very next step of the same run
         # execute it. Nothing runs what is in the drafts folder.
-        answer = mock.Mock(text="print('hello')")
+        answer = mock.Mock(text="print('hello')", finish_reason="stop")
         with mock.patch("our_harness.providers.create_provider",
                         return_value=mock.Mock(complete=mock.Mock(return_value=answer))):
             passed, said, _detail = pipelines._run_ai_unit_test(
@@ -879,6 +1394,124 @@ class WhatEachKindDoesTests(PipelineTestCase):
         landed = self.root / ".harness" / "pipelines" / "drafts" / "basket_test.py"
         self.assertTrue(landed.is_file())
         self.assertIn("move it into your tests yourself", said)
+
+    def test_the_ai_node_sends_all_200k_instruction_characters_to_the_provider(self) -> None:
+        exact = "x" * pipelines.AI_UNIT_INSTRUCTION_CHARACTERS
+        complete = mock.Mock(return_value=mock.Mock(text="assert True", finish_reason="stop"))
+        with mock.patch(
+            "our_harness.providers.create_provider",
+            return_value=mock.Mock(complete=complete),
+        ):
+            passed, said, _detail = pipelines._run_ai_unit_test(
+                self.config,
+                {"id": "ai", "label": "AI", "settings": {
+                    "instructions": exact,
+                    "write_to": "full_instruction_test.py",
+                }},
+                None,
+            )
+        self.assertTrue(passed, said)
+        request = complete.call_args.args[0]
+        self.assertEqual(request.messages[0]["content"], exact)
+        self.assertEqual(len(request.messages[0]["content"]), len(exact))
+        self.assertEqual(
+            request.max_output_tokens,
+            self.config.get("provider.max_output_tokens"),
+        )
+
+    def test_exact_200k_instructions_keep_whitespace_at_both_edges_to_provider(self) -> None:
+        exact = "\n\t  " + (
+            "x" * (pipelines.AI_UNIT_INSTRUCTION_CHARACTERS - 8)
+        ) + "  \t\n"
+        self.assertEqual(len(exact), pipelines.AI_UNIT_INSTRUCTION_CHARACTERS)
+        drawn = a_line("start", "ai_unit_test")
+        drawn["nodes"][1]["settings"] = {
+            "instructions": exact,
+            "write_to": "edge_whitespace_test.py",
+        }
+        node = pipelines.read_it(drawn)["nodes"][1]
+        complete = mock.Mock(return_value=mock.Mock(text="assert True", finish_reason="stop"))
+
+        with mock.patch(
+            "our_harness.providers.create_provider",
+            return_value=mock.Mock(complete=complete),
+        ):
+            passed, said, _detail = pipelines._run_ai_unit_test(
+                self.config, node, None,
+            )
+
+        self.assertTrue(passed, said)
+        handed_to_provider = complete.call_args.args[0].messages[0]["content"]
+        self.assertEqual(handed_to_provider, exact)
+        self.assertTrue(handed_to_provider.startswith("\n\t  "))
+        self.assertTrue(handed_to_provider.endswith("  \t\n"))
+
+    def test_the_ai_node_never_saves_a_provider_truncated_test_file(self) -> None:
+        answer = mock.Mock(text="def test_half():\n    assert ", finish_reason="length")
+        with mock.patch(
+            "our_harness.providers.create_provider",
+            return_value=mock.Mock(complete=mock.Mock(return_value=answer)),
+        ):
+            passed, said, detail = pipelines._run_ai_unit_test(
+                self.config,
+                {"id": "ai", "label": "AI", "settings": {
+                    "instructions": "write a comprehensive suite",
+                    "write_to": "not_partial_test.py",
+                }},
+                None,
+            )
+        self.assertFalse(passed)
+        self.assertIn("incomplete", said.lower())
+        self.assertIn("did not save", detail)
+        self.assertFalse(
+            (self.root / ".harness" / "pipelines" / "drafts" / "not_partial_test.py").exists()
+        )
+
+    def test_the_ai_node_never_saves_an_unknown_nonterminal_response(self) -> None:
+        answer = mock.Mock(
+            text="def test_partial():\n    assert ", finish_reason="unknown",
+        )
+        with mock.patch(
+            "our_harness.providers.create_provider",
+            return_value=mock.Mock(complete=mock.Mock(return_value=answer)),
+        ):
+            passed, said, detail = pipelines._run_ai_unit_test(
+                self.config,
+                {"id": "ai", "label": "AI", "settings": {
+                    "instructions": "write a complete suite",
+                    "write_to": "unknown_partial.py",
+                }},
+                None,
+            )
+        self.assertFalse(passed)
+        self.assertIn("incomplete", said.lower())
+        self.assertIn("explicit successful completion", detail)
+        self.assertFalse(
+            (self.root / ".harness" / "pipelines" / "drafts" / "unknown_partial.py").exists()
+        )
+
+    def test_the_ai_node_never_infers_success_when_completion_reason_is_missing(self) -> None:
+        from our_harness.models import ProviderResponse
+
+        answer = ProviderResponse(text="def test_partial():\n    assert ")
+        with mock.patch(
+            "our_harness.providers.create_provider",
+            return_value=mock.Mock(complete=mock.Mock(return_value=answer)),
+        ):
+            passed, said, detail = pipelines._run_ai_unit_test(
+                self.config,
+                {"id": "ai", "label": "AI", "settings": {
+                    "instructions": "write a complete suite",
+                    "write_to": "missing_reason_partial.py",
+                }},
+                None,
+            )
+        self.assertFalse(passed)
+        self.assertIn("incomplete", said.lower())
+        self.assertIn("no completion reason", detail)
+        self.assertFalse(
+            (self.root / ".harness" / "pipelines" / "drafts" / "missing_reason_partial.py").exists()
+        )
 
     def test_the_ai_node_refuses_a_path_and_so_cannot_choose_a_folder(self) -> None:
         for nowhere in ("tests/test_basket.py", "src/app.py", "../outside.js",
@@ -900,7 +1533,7 @@ class WhatEachKindDoesTests(PipelineTestCase):
         # Every runner this harness knows finds tests by walking the project;
         # the harness's own folder is not part of that walk.
         self.assertTrue(pipelines.DRAFTS.startswith(".harness/"))
-        answer = mock.Mock(text="print('hello')")
+        answer = mock.Mock(text="print('hello')", finish_reason="stop")
         with mock.patch("our_harness.providers.create_provider",
                         return_value=mock.Mock(complete=mock.Mock(return_value=answer))):
             pipelines._run_ai_unit_test(
@@ -925,7 +1558,9 @@ class WhatEachKindDoesTests(PipelineTestCase):
         (tests / "test_real.py").write_text(
             "def test_one():\n    assert True\n", encoding="utf-8"
         )
-        answer = mock.Mock(text="import os\nos.system('echo pwned')")
+        answer = mock.Mock(
+            text="import os\nos.system('echo pwned')", finish_reason="stop",
+        )
         drawn = {
             "name": "Draft then test",
             "nodes": [
@@ -969,7 +1604,9 @@ class WhatEachKindDoesTests(PipelineTestCase):
         node = {"id": "ai", "label": "AI", "settings": {
             "instructions": "write a test", "write_to": "made.js",
         }}
-        answer = mock.Mock(text="```js\nconsole.log('hello');\n```")
+        answer = mock.Mock(
+            text="```js\nconsole.log('hello');\n```", finish_reason="stop",
+        )
         with mock.patch("our_harness.providers.create_provider",
                         return_value=mock.Mock(complete=mock.Mock(return_value=answer))):
             passed, said, _detail = pipelines._run_ai_unit_test(self.config, node, None)

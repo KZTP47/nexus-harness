@@ -4,6 +4,7 @@ import importlib.util
 import tempfile
 import unittest
 import json
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -15,6 +16,13 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC and SPEC.loader
 installer = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(installer)
+
+BUILD_SPEC = importlib.util.spec_from_file_location(
+    "nexus_build_info", ROOT / "scripts" / "prepare_build_info.py"
+)
+assert BUILD_SPEC and BUILD_SPEC.loader
+build_info = importlib.util.module_from_spec(BUILD_SPEC)
+BUILD_SPEC.loader.exec_module(build_info)
 
 
 class ReleaseInstallerTests(unittest.TestCase):
@@ -47,6 +55,47 @@ class ReleaseInstallerTests(unittest.TestCase):
             with self.assertRaises(installer.InstallError):
                 installer._download("https://example.com/setup.exe", Path(folder) / "x", 100)
 
+    def test_existing_private_repository_token_is_sent_without_logging(self):
+        with mock.patch.object(installer, "_github_token", return_value="private-token"):
+            request = installer._request(
+                "https://api.github.com/repos/KZTP47/nexus-harness/releases/assets/42",
+                accept="application/octet-stream",
+            )
+        self.assertEqual(request.get_header("Authorization"), "Bearer private-token")
+        self.assertEqual(request.get_header("Accept"), "application/octet-stream")
+        self.assertNotIn("private-token", installer.__doc__ or "")
+
+    def test_redirect_validation_happens_before_follow_and_strips_cross_host_auth(self):
+        handler = installer._SafeGitHubRedirects()
+        original = installer.urllib.request.Request(
+            "https://api.github.com/repos/KZTP47/nexus-harness/releases/assets/42",
+            headers={"Authorization": "Bearer private-token"},
+        )
+        redirected = handler.redirect_request(
+            original, None, 302, "Found", {},
+            "https://release-assets.githubusercontent.com/nexus/setup.exe",
+        )
+        self.assertIsNotNone(redirected)
+        self.assertIsNone(redirected.get_header("Authorization"))
+        with self.assertRaises(installer.InstallError):
+            handler.redirect_request(
+                original, None, 302, "Found", {},
+                "https://attacker.example/collect-token",
+            )
+
+    def test_authenticated_asset_download_uses_the_release_asset_api(self):
+        asset = {
+            "url": "https://api.github.com/repos/KZTP47/nexus-harness/releases/assets/42",
+            "browser_download_url": "https://github.com/KZTP47/nexus-harness/releases/download/v0.2.0/x.exe",
+        }
+        self.assertEqual(
+            installer._asset_download_url(asset, authenticated=True), asset["url"]
+        )
+        self.assertEqual(
+            installer._asset_download_url(asset, authenticated=False),
+            asset["browser_download_url"],
+        )
+
     def test_windows_signature_must_be_valid_before_execution(self):
         valid = mock.Mock(returncode=0, stdout=json.dumps({
             "Status": "Valid", "Subject": "CN=Nexus Publisher", "Message": "",
@@ -63,6 +112,32 @@ class ReleaseInstallerTests(unittest.TestCase):
         with mock.patch.object(installer.subprocess, "run", return_value=invalid):
             with self.assertRaises(installer.InstallError):
                 installer._authenticode_signer(Path("Nexus.exe"), "CN=Nexus Publisher")
+            self.assertEqual(
+                installer._authenticode_signer(Path("Nexus.exe"), None),
+                "SHA-256 verified; not Authenticode-signed",
+            )
+
+    def test_checksum_only_mode_rejects_an_unexpected_signature(self):
+        signed = mock.Mock(returncode=0, stdout=json.dumps({
+            "Status": "Valid", "Subject": "CN=Unknown", "Message": "",
+        }), stderr="")
+        with mock.patch.object(installer.subprocess, "run", return_value=signed):
+            with self.assertRaises(installer.InstallError):
+                installer._authenticode_signer(Path("Nexus.exe"), None)
+
+    def test_tagged_unsigned_build_identifies_itself_as_a_release(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "build-info.json"
+            with (
+                mock.patch.object(build_info, "OUTPUT", output),
+                mock.patch.object(build_info, "git", side_effect=["abc123", ""]),
+                mock.patch.dict(os.environ, {
+                    "NEXUS_UNSIGNED_RELEASE": "1", "NEXUS_SIGNED_BUILD": "",
+                }),
+            ):
+                self.assertEqual(build_info.main(), 0)
+            value = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(value["build_kind"], "unsigned release")
 
     def test_clean_machine_release_and_first_run_contracts_are_wired(self):
         workflow = (ROOT / ".github" / "workflows" / "windows-release.yml").read_text(encoding="utf-8")
@@ -76,6 +151,10 @@ class ReleaseInstallerTests(unittest.TestCase):
         self.assertIn("Get-FileHash -Algorithm SHA256", workflow)
         self.assertNotRegex(workflow, r"uses:\s+[^\s]+@v\d")
         self.assertIn("WINDOWS_CERTIFICATE_BASE64", workflow)
+        self.assertIn("NEXUS_UNSIGNED_RELEASE", workflow)
+        self.assertIn("explicitly unsigned installer", workflow)
+        self.assertIn("Authenticode configuration is partial", workflow)
+        self.assertIn("publisher is pinned", workflow)
         self.assertIn("Refusing to replace or append assets", workflow)
         self.assertIn("UNSIGNED-DEV", workflow)
         self.assertIn("Finish setup before starting", panel)
@@ -93,6 +172,11 @@ class ReleaseInstallerTests(unittest.TestCase):
         self.assertRegex(browser_lock["chromium"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertIn("Get-AuthenticodeSignature", powershell_installer)
         self.assertIn("expectedPublisher", powershell_installer)
+        self.assertIn("-UNSIGNED", powershell_installer)
+        self.assertIn("SHA-256 verified", powershell_installer)
+        self.assertIn("credential fill", powershell_installer)
+        self.assertIn("GH_TOKEN", powershell_installer)
+        self.assertIn("$installers[0].url", powershell_installer)
         self.assertTrue((ROOT / "release" / "windows-authenticode-publisher.txt").is_file())
         self.assertTrue((ROOT / "THIRD_PARTY_NOTICES.md").is_file())
         notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")

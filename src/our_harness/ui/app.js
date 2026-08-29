@@ -3,6 +3,12 @@
 const $ = (id) => document.getElementById(id);
 const svgNS = "http://www.w3.org/2000/svg";
 const agentTypes = new Set(["planner", "coder", "evaluator", "merge"]);
+const SYSTEM_PROMPT_CHARACTER_LIMIT = 100000;
+const VAULT_BODY_CHARACTER_LIMIT = 200000;
+const AGENT_JOB_CHARACTER_LIMIT = 100000;
+const BOARD_TASK_CHARACTER_LIMIT = 200000;
+const SHARED_PAGE_CHARACTER_LIMIT = 200000;
+const PIPELINE_AI_INSTRUCTION_CHARACTER_LIMIT = 200000;
 let token = "";
 let graph = {schema_version: 2, name: "Untitled", entry: "", nodes: [], edges: []};
 let template = null;
@@ -29,6 +35,76 @@ let nodeStatuses = new Map();
 let lastRunAnnouncementAt = 0;
 let lastLiveDataRefreshAt = 0;
 let nexusProjectName = "this project";
+
+function systemPromptCharacters(value) {
+  // Array.from counts Unicode code points as Python len() does, so the count
+  // shown beside the field and the backend decision cannot disagree on emoji.
+  return Array.from(String(value || "")).length;
+}
+
+function renderSystemPromptCount(fieldId, countId) {
+  const field = $(fieldId);
+  const count = $(countId);
+  const length = systemPromptCharacters(field.value);
+  const over = Math.max(0, length - SYSTEM_PROMPT_CHARACTER_LIMIT);
+  count.classList.toggle("over-limit", Boolean(over));
+  count.textContent = over
+    ? `${length.toLocaleString()} / ${SYSTEM_PROMPT_CHARACTER_LIMIT.toLocaleString()} characters — ${over.toLocaleString()} over the limit. Nothing was clipped; shorten the prompt to save it.`
+    : `${length.toLocaleString()} / ${SYSTEM_PROMPT_CHARACTER_LIMIT.toLocaleString()} characters. Text is never clipped.`;
+  if (over) field.setAttribute("aria-invalid", "true");
+  else field.removeAttribute("aria-invalid");
+  return over;
+}
+
+function systemPromptProblem(fieldId, countId) {
+  const over = renderSystemPromptCount(fieldId, countId);
+  if (!over) return "";
+  const length = systemPromptCharacters($(fieldId).value);
+  return `This system prompt is ${length.toLocaleString()} characters; the disclosed limit is ${SYSTEM_PROMPT_CHARACTER_LIMIT.toLocaleString()}. Nexus did not truncate it. Shorten it by ${over.toLocaleString()} characters and try again.`;
+}
+
+function renderDisclosedTextCount(fieldId, countId, limit, label) {
+  const field = $(fieldId);
+  const count = $(countId);
+  if (!field || !count) return 0;
+  const length = systemPromptCharacters(field.value);
+  const over = Math.max(0, length - limit);
+  count.classList.toggle("over-limit", Boolean(over));
+  count.textContent = over
+    ? `${length.toLocaleString()} / ${limit.toLocaleString()} characters — ${over.toLocaleString()} over the limit. Nothing was clipped; shorten ${label} to save it.`
+    : `${length.toLocaleString()} / ${limit.toLocaleString()} characters. Text and line breaks are never clipped.`;
+  if (over) field.setAttribute("aria-invalid", "true");
+  else field.removeAttribute("aria-invalid");
+  return over;
+}
+
+function disclosedTextProblem(fieldId, countId, limit, label) {
+  const over = renderDisclosedTextCount(fieldId, countId, limit, label);
+  if (!over) return "";
+  const length = systemPromptCharacters($(fieldId).value);
+  return `${label[0].toUpperCase()}${label.slice(1)} is ${length.toLocaleString()} characters; the disclosed limit is ${limit.toLocaleString()}. Nexus did not truncate it. Shorten it by ${over.toLocaleString()} characters and try again.`;
+}
+
+function renderVaultBodyCount() {
+  const field = $("vaultFormBody");
+  const count = $("vaultFormBodyCount");
+  const length = systemPromptCharacters(field.value);
+  const over = Math.max(0, length - VAULT_BODY_CHARACTER_LIMIT);
+  count.classList.toggle("over-limit", Boolean(over));
+  count.textContent = over
+    ? `${length.toLocaleString()} / ${VAULT_BODY_CHARACTER_LIMIT.toLocaleString()} characters — ${over.toLocaleString()} over the limit. Nothing was clipped; shorten the note to save it.`
+    : `${length.toLocaleString()} / ${VAULT_BODY_CHARACTER_LIMIT.toLocaleString()} characters. Text is never clipped.`;
+  if (over) field.setAttribute("aria-invalid", "true");
+  else field.removeAttribute("aria-invalid");
+  return over;
+}
+
+function vaultBodyProblem() {
+  const over = renderVaultBodyCount();
+  if (!over) return "";
+  const length = systemPromptCharacters($("vaultFormBody").value);
+  return `This note is ${length.toLocaleString()} characters; the disclosed limit is ${VAULT_BODY_CHARACTER_LIMIT.toLocaleString()}. Nexus did not truncate it. Shorten it by ${over.toLocaleString()} characters and try again.`;
+}
 
 function announce(message, urgent = false) {
   const target = urgent ? $("liveAlert") : $("liveStatus");
@@ -518,9 +594,11 @@ function openAgentDialog(type = "planner", x = 360, y = 300, invoker = document.
   dialogPosition = {x, y}; dialogInvoker = invoker;
   $("agentDialogTitle").textContent = type === "merge" ? "Add merge agent" : "Add agent";
   $("agentType").value = type; $("agentLabel").value = `${type[0].toUpperCase()}${type.slice(1)} ${nextId}`; $("agentRoleName").value = type === "merge" ? "Findings synthesizer" : `${type[0].toUpperCase()}${type.slice(1)} agent`; $("agentPrompt").value = "";
+  renderSystemPromptCount("agentPrompt", "agentPromptCount");
   fillAgentSelect($("agentRef")); fillProviderSelect($("agentProvider")); updateModelSuggestions($("agentProvider").value, $("agentModel")); renderCapabilityChecks($("agentCapabilities"), type === "coder" ? ["workspace.read", "workspace.write"] : ["workspace.read"]);
   $("agentMergeFields").hidden = type !== "merge"; $("agentFormError").hidden = true; $("agentFormError").replaceChildren();
   for (const field of $("agentForm").querySelectorAll("[aria-invalid]")) { field.removeAttribute("aria-invalid"); field.removeAttribute("aria-describedby"); }
+  $("agentPrompt").setAttribute("aria-describedby", "agentPromptCount");
   $("agentDialog").showModal(); $("agentDialogTitle").focus();
 }
 function closeAgentDialog() { $("agentDialog").close(); dialogInvoker?.focus?.(); }
@@ -536,10 +614,11 @@ function applyAgentAssignment(select, providerSelect, modelInput, roleInput, cap
 function submitAgent(event) {
   event.preventDefault();
   const type = $("agentType").value; const label = $("agentLabel").value.trim(); const provider = $("agentProvider").value; const model = $("agentModel").value.trim(); const role = $("agentRoleName").value.trim();
-  const invalid = !label ? ["agentLabel", "Enter a label."] : !provider ? ["agentProvider", "Choose a provider route."] : providerById(provider)?.graph_routing_allowed === false ? ["agentProvider", "This route does not allow submitted workflow graphs."] : !model ? ["agentModel", "Enter a model."] : !role ? ["agentRoleName", "Enter a role."] : null;
+  const promptProblem = systemPromptProblem("agentPrompt", "agentPromptCount");
+  const invalid = !label ? ["agentLabel", "Enter a label."] : !provider ? ["agentProvider", "Choose a provider route."] : providerById(provider)?.graph_routing_allowed === false ? ["agentProvider", "This route does not allow submitted workflow graphs."] : !model ? ["agentModel", "Enter a model."] : !role ? ["agentRoleName", "Enter a role."] : promptProblem ? ["agentPrompt", promptProblem] : null;
   if (invalid) {
     const [fieldId, message] = invalid; const field = $(fieldId); const link = make("a", "", message); link.href = `#${fieldId}`; link.addEventListener("click", (click) => { click.preventDefault(); field.focus(); });
-    field.setAttribute("aria-invalid", "true"); field.setAttribute("aria-describedby", "agentFormError"); $("agentFormError").replaceChildren(link); $("agentFormError").hidden = false; $("agentFormError").focus(); return;
+    field.setAttribute("aria-invalid", "true"); const described = new Set(String(field.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean)); described.add("agentFormError"); field.setAttribute("aria-describedby", [...described].join(" ")); $("agentFormError").replaceChildren(link); $("agentFormError").hidden = false; $("agentFormError").focus(); return;
   }
   pushHistory();
   const agentRef = $("agentRef").value; const id = uniqueId(type); const config = {agent_ref: agentRef, provider_route: agentRef ? "" : provider, model: agentRef ? "" : model, role_name: role, system_prompt: $("agentPrompt").value, capabilities: selectedCapabilities($("agentCapabilities")), data_class: "project_private"};
@@ -578,12 +657,17 @@ function renderInspector() {
   if (selected?.kind === "node") {
     const node = nodeById(selected.id); if (!node) return; const isAgent = agentTypes.has(node.type);
     $("nodeLabel").value = node.label || ""; $("agentInspectorFields").hidden = !isAgent; $("nodeRole").hidden = node.type !== "tool"; $("nodeRole").previousElementSibling.hidden = node.type !== "tool"; $("nodeRole").value = node.config?.role || "generic";
-    if (isAgent) { const agentRef = node.config?.agent_ref || ""; const assignment = agentById(agentRef); fillAgentSelect($("nodeAgentRef"), agentRef); fillProviderSelect($("nodeProvider"), assignment?.provider_route || node.config?.provider_route || ""); $("nodeProvider").disabled = Boolean(assignment); $("nodeModel").value = assignment?.model || node.config?.model || ""; $("nodeModel").disabled = Boolean(assignment); $("nodeRoleName").value = node.config?.role_name || assignment?.role || ""; $("nodePrompt").value = node.config?.system_prompt || ""; renderCapabilityChecks($("nodeCapabilities"), node.config?.capabilities || [], assignment?.capabilities || null); $("mergeFields").hidden = node.type !== "merge"; $("mergeSlots").value = (node.config?.required_slots || []).join(", "); $("mergeOutput").value = node.config?.output_field || "merged_output"; }
+    if (isAgent) { const agentRef = node.config?.agent_ref || ""; const assignment = agentById(agentRef); fillAgentSelect($("nodeAgentRef"), agentRef); fillProviderSelect($("nodeProvider"), assignment?.provider_route || node.config?.provider_route || ""); $("nodeProvider").disabled = Boolean(assignment); $("nodeModel").value = assignment?.model || node.config?.model || ""; $("nodeModel").disabled = Boolean(assignment); $("nodeRoleName").value = node.config?.role_name || assignment?.role || ""; $("nodePrompt").value = node.config?.system_prompt || ""; renderSystemPromptCount("nodePrompt", "nodePromptCount"); renderCapabilityChecks($("nodeCapabilities"), node.config?.capabilities || [], assignment?.capabilities || null); $("mergeFields").hidden = node.type !== "merge"; $("mergeSlots").value = (node.config?.required_slots || []).join(", "); $("mergeOutput").value = node.config?.output_field || "merged_output"; }
   }
   if (selected?.kind === "edge") { const edge = graph.edges.find((item) => item.id === selected.id); if (!edge) return; $("edgeMode").value = edge.mode || "state"; $("edgeCondition").value = edge.condition || ""; $("edgeVariables").value = (edge.variables || []).join(", "); $("edgeTargetSlot").value = edge.target_slot || ""; $("edgeReturnFields").value = (edge.return_fields || []).join(", "); $("maxIterations").value = edge.loop?.max_iterations || ""; $("temperatureDecay").value = edge.loop?.temperature_decay || ""; $("loopTimeout").value = edge.loop?.timeout_seconds || ""; }
 }
 function updateSelectedNode() {
-  if (selected?.kind !== "node") return; const node = nodeById(selected.id); pushHistory(); node.label = $("nodeLabel").value.trim() || node.id; node.config = {...(node.config || {})};
+  if (selected?.kind !== "node") return; const node = nodeById(selected.id);
+  if (agentTypes.has(node.type)) {
+    const promptProblem = systemPromptProblem("nodePrompt", "nodePromptCount");
+    if (promptProblem) { showError(promptProblem); $("nodePrompt").focus(); return; }
+  }
+  pushHistory(); node.label = $("nodeLabel").value.trim() || node.id; node.config = {...(node.config || {})};
   if (agentTypes.has(node.type)) { node.config.agent_ref = $("nodeAgentRef").value; node.config.provider_route = node.config.agent_ref ? "" : $("nodeProvider").value; node.config.model = node.config.agent_ref ? "" : $("nodeModel").value.trim(); node.config.role_name = $("nodeRoleName").value.trim(); node.config.system_prompt = $("nodePrompt").value; node.config.capabilities = selectedCapabilities($("nodeCapabilities")); node.config.data_class = node.config.data_class || "project_private"; if (node.type === "merge") { node.config.required_slots = csv($("mergeSlots").value); node.config.output_field = $("mergeOutput").value.trim() || "merged_output"; node.config.output_contract = "implementation_plan"; } }
   else if (node.type === "tool") node.config.role = $("nodeRole").value;
   renderNodes(); renderOutline();
@@ -699,7 +783,7 @@ function switchView(name) {
   if (name === "checks") { refreshChecks(); $("starterUrl").placeholder = window.location.origin + "/"; }
   if (name === "workflow") { fitGraph(); refreshTeamNotes(); renderWhatItIsDoing(); refreshWorkflows(); }
   if (name === "history") refreshHistory();
-  if (name === "pipelines") refreshPipelines();
+  if (name === "pipelines") refreshPipelines(undefined, {replaceDrawing: !pipelineBaselineReady});
   if (name === "settings") refreshSettings();
   if (name === "vault") refreshVault(vaultOpen);
   if (name === "team") refreshTeam(teamOpen);
@@ -2372,6 +2456,9 @@ function openVaultDialog(note, changing) {
   $("vaultFormTags").value = (note.tags || []).join(", ");
   $("vaultFormSure").value = String(note.sure ?? 0.5);
   $("vaultFormBody").value = note.body || "";
+  renderVaultBodyCount();
+  $("vaultFormError").hidden = true;
+  $("vaultFormError").textContent = "";
   $("vaultDialog").showModal();
 }
 
@@ -2387,6 +2474,16 @@ function editVaultNote() {
 
 async function saveVaultNote() {
   const tags = $("vaultFormTags").value.split(",").map((tag) => tag.trim()).filter(Boolean);
+  const bodyProblem = vaultBodyProblem();
+  if (bodyProblem) {
+    $("vaultFormError").textContent = bodyProblem;
+    $("vaultFormError").hidden = false;
+    $("vaultFormError").focus();
+    announce(bodyProblem, true);
+    return;
+  }
+  $("vaultFormError").hidden = true;
+  $("vaultFormError").textContent = "";
   try {
     const said = await request("/api/vault/write", {
       method: "POST",
@@ -2407,7 +2504,13 @@ async function saveVaultNote() {
     await refreshVault(said.note.name);
     $("vaultSaid").textContent = `${said.note.title} is written down.`;
     announce($("vaultSaid").textContent);
-  } catch (error) { showError(error.message); $("vaultSaid").textContent = error.message; }
+  } catch (error) {
+    showError(error.message);
+    $("vaultFormError").textContent = error.message;
+    $("vaultFormError").hidden = false;
+    $("vaultFormError").focus();
+    $("vaultSaid").textContent = error.message;
+  }
 }
 
 async function removeVaultNote() {
@@ -2708,6 +2811,120 @@ let pipelineAuthorityId = "";
 let pipelinePendingRequest = null;
 let pipelineCannotRun = "";
 let currentAuthorityRepair = null;
+let pipelineBaselineReady = false;
+let pipelineBaselineSnapshot = "";
+
+function canonicalPipelineValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalPipelineValue);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.keys(value).sort().map(
+    (key) => [key, canonicalPipelineValue(value[key])]
+  ));
+}
+
+function currentPipelineSnapshot() {
+  return JSON.stringify(canonicalPipelineValue(pipelineOnScreen()));
+}
+
+function rememberPipelineBaseline() {
+  pipelineBaselineReady = true;
+  pipelineBaselineSnapshot = currentPipelineSnapshot();
+  renderPipelineDirtyState();
+}
+
+function markPipelineDrawingUnsaved() {
+  pipelineBaselineReady = true;
+  // Canonical snapshots are JSON objects, so this marker cannot equal one.
+  pipelineBaselineSnapshot = "unsaved-drawing";
+  renderPipelineDirtyState();
+}
+
+function pipelineHasUnsavedChanges() {
+  return pipelineBaselineReady && currentPipelineSnapshot() !== pipelineBaselineSnapshot;
+}
+
+function renderPipelineDirtyState() {
+  const status = $("pipelineDirtyState");
+  if (!status) return;
+  const dirty = pipelineHasUnsavedChanges();
+  status.classList.toggle("is-dirty", dirty);
+  status.textContent = dirty ? "Unsaved changes" : "All changes saved";
+}
+
+function askHowToReplaceUnsavedPipeline(action) {
+  if (!pipelineHasUnsavedChanges()) return Promise.resolve("discard");
+  return new Promise((finish) => {
+    const dialog = $("pipelineUnsavedDialog");
+    $("pipelineUnsavedWhy").textContent =
+      `You have unsaved changes. Save them before ${action}? Cancel keeps this exact drawing open.`;
+    $("pipelineUnsavedSaid").hidden = true;
+    $("pipelineUnsavedSaid").textContent = "";
+    dialog.returnValue = "cancel";
+    const done = () => {
+      dialog.removeEventListener("close", done);
+      $("pipelineUnsavedSave").onclick = null;
+      finish(dialog.returnValue || "cancel");
+    };
+    dialog.addEventListener("close", done);
+    $("pipelineUnsavedSave").onclick = async () => {
+      const button = $("pipelineUnsavedSave");
+      button.disabled = true;
+      const saved = await savePipeline();
+      button.disabled = false;
+      if (saved) dialog.close("save");
+      else {
+        $("pipelineUnsavedSaid").textContent =
+          "Nexus could not save this automation. The drawing is still intact; fix the error or cancel.";
+        $("pipelineUnsavedSaid").hidden = false;
+        $("pipelineUnsavedSaid").focus();
+      }
+    };
+    dialog.showModal();
+  });
+}
+
+function askForLongPageText(title, question, value = "") {
+  return new Promise((finish) => {
+    const box = $("longTextDialog");
+    $("longTextDialogTitle").textContent = title;
+    $("longTextDialogWhy").textContent = question || "";
+    const input = $("longTextDialogInput");
+    input.value = value == null ? "" : String(value);
+    renderDisclosedTextCount(
+      "longTextDialogInput", "longTextDialogCount",
+      SHARED_PAGE_CHARACTER_LIMIT, "the page entry");
+    const count = () => renderDisclosedTextCount(
+      "longTextDialogInput", "longTextDialogCount",
+      SHARED_PAGE_CHARACTER_LIMIT, "the page entry");
+    input.addEventListener("input", count);
+    const done = () => {
+      box.removeEventListener("close", done);
+      input.removeEventListener("input", count);
+      if (box.returnValue !== "ok") { finish(null); return; }
+      const problem = disclosedTextProblem(
+        "longTextDialogInput", "longTextDialogCount",
+        SHARED_PAGE_CHARACTER_LIMIT, "the page entry");
+      if (problem) {
+        // A method=dialog form closes before validation. Reopen it with every
+        // character still present; the backend will make the same decision.
+        box.showModal();
+        input.addEventListener("input", count);
+        box.addEventListener("close", done);
+        input.focus();
+        return;
+      }
+      finish(input.value);
+    };
+    box.addEventListener("close", done);
+    box.showModal();
+    input.focus();
+  });
+}
+
+async function mayReplacePipeline(action) {
+  const choice = await askHowToReplaceUnsavedPipeline(action);
+  return choice === "save" || choice === "discard";
+}
 
 function applyAgentRunPanelPreference() {
   try { $("agentRunPanel").open = window.localStorage.getItem(AGENT_RUN_PANEL_KEY) === "yes"; }
@@ -2908,12 +3125,14 @@ async function openExactPipelineRun() {
     say(`Run ${runId} is ${run.state || "known"}, but this server did not provide its immutable automation snapshot.`);
     return;
   }
+  if (!await mayReplacePipeline("opening this immutable run snapshot")) return;
   pipeline = structuredClone(snapshot);
   pipelineSavedName = "";
   pipelineProjectionRunId = runId;
   pipelineStates = new Map();
   $("pipelineLog").replaceChildren();
   $("pipelineName").value = pipeline.name || run.name || "Automation run";
+  markPipelineDrawingUnsaved();
   renderPipeline();
   if (run.result) showPipelineRun(run.result);
   say(`Showing immutable snapshot for run ${runId}. Saving creates or updates a separate automation; it cannot change this run.`);
@@ -3010,13 +3229,22 @@ async function toggleThePipelineFullScreen() {
   }
 }
 
-async function refreshPipelines(name) {
+async function refreshPipelines(name, options = {}) {
   const mine = ++pipelineNewestRefresh;
+  let replaceDrawing = options.replaceDrawing !== false;
+  let replacementSkipped = false;
   const requestedName = name === undefined ? pipelineSavedName : name;
   const previousName = pipelineSavedName;
   try {
-    const said = await request(`/api/pipelines${requestedName ? `?name=${encodeURIComponent(requestedName)}` : ""}`);
+    const said = await request(`/api/pipelines?recover_missing=1${requestedName ? `&name=${encodeURIComponent(requestedName)}` : ""}`);
     if (mine !== pipelineNewestRefresh) return;
+    if (replaceDrawing && options.expectedSnapshot
+        && currentPipelineSnapshot() !== options.expectedSnapshot) {
+      // A slow library read must not win over an edit made while it was in
+      // flight. Keep the exact current drawing and only refresh inventory.
+      replaceDrawing = false;
+      replacementSkipped = true;
+    }
     pipelineCannotRun = String(said.cannot_run || "");
     showProjectAuthorityPause(said.authority, pipelineCannotRun);
     if (said.project_authority_id) usePipelineAuthority(said.project_authority_id);
@@ -3030,9 +3258,12 @@ async function refreshPipelines(name) {
     pipelineStarters = said.starters || [];
     pipelineWhens = said.when_it_runs || [];
     pipelineWaits = said.waits || [];
-    pipeline = said.pipeline;
-    const resolvedName = said.selected_name || requestedName
-      || (pipelineSaved.includes(pipeline?.name) ? pipeline.name : "");
+    const receivedPipeline = said.pipeline;
+    const resolvedName = pipelineSaved.length ? (
+      (pipelineSaved.includes(said.selected_name) ? said.selected_name : "")
+      || (pipelineSaved.includes(requestedName) ? requestedName : "")
+      || (pipelineSaved.includes(receivedPipeline?.name) ? receivedPipeline.name : "")
+    ) : "";
     const priorAgentChoice = $("agentRunAutomation").value;
     fillOneChoice("agentRunAutomation", pipelineSaved.map((one) => ({name: one, label: one})),
                   "name", resolvedName || priorAgentChoice || pipelineSaved[0] || "");
@@ -3052,19 +3283,40 @@ async function refreshPipelines(name) {
     const projectionRunId = String(reconciledRun?.run_id || exactRunId);
     const preservingLiveProjection = Boolean(projectionRunId
       && pipelineProjectionRunId === projectionRunId && previousName === resolvedName);
-    if (!preservingLiveProjection) pipelineStates = new Map();
-    pipelineSavedName = resolvedName;
+    if (replaceDrawing) {
+      pipeline = receivedPipeline;
+      if (!preservingLiveProjection) pipelineStates = new Map();
+      pipelineSavedName = resolvedName;
+    } else if (pipelineSavedName && !pipelineSaved.includes(pipelineSavedName)) {
+      // The file disappeared outside the editor. Keep the live drawing and
+      // treat it as unsaved so the next replacement is guarded.
+      pipelineSavedName = "";
+      markPipelineDrawingUnsaved();
+    }
     pipelineActiveRunId = exactRunId;
     pipelineActiveRunName = reconciledRun?.running
       ? String(reconciledRun.name || pipelinePendingRequest?.name || "")
       : (!hadPendingRequest ? activeRunName : "");
-    pipelineOlderOnes = said.older_ones || [];
-    $("pipelineName").value = pipeline.name || "";
+    if (replaceDrawing || requestedName === pipelineSavedName) {
+      pipelineOlderOnes = said.older_ones || [];
+    }
+    if (replaceDrawing) $("pipelineName").value = pipeline.name || "";
     $("pipelineStop").disabled = !exactRunId;
     renderPipelinePalette();
     renderPipelineStarters();
     renderPipelineSaved();
     renderPipeline();
+    if (replaceDrawing) {
+      // A server-provided starter is a clean drawing, but it is not a saved
+      // automation.  Calling it "All changes saved" would hide the first
+      // possible loss.  Only a definition actually present in the library is
+      // allowed to establish a saved baseline.
+      if (pipelineSavedName && pipelineSaved.includes(pipelineSavedName)) {
+        rememberPipelineBaseline();
+      } else {
+        markPipelineDrawingUnsaved();
+      }
+    }
     if (!$("agentRunAutomation").dataset.bound) {
       $("agentRunAutomation").dataset.bound = "true";
       $("agentRunAutomation").addEventListener("change", refreshAgentContract);
@@ -3090,6 +3342,9 @@ async function refreshPipelines(name) {
     }
     else if (pipelineActiveRunId && pipelineProjectionRunId !== pipelineActiveRunId) {
       say("An exact automation run is active. Open its immutable snapshot to project its step updates on this board.");
+    }
+    if (replacementSkipped) {
+      say("The automation library finished loading, but the drawing changed meanwhile, so Nexus kept your newer edits. Choose the saved automation again when you are ready.");
     }
   } catch (error) {
     if (mine !== pipelineNewestRefresh) return;
@@ -3124,7 +3379,7 @@ async function runAgentAutomation() {
     pipelineProjectionRunId = "";
     rememberPipelinePendingRequest({...pending, run_id: pipelineActiveRunId});
     $("agentRunSaid").textContent = `Started exactly “${name}”. Watch the run status above for completion.`;
-    await refreshPipelines(name);
+    await refreshPipelines(name, {replaceDrawing: false});
   } catch (error) {
     if (pipelineRequestWasDefinitelyRejected(error)) rememberPipelinePendingRequest(null);
     $("agentRunSaid").textContent = pipelineRequestWasDefinitelyRejected(error)
@@ -3143,9 +3398,13 @@ function renderPipelineSaved() {
   const problems = $("pipelineSavedProblems");
   problems.hidden = !pipelineSavedProblems.length;
   problems.textContent = pipelineSavedProblems.length
-    ? `${pipelineSavedProblems.length} saved JSON file${pipelineSavedProblems.length === 1 ? "" : "s"} could not be shown: ${pipelineSavedProblems.join("; ")}`
+    ? `${pipelineSavedProblems.length} automation library notice${pipelineSavedProblems.length === 1 ? "" : "s"}: ${pipelineSavedProblems.join("; ")}`
     : "";
-  $("pipelineExport").disabled = !pipelineSavedName || !pipelineSaved.includes(pipelineSavedName);
+  const hasSavedSelection = Boolean(
+    pipelineSavedName && pipelineSaved.includes(pipelineSavedName)
+  );
+  $("pipelineExport").disabled = !hasSavedSelection;
+  $("pipelineDelete").disabled = !hasSavedSelection;
   $("pipelineRun").disabled = Boolean(pipelineCannotRun);
   $("pipelineRun").title = pipelineCannotRun;
   $("agentRunCopyContract").disabled = !pipelineSaved.length;
@@ -3159,10 +3418,15 @@ function renderPipelineSaved() {
     const item = make("li", "");
     const button = make("button", `pipeline-saved-one${name === pipelineSavedName ? " chosen" : ""}`, name);
     button.type = "button";
-    button.addEventListener("click", () => refreshPipelines(name));
+    button.addEventListener("click", () => openSavedPipeline(name));
     item.append(button);
     list.append(item);
   }
+}
+
+async function openSavedPipeline(name) {
+  if (!await mayReplacePipeline(`opening “${name}”`)) return;
+  await refreshPipelines(name, {expectedSnapshot: currentPipelineSnapshot()});
 }
 
 // Ready-made pipelines. A blank board is the hardest thing to hand somebody
@@ -3194,16 +3458,22 @@ function renderPipelineStarters() {
 }
 
 async function usePipelineStarter(starter) {
-  if (pipeline.nodes.length
-      && !window.confirm(`Replace what is on the board with "${starter.title}"?`)) return;
+  if (!await mayReplacePipeline(`starting from “${starter.title}”`)) return;
+  const beforeRequest = currentPipelineSnapshot();
   try {
     const said = await request("/api/pipelines/starter", {
       method: "POST", body: JSON.stringify({key: starter.key}),
     });
+    if (currentPipelineSnapshot() !== beforeRequest) {
+      say("The starter loaded, but the drawing changed meanwhile, so Nexus kept your newer edits. Choose the starter again when you are ready.");
+      return;
+    }
     pipeline = said.pipeline;
     pipelineStates = new Map();
     $("pipelineName").value = pipeline.name;
     $("pipelineLog").replaceChildren();
+    pipelineSavedName = "";
+    markPipelineDrawingUnsaved();
     renderPipeline();
     say(`${starter.title} is on the board. Press Run, or change it first.`);
   } catch (error) { showError(error.message); say(error.message); }
@@ -3364,6 +3634,7 @@ function renderPipeline() {
       : restoredCard?.querySelector(`[data-pipeline-action="${CSS.escape(focusAction)}"]`);
     if (restored) restored.focus({preventScroll: true});
   }
+  renderPipelineDirtyState();
 }
 
 function pipelineNodeName(nodeId) {
@@ -3607,6 +3878,7 @@ const PIPELINE_FIELDS = {
   needs: {label: "How much has to pass", choices: ["all", "any"]},
   command_kind: {label: "Which command", choices: ["test", "lint", "build"]},
   instructions: {label: "What the model should write", long: true,
+                 characterLimit: PIPELINE_AI_INSTRUCTION_CHARACTER_LIMIT,
                  placeholder: "Write a test for the basket total, covering an empty basket."},
   write_to: {label: "Save the draft as", placeholder: "basket-total.test.js"},
   question: {label: "What to ask", long: true,
@@ -3652,6 +3924,18 @@ function openPipelineNode(nodeId) {
     if (field.placeholder) input.placeholder = field.placeholder;
     input.value = node.settings?.[name] || "";
     box.append(input);
+    if (field.characterLimit) {
+      const countId = `${id}-count`;
+      input.setAttribute("aria-describedby", countId);
+      const count = make("p", "field-help", "");
+      count.id = countId;
+      count.setAttribute("role", "status");
+      box.append(count);
+      const update = () => renderDisclosedTextCount(
+        id, countId, field.characterLimit, "the model-writing instructions");
+      input.addEventListener("input", update);
+      update();
+    }
   }
   // Which of this step's settings should be asked about when the run starts
   // rather than fixed now. One saved pipeline then covers more than one job.
@@ -3707,6 +3991,14 @@ function sayWhatTheStepChoicesMean() {
 function savePipelineNode() {
   const node = pipeline.nodes.find((item) => item.id === pipelineEditing);
   if (!node) return;
+  for (const input of $("pipelineNodeSettings").querySelectorAll("[data-setting]")) {
+    const field = PIPELINE_FIELDS[input.dataset.setting] || {};
+    if (!field.characterLimit) continue;
+    const problem = disclosedTextProblem(
+      input.id, `${input.id}-count`, field.characterLimit,
+      "the model-writing instructions");
+    if (problem) { say(problem); showError(problem); input.focus(); return; }
+  }
   node.label = $("pipelineNodeLabel").value.trim() || kindOf(node.kind).label;
   const settings = {};
   for (const input of $("pipelineNodeSettings").querySelectorAll("[data-setting]")) {
@@ -3757,14 +4049,27 @@ async function savePipeline() {
     });
     pipeline = said.pipeline;
     pipelineSavedName = pipeline.name;
+    $("pipelineName").value = pipeline.name;
+    rememberPipelineBaseline();
     say(`Saved ${pipeline.name}.`);
-    const list = await request(`/api/pipelines?name=${encodeURIComponent(pipeline.name)}`);
-    pipelineSaved = list.saved || [];
-    pipelineSavedProblems = list.saved_problems || [];
-    pipelineOlderOnes = list.older_ones || [];
-    renderPipelineSaved();
-    if (pipelineLooking === "before") listHowItLookedBefore();
-  } catch (error) { say(error.message); showError(error.message); }
+    try {
+      const list = await request(`/api/pipelines?name=${encodeURIComponent(pipeline.name)}`);
+      pipelineSaved = list.saved || [];
+      pipelineSavedProblems = list.saved_problems || [];
+      pipelineOlderOnes = list.older_ones || [];
+      renderPipelineSaved();
+      if (pipelineLooking === "before") listHowItLookedBefore();
+    } catch (inventoryError) {
+      // The write is already acknowledged and must not be reported as a
+      // failure merely because the follow-up library refresh was interrupted.
+      say(`Saved ${pipeline.name}. The library list could not refresh yet: ${inventoryError.message}`);
+    }
+    return true;
+  } catch (error) {
+    say(error.message);
+    showError(error.message);
+    return false;
+  }
 }
 
 async function savePipelineAs() {
@@ -3773,30 +4078,49 @@ async function savePipelineAs() {
        `${$("pipelineName").value} copy`);
   if (!name) return;
   $("pipelineName").value = name;
+  renderPipelineDirtyState();
   await savePipeline();
 }
 
 async function deletePipeline() {
-  const name = $("pipelineName").value.trim();
-  if (!name) return;
+  const name = pipelineSavedName;
+  if (!name || !pipelineSaved.includes(name)) {
+    pipelineSavedName = "";
+    renderPipelineSaved();
+    say("Choose a saved automation before removing one. The drawing on screen was not changed.");
+    return;
+  }
   if (!window.confirm(`Remove the saved pipeline "${name}"? The drawing on screen stays.`)) return;
   try {
     const said = await request("/api/pipelines/delete", {method: "POST", body: JSON.stringify({name})});
     pipelineSaved = said.saved || [];
     pipelineSavedProblems = said.saved_problems || [];
+    if (!pipelineSaved.includes(pipelineSavedName)) {
+      pipelineSavedName = "";
+      markPipelineDrawingUnsaved();
+    }
     renderPipelineSaved();
     say(said.note);
   } catch (error) { say(error.message); showError(error.message); }
 }
 
 async function newPipeline() {
+  if (!await mayReplacePipeline("creating a new automation")) return;
   const name = await askForOneLine(
     "Create new automation", "What should the new automation be called?", "New automation");
   if (!name) return;
+  const beforeRequest = currentPipelineSnapshot();
   try {
     const said = await request("/api/pipelines/create", {
       method: "POST", body: JSON.stringify({name}),
     });
+    if (currentPipelineSnapshot() !== beforeRequest) {
+      pipelineSaved = said.saved || [];
+      pipelineSavedProblems = said.saved_problems || [];
+      renderPipelineSaved();
+      say(`Created and saved ${said.pipeline?.name || name}, but the drawing changed meanwhile, so Nexus kept your newer edits. Open the new automation from the library when you are ready.`);
+      return;
+    }
     pipeline = said.pipeline;
     pipelineSavedName = pipeline.name;
     pipelineSaved = said.saved || [];
@@ -3805,6 +4129,7 @@ async function newPipeline() {
     pipelineStates = new Map();
     $("pipelineName").value = pipeline.name;
     $("pipelineLog").replaceChildren();
+    rememberPipelineBaseline();
     renderPipeline();
     renderPipelineSaved();
     say(`Created and saved ${pipeline.name}. Add steps from the left.`);
@@ -3836,7 +4161,14 @@ async function importPipeline(file) {
     if (file.size > 10_000_000) {
       throw new Error("That JSON file is larger than 10 MB. Nothing was imported.");
     }
-    const written = await file.text();
+    let written;
+    try {
+      written = new TextDecoder("utf-8", {fatal: true}).decode(
+        await file.arrayBuffer()
+      );
+    } catch (_) {
+      throw new Error("That automation file is not valid UTF-8. Nothing was imported.");
+    }
     let document;
     try { document = JSON.parse(written); }
     catch (_) { throw new Error("That file is not valid JSON. Nothing was imported."); }
@@ -3853,17 +4185,10 @@ async function importPipeline(file) {
     const said = await request("/api/pipelines/import", {
       method: "POST", body: JSON.stringify({document, name}),
     });
-    pipeline = said.pipeline;
-    pipelineSavedName = pipeline.name;
     pipelineSaved = said.saved || [];
     pipelineSavedProblems = said.saved_problems || [];
-    pipelineOlderOnes = [];
-    pipelineStates = new Map();
-    $("pipelineName").value = pipeline.name;
-    $("pipelineLog").replaceChildren();
-    renderPipeline();
     renderPipelineSaved();
-    say(said.note || `Imported and saved ${pipeline.name}.`);
+    say(`${said.note || `Imported and saved ${name}.`} The current drawing was not changed; open the imported automation from the library when you are ready.`);
   } catch (error) {
     say(error.message);
     showError(error.message);
@@ -4573,13 +4898,17 @@ function bindEvents() {
   $("zoomIn").addEventListener("click", () => { zoom = Math.min(1.8, zoom + .1); updateViewport(); }); $("zoomOut").addEventListener("click", () => { zoom = Math.max(.3, zoom - .1); updateViewport(); }); $("fitButton").addEventListener("click", fitGraph); $("undoButton").addEventListener("click", undo);
   $("addAgentButton").addEventListener("click", () => openAgentDialog("planner", 360, 300, $("addAgentButton"))); $("validateButton").addEventListener("click", () => validate()); $("simulateButton").addEventListener("click", simulate); $("runButton").addEventListener("click", startRun); $("exportButton").addEventListener("click", exportGraph); $("importInput").addEventListener("change", (event) => event.target.files[0] && importGraph(event.target.files[0])); $("clearLog").addEventListener("click", () => $("eventBody").replaceChildren());
   $("agentForm").addEventListener("submit", submitAgent); $("closeAgentDialog").addEventListener("click", closeAgentDialog); $("cancelAgent").addEventListener("click", closeAgentDialog); $("agentType").addEventListener("change", () => { $("agentMergeFields").hidden = $("agentType").value !== "merge"; }); $("agentProvider").addEventListener("change", () => updateModelSuggestions($("agentProvider").value, $("agentModel"))); $("agentRef").addEventListener("change", () => applyAgentAssignment($("agentRef"), $("agentProvider"), $("agentModel"), $("agentRoleName"), $("agentCapabilities")));
+  for (const [fieldId, countId] of [["agentPrompt", "agentPromptCount"], ["nodePrompt", "nodePromptCount"], ["teamCustomPrompt", "teamCustomPromptCount"]]) {
+    $(fieldId).addEventListener("input", () => renderSystemPromptCount(fieldId, countId));
+  }
   $("agentDialog").addEventListener("close", () => dialogInvoker?.focus?.());
   ["nodeLabel", "nodeProvider", "nodeModel", "nodeRoleName", "nodePrompt", "nodeRole", "mergeSlots", "mergeOutput"].forEach((id) => $(id).addEventListener("change", updateSelectedNode)); $("nodeCapabilities").addEventListener("change", updateSelectedNode); $("nodeAgentRef").addEventListener("change", () => { applyAgentAssignment($("nodeAgentRef"), $("nodeProvider"), $("nodeModel"), $("nodeRoleName"), $("nodeCapabilities")); updateSelectedNode(); });
   ["edgeMode", "edgeCondition", "edgeVariables", "edgeTargetSlot", "edgeReturnFields", "maxIterations", "temperatureDecay", "loopTimeout"].forEach((id) => $(id).addEventListener("change", updateSelectedEdge)); $("deleteNode").addEventListener("click", () => selected?.kind === "node" && removeNode(selected.id)); $("deleteEdge").addEventListener("click", () => selected?.kind === "edge" && removeEdge(selected.id));
   $("newWorkflow").addEventListener("click", newWorkflow); $("saveWorkflow").addEventListener("click", saveWorkflow); $("renameWorkflow").addEventListener("click", renameWorkflow); $("deleteWorkflow").addEventListener("click", deleteWorkflow);
   $("refreshHistory").addEventListener("click", refreshHistory); $("refreshCheckup").addEventListener("click", () => refreshCheckup(true)); $("quickRun").addEventListener("click", quickRun); $("quickBootstrap").addEventListener("change", updateQuickReadiness); $("quickChecks").addEventListener("click", () => { switchView("checks"); runChecks(); });
   document.querySelectorAll("[data-example]").forEach((button) => button.addEventListener("click", () => { $("quickTask").value = button.dataset.example; $("quickTask").focus(); }));
-  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("moreOptionsEnabled").addEventListener("change", changeMoreOptionsPreference); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineImport").addEventListener("click", () => $("pipelineImportFile").click()); $("pipelineImportFile").addEventListener("change", (event) => importPipeline(event.target.files?.[0])); $("pipelineExport").addEventListener("click", exportPipeline); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
+  $("pipelineName").addEventListener("input", renderPipelineDirtyState);
+  window.addEventListener("resize", () => { if (howStages.length) hideArrowsAtTheEndOfARow(); }); $("showMeAround").addEventListener("click", showMeAround); $("vaultNew").addEventListener("click", newVaultNote); $("vaultLearn").addEventListener("click", vaultLearnFromRuns); $("vaultRedraw").addEventListener("click", () => { vaultPlaces = new Map(); settleTheVault(); }); $("vaultEdit").addEventListener("click", editVaultNote); $("vaultRemove").addEventListener("click", removeVaultNote); $("vaultUsedWell").addEventListener("click", () => vaultNoteWasUsed(true)); $("vaultUsedBadly").addEventListener("click", () => vaultNoteWasUsed(false)); $("vaultClose").addEventListener("click", () => { $("vaultNote").hidden = true; vaultOpen = ""; renderVaultList(); drawTheVault(); }); $("vaultFormSave").addEventListener("click", saveVaultNote); $("vaultFormCancel").addEventListener("click", () => $("vaultDialog").close()); $("vaultFormBody").addEventListener("input", renderVaultBodyCount); $("vaultSearch").addEventListener("input", (event) => { vaultLooking = event.target.value; renderVaultList(); settleTheVaultSoon(); if (vaultNotes.length >= MOST_TO_DRAW || vaultAskingFor) { vaultAskingFor = event.target.value.trim(); refreshVault(vaultOpen); } }); $("vaultOnlyNear").addEventListener("change", () => { renderVaultList(); settleTheVault(); }); $("vaultGraph").addEventListener("keydown", vaultGraphKey); $("refreshSettings").addEventListener("click", refreshSettings); $("settingsFilter").addEventListener("input", renderSettings); $("settingsChangedOnly").addEventListener("change", renderSettings); $("moreOptionsEnabled").addEventListener("change", changeMoreOptionsPreference); $("pipelineSave").addEventListener("click", savePipeline); $("pipelineSaveAs").addEventListener("click", savePipelineAs); $("pipelineImport").addEventListener("click", () => $("pipelineImportFile").click()); $("pipelineImportFile").addEventListener("change", (event) => importPipeline(event.target.files?.[0])); $("pipelineExport").addEventListener("click", exportPipeline); $("pipelineRun").addEventListener("click", () => runPipelineAsking()); $("pipelineStop").addEventListener("click", stopPipeline); $("pipelineDelete").addEventListener("click", deletePipeline); $("pipelineNew").addEventListener("click", newPipeline); $("pipelineCheck").addEventListener("click", checkPipeline); $("pipelineNodeSave").addEventListener("click", savePipelineNode); $("pipelineNodeCancel").addEventListener("click", () => $("pipelineNodeDialog").close()); document.addEventListener("pointermove", movePipelineDrag); document.addEventListener("pointerup", endPipelineDrag); $("howDemo").addEventListener("click", demoHowItWorks); $("howRefresh").addEventListener("click", refreshHowItWorks); $("findSeats").addEventListener("click", findSeats); $("setUpSeats").addEventListener("click", setUpSeats); $("shareTheWork").addEventListener("click", shareTheWork); $("undoSeats").addEventListener("click", undoSeats); $("createSuite").addEventListener("click", createSuite); $("runChecks").addEventListener("click", runChecks); $("saveBaselines").addEventListener("click", saveBaselines); $("pickElement").addEventListener("click", pickElement); $("findGaps").addEventListener("click", findGaps); $("makeSharePage").addEventListener("click", makeSharePage); $("addMissingChecks").addEventListener("click", addMissingChecks);$("recordSteps").addEventListener("click", recordSteps); $("makeBundle").addEventListener("click", makeBundle); $("starterBox").addEventListener("toggle", () => $("starterBox").open && refreshStarters()); $("refreshUnstable").addEventListener("click", () => { refreshUnstable(); refreshChanged(); }); $("checkTag").addEventListener("change", renderChecks);
   $("teamLookAgain").addEventListener("click", () => refreshTeam(teamOpen));
   $("teamSetUp").addEventListener("click", setUpTheTeam);
   // This one says what went wrong. Without it, a request that failed threw
@@ -4649,6 +4978,9 @@ function bindEvents() {
       refreshThePage();
     });
     $("thePageStandsSave").addEventListener("click", saveWhereItStands);
+    $("thePageStands").addEventListener("input", () => renderDisclosedTextCount(
+      "thePageStands", "thePageStandsCount",
+      SHARED_PAGE_CHARACTER_LIMIT, "where it stands"));
     $("thePageAdd").addEventListener("click", addSomethingOfMyOwn);
     $("thePagePutAway").addEventListener("click", putThePageAway);
     $("thePage").addEventListener("toggle", () => $("thePage").open && refreshThePage());
@@ -5273,6 +5605,7 @@ function openTheCustomWindow() {
   $("teamCustomLabel").value = "";
   $("teamCustomModel").value = "";
   $("teamCustomPrompt").value = "";
+  renderSystemPromptCount("teamCustomPrompt", "teamCustomPromptCount");
   $("teamCustomSaid").textContent = anybody
     ? ""
     : "No assistant on this machine is ready yet, so there is nobody to give this job to. "
@@ -5291,6 +5624,14 @@ async function saveTheCustomOne() {
     model: $("teamCustomModel").value.trim(),
   };
   if (!one.label) { $("teamCustomSaid").textContent = "Give it a name first."; return; }
+  const promptProblem = systemPromptProblem(
+    "teamCustomPrompt", "teamCustomPromptCount"
+  );
+  if (promptProblem) {
+    $("teamCustomSaid").textContent = promptProblem;
+    $("teamCustomPrompt").focus();
+    return;
+  }
   if (one.asking === "set-prompt" && !one.prompt.trim()) {
     $("teamCustomSaid").textContent =
       "A box with one set prompt needs the prompt written down, or choose a conversation instead.";
@@ -5305,7 +5646,7 @@ async function saveTheCustomOne() {
       provider_route: one.route,
       ...(one.model ? {model: one.model} : {}),
       asking: one.asking,
-      system_prompt: one.prompt.trim(),
+      system_prompt: one.prompt,
     },
     at: {
       x: 30 + (teamGraph.nodes.length % 4) * 235,
@@ -5575,17 +5916,25 @@ function listHowItLookedBefore() {
 }
 
 async function putAnOldOneBack(which) {
+  if (!await mayReplacePipeline("restoring an older saved version")) return;
   if (!window.confirm(
     "Put this older version back? What is on the board now is kept too, so you can "
     + "swap back again.")) return;
+  const beforeRequest = currentPipelineSnapshot();
   try {
     const said = await request("/api/pipelines/put-one-back", {
       method: "POST",
       body: JSON.stringify({name: pipelineSavedName, which}),
     });
+    if (currentPipelineSnapshot() !== beforeRequest) {
+      pipelineOlderOnes = said.older_ones || [];
+      say("The older version was restored in the saved library, but the drawing changed meanwhile, so Nexus kept your newer edits. Open the saved automation when you are ready.");
+      return;
+    }
     pipeline = said.pipeline;
     pipelineOlderOnes = said.older_ones || [];
     $("pipelineName").value = pipeline.name;
+    rememberPipelineBaseline();
     renderPipeline();
     listHowItLookedBefore();
     say(said.note || "Put it back.");
@@ -6634,7 +6983,7 @@ const DEFAULT_FINITE_TEAM_ROUNDS = 12;
 // reloading the panel cannot strand work which the server says is resumable.
 const SWARM_WORK_RECOVERIES_KEY = "nexus.swarm.work-recoveries.v1";
 const SWARM_RECOVERABLE_WORK_STATUSES = new Set([
-  "paused_provider", "paused_for_user", "incomplete",
+  "paused_provider", "paused_for_user", "paused_tool_budget", "incomplete",
   "applied_unverified", "needs_verification",
 ]);
 const swarmWorkRecoveries = loadSwarmWorkRecoveries();
@@ -6894,6 +7243,8 @@ function workRecoveryTitle(status) {
     ? "Project work paused for your answer"
     : status === "paused_provider"
       ? "Provider connection interrupted"
+    : status === "paused_tool_budget"
+      ? "Context-tool execution time needs your choice"
     : status === "needs_verification"
       ? "Applied changes need verification"
       : status === "incomplete"
@@ -6913,6 +7264,8 @@ function fillWorkRecoveryPanel(panel, agentId) {
     ? "Nexus changed no files. Answer below to continue this exact saved run."
     : recovery.status === "paused_provider"
       ? "Nexus saved the exact run after a provider failed to answer. Reconnect that provider, then resume; no user answer is required."
+      : recovery.status === "paused_tool_budget"
+        ? "Nexus charged only time spent inside context tools, saved the exact run, and did not call this a provider outage. Reset the consumed tool time explicitly below, or change the displayed setting before resuming."
       : recovery.status === "incomplete"
         ? "Nexus saved the unfinished run and has not claimed completion. Resume the same run so the team can continue."
         : "Nexus has not claimed completion. Resume the same run so the team can verify or revise what was applied.";
@@ -6956,9 +7309,12 @@ function fillWorkRecoveryPanel(panel, agentId) {
   const resume = make("button", "primary work-recovery-resume",
     recovery.status === "paused_for_user" ? "Answer and resume"
       : recovery.status === "paused_provider" ? "Retry provider and resume"
+        : recovery.status === "paused_tool_budget" ? "Reset tool time and resume"
         : recovery.status === "incomplete" ? "Resume project work" : "Resume verification");
   resume.type = "button";
-  resume.addEventListener("click", () => resumeSwarmWork(agentId));
+  resume.addEventListener("click", () => resumeSwarmWork(
+    agentId, recovery.status === "paused_tool_budget",
+  ));
   row.append(resume);
   panel.append(row);
 }
@@ -7415,6 +7771,10 @@ async function refreshSwarm(quietly) {
     // open performs integrity verification. Draw the saved board immediately;
     // recovery cards hydrate independently a moment later.
     void refreshDurableSwarmWorkRecoveries();
+    // The goal cursor is server-owned. Rehydrate it independently so closing
+    // or reloading this renderer cannot restart at goal one or strand a queued
+    // successor after the preceding goal verified.
+    void refreshBoardGoalQueue(true);
     // What the agents passed to each other, so the list down the side holds
     // those conversations too rather than only the ones you have had. It is
     // small, and without it the list is half a list until somebody opens the
@@ -8173,6 +8533,19 @@ async function flushSwarmAgentSettings(agentId, announce = false) {
     if (thePickedAgent()?.id === agentId) $("swarmAgentName").focus();
     return false;
   }
+  const jobLength = systemPromptCharacters(values.job);
+  if (jobLength > AGENT_JOB_CHARACTER_LIMIT) {
+    const over = jobLength - AGENT_JOB_CHARACTER_LIMIT;
+    draft.error = `Not saved yet — this role description is ${jobLength.toLocaleString()} characters; the disclosed limit is ${AGENT_JOB_CHARACTER_LIMIT.toLocaleString()}. Nexus did not truncate it. Shorten it by ${over.toLocaleString()} characters.`;
+    renderSwarmAgentSaveState(agentId);
+    if (thePickedAgent()?.id === agentId) {
+      renderDisclosedTextCount(
+        "swarmAgentJob", "swarmAgentJobCount",
+        AGENT_JOB_CHARACTER_LIMIT, "the role description");
+      $("swarmAgentJob").focus();
+    }
+    return false;
+  }
   const before = theSwarmAgent(agentId);
   if (!before) {
     if (draft.timer) window.clearTimeout(draft.timer);
@@ -8183,7 +8556,7 @@ async function flushSwarmAgentSettings(agentId, announce = false) {
   renderSwarmAgentSaveState(agentId);
   draft.inFlight = (async () => {
     const who = values.who;
-    const job = values.job.trim();
+    const job = values.job;
     const icon = values.icon;
     const colour = values.colour;
     const bubbleColour = values.bubbleColour;
@@ -8276,6 +8649,9 @@ function renderSwarmAgentPanel(agent) {
   const values = draft?.values || agentSettingsFromAgent(agent);
   $("swarmAgentName").value = values.name;
   $("swarmAgentJob").value = values.job;
+  renderDisclosedTextCount(
+    "swarmAgentJob", "swarmAgentJobCount",
+    AGENT_JOB_CHARACTER_LIMIT, "the role description");
   $("swarmAgentIcon").value = values.icon;
   $("swarmAgentColour").value = values.colour;
   $("swarmAgentBubbleColour").value = values.bubbleColour;
@@ -8418,6 +8794,25 @@ function renderSwarmProjectPanel(project) {
   $("swarmProjectWho").textContent = on_it.length
     ? `Worked on by ${on_it.join(", ")}.`
     : "Nobody works on this yet. Press the gear on an agent and tick this project.";
+  const approval = (swarmSaid.verification_command_approvals || [])
+    .find((one) => one.project_id === project.id) || {};
+  const commands = Array.isArray(approval.commands) ? approval.commands : [];
+  $("swarmProjectVerificationCommands").textContent = commands.length
+    ? commands.map((command) => JSON.stringify(command)).join("\n")
+    : "No deterministic test command is currently discoverable.";
+  if (approval.approved) {
+    $("swarmProjectVerificationStatus").textContent =
+      "Approved. Nexus may run only these exact discovered commands for this exact project path.";
+  } else if (approval.stale_approval) {
+    $("swarmProjectVerificationStatus").textContent =
+      "Approval expired because the project path or discovered commands changed. Review and approve the current commands again.";
+  } else {
+    $("swarmProjectVerificationStatus").textContent = approval.reason
+      || "Refresh the command list to see whether this project needs approval.";
+  }
+  $("swarmProjectVerificationDigest").textContent = approval.approval_digest
+    ? `Exact approval fingerprint: ${approval.approval_digest}`
+    : "No approval fingerprint is available.";
   const list = $("swarmTasks");
   list.replaceChildren();
   if (!project.tasks.length) {
@@ -8432,6 +8827,9 @@ function renderSwarmProjectPanel(project) {
     row.append(drop);
     list.append(row);
   });
+  renderDisclosedTextCount(
+    "swarmTaskText", "swarmTaskTextCount",
+    BOARD_TASK_CHARACTER_LIMIT, "the project job");
 }
 
 function renderSwarmLinePanel(line) {
@@ -8519,12 +8917,29 @@ function setWhatCanBePressedInSwarm() {
   $("swarmAddTask").disabled = held
     || !project || project.tasks.length >= (most.tasks || 40);
   $("swarmProjectRemove").disabled = held || !project;
+  $("swarmProjectRebind").disabled = held || !project;
+  const verificationApproval = (swarmSaid.verification_command_approvals || [])
+    .find((one) => one.project_id === project?.id) || {};
+  $("swarmProjectVerificationApprove").disabled = held || !project
+    || !verificationApproval.can_approve || verificationApproval.approved;
+  $("swarmProjectVerificationRevoke").disabled = held || !project
+    || !verificationApproval.approved_digest;
+  $("swarmProjectVerificationRefresh").disabled = !project;
   $("swarmLineOn").disabled = held || !line;
   $("swarmLineRemove").disabled = held || !line || !$("swarmLineOn").checked;
   for (const tick of $("swarmWorksOn").querySelectorAll("input")) tick.disabled = held;
   for (const tick of $("swarmTalksTo").querySelectorAll("input")) tick.disabled = held;
   $("swarmStart").disabled = held || Boolean(swarmSaid.cannot_run) || swarmGoing;
   $("swarmStart").title = String(swarmSaid.cannot_run || held || "");
+  $("swarmWorkGoals").disabled = Boolean(
+    held || swarmSaid.cannot_run || swarmGoing || swarmGoalWorkRunning
+    || swarmGoalQueue?.status === "running");
+  $("swarmWorkGoals").title = String(
+    swarmSaid.cannot_run || held
+    || (swarmGoalQueue?.status === "running" || swarmGoalWorkRunning
+      ? "The exact current goal is already running." : ""));
+  $("swarmCancelGoals").disabled = !swarmGoalQueue
+    || !["queued", "paused"].includes(swarmGoalQueue.status);
   $("swarmStop").disabled = !swarmGoing;
   for (const card of $("swarmBoard").querySelectorAll(".swarm-chat-card")) {
     setWhatCanBePressedInAChat(card);
@@ -8706,15 +9121,20 @@ async function saveTheSwarmAgent() {
   await flushSwarmAgentSettings(agent.id, true);
 }
 
-async function removeTheSwarmAgent() {
+function restoreSwarmRemovalFocus(invoker) {
+  const current = invoker?.id ? document.getElementById(invoker.id) : invoker;
+  current?.focus?.({preventScroll: true});
+}
+
+async function removeTheSwarmAgent(event) {
   const agent = thePickedAgent();
   if (!agent) { sayInSwarm("Press the gear on an agent first."); return; }
-  const invoker = document.activeElement;
+  const invoker = event?.currentTarget || document.activeElement;
   const projects = theSwarmBoard().works_on.filter((line) => line.agent === agent.id).length;
   const connections = theSwarmBoard().talks_to.filter(
     (line) => line.one === agent.id || line.other === agent.id).length;
   if (!window.confirm(`Remove ${agent.name} from this board? This also removes ${projects} project assignment${projects === 1 ? "" : "s"} and ${connections} agent connection${connections === 1 ? "" : "s"}. Saved chat transcripts and project files are kept.`)) {
-    invoker?.focus?.({preventScroll: true});
+    restoreSwarmRemovalFocus(invoker);
     return;
   }
   // Removal is an explicit decision to discard the form as well as the agent.
@@ -8727,17 +9147,18 @@ async function removeTheSwarmAgent() {
     swarmChats = swarmChats.filter((one) => one.agent !== agent.id);
     swarmPicked = null;
   }, `${agent.name} is off the board. What it said is kept.`);
-  (changed ? $("swarmAddAgent") : invoker)?.focus?.({preventScroll: true});
+  if (changed) $("swarmAddAgent")?.focus?.({preventScroll: true});
+  else restoreSwarmRemovalFocus(invoker);
 }
 
-async function removeTheSwarmProject() {
+async function removeTheSwarmProject(event) {
   const project = thePickedProject();
   if (!project) { sayInSwarm("Press the gear on a project folder first."); return; }
-  const invoker = document.activeElement;
+  const invoker = event?.currentTarget || document.activeElement;
   const assignments = theSwarmBoard().works_on.filter((line) => line.project === project.id).length;
   const tasks = project.tasks?.length || 0;
   if (!window.confirm(`Remove ${project.name} from this board? This removes ${assignments} agent assignment${assignments === 1 ? "" : "s"} and ${tasks} board task${tasks === 1 ? "" : "s"}. Nothing in the project folder is changed.`)) {
-    invoker?.focus?.({preventScroll: true});
+    restoreSwarmRemovalFocus(invoker);
     return;
   }
   const changed = await changeTheSwarmBoard((board) => {
@@ -8745,20 +9166,57 @@ async function removeTheSwarmProject() {
     board.works_on = board.works_on.filter((line) => line.project !== project.id);
     swarmPicked = null;
   }, `${project.name} is off the board. Nothing in the folder was changed.`);
-  (changed ? $("swarmAddProject") : invoker)?.focus?.({preventScroll: true});
+  if (changed) $("swarmAddProject")?.focus?.({preventScroll: true});
+  else restoreSwarmRemovalFocus(invoker);
+}
+
+async function rebindTheSwarmProject() {
+  const project = thePickedProject();
+  if (!project) { sayInSwarm("Press the gear on a project folder first."); return; }
+  const said = await askForOneLine(
+    "Use this board project on this computer",
+    "Which local folder contains this same project? Its tasks, agents, links, and history identity stay on the board. Test-command approval is cleared.",
+    project.is_there ? project.path : "", null, true,
+  );
+  if (said === null) { sayInSwarm("The project folder was not changed."); return; }
+  const wanted = said.trim();
+  if (!wanted) { sayInSwarm("Choose a project folder."); return; }
+  if (wanted === project.path) {
+    sayInSwarm("That project already uses this folder.");
+    return;
+  }
+  const changed = await changeTheSwarmBoard((board) => {
+    const held = board.projects.find((one) => one.id === project.id);
+    if (!held) return false;
+    held.path = wanted;
+    held.approved_test_command_digest = "";
+  }, () => {
+    const rebound = theSwarmProject(project.id);
+    return `Rebound ${rebound?.name || project.name} to ${wanted}. Tasks, agents, links, and its board identity were kept; local command approval was cleared.`;
+  });
+  if (changed) pickSwarmBox("project", project.id);
 }
 
 async function addOneSwarmTask() {
   const project = thePickedProject();
   if (!project) return;
-  const words = $("swarmTaskText").value.trim();
-  if (!words) { sayInSwarm("Type the job first."); return; }
+  const problem = disclosedTextProblem(
+    "swarmTaskText", "swarmTaskTextCount",
+    BOARD_TASK_CHARACTER_LIMIT, "the project job");
+  if (problem) { sayInSwarm(problem); $("swarmTaskText").focus(); return; }
+  const words = $("swarmTaskText").value;
+  if (!words.trim()) { sayInSwarm("Type the job first."); return; }
   const worked = await changeTheSwarmBoard((board) => {
     const held = board.projects.find((one) => one.id === project.id);
     if (!held) return false;
     held.tasks.push(words);
   }, `Added to ${project.name}: ${words}`);
-  if (worked) $("swarmTaskText").value = "";
+  if (worked) {
+    $("swarmTaskText").value = "";
+    renderDisclosedTextCount(
+      "swarmTaskText", "swarmTaskTextCount",
+      BOARD_TASK_CHARACTER_LIMIT, "the project job");
+  }
 }
 
 function removeOneSwarmTask(projectId, at) {
@@ -8799,7 +9257,7 @@ function tidyTheSwarmBoard() {
 // back to it. Big, because a chat in a strip at the edge of the page is a chat
 // nobody uses, and because the answer is the part you came to read.
 
-function openTheChatFor(agentId) {
+async function openTheChatFor(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
   const already = swarmChats.find((one) => one.agent === agentId);
@@ -8820,7 +9278,7 @@ function openTheChatFor(agentId) {
   }
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
-  loadConversationsFor(agentId);
+  await loadConversationsFor(agentId);
   renderTheChatTray();
   const card = theChatCardFor(agentId);
   if (card) {
@@ -8834,6 +9292,74 @@ function closeTheChatFor(agentId) {
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
   renderTheChatTray();
+}
+
+function setProjectVerificationApproval(approved) {
+  const mine = theChangeBeforeThis.then(
+    () => applyProjectVerificationApproval(Boolean(approved))
+  );
+  theChangeBeforeThis = mine.catch(() => {});
+  return mine;
+}
+
+async function applyProjectVerificationApproval(approved) {
+  const project = thePickedProject();
+  if (!project) {
+    sayInSwarm("Press the gear on a project folder first.");
+    return false;
+  }
+  const proposal = (swarmSaid.verification_command_approvals || [])
+    .find((one) => one.project_id === project.id) || {};
+  if (approved && (!proposal.can_approve || !proposal.approval_digest)) {
+    sayInSwarm(proposal.reason || "There are no discovered test commands to approve.");
+    return false;
+  }
+  if (approved) {
+    const exact = (proposal.commands || [])
+      .map((command) => JSON.stringify(command)).join("\n");
+    if (!window.confirm(
+      `Allow Nexus to run only these discovered test commands in ${project.path}?\n\n${exact}\n\n`
+      + `Approval fingerprint: ${proposal.approval_digest}\n\n`
+      + "Changing the path or test configuration makes Nexus ask again."
+    )) {
+      sayInSwarm("Nothing was approved.");
+      return false;
+    }
+  } else if (!window.confirm(
+    `Revoke test-command approval for ${project.path}? Nexus will stop before running discovered project tests.`
+  )) {
+    sayInSwarm("The approval was left as it was.");
+    return false;
+  }
+  try {
+    const said = await request("/api/swarm/verification-approval", {
+      method: "POST",
+      body: JSON.stringify({
+        project_id: project.id,
+        project_path: project.path,
+        board_version: theSwarmBoard().version,
+        approved,
+        approval_digest: approved ? proposal.approval_digest : "",
+      }),
+    });
+    howManyChangesLanded += 1;
+    swarmSaid = said;
+    acceptKeptInventory(said, true);
+    keepTheSwarmPick();
+    renderSwarmBoard();
+    renderSwarmNotReady();
+    renderSwarmPanel();
+    renderTheChatsOnThisBoard();
+    sayInSwarm(said.verification_command_approval_note || (
+      approved ? "Those exact test commands are approved." : "Test-command approval was revoked."
+    ));
+    return true;
+  } catch (error) {
+    await refreshSwarm(true);
+    showError(error.message);
+    sayInSwarm(error.message);
+    return false;
+  }
 }
 
 function pairKey(pair) {
@@ -9160,6 +9686,7 @@ function previewSwarmAgentAppearance() {
     const name = card.querySelector(".swarm-box-name");
     if (name) name.textContent = draft.name;
   }
+  return card;
 }
 
 async function resizedAgentPicture(file) {
@@ -9534,6 +10061,7 @@ function oneSwarmChatCard(held) {
   files.type = "file";
   files.multiple = true;
   files.className = "sr-only swarm-chat-files";
+  files.setAttribute("aria-label", `Attach files or screenshots to ${agent.name}'s chat`);
   files.accept = "image/*,.txt,.md,.json,.yaml,.yml,.toml,.ini,.csv,.py,.js,.ts,.tsx,.jsx,.css,.html,.xml";
   files.addEventListener("change", async () => {
     await addChatAttachments(held.agent, files.files || []);
@@ -9980,6 +10508,9 @@ function workResponseWords(answered, agentName = "The team", ordinaryWords = "")
   if (status === "paused_provider") {
     return "A provider did not answer. Nexus saved the exact run; reconnect it and use Retry provider and resume. No user answer is required." + budget;
   }
+  if (status === "paused_tool_budget") {
+    return "The configured context-tool execution budget was used. Nexus saved the exact run; use Reset tool time and resume, or change Context tool execution seconds in Settings. Provider thinking and waiting did not spend this budget." + budget;
+  }
   if (status === "incomplete") {
     return "The long-horizon goal is still incomplete. Nexus saved the exact run so the team can continue instead of starting over." + budget;
   }
@@ -9999,7 +10530,7 @@ function workResponseWords(answered, agentName = "The team", ordinaryWords = "")
         : answered?.routing?.reason || `${agentName} answered.`);
 }
 
-async function resumeSwarmWork(agentId) {
+async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
   const key = swarmChatKey(agentId);
   const recovery = swarmWorkRecoveries.get(key);
   const agent = theSwarmAgent(agentId);
@@ -10039,6 +10570,8 @@ async function resumeSwarmWork(agentId) {
     ? "Resuming the saved run with your answer..."
     : recovery.status === "paused_provider"
       ? "Retrying the provider and resuming the exact saved run..."
+      : recovery.status === "paused_tool_budget"
+        ? "Resetting consumed context-tool time and resuming the exact saved run..."
       : recovery.status === "incomplete"
         ? "Resuming the unfinished long-horizon run..."
         : "Resuming deterministic verification for the saved run...");
@@ -10047,6 +10580,13 @@ async function resumeSwarmWork(agentId) {
   setWhatCanBePressedInSwarm();
   renderWorkRecovery(agentId);
   try {
+    const goalItem = (
+      swarmGoalQueue?.current
+      && ["paused", "running"].includes(swarmGoalQueue.status)
+      && swarmGoalQueue.current.lead_id === agentId
+      && swarmGoalQueue.current.project_id === conversation.project
+      && swarmGoalQueue.current.objective === recovery.objective
+    ) ? swarmGoalQueue.current : null;
     const answered = await request("/api/swarm/say", {
       method: "POST", body: JSON.stringify({
         agent: agentId,
@@ -10058,6 +10598,13 @@ async function resumeSwarmWork(agentId) {
         allow_project_changes: true,
         round_limit: selectedChatRoundLimit(agentId),
         resume_session_id: recovery.resumeToken,
+        ...(goalItem ? {
+          board_goal: true,
+          goal_queue_id: swarmGoalQueue.queue_id,
+          goal_item_id: goalItem.id,
+        } : {}),
+        ...(resetToolExecutionBudget
+          ? {reset_context_tool_execution_budget: true} : {}),
         ...(answers ? {user_answers: answers} : {}),
         // Clone the frozen authority for JSON serialization. It came from the
         // original server response and has no editable UI path.
@@ -10077,6 +10624,11 @@ async function resumeSwarmWork(agentId) {
     sayInTheChatFor(agentId, message);
     if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
     refreshSwarm(true);
+    if (goalItem) {
+      await refreshBoardGoalQueue(false);
+      void continueBoardGoalQueue();
+    }
+    return answered;
   } catch (error) {
     await refreshTheChatFor(agentId);
     const message = String(error?.message || error);
@@ -10084,6 +10636,7 @@ async function resumeSwarmWork(agentId) {
     if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
     if (!stoppedChatError(error)) showError(message);
     finishSwarmChatActivity(agentId, false, message);
+    return null;
   } finally {
     swarmBusy.delete(agentId);
     swarmStopping.delete(agentId);
@@ -10094,6 +10647,8 @@ async function resumeSwarmWork(agentId) {
 
 async function sendWhatIsTypedTo(agentId) {
   const mode = arguments[1] || "auto";
+  const confirmedPermission = arguments[2] || null;
+  const goalQueueItem = arguments[3] || null;
   const card = theChatCardFor(agentId);
   const agent = theSwarmAgent(agentId);
   if (!card || !agent) return;
@@ -10123,7 +10678,7 @@ async function sendWhatIsTypedTo(agentId) {
     sayInTheChatFor(agentId, "Finishing the chat switch first.");
     return;
   }
-  const projectPermission = confirmProjectWork(agent, words, mode);
+  const projectPermission = confirmedPermission || confirmProjectWork(agent, words, mode);
   if (!projectPermission.allowed) return;
   const conversation = activeConversationFor(agentId);
   const recoveryKey = swarmChatKey(agentId);
@@ -10147,6 +10702,11 @@ async function sendWhatIsTypedTo(agentId) {
         agent: agentId, text: words, mode, attachments, activity: activity.id,
         chat: conversation?.id || "",
         allow_project_changes: projectPermission.confirmed,
+        ...(projectPermission.boardGoal ? {board_goal: true} : {}),
+        ...(goalQueueItem ? {
+          goal_queue_id: goalQueueItem.queueId,
+          goal_item_id: goalQueueItem.itemId,
+        } : {}),
         round_limit: selectedChatRoundLimit(agentId),
       }),
     });
@@ -10174,6 +10734,7 @@ async function sendWhatIsTypedTo(agentId) {
     // The list down the side carries the last thing said under each name, and
     // something was just said.
     refreshSwarm(true);
+    return said;
   } catch (error) {
     // Read back what was really kept, so a message that did not get through
     // stops looking like one that did. The words stay in the box.
@@ -10181,6 +10742,7 @@ async function sendWhatIsTypedTo(agentId) {
     if (!stoppedChatError(error)) showError(error.message);
     sayInTheChatFor(agentId, error.message);
     finishSwarmChatActivity(agentId, false, String(error.message || error));
+    return null;
   } finally {
     swarmBusy.delete(agentId);
     swarmStopping.delete(agentId);
@@ -10253,15 +10815,23 @@ function renderWhatTheySaidToEachOther(said) {
   }
   const dropped = said.dropped || 0;
   const delivery = said.delivery || {};
-  const waiting = Number(delivery.queued || 0);
-  const retrying = Number(delivery.retrying || 0);
-  $("swarmExchangeSaid").textContent = notes.length
+  const countsKnown = delivery.counts_known !== false;
+  const waiting = countsKnown ? Number(delivery.queued || 0) : 0;
+  const retrying = countsKnown ? Number(delivery.retrying || 0) : 0;
+  const deliveryTrouble = String(said.delivery_trouble || delivery.trouble || "").trim();
+  const ordinaryStatus = notes.length
     ? `${notes.length} answer${notes.length === 1 ? "" : "s"} passed`
       + (dropped ? `, and ${dropped} older ones dropped to keep the list readable` : "")
       + (waiting ? `; ${waiting} safely queued${retrying ? ` (${retrying} awaiting retry)` : ""}` : "")
     : (waiting
       ? `${waiting} message${waiting === 1 ? " is" : "s are"} safely queued for the next successful turn`
       : "nothing passed yet");
+  $("swarmExchangeSaid").textContent = deliveryTrouble
+    ? `${ordinaryStatus}. Delivery status needs attention: ${deliveryTrouble}`
+    : ordinaryStatus;
+  if (deliveryTrouble) {
+    list.append(make("li", "warning-one", deliveryTrouble));
+  }
   if (!notes.length) {
     list.append(make("li", "hint",
       "Nothing has been passed between agents yet. It happens on the second round "
@@ -10279,6 +10849,10 @@ function renderWhatTheySaidToEachOther(said) {
     } else if (one.message_id) {
       under.push("received and acknowledged");
     }
+    if (Number(one.original_characters || 0) > systemPromptCharacters(one.text || "")) {
+      under.push(`display projection of ${Number(one.original_characters).toLocaleString()} characters`);
+    }
+    if (one.projection_source) under.push(`full source: ${one.projection_source}`);
     row.append(make("p", "hint", under.join(" | ")));
     row.append(make("p", "swarm-exchange-text", one.text));
     list.append(row);
@@ -10293,6 +10867,11 @@ function renderWhatTheySaidToEachOther(said) {
 // that says nothing for a minute is a page somebody presses again.
 
 let swarmGoing = false;      // a run is on
+let swarmGoalWorkRunning = false; // this renderer is dispatching the server's exact cursor
+let swarmGoalQueue = null;   // durable server-owned board-wide goal cursor
+let swarmGoalQueueWatching = 0;
+let swarmGoalQueueContinuing = false;
+const SWARM_GOAL_QUEUE_REQUEST_KEY = "nexus.swarm.goal-queue-request.v1";
 let swarmWatching = 0;       // the timer that keeps asking how it is going
 let swarmBoardRunId = localStorage.getItem("nexus.swarm.board-run") || "";
 let swarmBoardRequestId = localStorage.getItem("nexus.swarm.board-request") || "";
@@ -10340,6 +10919,236 @@ async function setThemGoing() {
     showError(error.message);
     sayInSwarm(error.message);
     $("swarmDoingSaid").textContent = error.message;
+  }
+}
+
+function workingPairForProject(project) {
+  const board = theSwarmBoard();
+  const assigned = new Set((board.works_on || [])
+    .filter((line) => line.project === project.id).map((line) => line.agent));
+  const ready = (board.agents || []).filter(
+    (agent) => assigned.has(agent.id) && agent.ready && agent.who);
+  for (const lead of ready) {
+    const peer = ready.find(
+      (other) => other.id !== lead.id && mayTheyTalk(lead.id, other.id));
+    if (peer) return {lead, peer};
+  }
+  return null;
+}
+
+async function prepareGoalConversation(project, pair) {
+  await openTheChatFor(pair.lead.id);
+  const held = swarmChats.find((one) => one.agent === pair.lead.id);
+  if (!held) throw new Error(`Nexus could not open ${pair.lead.name}'s durable chat.`);
+  let conversation = (held.conversations || []).find((one) => (
+    one.peer === pair.peer.id && !one.archived_at && one.project === project.id));
+  if (!conversation) {
+    conversation = (held.conversations || []).find(
+      (one) => one.peer === pair.peer.id && !one.archived_at);
+  }
+  if (conversation && held.conversation !== conversation.id) {
+    await activateConversationFor(pair.lead.id, conversation.id);
+  } else if (!conversation) {
+    await createConversationFor(pair.lead.id, pair.peer.id);
+  }
+  conversation = activeConversationFor(pair.lead.id);
+  if (!conversation || conversation.peer !== pair.peer.id) {
+    throw new Error(
+      `Nexus could not prepare a durable ${pair.lead.name}/${pair.peer.name} project chat.`);
+  }
+  if (conversation.project !== project.id) {
+    await selectConversationProject(pair.lead.id, project.id);
+    conversation = activeConversationFor(pair.lead.id);
+  }
+  if (!conversation || conversation.project !== project.id) {
+    throw new Error(`Nexus could not bind the durable chat to ${project.name}.`);
+  }
+  return conversation;
+}
+
+function showBoardGoalQueue(queue) {
+  swarmGoalQueue = queue || null;
+  const button = $("swarmWorkGoals");
+  const cancel = $("swarmCancelGoals");
+  if (!queue) {
+    button.textContent = "Work until the goals are achieved";
+    cancel.disabled = true;
+    return;
+  }
+  const current = queue.current;
+  if (queue.status === "complete") {
+    button.textContent = "Work until the goals are achieved";
+    $("swarmGoalWorkSaid").textContent =
+      `All ${queue.total} board goal(s) reached verified completion.`;
+    localStorage.removeItem(SWARM_GOAL_QUEUE_REQUEST_KEY);
+  } else if (queue.status === "cancelled") {
+    button.textContent = "Start the board goals";
+    $("swarmGoalWorkSaid").textContent = queue.note || "The remaining goals were cancelled.";
+    localStorage.removeItem(SWARM_GOAL_QUEUE_REQUEST_KEY);
+  } else {
+    button.textContent = queue.status === "paused"
+      ? "Open the saved goal's Resume controls" : "Show active goal work";
+    const number = Number(queue.cursor || 0) + 1;
+    $("swarmGoalWorkSaid").textContent = queue.note
+      || `Goal ${number} of ${queue.total}: ${current?.lead_name || "the team"} is working in ${current?.project_name || "the project"}.`;
+  }
+  cancel.disabled = !["queued", "paused"].includes(queue.status);
+  setWhatCanBePressedInSwarm();
+}
+
+async function refreshBoardGoalQueue(autoContinue = false) {
+  try {
+    const said = await request("/api/swarm/goal-queue");
+    showBoardGoalQueue(said.queue);
+    if (said.queue?.status === "running") watchBoardGoalQueue();
+    if (autoContinue && said.queue?.status === "queued") {
+      void continueBoardGoalQueue();
+    }
+    return said.queue;
+  } catch (error) {
+    $("swarmGoalWorkSaid").textContent = String(error.message || error);
+    return null;
+  }
+}
+
+function watchBoardGoalQueue() {
+  if (swarmGoalQueueWatching) return;
+  const poll = async () => {
+    swarmGoalQueueWatching = 0;
+    const queue = await refreshBoardGoalQueue(false);
+    if (queue?.status === "running") {
+      swarmGoalQueueWatching = window.setTimeout(poll, 1200);
+    } else if (queue?.status === "queued") {
+      void continueBoardGoalQueue();
+    }
+  };
+  swarmGoalQueueWatching = window.setTimeout(poll, 1200);
+}
+
+async function continueBoardGoalQueue({retryPaused = false} = {}) {
+  if (swarmGoalQueueContinuing) return;
+  swarmGoalQueueContinuing = true;
+  swarmGoalWorkRunning = true;
+  setWhatCanBePressedInSwarm();
+  try {
+    while (true) {
+      const queue = await refreshBoardGoalQueue(false);
+      if (!queue || ["complete", "cancelled"].includes(queue.status)) return;
+      const item = queue.current;
+      if (!item) return;
+      if (queue.status === "running") {
+        watchBoardGoalQueue();
+        return;
+      }
+      const project = theSwarmProject(item.project_id);
+      const lead = theSwarmAgent(item.lead_id);
+      const peer = theSwarmAgent(item.peer_id);
+      if (!project || !lead || !peer) {
+        throw new Error(
+          `The saved queue still points to ${item.project_path}, led by ${item.lead_name} with ${item.peer_name}, but that exact board topology is no longer open. Restore it; Nexus did not substitute another goal or team.`);
+      }
+      const conversation = await prepareGoalConversation(project, {lead, peer});
+      if (queue.status === "paused" && item.resume_token) {
+        $("swarmGoalWorkSaid").textContent =
+          `Goal ${Number(queue.cursor) + 1} of ${queue.total} is saved in ${lead.name}'s chat. Use its Resume action; after verification Nexus will continue the remaining goals automatically.`;
+        await refreshDurableSwarmWorkRecoveries();
+        if (!workRecoveryFor(lead.id) && item.recovery?.resume_token) {
+          rememberWorkRecoveryForKey(
+            swarmChatKey(lead.id), item.recovery, item.objective,
+            {project: item.project_id});
+        }
+        renderWorkRecovery(lead.id);
+        return;
+      }
+      if (queue.status === "paused" && !retryPaused) return;
+      $("swarmGoalWorkSaid").textContent =
+        `Goal ${Number(queue.cursor) + 1} of ${queue.total}: ${lead.name} and ${peer.name} are working in ${project.name}.`;
+      const card = theChatCardFor(lead.id);
+      const box = card?.querySelector(".swarm-chat-box");
+      if (!box) throw new Error(`Nexus could not open the composer for ${lead.name}.`);
+      box.value = item.objective;
+      countWhatIsTypedTo(lead.id);
+      const answered = await sendWhatIsTypedTo(
+        lead.id, "work", {allowed: true, confirmed: true, boardGoal: true},
+        {queueId: queue.queue_id, itemId: item.id});
+      if (!answered) {
+        await refreshBoardGoalQueue(false);
+        return;
+      }
+      // The server records the verified result and moves the cursor before
+      // answering. Read that authority rather than incrementing browser state.
+      retryPaused = false;
+    }
+  } finally {
+    swarmGoalQueueContinuing = false;
+    swarmGoalWorkRunning = false;
+    setWhatCanBePressedInSwarm();
+  }
+}
+
+async function workOnEveryBoardGoal() {
+  if (swarmGoalWorkRunning) return;
+  const existing = await refreshBoardGoalQueue(false);
+  if (existing && ["queued", "running", "paused"].includes(existing.status)) {
+    await continueBoardGoalQueue({retryPaused: existing.status === "paused"});
+    return;
+  }
+  const projects = theSwarmBoard().projects.filter(
+    (project) => project.is_there && Array.isArray(project.tasks) && project.tasks.length);
+  if (!projects.length) {
+    $("swarmGoalWorkSaid").textContent = "Write at least one job on a project first.";
+    return;
+  }
+  const prepared = projects.map((project) => ({
+    project, pair: workingPairForProject(project),
+  }));
+  const blocked = prepared.filter((one) => !one.pair);
+  if (blocked.length) {
+    $("swarmGoalWorkSaid").textContent =
+      `Connect at least two ready agents who both work on ${blocked.map((one) => one.project.name).join(", ")}, with a green line between them.`;
+    return;
+  }
+  const total = prepared.reduce((sum, one) => sum + one.project.tasks.length, 0);
+  const scope = prepared.map((one) =>
+    `${one.project.path} — ${one.project.tasks.length} goal(s), led by ${one.pair.lead.name} with ${one.pair.peer.name}`
+  ).join("\n");
+  if (!window.confirm(
+    `Start durable project work for ${total} goal(s)?\n\n${scope}\n\n`
+    + "Connected agents may change files inside these project folders. Nexus will plan, "
+    + "review, test, repair, and keep incomplete work resumable. It will claim completion "
+    + "only after deterministic verification."
+  )) return;
+
+  try {
+    const requestId = localStorage.getItem(SWARM_GOAL_QUEUE_REQUEST_KEY)
+      || (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID()
+        : `board-goals-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    localStorage.setItem(SWARM_GOAL_QUEUE_REQUEST_KEY, requestId);
+    const started = await request("/api/swarm/goal-queue/start", {
+      method: "POST", body: JSON.stringify({request_id: requestId}),
+    });
+    showBoardGoalQueue(started.queue);
+    await continueBoardGoalQueue({retryPaused: true});
+  } catch (error) {
+    const words = String(error.message || error);
+    $("swarmGoalWorkSaid").textContent = words;
+    showError(words);
+  }
+}
+
+async function cancelRemainingBoardGoals() {
+  const queue = swarmGoalQueue || await refreshBoardGoalQueue(false);
+  if (!queue || !["queued", "paused"].includes(queue.status)) return;
+  if (!window.confirm(
+    `Cancel ${queue.total - queue.completed} remaining board goal(s)? Verified completed goals stay recorded.`
+  )) return;
+  try {
+    const said = await request("/api/swarm/goal-queue/cancel", {
+      method: "POST", body: JSON.stringify({queue_id: queue.queue_id}),
+    });
+    showBoardGoalQueue(said.queue);
+  } catch (error) {
+    showError(error.message);
   }
 }
 
@@ -10644,7 +11453,7 @@ function wireUpMicrosoft() {
 // want two, and then the second one means taking the first apart and building
 // it again from memory on Monday.
 
-const MAX_SAVED_BOARD_IMPORT_BYTES = 10_000_000;
+const MAX_SAVED_BOARD_IMPORT_BYTES = 768_000_000;
 let swarmKept = [];
 let swarmKeptProblems = [];
 
@@ -10825,6 +11634,7 @@ async function useThisLocalModel(server, model, button) {
 
 let thePage = null;
 let thePageFolder = "";
+const THE_PAGE_WINDOW = 20;
 
 function sayAboutThePage(words) {
   const where = $("thePageSaid");
@@ -10867,7 +11677,11 @@ async function refreshThePage() {
   try {
     thePage = await request("/api/swarm/the-page", {
       method: "POST",
-      body: JSON.stringify({folder: thePageFolder, name: named ? named.name : ""}),
+      body: JSON.stringify({
+        folder: thePageFolder,
+        name: named ? named.name : "",
+        limit: THE_PAGE_WINDOW,
+      }),
     });
     renderThePage();
   } catch (trouble) {
@@ -10882,19 +11696,45 @@ function renderThePage() {
   if (!thePage) {
     list.append(make("li", "hint", "Pick a project folder to see its page."));
     $("thePageStands").value = "";
+    renderDisclosedTextCount(
+      "thePageStands", "thePageStandsCount",
+      SHARED_PAGE_CHARACTER_LIMIT, "where it stands");
     return;
   }
   $("thePageStands").value = thePage.where_it_stands || "";
+  renderDisclosedTextCount(
+    "thePageStands", "thePageStandsCount",
+    SHARED_PAGE_CHARACTER_LIMIT, "where it stands");
   if (!thePage.parts.length) {
     list.append(make("li", "hint",
       "Nothing on this page yet. It fills in as the agents work, and you can add to it too."));
+  }
+  if (thePage.window?.has_older) {
+    const olderRow = make("li", "hint");
+    const older = make("button", "", "Load 20 older parts");
+    older.type = "button";
+    older.addEventListener("click", loadOlderPageParts);
+    olderRow.append(older, document.createTextNode(
+      ` Showing ${thePage.parts.length.toLocaleString()} of ${Number(thePage.how_many || 0).toLocaleString()} parts.`
+    ));
+    list.append(olderRow);
   }
   for (const one of thePage.parts) {
     const row = make("li", "swarm-exchange-one");
     row.append(make("strong", "", `${one.number}. ${one.who}`));
     const about = [one.what_they_were_doing, one.at].filter(Boolean).join(" | ");
     row.append(make("p", "hint", about));
-    row.append(make("p", "swarm-exchange-text", one.text));
+    const text = make("p", "swarm-exchange-text", one.text);
+    row.append(text);
+    if (Number(one.text_characters || 0) > String(one.text_preview || "").length) {
+      const full = make("button", "");
+      full.type = "button";
+      full.textContent = one.text_complete
+        ? "Collapse to the 20,000-character preview"
+        : `Show complete ${Number(one.text_characters).toLocaleString()}-character part`;
+      full.addEventListener("click", () => toggleCompletePagePart(one, full));
+      row.append(full);
+    }
     list.append(row);
   }
   // What a person wants to know first: how much is on it and who wrote last.
@@ -10907,8 +11747,67 @@ function renderThePage() {
   sayAboutThePage(thePage.trouble ? `${bits.join(". ")}. ${thePage.trouble}` : `${bits.join(". ")}.`);
 }
 
+async function toggleCompletePagePart(one, button) {
+  if (one.text_complete) {
+    one.text = one.text_preview || "";
+    one.text_complete = false;
+    renderThePage();
+    return;
+  }
+  if (!thePageFolder) return;
+  button.disabled = true;
+  const named = whichProjectsHavePages().find((project) => project.path === thePageFolder);
+  try {
+    const complete = await request("/api/swarm/page-part", {
+      method: "POST",
+      body: JSON.stringify({
+        folder: thePageFolder,
+        name: named ? named.name : "",
+        number: one.number,
+      }),
+    });
+    Object.assign(one, complete);
+    renderThePage();
+  } catch (trouble) {
+    sayAboutThePage(String(trouble.message || trouble));
+    button.disabled = false;
+  }
+}
+
+async function loadOlderPageParts(event) {
+  if (!thePageFolder || !thePage?.window?.has_older) return;
+  const button = event?.currentTarget;
+  if (button) button.disabled = true;
+  const named = whichProjectsHavePages().find((one) => one.path === thePageFolder);
+  try {
+    const older = await request("/api/swarm/the-page", {
+      method: "POST",
+      body: JSON.stringify({
+        folder: thePageFolder,
+        name: named ? named.name : "",
+        before: thePage.window.next_before,
+        limit: THE_PAGE_WINDOW,
+      }),
+    });
+    const already = new Set((thePage.parts || []).map((one) => Number(one.number)));
+    const additions = (older.parts || []).filter((one) => !already.has(Number(one.number)));
+    thePage.parts = [...additions, ...(thePage.parts || [])];
+    thePage.window.first = older.window?.first || thePage.window.first;
+    thePage.window.next_before = older.window?.next_before || 0;
+    thePage.window.has_older = Boolean(older.window?.has_older);
+    renderThePage();
+  } catch (trouble) {
+    sayAboutThePage(String(trouble.message || trouble));
+    if (button) button.disabled = false;
+  }
+}
+
 async function saveWhereItStands() {
   if (!thePageFolder) return;
+  const problem = disclosedTextProblem(
+    "thePageStands", "thePageStandsCount",
+    SHARED_PAGE_CHARACTER_LIMIT, "where it stands");
+  if (problem) { sayAboutThePage(problem); $("thePageStands").focus(); return; }
   try {
     await request("/api/swarm/where-it-stands", {
       method: "POST",
@@ -10929,7 +11828,7 @@ async function saveWhereItStands() {
 
 async function addSomethingOfMyOwn() {
   if (!thePageFolder) return;
-  const said = await askForOneLine(
+  const said = await askForLongPageText(
     "Add to the page", "This goes on the page under your name, and every agent reads it.", "");
   if (said === null || !said.trim()) return;
   try {
@@ -11074,9 +11973,16 @@ async function importKeptBoard(file) {
   if (!file) return;
   try {
     if (file.size > MAX_SAVED_BOARD_IMPORT_BYTES) {
-      throw new Error("That saved-board JSON file is larger than 10 MB. Nothing was imported.");
+      throw new Error("That saved-board JSON file is larger than 768 MB. Nothing was imported.");
     }
-    const written = await file.text();
+    let written;
+    try {
+      written = new TextDecoder("utf-8", {fatal: true}).decode(
+        await file.arrayBuffer()
+      );
+    } catch (_) {
+      throw new Error("That saved-board file is not valid UTF-8. Nothing was imported.");
+    }
     let document;
     try { document = JSON.parse(written); }
     catch (_) { throw new Error("That file is not valid JSON. Nothing was imported."); }
@@ -11109,8 +12015,8 @@ async function exportKeptBoard(name) {
       `/api/swarm/export-kept?name=${encodeURIComponent(name)}`
     );
     const written = JSON.stringify(said.document, null, 2) + "\n";
-    if (window.harnessDesktop?.saveJsonFile) {
-      const saved = await window.harnessDesktop.saveJsonFile(
+    if (window.harnessDesktop?.saveLargeJsonFile) {
+      const saved = await window.harnessDesktop.saveLargeJsonFile(
         said.filename || "nexus-saved-board.json", written
       );
       sayInSwarm(saved?.saved
@@ -12555,6 +13461,8 @@ function wireUpTheSwarmBoard() {
   $("swarmRefresh").addEventListener("click", () => refreshSwarm());
   wireUpWebChats();
   $("swarmStart").addEventListener("click", setThemGoing);
+  $("swarmWorkGoals").addEventListener("click", workOnEveryBoardGoal);
+  $("swarmCancelGoals").addEventListener("click", cancelRemainingBoardGoals);
   $("swarmStop").addEventListener("click", stopThemGoing);
   $("swarmAgentSave").addEventListener("click", saveTheSwarmAgent);
   $("swarmAgentWho").addEventListener("change", async (event) => {
@@ -12570,6 +13478,9 @@ function wireUpTheSwarmBoard() {
   for (const id of ["swarmAgentName", "swarmAgentJob"]) {
     $(id).addEventListener("input", () => {
       if (id === "swarmAgentName") previewSwarmAgentAppearance();
+      if (id === "swarmAgentJob") renderDisclosedTextCount(
+        "swarmAgentJob", "swarmAgentJobCount",
+        AGENT_JOB_CHARACTER_LIMIT, "the role description");
       rememberSwarmAgentSettings(550);
     });
     // Leaving a text field is a natural save boundary; do not make a quick
@@ -12606,9 +13517,21 @@ function wireUpTheSwarmBoard() {
     if (agent) openTheChatFor(agent.id);
   });
   $("swarmProjectRemove").addEventListener("click", removeTheSwarmProject);
+  $("swarmProjectRebind").addEventListener("click", rebindTheSwarmProject);
+  $("swarmProjectVerificationApprove").addEventListener(
+    "click", () => setProjectVerificationApproval(true));
+  $("swarmProjectVerificationRevoke").addEventListener(
+    "click", () => setProjectVerificationApproval(false));
+  $("swarmProjectVerificationRefresh").addEventListener(
+    "click", () => refreshSwarm());
   $("swarmAddTask").addEventListener("click", addOneSwarmTask);
+  $("swarmTaskText").addEventListener("input", () => renderDisclosedTextCount(
+    "swarmTaskText", "swarmTaskTextCount",
+    BOARD_TASK_CHARACTER_LIMIT, "the project job"));
   $("swarmTaskText").addEventListener("keydown", (event) => {
-    if (event.key === "Enter") { event.preventDefault(); addOneSwarmTask(); }
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault(); addOneSwarmTask();
+    }
   });
   $("swarmLineOn").addEventListener("change", () => setThePickedLine($("swarmLineOn").checked));
   $("swarmLineRemove").addEventListener("click", () => setThePickedLine(false));

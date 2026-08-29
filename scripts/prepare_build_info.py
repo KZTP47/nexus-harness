@@ -24,10 +24,18 @@ def main() -> int:
     commit = git("rev-parse", "HEAD") or "unknown"
     dirty = bool(git("status", "--porcelain"))
     signed = os.environ.get("NEXUS_SIGNED_BUILD") == "1"
+    unsigned_release = os.environ.get("NEXUS_UNSIGNED_RELEASE") == "1"
+    if signed and unsigned_release:
+        raise RuntimeError("A Nexus build cannot be both signed and explicitly unsigned")
+    build_kind = (
+        "signed release" if signed
+        else "unsigned release" if unsigned_release
+        else "unsigned development build"
+    )
     value = {
         "commit": commit,
         "dirty": dirty,
-        "build_kind": "signed release" if signed else "unsigned development build",
+        "build_kind": build_kind,
     }
     OUTPUT.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     print(f"Prepared {value['build_kind']} identity {commit}{'+dirty' if dirty else ''}")

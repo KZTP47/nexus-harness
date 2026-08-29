@@ -1,18 +1,24 @@
 # Runtime data the harness writes. The suites and config in .harness are shared;
 # .harness/.gitignore names the parts that are not.
 .harness/config.local.json
+.harness/project-authority.json
 .harness/memory/
 .harness/runs/
 .harness/backups/
 .harness/checkpoints/
 .harness/cache/
+.harness/runtime/
+.harness/swarm-mutation-sagas/
 .harness/qa/runs/
 .harness/qa/tmp/
+.harness/qa/pipeline-preservation.lock
+.harness/qa/pipelines-before-checks/
 .harness/bundles/
 .harness/qa/history.json
 # What you said to an assistant, and what it said back. Yours, and about this
 # machine, so it never goes into a repository.
 .harness/chats/
+.harness/pages/
 # Machine-local memory and agent policy. These can contain private project
 # paths and must never be staged with the product source.
 .harness/vault/
@@ -22,6 +28,7 @@ AGENTS.md
 .harness/qa/full-report.json
 .harness/qa/ci-report.json
 .harness/qa/candidates.json
+.harness/qa/*report*.json
 .harness/transaction.lock
 
 # The private project memory lives outside this repository. These names are a
@@ -52,9 +59,16 @@ __pycache__/
 .harness/pipelines/auto2-copy.json
 .harness/pipelines/first-pipeline.json
 .harness/pipelines/new-automation2.json
+.harness/pipelines/last-run.json
+.harness/pipelines/evidence/
+.harness/pipelines/drafts/
 benchmark-logs/
 benchmark-archive/
 reports/
+
+# A killed counterexample check can leave its isolated project copy behind.
+# It is recovery/scratch data and can contain source from the current checkout.
+.counterexample-sandbox-*/
 
 # When this machine last looked at its timers, and the lock a run holds while
 # it goes. About this machine at this moment, not about the project - the

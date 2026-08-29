@@ -8,8 +8,8 @@ title Install Nexus Harness
 echo.
 echo   Nexus Harness
 echo   =============
-echo   Downloading the signed, versioned Windows release. No administrator
-echo   account and no separate Python installation are required.
+echo   Downloading the versioned Windows release and verifying its SHA-256.
+echo   No administrator account and no separate Python are required.
 echo.
 
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\install_nexus_harness.ps1"

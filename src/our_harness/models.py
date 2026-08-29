@@ -153,7 +153,9 @@ class ProviderRequest:
 @dataclass(frozen=True)
 class ProviderResponse:
     text: str
-    finish_reason: str = "stop"
+    # Empty means the adapter has not proved a terminal provider outcome. No
+    # caller may infer success merely because some plausible text arrived.
+    finish_reason: str = ""
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_input_tokens: int | None = None

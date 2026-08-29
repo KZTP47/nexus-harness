@@ -38,8 +38,10 @@ from .models import HarnessError
 from .safety import confined_path
 
 WHERE_THEY_LIVE = ".harness/vault"
-# A note is a small thing on purpose. Anything longer belongs in the project.
-MOST_LETTERS = 20000
+# Large enough for substantial project knowledge, while keeping a disclosed
+# per-note bound well below the server's request-size safety limit.  The panel
+# shows this exact limit and neither side silently trims a note to fit it.
+MOST_LETTERS = 200_000
 MOST_NOTES = 2000
 # After this long with nothing touching it, a note is called stale: still
 # there, still readable, no longer taken as certainly true.
@@ -183,7 +185,12 @@ def _read_front(text: str) -> tuple[dict[str, Any], str]:
             front[key] = [part.strip().strip("'\"") for part in inside.split(",") if part.strip()]
         else:
             front[key] = value.strip("'\"")
-    return front, text[end + 4:].lstrip("\n")
+    body = text[end + 4:]
+    # Remove only the newline that terminates the closing frontmatter marker.
+    # Any newline after that can be intentional note content. Legacy notes are
+    # normalized in from_text; notes written by this version carry an explicit
+    # body marker and round-trip every leading/trailing character.
+    return front, body[1:] if body.startswith("\n") else body
 
 
 def _one_plain_line(said: Any) -> str:
@@ -214,8 +221,11 @@ def _write_front(note: Note) -> str:
         f"from: {note.came_from}\n"
         f"uses: {note.uses}\n"
         f"worked: {note.worked}\n"
-        "---\n\n"
-        f"{note.body.strip()}\n"
+        f"body-characters: {len(note.body)}\n"
+        "---\n"
+        # This newline ends the frontmatter.  The reader removes exactly this
+        # structural character; every character in note.body remains data.
+        f"{note.body}"
     )
 
 
@@ -241,12 +251,13 @@ def from_text(name: str, text: str) -> Note:
     """One note, read out of the file it lives in."""
 
     front, body = _read_front(text)
+    body = body if "body-characters" in front else body.strip()
     kind = str(front.get("kind") or "about-this-project")
     return Note(
         name=name,
         title=str(front.get("title") or name.replace("-", " ")),
         kind=kind if kind in KINDS else "about-this-project",
-        body=body.strip(),
+        body=body,
         tags=[
             re.sub(r"[^A-Za-z0-9_-]+", "", str(tag))[:32]
             for tag in (front.get("tags") or [])
@@ -282,8 +293,9 @@ def write_one(config: LoadedConfig, note: Note, *, was: str = "") -> Note:
         raise VaultError(f"{note.kind} is not a kind of note this keeps")
     if len(note.body) > MOST_LETTERS:
         raise VaultError(
-            f"A note is a small thing: this one is longer than {MOST_LETTERS} letters. "
-            "Anything that long belongs in the project, with a note pointing at it."
+            f"This note is {len(note.body):,} characters; the disclosed limit is "
+            f"{MOST_LETTERS:,}. Nexus did not truncate it. Shorten it by "
+            f"{len(note.body) - MOST_LETTERS:,} characters and try again."
         )
     if any(ord(letter) < 32 and letter not in "\t\n\r" for letter in note.body):
         raise VaultError("That note holds a control character")

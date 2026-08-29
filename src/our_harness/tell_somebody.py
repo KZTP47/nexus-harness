@@ -59,8 +59,13 @@ from .models import HarnessError
 WHERE_THEY_LIVE = "telling"
 
 # The most that goes out in one message. A chat room is not a log file, and a
-# whole failing test run pasted into one is read by nobody.
+# whole failing test run pasted into one is read by nobody. A bounded message
+# is always visibly marked and points to the full persisted run; it is never a
+# silent slice.
 MOST_LETTERS = 3_000
+DISCORD_MESSAGE_LETTERS = 1_900
+MOST_HEADING_LETTERS = 200
+MOST_RESULT_REFERENCE_LETTERS = 500
 # How long to wait for the other end. Long enough for a slow morning, short
 # enough that a timer's run is not held up by somebody else's outage.
 LONGEST_WAIT = 20.0
@@ -440,9 +445,43 @@ class Said:
     name: str
     sent: bool
     note: str
+    truncated: bool = False
+    original_characters: int = 0
+    full_result_reference: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "sent": self.sent, "note": self.note}
+        return {
+            "name": self.name,
+            "sent": self.sent,
+            "note": self.note,
+            "truncated": self.truncated,
+            "original_characters": self.original_characters,
+            "full_result_reference": self.full_result_reference,
+        }
+
+
+def _notification_projection(
+    body: str, *, most_characters: int, full_result_reference: str
+) -> tuple[str, bool]:
+    """Return a visibly bounded channel projection or refuse unrecoverable loss."""
+
+    if len(body) <= most_characters:
+        return body, False
+    if not full_result_reference:
+        raise TellingError(
+            f"This notification is {len(body):,} characters; the channel limit is "
+            f"{most_characters:,}. Nexus did not silently cut it. Persist the full "
+            "result and provide its reference before sending a shortened notification."
+        )
+    marker = (
+        "\n\n[Shortened notification: the full result is "
+        f"{len(body):,} characters. Open {full_result_reference}.]"
+    )
+    if len(marker) >= most_characters:
+        raise TellingError(
+            "The full-result reference is too long to fit beside the notification notice."
+        )
+    return body[:most_characters - len(marker)] + marker, True
 
 
 def tell_them(
@@ -452,6 +491,7 @@ def tell_them(
     body: str,
     *,
     passed: bool = True,
+    full_result_reference: str = "",
     post: Callable[..., str] | None = None,
 ) -> Said:
     """Say one thing, one way.
@@ -471,8 +511,28 @@ def tell_them(
     # Found by looking, the looking can quietly find none - and then the very
     # key this is about goes out in plain text.
     clean = CredentialRedactor(config, also_hide=_every_key_name(config, way))
-    heading = clean.text(str(heading))[:200]
-    body = clean.text(str(body))[:MOST_LETTERS]
+    heading = clean.text(str(heading))
+    if len(heading) > MOST_HEADING_LETTERS:
+        raise TellingError(
+            f"This notification heading is {len(heading):,} characters; the disclosed "
+            f"limit is {MOST_HEADING_LETTERS:,}. Nexus did not truncate it."
+        )
+    reference = _one_line(clean.text(str(full_result_reference))).strip()
+    if len(reference) > MOST_RESULT_REFERENCE_LETTERS:
+        raise TellingError(
+            f"The full-result reference is longer than {MOST_RESULT_REFERENCE_LETTERS:,} "
+            "characters. Nothing was sent."
+        )
+    body = clean.text(str(body))
+    original_characters = len(body)
+    body_limit = MOST_LETTERS
+    if way.kind == "discord":
+        body_limit = DISCORD_MESSAGE_LETTERS - len(f"**{heading}**\n")
+    body, truncated = _notification_projection(
+        body,
+        most_characters=body_limit,
+        full_result_reference=reference,
+    )
     secret = os.environ[way.secret_in].strip()
     post = post or _post_it
 
@@ -490,6 +550,7 @@ def tell_them(
             f"{STUCK_ONES_ALLOWED} messages are already stuck waiting for an "
             "answer, so this one was not started. Something you are telling is "
             "not there. Check the addresses in: harness tell list",
+            truncated, original_characters, reference,
         )
     except TookTooLong:
         return Said(
@@ -497,6 +558,7 @@ def tell_them(
             f"{way.name} did not answer within "
             f"{int(LONGEST_WAIT + A_LITTLE_LONGER)} seconds, "
             "so the harness stopped waiting and carried on.",
+            truncated, original_characters, reference,
         )
     except TellingError:
         raise
@@ -507,8 +569,12 @@ def tell_them(
             way.name, False,
             f"{way.name} could not be reached ({type(exc).__name__}). The "
             "harness is fine; something between here and there is not.",
+            truncated, original_characters, reference,
         )
-    return Said(way.name, True, f"Told {way.name}.")
+    return Said(
+        way.name, True, f"Told {way.name}.",
+        truncated, original_characters, reference,
+    )
 
 
 def _every_key_name(config: LoadedConfig, way: Way) -> set[str]:
@@ -605,7 +671,9 @@ def _what_to_post(
     if way.kind == "slack":
         return _an_address(secret), {"text": f"{heading}\n{body}"}
     if way.kind == "discord":
-        return _an_address(secret), {"content": f"**{heading}**\n{body}"[:1900]}
+        # tell_them already projected the body to the complete channel budget,
+        # including this heading. A second slice here would hide data loss.
+        return _an_address(secret), {"content": f"**{heading}**\n{body}"}
     if way.kind == "teams":
         return _an_address(secret), {"title": heading, "text": body}
     if way.kind == "telegram":
@@ -706,6 +774,7 @@ def tell_everybody(
     *,
     passed: bool = True,
     only_when_it_fails: bool = False,
+    full_result_reference: str = "",
     post: Callable[..., str] | None = None,
 ) -> list[Said]:
     """Say one thing every way that is set up and can be used."""
@@ -713,7 +782,10 @@ def tell_everybody(
     if only_when_it_fails and passed:
         return []
     return [
-        tell_them(config, one, heading, body, passed=passed, post=post)
+        tell_them(
+            config, one, heading, body, passed=passed,
+            full_result_reference=full_result_reference, post=post,
+        )
         for one in every_one(config)
         if one.turned_on
     ]

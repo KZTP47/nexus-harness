@@ -42,6 +42,7 @@ from . import seats as seats_lab
 from . import workflows as workflows_lab
 from .config import (
     LoadedConfig,
+    SYSTEM_PROMPT_MAX_CHARACTERS,
     is_project_local_config_trusted,
     trust_project_local_config,
 )
@@ -119,7 +120,7 @@ WAY_IN_NAMES = {key for key, _label, _means in WAYS_IN}
 KIND_FOR_WAY_IN = {"on-this-machine": "ollama", "with-a-key": "openai-compatible"}
 ROUTE_SHAPE = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
 KEY_NAME_SHAPE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
-MOST_PROMPT_LETTERS = 4000
+MOST_PROMPT_LETTERS = SYSTEM_PROMPT_MAX_CHARACTERS
 
 # How many boxes one team may hold. Past this it stops being a picture somebody
 # can read, which is the whole point of it.
@@ -528,8 +529,9 @@ def check_a_custom_member(said: Any) -> dict[str, Any]:
     prompt = str(said.get("prompt") or "")
     if len(prompt) > MOST_PROMPT_LETTERS:
         raise TeamError(
-            f"That prompt is longer than {MOST_PROMPT_LETTERS} letters. Anything that "
-            "long belongs in the project, with the prompt pointing at it."
+            f"That prompt is {len(prompt):,} characters; the disclosed limit is "
+            f"{MOST_PROMPT_LETTERS:,}. Nexus did not truncate it. Shorten it by "
+            f"{len(prompt) - MOST_PROMPT_LETTERS:,} characters and try again."
         )
     if any(ord(letter) < 32 and letter not in "\t\n\r" for letter in prompt):
         raise TeamError("That prompt holds a control character.")
@@ -542,7 +544,10 @@ def check_a_custom_member(said: Any) -> dict[str, Any]:
         "label": label,
         "job": job,
         "asking": asking,
-        "prompt": prompt.strip(),
+        # Keep the exact text the person entered.  Whitespace may be
+        # meaningful in examples or structured instructions; validation must
+        # never quietly rewrite a prompt on the way to the graph.
+        "prompt": prompt,
         "route": str(said.get("route") or "").strip().lower(),
         "model": str(said.get("model") or "").strip()[:120],
     }

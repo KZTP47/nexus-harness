@@ -9,9 +9,11 @@ the checksum published beside it, and then starts the installer.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,6 +27,7 @@ REPOSITORY = "KZTP47/nexus-harness"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 MAX_INSTALLER_BYTES = 350 * 1024 * 1024
 ALLOWED_DOWNLOAD_HOSTS = {
+    "api.github.com",
     "github.com",
     "objects.githubusercontent.com",
     "release-assets.githubusercontent.com",
@@ -32,15 +35,13 @@ ALLOWED_DOWNLOAD_HOSTS = {
 PUBLISHER_FILE = Path(__file__).resolve().parents[1] / "release" / "windows-authenticode-publisher.txt"
 
 
-def _expected_publisher() -> str:
+def _expected_publisher() -> str | None:
     try:
         subject = PUBLISHER_FILE.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise InstallError("The pinned Windows publisher identity is missing; nothing was downloaded.") from exc
     if not subject or subject.startswith("UNCONFIGURED"):
-        raise InstallError(
-            "This checkout has no pinned Windows publisher yet, so it cannot safely install a public release."
-        )
+        return None
     return subject
 
 
@@ -48,19 +49,77 @@ class InstallError(RuntimeError):
     pass
 
 
-def _request(url: str) -> urllib.request.Request:
-    return urllib.request.Request(
-        url,
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "Nexus-Harness-Installer"},
-    )
+@functools.lru_cache(maxsize=1)
+def _github_token() -> str:
+    """Reuse an existing private-repository login without printing or storing it."""
+
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+    if token:
+        return token.strip()
+    for argv, input_text, environment in (
+        (["gh", "auth", "token"], None, None),
+        (["git", "credential", "fill"], "protocol=https\nhost=github.com\n\n",
+         {**os.environ, "GCM_INTERACTIVE": "Never"}),
+    ):
+        try:
+            result = subprocess.run(
+                argv, input=input_text, capture_output=True, text=True,
+                timeout=15, check=False, env=environment,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        if argv[0] == "gh" and result.stdout.strip():
+            return result.stdout.strip()
+        for line in result.stdout.splitlines():
+            if line.startswith("password="):
+                return line.removeprefix("password=").strip()
+    return ""
+
+
+def _request(url: str, *, accept: str = "application/vnd.github+json") -> urllib.request.Request:
+    headers = {"Accept": accept, "User-Agent": "Nexus-Harness-Installer"}
+    token = _github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.Request(url, headers=headers)
+
+
+def _allowed_address(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS
+
+
+class _SafeGitHubRedirects(urllib.request.HTTPRedirectHandler):
+    """Validate before following and never carry a bearer token across hosts."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        if not _allowed_address(newurl):
+            raise InstallError(
+                "The release download redirected away from GitHub; nothing was run."
+            )
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        if urlparse(req.full_url).hostname != urlparse(newurl).hostname:
+            redirected.remove_header("Authorization")
+            redirected.headers.pop("Authorization", None)
+            redirected.unredirected_hdrs.pop("Authorization", None)
+        return redirected
+
+
+_SAFE_DOWNLOAD_OPENER = urllib.request.build_opener(_SafeGitHubRedirects())
 
 
 def _download(url: str, destination: Path, maximum: int) -> None:
-    if urlparse(url).scheme != "https" or urlparse(url).hostname not in ALLOWED_DOWNLOAD_HOSTS:
+    if not _allowed_address(url):
         raise InstallError("GitHub returned an unexpected download address; nothing was run.")
     total = 0
     try:
-        with urllib.request.urlopen(_request(url), timeout=60) as response, destination.open("wb") as output:
+        with _SAFE_DOWNLOAD_OPENER.open(
+            _request(url, accept="application/octet-stream"), timeout=60,
+        ) as response, destination.open("wb") as output:
             final = urlparse(response.geturl())
             if final.scheme != "https" or final.hostname not in ALLOWED_DOWNLOAD_HOSTS:
                 raise InstallError("The release download redirected away from GitHub; nothing was run.")
@@ -77,8 +136,12 @@ def _download(url: str, destination: Path, maximum: int) -> None:
 
 
 def _release(api_url: str = LATEST_RELEASE_API) -> dict:
+    if not _allowed_address(api_url):
+        raise InstallError(
+            "The release metadata address is not an approved GitHub HTTPS host."
+        )
     try:
-        with urllib.request.urlopen(_request(api_url), timeout=30) as response:
+        with _SAFE_DOWNLOAD_OPENER.open(_request(api_url), timeout=30) as response:
             body = response.read(2 * 1024 * 1024 + 1)
     except (OSError, urllib.error.URLError) as exc:
         raise InstallError(f"GitHub releases could not be reached: {exc}") from exc
@@ -102,6 +165,16 @@ def _assets(release: dict) -> tuple[dict, dict]:
     return installers[0], checksums[0]
 
 
+def _asset_download_url(asset: dict, *, authenticated: bool) -> str:
+    """Use GitHub's asset API for private/authenticated release downloads."""
+
+    key = "url" if authenticated else "browser_download_url"
+    address = str(asset.get(key) or "")
+    if not address:
+        raise InstallError(f"The release asset has no {key}; nothing was downloaded.")
+    return address
+
+
 def _expected_digest(checksum_file: Path, installer_name: str) -> str:
     lines = checksum_file.read_text(encoding="utf-8-sig").splitlines()
     for line in lines:
@@ -121,8 +194,8 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _authenticode_signer(path: Path, expected_subject: str) -> str:
-    """Return the valid Windows signer subject, or refuse to run the file."""
+def _authenticode_signer(path: Path, expected_subject: str | None) -> str:
+    """Verify the declared release mode and return its human-readable trust label."""
 
     script = (
         "$signature = Get-AuthenticodeSignature -LiteralPath $args[0]; "
@@ -140,6 +213,14 @@ def _authenticode_signer(path: Path, expected_subject: str) -> str:
         raise InstallError(f"Windows could not verify the installer signature: {exc}") from exc
     status = str(value.get("Status") or "")
     subject = str(value.get("Subject") or "")
+    if expected_subject is None:
+        if status != "NotSigned" or subject:
+            detail = str(value.get("Message") or result.stderr or status or "unexpected signature state")
+            raise InstallError(
+                "The checksum-only release did not have the expected unsigned Windows signature state "
+                f"({detail}); nothing was run."
+            )
+        return "SHA-256 verified; not Authenticode-signed"
     if status != "Valid" or not subject:
         detail = str(value.get("Message") or result.stderr or status or "no signature")
         raise InstallError(f"The installer does not have a valid Authenticode signature ({detail}); nothing was run.")
@@ -156,20 +237,42 @@ def install(*, api_url: str = LATEST_RELEASE_API, quiet: bool = False) -> str:
     expected_publisher = _expected_publisher()
     release = _release(api_url)
     installer_asset, checksum_asset = _assets(release)
+    installer_name = str(installer_asset.get("name") or "")
+    canonical = re.fullmatch(r"Nexus-Harness-Setup-[0-9][0-9.]*\.exe", installer_name)
+    checksum_only = re.fullmatch(r"Nexus-Harness-Setup-[0-9][0-9.]*-UNSIGNED\.exe", installer_name)
+    if expected_publisher is None and not checksum_only:
+        raise InstallError(
+            "The repository has no pinned Windows publisher, but the release is not explicitly named UNSIGNED; "
+            "nothing was run."
+        )
+    if expected_publisher is not None and not canonical:
+        raise InstallError("The signed release has an unexpected installer name; nothing was run.")
     version = str(release.get("tag_name") or "the latest release")
     with tempfile.TemporaryDirectory(prefix="nexus-harness-install-") as temporary:
         folder = Path(temporary)
         installer = folder / str(installer_asset["name"])
         checksum = folder / str(checksum_asset["name"])
         print(f"Downloading Nexus Harness {version} from GitHub Releases...")
-        _download(str(installer_asset["browser_download_url"]), installer, MAX_INSTALLER_BYTES)
-        _download(str(checksum_asset["browser_download_url"]), checksum, 128 * 1024)
+        authenticated = bool(_github_token())
+        _download(
+            _asset_download_url(installer_asset, authenticated=authenticated),
+            installer, MAX_INSTALLER_BYTES,
+        )
+        _download(
+            _asset_download_url(checksum_asset, authenticated=authenticated),
+            checksum, 128 * 1024,
+        )
         expected = _expected_digest(checksum, installer.name)
         actual = _sha256(installer)
         if actual != expected:
             raise InstallError("The installer checksum did not match; the file was deleted and not run.")
-        signer = _authenticode_signer(installer, expected_publisher)
-        print(f"Checksum and Windows signature verified ({signer}). Starting the installer...")
+        trust = _authenticode_signer(installer, expected_publisher)
+        if expected_publisher is None:
+            print(
+                "WARNING: this installer is not Authenticode-signed. Its exact bytes matched the SHA-256 "
+                "published with the immutable GitHub release."
+            )
+        print(f"Release trust verified ({trust}). Starting the installer...")
         arguments = [str(installer), *( ["/S"] if quiet else [] )]
         result = subprocess.run(arguments, check=False)
         if result.returncode != 0:
@@ -188,7 +291,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Installation stopped safely: {exc}", file=sys.stderr)
         print(
             "Open https://github.com/KZTP47/nexus-harness/releases to install manually. "
-            "If you are developing Nexus itself, see docs/DESKTOP.md instead.",
+            "For this private repository, first sign in with GitHub CLI or Git Credential Manager, "
+            "or set GH_TOKEN only for the installer process. If you are developing Nexus itself, "
+            "see docs/DESKTOP.md instead.",
             file=sys.stderr,
         )
         return 1

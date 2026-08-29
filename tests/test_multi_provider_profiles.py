@@ -324,6 +324,19 @@ class NativeToolAdapterTests(unittest.TestCase):
             result = payloads[1]["messages"][-1]["content"][0]
             self.assertEqual(result["tool_use_id"], "call-a")
 
+    def test_anthropic_requires_an_explicit_stop_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = AnthropicProvider(
+                self.provider_config(Path(temporary), "anthropic"),
+            )
+            incomplete = {
+                "content": [{"type": "text", "text": "plausible partial"}],
+                "usage": {},
+            }
+            with patch.object(provider, "_post", return_value=incomplete), \
+                    self.assertRaisesRegex(HarnessError, "stop_reason"):
+                provider.complete(request())
+
 
 class WorkflowProviderRoutingTests(unittest.TestCase):
     @staticmethod
@@ -534,6 +547,17 @@ class WorkflowProviderRoutingTests(unittest.TestCase):
             self.assertIn("tools", payloads[0])
             self.assertEqual(payloads[1]["messages"][-1], {"role": "tool", "tool_name": "read_file", "content": "source"})
             self.assertEqual(second.text, "done")
+
+    def test_ollama_non_stream_refuses_done_false_partial_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = OllamaProvider(self.provider_config(Path(temporary), "ollama"))
+            incomplete = {
+                "message": {"role": "assistant", "content": "partial output"},
+                "done": False,
+            }
+            with patch.object(provider, "_post", return_value=incomplete), \
+                    self.assertRaisesRegex(HarnessError, "nonterminal"):
+                provider.complete(request())
 
     def test_ollama_stream_accumulates_tool_calls_and_thinking_before_done(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

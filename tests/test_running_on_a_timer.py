@@ -578,6 +578,45 @@ class NothingFiresEarly(TimerTestCase):
 
 
 class WhatHappensWhenItRuns(TimerTestCase):
+    def test_long_visible_history_is_marked_and_points_to_full_run(self) -> None:
+        one = self.a_timer()
+        long_result = "start-" + "x" * 800 + "-tail-sentinel"
+        timer.write_down_a_run(
+            self.config, one, long_result, False, run_id="exact-long-run"
+        )
+        kept = timer.load(self.config, "Every night").runs[-1]
+        self.assertTrue(kept["said_truncated"])
+        self.assertEqual(kept["said_original_characters"], len(long_result))
+        self.assertEqual(kept["full_result_reference"], "pipeline-run:exact-long-run")
+        self.assertLessEqual(len(kept["said"]), timer.RUN_HISTORY_SAID_CHARACTERS)
+        self.assertIn("shortened from", kept["said"])
+        self.assertIn("pipeline-run:exact-long-run", kept["said"])
+        self.assertNotIn("tail-sentinel", kept["said"])
+
+    def test_history_without_a_full_run_reference_is_never_silently_cut(self) -> None:
+        one = self.a_timer()
+        long_result = "y" * 800 + "-unreferenced-tail"
+        timer.write_down_a_run(self.config, one, long_result, False, run_id="")
+        kept = timer.load(self.config, "Every night").runs[-1]
+        self.assertFalse(kept["said_truncated"])
+        self.assertEqual(kept["said"], long_result)
+        self.assertEqual(kept["said_original_characters"], len(long_result))
+        self.assertEqual(kept["full_result_reference"], "")
+
+    def test_a_notification_points_to_the_exact_persisted_automation_run(self) -> None:
+        one = timer.Timer(name="Every night", automation="Nightly check")
+        with mock.patch(
+            "our_harness.tell_somebody.tell_everybody", return_value=[]
+        ) as tell:
+            timer._tell_somebody_about_it(
+                self.config, one, False, "failed", run_id="exact-run-123"
+            )
+        self.assertEqual(
+            tell.call_args.kwargs["full_result_reference"],
+            "Nexus → Visual test automation → run exact-run-123 "
+            "(pipeline-run:exact-run-123)",
+        )
+
     def test_it_runs_the_automation_and_writes_down_what_happened(self) -> None:
         self.a_timer()
         timer.looked_just_now(self.config, datetime(2026, 8, 19, 12, 0))

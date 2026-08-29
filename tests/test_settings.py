@@ -218,6 +218,7 @@ class WhichFileTests(SettingsTestCase):
             "execution.deny_executables", "execution.deny_argument_sequences",
             "git.protected_branches", "git.required_branch_prefix", "git.enabled",
             "workflow.reviewers", "workflow.review_parallelism", "workflow.name",
+            "workflow.context_tool_execution_seconds",
             "provider.name", "provider.model",
         }
         self.assertEqual(sorted(set(missing) - allowed_to_find_their_own_way), [])

@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import inspect
 import json
 import os
+import re
 import tarfile
 import tempfile
 import unittest
@@ -48,6 +50,27 @@ class RuntimePreparationTests(unittest.TestCase):
         self.assertEqual({one["version"] for one in locked["packages"]}, {"1.62.1"})
         for package in locked["packages"]:
             self.assertRegex(package["integrity"], r"^sha512-[A-Za-z0-9+/]+={0,2}$")
+
+    def test_python_runtime_lock_and_validator_include_pinned_pytest_graph(self) -> None:
+        locked = [
+            line.strip() for line in runtime.LOCK.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        by_name = {
+            line.split("==", 1)[0].casefold(): line
+            for line in locked if "==" in line
+        }
+        for package in ("pytest", "iniconfig", "packaging", "pluggy", "pygments"):
+            with self.subTest(package=package):
+                self.assertIn(package, by_name)
+                self.assertRegex(
+                    by_name[package],
+                    re.compile(rf"^{package}==[^=<>!~]+$", re.IGNORECASE),
+                )
+        validator = inspect.getsource(runtime.validate_runtime)
+        self.assertIn("import pytest", validator)
+        self.assertIn("dist.requires or []", validator)
+        self.assertIn("required.specifier", validator)
 
     def test_npm_integrity_is_validated_from_archive_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

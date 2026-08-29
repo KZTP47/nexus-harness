@@ -469,6 +469,45 @@ const steps = [
         self.assertIn('"routes": ["/a"]', script)
         self.assertNotIn("__PLAN__", script)
 
+    def test_board_capability_never_lands_in_generated_browser_script(self) -> None:
+        token = "a" * 64
+        captured: dict[str, object] = {}
+
+        class CaptureCommand:
+            def run(self, argv, **kwargs):
+                captured["script"] = (self_root / argv[1]).read_text(encoding="utf-8")
+                captured["environment"] = kwargs.get("environment_overrides")
+
+                class Answer:
+                    stdout = '<<<QA_REPORT>>>{"routes": []}'
+                    stderr = ""
+
+                return Answer()
+
+        self_root = self.root
+        runner = qa.QaRunner(self.config, command_runner=CaptureCommand())
+        case = qa.QaCase(
+            index=0, id="board-browser", title="Board browser", kind="browser",
+            url="http://127.0.0.1:1/", touches=("the board",),
+            expect=qa.QaExpectation(),
+        )
+        runner._drive_browser(case, {
+            "url": case.url,
+            "routes": ["/"],
+            "viewport": {"width": 800, "height": 600},
+            "boardQaCapability": {
+                "origin": "http://127.0.0.1:1",
+                "header": qa.BOARD_QA_CAPABILITY_HEADER,
+                "token": token,
+            },
+        }, 10)
+
+        self.assertNotIn(token, captured["script"])
+        self.assertIn("NEXUS_BOARD_QA_CAPABILITY", captured["script"])
+        self.assertEqual(
+            captured["environment"], {"NEXUS_BOARD_QA_CAPABILITY": token},
+        )
+
 
 class HistoryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1039,7 +1078,7 @@ class _FakeProvider:
         from our_harness.models import ProviderResponse
 
         self.requests.append(request)
-        return ProviderResponse(text=self.text)
+        return ProviderResponse(text=self.text, finish_reason="stop")
 
 
 class ConfigTests(unittest.TestCase):

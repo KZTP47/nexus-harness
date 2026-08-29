@@ -72,6 +72,10 @@ AUTOMATION_DOCUMENT_VERSION = 1
 # this limit before a file is chosen; it is a portability bound, not a hidden
 # prompt or model-context limit.
 MAX_AUTOMATION_DOCUMENT_BYTES = 10_000_000
+# Model-writing instructions are canonical user input.  They share the visible
+# main-input boundary and are rejected, never sliced, when a definition is
+# saved or run.
+AI_UNIT_INSTRUCTION_CHARACTERS = 200_000
 # Where a model's writing goes. Deliberately somewhere no test runner looks:
 # what a model wrote is a draft for a person to read, not something the next
 # step of the same run should be able to execute.
@@ -411,15 +415,29 @@ def read_it(pipeline: Any) -> dict[str, Any]:
                     _text(item, f"{node_id}.{key}")
             else:
                 _text(value, f"{node_id}.{key}")
+        if kind == "ai_unit_test":
+            instructions = str(settings.get("instructions") or "")
+            if len(instructions) > AI_UNIT_INSTRUCTION_CHARACTERS:
+                raise PipelineError(
+                    f"{node_id}.instructions is {len(instructions):,} characters; "
+                    f"the disclosed limit is {AI_UNIT_INSTRUCTION_CHARACTERS:,}. "
+                    "Nexus did not truncate it."
+                )
         where = node.get("at") or {}
         at = {
             "x": float(where.get("x", 0)) if isinstance(where, dict) else 0.0,
             "y": float(where.get("y", 0)) if isinstance(where, dict) else 0.0,
         }
+        label = _text(node.get("label") or KINDS[kind].label, "A node label")
+        if len(label) > 80:
+            raise PipelineError(
+                f"A node label is {len(label):,} characters; the disclosed limit "
+                "is 80. Nexus did not truncate it. Nothing was imported or saved."
+            )
         tidy_nodes.append({
             "id": node_id,
             "kind": kind,
-            "label": _text(node.get("label") or KINDS[kind].label, "A node label")[:80],
+            "label": label,
             "settings": settings,
             "at": at,
         })
@@ -579,11 +597,30 @@ def saved_inventory(config: LoadedConfig) -> tuple[list[str], list[str]]:
     needs attention.
     """
 
+    recovery_problems: list[str] = []
+    try:
+        # Lazy by design: qa imports the common pipeline execution pieces, and
+        # pipeline startup must not grow an import cycle. An ordinary panel
+        # inventory refresh is the recovery trigger after a QA process dies.
+        from . import qa as qa_lab
+
+        recovered_or_idle = qa_lab.recover_abandoned_pipeline_transactions(
+            config.project_root
+        )
+        if recovered_or_idle:
+            recovery_problems.extend(
+                qa_lab.retained_pipeline_recovery_notices(config.project_root)
+            )
+    except HarnessError as exc:
+        # Healthy definitions remain visible, but a corrupt or over-cap
+        # recovery journal must never disappear as an omitted file.
+        recovery_problems.append(f"Interrupted automation recovery: {exc}")
+
     where = folder(config)
     if not where.is_dir():
-        return [], []
+        return [], recovery_problems
     found: list[str] = []
-    problems: list[str] = []
+    problems: list[str] = list(recovery_problems)
     for path in sorted(where.glob("*.json")):
         # Run state is deliberately beside the definitions, but is not one.
         if path.name == "last-run.json":
@@ -944,7 +981,14 @@ def _portable_document_json(tidy: dict[str, Any]) -> str:
         ensure_ascii=False,
         indent=2,
     ) + "\n"
-    if len(written.encode("utf-8")) > MAX_AUTOMATION_DOCUMENT_BYTES:
+    try:
+        written_bytes = written.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise PipelineError(
+            "This automation contains an invalid lone Unicode surrogate. Nexus "
+            "did not save, import, or partially rewrite it."
+        ) from exc
+    if len(written_bytes) > MAX_AUTOMATION_DOCUMENT_BYTES:
         raise PipelineError(
             "This automation is larger than the visible 10 MB saved-automation limit. "
             "Split very large embedded instructions across steps or project files."
@@ -1280,9 +1324,16 @@ def _run_ai_unit_test(config: LoadedConfig, node: dict[str, Any], _kinds) -> tup
     from .providers import create_provider
 
     settings = node["settings"]
-    instructions = str(settings.get("instructions") or "").strip()
-    if not instructions:
+    # Preserve canonical user input exactly.  Stripping here silently changed
+    # indentation and trailing newlines before the provider saw the request.
+    instructions = str(settings.get("instructions") or "")
+    if not instructions.strip():
         return False, "Nothing was asked for", "Say what the test should cover."
+    if len(instructions) > AI_UNIT_INSTRUCTION_CHARACTERS:
+        return False, "The instructions are over the disclosed limit", (
+            f"They contain {len(instructions):,} characters; the limit is "
+            f"{AI_UNIT_INSTRUCTION_CHARACTERS:,}. Nexus did not truncate them."
+        )
     write_to = str(settings.get("write_to") or "").strip()
     if not write_to:
         return False, "Nowhere to write it", "Give the draft a file name."
@@ -1323,14 +1374,31 @@ def _run_ai_unit_test(config: LoadedConfig, node: dict[str, Any], _kinds) -> tup
             "of the file only: no explanation, no fence, no commentary."
         ),
         dynamic_context="",
-        messages=[{"role": "user", "content": instructions[:4000]}],
+        messages=[{"role": "user", "content": instructions}],
         model=str(config.get("provider.model") or ""),
-        max_output_tokens=4096,
+        # Use the route's disclosed output budget. The old hidden 4,096-token
+        # override commonly stopped substantial test suites halfway through.
+        max_output_tokens=max(
+            1, int(config.get("provider.max_output_tokens") or 65_536)
+        ),
     )
     try:
         answer = provider.complete(asked)
     except HarnessError as exc:
         return False, "The model could not be reached", str(exc)
+    finish_reason = str(getattr(answer, "finish_reason", "") or "").strip().lower()
+    # Save only a response whose provider positively reported a terminal,
+    # successful completion.  A blacklist allowed new/unknown nonterminal
+    # reasons (notably Ollama done:false -> "unknown") to masquerade as a
+    # complete test file.
+    complete_reasons = {"stop", "completed", "end_turn", "stop_sequence"}
+    if finish_reason not in complete_reasons:
+        return False, "The model's test file was incomplete", (
+            f"The provider ended with {finish_reason or 'no completion reason'!r}. "
+            "Only an explicit successful completion is accepted. Nexus did not save a "
+            "plausible-looking partial test file. Increase the provider output "
+            "budget or split this into several explicit test-file steps."
+        )
     written = CredentialRedactor(config).text(
         str(getattr(answer, "text", "") or "").strip()
     )
@@ -1349,10 +1417,17 @@ def _run_ai_unit_test(config: LoadedConfig, node: dict[str, Any], _kinds) -> tup
         return False, "There is already a draft with that name", (
             f"{where.name} appeared while the model was answering; it was not overwritten."
         )
+    preview = written
+    if len(preview) > 400:
+        marker = (
+            f"\n\n[Display preview only: {len(written):,} characters are saved "
+            f"complete in {DRAFTS}/{where.name}. Nexus did not truncate the file.]"
+        )
+        preview = preview[:max(0, 400 - len(marker))] + marker
     return True, (
         f"Wrote {DRAFTS}/{where.name}, {len(written.splitlines())} lines. "
         "Read it, then move it into your tests yourself. Nothing runs it where it is."
-    ), written[:400]
+    ), preview
 
 
 def _run_artifact(config: LoadedConfig, node: dict[str, Any], _kinds, so_far=None) -> tuple[bool, str, str]:

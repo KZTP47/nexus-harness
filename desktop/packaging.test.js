@@ -159,7 +159,7 @@ test("the packaged Electron app carries the visual automation exchange UI", () =
   assert.match(preload, /saveJsonFile:/);
   assert.match(preload, /harness:saveJsonFile/);
   assert.match(main, /ipcMain\.handle\("harness:saveJsonFile"/);
-  assert.match(main, /12_000_000/);
+  assert.match(main, /768_000_000/);
   assert.match(main, /fs\.renameSync\(beside, chosen\)/);
   assert.ok(
     PACKAGE.build.extraResources.some((item) => item.from === "../src" && item.to === "harness/src"),

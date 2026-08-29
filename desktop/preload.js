@@ -24,6 +24,42 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   saveJsonFile: (suggestedName, contents) => ipcRenderer.invoke(
     "harness:saveJsonFile", String(suggestedName || "nexus-export.json"),
     String(contents || "")),
+  saveLargeJsonFile: async (suggestedName, contents) => {
+    const written = String(contents || "");
+    const begun = await ipcRenderer.invoke(
+      "harness:beginLargeJsonFile",
+      String(suggestedName || "nexus-saved-board.json"),
+    );
+    if (!begun?.saved) return {saved: false};
+    let sequence = 0;
+    try {
+      // Keep each IPC message far below Chromium's fixed channel maximum.
+      // Avoid splitting a UTF-16 surrogate pair between chunks so encoding the
+      // original JSON remains byte-for-byte stable.
+      for (let start = 0; start < written.length;) {
+        let end = Math.min(written.length, start + 1_000_000);
+        if (end < written.length) {
+          const before = written.charCodeAt(end - 1);
+          const after = written.charCodeAt(end);
+          if (before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF) {
+            end -= 1;
+          }
+        }
+        const accepted = await ipcRenderer.invoke(
+          "harness:appendLargeJsonFile", begun.identity, sequence,
+          written.slice(start, end),
+        );
+        sequence = Number(accepted?.sequence);
+        start = end;
+      }
+      return await ipcRenderer.invoke(
+        "harness:finishLargeJsonFile", begun.identity, sequence,
+      );
+    } catch (error) {
+      await ipcRenderer.invoke("harness:abortLargeJsonFile", begun.identity).catch(() => {});
+      throw error;
+    }
+  },
   focusHarness: () => ipcRenderer.invoke("harness:focusHarness"),
   setFullScreen: (on) => ipcRenderer.invoke("harness:setFullScreen", Boolean(on)),
   webChatProviders: () => ipcRenderer.invoke("harness:webChatProviders"),
