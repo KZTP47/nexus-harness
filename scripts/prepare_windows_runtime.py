@@ -30,6 +30,20 @@ from our_harness.verification_python import (  # noqa: E402
 )
 RUNTIME_LOCK = DESKTOP / ".runtime-build.lock"
 RUNTIME_PUBLISH_TIMEOUT_SECONDS = 300.0
+RUNTIME_CANONICAL_RENAME_TIMEOUT_SECONDS = 2.0
+RUNTIME_CLEANUP_TIMEOUT_SECONDS = 2.0
+
+
+def _is_retryable_windows_error(error: OSError) -> bool:
+    return os.name == "nt" and getattr(error, "winerror", None) in {5, 32, 145}
+
+
+def _runtime_selection_path() -> Path:
+    return DESKTOP / ".runtime-selection.json"
+
+
+def _published_runtimes_path() -> Path:
+    return DESKTOP / ".runtime-published"
 
 
 def retry_owned_windows_operation(operation, description: str, timeout_seconds: float = 30.0):
@@ -40,7 +54,7 @@ def retry_owned_windows_operation(operation, description: str, timeout_seconds: 
         try:
             return operation()
         except OSError as error:
-            retryable = os.name == "nt" and getattr(error, "winerror", None) in {5, 32, 145}
+            retryable = _is_retryable_windows_error(error)
             if not retryable or time.monotonic() - started >= timeout_seconds:
                 raise
             time.sleep(0.1)
@@ -96,6 +110,156 @@ def digest(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             held.update(block)
     return held.hexdigest()
+
+
+def runtime_tree_digest(root: Path) -> str:
+    """Bind a prepared runtime to every relative path and file byte.
+
+    Timestamps and other host filesystem metadata are intentionally excluded;
+    they do not affect the packaged runtime. Links and non-file entries are
+    rejected so publication cannot make the packager follow another tree.
+    """
+
+    lexical = Path(os.path.abspath(root))
+    canonical = root.resolve()
+    if root.is_symlink() or os.path.normcase(str(lexical)) != os.path.normcase(str(canonical)):
+        raise RuntimeError(f"Private runtime root is a link or reparse point: {root}")
+    if not canonical.is_dir():
+        raise RuntimeError(f"Private runtime is not a directory: {root}")
+    held = hashlib.sha256()
+    paths = sorted(canonical.rglob("*"), key=lambda one: one.relative_to(canonical).as_posix())
+    for path in paths:
+        if path.is_symlink():
+            raise RuntimeError(f"Private runtime contains a link: {path}")
+        relative = path.relative_to(canonical).as_posix().encode("utf-8")
+        if path.is_dir():
+            held.update(b"D\0" + relative + b"\0")
+            continue
+        if not path.is_file():
+            raise RuntimeError(f"Private runtime contains an unsupported entry: {path}")
+        held.update(b"F\0" + relative + b"\0" + str(path.stat().st_size).encode("ascii") + b"\0")
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                held.update(block)
+    return held.hexdigest()
+
+
+def _runtime_input_identity() -> str:
+    payload = json.dumps({
+        "schema_version": 1,
+        "python": PYTHON_VERSION,
+        "python_sha256": PYTHON_SHA256,
+        "requirements_sha256": digest(LOCK),
+        "playwright_lock_sha256": digest(PLAYWRIGHT_LOCK),
+    }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _selection_payload(selected: Path, *, tree_sha256: str | None = None) -> dict[str, object]:
+    desktop = DESKTOP.resolve()
+    lexical = Path(os.path.abspath(selected))
+    resolved = selected.resolve()
+    if selected.is_symlink() or os.path.normcase(str(lexical)) != os.path.normcase(str(resolved)):
+        raise RuntimeError(f"Selected private runtime is a link or reparse point: {selected}")
+    relative = resolved.relative_to(desktop).as_posix()
+    if relative != "runtime" and not (
+        relative.startswith(".runtime-published/") and len(relative.split("/")) == 2
+    ):
+        raise RuntimeError(f"Refusing unsafe private-runtime selection: {selected}")
+    manifest = resolved / "NEXUS_RUNTIME.json"
+    if not manifest.is_file():
+        raise RuntimeError(f"Selected private runtime has no manifest: {selected}")
+    try:
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Selected private runtime manifest is unreadable: {selected}") from error
+    expected_requirements = digest(LOCK)
+    expected_playwright = digest(PLAYWRIGHT_LOCK)
+    if (
+        metadata.get("python") != PYTHON_VERSION
+        or metadata.get("python_sha256") != PYTHON_SHA256
+        or metadata.get("requirements_sha256") != expected_requirements
+        or metadata.get("playwright", {}).get("lock_sha256") != expected_playwright
+    ):
+        raise RuntimeError("Selected private runtime does not match the current locked inputs")
+    return {
+        "schema_version": 1,
+        "runtime_path": relative,
+        "manifest_sha256": digest(manifest),
+        "tree_sha256": tree_sha256 or runtime_tree_digest(lexical),
+        "python": PYTHON_VERSION,
+        "python_sha256": PYTHON_SHA256,
+        "requirements_sha256": expected_requirements,
+        "playwright_lock_sha256": expected_playwright,
+    }
+
+
+def _write_runtime_selection(selected: Path, *, tree_sha256: str | None = None) -> None:
+    payload = _selection_payload(selected, tree_sha256=tree_sha256)
+    destination = _runtime_selection_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def selected_runtime(*, verify_tree: bool = True) -> Path:
+    """Resolve the prepared runtime selected for source smokes and packaging."""
+
+    try:
+        payload = json.loads(_runtime_selection_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("Private-runtime selection is missing or unreadable") from error
+    if payload.get("schema_version") != 1:
+        raise RuntimeError("Unsupported private-runtime selection schema")
+    relative = payload.get("runtime_path")
+    if not isinstance(relative, str) or Path(relative).is_absolute():
+        raise RuntimeError("Private-runtime selection path is invalid")
+    parts = Path(relative).parts
+    if parts != ("runtime",) and not (
+        len(parts) == 2 and parts[0] == ".runtime-published"
+        and len(parts[1]) == 64 and all(one in "0123456789abcdef" for one in parts[1])
+    ):
+        raise RuntimeError("Private-runtime selection path is outside the owned runtime roots")
+    lexical = Path(os.path.abspath(DESKTOP / relative))
+    selected = lexical.resolve()
+    desktop = DESKTOP.resolve()
+    if (
+        lexical.is_symlink()
+        or os.path.normcase(str(lexical)) != os.path.normcase(str(selected))
+        or selected == desktop or desktop not in selected.parents
+    ):
+        raise RuntimeError("Private-runtime selection escapes the desktop directory")
+    manifest = selected / "NEXUS_RUNTIME.json"
+    expected_manifest = payload.get("manifest_sha256")
+    if not isinstance(expected_manifest, str) or len(expected_manifest) != 64:
+        raise RuntimeError("Private-runtime selection manifest identity is invalid")
+    if not manifest.is_file() or digest(manifest) != expected_manifest:
+        raise RuntimeError("Selected private-runtime manifest does not match its selection")
+    try:
+        metadata = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("Selected private-runtime manifest is unreadable") from error
+    if (
+        payload.get("python") != PYTHON_VERSION
+        or payload.get("python_sha256") != PYTHON_SHA256
+        or payload.get("requirements_sha256") != digest(LOCK)
+        or payload.get("playwright_lock_sha256") != digest(PLAYWRIGHT_LOCK)
+        or metadata.get("python") != payload.get("python")
+        or metadata.get("python_sha256") != payload.get("python_sha256")
+        or metadata.get("requirements_sha256") != payload.get("requirements_sha256")
+        or metadata.get("playwright", {}).get("lock_sha256") != payload.get("playwright_lock_sha256")
+    ):
+        raise RuntimeError("Selected private runtime does not match the current locked inputs")
+    expected_tree = payload.get("tree_sha256")
+    if not isinstance(expected_tree, str) or len(expected_tree) != 64:
+        raise RuntimeError("Private-runtime selection tree identity is invalid")
+    if verify_tree and runtime_tree_digest(lexical) != expected_tree:
+        raise RuntimeError("Selected private-runtime tree does not match its selection")
+    return selected
 
 
 def sri_digest(path: Path, integrity: str) -> bool:
@@ -353,65 +517,134 @@ def _remove_abandoned_runtime_trees() -> None:
     desktop = DESKTOP.resolve()
     for pattern in (".runtime-stage-*", ".runtime-previous-*"):
         for candidate in desktop.glob(pattern):
+            lexical = Path(os.path.abspath(candidate))
             resolved = candidate.resolve()
-            if resolved.parent != desktop or not resolved.is_dir():
+            if (
+                candidate.is_symlink()
+                or os.path.normcase(str(lexical)) != os.path.normcase(str(resolved))
+                or resolved.parent != desktop or not resolved.is_dir()
+            ):
                 raise RuntimeError(f"Refusing unsafe abandoned runtime path: {candidate}")
+            try:
+                retry_owned_windows_operation(
+                    lambda target=lexical: shutil.rmtree(target),
+                    "remove abandoned private-runtime tree",
+                    timeout_seconds=RUNTIME_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except OSError as error:
+                # A dead build can leave a tree held by a filesystem watcher or
+                # antivirus scanner. It is not a reason to mutate that tree or
+                # stop a new immutable candidate from being prepared.
+                if not _is_retryable_windows_error(error):
+                    raise
+
+
+def _cleanup_unreferenced_runtime_tree(path: Path, description: str) -> None:
+    """Bound cleanup of an owned tree without turning a valid publish into failure."""
+
+    if not path.exists():
+        return
+    try:
+        retry_owned_windows_operation(
+            lambda: shutil.rmtree(path), description,
+            timeout_seconds=RUNTIME_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except OSError as error:
+        if not _is_retryable_windows_error(error):
+            raise
+
+
+def _publish_immutable_candidate(staging: Path) -> Path:
+    """Publish one deterministic candidate for the exact locked inputs."""
+
+    identity = _runtime_input_identity()
+    published = _published_runtimes_path()
+    expected_published = Path(os.path.abspath(DESKTOP / ".runtime-published"))
+    if published.exists() and (
+        published.is_symlink()
+        or os.path.normcase(str(published.resolve())) != os.path.normcase(str(expected_published))
+    ):
+        raise RuntimeError("The private-runtime publication root is a link or reparse point")
+    destination = published / identity
+    tree_sha256 = runtime_tree_digest(staging)
+    published.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if runtime_tree_digest(destination) != tree_sha256:
+            raise RuntimeError(
+                "The immutable private-runtime candidate for these locked inputs already exists "
+                "with different bytes; the current runtime and candidate were left untouched"
+            )
+        _cleanup_unreferenced_runtime_tree(staging, "remove duplicate private-runtime staging tree")
+    else:
+        retry_owned_windows_operation(
+            lambda: staging.replace(destination), "publish immutable private-runtime candidate",
+            timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+        )
+    _write_runtime_selection(destination, tree_sha256=tree_sha256)
+    return destination
+
+
+def _prepare_locked(output: Path) -> Path:
+    output = Path(os.path.abspath(output))
+    allowed = Path(os.path.abspath(DESKTOP / "runtime"))
+    if os.path.normcase(str(output)) != os.path.normcase(str(allowed)):
+        raise RuntimeError(f"Runtime output must be exactly {allowed}")
+    if output.exists() and (
+        output.is_symlink()
+        or os.path.normcase(str(output.resolve())) != os.path.normcase(str(output))
+    ):
+        raise RuntimeError("Runtime output is a link or reparse point")
+    _remove_abandoned_runtime_trees()
+    staging = DESKTOP / f".runtime-stage-{uuid.uuid4().hex}"
+    previous = DESKTOP / f".runtime-previous-{uuid.uuid4().hex}"
+    try:
+        _prepare_staging(staging)
+        # Publish only a fully validated runtime. Builders never install
+        # packages into the shared destination, so a parallel job cannot
+        # observe or delete a half-populated site-packages tree.
+        had_previous = output.exists()
+        if had_previous:
+            try:
+                retry_owned_windows_operation(
+                    lambda: output.replace(previous), "preserve previous private runtime",
+                    timeout_seconds=RUNTIME_CANONICAL_RENAME_TIMEOUT_SECONDS,
+                )
+            except OSError as error:
+                # Windows directory watchers can keep the old runtime's
+                # directory handle non-renamable indefinitely. The old
+                # runtime is still intact, so package the freshly verified
+                # candidate through the atomic selector instead.
+                if not (
+                    _is_retryable_windows_error(error)
+                    and output.exists() and not previous.exists()
+                ):
+                    raise
+                return _publish_immutable_candidate(staging)
+        try:
             retry_owned_windows_operation(
-                lambda target=resolved: shutil.rmtree(target),
-                "remove abandoned private-runtime tree",
+                lambda: staging.replace(output), "publish validated private runtime",
                 timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
             )
+        except BaseException:
+            if had_previous and previous.exists() and not output.exists():
+                retry_owned_windows_operation(
+                    lambda: previous.replace(output), "restore previous private runtime",
+                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+                )
+            raise
+        _write_runtime_selection(output)
+        _cleanup_unreferenced_runtime_tree(previous, "remove previous private runtime")
+    finally:
+        if staging.exists():
+            _cleanup_unreferenced_runtime_tree(staging, "remove private-runtime staging tree")
+        if previous.exists() and output.exists():
+            _cleanup_unreferenced_runtime_tree(previous, "remove private-runtime rollback tree")
+    return output
 
 
 def prepare(output: Path) -> Path:
-    output = output.resolve()
-    allowed = (DESKTOP / "runtime").resolve()
-    if output != allowed:
-        raise RuntimeError(f"Runtime output must be exactly {allowed}")
     with runtime_build_lock():
-        _remove_abandoned_runtime_trees()
-        staging = DESKTOP / f".runtime-stage-{uuid.uuid4().hex}"
-        previous = DESKTOP / f".runtime-previous-{uuid.uuid4().hex}"
-        try:
-            _prepare_staging(staging)
-            # Publish only a fully validated runtime. Builders never install
-            # packages into the shared destination, so a parallel job cannot
-            # observe or delete a half-populated site-packages tree.
-            had_previous = output.exists()
-            if had_previous:
-                retry_owned_windows_operation(
-                    lambda: output.replace(previous), "preserve previous private runtime",
-                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
-                )
-            try:
-                retry_owned_windows_operation(
-                    lambda: staging.replace(output), "publish validated private runtime",
-                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
-                )
-            except BaseException:
-                if had_previous and previous.exists() and not output.exists():
-                    retry_owned_windows_operation(
-                        lambda: previous.replace(output), "restore previous private runtime",
-                        timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
-                    )
-                raise
-            if previous.exists():
-                retry_owned_windows_operation(
-                    lambda: shutil.rmtree(previous), "remove previous private runtime",
-                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
-                )
-        finally:
-            if staging.exists():
-                retry_owned_windows_operation(
-                    lambda: shutil.rmtree(staging), "remove private-runtime staging tree",
-                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
-                )
-            if previous.exists() and output.exists():
-                retry_owned_windows_operation(
-                    lambda: shutil.rmtree(previous), "remove private-runtime rollback tree",
-                    timeout_seconds=RUNTIME_PUBLISH_TIMEOUT_SECONDS,
-                )
-    return output
+        return _prepare_locked(output)
 
 
 def main(argv: list[str] | None = None) -> int:

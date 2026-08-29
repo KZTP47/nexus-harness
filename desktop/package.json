@@ -10,8 +10,8 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test",
-    "prebuild": "python ../scripts/prepare_windows_runtime.py && python ../scripts/smoke_bundled_playwright.py && python ../scripts/prepare_build_info.py",
-    "build": "electron-builder",
+    "prebuild": "python ../scripts/prepare_build_info.py",
+    "build": "python ../scripts/build_windows_desktop.py",
     "smoke": "node smoke.js",
     "smoke:packaged": "node packaged.smoke.js",
     "smoke:built": "node built.smoke.js",

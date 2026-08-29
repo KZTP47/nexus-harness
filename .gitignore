@@ -42,6 +42,10 @@ node_modules/
 desktop/build-output/
 desktop/runtime/
 desktop/.runtime-build.lock
+desktop/.runtime-selection.json
+desktop/.runtime-published/
+desktop/.runtime-stage-*/
+desktop/.runtime-previous-*/
 .harness/desktop-deployment.lock
 .harness/desktop-deployment.owner.json
 desktop/build-info.json

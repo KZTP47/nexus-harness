@@ -9,17 +9,20 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from our_harness.playwright_runtime import (
     discover_bundled_playwright_runtime,
     run_brokered_playwright_appcontainer,
 )
+from scripts.prepare_windows_runtime import selected_runtime
 
 
 def main() -> int:
     if os.name != "nt":
         raise SystemExit("Windows AppContainer is required for this smoke")
+    os.environ["NEXUS_PLAYWRIGHT_RUNTIME"] = str(selected_runtime() / "playwright")
     runtime = discover_bundled_playwright_runtime(required=True)
     assert runtime is not None
     with tempfile.TemporaryDirectory(prefix="nexus-playwright-smoke-") as temporary:

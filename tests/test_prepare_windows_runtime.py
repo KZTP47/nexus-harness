@@ -16,6 +16,15 @@ from unittest import mock
 from scripts import prepare_windows_runtime as runtime
 
 
+def write_runtime_manifest(destination: Path) -> None:
+    (destination / "NEXUS_RUNTIME.json").write_text(json.dumps({
+        "python": runtime.PYTHON_VERSION,
+        "python_sha256": runtime.PYTHON_SHA256,
+        "requirements_sha256": runtime.digest(runtime.LOCK),
+        "playwright": {"lock_sha256": runtime.digest(runtime.PLAYWRIGHT_LOCK)},
+    }), encoding="utf-8")
+
+
 class RuntimePreparationTests(unittest.TestCase):
     def test_owned_windows_loader_lock_is_retried(self) -> None:
         attempts = 0
@@ -103,6 +112,7 @@ class RuntimePreparationTests(unittest.TestCase):
                 self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
                 destination.mkdir(parents=True)
                 (destination / "identity.txt").write_text("new", encoding="utf-8")
+                write_runtime_manifest(destination)
 
             with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
                 runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
@@ -146,6 +156,7 @@ class RuntimePreparationTests(unittest.TestCase):
             def stage(destination: Path) -> None:
                 destination.mkdir(parents=True)
                 (destination / "identity.txt").write_text("new", encoding="utf-8")
+                write_runtime_manifest(destination)
 
             real_retry = runtime.retry_owned_windows_operation
 
@@ -162,7 +173,7 @@ class RuntimePreparationTests(unittest.TestCase):
 
             self.assertEqual(
                 timeouts["preserve previous private runtime"],
-                runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+                runtime.RUNTIME_CANONICAL_RENAME_TIMEOUT_SECONDS,
             )
             self.assertEqual(
                 timeouts["publish validated private runtime"],
@@ -170,7 +181,7 @@ class RuntimePreparationTests(unittest.TestCase):
             )
             self.assertEqual(
                 timeouts["remove previous private runtime"],
-                runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS,
+                runtime.RUNTIME_CLEANUP_TIMEOUT_SECONDS,
             )
             self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "new")
 
@@ -185,6 +196,7 @@ class RuntimePreparationTests(unittest.TestCase):
             def stage(destination: Path) -> None:
                 destination.mkdir(parents=True)
                 (destination / "identity.txt").write_text("new", encoding="utf-8")
+                write_runtime_manifest(destination)
 
             def fail_publish(operation, description: str, timeout_seconds: float = 30.0):
                 timeouts[description] = timeout_seconds
@@ -201,15 +213,18 @@ class RuntimePreparationTests(unittest.TestCase):
                     runtime.prepare(output)
 
             self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
-            for operation in (
-                "preserve previous private runtime",
-                "publish validated private runtime",
-                "restore previous private runtime",
-                "remove private-runtime staging tree",
-            ):
+            for operation in ("publish validated private runtime", "restore previous private runtime"):
                 self.assertEqual(
                     timeouts[operation], runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS, operation
                 )
+            self.assertEqual(
+                timeouts["preserve previous private runtime"],
+                runtime.RUNTIME_CANONICAL_RENAME_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(
+                timeouts["remove private-runtime staging tree"],
+                runtime.RUNTIME_CLEANUP_TIMEOUT_SECONDS,
+            )
 
     def test_locked_prepare_removes_abandoned_stage_and_rollback_trees(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -228,6 +243,7 @@ class RuntimePreparationTests(unittest.TestCase):
                 self.assertFalse(abandoned_previous.exists())
                 destination.mkdir(parents=True)
                 (destination / "identity.txt").write_text("new", encoding="utf-8")
+                write_runtime_manifest(destination)
 
             timeouts: list[float] = []
             real_retry = runtime.retry_owned_windows_operation
@@ -249,8 +265,238 @@ class RuntimePreparationTests(unittest.TestCase):
             self.assertFalse(any(desktop.glob(".runtime-previous-*")))
             self.assertEqual(
                 timeouts,
-                [runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS, runtime.RUNTIME_PUBLISH_TIMEOUT_SECONDS],
+                [runtime.RUNTIME_CLEANUP_TIMEOUT_SECONDS, runtime.RUNTIME_CLEANUP_TIMEOUT_SECONDS],
             )
+
+    def test_locked_previous_runtime_selects_one_immutable_verified_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            old = b"old-runtime-must-stay-byte-identical"
+            (output / "identity.txt").write_bytes(old)
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("fresh", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            def locked_previous(operation, description: str, timeout_seconds: float = 30.0):
+                if description == "preserve previous private runtime":
+                    error = PermissionError("watched directory")
+                    error.winerror = 5
+                    raise error
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=locked_previous
+            ), mock.patch.object(runtime.os, "name", "nt"):
+                selected = runtime.prepare(output)
+                self.assertEqual(runtime.selected_runtime(), selected)
+
+            expected = desktop / ".runtime-published" / runtime._runtime_input_identity()
+            self.assertEqual(selected, expected)
+            self.assertEqual((output / "identity.txt").read_bytes(), old)
+            self.assertEqual((selected / "identity.txt").read_text(encoding="utf-8"), "fresh")
+            self.assertFalse(any(desktop.glob(".runtime-stage-*")))
+            self.assertFalse(any(desktop.glob(".runtime-previous-*")))
+            self.assertEqual(len(list((desktop / ".runtime-published").iterdir())), 1)
+
+    def test_candidate_collision_fails_without_mutating_old_or_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("old", encoding="utf-8")
+            published = desktop / ".runtime-published" / runtime._runtime_input_identity()
+            published.mkdir(parents=True)
+            (published / "identity.txt").write_text("unrelated", encoding="utf-8")
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("fresh", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            def locked_previous(operation, description: str, timeout_seconds: float = 30.0):
+                if description == "preserve previous private runtime":
+                    error = PermissionError("watched directory")
+                    error.winerror = 5
+                    raise error
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=locked_previous
+            ), mock.patch.object(runtime.os, "name", "nt"):
+                with self.assertRaisesRegex(RuntimeError, "different bytes"):
+                    runtime.prepare(output)
+
+            self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
+            self.assertEqual((published / "identity.txt").read_text(encoding="utf-8"), "unrelated")
+            self.assertFalse((desktop / ".runtime-selection.json").exists())
+
+    def test_runtime_selection_rejects_traversal_and_tree_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            desktop.mkdir()
+            selector = desktop / ".runtime-selection.json"
+            selector.write_text(json.dumps({
+                "schema_version": 1,
+                "runtime_path": "../outside",
+                "manifest_sha256": "0" * 64,
+                "tree_sha256": "0" * 64,
+            }), encoding="utf-8")
+            with mock.patch.object(runtime, "DESKTOP", desktop):
+                with self.assertRaisesRegex(RuntimeError, "outside"):
+                    runtime.selected_runtime()
+
+                selected = desktop / "runtime"
+                selected.mkdir()
+                write_runtime_manifest(selected)
+                (selected / "one.txt").write_text("one", encoding="utf-8")
+                runtime._write_runtime_selection(selected)
+                (selected / "one.txt").write_text("tampered", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "tree does not match"):
+                    runtime.selected_runtime()
+
+    def test_nonretryable_preserve_failure_keeps_old_runtime_and_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("old", encoding="utf-8")
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                write_runtime_manifest(destination)
+
+            def denied(operation, description: str, timeout_seconds: float = 30.0):
+                if description == "preserve previous private runtime":
+                    raise OSError("nonretryable")
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=denied
+            ):
+                with self.assertRaisesRegex(OSError, "nonretryable"):
+                    runtime.prepare(output)
+            self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
+            self.assertFalse((desktop / ".runtime-selection.json").exists())
+
+    def test_retryable_previous_cleanup_denial_does_not_fail_valid_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("old", encoding="utf-8")
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("fresh", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            def cleanup_denied(operation, description: str, timeout_seconds: float = 30.0):
+                if description in {
+                    "remove previous private runtime", "remove private-runtime rollback tree",
+                }:
+                    error = PermissionError("still watched")
+                    error.winerror = 32
+                    raise error
+                return operation()
+
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                runtime, "retry_owned_windows_operation", side_effect=cleanup_denied
+            ), mock.patch.object(runtime.os, "name", "nt"):
+                self.assertEqual(runtime.prepare(output), output)
+
+            self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "fresh")
+            with mock.patch.object(runtime, "DESKTOP", desktop):
+                self.assertEqual(runtime.selected_runtime(), output)
+            previous = list(desktop.glob(".runtime-previous-*"))
+            self.assertEqual(len(previous), 1)
+            self.assertEqual((previous[0] / "identity.txt").read_text(encoding="utf-8"), "old")
+
+    def test_abandoned_runtime_link_is_rejected_without_deleting_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            desktop.mkdir()
+            victim = desktop / "victim"
+            victim.mkdir()
+            sentinel = victim / "sentinel.txt"
+            sentinel.write_text("must survive", encoding="utf-8")
+            linked = desktop / ".runtime-stage-attacker"
+            try:
+                linked.symlink_to(victim, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory link unavailable: {error}")
+            with mock.patch.object(runtime, "DESKTOP", desktop):
+                with self.assertRaisesRegex(RuntimeError, "unsafe abandoned"):
+                    runtime._remove_abandoned_runtime_trees()
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "must survive")
+
+    def test_runtime_output_link_is_rejected_without_mutating_victim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            desktop.mkdir()
+            victim = desktop / "victim"
+            victim.mkdir()
+            sentinel = victim / "sentinel.txt"
+            sentinel.write_text("must survive", encoding="utf-8")
+            output = desktop / "runtime"
+            try:
+                output.symlink_to(victim, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"directory link unavailable: {error}")
+            with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+            ):
+                with self.assertRaisesRegex(RuntimeError, "link or reparse"):
+                    runtime.prepare(output)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "must survive")
+
+    @unittest.skipUnless(os.name == "nt", "real Windows directory sharing regression")
+    def test_real_no_share_delete_handle_uses_immutable_candidate(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        with tempfile.TemporaryDirectory() as temporary:
+            desktop = Path(temporary) / "desktop"
+            output = desktop / "runtime"
+            output.mkdir(parents=True)
+            (output / "identity.txt").write_text("old", encoding="utf-8")
+            create = ctypes.windll.kernel32.CreateFileW
+            create.argtypes = [
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            ]
+            create.restype = wintypes.HANDLE
+            handle = create(str(output), 1, 3, None, 3, 0x02000000, None)
+            self.assertNotEqual(handle, wintypes.HANDLE(-1).value)
+
+            def stage(destination: Path) -> None:
+                destination.mkdir(parents=True)
+                (destination / "identity.txt").write_text("fresh", encoding="utf-8")
+                write_runtime_manifest(destination)
+
+            try:
+                with mock.patch.object(runtime, "DESKTOP", desktop), mock.patch.object(
+                    runtime, "RUNTIME_LOCK", desktop / ".runtime-build.lock"
+                ), mock.patch.object(runtime, "_prepare_staging", side_effect=stage), mock.patch.object(
+                    runtime, "RUNTIME_CANONICAL_RENAME_TIMEOUT_SECONDS", 0
+                ):
+                    selected = runtime.prepare(output)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            self.assertNotEqual(selected, output)
+            self.assertEqual((output / "identity.txt").read_text(encoding="utf-8"), "old")
+            self.assertEqual((selected / "identity.txt").read_text(encoding="utf-8"), "fresh")
 
 
 if __name__ == "__main__":

@@ -137,9 +137,16 @@ test("the private Python runtime and harness source are packaged together", () =
   assert.ok(resources.some((item) => item.from === "../src" && item.to === "harness/src"));
   assert.ok(shipped("build-info.json"), "the exact commit/build label must ship with the app");
   assert.match(PACKAGE.scripts.prebuild, /prepare_build_info\.py/);
-  assert.match(PACKAGE.scripts.prebuild, /prepare_windows_runtime\.py/);
-  assert.match(PACKAGE.scripts.prebuild, /smoke_bundled_playwright\.py/,
+  assert.match(PACKAGE.scripts.build, /build_windows_desktop\.py/);
+  const builder = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "build_windows_desktop.py"), "utf8"
+  );
+  assert.match(builder, /runtime_build_lock/);
+  assert.match(builder, /_prepare_locked/);
+  assert.match(builder, /smoke_bundled_playwright\.py/,
     "a release must prove its bundled browser in AppContainer before packaging");
+  assert.match(builder, /electron-builder/,
+    "the same build lease must span private-runtime selection and Electron packaging");
 });
 
 test("the packaged Electron app carries the visual automation exchange UI", () => {
