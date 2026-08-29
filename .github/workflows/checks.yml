@@ -2,8 +2,9 @@ name: Checks
 
 # Everything that has to pass before a change is trusted. The jobs below do not
 # wait for each other, so the wait is as long as the slowest one rather than the
-# sum of all of them. The two long suites are split into four parts each, which
-# is what keeps that slowest one short.
+# sum of all of them. The main suite is split into four parts on Python 3.13 and
+# eight parts on Python 3.11; the extra compatibility shards keep its slower
+# interpreter lane in the same roughly two-to-five-minute window.
 #
 # Windows only, on purpose: this is the machine the project is developed and
 # checked on, so a green build here means the same thing as a green run at a
@@ -48,9 +49,14 @@ jobs:
         run: python scripts/run_tests.py --part ${{ matrix.part }}/4 --quiet
 
   tests-on-the-oldest-python:
-    name: Tests on Python 3.11
+    name: Tests on Python 3.11, part ${{ matrix.part }} of 8
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        part: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -58,11 +64,11 @@ jobs:
           python-version: "3.11"
       - name: Install the test-only runtime dependency
         run: python -m pip install "langgraph>=1.2.11,<2"
-      - name: Run every test
-        # The whole suite, not a part of it. This job says whether the oldest
-        # Python we promise to work on still works, so it has to cover all of
-        # it, and it runs beside the four parts rather than after them.
-        run: python scripts/run_tests.py --quiet
+      - name: Run this part of the tests
+        # All eight parts together still cover the whole suite on the oldest
+        # Python we promise to support. Matrix jobs run beside one another, so
+        # compatibility coverage no longer turns into one 20-minute wait.
+        run: python scripts/run_tests.py --part ${{ matrix.part }}/8 --quiet
 
   panel:
     name: Panel checks, part ${{ matrix.part }} of 4

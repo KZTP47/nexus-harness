@@ -342,14 +342,26 @@ class ResidentAPITests(unittest.TestCase):
     def test_shutdown_response_is_written_before_the_daemon_stops(self) -> None:
         handler = self.daemon.server.RequestHandlerClass
         original_reply = handler._reply
+        original_dispatch = handler._dispatch
         stopping_when_reply_started: list[bool] = []
+        request_finished = threading.Event()
 
         def watched_reply(request_handler, status, value):
             if request_handler.path == "/v1/shutdown":
                 stopping_when_reply_started.append(self.daemon.stopping)
             return original_reply(request_handler, status, value)
 
-        with patch.object(handler, "_reply", watched_reply):
+        def watched_dispatch(request_handler, method):
+            try:
+                return original_dispatch(request_handler, method)
+            finally:
+                if request_handler.path == "/v1/shutdown":
+                    request_finished.set()
+
+        with (
+            patch.object(handler, "_reply", watched_reply),
+            patch.object(handler, "_dispatch", watched_dispatch),
+        ):
             status, body = _request(
                 self.daemon,
                 "POST",
@@ -360,6 +372,7 @@ class ResidentAPITests(unittest.TestCase):
 
         self.assertEqual((status, body), (200, {"stopping": True}))
         self.assertEqual(stopping_when_reply_started, [False])
+        self.assertTrue(request_finished.wait(TEST_HTTP_TIMEOUT_SECONDS))
         self.assertTrue(self.daemon.stopping)
 
     def test_host_authority_rejects_duplicates_malformed_and_wrong_ports(self) -> None:

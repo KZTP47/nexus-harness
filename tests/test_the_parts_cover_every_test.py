@@ -1,8 +1,9 @@
 """Splitting the tests across machines must not drop any of them.
 
-The build server runs the tests in four parts at once, so a green build is four
-green parts. If one test file fell between two parts, nobody would run it and
-nobody would notice: the build would still be green, and the file would rot.
+The build server runs the current Python suite in four parts and the slower
+oldest-Python suite in eight. If one test file fell between two parts, nobody
+would run it and nobody would notice: the build would still be green, and the
+file would rot.
 """
 
 from __future__ import annotations
@@ -70,6 +71,9 @@ class SplittingTheTestsTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
         self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/4", workflow)
         self.assertIn("part: [1, 2, 3, 4]", workflow)
+        self.assertIn("Tests on Python 3.11, part ${{ matrix.part }} of 8", workflow)
+        self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/8", workflow)
+        self.assertIn("part: [1, 2, 3, 4, 5, 6, 7, 8]", workflow)
 
 
 if __name__ == "__main__":
