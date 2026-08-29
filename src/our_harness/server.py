@@ -3554,6 +3554,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 })
             elif self.path in ("/api/pipelines/run", "/api/pipelines/agent-run"):
                 local_lock_held = False
+                replay_response: dict[str, Any] | None = None
                 try:
                     with self.server.project_admission_lock:
                         config = self.server.config
@@ -3583,28 +3584,37 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             request_id=str(body.get("request_id") or ""),
                         )
                         if not created:
-                            self._json({
+                            # Acceptance is complete now. Do not keep the
+                            # project-admission lease while writing bytes to a
+                            # client: the client can finish reading before the
+                            # handler unwinds the surrounding context manager,
+                            # which made a move immediately after a replay
+                            # response fail intermittently on slower machines.
+                            replay_response = {
                                 "accepted": True,
                                 "replayed": True,
                                 "run_id": accepted["run_id"],
                                 "name": accepted["name"],
-                            }, HTTPStatus.ACCEPTED)
-                            return
-                        if not self.server.pipeline_lock.acquire(blocking=False):
-                            store.fail(
-                                accepted["run_id"],
-                                accepted["attempt_id"],
-                                "A local automation worker is running without a matching coordinator lease.",
-                            )
-                            raise HarnessError(
-                                "A pipeline is running already. Wait for it, or press Stop."
-                            )
-                        local_lock_held = True
-                        kinds = dict(self.server.check_kinds)
+                            }
+                        else:
+                            if not self.server.pipeline_lock.acquire(blocking=False):
+                                store.fail(
+                                    accepted["run_id"],
+                                    accepted["attempt_id"],
+                                    "A local automation worker is running without a matching coordinator lease.",
+                                )
+                                raise HarnessError(
+                                    "A pipeline is running already. Wait for it, or press Stop."
+                                )
+                            local_lock_held = True
+                            kinds = dict(self.server.check_kinds)
                 except Exception:
                     if local_lock_held:
                         self.server.pipeline_lock.release()
                     raise
+                if replay_response is not None:
+                    self._json(replay_response, HTTPStatus.ACCEPTED)
+                    return
                 run_id = accepted["run_id"]
                 attempt_id = accepted["attempt_id"]
                 self.server.pipeline_active_run_id = run_id

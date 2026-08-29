@@ -405,6 +405,9 @@ class MovingToAnotherOne(ProjectTestCase):
     def test_move_is_refused_while_pipeline_acceptance_is_in_flight(self) -> None:
         entered = threading.Event()
         release = threading.Event()
+        response_started = threading.Event()
+        release_response = threading.Event()
+        self.addCleanup(release_response.set)
 
         class BlockingStore:
             project_root = self.first
@@ -425,29 +428,42 @@ class MovingToAnotherOne(ProjectTestCase):
 
         self.panel._pipeline_store = BlockingStore()
         answer: list[tuple[int, dict]] = []
-        request = threading.Thread(
-            target=lambda: answer.append(self.ask(
-                "/api/pipelines/agent-run",
-                {"automation": "Only in alpha", "request_id": "same-alpha-request"},
-            )),
-            daemon=True,
-        )
-        request.start()
-        self.assertTrue(entered.wait(5))
+        original_json = server.HarnessHandler._json
 
-        with self.assertRaisesRegex(server.HarnessError, "being accepted"):
+        def block_replay_response(handler, value, status=200):
+            if handler.path == "/api/pipelines/agent-run":
+                response_started.set()
+                if not release_response.wait(5):
+                    raise RuntimeError("test did not release the replay response")
+            return original_json(handler, value, status)
+
+        with mock.patch.object(server.HarnessHandler, "_json", block_replay_response):
+            request = threading.Thread(
+                target=lambda: answer.append(self.ask(
+                    "/api/pipelines/agent-run",
+                    {"automation": "Only in alpha", "request_id": "same-alpha-request"},
+                )),
+                daemon=True,
+            )
+            request.start()
+            self.assertTrue(entered.wait(5))
+
+            with self.assertRaisesRegex(server.HarnessError, "being accepted"):
+                self.panel.move_to(str(self.second))
+            self.assertEqual(self.panel.config.project_root, self.first)
+
+            release.set()
+            self.assertTrue(response_started.wait(5))
+            # The durable acceptance has returned, so slow response I/O must
+            # not make the project appear busy after the work is really done.
             self.panel.move_to(str(self.second))
-        self.assertEqual(self.panel.config.project_root, self.first)
+            self.assertEqual(self.panel.config.project_root, self.second)
 
-        release.set()
-        request.join(5)
-        self.assertFalse(request.is_alive())
-        self.assertEqual(answer[0][0], 202, answer)
-        self.assertTrue(answer[0][1]["replayed"])
-        self.assertEqual(self.panel.config.project_root, self.first)
-
-        self.panel.move_to(str(self.second))
-        self.assertEqual(self.panel.config.project_root, self.second)
+            release_response.set()
+            request.join(5)
+            self.assertFalse(request.is_alive())
+            self.assertEqual(answer[0][0], 202, answer)
+            self.assertTrue(answer[0][1]["replayed"])
 
     def test_move_is_refused_for_each_whole_legacy_provider_turn(self) -> None:
         provider_roots: list[Path] = []

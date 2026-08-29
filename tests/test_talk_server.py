@@ -44,6 +44,31 @@ class Slowly:
         return Back(self.text)
 
 
+class MeetAtTheSameTime:
+    """A provider probe that can finish only when both calls overlap."""
+
+    def __init__(
+        self,
+        meeting: threading.Barrier,
+        call_threads: set[int],
+        call_threads_lock: threading.Lock,
+    ) -> None:
+        self.meeting = meeting
+        self.call_threads = call_threads
+        self.call_threads_lock = call_threads_lock
+
+    def complete(self, request):
+        with self.call_threads_lock:
+            self.call_threads.add(threading.get_ident())
+        try:
+            # The timeout is only a deadlock guard for a serialization
+            # regression. Success depends on rendezvous, not runner speed.
+            self.meeting.wait(timeout=10)
+        except threading.BrokenBarrierError as exc:
+            raise HarnessError("the provider calls did not overlap") from exc
+        return Back("an answer")
+
+
 class PanelTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -235,9 +260,26 @@ class AskingEveryoneThroughThePanel(PanelTestCase):
                 self.assertEqual(one["answer"], "an answer")
 
     def test_they_are_asked_at_the_same_time(self) -> None:
-        began = time.monotonic()
-        self.ask("/api/chat/ask-everyone", {"text": "What do you think?"})
-        self.assertLess(time.monotonic() - began, 0.9, "they were asked one after another")
+        meeting = threading.Barrier(2)
+        call_threads: set[int] = set()
+        call_threads_lock = threading.Lock()
+        with mock.patch.object(
+            chat,
+            "create_provider",
+            lambda config: MeetAtTheSameTime(
+                meeting, call_threads, call_threads_lock,
+            ),
+        ):
+            status, said = self.ask(
+                "/api/chat/ask-everyone", {"text": "What do you think?"},
+            )
+
+        self.assertEqual(status, 200, said)
+        self.assertFalse(meeting.broken, said)
+        self.assertEqual(len(call_threads), 2, call_threads)
+        self.assertTrue(
+            all(not one["went_wrong"] for one in said["answers"]), said,
+        )
 
 
 class NothingReachesOutside(PanelTestCase):
