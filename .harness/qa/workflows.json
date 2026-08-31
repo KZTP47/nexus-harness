@@ -5053,6 +5053,12 @@
           "note": "One reached with a key"
         },
         {
+          "do": "choose",
+          "target": "#teamModelProvider",
+          "value": "anthropic",
+          "note": "Choose a native provider and exercise its defaults"
+        },
+        {
           "do": "run",
           "script": "await new Promise(r => setTimeout(r, 400)); document.getElementById('teamModelRoute').value = 'a-check-made-this'; document.getElementById('teamModelModel').value = 'some-model'; document.getElementById('teamModelKeyName').value =   'SK_AVERYLONGVALUETHATLOOKSLIKEAKEYRATHERTHANANAME123456'; document.getElementById('teamModelSave').click(); for (let tries = 0; tries < 100; tries += 1) {   if (document.getElementById('teamModelSaid').textContent.length > 5) break;   await new Promise(r => setTimeout(r, 200)); } const said = document.getElementById('teamModelSaid').textContent.toLowerCase(); return said.includes('looks like a key') || said.includes('never the key itself')   ? 'pasting a key where the name goes is refused'   : 'it said: ' + said.slice(0, 70)",
           "text": "pasting a key where the name goes is refused",
@@ -7327,7 +7333,7 @@
         {
           "do": "choose",
           "target": "#thePageWhich",
-          "value": "Our Harness",
+          "value": "Nexus Harness",
           "note": "Pick which project's page to look at. Seeing a list says nothing about what choosing does."
         },
         {

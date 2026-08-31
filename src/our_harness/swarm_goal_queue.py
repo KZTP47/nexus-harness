@@ -22,6 +22,7 @@ from typing import Any, Callable
 import uuid
 
 from .models import HarnessError
+from . import user_questions
 from .pipeline_runs import _owner_is_alive, _process_token
 from .swarm_runs import _base
 from .runtime_integrity import atomic_text, mac, quarantine_marker
@@ -944,6 +945,24 @@ class SwarmGoalQueueStore:
                     return self._public(self._recover_dead(database, row))
             return public
 
+    def active_project_paths(self) -> list[str]:
+        """Return every unfinished project reserved by an executing legacy queue."""
+        with self._tx() as database:
+            row = database.execute(
+                "SELECT * FROM goal_queues WHERE status IN ('queued','running','paused') "
+                "ORDER BY updated_ms DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return []
+            document = self._recover_dead(database, row)
+            if document["status"] not in {"queued", "running", "paused"}:
+                return []
+            cursor = int(document["cursor"])
+            return list(dict.fromkeys(
+                str(one.get("project_path") or "") for one in document["items"][cursor:]
+                if str(one.get("project_path") or "")
+            ))
+
     def claim(
         self, queue_id: object, item_id: object, *, objective: str,
         agent_id: str, peer_id: str, project_id: str, conversation_id: str,
@@ -1034,7 +1053,7 @@ class SwarmGoalQueueStore:
                 "allowed_write_roots": list(result.get("allowed_write_roots") or [])[:20],
                 "write_scope_restricted": result.get("write_scope_restricted") is True,
                 "context_tool_budget": dict(result.get("context_tool_budget") or {}),
-                "questions": [str(one) for one in list(result.get("questions") or [])[:20]],
+                "questions": user_questions.frozen(result.get("questions")),
                 "remaining": [str(one) for one in list(result.get("remaining") or [])[:50]],
                 "project": {
                     "id": current["project_id"], "name": current["project_name"],

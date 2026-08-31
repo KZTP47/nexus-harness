@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import base64
+import contextlib
 import json
 import os
 import subprocess
@@ -34,8 +35,8 @@ from pathlib import Path
 from unittest import mock
 
 from our_harness import (
-    agent_mailbox, cancellation, chat, pages, server, swarm, swarm_runs,
-    swarm_work,
+    agent_mailbox, cancellation, chat, collaboration_outcomes, pages, server,
+    swarm, swarm_runs, swarm_work,
 )
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
 
@@ -2347,14 +2348,80 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("const firstHydration = !swarmBoardHydrated;", refresh)
         self.assertIn("if (said.provider_status_stale", refresh)
 
-    def test_login_checks_send_the_route_and_keep_the_answer_visible(self) -> None:
+    def test_connection_diagnosis_sends_the_exact_route_and_keeps_the_plan_visible(self) -> None:
         check = self.script[
-            self.script.index("async function checkAgentLogin"):
-            self.script.index("async function manuallyLogInAgent")
+            self.script.index("async function loadAgentRepairPlan"):
+            self.script.index("async function checkAgentLogin")
         ]
         self.assertIn("JSON.stringify({route})", check)
-        self.assertIn("said.note", check)
+        self.assertIn('request("/api/team/repair-plan"', check)
+        self.assertIn("swarmAgentRepairPlans.set(agentId, {route, plan})", check)
         self.assertNotIn("refreshSwarm", check)
+
+    def test_board_readiness_issues_open_the_exact_agents_repair_flow(self) -> None:
+        rendered = self.script[
+            self.script.index("function renderSwarmNotReady"):
+            self.script.index("// ---- dragging")
+        ]
+        self.assertIn('"Fix this agent"', rendered)
+        self.assertIn("openAgentRepairFlow(stuck.id, connect)", rendered)
+        self.assertIn("pickSwarmBox(\"agent\", agentId)", self.script)
+        self.assertIn("loadAgentRepairPlan(agentId, selected.who, button)", self.script)
+        self.assertIn('id="swarmRefresh" type="button"', self.markup)
+        self.assertIn(">Check board</button>", self.markup)
+
+    def test_every_broken_agent_surface_uses_the_same_exact_route_repair_flow(self) -> None:
+        self.assertIn("async function openAgentRepairFlow(agentId", self.script)
+        self.assertIn('(!one.ready || one.trouble_last_time)', self.script)
+        self.assertGreaterEqual(self.script.count('"Repair connection"'), 3)
+        compact = self.script[
+            self.script.index("function oneSwarmChatCard"):
+            self.script.index("function makeTheChatCardDraggable")
+        ]
+        doing = self.script[
+            self.script.index("function renderWhatItHasGoingOn"):
+            self.script.index("const GOOGLE_CLOUD_PROJECT_WELCOME")
+        ]
+        for surface in (compact, doing):
+            self.assertIn("openAgentRepairFlow(agent.id", surface)
+            self.assertNotIn("repairClaudeAccess", surface)
+            self.assertNotIn("showGeminiProjectHelp", surface)
+
+    def test_agent_panel_discloses_actual_route_and_renders_every_repair_action(self) -> None:
+        repaired = self.script[
+            self.script.index("function renderAgentRepairPanel"):
+            self.script.index("async function loadAgentRepairPlan")
+        ]
+        agent_panel = self.script[
+            self.script.index("function renderSwarmAgentPanel"):
+            self.script.index("function renderSwarmProjectPanel")
+        ]
+        self.assertIn('id="swarmAgentRouteIdentity"', self.markup)
+        self.assertIn("Actual provider:", agent_panel)
+        self.assertIn("Route: ${route}", agent_panel)
+        self.assertIn('id="swarmAgentRepairChoices"', self.markup)
+        self.assertIn("choices.append(choice)", repaired)
+        self.assertIn("performAgentRepairAction(agent.id, route, offered, choice)", repaired)
+
+    def test_uncertain_web_turn_opens_the_exact_provider_conversation_before_retry(self) -> None:
+        actions = self.script[
+            self.script.index("async function performAgentRepairAction"):
+            self.script.index("async function runAgentRouteTest")
+        ]
+        self.assertIn('actionId === "inspect-provider-turn"', actions)
+        self.assertIn("destination.web_chat_id", actions)
+        self.assertIn("destination.web_conversation_key", actions)
+        self.assertIn("showFullWebChatInsideNexus", actions)
+        self.assertIn("Confirm whether the uncertain turn arrived before retrying", actions)
+        self.assertIn("diagnosis_fingerprint: diagnosisFingerprint", self.script)
+
+    def test_route_settings_filter_searches_current_provider_values(self) -> None:
+        rendered = self.script[
+            self.script.index("function renderSettings"):
+            self.script.index("function settingRow")
+        ]
+        self.assertIn("JSON.stringify(one.value", rendered)
+        self.assertIn("${current}", rendered)
 
     def test_pair_chat_exposes_the_live_shared_agent_ledger(self) -> None:
         self.assertIn("Live shared agent ledger:", self.script)
@@ -2379,7 +2446,7 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("if (!doing.has_more || next === cursor) return doing", self.script)
         self.assertIn('JSON.stringify({run_id: swarmBoardRunId})', self.script)
         self.assertIn("window.harnessDesktop.stopWebChat(", self.script)
-        self.assertIn('agent.who, conversation?.filed_as || ""', self.script)
+        self.assertIn("activity.route, activity.filedAs", self.script)
 
     def test_board_goal_sequence_is_server_owned_resumable_and_cancellable(self) -> None:
         self.assertIn('id="swarmWorkGoals"', self.markup)
@@ -2475,6 +2542,160 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertLess(switched.index("held.conversation = chatId"),
                         switched.index('request("/api/swarm/chats/activate"'))
         self.assertIn("swarmConversationSwitching.has(agentId)", switched)
+        self.assertNotIn("swarmBusy", switched)
+        self.assertNotIn("swarmChatIsBusy", switched)
+
+    def test_busy_controls_and_activity_are_scoped_to_the_exact_saved_chat(self) -> None:
+        controls = self.script[
+            self.script.index("function setWhatCanBePressedInSwarm"):
+            self.script.index("// ---- changing it")
+        ]
+        sidebar = self.script[
+            self.script.index("function renderTheConversationSidebar"):
+            self.script.index("function renderTheConversationProject")
+        ]
+        activity = self.script[
+            self.script.index("function beginSwarmChatActivity"):
+            self.script.index("function sayInSwarm")
+        ]
+        self.assertIn("function swarmChatRuntimeKeyFor(agentId, chatId", self.script)
+        self.assertIn("return exact ? `chat:${exact}` : `legacy:${agentId}`", self.script)
+        self.assertIn("const targetBusy = Boolean(chatId)", controls)
+        self.assertIn('action === "pick"', controls)
+        self.assertNotIn("button.disabled = waiting ||", controls)
+        self.assertIn('pick.dataset.conversationAction = "pick"', sidebar)
+        self.assertIn(
+            'remove.dataset.conversationAction = archived ? "restore" : "archive"',
+            sidebar,
+        )
+        self.assertIn("const running = swarmChatIsBusy(agentId, conversation.id)", sidebar)
+        self.assertIn("swarmChatActivity.set(chatKey, activity)", activity)
+        self.assertIn("chatId: conversation?.id", activity)
+        self.assertIn("swarmBusy.delete(activity.chatKey)", activity)
+
+    def test_chat_composers_pause_only_while_saved_chat_identity_changes(self) -> None:
+        compact = self.script[
+            self.script.index("function setWhatCanBePressedInAChat"):
+            self.script.index("function stoppedChatError")
+        ]
+        enlarged = self.script[
+            self.script.index("function setWhatCanBePressedInSwarm"):
+            self.script.index("// ---- changing it")
+        ]
+        for controls in (compact, enlarged):
+            self.assertIn("const identityChanging = swarmChatIsResetting", controls)
+            self.assertIn("swarmConversationSwitching.has", controls)
+            self.assertIn("swarmChatIsHydrating", controls)
+            self.assertIn("const waiting = busy || identityChanging", controls)
+        self.assertIn("box.disabled = !agent || identityChanging", compact)
+        self.assertIn("const chatAgent = theSwarmAgent(theBigOne)", enlarged)
+        self.assertIn('$("theBigChatBox").disabled = !chatAgent || identityChanging', enlarged)
+        self.assertIn('$("theBigChatSend").disabled = waiting || !chatAgent', enlarged)
+        self.assertIn('$("theBigChatAttach").disabled = waiting || !chatAgent', enlarged)
+        self.assertNotIn("box.disabled = !agent || busy", compact)
+        self.assertNotIn('$("theBigChatBox").disabled = !chatAgent || busy', enlarged)
+
+    def test_latest_conversation_metadata_read_inherits_full_transcript_refresh(self) -> None:
+        load = self.script[
+            self.script.index("async function loadConversationsFor"):
+            self.script.index("function finishConversationSwitch")
+        ]
+        finish = self.script[
+            self.script.index("function finishConversationSwitch"):
+            self.script.index("async function createConversationFor")
+        ]
+        close = self.script[
+            self.script.index("function closeTheChatFor"):
+            self.script.index("function minimiseTheChatFor")
+        ]
+        self.assertIn("const swarmConversationTranscriptRefreshes = new Set()", self.script)
+        self.assertIn("if (refresh || swarmChatIsHydrating(agentId))", load)
+        self.assertIn("swarmConversationTranscriptRefreshes.add(agentId)", load)
+        self.assertIn(
+            "const refreshTranscript = swarmConversationTranscriptRefreshes.delete(agentId)",
+            load,
+        )
+        self.assertIn("if (refreshTranscript &&", load)
+        self.assertIn("swarmConversationTranscriptRefreshes.has(agentId)", finish)
+        self.assertIn("loadConversationsFor(agentId, false)", finish)
+        self.assertIn("swarmConversationTranscriptRefreshes.delete(agentId)", close)
+
+    def test_late_chat_results_hydration_and_reset_keep_exact_identity(self) -> None:
+        self.assertIn("function swarmActivityCanSettle(activity)", self.script)
+        self.assertIn("function swarmActivityCanReconcileSuccess(activity)", self.script)
+        self.assertIn("activity.settled = true", self.script)
+        self.assertIn("if (!swarmActivityCanSettle(activity)) return null", self.script)
+        self.assertIn("restoreSwarmActivityDraft(activity)", self.script)
+        self.assertIn("clearSwarmActivityAttachments(activity)", self.script)
+        self.assertIn("finishSwarmActivityResponse(agentId, activity)", self.script)
+        self.assertIn("const swarmConversationHydrating = new Set()", self.script)
+        self.assertIn("swarmConversationHydrating.add(agentId)", self.script)
+        self.assertIn("swarmChatIsHydrating(card.dataset.agent)", self.script)
+        self.assertIn("function finishConversationSwitch(agentId)", self.script)
+        self.assertIn("const swarmChatResetting = new Set()", self.script)
+        self.assertIn("swarmChatResetting.add(runtimeKey)", self.script)
+        self.assertIn("swarmChatResetting.delete(runtimeKey)", self.script)
+        self.assertIn("let cleanupWarning = \"\"", self.script)
+        self.assertIn("`${said.note || `${agentName} starts again.`}${cleanupWarning}`", self.script)
+        self.assertIn("function bigChatShows(agentId, conversationId", self.script)
+        self.assertIn("sayInBigChatConversationFor(agentId, error.message", self.script)
+
+    def test_terminal_feed_attachment_cleanup_is_owned_by_one_activity(self) -> None:
+        cleanup = self.script[
+            self.script.index("function clearSwarmActivityAttachments"):
+            self.script.index("function normalizedUserQuestions")
+        ]
+        activity = self.script[
+            self.script.index("function beginSwarmChatActivity"):
+            self.script.index("function scheduleSwarmChatActivityCollapse")
+        ]
+        compact = self.script[
+            self.script.index("async function sendWhatIsTypedTo"):
+            self.script.index("async function startTheChatAgainFor")
+        ]
+        enlarged = self.script[
+            self.script.index("async function sendFromTheBigChat"):
+            self.script.index("function wireUpTheTray")
+        ]
+        self.assertIn("attachmentsCleared: false", activity)
+        self.assertIn("activity.attachmentsCleared", cleanup)
+        self.assertIn("activity.attachmentsCleared = true", cleanup)
+        self.assertEqual(compact.count("clearSwarmActivityAttachments(activity)"), 2)
+        self.assertEqual(enlarged.count("clearSwarmActivityAttachments(activity)"), 2)
+        self.assertNotIn("swarmChatAttachments.delete(attachmentKey)", compact)
+        self.assertNotIn("swarmChatAttachments.delete(attachmentKey)", enlarged)
+
+    def test_terminal_feed_collapse_keeps_only_a_non_rendered_tombstone(self) -> None:
+        collapse = self.script[
+            self.script.index("function scheduleSwarmChatActivityCollapse"):
+            self.script.index("function settleSwarmChatActivityFromFeed")
+        ]
+        turns = self.script[
+            self.script.index("function chatTurnsWhileWorking"):
+            self.script.index("function renderTurnsThatArrived")
+        ]
+        render = self.script[
+            self.script.index("function renderSwarmChatActivity"):
+            self.script.index("async function pollSwarmChatActivity")
+        ]
+        self.assertIn("activity.collapsed = true", collapse)
+        self.assertIn("if (activity.responseFinished) swarmChatActivity.delete", collapse)
+        self.assertIn("function finishSwarmActivityResponse", collapse)
+        self.assertIn("visibleSwarmChatActivity(swarmChatActivityFor(agentId))", turns)
+        self.assertIn("visibleSwarmChatActivity(swarmChatActivity.get(chatKey))", render)
+        self.assertIn(
+            "visibleSwarmChatActivity(swarmChatActivityFor(held.agent))", self.script,
+        )
+
+    def test_terminal_feed_failure_refreshes_the_visible_compact_draft(self) -> None:
+        restored = self.script[
+            self.script.index("function restoreSwarmChatDraft"):
+            self.script.index("function restoreSwarmActivityDraft")
+        ]
+        self.assertIn("swarmChats.find((one) => swarmChatKey(one.agent) === chatKey)", restored)
+        self.assertIn("if (box && !box.value)", restored)
+        self.assertIn("box.value = words", restored)
+        self.assertIn("rememberSwarmChatComposer(held.agent)", restored)
 
     def test_only_the_latest_conversation_list_can_change_the_selection(self) -> None:
         loaded = self.script[
@@ -2642,9 +2863,10 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("nextSwarmChatRevision(agentId)", kept)
         self.assertIn("activeConversationIdFor(agentId) !== conversationId", kept)
 
-    def test_send_can_route_to_connected_agents_and_code_blocks_can_be_copied(self) -> None:
-        self.assertIn('const mode = arguments[1] || "auto"', self.script)
-        self.assertIn('sendFromTheBigChat("auto")', self.script)
+    def test_send_is_direct_and_explicit_collaboration_and_code_copy_remain_available(self) -> None:
+        self.assertIn('const mode = arguments[1] || "chat"', self.script)
+        self.assertIn('sendFromTheBigChat("chat")', self.script)
+        self.assertIn('sendWhatIsTypedTo(held.agent, "collaborate")', self.script)
         self.assertIn('answered.routing?.selected === "collaborate"', self.script)
         self.assertIn("said.partial_provider_failure || automaticRoundStopWords(said)", self.script)
         self.assertIn("answered.partial_provider_failure || automaticRoundStopWords(answered)", self.script)
@@ -2653,28 +2875,94 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn('navigator.clipboard?.writeText', self.script)
         self.assertIn(".chat-code-block", self.styles)
 
+    def test_chat_actions_name_the_exact_direct_and_team_recipients(self) -> None:
+        self.assertIn("function chatRecipientWords(agentId)", self.script)
+        self.assertIn("const direct = `Ask ${selectedName} only`", self.script)
+        self.assertIn('expected === 2 ? "Ask both agents"', self.script)
+        self.assertIn('`Ask all ${expected} agents`', self.script)
+        self.assertIn('class="hint chat-auto-hint"', self.markup)
+        self.assertIn('id="theBigChatScopeHint"', self.markup)
+        self.assertIn('make("p", "hint swarm-chat-scope", recipientWords.help)',
+                      self.script)
+        self.assertIn("expected initial replies", self.script)
+
+    def test_team_send_is_blocked_until_every_named_participant_is_ready(self) -> None:
+        self.assertIn("function unavailableChatParticipants(agentId)", self.script)
+        self.assertIn("return current || {...saved, ready: false}", self.script)
+        self.assertIn("function fillChatTeamReadiness(panel, agentId)", self.script)
+        self.assertIn('`Repair ${one.name || "agent"}`', self.script)
+        self.assertIn("|| unavailablePeers.length > 0", self.script)
+        self.assertIn('$("theBigChatSend").disabled = waiting || !chatAgent || !chatAgent.ready',
+                      self.script)
+        self.assertGreaterEqual(
+            self.script.count("The team request was not sent. Repair"), 2,
+        )
+        self.assertIn('id="theBigChatTeamReadiness"', self.markup)
+        self.assertIn(".chat-team-readiness", self.styles)
+
+    def test_participant_outcomes_render_from_the_saved_transcript_in_both_views(self) -> None:
+        self.assertIn('participant_outcome: "Team response status"', self.script)
+        self.assertIn("function normalizedParticipantOutcome(one)", self.script)
+        self.assertIn("one?.participant_outcome", self.script)
+        self.assertIn('one?.phase === "participant_outcome"', self.script)
+        self.assertIn("function appendParticipantOutcome", self.script)
+        self.assertGreaterEqual(
+            self.script.count("appendParticipantOutcome("), 3,
+        )
+        self.assertIn("${outcome.answered} of ${outcome.expected} agents answered.",
+                      self.script)
+        self.assertIn('"inspect-provider-turn" ? "Inspect" : "Repair"', self.script)
+        self.assertIn("${participant.name}`", self.script)
+        self.assertIn("Nexus will not resend", self.script)
+        self.assertIn(".participant-outcome-card", self.styles)
+
+        restore = self.script[
+            self.script.index("function restoreParticipantOutcomePrompt"):
+            self.script.index("function appendParticipantOutcome")
+        ]
+        self.assertIn("box.value = words", restore)
+        self.assertIn("Nothing was sent", restore)
+        self.assertNotIn("request(", restore)
+
+    def test_collaboration_record_reset_is_problem_scoped_and_never_reuses_start_again(self) -> None:
+        reset = self.script[
+            self.script.index("async function resetCollaborationRecord"):
+            self.script.index("function aChatDestination")
+        ]
+        self.assertIn("conversation?.collaboration_problem", reset)
+        self.assertIn('request("/api/swarm/collaboration/reset"', reset)
+        self.assertIn("agent: agent.id, chat: conversation.id", reset)
+        self.assertIn("No prompt is sent and no AI is contacted", reset)
+        self.assertNotIn("/api/swarm/start-again", reset)
+        destination = self.script[
+            self.script.index("function aChatDestination"):
+            self.script.index("function readChatAttachment")
+        ]
+        self.assertIn("if (collaborationProblem && agent && conversation)", destination)
+        self.assertIn('"Reset collaboration record"', destination)
+
     def test_chat_round_policy_is_visible_and_sent_with_both_chat_views(self) -> None:
         self.assertIn('id="theBigChatRoundLimit"', self.markup)
         self.assertIn('id="theBigChatUnlimited"', self.markup)
         self.assertIn("Unlimited while progress continues", self.markup)
+        self.assertIn('value="3"', self.markup)
+        self.assertIn("const DEFAULT_FINITE_TEAM_ROUNDS = 3", self.script)
+        self.assertIn("{unlimited: false, maximum: DEFAULT_FINITE_TEAM_ROUNDS}",
+                      self.script)
         self.assertIn("function selectedChatRoundLimit(agentId)", self.script)
         self.assertIn("round_limit: selectedChatRoundLimit(agentId)", self.script)
-        self.assertIn("Repeated no-progress cycles still stop", self.script)
+        self.assertIn("Unlimited is an explicit opt-in", self.markup)
         self.assertIn(".chat-round-policy", self.styles)
 
-    def test_solo_chat_action_is_always_available_in_both_chat_bottoms(self) -> None:
+    def test_normal_send_is_the_solo_chat_action_in_both_chat_bottoms(self) -> None:
         start = self.markup.index('<div class="the-big-chat-bottom">')
         end = self.markup.index('<div id="theBigChatAttachments"', start)
         bottom = self.markup[start:end]
-        self.assertIn('id="theBigChatSolo"', self.markup[start:])
-        self.assertIn("Chat with only this agent", self.markup[start:])
+        self.assertNotIn('id="theBigChatSolo"', self.markup[start:])
+        self.assertIn('title="Send only to the selected agent"', self.markup[start:])
         self.assertIn('sendFromTheBigChat("chat")', self.script)
-        self.assertIn(
-            'make("button", "swarm-chat-solo", "Chat with only this agent")',
-            self.script,
-        )
-        self.assertIn('sendWhatIsTypedTo(held.agent, "chat")', self.script)
-        self.assertIn('"theBigChatSend", "theBigChatSolo", "theBigChatAttach"', self.script)
+        self.assertNotIn('make("button", "swarm-chat-solo"', self.script)
+        self.assertIn('"theBigChatSend", "theBigChatAttach"', self.script)
         self.assertIn('id="theBigChatBox"', bottom)
 
     def test_normal_send_confirms_explicit_project_work_and_labels_iterative_turns(self) -> None:
@@ -2708,6 +2996,13 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("allowedWriteRoots: Object.freeze(roots)", self.script)
         self.assertIn("writeScopeRestricted: Boolean", self.script)
         self.assertIn("contextToolBudget: Object.freeze", self.script)
+        self.assertIn("function normalizedUserQuestions(value)", self.script)
+        self.assertIn("function compiledQuestionAnswers(questions, answers)", self.script)
+        self.assertIn("function appendInlineUserQuestions", self.script)
+        self.assertIn('make("span", "agent-question-recommended", "Recommended")', self.script)
+        self.assertIn('void sendWhatIsTypedTo(agent.id, "chat")', self.script)
+        self.assertIn("questionAnswers: frozenQuestionAnswers", self.script)
+        self.assertIn(".agent-question-card", self.styles)
         self.assertIn("answered?.context_tool_budget?.summary", self.script)
         self.assertIn('"Reset tool time and resume"', self.script)
         self.assertIn("reset_context_tool_execution_budget: true", self.script)
@@ -2783,9 +3078,46 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("chat-activity-shimmer", self.styles)
         self.assertIn("chat-activity-track", self.styles)
 
+    def test_chat_progress_is_inside_the_bottom_of_each_transcript_pane(self) -> None:
+        big = self.markup[
+            self.markup.index('<div class="the-big-chat-transcript">'):
+            self.markup.index('id="theBigChatActivityResize"')
+        ]
+        self.assertIn('id="theBigChatSaid"', big)
+        self.assertIn('id="theBigChatActivity"', big)
+        self.assertLess(big.index('id="theBigChatSaid"'), big.index('id="theBigChatActivity"'))
+        compact = self.script[
+            self.script.index('const transcript = make("div", "swarm-chat-transcript")'):
+            self.script.index('const recoveryPanel = make("section", "work-recovery swarm-chat-work-recovery")')
+        ]
+        self.assertIn("transcript.append(thread)", compact)
+        self.assertIn("transcript.append(activityPanel)", compact)
+        self.assertIn(".the-big-chat-transcript", self.styles)
+        self.assertIn("grid-template-rows: minmax(0, 1fr) auto", self.styles)
+
+    def test_lone_agent_chat_disables_team_actions_but_keeps_direct_controls(self) -> None:
+        self.assertIn("function isLoneAgentChat(agentId)", self.script)
+        self.assertIn('pair.length === 1', self.script)
+        compact = self.script[
+            self.script.index("function setWhatCanBePressedInAChat"):
+            self.script.index("function stoppedChatError")
+        ]
+        enlarged = self.script[
+            self.script.index("function setWhatCanBePressedInSwarm"):
+            self.script.index("// ---- changing it")
+        ]
+        self.assertIn('waiting || lone || !agent || !agent.ready', compact)
+        self.assertIn('const workDisabled = waiting || lone', compact)
+        self.assertIn('$("theBigChatCollaborate").disabled = waiting || lone', enlarged)
+        self.assertIn('waiting || lone || Boolean(recovery)', enlarged)
+        self.assertIn('["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)',
+                      self.script)
+        self.assertNotIn('$("theBigChatSend").disabled = waiting || lone', enlarged)
+        self.assertNotIn('$("theBigChatAttach").disabled = waiting || lone', enlarged)
+
     def test_completed_collaboration_turns_stream_into_both_chat_views(self) -> None:
         self.assertIn("Array.isArray(update.turns)", self.script)
-        self.assertIn("renderTurnsThatArrived(agentId)", self.script)
+        self.assertIn("renderTurnsThatArrived(agentId, chatKey)", self.script)
         self.assertIn("chatTurnsWhileWorking(agentId", self.script)
         self.assertIn("localTurns: words ?", self.script)
 
@@ -2834,7 +3166,9 @@ class MovingAroundTheBoard(unittest.TestCase):
         ]
         self.assertIn("Describe the project-file change first.", sending)
         self.assertIn("Type the question or task", sending)
-        self.assertIn("swarmBusy.has(agentId)", sending)
+        self.assertIn("const runtimeKey = swarmChatRuntimeKey(agentId)", sending)
+        self.assertIn("swarmBusy.has(runtimeKey)", sending)
+        self.assertNotIn("swarmBusy.has(agentId)", sending)
         self.assertIn("showError(words)", sending)
 
     def test_large_swarms_can_be_zoomed_and_fitted_to_the_view(self) -> None:
@@ -2855,7 +3189,7 @@ class MovingAroundTheBoard(unittest.TestCase):
 
     def test_connect_actions_do_not_start_the_card_drag(self) -> None:
         action = self.script[self.script.index(
-            'const connect = make("button", "swarm-connect swarm-box-connect", label);'
+            'const connect = make("button", "swarm-connect swarm-box-connect", "Repair connection");'
         ):]
         action = action[:action.index("box.append(connect);")]
         self.assertIn(
@@ -2863,7 +3197,7 @@ class MovingAroundTheBoard(unittest.TestCase):
             action,
         )
         self.assertIn("event.preventDefault();", action)
-        self.assertIn("connectThisAssistant(one.can_be_connected, connect);", action)
+        self.assertIn("openAgentRepairFlow(one.id, connect);", action)
 
     def test_gemini_project_dialog_links_to_the_official_explanation(self) -> None:
         self.assertIn('id="askDialogHelp"', self.markup)
@@ -3348,7 +3682,14 @@ class WhatThePanelIsTold(BoardTestCase):
                 "resume_token": token, "goal_complete": False,
                 "allowed_write_roots": "not-a-list" if status == "incomplete" else ["output"],
                 "write_scope_restricted": True,
-                "questions": ["valid question", 42],
+                "questions": [{
+                    "id": "valid-question", "prompt": "valid question",
+                    "options": [{
+                        "label": "Recommended choice", "description": "best default",
+                        "recommended": True,
+                    }],
+                    "multiple": False, "allow_other": True,
+                }, 42],
                 "remaining": ["valid remaining", {"not": "text"}],
                 "context_tool_budget": {
                     "epoch": 2, "summary": "bounded", "unknown": "x" * 100_000,
@@ -3391,7 +3732,10 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertTrue(by_status["paused_provider"]["objective_truncated"])
         self.assertLessEqual(len(by_status["paused_provider"]["objective"]), 2_000)
         self.assertEqual(by_status["incomplete"]["allowed_write_roots"], [])
-        self.assertEqual(by_status["incomplete"]["questions"], ["valid question"])
+        self.assertEqual(by_status["incomplete"]["questions"][0]["prompt"], "valid question")
+        self.assertTrue(
+            by_status["incomplete"]["questions"][0]["options"][0]["recommended"]
+        )
         self.assertEqual(by_status["incomplete"]["remaining"], ["valid remaining"])
         self.assertEqual(by_status["incomplete"]["context_tool_budget"], {
             "epoch": 2, "summary": "bounded",
@@ -3456,8 +3800,17 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(kept_status, 200, kept)
         exported_status, _exported = self.ask("/api/swarm/export-kept?name=Snapshot")
         self.assertEqual(exported_status, 200)
-        opened_status, opened = self.ask("/api/swarm/open-kept", {"name": "Snapshot"})
+        with mock.patch.object(
+            chat, "who_can_talk",
+            side_effect=AssertionError(
+                "opening a saved local board must not wait for provider discovery"
+            ),
+        ):
+            opened_status, opened = self.ask(
+                "/api/swarm/open-kept", {"name": "Snapshot"}
+            )
         self.assertEqual(opened_status, 200, opened)
+        self.assertTrue(opened["provider_status_stale"])
         self.assertEqual(opened["cannot_be_changed"], "")
         self.assertIn("automation is paused", opened["cannot_run"])
         forgotten_status, forgotten = self.ask(
@@ -3470,12 +3823,10 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(start_status, 400)
         self.assertIn("copied or substituted", refused["error"])
 
-        # Every legacy project/provider/QA execution route fails before taking
-        # a lease, creating a thread, or opening a provider cancellation scope.
+        # Project/QA execution still fails before taking a lease or creating a
+        # thread. Plain provider conversation is tested separately below.
         executable_requests = [
             ("/api/run", {"task": "Do not dispatch"}),
-            ("/api/chat/say", {"who": "openai", "text": "Do not ask"}),
-            ("/api/chat/ask-everyone", {"text": "Do not ask"}),
             ("/api/qa/record", {"url": "http://127.0.0.1/"}),
             ("/api/qa/coverage", {"url": "http://127.0.0.1/"}),
             ("/api/qa/pick", {"url": "http://127.0.0.1/"}),
@@ -3517,6 +3868,70 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertTrue(self.panel.qa_lock.acquire(blocking=False))
         self.panel.qa_lock.release()
         self.assertIsNone(self.panel._pipeline_store)
+
+        # A project-authority conflict is a mutation fence, not a mute switch.
+        # Direct chat, fan-out, and board-agent collaboration keep durable
+        # communication identities while project work remains refused.
+        direct_answer = {
+            "said": [{"who": "them", "text": "direct answer", "at": ""}],
+            "answer": {"who": "them", "text": "direct answer", "at": ""},
+        }
+        with (
+            mock.patch.object(chat, "say", return_value=direct_answer) as direct,
+            mock.patch.object(chat, "ask_everyone", return_value=[{
+                "route": "openai", "answer": "fan-out answer",
+            }]) as everyone,
+        ):
+            direct_status, direct_said = self.ask(
+                "/api/chat/say", {"who": "openai", "text": "Hello"}
+            )
+            everyone_status, everyone_said = self.ask(
+                "/api/chat/ask-everyone", {"text": "Hello all"}
+            )
+        self.assertEqual(direct_status, 200, direct_said)
+        self.assertEqual(direct_said["answer"]["text"], "direct answer")
+        self.assertEqual(everyone_status, 200, everyone_said)
+        self.assertEqual(everyone_said["answers"][0]["answer"], "fan-out answer")
+        direct.assert_called_once()
+        everyone.assert_called_once()
+
+        board_status, board_saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [{"name": "Conflicted", "path": str(self.where)}],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(board_status, 200, board_saved)
+        lead_id = board_saved["board"]["agents"][0]["id"]
+        collaboration_answer = {
+            "said": [{"who": "them", "text": "team answer", "at": ""}],
+            "collaborated_with": [{"id": "agent-2", "name": "The peer"}],
+        }
+        with mock.patch.object(
+            swarm_work, "collaborate", return_value=collaboration_answer,
+        ) as collaborate:
+            chat_status, chat_said = self.ask("/api/swarm/say", {
+                "agent": lead_id, "text": "Discuss this", "mode": "collaborate",
+            })
+        self.assertEqual(chat_status, 200, chat_said)
+        self.assertEqual(chat_said["said"][0]["text"], "team answer")
+        self.assertTrue(
+            self.panel.swarm_communication_runs.authority.startswith("communication-")
+        )
+        collaborate.assert_called_once()
+
+        work_status, work_refused = self.ask("/api/swarm/say", {
+            "agent": lead_id, "text": "Create a project file", "mode": "work",
+            "allow_project_changes": True,
+        })
+        self.assertEqual(work_status, 400, work_refused)
+        self.assertIn("copied or substituted", work_refused["error"])
 
         no_confirm, refused = self.ask(
             "/api/projects/use-as-new-local",
@@ -3593,6 +4008,65 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(self.panel.swarm_known_routes, routes)
         discover.assert_called_once()
 
+    def test_slow_provider_refresh_does_not_block_a_visible_board_edit(self) -> None:
+        discovery_started = threading.Event()
+        release_discovery = threading.Event()
+        save_finished = threading.Event()
+        discovery_lock_states: list[bool] = []
+        observed: dict[str, tuple[int, dict] | BaseException] = {}
+
+        def slow_discovery(_config) -> list[dict]:
+            discovery_lock_states.append(self.panel.swarm_lock.locked())
+            discovery_started.set()
+            if not release_discovery.wait(10):
+                raise AssertionError("the test did not release provider discovery")
+            return [{"route": "claude", "label": "Claude", "ready": True}]
+
+        def refresh() -> None:
+            try:
+                observed["refresh"] = self.ask("/api/swarm")
+            except BaseException as exc:
+                observed["refresh"] = exc
+
+        def save() -> None:
+            try:
+                observed["save"] = self.ask(
+                    "/api/swarm/save",
+                    {"board": {"agents": [{"name": "Responsive edit"}]}},
+                )
+            except BaseException as exc:
+                observed["save"] = exc
+            finally:
+                save_finished.set()
+
+        with mock.patch.object(chat, "who_can_talk", side_effect=slow_discovery):
+            refresh_thread = threading.Thread(target=refresh)
+            save_thread = threading.Thread(target=save)
+            refresh_thread.start()
+            self.assertTrue(discovery_started.wait(5), "provider discovery never started")
+            save_thread.start()
+            try:
+                self.assertTrue(
+                    save_finished.wait(2),
+                    "a slow provider scan held the board mutation lock",
+                )
+            finally:
+                release_discovery.set()
+                save_thread.join(10)
+                refresh_thread.join(10)
+
+        self.assertFalse(save_thread.is_alive())
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertEqual(discovery_lock_states, [False])
+        self.assertNotIsInstance(observed.get("save"), BaseException)
+        self.assertNotIsInstance(observed.get("refresh"), BaseException)
+        save_status, saved = observed["save"]  # type: ignore[misc]
+        refresh_status, refreshed = observed["refresh"]  # type: ignore[misc]
+        self.assertEqual(save_status, 200, saved)
+        self.assertEqual(saved["board"]["agents"][0]["name"], "Responsive edit")
+        self.assertEqual(refresh_status, 200, refreshed)
+        self.assertEqual(refreshed["board"]["agents"][0]["name"], "Responsive edit")
+
     def test_chat_activity_feed_returns_current_or_waiting_stage(self) -> None:
         activity_id = "activity-test-123"
         status, waiting = self.ask(f"/api/swarm/activity?activity={activity_id}")
@@ -3636,6 +4110,66 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(activity["state"], "complete")
         self.assertEqual(activity["stage"], "Answer received")
 
+    def test_degraded_team_result_has_truthful_terminal_activity_words(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        _status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        conversation = next(
+            one for one in listed["chats"]
+            if one["pair"] == ["agent-1", "agent-2"]
+        )
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        cases = (
+            ("partial", 1, "Some agents need attention", "every available answer"),
+            ("none", 0, "No agent answered", "No uncertain provider turn was resent"),
+        )
+        participants = [
+            {"id": "agent-1", "name": "The lead", "who": "claude"},
+            {"id": "agent-2", "name": "The peer", "who": "codex"},
+        ]
+        for number, (outcome, answered, stage, detail) in enumerate(cases, 1):
+            activity_id = f"activity-degraded-team-{number}"
+            answered_ids = {"agent-1"} if answered else set()
+            failures = [
+                {
+                    "id": one["id"], "name": one["name"], "route": one["who"],
+                    "provider_reason": "temporary provider failure",
+                }
+                for one in participants if one["id"] not in answered_ids
+            ]
+            result = {
+                "said": [],
+                "participant_outcome": collaboration_outcomes.build(
+                    participants,
+                    answered_agent_ids=answered_ids,
+                    failures=failures,
+                    requested_mode="collaborate",
+                ),
+            }
+            self.assertEqual(result["participant_outcome"]["outcome"], outcome)
+            with mock.patch.object(swarm_work, "collaborate", return_value=result):
+                status, _said = self.ask("/api/swarm/say", {
+                    "agent": "agent-1", "chat": conversation["id"],
+                    "text": "ask the full team", "mode": "collaborate",
+                    "activity": activity_id,
+                    "request_id": f"request-degraded-team-{number}",
+                })
+            self.assertEqual(status, 200)
+            _activity_status, activity = self.ask(
+                f"/api/swarm/activity?activity={activity_id}"
+            )
+            self.assertEqual(activity["state"], "complete")
+            self.assertEqual(activity["stage"], stage)
+            self.assertIn(detail, activity["detail"])
+
     def test_failed_chat_turn_is_saved_as_a_visible_nexus_outcome(self) -> None:
         self.ask("/api/swarm/save", {"board": {"agents": [
             {"name": "The reviewer", "who": "claude"},
@@ -3670,7 +4204,9 @@ class WhatThePanelIsTold(BoardTestCase):
             with swarm_runs.provider_effect(
                 config, route, filed_as or route, "ambiguous-delivery-digest",
             ):
-                raise chat.ChatError("provider acknowledgement was lost")
+                raise swarm_runs.ProviderOutcomeUnknown(
+                    "provider acknowledgement was lost"
+                )
 
         with mock.patch.object(chat, "say", side_effect=ambiguous_delivery) as talked:
             status, failed = self.ask("/api/swarm/say", {
@@ -3705,8 +4241,8 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertIn("already working", refused["error"])
         self.assertIn("left running", refused["error"])
         talked.assert_not_called()
-        rejected = self.panel.swarm_runs.get("request-cross-process-busy-123")
-        self.assertEqual(rejected["status"], "failed")
+        with self.assertRaisesRegex(RuntimeError, "does not exist"):
+            self.panel.swarm_runs.get("request-cross-process-busy-123")
         self.assertEqual(chat.read_it(
             self.panel.config, "claude", "The reviewer"
         ), [])
@@ -3887,7 +4423,9 @@ class WhatThePanelIsTold(BoardTestCase):
             ))
 
         standing = {"board": {"agents": [], "projects": [], "works_on": [], "talks_to": []}}
-        with mock.patch.object(self.panel, "swarm_standing", return_value=standing), \
+        with mock.patch.object(
+                self.panel, "refresh_swarm_provider_status", return_value=True), \
+                mock.patch.object(self.panel, "swarm_standing", return_value=standing), \
                 mock.patch.object(self.panel.swarm_runner, "start", side_effect=slow_start):
             thread = threading.Thread(target=start_board)
             thread.start()
@@ -3965,6 +4503,1022 @@ class WhatThePanelIsTold(BoardTestCase):
             "/api/swarm/activity?activity=activity-first-123"
         )
         self.assertEqual(activity["state"], "stopped")
+
+    def test_same_agent_pair_chats_run_in_parallel_and_stop_by_exact_identity(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        lead_id, peer_id = [one["id"] for one in saved["board"]["agents"]]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        status, listed = self.ask(f"/api/swarm/chats?agent={lead_id}")
+        self.assertEqual(status, 200, listed)
+        first = next(one for one in listed["chats"] if one["pair"] == [lead_id, peer_id])
+        status, made = self.ask("/api/swarm/chats/create", {
+            "agent": lead_id, "peer": peer_id,
+        })
+        self.assertEqual(status, 200, made)
+        second = next(one for one in made["chats"] if one["id"] == made["active"])
+        self.assertNotEqual(first["id"], second["id"])
+        status, activated = self.ask("/api/swarm/chats/activate", {
+            "agent": lead_id, "chat": first["id"],
+        })
+        self.assertEqual(status, 200, activated)
+
+        conversations = {
+            first["filed_as"]: first,
+            second["filed_as"]: second,
+        }
+        entered = {one["id"]: threading.Event() for one in conversations.values()}
+        release = {one["id"]: threading.Event() for one in conversations.values()}
+        for signal in release.values():
+            self.addCleanup(signal.set)
+        activities = {
+            first["id"]: "activity-same-agent-first-123",
+            second["id"]: "activity-same-agent-second-123",
+        }
+        requests = {
+            first["id"]: "request-same-agent-first-123",
+            second["id"]: "request-same-agent-second-123",
+        }
+        results: dict[str, tuple[int, dict]] = {}
+
+        def slow_answer(_config, _route, _text, filed_as="", **_kwargs):
+            conversation = conversations[str(filed_as)]
+            chat_id = conversation["id"]
+            entered[chat_id].set()
+            while not release[chat_id].wait(0.01):
+                cancellation.checkpoint()
+            cancellation.checkpoint()
+            return {"said": [{
+                "who": "them", "text": f"answer for {conversation['name']}", "at": "",
+            }]}
+
+        def send(conversation: dict) -> None:
+            chat_id = conversation["id"]
+            results[chat_id] = self.ask("/api/swarm/say", {
+                "agent": lead_id, "chat": chat_id,
+                "text": f"question for {conversation['name']}", "mode": "chat",
+                "activity": activities[chat_id], "request_id": requests[chat_id],
+            })
+
+        with mock.patch.object(chat, "say", side_effect=slow_answer) as talked:
+            first_thread = threading.Thread(target=send, args=(first,))
+            first_thread.start()
+            self.assertTrue(
+                entered[first["id"]].wait(5),
+                f"first chat did not reach its provider: {results.get(first['id'])}",
+            )
+
+            # Selecting another saved chat is navigation. It remains available
+            # while the first provider call owns only its exact conversation.
+            status, switched = self.ask("/api/swarm/chats/activate", {
+                "agent": lead_id, "chat": second["id"],
+            })
+            self.assertEqual(status, 200, switched)
+            self.assertEqual(switched["active"], second["id"])
+
+            second_thread = threading.Thread(target=send, args=(second,))
+            second_thread.start()
+            self.assertTrue(entered[second["id"]].wait(5), "second chat was serialized behind the first")
+
+            _first_store, first_run = self.panel.find_swarm_run(requests[first["id"]])
+            mismatch_status, mismatch = self.ask("/api/swarm/stop-chat", {
+                "agent": lead_id, "chat": second["id"],
+                "activity": activities[first["id"]], "run_id": first_run["run_id"],
+            })
+            self.assertEqual(mismatch_status, 400, mismatch)
+            self.assertIn("belongs to a different chat", mismatch["error"])
+            self.assertTrue(first_thread.is_alive(), "mismatched chat identity stopped the first run")
+            self.assertTrue(second_thread.is_alive(), "mismatched run identity stopped the sibling")
+
+            stop_status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": lead_id, "chat": first["id"],
+                "activity": activities[first["id"]], "run_id": first_run["run_id"],
+            })
+            self.assertEqual(stop_status, 200, stopped)
+            self.assertTrue(stopped["stopped"], stopped)
+            first_thread.join(5)
+            self.assertFalse(first_thread.is_alive(), "exactly stopped chat did not finish")
+            self.assertTrue(second_thread.is_alive(), "stopping one saved chat stopped its sibling")
+
+            release[second["id"]].set()
+            second_thread.join(5)
+
+        self.assertFalse(second_thread.is_alive(), "sibling chat did not finish")
+        self.assertEqual(talked.call_count, 2)
+        self.assertEqual(
+            {str(call.kwargs.get("filed_as") or "") for call in talked.call_args_list},
+            {first["filed_as"], second["filed_as"]},
+        )
+        self.assertEqual(results[first["id"]][0], 400)
+        self.assertEqual(results[first["id"]][1]["error"], "Stopped by you.")
+        self.assertEqual(results[second["id"]][0], 200)
+        _first_store, first_finished = self.panel.find_swarm_run(requests[first["id"]])
+        _second_store, second_finished = self.panel.find_swarm_run(requests[second["id"]])
+        self.assertEqual(first_finished["status"], "stopped")
+        self.assertEqual(second_finished["status"], "complete")
+
+    def test_durable_stop_from_another_store_cancels_the_exact_chat_owner(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "The lead", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        entered = threading.Event()
+        result: list[tuple[int, dict]] = []
+
+        def slow_answer(*_args, **_kwargs):
+            entered.set()
+            while True:
+                cancellation.checkpoint()
+                time.sleep(0.01)
+
+        def send() -> None:
+            result.append(self.ask("/api/swarm/say", {
+                "agent": agent_id, "text": "wait for external stop", "mode": "chat",
+                "activity": "activity-external-stop-123",
+                "request_id": "request-external-stop-123",
+            }))
+
+        with mock.patch.object(chat, "say", side_effect=slow_answer):
+            thread = threading.Thread(target=send)
+            thread.start()
+            self.assertTrue(entered.wait(5), f"chat did not reach its provider: {result}")
+            external = swarm_runs.SwarmRunStore(self.panel.config)
+            running = external.get("request-external-stop-123")
+            external.request_stop(running["run_id"])
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive(), "durable Stop did not reach the owner process")
+        self.assertEqual(result[0][0], 400, result[0][1])
+        self.assertEqual(result[0][1]["error"], "Stopped by you.")
+        self.assertEqual(
+            external.get("request-external-stop-123")["status"], "stopped",
+        )
+
+    def test_stop_before_direct_chat_commit_saves_no_late_provider_answer(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "Race lead", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        before_mutation = threading.Event()
+        release_mutation = threading.Event()
+        self.addCleanup(release_mutation.set)
+        result: list[tuple[int, dict]] = []
+        real_boundary = swarm_runs.post_provider_mutation
+
+        class Back:
+            text = "answer at the transcript boundary"
+
+        class Provider:
+            def complete(self, _request):
+                return Back()
+
+        @contextlib.contextmanager
+        def delayed_boundary():
+            before_mutation.set()
+            self.assertTrue(release_mutation.wait(5))
+            with real_boundary():
+                yield
+
+        def send() -> None:
+            result.append(self.ask("/api/swarm/say", {
+                "agent": agent_id,
+                "text": "question at the stop boundary",
+                "mode": "chat",
+                "activity": "activity-post-provider-stop-race",
+                "request_id": "request-post-provider-stop-race",
+            }))
+
+        with mock.patch.object(
+            chat.ProviderRegistry, "provider_config", return_value=self.panel.config,
+        ), mock.patch.object(
+            chat, "create_provider", return_value=Provider(),
+        ), mock.patch.object(
+            swarm_runs, "post_provider_mutation", side_effect=delayed_boundary,
+        ):
+            worker = threading.Thread(target=send)
+            worker.start()
+            self.assertTrue(before_mutation.wait(5), result)
+            _store, running = self.panel.find_swarm_run(
+                "request-post-provider-stop-race"
+            )
+            stop_status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": agent_id,
+                "activity": "activity-post-provider-stop-race",
+                "run_id": running["run_id"],
+            })
+            self.assertEqual(stop_status, 200, stopped)
+            self.assertTrue(stopped["stopped"], stopped)
+            release_mutation.set()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result[0][0], 400, result[0][1])
+        self.assertEqual(result[0][1]["error"], "Stopped by you.")
+        _store, finished = self.panel.find_swarm_run(
+            "request-post-provider-stop-race"
+        )
+        self.assertEqual(finished["status"], "stopped")
+        words = [
+            turn.text for turn in chat.read_it(
+                self.panel.config, "claude", "Race lead"
+            )
+        ]
+        self.assertNotIn("answer at the transcript boundary", words)
+
+    def test_stop_chat_does_not_cancel_residual_token_for_complete_run(self) -> None:
+        store = self.panel.swarm_runs
+        accepted, _created = store.accept(
+            "request-terminal-complete-123", {"chat_key": "agent-complete-123"},
+        )
+        run_id = store.start(accepted["run_id"])["run_id"]
+        store.finish(run_id, {"ok": True})
+        token = self.panel.chat_cancellations.begin("agent-complete-123", run_id)
+        try:
+            status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": "agent-complete-123", "run_id": run_id,
+            })
+        finally:
+            self.panel.chat_cancellations.finish("agent-complete-123", token)
+        self.assertEqual(status, 200, stopped)
+        self.assertFalse(stopped["stopped"], stopped)
+        self.assertFalse(token.cancelled)
+        self.assertEqual(store.get(run_id)["status"], "complete")
+
+    def test_stop_endpoint_prefers_exact_run_id_across_durable_journals(self) -> None:
+        execution = self.panel.swarm_runs
+        exact, _created = execution.accept(
+            "request-cross-journal-exact-123", {"chat_key": "chat-collision-123"},
+        )
+        exact_run_id = execution.start(exact["run_id"])["run_id"]
+        execution.finish(exact_run_id, {"ok": True})
+
+        communication = self.panel.swarm_communication_runs
+        alias, alias_created = communication.accept(
+            exact_run_id, {"chat_key": "chat-collision-123"},
+        )
+        self.assertTrue(alias_created)
+        alias_run_id = communication.start(alias["run_id"])["run_id"]
+
+        status, stopped = self.ask("/api/swarm/stop-chat", {
+            "agent": "agent-collision-123", "chat": "chat-collision-123",
+            "run_id": exact_run_id,
+        })
+
+        self.assertEqual(status, 200, stopped)
+        self.assertFalse(stopped["stopped"], stopped)
+        self.assertEqual(stopped["run_id"], exact_run_id)
+        self.assertEqual(execution.get(exact_run_id)["status"], "complete")
+        self.assertEqual(communication.get(alias_run_id)["status"], "running")
+
+    def test_execution_journal_failure_rejects_communication_alias_but_keeps_exact_run(self) -> None:
+        communication = self.panel.swarm_communication_runs
+        alias_request_id = "request-unavailable-execution-alias-123"
+        alias, _created = communication.accept(
+            alias_request_id, {"chat_key": "chat-unavailable-alias-123"},
+        )
+        alias_run_id = communication.start(alias["run_id"])["run_id"]
+        exact, _created = communication.accept(
+            "request-unavailable-execution-exact-123",
+            {"chat_key": "chat-unavailable-exact-123"},
+        )
+        exact_run_id = communication.start(exact["run_id"])["run_id"]
+        self.panel._swarm_runs = None
+
+        unavailable = mock.PropertyMock(
+            side_effect=server.HarnessError("execution journal unavailable"),
+        )
+        with mock.patch.object(type(self.panel), "swarm_runs", new=unavailable):
+            alias_status, refused = self.ask("/api/swarm/stop-chat", {
+                "agent": "agent-unavailable-alias-123",
+                "chat": "chat-unavailable-alias-123",
+                "run_id": alias_request_id,
+            })
+            exact_status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": "agent-unavailable-exact-123",
+                "chat": "chat-unavailable-exact-123",
+                "run_id": exact_run_id,
+            })
+
+        self.assertEqual(alias_status, 400, refused)
+        self.assertIn("execution journal unavailable", refused["error"])
+        self.assertEqual(communication.get(alias_run_id)["status"], "running")
+        self.assertEqual(exact_status, 200, stopped)
+        self.assertTrue(stopped["stopped"], stopped)
+        self.assertEqual(stopped["run_id"], exact_run_id)
+        self.assertEqual(communication.get(exact_run_id)["status"], "stopping")
+
+    def test_stale_stopped_run_does_not_cancel_newer_same_chat_token(self) -> None:
+        store = self.panel.swarm_runs
+        accepted, _created = store.accept(
+            "request-old-stopped-123", {"chat_key": "chat-reused-123"},
+        )
+        old_run = store.start(accepted["run_id"])["run_id"]
+        store.request_stop(old_run)
+        store.fail(old_run, "Stopped by you.", stopped=True)
+        newer = self.panel.chat_cancellations.begin("chat-reused-123", "new-run-123")
+        try:
+            status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": "agent-reused-123", "chat": "chat-reused-123",
+                "run_id": old_run,
+            })
+        finally:
+            self.panel.chat_cancellations.finish("chat-reused-123", newer)
+        self.assertEqual(status, 200, stopped)
+        self.assertTrue(stopped["stopped"], stopped)
+        self.assertFalse(newer.cancelled)
+        self.assertEqual(stopped["activity"], "")
+
+    def test_stop_chat_accepts_owner_terminalizing_during_stop_projection(self) -> None:
+        store = self.panel.swarm_runs
+        accepted, _created = store.accept(
+            "request-terminal-stopped-race-123", {"chat_key": "agent-stopped-123"},
+        )
+        run_id = store.start(accepted["run_id"])["run_id"]
+        real_request_stop = store.request_stop
+
+        def owner_finishes(identity: str) -> dict:
+            real_request_stop(identity)
+            store.fail(run_id, "Stopped by you.", stopped=True)
+            return store.get(run_id)
+
+        with mock.patch.object(store, "request_stop", side_effect=owner_finishes), \
+                mock.patch.object(
+                    self.panel.chat_cancellations, "stop", return_value=(False, ""),
+                ):
+            status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": "agent-stopped-123", "run_id": run_id,
+            })
+        self.assertEqual(status, 200, stopped)
+        self.assertTrue(stopped["stopped"], stopped)
+        self.assertIn("already stopped", stopped["note"])
+        self.assertEqual(store.get(run_id)["status"], "stopped")
+
+    def test_stop_between_accept_and_start_is_terminal_stopped(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "Admission race", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        store = self.panel.swarm_runs
+        real_start = store.start
+
+        def stopped_start(run_id: str) -> dict:
+            store.request_stop(run_id)
+            return real_start(run_id)
+
+        with mock.patch.object(store, "start", side_effect=stopped_start), \
+                mock.patch.object(chat, "say") as talked:
+            send_status, refused = self.ask("/api/swarm/say", {
+                "agent": agent_id, "text": "never dispatch this", "mode": "chat",
+                "activity": "activity-admission-stop-race-123",
+                "request_id": "request-admission-stop-race-123",
+            })
+        self.assertEqual(send_status, 400, refused)
+        self.assertEqual(refused["error"], "Stopped by you.")
+        talked.assert_not_called()
+        self.assertEqual(
+            store.get("request-admission-stop-race-123")["status"], "stopped",
+        )
+
+    def test_stop_during_resumable_finalization_is_terminal_stopped(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "Resumable race", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        store = self.panel.swarm_runs
+        real_checkpoint = store.checkpoint
+        real_request_stop = store.request_stop
+        stop_injected = threading.Event()
+        paused = swarm_work.ResumableSwarmError("paused for recovery", {
+            "status": "paused_provider", "said": [], "changed": [],
+            "resume_token": "resume-finalization-race-123",
+        })
+
+        def stop_before_paused_checkpoint(
+            run_id: str, kind: str, payload: object,
+        ) -> int:
+            if kind == "paused":
+                real_request_stop(run_id)
+                stop_injected.set()
+            return real_checkpoint(run_id, kind, payload)
+
+        with mock.patch.object(chat, "say", side_effect=paused), mock.patch.object(
+            store, "checkpoint", side_effect=stop_before_paused_checkpoint,
+        ):
+            send_status, refused = self.ask("/api/swarm/say", {
+                "agent": agent_id, "text": "pause exactly while Stop wins",
+                "mode": "chat", "activity": "activity-resumable-stop-race-123",
+                "request_id": "request-resumable-stop-race-123",
+            })
+
+        self.assertTrue(stop_injected.is_set())
+        self.assertEqual(send_status, 400, refused)
+        self.assertEqual(refused["error"], "Stopped by you.")
+        self.assertEqual(
+            store.get("request-resumable-stop-race-123")["status"], "stopped",
+        )
+
+    def test_stop_watcher_fails_closed_when_durable_polling_breaks(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "Watcher race", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        entered = threading.Event()
+        store = self.panel.swarm_runs
+        real_should_stop = store.should_stop
+
+        def unreliable_poll(run_id: str) -> bool:
+            if entered.is_set():
+                raise RuntimeError("simulated durable stop storage failure")
+            return real_should_stop(run_id)
+
+        def slow_answer(*_args, **_kwargs):
+            entered.set()
+            while True:
+                cancellation.checkpoint()
+                time.sleep(0.01)
+
+        with mock.patch.object(store, "should_stop", side_effect=unreliable_poll), \
+                mock.patch.object(chat, "say", side_effect=slow_answer):
+            send_status, refused = self.ask("/api/swarm/say", {
+                "agent": agent_id, "text": "fail closed", "mode": "chat",
+                "activity": "activity-watcher-failure-123",
+                "request_id": "request-watcher-failure-123",
+            })
+        self.assertEqual(send_status, 400, refused)
+        self.assertEqual(refused["error"], "Stopped by you.")
+        self.assertEqual(
+            store.get("request-watcher-failure-123")["status"], "stopped",
+        )
+
+    def test_stop_watcher_failure_after_provider_return_blocks_transcript_commit(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "Late watcher race", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        provider_returned = threading.Event()
+        watcher_failed = threading.Event()
+        stop_persisted = threading.Event()
+        store = self.panel.swarm_runs
+        real_should_stop = store.should_stop
+        real_request_stop = store.request_stop
+        real_boundary = swarm_runs.post_provider_mutation
+
+        class Back:
+            text = "answer after the watcher lost durable state"
+
+        class Provider:
+            def complete(self, _request):
+                provider_returned.set()
+                return Back()
+
+        def unreliable_watcher_poll(run_id: str) -> bool:
+            if (
+                provider_returned.is_set()
+                and threading.current_thread().name.startswith("nexus-chat-stop-")
+            ):
+                watcher_failed.set()
+                raise RuntimeError("simulated late durable stop storage failure")
+            return real_should_stop(run_id)
+
+        def record_fail_closed_stop(run_id: str) -> dict:
+            stopped = real_request_stop(run_id)
+            stop_persisted.set()
+            return stopped
+
+        @contextlib.contextmanager
+        def wait_for_failed_watcher():
+            self.assertTrue(
+                stop_persisted.wait(5),
+                "the failed durable watcher did not persist its fail-closed Stop",
+            )
+            with real_boundary():
+                yield
+
+        with mock.patch.object(
+            chat.ProviderRegistry, "provider_config", return_value=self.panel.config,
+        ), mock.patch.object(
+            chat, "create_provider", return_value=Provider(),
+        ), mock.patch.object(
+            store, "should_stop", side_effect=unreliable_watcher_poll,
+        ), mock.patch.object(
+            store, "request_stop", side_effect=record_fail_closed_stop,
+        ), mock.patch.object(
+            swarm_runs, "post_provider_mutation", side_effect=wait_for_failed_watcher,
+        ):
+            send_status, refused = self.ask("/api/swarm/say", {
+                "agent": agent_id, "text": "fail closed after the provider returns",
+                "mode": "chat", "activity": "activity-late-watcher-failure-123",
+                "request_id": "request-late-watcher-failure-123",
+            })
+
+        self.assertTrue(provider_returned.is_set())
+        self.assertTrue(watcher_failed.is_set())
+        self.assertTrue(stop_persisted.is_set())
+        self.assertEqual(send_status, 400, refused)
+        self.assertEqual(refused["error"], "Stopped by you.")
+        self.assertEqual(
+            store.get("request-late-watcher-failure-123")["status"], "stopped",
+        )
+        words = [
+            turn.text for turn in chat.read_it(
+                self.panel.config, "claude", "Late watcher race",
+            )
+        ]
+        self.assertNotIn("answer after the watcher lost durable state", words)
+
+    def test_fresh_process_accepts_durable_stop_without_a_local_cancel_token(self) -> None:
+        external = swarm_runs.SwarmRunStore(self.panel.config)
+        running, created = external.accept(
+            "request-remote-project-chat-stop-123",
+            {"chat_key": "chat-remote-project-123"},
+        )
+        self.assertTrue(created)
+        external.start(running["run_id"])
+        # Model a second server process: it has neither the owner's in-memory
+        # cancellation token nor an already-open execution journal.
+        self.panel._swarm_runs = None
+        with mock.patch.object(
+            self.panel.chat_cancellations, "stop", return_value=(False, ""),
+        ):
+            status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": "agent-remote-123",
+                "chat": "chat-remote-project-123",
+                "activity": "activity-remote-project-stop-123",
+                "run_id": running["run_id"],
+            })
+        self.assertEqual(status, 200, stopped)
+        self.assertTrue(stopped["stopped"], stopped)
+        self.assertEqual(
+            external.get(running["run_id"])["status"], "stopping",
+        )
+
+    def test_stop_resolves_an_ordinary_chat_in_the_communication_journal(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "The lead", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        entered = threading.Event()
+        result: list[tuple[int, dict]] = []
+
+        def slow_answer(*_args, **_kwargs):
+            entered.set()
+            while True:
+                cancellation.checkpoint()
+                time.sleep(0.01)
+
+        def send() -> None:
+            result.append(self.ask("/api/swarm/say", {
+                "agent": agent_id, "text": "ordinary chat while authority is paused",
+                "mode": "chat", "activity": "activity-communication-stop-123",
+                "request_id": "request-communication-stop-123",
+            }))
+
+        paused = {"can_run": False, "reason": "test authority pause"}
+        with mock.patch.object(self.panel, "project_authority_status", return_value=paused), \
+                mock.patch.object(chat, "say", side_effect=slow_answer):
+            thread = threading.Thread(target=send)
+            thread.start()
+            self.assertTrue(entered.wait(5), f"chat did not reach its provider: {result}")
+            communication_run = self.panel.swarm_communication_runs.get(
+                "request-communication-stop-123"
+            )
+            self.assertEqual(communication_run["status"], "running")
+            stop_status, stopped = self.ask("/api/swarm/stop-chat", {
+                "agent": agent_id, "activity": "activity-communication-stop-123",
+                "run_id": communication_run["run_id"],
+            })
+            self.assertEqual(stop_status, 200, stopped)
+            self.assertTrue(stopped["stopped"], stopped)
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result[0][0], 400, result[0][1])
+        self.assertEqual(result[0][1]["error"], "Stopped by you.")
+        self.assertEqual(
+            self.panel.swarm_communication_runs.get(
+                "request-communication-stop-123"
+            )["status"],
+            "stopped",
+        )
+
+    def test_same_profile_chats_queue_at_configured_capacity_without_colliding(self) -> None:
+        self.panel.config.data["providers"] = {
+            "limited": {
+                "kind": "claude-cli", "model": "",
+                "max_concurrency": 1,
+            },
+        }
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "limited"},
+                {"name": "The peer", "who": "limited"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        lead_id, peer_id = [one["id"] for one in saved["board"]["agents"]]
+        self.panel.swarm_known_routes = [
+            {"route": "limited", "label": "Limited", "ready": True},
+        ]
+        status, listed = self.ask(f"/api/swarm/chats?agent={lead_id}")
+        self.assertEqual(status, 200, listed)
+        first = next(one for one in listed["chats"] if one["pair"] == [lead_id, peer_id])
+        status, made = self.ask("/api/swarm/chats/create", {
+            "agent": lead_id, "peer": peer_id,
+        })
+        self.assertEqual(status, 200, made)
+        second = next(one for one in made["chats"] if one["id"] == made["active"])
+        by_conversation = {
+            first["filed_as"]: first["id"], second["filed_as"]: second["id"],
+        }
+        entered = {first["id"]: threading.Event(), second["id"]: threading.Event()}
+        release = {first["id"]: threading.Event(), second["id"]: threading.Event()}
+        for signal in release.values():
+            self.addCleanup(signal.set)
+        results: dict[str, tuple[int, dict]] = {}
+
+        class Back:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+        class LimitedProvider:
+            def complete(self, request):
+                chat_id = by_conversation[str(request.conversation_key)]
+                entered[chat_id].set()
+                while not release[chat_id].wait(0.01):
+                    cancellation.checkpoint()
+                cancellation.checkpoint()
+                return Back(f"answer for {chat_id}")
+
+        def send(conversation: dict, request_id: str) -> None:
+            results[conversation["id"]] = self.ask("/api/swarm/say", {
+                "agent": lead_id, "chat": conversation["id"],
+                "text": f"question for {conversation['id']}", "mode": "chat",
+                "activity": request_id, "request_id": request_id,
+            })
+
+        provider = LimitedProvider()
+        with mock.patch.object(chat, "create_provider", return_value=provider):
+            first_thread = threading.Thread(
+                target=send, args=(first, "capacity-http-first-123"),
+            )
+            second_thread = threading.Thread(
+                target=send, args=(second, "capacity-http-second-123"),
+            )
+            first_thread.start()
+            self.assertTrue(entered[first["id"]].wait(5))
+            second_thread.start()
+            limit = time.time() + 5
+            while time.time() < limit:
+                try:
+                    if self.panel.find_swarm_run(
+                        "capacity-http-second-123"
+                    )[1]["status"] == "running":
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.02)
+            self.assertFalse(
+                entered[second["id"]].wait(0.15),
+                "the second provider body ignored max_concurrency=1",
+            )
+            self.assertTrue(second_thread.is_alive(), "the queued chat was rejected")
+            release[first["id"]].set()
+            self.assertTrue(entered[second["id"]].wait(5))
+            release[second["id"]].set()
+            first_thread.join(5)
+            second_thread.join(5)
+
+        self.assertEqual(results[first["id"]][0], 200, results[first["id"]][1])
+        self.assertEqual(results[second["id"]][0], 200, results[second["id"]][1])
+        for conversation in (first, second):
+            read_status, transcript = self.ask(
+                f"/api/swarm/said?agent={lead_id}&chat={conversation['id']}"
+            )
+            self.assertEqual(read_status, 200, transcript)
+            words = [one["text"] for one in transcript["said"]]
+            self.assertIn(f"answer for {conversation['id']}", words)
+            other = second if conversation is first else first
+            self.assertNotIn(f"answer for {other['id']}", words)
+
+    def test_lifecycle_mutations_are_excluded_only_for_the_running_pair_chat(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [{"name": "Shared", "path": str(self.where)}],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        lead_id, peer_id = [one["id"] for one in saved["board"]["agents"]]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        status, listed = self.ask(f"/api/swarm/chats?agent={lead_id}")
+        self.assertEqual(status, 200, listed)
+        running_chat = listed["chats"][0]
+        status, made = self.ask("/api/swarm/chats/create", {
+            "agent": lead_id, "peer": peer_id,
+        })
+        self.assertEqual(status, 200, made)
+        sibling_chat = next(one for one in made["chats"] if one["id"] == made["active"])
+
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        result: list[tuple[int, dict]] = []
+
+        def slow_answer(*_args, **_kwargs):
+            entered.set()
+            while not release.wait(0.01):
+                cancellation.checkpoint()
+            return {"said": []}
+
+        def send() -> None:
+            result.append(self.ask("/api/swarm/say", {
+                "agent": lead_id, "chat": running_chat["id"],
+                "text": "keep this exact chat busy", "mode": "chat",
+                "activity": "activity-lifecycle-running-123",
+                "request_id": "request-lifecycle-running-123",
+            }))
+
+        with mock.patch.object(chat, "say", side_effect=slow_answer):
+            thread = threading.Thread(target=send)
+            thread.start()
+            self.assertTrue(
+                entered.wait(5), f"running chat did not reach its provider: {result}",
+            )
+
+            running_mutations = [
+                ("/api/swarm/chats/project", {
+                    "agent": lead_id, "chat": running_chat["id"], "project": "project-1",
+                }),
+                ("/api/swarm/chats/delete", {
+                    "agent": lead_id, "chat": running_chat["id"],
+                }),
+                ("/api/swarm/start-again", {
+                    "agent": lead_id, "chat": running_chat["id"],
+                }),
+            ]
+            for endpoint, body in running_mutations:
+                mutation_status, refused = self.ask(endpoint, body)
+                self.assertEqual(mutation_status, 400, (endpoint, refused))
+                self.assertIn("already working", refused["error"], endpoint)
+
+            sibling_status, sibling_project = self.ask("/api/swarm/chats/project", {
+                "agent": lead_id, "chat": sibling_chat["id"], "project": "project-1",
+            })
+            self.assertEqual(sibling_status, 200, sibling_project)
+            selected = next(
+                one for one in sibling_project["chats"] if one["id"] == sibling_chat["id"]
+            )
+            self.assertEqual(selected["project"], "project-1")
+
+            reset_status, reset = self.ask("/api/swarm/start-again", {
+                "agent": lead_id, "chat": sibling_chat["id"],
+            })
+            self.assertEqual(reset_status, 200, reset)
+            archive_status, archived = self.ask("/api/swarm/chats/delete", {
+                "agent": lead_id, "chat": sibling_chat["id"],
+            })
+            self.assertEqual(archive_status, 200, archived)
+            sibling = next(
+                one for one in archived["chats"] if one["id"] == sibling_chat["id"]
+            )
+            self.assertTrue(sibling["archived_at"])
+
+            release.set()
+            thread.join(5)
+
+        self.assertFalse(thread.is_alive(), "running chat did not finish")
+        self.assertEqual(result[0][0], 200, result[0][1])
+
+    def test_untrusted_collaboration_record_can_be_reset_without_losing_chat(self) -> None:
+        from our_harness import collaboration_ledger
+
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        listed_status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        self.assertEqual(listed_status, 200, listed)
+        conversation = listed["chats"][0]
+        filed_as = conversation["filed_as"]
+        chat.keep_exchange(
+            self.panel.config, "claude", "Keep this question",
+            "Keep this answer", filed_as=filed_as,
+        )
+        ledger = collaboration_ledger.CollaborationLedger(
+            self.panel.config, "claude", filed_as,
+            session_id="legacy-collaboration-session",
+        ).begin("Ask both agents", [
+            {"id": "agent-1", "name": "The lead", "who": "claude"},
+            {"id": "agent-2", "name": "The peer", "who": "codex"},
+        ], mode="goal_collaboration")
+        events = [
+            json.loads(line)
+            for line in ledger.paths.jsonl.read_text(encoding="utf-8").splitlines()
+        ]
+        for event in events:
+            event.pop("previous_mac", None)
+            event.pop("integrity_mac", None)
+        ledger.paths.jsonl.write_text(
+            "".join(
+                collaboration_ledger._canonical(event) + "\n"
+                for event in events
+            ),
+            encoding="utf-8",
+        )
+        collaboration_ledger._ledger_anchor_path(ledger.paths.jsonl).unlink()
+
+        problem_status, with_problem = self.ask(
+            "/api/swarm/chats?agent=agent-1"
+        )
+        self.assertEqual(problem_status, 200, with_problem)
+        protected = next(
+            one for one in with_problem["chats"]
+            if one["id"] == conversation["id"]
+        )
+        self.assertEqual(
+            protected["collaboration_problem"]["action"],
+            "reset_collaboration_record",
+        )
+
+        reset_status, reset = self.ask("/api/swarm/collaboration/reset", {
+            "agent": "agent-1", "chat": conversation["id"],
+        })
+
+        self.assertEqual(reset_status, 200, reset)
+        self.assertTrue(reset["collaboration_reset"]["transcript_preserved"])
+        self.assertFalse(reset["collaboration_reset"]["automatic_resend"])
+        self.assertFalse(ledger.paths.jsonl.exists())
+        after = next(
+            one for one in reset["chats"] if one["id"] == conversation["id"]
+        )
+        self.assertIsNone(after["collaboration_problem"])
+        transcript_status, transcript = self.ask(
+            f"/api/swarm/said?agent=agent-1&chat={conversation['id']}"
+        )
+        self.assertEqual(transcript_status, 200, transcript)
+        self.assertEqual(
+            [one["text"] for one in transcript["said"]],
+            ["Keep this question", "Keep this answer"],
+        )
+
+        repeat_status, repeat = self.ask("/api/swarm/collaboration/reset", {
+            "agent": "agent-1", "chat": conversation["id"],
+        })
+        self.assertEqual(repeat_status, 400, repeat)
+        self.assertIn("passes its integrity checks", repeat["error"])
+
+    def test_saved_web_chat_start_again_rotates_the_next_provider_dispatch(self) -> None:
+        web_route = "web:chatgpt-portable-reset-17"
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The CLI lead", "who": "claude"},
+                {"name": "The web peer", "who": web_route},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        heartbeat_status, heartbeat = self.ask("/api/web-chats/heartbeat", {
+            "connections": [{
+                "id": "chatgpt-portable-reset-17", "provider": "chatgpt",
+                "title": "Portable reset helper",
+                "url": "https://chatgpt.com/c/portable-reset-17",
+            }],
+        })
+        self.assertEqual(heartbeat_status, 200, heartbeat)
+
+        listed_status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        self.assertEqual(listed_status, 200, listed)
+        original = listed["chats"][0]
+        chat.keep_exchange(
+            self.panel.config, "claude", "before reset", "old provider answer",
+            filed_as=original["filed_as"],
+        )
+
+        local_standing = self.panel.swarm_standing
+        with mock.patch.object(
+            self.panel, "swarm_standing",
+            side_effect=lambda *_args, **_kwargs: local_standing(),
+        ):
+            reset_status, reset = self.ask("/api/swarm/start-again", {
+                "agent": "agent-1", "chat": original["id"],
+            })
+
+        self.assertEqual(reset_status, 200, reset)
+        restarted = reset["conversation"]
+        rotated_key = reset["web_conversation_key"]
+        self.assertEqual(restarted["id"], original["id"])
+        self.assertEqual(restarted["filed_as"], original["filed_as"])
+        self.assertNotEqual(rotated_key, original["web_conversation_key"])
+        self.assertEqual(restarted["web_conversation_key"], rotated_key)
+        self.assertFalse(restarted["web_legacy_candidate"])
+        self.assertEqual(
+            reset["previous_web_conversation_key"],
+            original["web_conversation_key"],
+        )
+        self.assertEqual(reset["web_chat_id"], "chatgpt-portable-reset-17")
+        self.assertEqual(reset["web_chat_resets"], [{
+            "route": web_route,
+            "previous_web_conversation_key": original["web_conversation_key"],
+        }])
+        empty_status, empty = self.ask(
+            f"/api/swarm/said?agent=agent-1&chat={original['id']}"
+        )
+        self.assertEqual(empty_status, 200, empty)
+        self.assertEqual(empty["conversation"]["id"], original["id"])
+        self.assertEqual(empty["said"], [])
+
+        requests = []
+
+        class Back:
+            text = "answer after reset"
+
+        class Provider:
+            def complete(self, request):
+                requests.append(request)
+                return Back()
+
+        with mock.patch.object(
+            self.panel.web_chats, "provider", return_value=Provider(),
+        ):
+            say_status, said = self.ask("/api/swarm/say", {
+                "agent": "agent-2", "chat": original["id"],
+                "text": "use the fresh provider conversation", "mode": "chat",
+                "activity": "activity-web-reset-17",
+                "request_id": "request-web-reset-17",
+            })
+
+        self.assertEqual(say_status, 200, said)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0].conversation_key, rotated_key)
+        self.assertNotEqual(requests[0].conversation_key, original["filed_as"])
+        self.assertFalse(requests[0].prefer_existing_conversation)
+        transcript_status, transcript = self.ask(
+            f"/api/swarm/said?agent=agent-1&chat={original['id']}"
+        )
+        self.assertEqual(transcript_status, 200, transcript)
+        self.assertEqual(transcript["conversation"]["id"], original["id"])
+        self.assertEqual(
+            [one["text"] for one in transcript["said"]],
+            ["use the fresh provider conversation", "answer after reset"],
+        )
 
     def test_saving_a_board_writes_it_down(self) -> None:
         status, said = self.ask("/api/swarm/save", {"board": {
@@ -4136,7 +5690,7 @@ class WhatThePanelIsTold(BoardTestCase):
                 {"name": "The peer", "who": "codex"},
                 {"name": "A third", "who": "gemini"},
             ],
-            "projects": [{"name": "Chosen", "path": str(self.root)}],
+            "projects": [{"name": "Chosen", "path": str(self.where)}],
             "works_on": [
                 {"agent": "agent-1", "project": "project-1"},
                 {"agent": "agent-2", "project": "project-1"},
@@ -4181,7 +5735,7 @@ class WhatThePanelIsTold(BoardTestCase):
                 {"name": "The peer", "who": "codex"},
             ],
             "projects": [{
-                "name": "Chosen", "path": str(self.root),
+                "name": "Chosen", "path": str(self.where),
                 "tasks": ["First exact goal", "Second exact goal"],
             }],
             "works_on": [
@@ -4276,7 +5830,7 @@ class WhatThePanelIsTold(BoardTestCase):
                 {"name": "The lead", "who": "claude"},
                 {"name": "The peer", "who": "codex"},
             ],
-            "projects": [{"name": "Chosen", "path": str(self.root)}],
+            "projects": [{"name": "Chosen", "path": str(self.where)}],
             "works_on": [
                 {"agent": "agent-1", "project": "project-1"},
                 {"agent": "agent-2", "project": "project-1"},
@@ -4420,7 +5974,7 @@ class WhatThePanelIsTold(BoardTestCase):
             talked.call_args.kwargs["conversation_key"], conversation["filed_as"]
         )
 
-    def test_casual_pair_send_allows_the_selected_agents_answer_to_survive_peer_failure(self) -> None:
+    def test_casual_pair_send_contacts_only_the_selected_agent(self) -> None:
         self.ask("/api/swarm/save", {"board": {
             "agents": [
                 {"name": "The lead", "who": "claude"},
@@ -4436,17 +5990,19 @@ class WhatThePanelIsTold(BoardTestCase):
             {"route": "claude", "label": "Claude", "ready": True},
             {"route": "codex", "label": "Codex", "ready": True},
         ]
-        answer = {"said": [{"who": "them", "text": "lead survived", "at": ""}]}
-        with mock.patch.object(
-            swarm_work, "collaborate", return_value=answer
-        ) as confer:
+        answer = {"said": [{"who": "them", "text": "lead answered", "at": ""}]}
+        with (
+            mock.patch.object(chat, "say", return_value=answer) as talked,
+            mock.patch.object(swarm_work, "collaborate") as confer,
+        ):
             status, said = self.ask("/api/swarm/say", {
                 "agent": "agent-1", "chat": conversation["id"],
                 "text": "who is this?", "mode": "auto",
             })
         self.assertEqual(status, 200, said)
-        self.assertTrue(confer.call_args.kwargs["allow_partial_lead_answer"])
-        self.assertEqual(said["routing"]["selected"], "collaborate")
+        talked.assert_called_once()
+        confer.assert_not_called()
+        self.assertEqual(said["routing"]["selected"], "chat")
 
     def test_explicit_solo_chat_contacts_only_the_selected_agent(self) -> None:
         self.ask("/api/swarm/save", {"board": {
@@ -4558,7 +6114,7 @@ class WhatThePanelIsTold(BoardTestCase):
                 {"name": "The lead", "who": "claude"},
                 {"name": "The peer", "who": "codex"},
             ],
-            "projects": [{"name": "Demo", "path": str(self.root)}],
+            "projects": [{"name": "Demo", "path": str(self.where)}],
             "works_on": [
                 {"agent": "agent-1", "project": "project-1"},
                 {"agent": "agent-2", "project": "project-1"},
@@ -4587,6 +6143,7 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(allowed["changed"], ["one.txt"])
         work.assert_called_once()
+        self.assertEqual(work.call_args.args[3], "Create one.txt")
 
     def test_starting_again_clears_only_that_agents_conversation(self) -> None:
         self.ask("/api/swarm/save", {"board": {"agents": [
@@ -4713,11 +6270,12 @@ class WhatThePanelIsTold(BoardTestCase):
             script.index("function setWhatCanBePressedInAChat"):
             script.index("function stoppedChatError")
         ]
-        self.assertIn('card.querySelector(".swarm-chat-box").disabled = !agent;', controls)
+        self.assertIn('box.disabled = !agent || identityChanging;', controls)
         self.assertIn("waiting || !agent || !agent.ready", controls)
-        self.assertNotIn('swarm-chat-box").disabled = !agent || !agent.ready', controls)
+        self.assertNotIn("box.disabled = !agent || !agent.ready", controls)
+        self.assertNotIn("box.disabled = !agent || busy", controls)
 
-    def test_authority_pause_disables_every_provider_action_but_keeps_local_controls(self) -> None:
+    def test_authority_pause_disables_only_project_work_not_conversation(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
             encoding="utf-8")
         compact = script[script.index("function setWhatCanBePressedInAChat"):
@@ -4726,26 +6284,52 @@ class WhatThePanelIsTold(BoardTestCase):
                           script.index("// ---- changing it")]
         recovery = script[script.index("function renderWorkRecoveryButtons"):
                           script.index("function renderWorkRecovery(agentId)")]
-        helper = script[script.index("function swarmProviderPauseMessage"):
+        helper = script[script.index("function swarmProjectWorkPauseMessage"):
                         script.index("function confirmProjectWork")]
-        for class_name in ("swarm-chat-send", "swarm-chat-solo",
-                           "swarm-chat-collaborate", "swarm-chat-work"):
-            self.assertIn(f'setSwarmProviderControl(card.querySelector(".{class_name}")', compact)
-        for control_id in ("theBigChatSend", "theBigChatSolo",
-                           "theBigChatCollaborate", "theBigChatWork"):
-            self.assertIn(f'setSwarmProviderControl($("{control_id}")', enlarged)
-        self.assertIn("setSwarmProviderControl(button", recovery)
-        self.assertIn('button.setAttribute("aria-describedby", "authorityRepairReason")', script)
-        self.assertIn('$("theBigChatAttach").disabled = waiting;', enlarged)
-        self.assertNotIn('setSwarmProviderControl($("theBigChatAttach")', enlarged)
+        for class_name in ("swarm-chat-send", "swarm-chat-collaborate"):
+            self.assertIn(f'card.querySelector(".{class_name}").disabled', compact)
+            self.assertNotIn(f'setSwarmProjectWorkControl(card.querySelector(".{class_name}")', compact)
+        self.assertIn('card.querySelector(".swarm-chat-work")', compact)
+        self.assertIn('setSwarmProjectWorkControl(', compact)
+        self.assertIn('$("theBigChatSend").disabled = waiting', enlarged)
+        self.assertIn('$("theBigChatCollaborate").disabled = waiting || lone', enlarged)
+        for control_id in ("theBigChatSend", "theBigChatCollaborate"):
+            self.assertNotIn(f'setSwarmProjectWorkControl($("{control_id}")', enlarged)
+        self.assertIn('setSwarmProjectWorkControl($("theBigChatWork")', enlarged)
+        self.assertIn("setSwarmProjectWorkControl(button", recovery)
+        self.assertIn('status.id = `swarm-work-status-', script)
+        self.assertIn('"Project work", describedBy', script)
+        self.assertNotIn(
+            'setExecutionControl(button, ordinarilyDisabled, selectedProjectWorkPause(agentId), ordinaryTitle,\n    "Project work")',
+            script,
+        )
+        self.assertIn(
+            '$("theBigChatAttach").disabled = waiting || !chatAgent || !chatAgent.ready;',
+            enlarged,
+        )
+        self.assertNotIn('setSwarmProjectWorkControl($("theBigChatAttach")', enlarged)
         self.assertIn('card.querySelector(".swarm-chat-attach").disabled', compact)
-        self.assertNotIn('setSwarmProviderControl(card.querySelector(".swarm-chat-attach")', compact)
-        self.assertIn('return executionPauseWords("Provider contact", swarmSaid.cannot_run)', helper)
+        self.assertNotIn('setSwarmProjectWorkControl(card.querySelector(".swarm-chat-attach")', compact)
+        self.assertIn('return executionPauseWords("Project work", selectedProjectWorkPause(agentId))', helper)
+        self.assertIn('function projectWorkPauseForMessage(mode, words, agentId = theBigOne)', helper)
         saved_library = script[script.index("function renderTheKeptBoards"):
                                script.index("async function keepThisBoard")]
         self.assertIn('$("swarmKeep").disabled = false', script)
         self.assertIn("drop.disabled = false", saved_library)
         self.assertIn("open.disabled = held", saved_library)
+
+    def test_chat_work_shows_exact_target_and_disables_manual_login_for_isolated_codex(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        repair = script[script.index("function renderAgentRepairPanel"):
+                        script.index("async function loadAgentRepairPlan")]
+        confirmation = script[script.index("function confirmProjectWork"):
+                              script.index("function workResponseWords")]
+        self.assertIn('id === "login"', repair)
+        self.assertNotIn("isolated-ready", repair)
+        self.assertIn("for (const offered of repair.actions", repair)
+        self.assertIn('Exact folder: ${project?.path', confirmation)
+        self.assertIn("every selected connected agent a concrete contribution task", confirmation)
 
     def test_start_controls_are_disabled_and_guarded_by_the_same_authority_reason(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
@@ -4788,7 +6372,7 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertLess(boot.index("await refreshChecks()"),
                         boot.index("restoreAuthorityRepairSuccess()"))
 
-    def test_chat_submission_guards_preserve_drafts_before_permission_or_provider_contact(self) -> None:
+    def test_only_project_work_submission_is_guarded_by_project_authority(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
             encoding="utf-8")
         compact = script[script.index("async function sendWhatIsTypedTo"):
@@ -4798,24 +6382,24 @@ class WhatThePanelIsTold(BoardTestCase):
         resume = script[script.index("async function resumeSwarmWork"):
                         script.index("async function sendWhatIsTypedTo")]
         for body in (compact, enlarged):
-            guard = body.index("const executionPause = swarmProviderPauseMessage()")
+            guard = body.index("const executionPause = projectWorkPauseForMessage")
             self.assertLess(guard, body.index("confirmProjectWork"))
             self.assertLess(guard, body.index('request("/api/swarm/say"'))
             self.assertIn("box.focus()", body[guard:body.index("confirmProjectWork")])
         self.assertLess(
-            enlarged.index("const executionPause = swarmProviderPauseMessage()"),
+            enlarged.index("const executionPause = projectWorkPauseForMessage"),
             enlarged.index('box.value = ""'),
         )
         self.assertLess(
-            compact.index("const executionPause = swarmProviderPauseMessage()"),
+            compact.index("const executionPause = projectWorkPauseForMessage"),
             compact.index('box.value = ""'),
         )
         self.assertLess(
-            resume.index("const executionPause = swarmProviderPauseMessage()"),
+            resume.index("const executionPause = swarmProjectWorkPauseMessage(agentId)"),
             resume.index('request("/api/swarm/say"'),
         )
 
-    def test_legacy_talk_disables_and_guards_only_provider_contact(self) -> None:
+    def test_legacy_talk_remains_available_during_project_authority_pause(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
             encoding="utf-8")
         refresh = script[script.index("async function refreshTalk"):
@@ -4828,19 +6412,15 @@ class WhatThePanelIsTold(BoardTestCase):
                           script.index("async function stopTalking")]
         self.assertIn('talkCannotRun = String(said.cannot_run || "")', refresh)
         self.assertIn("showProjectAuthorityPause(said.authority, talkCannotRun)", refresh)
-        self.assertIn('setExecutionControl($("talkSend")', controls)
-        self.assertIn('setExecutionControl($("talkAskEveryone")', controls)
+        self.assertIn('$("talkSend").disabled = talkBusy || !somebody', controls)
+        self.assertIn('$("talkAskEveryone").disabled = talkBusy', controls)
+        self.assertNotIn("talkCannotRun", controls)
         self.assertIn('$("talkBox").disabled = !somebody', controls)
         self.assertIn('$("talkStartAgain").disabled = talkBusy || !somebody', controls)
-        for body, endpoint in (
-            (send, 'request("/api/chat/say"'),
-            (everyone, 'request("/api/chat/ask-everyone"'),
-        ):
-            guard = body.index('executionPauseWords("Provider contact", talkCannotRun)')
-            self.assertLess(guard, body.index("talkBusy = true"))
-            self.assertLess(guard, body.index(endpoint))
-            self.assertIn("box.focus()", body[guard:body.index("talkBusy = true")])
-            self.assertLess(guard, body.index('box.value = ""'))
+        self.assertNotIn("talkCannotRun", send)
+        self.assertNotIn("talkCannotRun", everyone)
+        self.assertIn('request("/api/chat/say"', send)
+        self.assertIn('request("/api/chat/ask-everyone"', everyone)
 
     def test_maximised_composer_is_viewport_bound_and_render_independent(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -4870,32 +6450,73 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertNotIn('finishSwarmChatActivity(agentId, true);\n    box.value = ""', sent)
         self.assertIn('if (theBigOne === agentId && swarmChatKey(agentId) === attachmentKey', sent)
 
-    def test_failed_chat_activity_stays_visible_until_the_next_request(self) -> None:
+    def test_terminal_chat_activity_releases_and_collapses_without_looking_live(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
             encoding="utf-8")
         finished = script[
-            script.index("function finishSwarmChatActivity"):
+            script.index("function settleSwarmChatActivityFromFeed"):
             script.index("function markSwarmChatActivityStopping")
         ]
-        self.assertIn("if (succeeded)", finished)
-        self.assertNotIn("succeeded ? 1600 : 3000", finished)
-        self.assertIn("activity.finishTimer = window.setTimeout", finished)
+        polling = script[
+            script.index("async function pollSwarmChatActivity"):
+            script.index("function beginSwarmChatActivity")
+        ]
+        self.assertIn('["complete", "error", "stopped"].includes', polling)
+        self.assertIn("settleSwarmChatActivityFromFeed(agentId, still, update)", polling)
+        self.assertIn("swarmBusy.delete(activity.chatKey)", finished)
+        self.assertIn("swarmStopping.delete(activity.chatKey)", finished)
+        self.assertNotIn("swarmBusy.delete(agentId)", finished)
+        self.assertIn("scheduleSwarmChatActivityCollapse", finished)
+        self.assertIn("succeeded && !degraded ? 1600 : 4200", finished)
+        self.assertIn("update?.result?.participant_outcome", finished)
+        self.assertIn('activity.state = degraded ? "attention"', finished)
+        self.assertIn("expectedActivity && activity !== expectedActivity", finished)
+        styles = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/styles.css").read_text(
+            encoding="utf-8")
+        self.assertIn('animation: none', styles)
+        self.assertIn('.chat-activity[data-state="attention"]', styles)
         self.assertIn("const alreadySaved = new Set(saved.map(identity));", script)
 
-    def test_connected_web_chat_is_materialized_as_a_board_agent(self) -> None:
+    def test_web_chat_heartbeat_is_availability_only_and_assignment_is_explicit(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(encoding="utf-8")
         heartbeat = script[
             script.index("async function heartbeatWebChats"):
             script.index("async function serviceWebChatBridge")
         ]
-        hydrate = heartbeat.index("if (!swarmBoardHydrated)")
-        materialize = heartbeat.index("for (const chat of webChatConnections)")
-        self.assertLess(hydrate, materialize)
-        self.assertIn("await refreshSwarm(true);", heartbeat[:materialize])
-        self.assertIn("if (!swarmBoardHydrated) return;", heartbeat[:materialize])
-        self.assertIn("const route = `web:${chat.id}`;", script)
-        self.assertIn("board.agents.push({id: \"\", name, who: route", script)
-        self.assertIn("addedToBoard", script)
+        self.assertIn('request("/api/web-chats/heartbeat"', heartbeat)
+        self.assertNotIn("changeTheSwarmBoard", heartbeat)
+        self.assertNotIn("board.agents.push", heartbeat)
+        self.assertNotIn("swarmBoardHydrated", heartbeat)
+        self.assertNotIn("for (const chat of webChatConnections)", heartbeat)
+        self.assertIn("if ((refreshBoard || changed)", heartbeat)
+
+        assignment = script[
+            script.index("async function assignSelectedWebChatToPendingAgent"):
+            script.index("async function heartbeatWebChats")
+        ]
+        add_to_board = script[
+            script.index("async function addWebChatAgent"):
+            script.index("function renderWebChatConnections")
+        ]
+        self.assertIn("changeTheSwarmBoard", assignment)
+        self.assertIn("changeTheSwarmBoard", add_to_board)
+        self.assertIn("board.agents.push", add_to_board)
+
+    def test_degraded_web_collaboration_turn_plainly_marks_unverified_state(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("if (one.structured_state_unavailable)", script)
+        self.assertIn(
+            "structuredStateUnavailable: Boolean(one.structured_state_unavailable)", script,
+        )
+        self.assertIn("if (one.structuredStateUnavailable)", script)
+        self.assertGreaterEqual(
+            script.count(
+                "Reply kept exactly as delivered; completion and progress could not be verified."
+            ),
+            2,
+        )
 
     def test_web_chat_bridge_releases_claim_lock_before_parallel_provider_waits(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
@@ -4909,6 +6530,32 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertLess(release, provider_wait)
         self.assertIn("claimed = pending.requests || [];", bridge)
         self.assertNotIn("await Promise.all((pending.requests || []).map", bridge)
+        self.assertIn("scheduleWebChatHeartbeat();", bridge)
+        self.assertNotIn("await heartbeatWebChats", bridge)
+        self.assertLess(
+            bridge.index('request("/api/web-chats/pending")'),
+            bridge.index("} catch (error)"),
+        )
+
+    def test_nexus_has_its_app_icon_and_web_chat_background_mode_is_explicit(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (root / "src/our_harness/ui/app.js").read_text(encoding="utf-8")
+        markup = (root / "src/our_harness/ui/index.html").read_text(encoding="utf-8")
+        preload = (root / "desktop/preload.js").read_text(encoding="utf-8")
+        main = (root / "desktop/main.js").read_text(encoding="utf-8")
+        self.assertIn("function isNexusChatTurn(one)", script)
+        self.assertIn('one?.speaker_id === "nexus"', script)
+        self.assertIn('one?.speaker_name === "Nexus" && one?.recipient_name === "You"', script)
+        self.assertIn('nexus: isNexusChatTurn(one)', script)
+        self.assertIn('const speaker = one.nexus ? null', script)
+        self.assertIn('aFaceFor(one.kind, speaker, one.nexus)', script)
+        self.assertIn('row.classList.toggle("nexus-turn", one.nexus)', script)
+        self.assertIn('window.harnessDesktop.appIconDataUrl()', script)
+        self.assertIn('"harness:appIconDataUrl"', preload)
+        self.assertIn('path.join(__dirname, "nexus-harness.ico")', main)
+        self.assertIn('id="webChatBackgroundMode"', markup)
+        self.assertIn("setWebChatBackgroundMode", script)
+        self.assertIn("hidden-window mode, not Chromium headless mode", markup)
 
     def test_human_page_entry_gets_stable_person_authority_and_reaches_agents(self) -> None:
         status, added = self.ask("/api/swarm/add-to-the-page", {

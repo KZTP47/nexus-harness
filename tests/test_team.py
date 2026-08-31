@@ -8,6 +8,7 @@ run that fails an hour later for a reason nobody can see now.
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,10 @@ from unittest import mock
 
 from our_harness import seats as seats_lab
 from our_harness import team
-from our_harness.config import DEFAULT_CONFIG, LoadedConfig
+from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
+from our_harness.providers import ProviderRegistry
+from our_harness.providers.base import AnthropicProvider, OllamaProvider, OpenAIProvider
+from our_harness.providers.gemini import GeminiProvider
 
 
 def a_seat(kind: str, route: str, label: str, *, ready: bool, why_not: str = "") -> seats_lab.Seat:
@@ -161,6 +165,115 @@ class InPlainWordsTests(TeamTestCase):
             with self.subTest(bad=bad):
                 said = team.in_plain_words(bad)
                 self.assertEqual(said.get("hand_overs", []), [])
+
+
+class ModelOnboardingTests(TeamTestCase):
+    def add(self, said: dict[str, str]) -> dict[str, object]:
+        with self.pretend(), mock.patch("our_harness.local_models.look", return_value=[]):
+            return team.add_its_own_way_in(self.config, said)
+
+    def test_every_supported_provider_gets_its_native_kind_and_customary_defaults(self) -> None:
+        cases = (
+            (
+                "local_ollama", "on-this-machine", "ollama", "qwen",
+                "http://127.0.0.1:11434", "", OllamaProvider,
+            ),
+            (
+                "local_compatible", "on-this-machine", "openai-compatible", "qwen",
+                "http://127.0.0.1:8000/v1", "", OpenAIProvider,
+            ),
+            (
+                "openai_api", "with-a-key", "openai", "fixture-openai",
+                "https://api.openai.com/v1", "OPENAI_API_KEY", OpenAIProvider,
+            ),
+            (
+                "anthropic_api", "with-a-key", "anthropic", "fixture-claude",
+                "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", AnthropicProvider,
+            ),
+            (
+                "gemini_api", "with-a-key", "gemini", "fixture-gemini",
+                "https://generativelanguage.googleapis.com/v1beta", "GEMINI_API_KEY", GeminiProvider,
+            ),
+            (
+                "compatible_api", "with-a-key", "openai-compatible", "fixture-compatible",
+                "http://127.0.0.1:8000/v1", "OPENAI_COMPATIBLE_API_KEY", OpenAIProvider,
+            ),
+        )
+        for route, way_in, provider, model, endpoint, key_name, provider_type in cases:
+            with self.subTest(provider=provider, way_in=way_in):
+                done = self.add({
+                    "route": route,
+                    "way_in": way_in,
+                    "provider": provider,
+                    "model": model,
+                    "endpoint": "",
+                    "key_name": "",
+                })
+                self.assertEqual(done["provider"], provider)
+                self.assertEqual(done["endpoint"], endpoint)
+                self.assertEqual(done["key_name"], key_name)
+
+                # Reload from the actual file rather than trusting the object
+                # used to write it, then exercise the production provider factory.
+                reloaded = load_config(self.root)
+                profile = ProviderRegistry(reloaded).profile(route)
+                created = ProviderRegistry(reloaded).create(route)
+                self.assertEqual(profile.name, provider)
+                self.assertEqual(profile.endpoint, endpoint)
+                self.assertEqual(profile.api_key_env, key_name)
+                self.assertIsInstance(created, provider_type)
+                self.assertEqual(created.settings["name"], provider)
+
+    def test_provider_and_way_in_must_agree_and_local_never_means_remote(self) -> None:
+        attempts = (
+            {
+                "route": "wrong_anthropic", "way_in": "on-this-machine",
+                "provider": "anthropic", "model": "fixture",
+            },
+            {
+                "route": "wrong_ollama", "way_in": "with-a-key",
+                "provider": "ollama", "model": "fixture",
+            },
+            {
+                "route": "remote_local", "way_in": "on-this-machine",
+                "provider": "openai-compatible", "model": "fixture",
+                "endpoint": "https://gateway.example/v1",
+            },
+        )
+        for attempt in attempts:
+            with self.subTest(attempt=attempt), self.assertRaises(team.TeamError):
+                self.add(attempt)
+        self.assertFalse((self.root / ".harness" / "config.local.json").exists())
+
+    def test_full_production_validation_happens_before_atomic_replacement(self) -> None:
+        local = self.root / ".harness" / "config.local.json"
+        original = json.dumps({
+            "providers": {
+                "kept": {
+                    "kind": "ollama", "model": "kept-model",
+                    "endpoint": "http://127.0.0.1:11434",
+                }
+            }
+        }, indent=2) + "\n"
+        local.write_text(original, encoding="utf-8")
+
+        with self.assertRaisesRegex(team.TeamError, "prevent Nexus from loading"):
+            self.add({
+                "route": "unsafe", "way_in": "with-a-key", "provider": "openai",
+                "model": "fixture", "endpoint": "https://api.openai.com/v1?key=not-here",
+                "key_name": "OPENAI_API_KEY",
+            })
+
+        self.assertEqual(local.read_text(encoding="utf-8"), original)
+        self.assertEqual(list(local.parent.glob(".config.local.json.*.part")), [])
+
+    def test_older_panel_payload_keeps_its_previous_compatible_protocol(self) -> None:
+        checked = team.check_its_own_way_in({
+            "route": "legacy", "way_in": "with-a-key", "model": "fixture",
+            "endpoint": "https://gateway.example/v1", "key_name": "GATEWAY_API_KEY",
+        })
+        self.assertEqual(checked.provider, "openai-compatible")
+        self.assertEqual(checked.as_a_route()["kind"], "openai-compatible")
 
 
 class WhatIsInTheWayTests(TeamTestCase):

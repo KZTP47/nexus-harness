@@ -1,20 +1,15 @@
 {
-  "name": "our-harness",
-  "version": "1.0.0",
-  "description": "Nexus Harness is a local programming-agent CLI. It scans a project, builds an indexed context, asks a configured model to plan and edit, runs project checks, reviews the result, and performs bounded repair attempts.",
-  "main": "index.js",
-  "directories": {
-    "doc": "docs",
-    "example": "examples",
-    "test": "tests"
-  },
+  "name": "nexus-harness-qa",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Development-only browser QA dependencies for Nexus Harness.",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "python scripts/run_tests.py --quiet"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "playwright": "^1.62.1"
   }

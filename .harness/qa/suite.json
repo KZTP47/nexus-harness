@@ -70,7 +70,6 @@
           "## Two main workspaces",
           "AI Agent Swarm orchestrator",
           "visual test automation",
-          "docs/images/agent-swarm-board.png",
           "## Install",
           "python -m pip install"
         ]

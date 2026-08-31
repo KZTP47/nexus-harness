@@ -1,0 +1,63 @@
+We have a synthetic demonstration project in:
+{ROOT}
+
+The repository variants live in:
+{ROOT}\repository variants
+
+The following folders are read-only:
+
+{ROOT}\repository variants\archive
+This contains historical snapshots. Nothing here may be changed.
+
+{ROOT}\repository variants\vendor baseline
+We may never change anything here. This is the untouched baseline supplied by
+a fictional vendor.
+
+{ROOT}\repository variants\upstream snapshot
+This is a read-only copy of the current upstream source.
+
+{ROOT}\repository variants\qa workspace
+Here we may create test-only changes. Changes are limited to tests,
+test support files, and TEST-ci.yml. Existing product and vendor workflow files
+must remain untouched.
+
+The tests must follow ordinary QA automation practices and the Arrange, Act,
+Assert pattern. Comments should use plain language. Tests belong under
+tests/UNIT, tests/API, and tests/E2E. Unit and API folders should mirror the
+source layout.
+
+API tests are named API-TEST-[interface]-[stable numeric id].
+E2E tests are named E2E-[flow]-[stable numeric id].
+Editing a test does not give it a new identity.
+
+{ROOT}\repository variants\release bundle
+After each change, create a dated-and-hourly folder containing only changed
+files, preserving their repository paths, plus a plain-language
+commit-message.md.
+
+Create an HTML traceability workbook after every session in:
+{ROOT}\test traceability
+
+It must link each test to its plan and implementation state, explain what the
+test does and why it exists, and identify its level and source file. Keep each
+session in a dated-and-hourly subfolder so the record can be followed year
+after year.
+
+The following two folders are reference material only and must never become
+write destinations:
+C:\ReferenceFixtures\traceability\sample
+Use this as a reference only.
+C:\ReferenceFixtures\dashboard\sample
+Use this as a reference only.
+
+The LangGraph files must all live in:
+{ROOT}\LangGraph policy
+
+Keep durable project notes under:
+{ROOT}\project memory
+
+Record every session and its verified conclusions there so later work can
+recover the reasoning.
+
+The synthetic staging site is:
+http://127.0.0.1:8999

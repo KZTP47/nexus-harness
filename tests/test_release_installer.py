@@ -156,6 +156,8 @@ class ReleaseInstallerTests(unittest.TestCase):
         self.assertIn("Authenticode configuration is partial", workflow)
         self.assertIn("publisher is pinned", workflow)
         self.assertIn("Refusing to replace or append assets", workflow)
+        self.assertIn("release-metadata.json", workflow)
+        self.assertIn("Measured download size", workflow)
         self.assertIn("UNSIGNED-DEV", workflow)
         self.assertIn("Finish setup before starting", panel)
         self.assertIn("Nexus will not begin work it cannot verify", panel)

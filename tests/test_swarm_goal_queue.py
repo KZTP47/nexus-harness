@@ -158,6 +158,10 @@ class DurableBoardGoalQueueTests(unittest.TestCase):
         self.assertEqual(queue["status"], "paused")
         self.assertEqual(queue["cursor"], 0)
         self.assertEqual(queue["current"]["resume_token"], "resume-one")
+        self.assertEqual(
+            SwarmGoalQueueStore(self.config).active_project_paths(),
+            [str((self.root / "project").resolve())],
+        )
 
         self.claim(queue, "work-resume-1")
         queue = self.store.record_result(

@@ -165,33 +165,6 @@ async function settle(page, ms = 1200) {
 
   await page.screenshot({ path: out + '/start.png' });
 
-  // The seat setup, after looking. Nothing is written by looking.
-  await page.click('#findSeats');
-  for (let tries = 0; tries < 200; tries += 1) {
-    if (await page.locator('#seatList li').count()) break;
-    await page.waitForTimeout(250);
-  }
-  await settle(page, 600);
-  // Where a tool was found is useful on your own machine and nobody else's
-  // business in a picture. A path can also turn up in the line that says why a
-  // tool would not start, so anything path-shaped goes, not only the words
-  // "found at": a Windows path carries the account name in it.
-  await page.evaluate(() => {
-    // Built fresh for each line: a regular expression with /g remembers where
-    // it stopped, so reusing one here would skip every other line.
-    const stand_in = 'the usual place for this machine';
-    // Only the lines of text. Writing over a whole row would throw away the
-    // parts inside it and leave every word run together.
-    document.querySelectorAll('#seatList p').forEach((line) => {
-      line.textContent = line.textContent.replace(
-        // A drive letter, then everything up to the next space. The letter has
-        // to stand on its own, or the middle of "http://..." would count.
-        /(?<![A-Za-z])[A-Za-z][:][^\s,;"']+|\/(?:home|Users)\/[^\s,;"']+/g, stand_in);
-    });
-  });
-  await settle(page, 300);
-  await page.locator('#seatSteps').screenshot({ path: out + '/seats.png' });
-
   // The picture of the workflow, part way through the walk through, so the
   // steps show as done, working, and still to come all at once.
   await page.click('#howDemo');
@@ -335,39 +308,6 @@ async function settle(page, ms = 1200) {
   });
   await settle(page, 900);
   await page.screenshot({ path: out + '/what-it-knows.png' });
-
-  // The team: who is on this machine and how they work together. Whatever is
-  // really installed here is what shows, so this picture is honest about a
-  // machine with one assistant as much as one with two.
-  await page.click('[data-view="team"]');
-  for (let tries = 0; tries < 80; tries += 1) {
-    if (await page.locator('.team-node').count()
-        && await page.locator('#teamPlain li').count()) break;
-    await page.waitForTimeout(250);
-  }
-  await settle(page, 600);
-  await page.screenshot({ path: out + '/your-team.png' });
-
-  // Talking to them. The demo project has whatever is really on this machine,
-  // so this picture is honest about a machine with one assistant as much as
-  // one with three.
-  await page.click('[data-view="talk"]');
-  for (let tries = 0; tries < 80; tries += 1) {
-    if (await page.locator('#talkWho li').count()) break;
-    await page.waitForTimeout(250);
-  }
-  await page.fill('#talkBox', 'Is the old parser still used anywhere?');
-  // Where a tool was found is a path on this machine, and a path carries an
-  // account name in it.
-  await page.evaluate(() => {
-    document.querySelectorAll('#talkWho .hint').forEach((line) => {
-      if (/[A-Za-z]:[\/]/.test(line.textContent)) {
-        line.textContent = 'the usual place for this machine';
-      }
-    });
-  });
-  await settle(page, 500);
-  await page.screenshot({ path: out + '/talk-to-them.png' });
 
   // Looking something up in the code. The demo project is tiny, so the answer
   // here is the honest guess, which is the half of this feature worth showing:

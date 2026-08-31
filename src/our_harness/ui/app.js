@@ -784,7 +784,10 @@ function switchView(name) {
   if (name === "workflow") { fitGraph(); refreshTeamNotes(); renderWhatItIsDoing(); refreshWorkflows(); }
   if (name === "history") refreshHistory();
   if (name === "pipelines") refreshPipelines(undefined, {replaceDrawing: !pipelineBaselineReady});
-  if (name === "settings") refreshSettings();
+  if (name === "settings") {
+    refreshSettings();
+    void refreshWebChatSettingsRecoveryStatus().catch(() => {});
+  }
   if (name === "vault") refreshVault(vaultOpen);
   if (name === "team") refreshTeam(teamOpen);
   if (name === "lookup") refreshLookup();
@@ -2637,7 +2640,8 @@ function renderSettings() {
   const shown = settingsHeld.filter((one) => {
     if (onlyChanged && !one.changed) return false;
     if (!looking) return true;
-    return `${one.key} ${one.label} ${one.means}`.toLowerCase().includes(looking);
+    const current = typeof one.value === "string" ? one.value : JSON.stringify(one.value ?? "");
+    return `${one.key} ${one.label} ${one.means} ${current}`.toLowerCase().includes(looking);
   });
   if (!shown.length) {
     list.append(make("p", "field-help", "Nothing matches that."));
@@ -5013,6 +5017,7 @@ function bindEvents() {
   $("teamModelSave").addEventListener("click", saveTheModel);
   $("teamModelCancel").addEventListener("click", () => $("teamModelDialog").close());
   $("teamModelWayIn").addEventListener("change", sayWhatTheWayInMeans);
+  $("teamModelProvider").addEventListener("change", useTheProviderDefaults);
   $("teamNodeSave").addEventListener("click", saveTeamNode);
   $("teamNodeCancel").addEventListener("click", () => $("teamNodeDialog").close());
   $("teamNodeJob").addEventListener("change", () => {
@@ -5058,6 +5063,7 @@ async function refreshTeam(name) {
     teamJobs = said.jobs || [];
     teamWaysOfAsking = said.ways_of_asking || [];
     teamWaysIn = said.ways_in || [];
+    teamModelProviders = said.model_providers || [];
     teamSavedNames = said.teams || [];
     $("teamWhoNote").textContent = said.who?.note || "";
     renderTeamWho();
@@ -5140,12 +5146,6 @@ function renderTeamWho() {
       signIn.type = "button";
       signIn.addEventListener("click", () => signInThisAssistant(one.kind, signIn));
       row.append(signIn);
-    }
-    if (one.ready && one.kind === "claude-cli") {
-      const repair = make("button", "team-repair", "Repair Claude access");
-      repair.type = "button";
-      repair.addEventListener("click", () => repairClaudeAccess(repair));
-      row.append(repair);
     }
     if (one.ready && one.kind === "gemini-cli") {
       const projectHelp = make("button", "team-project-help", "Find Cloud project ID");
@@ -5556,6 +5556,7 @@ async function setUpTheTeam() {
 
 let teamWaysOfAsking = [];
 let teamWaysIn = [];
+let teamModelProviders = [];
 
 function fillTeamChoices() {
   const jobs = $("teamCustomJob");
@@ -5673,23 +5674,46 @@ function openTheModelWindow() {
   }
   $("teamModelRoute").value = "";
   $("teamModelModel").value = "";
-  $("teamModelEndpoint").value = "";
-  $("teamModelKeyName").value = "";
   $("teamModelSaid").textContent = "";
   sayWhatTheWayInMeans();
   $("teamModelDialog").showModal();
 }
 
 function sayWhatTheWayInMeans() {
-  const way = teamWaysIn.find((one) => one.way_in === $("teamModelWayIn").value);
+  const selectedWay = $("teamModelWayIn").value;
+  const way = teamWaysIn.find((one) => one.way_in === selectedWay);
   $("teamModelWayMeans").textContent = way?.means || "";
   // Only one of the two needs a key, and asking for one where it cannot be
   // used is how somebody ends up pasting a key that nothing reads.
-  const needsAKey = $("teamModelWayIn").value === "with-a-key";
+  const needsAKey = selectedWay === "with-a-key";
   $("teamModelKeyName").closest("form").querySelectorAll("label").forEach((label) => {
     if (label.getAttribute("for") === "teamModelKeyName") label.hidden = !needsAKey;
   });
   $("teamModelKeyName").hidden = !needsAKey;
+  $("teamModelKeyHelp").hidden = !needsAKey;
+
+  const choices = teamModelProviders.filter(
+    (one) => Array.isArray(one.ways_in) && one.ways_in.includes(selectedWay));
+  const providers = $("teamModelProvider");
+  providers.replaceChildren();
+  for (const choice of choices) {
+    const option = make("option", "", choice.label);
+    option.value = choice.kind;
+    providers.append(option);
+  }
+  useTheProviderDefaults();
+}
+
+function useTheProviderDefaults() {
+  const provider = teamModelProviders.find(
+    (one) => one.kind === $("teamModelProvider").value);
+  $("teamModelProviderMeans").textContent = provider?.means || "";
+  $("teamModelEndpoint").value = provider?.default_endpoint || "";
+  $("teamModelEndpoint").placeholder = provider?.default_endpoint || "https://provider.example/v1";
+  $("teamModelModel").placeholder = provider?.model_hint || "model-name";
+  const needsAKey = $("teamModelWayIn").value === "with-a-key";
+  $("teamModelKeyName").value = needsAKey ? (provider?.default_key_name || "") : "";
+  $("teamModelKeyName").placeholder = provider?.default_key_name || "PROVIDER_API_KEY";
 }
 
 async function saveTheModel() {
@@ -5700,6 +5724,7 @@ async function saveTheModel() {
         model: {
           route: $("teamModelRoute").value.trim(),
           way_in: $("teamModelWayIn").value,
+          provider: $("teamModelProvider").value,
           model: $("teamModelModel").value.trim(),
           endpoint: $("teamModelEndpoint").value.trim(),
           key_name: $("teamModelKeyName").value.trim(),
@@ -6186,12 +6211,12 @@ function executionPauseWords(kind, reason) {
 }
 
 function setExecutionControl(button, ordinarilyDisabled, reason, ordinaryTitle = "",
-                             kind = "Project execution") {
+                             kind = "Project execution", describedById = "authorityRepairReason") {
   if (!button) return;
   const pause = executionPauseWords(kind, reason);
   button.disabled = Boolean(ordinarilyDisabled) || Boolean(pause);
   button.title = pause || ordinaryTitle;
-  if (pause) button.setAttribute("aria-describedby", "authorityRepairReason");
+  if (pause && describedById) button.setAttribute("aria-describedby", describedById);
   else button.removeAttribute("aria-describedby");
 }
 
@@ -6531,13 +6556,12 @@ function sayInTalk(words) { $("talkSaid").textContent = words; }
 function setWhatCanBePressed() {
   const somebody = talkTheOpenOne();
   $("talkBox").disabled = !somebody;
-  setExecutionControl($("talkSend"), talkBusy || !somebody, talkCannotRun,
-    "Send this message to the selected assistant", "Provider contact");
+  $("talkSend").disabled = talkBusy || !somebody;
+  $("talkSend").title = "Send this message to the selected assistant";
   $("talkStop").disabled = !talkBusy || talkStopping;
   $("talkStop").textContent = talkStopping ? "Stopping…" : "Stop";
-  setExecutionControl($("talkAskEveryone"),
-    talkBusy || !talkWho.some((one) => one.ready), talkCannotRun,
-    "Ask every ready assistant", "Provider contact");
+  $("talkAskEveryone").disabled = talkBusy || !talkWho.some((one) => one.ready);
+  $("talkAskEveryone").title = "Ask every ready assistant";
   $("talkStartAgain").disabled = talkBusy || !somebody;
   // The names on the left too, and now rather than the next time the list is
   // drawn: switching while an answer is on its way leaves "Asking them..." on
@@ -6615,12 +6639,6 @@ function countWhatIsTyped() {
 
 async function sendWhatIsTyped() {
   const box = $("talkBox");
-  const executionPause = executionPauseWords("Provider contact", talkCannotRun);
-  if (executionPause) {
-    sayInTalk(executionPause);
-    box.focus();
-    return;
-  }
   const words = box.value.trim();
   const one = talkTheOpenOne();
   if (!words) { sayInTalk("Type something first."); return; }
@@ -6683,12 +6701,6 @@ function readOneTurnBack(row) {
 
 async function askEveryone() {
   const box = $("talkBox");
-  const executionPause = executionPauseWords("Provider contact", talkCannotRun);
-  if (executionPause) {
-    sayInTalk(executionPause);
-    box.focus();
-    return;
-  }
   const words = box.value.trim();
   if (!words) { sayInTalk("Type something first."); return; }
   if (talkBusy) { sayInTalk("Still waiting for the last answer."); return; }
@@ -6887,6 +6899,7 @@ function renderLookupAnswer(said) {
 async function boot() {
   bindEvents();
   try {
+    await loadNexusAppIcon();
     const value = await request("/api/bootstrap");
     token = value.token;
     startedId = value.started_id || "";
@@ -6954,9 +6967,17 @@ let swarmSaid = {
 // What is picked: a box, or one of the lines. Lines are picked as
 // {kind: "works", agent, project} or {kind: "talks", one, other}.
 let swarmPicked = null;
-let swarmBusy = new Set();   // the agents waiting on an answer right now
-let swarmStopping = new Set(); // per-chat stops already being delivered
+// Runtime ownership is per exact saved chat, never per lead agent. One lead
+// can therefore have Chat 1 and Chat 2 in flight at the same time without a
+// late answer, Stop press, or progress poll crossing between them.
+let swarmBusy = new Set();   // canonical `chat:<id>` (or legacy-agent) runtime keys waiting now
+let swarmStopping = new Set(); // exact chat stops already being delivered
 let swarmNewestRefresh = 0;  // so a slow look cannot overwrite a newer one
+// Connection recovery belongs to the selected agent and exact route. Board
+// redraws must not erase a diagnosis or a successful live verification, and a
+// delayed answer for an old route must never decorate the newly selected one.
+const swarmAgentRepairPlans = new Map();
+const swarmAgentRepairTests = new Map();
 // The value above is deliberately an empty placeholder until /api/swarm has
 // answered.  Startup also starts the web-chat heartbeat.  That heartbeat may
 // add connected chats to the board, so it must never mistake the placeholder
@@ -6967,16 +6988,22 @@ let swarmBoardHydrated = false;
 // window and this minute, and two windows should not fight over it.
 let swarmChats = [];
 const swarmChatAttachments = new Map();
+// Compact cards share one DOM composer per lead agent as the selected saved
+// chat changes. Keep the actual draft and caret per exact chat so jumping away
+// from an in-flight turn cannot let its delayed completion erase a sibling's
+// draft.
+const swarmChatComposerDrafts = new Map();
+const swarmChatComposerKeys = new Map();
 // A maximised composer belongs to one exact pair-chat. Keeping its draft and
 // caret outside the rendered DOM means conversation switches, board redraws,
 // and full-screen reparenting cannot turn typing into lost or misplaced text.
 const theBigChatComposerDrafts = new Map();
 let theBigChatComposerKey = "";
 // Round policy belongs to the exact saved pair chat, just like attachments.
-// Unlimited means no numeric ceiling while progress continues; the engine's
-// objective no-progress guard remains active so this is not an infinite-loop switch.
+// New chats stop the legacy relay after three rounds. Unlimited remains an
+// explicit advanced opt-in; the engine's no-progress guard still applies.
 const swarmChatRoundPolicies = new Map();
-const DEFAULT_FINITE_TEAM_ROUNDS = 12;
+const DEFAULT_FINITE_TEAM_ROUNDS = 3;
 // A paused or not-yet-verified project run belongs to one exact saved pair
 // chat. Keep its opaque resume token and mechanically enforced destinations
 // outside the rendered cards so minimising, maximising, switching chats, or
@@ -6991,11 +7018,12 @@ let swarmWorkRecoveryRefreshRevision = 0;
 // A long provider request remains one HTTP call, but its truthful Nexus stages
 // arrive through a second, lightweight activity feed.  This map lets both the
 // movable and maximised views show the same live state.
-const swarmChatActivity = new Map();
+const swarmChatActivity = new Map(); // exact chat key -> live/terminal activity
 const AGENT_ICONS = new Set(["robot", "person", "code", "star", "brain"]);
 const AGENT_COLOUR = /^#[0-9a-f]{6}$/i;
 const AGENT_PICTURE = /^data:image\/(?:png|jpeg|webp);base64,/i;
 const MAX_AGENT_PICTURE_LENGTH = 400000;
+let nexusAppIconDataUrl = "";
 let swarmAgentPictureDraft = "";
 const SWARM_AGENT_AUTOSAVE_DELAY = 450;
 // Unsaved form state lives outside the rendered board. Every successful board
@@ -7056,13 +7084,50 @@ function anAgentFace(agent, className = "", iconSize = 24) {
   return putAgentFaceIn(face, appearance, iconSize);
 }
 
+async function loadNexusAppIcon() {
+  if (typeof window.harnessDesktop?.appIconDataUrl !== "function") return "";
+  try {
+    const icon = String(await window.harnessDesktop.appIconDataUrl() || "");
+    nexusAppIconDataUrl = /^data:image\/x-icon;base64,/i.test(icon) ? icon : "";
+  } catch (_error) {
+    nexusAppIconDataUrl = "";
+  }
+  return nexusAppIconDataUrl;
+}
+
+function isNexusChatTurn(one) {
+  // Older saved failure turns predate speaker_id. Their visible attribution is
+  // still authoritative enough to keep Nexus from borrowing the selected
+  // agent's appearance when those conversations are reopened.
+  return one?.speaker_id === "nexus"
+    || (one?.speaker_name === "Nexus" && one?.recipient_name === "You");
+}
+
+function aChatTurnFace(one, agent, className = "", iconSize = 24) {
+  if (!isNexusChatTurn(one)) return anAgentFace(agent, className, iconSize);
+  const face = make("span", `swarm-agent-face nexus-app-face ${className}`.trim());
+  const icon = nexusAppIconDataUrl;
+  if (/^data:image\/x-icon;base64,/i.test(icon)) {
+    const picture = document.createElement("img");
+    picture.src = icon;
+    picture.alt = "Nexus Harness";
+    picture.draggable = false;
+    face.append(picture);
+  } else {
+    // Browser-only development has no packaged desktop asset. It still gets a
+    // distinct Nexus mark instead of borrowing the connected agent's face.
+    face.append(aSwarmDrawing("star", iconSize));
+  }
+  return face;
+}
+
 function agentForChatTurn(one, fallback) {
-  if (one?.speaker_id === "nexus") return null;
+  if (isNexusChatTurn(one)) return null;
   return theSwarmAgent(one?.speaker_id) || fallback || null;
 }
 
 function chatTurnsWhileWorking(agentId, saved = []) {
-  const activity = swarmChatActivity.get(agentId);
+  const activity = visibleSwarmChatActivity(swarmChatActivityFor(agentId));
   if (!activity) return saved;
   const identity = (one) => JSON.stringify([
     one?.who || "", one?.speaker_id || "", one?.phase || "", one?.text || "",
@@ -7078,11 +7143,14 @@ function chatTurnsWhileWorking(agentId, saved = []) {
   ];
 }
 
-function renderTurnsThatArrived(agentId) {
-  const held = swarmChats.find((one) => one.agent === agentId);
-  if (!held) return;
-  renderTheChatThreadFor(agentId, keptTranscriptFor(agentId));
-  if (theBigOne === agentId) renderTheBigChat();
+function renderTurnsThatArrived(agentId, chatKey = swarmChatRuntimeKey(agentId)) {
+  // A canonical pair chat can be open through either participant. Refresh
+  // every visible view of this exact chat, not just the agent which sent it.
+  for (const held of swarmChats) {
+    if (swarmChatRuntimeKey(held.agent) !== chatKey) continue;
+    renderTheChatThreadFor(held.agent, keptTranscriptFor(held.agent));
+    if (theBigOne === held.agent) renderTheBigChat();
+  }
 }
 // A chat read can still be in flight when an answer or "start again" changes
 // the transcript.  Only the newest operation may replace the copy both chat
@@ -7093,21 +7161,447 @@ const swarmChatRevisions = new Map();
 // server records it, so an older list can never restore a previous chat.
 const swarmConversationListRevisions = new Map();
 const swarmConversationSwitching = new Set();
+// Metadata-only refreshes can race the first full chat hydration. Preserve the
+// strongest requested operation so a later list read cannot win the revision
+// race and accidentally suppress the only transcript read.
+const swarmConversationTranscriptRefreshes = new Set();
+// Conversation metadata arrives after a board card is first drawn. Until its
+// saved chat ID is known, drafting/navigation are safe but any provider or
+// lifecycle action would run under the temporary legacy agent identity.
+const swarmConversationHydrating = new Set();
+// Reset is a lifecycle mutation on one exact saved chat. It may continue in
+// Electron after the server transcript reset has returned, so keep a separate
+// exact-chat lease until both halves have finished.
+const swarmChatResetting = new Set();
 
 function activeConversationFor(agentId) {
   const held = swarmChats.find((one) => one.agent === agentId);
   return (held?.conversations || []).find((one) => one.id === held?.conversation) || null;
 }
 
+function isLoneAgentChat(agentId) {
+  const conversation = activeConversationFor(agentId);
+  if (!conversation) return false;
+  const pair = Array.isArray(conversation.pair_agents) && conversation.pair_agents.length
+    ? conversation.pair_agents : conversation.pair;
+  return Array.isArray(pair) && pair.length === 1;
+}
+
+function chatRecipientWords(agentId) {
+  const selected = theSwarmAgent(agentId);
+  const conversation = activeConversationFor(agentId);
+  let participants = Array.isArray(conversation?.pair_agents)
+    ? conversation.pair_agents.filter((one) => one && (one.id || one.name)) : [];
+  if (!participants.length && Array.isArray(conversation?.pair)) {
+    participants = conversation.pair.map((id) => {
+      const found = theSwarmAgent(id);
+      return found || {id, name: String(id || "Agent")};
+    });
+  }
+  if (!participants.length && selected) participants = [selected];
+  const selectedName = String(selected?.name || "selected agent");
+  const expected = Math.max(1, participants.length || 1);
+  const direct = `Ask ${selectedName} only`;
+  const team = expected === 2 ? "Ask both agents"
+    : expected > 2 ? `Ask all ${expected} agents` : "Ask connected agents";
+  const help = expected > 1
+    ? `${direct} sends to one assistant. ${team} starts team collaboration; expected initial replies: ${expected}.`
+    : `${direct} sends to this one assistant. Add a connected agent before starting team collaboration.`;
+  return {direct, team, help, expected, selectedName};
+}
+
+function syncChatRecipientWords(agentId, card = null) {
+  const words = chatRecipientWords(agentId);
+  if (card) {
+    const send = card.querySelector(".swarm-chat-send");
+    const team = card.querySelector(".swarm-chat-collaborate");
+    const help = card.querySelector(".swarm-chat-scope");
+    if (send) {
+      send.textContent = words.direct;
+      send.setAttribute("aria-label", words.direct);
+    }
+    if (team) {
+      team.textContent = words.team;
+      team.setAttribute("aria-label", words.team);
+    }
+    if (help) help.textContent = words.help;
+  }
+  if (theBigOne === agentId) {
+    const send = $("theBigChatSend");
+    const team = $("theBigChatCollaborate");
+    const help = $("theBigChatScopeHint");
+    if (send) {
+      send.textContent = words.direct;
+      send.setAttribute("aria-label", words.direct);
+    }
+    if (team) {
+      team.textContent = words.team;
+      team.setAttribute("aria-label", words.team);
+    }
+    if (help) help.textContent = words.help
+      + " Project-file work always asks for confirmation.";
+  }
+  return words;
+}
+
+function unavailableChatParticipants(agentId) {
+  const conversation = activeConversationFor(agentId);
+  const pair = Array.isArray(conversation?.pair_agents) && conversation.pair_agents.length
+    ? conversation.pair_agents
+    : (Array.isArray(conversation?.pair) ? conversation.pair.map((id) => ({id})) : []);
+  return pair.map((saved) => {
+    const current = theSwarmAgent(saved?.id);
+    // Readiness is live board state. A participant removed after this chat was
+    // saved is unavailable even if older conversation metadata said otherwise.
+    return current || {...saved, ready: false};
+  }).filter((one) => !one?.ready);
+}
+
+function fillChatTeamReadiness(panel, agentId) {
+  if (!panel) return [];
+  const unavailable = unavailableChatParticipants(agentId);
+  panel.hidden = !unavailable.length;
+  panel.replaceChildren();
+  if (!unavailable.length) return unavailable;
+  panel.append(make("strong", "", "Team action unavailable"));
+  panel.append(make("p", "hint",
+    `${unavailable.map((one) => one.name || one.id || "An agent").join(", ")} ${unavailable.length === 1 ? "is" : "are"} not ready. Repair the exact connection before asking the team.`));
+  const actions = make("div", "button-row chat-team-readiness-actions");
+  for (const one of unavailable) {
+    const repair = make("button", "swarm-repair", `Repair ${one.name || "agent"}`);
+    repair.type = "button";
+    repair.title = one.who
+      ? `Diagnose ${one.name || "this agent"}'s exact route: ${one.who}`
+      : `Choose a provider route for ${one.name || "this agent"}`;
+    repair.addEventListener("click", () => void openAgentRepairFlow(one.id, repair));
+    actions.append(repair);
+  }
+  panel.append(actions);
+  return unavailable;
+}
+
+function syncChatTeamReadiness(agentId, card = null) {
+  const unavailable = unavailableChatParticipants(agentId);
+  if (card) fillChatTeamReadiness(
+    card.querySelector(".swarm-chat-team-readiness"), agentId,
+  );
+  if (theBigOne === agentId) fillChatTeamReadiness($("theBigChatTeamReadiness"), agentId);
+  return unavailable;
+}
+
+function loneAgentActionMessage(mode) {
+  return mode === "work"
+    ? "This is a lone-agent chat. Project-file teamwork is available only in a connected-agent chat."
+    : "This is a lone-agent chat. Open a connected-agent chat before asking agents to collaborate.";
+}
+
+function swarmChatKeyFor(agentId, chatId = undefined) {
+  const exact = chatId === undefined
+    ? activeConversationFor(agentId)?.id || ""
+    : String(chatId || "");
+  return `${agentId}:${exact || "legacy"}`;
+}
+
 function swarmChatKey(agentId) {
-  return `${agentId}:${activeConversationFor(agentId)?.id || "legacy"}`;
+  return swarmChatKeyFor(agentId);
+}
+
+function swarmChatRuntimeKeyFor(agentId, chatId = undefined) {
+  const exact = chatId === undefined
+    ? activeConversationFor(agentId)?.id || ""
+    : String(chatId || "");
+  // A saved pair chat can be opened through either participant. Runtime
+  // ownership follows the canonical chat ID so both views observe the same
+  // in-flight turn; unsaved legacy chats fall back to their one agent owner.
+  return exact ? `chat:${exact}` : `legacy:${agentId}`;
+}
+
+function swarmChatRuntimeKey(agentId) {
+  return swarmChatRuntimeKeyFor(agentId);
+}
+
+function swarmChatIsBusy(agentId, chatId = undefined) {
+  return swarmBusy.has(swarmChatRuntimeKeyFor(agentId, chatId));
+}
+
+function swarmChatIsStopping(agentId, chatId = undefined) {
+  return swarmStopping.has(swarmChatRuntimeKeyFor(agentId, chatId));
+}
+
+function swarmChatIsResetting(agentId, chatId = undefined) {
+  return swarmChatResetting.has(swarmChatRuntimeKeyFor(agentId, chatId));
+}
+
+function swarmChatIsHydrating(agentId) {
+  return swarmConversationHydrating.has(agentId);
+}
+
+function swarmChatActivityFor(agentId, chatId = undefined) {
+  return swarmChatActivity.get(swarmChatRuntimeKeyFor(agentId, chatId));
+}
+
+function visibleSwarmChatActivity(activity) {
+  // A terminal feed result remains in the runtime map as a non-rendered
+  // reconciliation tombstone until the original HTTP request settles. Keeping
+  // that transport identity must not keep its progress card or optimistic
+  // transcript turns visible.
+  return activity?.collapsed ? null : activity;
+}
+
+function swarmActivityIsCurrent(activity) {
+  return Boolean(activity?.chatKey && swarmChatActivity.get(activity.chatKey) === activity);
+}
+
+function swarmActivityCanSettle(activity) {
+  return swarmActivityIsCurrent(activity) && activity.settled !== true;
+}
+
+function swarmActivityCanReconcileSuccess(activity) {
+  return swarmActivityIsCurrent(activity) && (
+    activity.settled !== true
+    || (activity.settledBy === "feed" && activity.terminalState === "complete")
+  );
+}
+
+function selectedChatIs(activity) {
+  return Boolean(activity && swarmChats.some(
+    (held) => swarmChatRuntimeKey(held.agent) === activity.chatKey,
+  ));
+}
+
+function rememberSwarmChatComposer(agentId) {
+  const card = theChatCardFor(agentId);
+  const box = card?.querySelector(".swarm-chat-box");
+  if (!box) return null;
+  const key = swarmChatComposerKeys.get(agentId) || swarmChatKey(agentId);
+  const state = {
+    value: box.value,
+    start: box.selectionStart,
+    end: box.selectionEnd,
+    direction: box.selectionDirection || "none",
+  };
+  swarmChatComposerDrafts.set(key, state);
+  swarmChatComposerKeys.set(agentId, key);
+  return state;
+}
+
+function syncSwarmChatComposer(agentId) {
+  const card = theChatCardFor(agentId);
+  const box = card?.querySelector(".swarm-chat-box");
+  if (!box) return;
+  const nextKey = swarmChatKey(agentId);
+  const previousKey = swarmChatComposerKeys.get(agentId) || "";
+  if (previousKey === nextKey) return;
+  const wasFocused = document.activeElement === box;
+  rememberSwarmChatComposer(agentId);
+  const legacyKey = swarmChatKeyFor(agentId, "");
+  const state = swarmChatComposerDrafts.get(nextKey)
+    || (previousKey === legacyKey ? swarmChatComposerDrafts.get(previousKey) : null);
+  if (state && previousKey === legacyKey && !swarmChatComposerDrafts.has(nextKey)) {
+    swarmChatComposerDrafts.set(nextKey, state);
+    swarmChatComposerDrafts.delete(previousKey);
+  }
+  swarmChatComposerKeys.set(agentId, nextKey);
+  box.value = state?.value || "";
+  if (state) box.setSelectionRange(state.start, state.end, state.direction);
+  countWhatIsTypedTo(agentId);
+  if (wasFocused) box.focus({preventScroll: true});
+}
+
+function restoreSwarmChatDraft(chatKey, words) {
+  const existing = swarmChatComposerDrafts.get(chatKey);
+  if (!existing?.value) {
+    swarmChatComposerDrafts.set(chatKey, {
+      value: words, start: words.length, end: words.length, direction: "none",
+    });
+  }
+  const activity = [...swarmChatActivity.values()].find(
+    (one) => one.stateKey === chatKey,
+  );
+  // syncSwarmChatComposer deliberately returns early when the identity did not
+  // change. Feed failure restores the same identity, so refresh that visible
+  // textarea explicitly instead of waiting for a switch or full redraw.
+  const held = swarmChats.find((one) => swarmChatKey(one.agent) === chatKey);
+  const box = held ? theChatCardFor(held.agent)?.querySelector(".swarm-chat-box") : null;
+  if (box && !box.value) {
+    box.value = words;
+    box.setSelectionRange(words.length, words.length);
+    rememberSwarmChatComposer(held.agent);
+    countWhatIsTypedTo(held.agent);
+  } else if (activity && selectedChatIs(activity)) {
+    syncSwarmChatComposer(activity.agentId);
+  }
+}
+
+function restoreSwarmActivityDraft(activity) {
+  const words = String(activity?.localTurns?.find(
+    (one) => one?.who === "you" && String(one?.text || "").trim()
+  )?.text || "");
+  if (!activity?.stateKey || !words) return;
+  restoreSwarmChatDraft(activity.stateKey, words);
+  const existing = theBigChatComposerDrafts.get(activity.stateKey);
+  if (!existing?.value) {
+    theBigChatComposerDrafts.set(activity.stateKey, {
+      value: words, start: words.length, end: words.length, direction: "none",
+    });
+  }
+  if (theBigOne && swarmChatKey(theBigOne) === activity.stateKey
+      && !$("theBigChatBox").value) {
+    $("theBigChatBox").value = words;
+    $("theBigChatBox").setSelectionRange(words.length, words.length);
+    rememberTheBigChatComposer();
+  }
+}
+
+function clearSwarmActivityAttachments(activity) {
+  // Feed completion can release the composer before the original HTTP response
+  // arrives. Cleanup belongs to that immutable activity and runs once: a late
+  // response must never delete files the user attached for the next turn.
+  if (!activity?.stateKey || activity.attachmentsCleared) return false;
+  activity.attachmentsCleared = true;
+  swarmChatAttachments.delete(activity.stateKey);
+  for (const held of swarmChats) {
+    if (swarmChatRuntimeKey(held.agent) !== activity.chatKey) continue;
+    renderChatAttachments(held.agent);
+    countWhatIsTypedTo(held.agent);
+  }
+  return true;
+}
+
+function normalizedUserQuestions(value) {
+  if (!Array.isArray(value)) return [];
+  const used = new Set();
+  return value.slice(0, 6).map((raw, index) => {
+    const source = typeof raw === "string" ? {prompt: raw} : raw;
+    if (!source || typeof source !== "object") return null;
+    const prompt = String(source.prompt || "").trim().slice(0, 500);
+    if (!prompt) return null;
+    let id = String(source.id || `question-${index + 1}`)
+      .replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 120) || `question-${index + 1}`;
+    if (used.has(id.toLowerCase())) id = `${id}-${index + 1}`;
+    used.add(id.toLowerCase());
+    let recommendationKept = false;
+    const options = (Array.isArray(source.options) ? source.options : [])
+      .slice(0, 8).map((option) => {
+        const recommended = option?.recommended === true && !recommendationKept;
+        recommendationKept ||= recommended;
+        return {
+          label: String(option?.label || "").trim().slice(0, 160),
+          description: String(option?.description || "").trim().slice(0, 500),
+          recommended,
+        };
+      }).filter((option) => option.label);
+    return Object.freeze({
+      id, prompt, options: Object.freeze(options),
+      multiple: source.multiple === true && options.length > 1,
+      allowOther: source.allow_other !== false || !options.length,
+    });
+  }).filter(Boolean);
+}
+
+function frozenQuestionAnswers(value) {
+  const found = {};
+  if (!value || typeof value !== "object") return Object.freeze(found);
+  for (const [id, raw] of Object.entries(value).slice(0, 6)) {
+    if (!raw || typeof raw !== "object") continue;
+    found[String(id).slice(0, 120)] = Object.freeze({
+      selected: Object.freeze((Array.isArray(raw.selected) ? raw.selected : [])
+        .map((one) => String(one).slice(0, 160)).filter(Boolean).slice(0, 8)),
+      other: String(raw.other || "").trim().slice(0, 2000),
+      text: String(raw.text || "").trim().slice(0, 4000),
+    });
+  }
+  return Object.freeze(found);
+}
+
+function compiledQuestionAnswers(questions, answers) {
+  const lines = [];
+  const missing = [];
+  for (const question of normalizedUserQuestions(questions)) {
+    const answer = answers?.[question.id] || {};
+    const selected = (Array.isArray(answer.selected) ? answer.selected : [])
+      .map((one) => String(one).trim()).filter(Boolean);
+    const other = String(answer.other || "").trim();
+    const textAnswer = String(answer.text || "").trim();
+    const values = question.options.length
+      ? [...selected, ...(other ? [`Other: ${other}`] : [])]
+      : (textAnswer ? [textAnswer] : []);
+    if (!values.length) {
+      missing.push(question.prompt);
+      continue;
+    }
+    lines.push(`- [${question.id}] ${question.prompt}\n  Answer: ${values.join("; ")}`);
+  }
+  return {text: lines.length ? `Answers to your questions:\n${lines.join("\n")}` : "", missing};
+}
+
+function userQuestionFields(question, current, onChange, namespace) {
+  const fieldset = make("fieldset", "agent-question-fields");
+  fieldset.append(make("legend", "agent-question-prompt", question.prompt));
+  const answer = {
+    selected: [...(current?.selected || [])],
+    other: String(current?.other || ""),
+    text: String(current?.text || ""),
+  };
+  const changed = () => onChange({
+    selected: [...answer.selected], other: answer.other, text: answer.text,
+  });
+  if (question.options.length) {
+    for (const [index, option] of question.options.entries()) {
+      const label = make("label", `agent-question-option${option.recommended ? " recommended" : ""}`);
+      const input = document.createElement("input");
+      input.type = question.multiple ? "checkbox" : "radio";
+      input.name = `${namespace}-${question.id}`;
+      input.value = option.label;
+      input.checked = answer.selected.includes(option.label);
+      input.addEventListener("change", () => {
+        answer.selected = question.multiple
+          ? [...fieldset.querySelectorAll("input[data-question-choice]:checked")]
+            .map((one) => one.value)
+          : [input.value];
+        if (!question.multiple) answer.other = "";
+        changed();
+      });
+      input.dataset.questionChoice = "true";
+      const words = make("span", "agent-question-option-words");
+      words.append(make("strong", "", option.label));
+      if (option.recommended) words.append(make("span", "agent-question-recommended", "Recommended"));
+      if (option.description) words.append(make("small", "", option.description));
+      label.append(input, words);
+      fieldset.append(label);
+    }
+  }
+  if (question.allowOther || !question.options.length) {
+    const label = make("label", "agent-question-other");
+    label.append(make("span", "", question.options.length ? "Other answer" : "Your answer"));
+    const input = question.options.length ? make("input", "") : make("textarea", "");
+    if (!question.options.length) input.rows = 2;
+    input.value = question.options.length ? answer.other : answer.text;
+    input.placeholder = question.options.length ? "Type your own answer" : "Type your answer";
+    input.addEventListener("input", () => {
+      if (question.options.length) {
+        answer.other = input.value;
+        if (answer.other.trim() && !question.multiple) {
+          answer.selected = [];
+          for (const choice of fieldset.querySelectorAll("input[data-question-choice]")) {
+            choice.checked = false;
+          }
+        }
+      } else {
+        answer.text = input.value;
+      }
+      changed();
+    });
+    label.append(input);
+    fieldset.append(label);
+  }
+  return fieldset;
 }
 
 function frozenWorkRecovery(value) {
   const roots = Array.isArray(value?.allowedWriteRoots)
     ? value.allowedWriteRoots.map((one) => String(one)).filter(Boolean) : [];
-  const questions = Array.isArray(value?.questions)
-    ? value.questions.map((one) => String(one)).filter(Boolean) : [];
+  const questions = normalizedUserQuestions(value?.questions);
   const remaining = Array.isArray(value?.remaining)
     ? value.remaining.map((one) => String(one)).filter(Boolean) : [];
   return Object.freeze({
@@ -7120,6 +7614,7 @@ function frozenWorkRecovery(value) {
     writeScopeRestricted: Boolean(value?.writeScopeRestricted),
     contextToolBudget: Object.freeze({...value?.contextToolBudget}),
     questions: Object.freeze(questions),
+    questionAnswers: frozenQuestionAnswers(value?.questionAnswers),
     remaining: Object.freeze(remaining),
     objective: String(value?.objective || ""),
     answerDraft: String(value?.answerDraft || ""),
@@ -7210,6 +7705,7 @@ function rememberWorkRecoveryForKey(key, answered, objective, conversation = nul
       ? before.writeScopeRestricted : Boolean(answered?.write_scope_restricted),
     contextToolBudget: answered?.context_tool_budget || before?.contextToolBudget || {},
     questions: answered?.questions || [],
+    questionAnswers: sameRun ? before.questionAnswers : {},
     remaining: answered?.remaining || [],
     objective: sameRun ? before.objective : objective,
     answerDraft: sameRun ? before.answerDraft : "",
@@ -7235,6 +7731,16 @@ function updateWorkRecoveryAnswer(agentId, answer, source) {
   for (const field of fields.filter(Boolean)) {
     if (field !== source && field.value !== answer) field.value = answer;
   }
+  renderWorkRecoveryButtons(agentId);
+}
+
+function updateWorkRecoveryQuestionAnswer(agentId, questionId, answer) {
+  const key = swarmChatKey(agentId);
+  const before = swarmWorkRecoveries.get(key);
+  if (!before) return;
+  const questionAnswers = {...before.questionAnswers, [questionId]: answer};
+  swarmWorkRecoveries.set(key, frozenWorkRecovery({...before, questionAnswers}));
+  saveSwarmWorkRecoveries();
   renderWorkRecoveryButtons(agentId);
 }
 
@@ -7274,9 +7780,22 @@ function fillWorkRecoveryPanel(panel, agentId) {
   if (needs.length) {
     const heading = make("strong", "", recovery.questions.length
       ? "Questions from the team" : "What remains");
-    const list = make("ul", "work-recovery-items");
-    for (const one of needs) list.append(make("li", "", one));
-    panel.append(heading, list);
+    panel.append(heading);
+    if (recovery.questions.length) {
+      const questions = make("div", "agent-question-list");
+      for (const question of recovery.questions) {
+        questions.append(userQuestionFields(
+          question, recovery.questionAnswers[question.id],
+          (answer) => updateWorkRecoveryQuestionAnswer(agentId, question.id, answer),
+          `recovery-${agentId}-${recovery.resumeToken}`,
+        ));
+      }
+      panel.append(questions);
+    } else {
+      const list = make("ul", "work-recovery-items");
+      for (const one of needs) list.append(make("li", "", one));
+      panel.append(list);
+    }
   }
   const scope = make("details", "work-recovery-scope");
   scope.append(make("summary", "", "Locked write destinations"));
@@ -7294,17 +7813,19 @@ function fillWorkRecoveryPanel(panel, agentId) {
     scope.append(make("p", "hint", recovery.contextToolBudget.summary));
   }
   panel.append(scope);
-  const label = make("label", "work-recovery-answer-label",
-    recovery.status === "paused_for_user" ? "Your answer" : "Optional resume note");
-  const answer = make("textarea", "work-recovery-answer");
-  answer.rows = recovery.status === "paused_for_user" ? 3 : 2;
-  answer.value = recovery.answerDraft;
-  answer.placeholder = recovery.status === "paused_for_user"
-    ? "Answer the team's questions to resume"
-    : "Add useful context, or resume without a note";
-  answer.addEventListener("input", () => updateWorkRecoveryAnswer(agentId, answer.value, answer));
-  label.append(answer);
-  panel.append(label);
+  if (recovery.status !== "paused_for_user" || !recovery.questions.length) {
+    const label = make("label", "work-recovery-answer-label",
+      recovery.status === "paused_for_user" ? "Your answer" : "Optional resume note");
+    const answer = make("textarea", "work-recovery-answer");
+    answer.rows = recovery.status === "paused_for_user" ? 3 : 2;
+    answer.value = recovery.answerDraft;
+    answer.placeholder = recovery.status === "paused_for_user"
+      ? "Answer the team's questions to resume"
+      : "Add useful context, or resume without a note";
+    answer.addEventListener("input", () => updateWorkRecoveryAnswer(agentId, answer.value, answer));
+    label.append(answer);
+    panel.append(label);
+  }
   const row = make("div", "button-row work-recovery-actions");
   const resume = make("button", "primary work-recovery-resume",
     recovery.status === "paused_for_user" ? "Answer and resume"
@@ -7321,17 +7842,23 @@ function fillWorkRecoveryPanel(panel, agentId) {
 
 function renderWorkRecoveryButtons(agentId) {
   const recovery = workRecoveryFor(agentId);
-  const unavailable = swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)
+  const unavailable = swarmChatIsBusy(agentId) || swarmConversationSwitching.has(agentId)
     || !theSwarmAgent(agentId)?.ready;
+  const structuredAnswers = compiledQuestionAnswers(
+    recovery?.questions || [], recovery?.questionAnswers || {},
+  );
   const answerMissing = recovery?.status === "paused_for_user"
-    && !String(recovery.answerDraft || "").trim();
+    && (recovery.questions.length
+      ? structuredAnswers.missing.length > 0
+      : !String(recovery.answerDraft || "").trim());
   const card = theChatCardFor(agentId);
   const buttons = [card?.querySelector(".work-recovery-resume")];
   if (theBigOne === agentId) buttons.push($("theBigChatWorkRecovery")
     ?.querySelector(".work-recovery-resume"));
   for (const button of buttons.filter(Boolean)) {
-    setSwarmProviderControl(button, unavailable || answerMissing,
-      answerMissing ? "Answer the paused questions before resuming" : "Resume this saved project-work run");
+    setSwarmProjectWorkControl(button, unavailable || answerMissing,
+      answerMissing ? "Answer the paused questions before resuming" : "Resume this saved project-work run",
+      agentId);
   }
 }
 
@@ -7345,7 +7872,7 @@ function renderWorkRecovery(agentId) {
 function chatRoundPolicyFor(agentId) {
   const key = swarmChatKey(agentId);
   if (!swarmChatRoundPolicies.has(key)) {
-    swarmChatRoundPolicies.set(key, {unlimited: true, maximum: DEFAULT_FINITE_TEAM_ROUNDS});
+    swarmChatRoundPolicies.set(key, {unlimited: false, maximum: DEFAULT_FINITE_TEAM_ROUNDS});
   }
   return swarmChatRoundPolicies.get(key);
 }
@@ -7370,31 +7897,32 @@ function syncChatRoundPolicy(agentId) {
   const compactUnlimited = card?.querySelector(".swarm-chat-round-unlimited");
   if (compactMaximum) {
     compactMaximum.value = String(policy.maximum);
-    compactMaximum.disabled = policy.unlimited || swarmBusy.has(agentId);
+    compactMaximum.disabled = policy.unlimited || swarmChatIsBusy(agentId);
   }
   if (compactUnlimited) {
     compactUnlimited.checked = policy.unlimited;
-    compactUnlimited.disabled = swarmBusy.has(agentId);
+    compactUnlimited.disabled = swarmChatIsBusy(agentId);
   }
   if (theBigOne === agentId && $("theBigChatRoundLimit")) {
     $("theBigChatRoundLimit").value = String(policy.maximum);
-    $("theBigChatRoundLimit").disabled = policy.unlimited || swarmBusy.has(agentId);
+    $("theBigChatRoundLimit").disabled = policy.unlimited || swarmChatIsBusy(agentId);
     $("theBigChatUnlimited").checked = policy.unlimited;
-    $("theBigChatUnlimited").disabled = swarmBusy.has(agentId);
+    $("theBigChatUnlimited").disabled = swarmChatIsBusy(agentId);
   }
 }
 
 function aChatRoundPolicy(agentId) {
   const policy = chatRoundPolicyFor(agentId);
   const panel = make("div", "chat-round-policy");
-  const maximumLabel = make("label", "chat-round-maximum", "Maximum team rounds");
+  panel.append(make("strong", "", "Connected-agent collaboration only"));
+  const maximumLabel = make("label", "chat-round-maximum", "Maximum relay rounds");
   const maximum = document.createElement("input");
   maximum.type = "number";
   maximum.min = "1";
   maximum.max = "10000";
   maximum.value = String(policy.maximum);
   maximum.className = "swarm-chat-round-limit";
-  maximum.setAttribute("aria-label", "Maximum rounds per team phase");
+  maximum.setAttribute("aria-label", "Maximum relay rounds for connected-agent collaboration");
   maximum.disabled = policy.unlimited;
   maximum.addEventListener("change", () => (
     updateChatRoundPolicy(agentId, false, maximum.value)
@@ -7408,10 +7936,11 @@ function aChatRoundPolicy(agentId) {
   unlimited.addEventListener("change", () => (
     updateChatRoundPolicy(agentId, unlimited.checked, maximum.value)
   ));
-  unlimitedLabel.append(unlimited, document.createTextNode(" Unlimited while progress continues"));
+  unlimitedLabel.append(unlimited, document.createTextNode(
+    " Unlimited while progress continues (advanced opt-in)"));
   panel.append(maximumLabel, unlimitedLabel);
   panel.append(make("span", "hint chat-round-help",
-    "Applies to each team phase. Repeated no-progress cycles still stop."));
+    "Ask connected agents stops after 3 relay rounds by default. Unlimited is an explicit opt-in. Project-file Work uses the separate goal engine."));
   return panel;
 }
 
@@ -7485,48 +8014,60 @@ function showActivityInPanel(panel, activity) {
   panel.querySelector(".chat-activity-elapsed").textContent = activityWords(activity);
 }
 
-function renderSwarmChatActivity(agentId) {
-  const activity = swarmChatActivity.get(agentId);
+function renderSwarmChatActivity(agentId, chatKey = swarmChatRuntimeKey(agentId)) {
+  const activity = visibleSwarmChatActivity(swarmChatActivity.get(chatKey));
   const panels = [];
-  const card = theChatCardFor(agentId);
-  if (card) panels.push(card.querySelector(".chat-activity"));
-  if (theBigOne === agentId) panels.push($("theBigChatActivity"));
+  for (const held of swarmChats) {
+    if (swarmChatRuntimeKey(held.agent) !== chatKey) continue;
+    const card = theChatCardFor(held.agent);
+    if (card) panels.push(card.querySelector(".chat-activity"));
+    if (theBigOne === held.agent) panels.push($("theBigChatActivity"));
+  }
   for (const panel of panels.filter(Boolean)) {
     showActivityInPanel(panel, activity);
   }
 }
 
-async function pollSwarmChatActivity(agentId, activityId) {
-  const current = swarmChatActivity.get(agentId);
-  if (!current || current.id !== activityId || current.state !== "working") return;
+async function pollSwarmChatActivity(agentId, chatKey, activityId) {
+  const current = swarmChatActivity.get(chatKey);
+  if (!current || current.id !== activityId || !swarmActivityCanSettle(current)) return;
   try {
     const update = await request(
       `/api/swarm/activity?activity=${encodeURIComponent(activityId)}`
     );
-    const still = swarmChatActivity.get(agentId);
-    if (!still || still.id !== activityId || still.state !== "working") return;
-    still.stage = update.stage || still.stage;
-    still.detail = update.detail || still.detail;
+    const still = swarmChatActivity.get(chatKey);
+    if (!still || still.id !== activityId || !swarmActivityCanSettle(still)) return;
+    if (still.state === "working") {
+      still.stage = update.stage || still.stage;
+      still.detail = update.detail || still.detail;
+    }
     const turns = Array.isArray(update.turns) ? update.turns : [];
     if (turns.length !== still.remoteTurns.length) {
       still.remoteTurns = turns;
-      renderTurnsThatArrived(agentId);
+      renderTurnsThatArrived(agentId, chatKey);
     }
-    renderSwarmChatActivity(agentId);
+    if (["complete", "error", "stopped"].includes(String(update.state || ""))) {
+      settleSwarmChatActivityFromFeed(agentId, still, update);
+      return;
+    }
+    if (selectedChatIs(still)) renderSwarmChatActivity(agentId, chatKey);
   } catch (_) {
     // The main request owns errors. A missed progress poll must never turn a
     // healthy provider answer into a failed chat.
   }
-  const still = swarmChatActivity.get(agentId);
-  if (still && still.id === activityId && still.state === "working") {
+  const still = swarmChatActivity.get(chatKey);
+  if (still && still.id === activityId && swarmActivityCanSettle(still)) {
     still.pollTimer = window.setTimeout(
-      () => pollSwarmChatActivity(agentId, activityId), 450
+      () => pollSwarmChatActivity(agentId, chatKey, activityId), 450
     );
   }
 }
 
 function beginSwarmChatActivity(agentId, mode, agent, words = "", attachments = []) {
-  const previous = swarmChatActivity.get(agentId);
+  const conversation = activeConversationFor(agentId);
+  const chatKey = swarmChatRuntimeKey(agentId);
+  const stateKey = swarmChatKey(agentId);
+  const previous = swarmChatActivity.get(chatKey);
   if (previous) {
     window.clearInterval(previous.elapsedTimer);
     window.clearTimeout(previous.pollTimer);
@@ -7542,7 +8083,11 @@ function beginSwarmChatActivity(agentId, mode, agent, words = "", attachments = 
     work: ["Preparing confirmed project work", "Nexus will collect plans before validating any file changes."],
   }[mode] || ["Starting the request", "Nexus is preparing the agent connection."];
   const activity = {
-    id, state: "working", stage: first[0], detail: first[1], startedAt: Date.now(),
+    agentId, chatKey, stateKey, chatId: conversation?.id || "",
+    filedAs: conversation?.filed_as || "", route: String(agent?.who || ""),
+    id, state: "working", settled: false, settledBy: "", terminalState: "",
+    responseFinished: false, collapsed: false, attachmentsCleared: false,
+    stage: first[0], detail: first[1], startedAt: Date.now(),
     elapsedTimer: 0, pollTimer: 0, finishTimer: 0, remoteTurns: [],
     localTurns: words ? [{
       who: "you", speaker_name: "You", text: words, phase: "user_prompt",
@@ -7551,51 +8096,139 @@ function beginSwarmChatActivity(agentId, mode, agent, words = "", attachments = 
       })),
     }] : [],
   };
-  swarmChatActivity.set(agentId, activity);
-  activity.elapsedTimer = window.setInterval(() => renderSwarmChatActivity(agentId), 1000);
-  renderSwarmChatActivity(agentId);
-  renderTurnsThatArrived(agentId);
-  activity.pollTimer = window.setTimeout(() => pollSwarmChatActivity(agentId, id), 150);
+  swarmChatActivity.set(chatKey, activity);
+  activity.elapsedTimer = window.setInterval(() => {
+    if (selectedChatIs(activity)) renderSwarmChatActivity(agentId, chatKey);
+  }, 1000);
+  renderSwarmChatActivity(agentId, chatKey);
+  renderTurnsThatArrived(agentId, chatKey);
+  activity.pollTimer = window.setTimeout(
+    () => pollSwarmChatActivity(agentId, chatKey, id), 150,
+  );
   return activity;
 }
 
-function finishSwarmChatActivity(agentId, succeeded, detail = "") {
-  const activity = swarmChatActivity.get(agentId);
-  if (!activity) return;
+function scheduleSwarmChatActivityCollapse(agentId, activity, delay) {
+  window.clearTimeout(activity.finishTimer);
+  activity.finishTimer = window.setTimeout(() => {
+    if (!swarmActivityIsCurrent(activity)) return;
+    activity.collapsed = true;
+    if (activity.responseFinished) swarmChatActivity.delete(activity.chatKey);
+    renderSwarmChatActivity(agentId, activity.chatKey);
+    if (theBigOne === agentId) renderTheBigChat();
+  }, delay);
+}
+
+function finishSwarmActivityResponse(agentId, activity) {
+  activity.responseFinished = true;
+  if (!activity.collapsed || !swarmActivityIsCurrent(activity)) return;
+  swarmChatActivity.delete(activity.chatKey);
+  renderSwarmChatActivity(agentId, activity.chatKey);
+  if (theBigOne === agentId) renderTheBigChat();
+}
+
+function settleSwarmChatActivityFromFeed(agentId, activity, update) {
+  if (!swarmActivityCanSettle(activity)) return;
+  activity.settled = true;
+  activity.settledBy = "feed";
+  activity.terminalState = String(update.state || "error");
   window.clearInterval(activity.elapsedTimer);
   window.clearTimeout(activity.pollTimer);
-  activity.state = succeeded ? "complete" : "error";
+  const succeeded = update.state === "complete";
+  const participantOutcome = normalizedParticipantOutcome({
+    participant_outcome: update?.result?.participant_outcome,
+  });
+  const degraded = participantOutcome && participantOutcome.outcome !== "complete";
+  activity.state = degraded ? "attention" : succeeded ? "complete" : "error";
+  activity.stage = degraded
+    ? `${participantOutcome.answered} of ${participantOutcome.expected} agents answered`
+    : update.stage || (succeeded ? "Answer received" : "Request stopped");
+  activity.detail = degraded
+    ? (participantOutcome.outcome === "none"
+      ? "No AI answer was saved. The transcript has exact Repair actions."
+      : "Available replies were saved. The transcript has exact Repair actions for missing participants.")
+    : update.detail || (succeeded
+      ? "Nexus saved the answer and updated the conversation."
+      : "The request ended before an answer was saved.");
+  if (succeeded) {
+    activity.localTurns = [];
+    activity.remoteTurns = [];
+    clearSwarmActivityAttachments(activity);
+  } else {
+    // A lost HTTP rejection must not strand the accepted prompt. Restore it
+    // from the immutable activity snapshot now; a later transport catch sees
+    // the terminal feed and performs no duplicate UI mutation.
+    restoreSwarmActivityDraft(activity);
+  }
+  if (selectedChatIs(activity)) {
+    renderSwarmChatActivity(agentId, activity.chatKey);
+    renderTurnsThatArrived(agentId, activity.chatKey);
+  }
+  // The activity feed is authoritative even if the original HTTP response was
+  // lost. A terminal server run must release this renderer's composer lease.
+  // Late responses are identity-guarded and cannot finish a newer request.
+  swarmBusy.delete(activity.chatKey);
+  swarmStopping.delete(activity.chatKey);
+  setWhatCanBePressedInSwarm();
+  for (const held of swarmChats) {
+    if (swarmChatRuntimeKey(held.agent) === activity.chatKey) {
+      void refreshTheChatFor(held.agent);
+    }
+  }
+  if (theBigOne === agentId) renderTheBigChat();
+  scheduleSwarmChatActivityCollapse(agentId, activity,
+    succeeded && !degraded ? 1600 : 4200);
+}
+
+function finishSwarmChatActivity(
+  agentId, succeeded, detail = "", expectedActivity = null, rawParticipantOutcome = null,
+) {
+  const activity = expectedActivity || swarmChatActivityFor(agentId);
+  if (!activity || (expectedActivity && activity !== expectedActivity)) return;
+  if (!swarmActivityCanSettle(activity)) return;
+  activity.settled = true;
+  activity.settledBy = "response";
+  activity.terminalState = succeeded ? "complete" : "error";
+  window.clearInterval(activity.elapsedTimer);
+  window.clearTimeout(activity.pollTimer);
+  const participantOutcome = normalizedParticipantOutcome({
+    participant_outcome: rawParticipantOutcome,
+  });
+  const degraded = participantOutcome && participantOutcome.outcome !== "complete";
+  activity.state = degraded ? "attention" : succeeded ? "complete" : "error";
   if (succeeded) {
     activity.localTurns = [];
     activity.remoteTurns = [];
   }
-  activity.stage = succeeded ? "Answer received" : "Request stopped";
-  activity.detail = detail || (succeeded
-    ? "Nexus saved the answer and updated the conversation."
-    : "The request ended before an answer was saved.");
-  renderSwarmChatActivity(agentId);
-  renderTurnsThatArrived(agentId);
-  // A completed activity may collapse after the saved answer appears in the
-  // transcript. A failure has no provider answer to replace it, so keep the
-  // exact reason visible until this chat starts another request or is closed.
-  // Hiding it after three seconds made a failed turn look like Nexus had simply
-  // ignored the user.
-  if (succeeded) {
-    activity.finishTimer = window.setTimeout(() => {
-      if (swarmChatActivity.get(agentId) !== activity) return;
-      swarmChatActivity.delete(agentId);
-      renderSwarmChatActivity(agentId);
-    }, 1600);
+  activity.stage = degraded
+    ? `${participantOutcome.answered} of ${participantOutcome.expected} agents answered`
+    : succeeded ? "Answer received" : "Request stopped";
+  activity.detail = degraded
+    ? (participantOutcome.outcome === "none"
+      ? "No AI answer was saved. The transcript has exact Repair actions."
+      : "Available replies were saved. The transcript has exact Repair actions for missing participants.")
+    : detail || (succeeded
+      ? "Nexus saved the answer and updated the conversation."
+      : "The request ended before an answer was saved.");
+  if (selectedChatIs(activity)) {
+    renderSwarmChatActivity(agentId, activity.chatKey);
+    renderTurnsThatArrived(agentId, activity.chatKey);
   }
+  if (theBigOne === agentId) renderTheBigChat();
+  // Failures are now durable Nexus transcript turns. Keep the terminal status
+  // briefly for orientation, then collapse it so it never looks like a live
+  // request or strands the composer below a permanent progress panel.
+  scheduleSwarmChatActivityCollapse(agentId, activity,
+    succeeded && !degraded ? 1600 : 4200);
 }
 
-function markSwarmChatActivityStopping(agentId) {
-  const activity = swarmChatActivity.get(agentId);
-  if (!activity) return;
+function markSwarmChatActivityStopping(agentId, activity = swarmChatActivityFor(agentId)) {
+  if (!activity || !swarmActivityCanSettle(activity)) return;
   activity.state = "stopping";
   activity.stage = "Stopping";
   activity.detail = "Nexus is interrupting only this chat's current request.";
-  renderSwarmChatActivity(agentId);
+  if (selectedChatIs(activity)) renderSwarmChatActivity(agentId, activity.chatKey);
+  if (theBigOne === agentId) renderTheBigChat();
 }
 
 function sayInSwarm(words) { $("swarmSaid").textContent = words; }
@@ -7767,6 +8400,13 @@ async function refreshSwarm(quietly) {
     renderTheKeptBoards();
     renderTheChatTray();
     if (theBigOne) renderTheBigChat();
+    // Route/profile and project-path changes are authority changes for an
+    // existing chat even when its short agent ids stayed the same. Re-read the
+    // small registry snapshots so the protection card and one-click fresh-chat
+    // action appear immediately after a repair, external edit, or board open.
+    void Promise.all(swarmChats.map(
+      (held) => loadConversationsFor(held.agent, false)
+    ));
     // The signed run journal can contain substantial history and its first
     // open performs integrity verification. Draw the saved board immediately;
     // recovery cards hydrate independently a moment later.
@@ -7774,7 +8414,8 @@ async function refreshSwarm(quietly) {
     // The goal cursor is server-owned. Rehydrate it independently so closing
     // or reloading this renderer cannot restart at goal one or strand a queued
     // successor after the preceding goal verified.
-    void refreshBoardGoalQueue(true);
+    void refreshBoardGoalQueue(false);
+    void refreshLongGoals(true);
     // What the agents passed to each other, so the list down the side holds
     // those conversations too rather than only the ones you have had. It is
     // small, and without it the list is half a list until somebody opens the
@@ -7918,12 +8559,16 @@ function renderSwarmBoard() {
   for (const box of document.querySelectorAll(".swarm-chat-card .swarm-chat-box")) {
     const agentId = box.closest(".swarm-chat-card")?.dataset.agent;
     if (!agentId) continue;
-    composerState.set(agentId, {
+    const state = {
       value: box.value,
       start: box.selectionStart,
       end: box.selectionEnd,
       direction: box.selectionDirection,
-    });
+    };
+    composerState.set(agentId, state);
+    const chatKey = swarmChatKey(agentId);
+    swarmChatComposerDrafts.set(chatKey, state);
+    swarmChatComposerKeys.set(agentId, chatKey);
     if (document.activeElement === box) focusedComposer = agentId;
   }
   // Anything pointed at is about to be a different element. Left behind, the
@@ -7936,7 +8581,9 @@ function renderSwarmBoard() {
     old.remove();
   }
   const said = theSwarmBoard();
-  if (!said.agents.length && !said.projects.length) {
+  if (!swarmBoardHydrated) {
+    canvas.append(make("div", "swarm-empty", "Loading your saved board…"));
+  } else if (!said.agents.length && !said.projects.length) {
     canvas.append(make("div", "swarm-empty",
       "Nothing on the board yet. Press Add another agent under the board, then Add "
       + "another project folder, then press the gear on the line between them."));
@@ -8037,15 +8684,12 @@ function oneSwarmBox(kind, one) {
       () => openTheChatFor(one.id), `chat with ${one.name}`, "chat"));
   }
   box.append(tools);
-  // Put the repair beside the problem itself.  The readiness list may be off
-  // screen in a full-board view, and a provider setting hidden behind an agent
-  // gear looks like an agent setting.  Gemini's project id belongs to the
-  // provider route, so this calls the existing guarded connection flow.
-  if (kind === "agent" && one.can_be_connected) {
-    const label = one.assistant_kind === "gemini-cli"
-      ? "Set Cloud project"
-      : "Connect it";
-    const connect = make("button", "swarm-connect swarm-box-connect", label);
+  // Put the one provider-neutral repair entry point beside the problem itself.
+  // The engine diagnoses this exact route before offering any provider action;
+  // the board card must not guess that a failure is a login or Cloud-project
+  // problem from the provider kind alone.
+  if (kind === "agent" && (!one.ready || one.trouble_last_time)) {
+    const connect = make("button", "swarm-connect swarm-box-connect", "Repair connection");
     connect.type = "button";
     // The whole card is draggable and captures a pointer that starts anywhere
     // inside it.  Keep this action out of that drag gesture, just like the gear
@@ -8055,7 +8699,7 @@ function oneSwarmBox(kind, one) {
     connect.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      connectThisAssistant(one.can_be_connected, connect);
+      void openAgentRepairFlow(one.id, connect);
     });
     box.append(connect);
   }
@@ -8224,19 +8868,18 @@ function renderSwarmNotReady() {
   }
   for (const one of said) {
     const row = make("li", "", one);
-    // A button right where the problem is said, when one press would fix it.
-    // Somebody had Claude installed and signed in, an agent set to use it, and
-    // this list saying not ready - with nothing to press, because the only way
-    // to point the settings at it was a terminal.
+    // Every agent problem is also a direct route into the same provider-neutral
+    // diagnosis shown in that agent's settings. Users should never have to
+    // decode this sentence, find a distant box, and guess which login button
+    // might apply.
     const stuck = (theSwarmBoard().agents || []).find(
-      (agent) => agent.can_be_connected && one.startsWith(`${agent.name}:`));
+      (agent) => one.startsWith(`${agent.name}:`));
     if (stuck) {
-      const connect = make("button", "swarm-connect", "Connect it");
+      const connect = make("button", "swarm-connect", "Fix this agent");
       connect.type = "button";
       connect.setAttribute("aria-label",
-        `Connect ${stuck.who} so ${stuck.name} can be used`);
-      connect.addEventListener("click", () => connectThisAssistant(
-        stuck.can_be_connected, connect));
+        `Open connection repair for ${stuck.name}`);
+      connect.addEventListener("click", () => void openAgentRepairFlow(stuck.id, connect));
       row.append(connect);
     }
     list.append(row);
@@ -8358,6 +9001,24 @@ function pickSwarmBox(kind, id) {
   showTheSwarmPanel();
   renderSwarmBoard();
   renderSwarmPanel();
+}
+
+async function openAgentRepairFlow(agentId, button = null) {
+  // A maximised chat is modal, so expose the selected agent's board panel
+  // before moving focus into it. The chat stays open in the tray.
+  if (!$("theBigChat").hidden) minimiseTheBigChat(false);
+  pickSwarmBox("agent", agentId);
+  const selected = theSwarmAgent(agentId);
+  if (!selected) {
+    sayInSwarm("That agent is no longer on this board. The board was refreshed.");
+    return;
+  }
+  if (selected.who) await loadAgentRepairPlan(agentId, selected.who, button);
+  else renderSwarmAgentPanel(selected);
+  const panel = $("swarmAgentRepair");
+  panel?.scrollIntoView({block: "nearest", behavior: "smooth"});
+  const first = panel?.querySelector("button:not([hidden]):not(:disabled)");
+  first?.focus({preventScroll: true});
 }
 
 function renderSwarmStructure() {
@@ -8691,17 +9352,26 @@ function renderSwarmAgentPanel(agent) {
     who.append(gone);
   }
   who.value = values.who;
-  const check = $("swarmAgentCheckLogin");
-  const login = $("swarmAgentManualLogin");
-  const session = $("swarmAgentSessionStatus");
   const route = String(values.who || "");
-  check.disabled = !route;
-  login.disabled = !route;
-  check.onclick = () => checkAgentLogin(agent.id, route);
-  login.onclick = () => manuallyLogInAgent(agent.id, route);
-  session.textContent = route
-    ? "Check the provider session before sending a message."
-    : "Choose an assistant first.";
+  const routeIdentity = $("swarmAgentRouteIdentity");
+  const routeSetup = (swarmSaid.who_can_be_used || []).find((one) => one.route === route);
+  if (!route) {
+    routeIdentity.textContent = "No provider route is assigned to this agent.";
+    routeIdentity.dataset.tone = "missing";
+  } else if (!routeSetup) {
+    routeIdentity.textContent = `Actual route: ${route}. It is not available on this computer.`;
+    routeIdentity.dataset.tone = "missing";
+  } else {
+    const model = String(routeSetup.model || agent.chat_destination?.model || "").trim();
+    routeIdentity.textContent = `Actual provider: ${routeSetup.label || routeSetup.kind || route}. Route: ${route}${model ? `. Model: ${model}` : ""}.`;
+    routeIdentity.dataset.tone = routeSetup.ready ? "ready" : "missing";
+  }
+  const cachedRepair = swarmAgentRepairPlans.get(agent.id);
+  renderAgentRepairPanel(
+    agent,
+    route,
+    cachedRepair?.route === route ? cachedRepair.plan : null,
+  );
 
   const worksOn = $("swarmWorksOn");
   worksOn.replaceChildren();
@@ -8873,6 +9543,21 @@ function whyTheBoardIsHeld() {
   return "";
 }
 
+function boardGoalAuthorityPause() {
+  const authorities = swarmSaid.project_authorities || {};
+  const selected = (theSwarmBoard().projects || []).filter(
+    (project) => (project.tasks || []).some((task) => String(task || "").trim()),
+  );
+  const blocked = selected.filter(
+    (project) => authorities[project.id]?.can_run === false,
+  );
+  return blocked.length
+    ? blocked.map((project) => (
+      `${project.name}: ${authorities[project.id]?.reason || "Project execution is paused."}`
+    )).join(" ")
+    : "";
+}
+
 function setWhatCanBePressedInSwarm() {
   const agent = thePickedAgent();
   const project = thePickedProject();
@@ -8931,43 +9616,97 @@ function setWhatCanBePressedInSwarm() {
   for (const tick of $("swarmTalksTo").querySelectorAll("input")) tick.disabled = held;
   $("swarmStart").disabled = held || Boolean(swarmSaid.cannot_run) || swarmGoing;
   $("swarmStart").title = String(swarmSaid.cannot_run || held || "");
+  const boardGoalPause = boardGoalAuthorityPause();
   $("swarmWorkGoals").disabled = Boolean(
-    held || swarmSaid.cannot_run || swarmGoing || swarmGoalWorkRunning
-    || swarmGoalQueue?.status === "running");
+    held || boardGoalPause || swarmGoing || swarmGoalWorkRunning);
   $("swarmWorkGoals").title = String(
-    swarmSaid.cannot_run || held
-    || (swarmGoalQueue?.status === "running" || swarmGoalWorkRunning
-      ? "The exact current goal is already running." : ""));
-  $("swarmCancelGoals").disabled = !swarmGoalQueue
-    || !["queued", "paused"].includes(swarmGoalQueue.status);
+    boardGoalPause || held
+    || (swarmGoalWorkRunning ? "Goal work is starting." : ""));
+  $("swarmCancelGoals").disabled = !longGoal
+    || ["complete", "cancelled", "failed"].includes(longGoal.status);
+  const longProjectWorkActive = longGoals.some(
+    (goal) => ["queued", "running", "paused", "waiting_for_user"].includes(goal.status));
+  $("swarmLegacyGoals").disabled = Boolean(
+    held || boardGoalPause || swarmGoing || swarmGoalWorkRunning
+    || ["queued", "running"].includes(swarmGoalQueue?.status)
+    || longProjectWorkActive);
+  $("swarmLegacyGoals").title = longProjectWorkActive
+    ? "Cancel or finish active long-horizon project work before using the legacy paired workflow."
+    : "Use the older paired plan/review/execute workflow.";
   $("swarmStop").disabled = !swarmGoing;
   for (const card of $("swarmBoard").querySelectorAll(".swarm-chat-card")) {
     setWhatCanBePressedInAChat(card);
   }
   if (theBigOne) {
-    const busy = swarmBusy.has(theBigOne);
-    const waiting = busy || swarmConversationSwitching.has(theBigOne);
-    const stopping = swarmStopping.has(theBigOne);
+    // The maximised chat owns its own agent identity. Board settings selection
+    // is unrelated and may legitimately be empty (or point at a project or a
+    // different agent), especially after restart and repair inspection.
+    const chatAgent = theSwarmAgent(theBigOne);
+    const busy = swarmChatIsBusy(theBigOne);
+    const identityChanging = swarmChatIsResetting(theBigOne)
+      || swarmConversationSwitching.has(theBigOne) || swarmChatIsHydrating(theBigOne);
+    const waiting = busy || identityChanging;
+    const stopping = swarmChatIsStopping(theBigOne);
     const recovery = workRecoveryFor(theBigOne);
-    $("theBigChatAttach").disabled = waiting;
-    setSwarmProviderControl($("theBigChatSend"), waiting, "Send with automatic collaboration");
-    setSwarmProviderControl($("theBigChatSolo"), waiting, "Ask only this agent");
-    setSwarmProviderControl($("theBigChatCollaborate"), waiting,
-      "Ask connected agents to collaborate");
+    const lone = isLoneAgentChat(theBigOne);
     const conversation = activeConversationFor(theBigOne);
+    const bindingProblem = conversation?.binding_problem;
+    const bindingWords = String(bindingProblem?.message || "");
+    const recipientWords = syncChatRecipientWords(theBigOne);
+    const unavailablePeers = syncChatTeamReadiness(theBigOne);
+    // Do not accept text under one saved-chat identity while its replacement
+    // is still being selected. The composer draft is keyed by chat id, so a
+    // keystroke in this interval would otherwise be saved under the old id and
+    // appear to vanish as soon as the authoritative selection arrives.
+    $("theBigChatBox").disabled = !chatAgent || identityChanging;
+    $("theBigChatBox").title = identityChanging
+      ? "Wait while Nexus opens the selected saved chat."
+      : "";
+    $("theBigChatAttach").disabled = waiting || !chatAgent || !chatAgent.ready;
+    if (bindingProblem) $("theBigChatAttach").disabled = true;
+    $("theBigChatSend").disabled = waiting || !chatAgent || !chatAgent.ready
+      || Boolean(bindingProblem);
+    $("theBigChatSend").title = bindingWords
+      || `${recipientWords.direct}. No connected peer receives this request.`;
+    $("theBigChatCollaborate").disabled = waiting || lone || Boolean(bindingProblem)
+      || unavailablePeers.length > 0;
+    $("theBigChatCollaborate").title = bindingWords || (lone
+      ? loneAgentActionMessage("collaborate")
+      : unavailablePeers.length
+      ? `Repair ${unavailablePeers.map((one) => one.name || one.id).join(", ")} before asking the team.`
+      : `${recipientWords.team}. Expected initial replies: ${recipientWords.expected}.`);
     if ($("theBigChatWork")) {
-      const workTitle = recovery
+      const workTitle = bindingWords || (lone
+        ? loneAgentActionMessage("work")
+        : recovery
         ? "Resume the saved project-work run before starting another"
         : conversation && !conversation.project
         ? "Choose this chat's active project first"
-        : "Ask this pair to work together on the selected project";
-      setSwarmProviderControl($("theBigChatWork"), waiting || Boolean(recovery)
-        || (Boolean(conversation) && !conversation.project), workTitle);
+        : "Start durable project work with a required contribution from every ready agent in this chat");
+      setSwarmProjectWorkControl($("theBigChatWork"), waiting || lone || Boolean(recovery)
+        || Boolean(bindingProblem)
+        || (Boolean(conversation) && !conversation.project), workTitle, theBigOne);
     }
-    if ($("theBigChatProject")) $("theBigChatProject").disabled = waiting || !conversation;
+    if ($("theBigChatProject")) {
+      $("theBigChatProject").disabled = waiting || !conversation || Boolean(bindingProblem);
+    }
     syncChatRoundPolicy(theBigOne);
     for (const button of $("theBigChatConversationList")?.querySelectorAll("button") || []) {
-      button.disabled = waiting || button.dataset.archived === "true";
+      const action = button.dataset.conversationAction || "";
+      const chatId = button.dataset.chatId || "";
+      const targetBusy = Boolean(chatId) && swarmChatIsBusy(theBigOne, chatId);
+      const targetResetting = Boolean(chatId) && swarmChatIsResetting(theBigOne, chatId);
+      const switching = swarmConversationSwitching.has(theBigOne);
+      // Sidebar rows are navigation for independent saved chats. A turn in
+      // the selected chat must not disable a sibling row or its New-chat
+      // action; only destructive controls for the exact live chat are held.
+      if (action === "pick") {
+        button.disabled = switching || button.dataset.archived === "true";
+      } else if (action === "archive") {
+        button.disabled = switching || targetBusy || targetResetting;
+      } else {
+        button.disabled = switching;
+      }
     }
     const stop = $("theBigChatStop");
     if (stop) {
@@ -9030,6 +9769,9 @@ async function applyOneChangeToTheBoard(change, note) {
     renderSwarmNotReady();
     renderSwarmPanel();
     renderTheChatsOnThisBoard();
+    void Promise.all(swarmChats.map(
+      (held) => loadConversationsFor(held.agent, false)
+    ));
     if (note) sayInSwarm(typeof note === "function" ? note() : note);
     return true;
   } catch (error) {
@@ -9262,6 +10004,7 @@ async function openTheChatFor(agentId) {
   if (!agent) return;
   const already = swarmChats.find((one) => one.agent === agentId);
   if (!already) {
+    swarmConversationHydrating.add(agentId);
     swarmChats.push({
       agent: agentId,
       at: {x: Math.max(0, agent.at.x - 20), y: agent.at.y + 190},
@@ -9288,6 +10031,8 @@ async function openTheChatFor(agentId) {
 }
 
 function closeTheChatFor(agentId) {
+  swarmConversationHydrating.delete(agentId);
+  swarmConversationTranscriptRefreshes.delete(agentId);
   swarmChats = swarmChats.filter((one) => one.agent !== agentId);
   renderSwarmBoard();
   renderTheChatsOnThisBoard();
@@ -9379,7 +10124,9 @@ function connectedPairsFor(agentId) {
 function applyConversationList(agentId, said) {
   const held = swarmChats.find((one) => one.agent === agentId);
   if (!held) return;
+  swarmConversationHydrating.delete(agentId);
   const before = held.conversation;
+  rememberSwarmChatComposer(agentId);
   held.conversations = Array.isArray(said?.chats) ? said.chats : [];
   const ids = new Set(held.conversations.map((one) => one.id));
   held.conversation = ids.has(said?.active) ? said.active
@@ -9394,6 +10141,7 @@ function applyConversationList(agentId, said) {
     nextSwarmChatRevision(agentId);
     renderTheChatThreadFor(agentId, []);
   }
+  syncSwarmChatComposer(agentId);
   const card = theChatCardFor(agentId);
   const oldDestination = card?.querySelector(".chat-destination");
   if (oldDestination) {
@@ -9407,7 +10155,11 @@ function applyConversationList(agentId, said) {
 
 async function loadConversationsFor(agentId, refresh = true) {
   const held = swarmChats.find((one) => one.agent === agentId);
-  if (!held || swarmConversationSwitching.has(agentId)) return;
+  if (!held) return;
+  if (refresh || swarmChatIsHydrating(agentId)) {
+    swarmConversationTranscriptRefreshes.add(agentId);
+  }
+  if (swarmConversationSwitching.has(agentId)) return;
   const revision = nextConversationListRevision(agentId);
   try {
     const said = await request(
@@ -9416,20 +10168,37 @@ async function loadConversationsFor(agentId, refresh = true) {
     if (!swarmChats.includes(held)
         || swarmConversationListRevisions.get(agentId) !== revision) return;
     applyConversationList(agentId, said);
-    if (refresh && swarmConversationListRevisions.get(agentId) === revision) {
+    // A metadata-only request may have superseded a full request while both
+    // were in flight. The winning request inherits the pending transcript
+    // intent instead of leaving a correctly selected chat visibly empty.
+    const refreshTranscript = swarmConversationTranscriptRefreshes.delete(agentId);
+    if (refreshTranscript && swarmConversationListRevisions.get(agentId) === revision) {
       await refreshTheChatFor(agentId);
     }
   } catch (error) {
     if (swarmConversationListRevisions.get(agentId) !== revision) return;
     sayInTheChatFor(agentId, error.message);
-    if (theBigOne === agentId) {
-      $("theBigChatConversationSaid").textContent = error.message;
-    }
+    sayInBigChatConversationFor(agentId, error.message);
+  } finally {
+    setWhatCanBePressedInSwarm();
+  }
+}
+
+function finishConversationSwitch(agentId) {
+  swarmConversationSwitching.delete(agentId);
+  setWhatCanBePressedInSwarm();
+  // A card can be closed and reopened while an older lifecycle request is in
+  // flight. Its first metadata read correctly waits for that mutation; retry
+  // now so the reopened card cannot remain forever under legacy:<agent>.
+  if ((swarmChatIsHydrating(agentId)
+      || swarmConversationTranscriptRefreshes.has(agentId))
+      && swarmChats.some((one) => one.agent === agentId)) {
+    void loadConversationsFor(agentId, false);
   }
 }
 
 async function createConversationFor(agentId, peerId) {
-  if (swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
+  if (swarmConversationSwitching.has(agentId) || swarmChatIsHydrating(agentId)) return;
   swarmConversationSwitching.add(agentId);
   nextConversationListRevision(agentId);
   setWhatCanBePressedInSwarm();
@@ -9440,22 +10209,23 @@ async function createConversationFor(agentId, peerId) {
     applyConversationList(agentId, said);
     keepWhatWasSaidTo(agentId, []);
     await refreshTheChatFor(agentId);
-    $("theBigChatConversationSaid").textContent = "New pair chat created.";
-    $("theBigChatBox").focus();
+    sayInBigChatConversationFor(agentId, "New pair chat created.");
+    if (bigChatShows(agentId)) $("theBigChatBox").focus();
   } catch (error) {
-    $("theBigChatConversationSaid").textContent = error.message;
+    sayInBigChatConversationFor(agentId, error.message);
   } finally {
-    swarmConversationSwitching.delete(agentId);
-    setWhatCanBePressedInSwarm();
+    finishConversationSwitch(agentId);
   }
 }
 
 async function activateConversationFor(agentId, chatId) {
   const held = swarmChats.find((one) => one.agent === agentId);
   const conversation = (held?.conversations || []).find((one) => one.id === chatId);
-  if (!held || held.conversation === chatId || swarmBusy.has(agentId)
+  if (!held || held.conversation === chatId
       || swarmConversationSwitching.has(agentId)
+      || swarmChatIsHydrating(agentId)
       || !conversation || conversation.archived_at) return;
+  rememberSwarmChatComposer(agentId);
   swarmConversationSwitching.add(agentId);
   nextConversationListRevision(agentId);
   // Change the highlighted row, header, destination, project, and transcript
@@ -9464,6 +10234,7 @@ async function activateConversationFor(agentId, chatId) {
   held.conversation = chatId;
   held.said = [];
   held.saidFor = transcriptIdentityFor(agentId);
+  syncSwarmChatComposer(agentId);
   nextSwarmChatRevision(agentId);
   renderTheChatThreadFor(agentId, []);
   if (theBigOne === agentId) renderTheBigChat();
@@ -9475,27 +10246,28 @@ async function activateConversationFor(agentId, chatId) {
     });
     if (!swarmChats.includes(held) || held.conversation !== chatId) return;
     applyConversationList(agentId, said);
-    $("theBigChatSaidBack").textContent = "Switched chat.";
+    if (bigChatShows(agentId, chatId)) $("theBigChatSaidBack").textContent = "Switched chat.";
     await refreshTheChatFor(agentId);
   } catch (error) {
     failed = error;
   } finally {
-    swarmConversationSwitching.delete(agentId);
-    setWhatCanBePressedInSwarm();
+    finishConversationSwitch(agentId);
   }
   if (failed) {
     // The optimistic selection was not committed. Re-read the authoritative
     // selection rather than leaving the interface on a chat the server did
     // not accept.
     await loadConversationsFor(agentId);
-    $("theBigChatConversationSaid").textContent = failed.message;
+    sayInBigChatConversationFor(agentId, failed.message);
   }
 }
 
 async function archiveConversationFor(agentId, chatId) {
   const conversation = (swarmChats.find((one) => one.agent === agentId)?.conversations || [])
     .find((one) => one.id === chatId);
-  if (!conversation || swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
+  if (!conversation || swarmChatIsBusy(agentId, chatId)
+      || swarmChatIsResetting(agentId, chatId) || swarmChatIsHydrating(agentId)
+      || swarmConversationSwitching.has(agentId)) return;
   const pair = (conversation.pair_agents || []).map((one) => one.name).join(" and ");
   if (!window.confirm(
     `Archive ${conversation.name} between ${pair || "these agents"}?\n\n`
@@ -9511,20 +10283,19 @@ async function archiveConversationFor(agentId, chatId) {
     applyConversationList(agentId, said);
     keepWhatWasSaidTo(agentId, []);
     if (activeConversationFor(agentId)) await refreshTheChatFor(agentId);
-    $("theBigChatConversationSaid").textContent = "Chat archived. Its history is still saved.";
+    sayInBigChatConversationFor(agentId, "Chat archived. Its history is still saved.");
   } catch (error) {
-    $("theBigChatConversationSaid").textContent = error.message;
+    sayInBigChatConversationFor(agentId, error.message);
   } finally {
-    swarmConversationSwitching.delete(agentId);
-    setWhatCanBePressedInSwarm();
+    finishConversationSwitch(agentId);
   }
 }
 
 async function restoreConversationFor(agentId, chatId) {
   const conversation = (swarmChats.find((one) => one.agent === agentId)?.conversations || [])
     .find((one) => one.id === chatId);
-  if (!conversation?.archived_at || swarmBusy.has(agentId)
-      || swarmConversationSwitching.has(agentId)) return;
+  if (!conversation?.archived_at || swarmConversationSwitching.has(agentId)
+      || swarmChatIsHydrating(agentId)) return;
   swarmConversationSwitching.add(agentId);
   nextConversationListRevision(agentId);
   setWhatCanBePressedInSwarm();
@@ -9534,19 +10305,20 @@ async function restoreConversationFor(agentId, chatId) {
     });
     applyConversationList(agentId, said);
     await refreshTheChatFor(agentId);
-    $("theBigChatConversationSaid").textContent = "Chat restored with its saved history.";
-    $("theBigChatBox").focus();
+    sayInBigChatConversationFor(agentId, "Chat restored with its saved history.");
+    if (bigChatShows(agentId)) $("theBigChatBox").focus();
   } catch (error) {
-    $("theBigChatConversationSaid").textContent = error.message;
+    sayInBigChatConversationFor(agentId, error.message);
   } finally {
-    swarmConversationSwitching.delete(agentId);
-    setWhatCanBePressedInSwarm();
+    finishConversationSwitch(agentId);
   }
 }
 
 async function selectConversationProject(agentId, projectId) {
   const conversation = activeConversationFor(agentId);
-  if (!conversation || swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
+  if (!conversation || swarmChatIsBusy(agentId) || swarmChatIsResetting(agentId)
+      || swarmChatIsHydrating(agentId)
+      || swarmConversationSwitching.has(agentId)) return;
   swarmConversationSwitching.add(agentId);
   nextConversationListRevision(agentId);
   setWhatCanBePressedInSwarm();
@@ -9558,15 +10330,16 @@ async function selectConversationProject(agentId, projectId) {
     });
     applyConversationList(agentId, said);
     const selected = activeConversationFor(agentId);
-    $("theBigChatProjectHelp").textContent = selected?.project
-      ? "This chat's file work is confined to the selected folder."
-      : "Choose a shared project before asking the pair to change files.";
+    if (bigChatShows(agentId, conversation.id)) {
+      $("theBigChatProjectHelp").textContent = selected?.project
+        ? "This chat's file work is confined to the selected folder."
+        : "Choose a shared project before asking the pair to change files.";
+    }
   } catch (error) {
-    $("theBigChatConversationSaid").textContent = error.message;
-    renderTheBigChat();
+    sayInBigChatConversationFor(agentId, error.message, conversation.id);
+    if (bigChatShows(agentId, conversation.id)) renderTheBigChat();
   } finally {
-    swarmConversationSwitching.delete(agentId);
-    setWhatCanBePressedInSwarm();
+    finishConversationSwitch(agentId);
   }
 }
 
@@ -9762,6 +10535,12 @@ function showHowTheSwarmFillsTheScreen(full = document.fullscreenElement === $("
 
 async function toggleTheSwarmFullScreen() {
   const wanted = !swarmIsFullScreen;
+  const focusedBox = $("theBigChatBox");
+  const restoreComposer = Boolean(
+    focusedBox && document.activeElement === focusedBox && !$("theBigChat").hidden,
+  );
+  const focusedKey = theBigChatComposerKey;
+  const focusedState = restoreComposer ? rememberTheBigChatComposer() : null;
   try {
     if (wanted) putTheChatsInTheSwarmFullScreen();
     if (window.harnessDesktop?.setFullScreen) {
@@ -9776,6 +10555,18 @@ async function toggleTheSwarmFullScreen() {
   } catch (error) {
     putTheChatsBackWhereTheyLive();
     sayInSwarm(`Full screen could not be opened: ${error.message || error}`);
+  } finally {
+    // Native full-screen transitions can take focus after the DOM has already
+    // been reparented. The desktop bridge now waits for that transition; put
+    // the exact saved chat's caret back only after it has really completed.
+    const box = $("theBigChatBox");
+    if (restoreComposer && focusedState && box?.isConnected
+        && !$("theBigChat").hidden && theBigChatComposerKey === focusedKey) {
+      box.focus({preventScroll: true});
+      box.setSelectionRange(
+        focusedState.start, focusedState.end, focusedState.direction || "none",
+      );
+    }
   }
 }
 
@@ -9838,6 +10629,38 @@ async function showTheSharedLedger(destination, button) {
   }
 }
 
+async function resetCollaborationRecord(agent, conversation, button) {
+  if (!agent?.id || !conversation?.id || !conversation?.collaboration_problem) return;
+  if (!window.confirm(
+    "Reset only this chat's damaged collaboration record?\n\n"
+    + "The saved transcript, attachments, and provider conversations are preserved. "
+    + "No prompt is sent and no AI is contacted."
+  )) return;
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Resetting record…";
+  try {
+    const said = await request("/api/swarm/collaboration/reset", {
+      method: "POST", body: JSON.stringify({
+        agent: agent.id, chat: conversation.id,
+      }),
+    });
+    sayInRuntimeChat(swarmChatRuntimeKeyFor(agent.id, conversation.id),
+      said.note || "The collaboration record was reset. The transcript and provider conversations were preserved.");
+    await loadConversationsFor(agent.id, false);
+    await refreshTheChatFor(agent.id);
+  } catch (error) {
+    const words = String(error?.message || error);
+    showError(words);
+    sayInRuntimeChat(swarmChatRuntimeKeyFor(agent.id, conversation.id), words);
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = was;
+    }
+  }
+}
+
 function aChatDestination(agent, {offerFullChat = false, conversation = null} = {}) {
   const destination = chatDestinationFor(agent, conversation);
   const box = make("section", "chat-destination");
@@ -9858,6 +10681,15 @@ function aChatDestination(agent, {offerFullChat = false, conversation = null} = 
       `Live shared agent ledger: ${destination.collaboration_path}`));
   }
   box.append(make("p", "chat-destination-warning", destination.explanation));
+  const collaborationProblem = conversation?.collaboration_problem;
+  if (collaborationProblem) {
+    box.append(make("p", "chat-destination-warning collaboration-problem",
+      String(collaborationProblem.message || collaborationProblem)));
+    if (collaborationProblem.action_note) {
+      box.append(make("p", "hint collaboration-problem-note",
+        String(collaborationProblem.action_note)));
+    }
+  }
   const actions = make("div", "chat-destination-actions");
   if (offerFullChat && agent) {
     const open = make("button", "", "Open full Nexus chat");
@@ -9910,6 +10742,19 @@ function aChatDestination(agent, {offerFullChat = false, conversation = null} = 
       : "The shared ledger appears when connected agents begin a collaboration.";
     shared.addEventListener("click", () => showTheSharedLedger(destination, shared));
     actions.append(shared);
+  }
+  if (collaborationProblem && agent && conversation) {
+    const reset = make("button", "danger collaboration-record-reset",
+      String(collaborationProblem.action_label || "Reset collaboration record"));
+    reset.type = "button";
+    reset.disabled = swarmChatIsBusy(agent.id, conversation.id);
+    reset.title = reset.disabled
+      ? "Stop this exact chat's current request before resetting its collaboration record."
+      : "Reset only the damaged collaboration ledger. Preserve the transcript and provider conversations; send nothing.";
+    reset.addEventListener("click", () => (
+      resetCollaborationRecord(agent, conversation, reset)
+    ));
+    actions.append(reset);
   }
   if (actions.childElementCount) box.append(actions);
   return box;
@@ -10014,36 +10859,28 @@ function oneSwarmChatCard(held) {
   if (agent.how_to_fix_it) {
     card.append(make("p", "swarm-chat-repair hint", agent.how_to_fix_it));
   }
-  if (agent.trouble_last_time && agent.assistant_kind === "claude-cli") {
-    const repair = make("button", "swarm-repair", "Repair Claude access");
+  if (agent.trouble_last_time || !agent.ready) {
+    const repair = make("button", "swarm-repair", "Repair connection");
     repair.type = "button";
-    repair.addEventListener("click", () => repairClaudeAccess(repair));
+    repair.addEventListener("click", () => void openAgentRepairFlow(agent.id, repair));
     card.append(repair);
-  } else if (agent.trouble_last_time && agent.can_sign_in && agent.assistant_kind) {
-    const signIn = make("button", "swarm-sign-in", "Open its sign-in");
-    signIn.type = "button";
-    signIn.addEventListener("click", () => signInThisAssistant(
-      agent.who || agent.assistant_kind, signIn));
-    card.append(signIn);
-  }
-  if (agent.trouble_last_time && agent.assistant_kind === "gemini-cli") {
-    const projectHelp = make("button", "swarm-project-help", "Find Cloud project ID");
-    projectHelp.type = "button";
-    projectHelp.addEventListener("click", showGeminiProjectHelp);
-    card.append(projectHelp);
   }
   card.append(aChatDestination(agent, {
     offerFullChat: true, conversation: activeConversationFor(held.agent),
   }));
+  const transcript = make("div", "swarm-chat-transcript");
   const thread = make("ol", "swarm-chat-thread talk-thread");
-  card.append(thread);
+  transcript.append(thread);
   putTheChatTurnsIn(
     thread, agent, chatTurnsWhileWorking(held.agent, keptTranscriptFor(held.agent)), false
   );
 
   const activityPanel = aChatActivityPanel("swarm-chat-activity");
-  showActivityInPanel(activityPanel, swarmChatActivity.get(held.agent));
-  card.append(activityPanel);
+  showActivityInPanel(
+    activityPanel, visibleSwarmChatActivity(swarmChatActivityFor(held.agent)),
+  );
+  transcript.append(activityPanel);
+  card.append(transcript);
 
   const recoveryPanel = make("section", "work-recovery swarm-chat-work-recovery");
   fillWorkRecoveryPanel(recoveryPanel, held.agent);
@@ -10054,6 +10891,13 @@ function oneSwarmChatCard(held) {
   box.rows = 6;
   box.placeholder = "What did you change and why?";
   box.setAttribute("aria-label", `What to say to ${agent.name}`);
+  const composerKey = swarmChatKey(held.agent);
+  const composer = swarmChatComposerDrafts.get(composerKey);
+  box.value = composer?.value || "";
+  if (composer) box.setSelectionRange(
+    composer.start, composer.end, composer.direction || "none",
+  );
+  swarmChatComposerKeys.set(held.agent, composerKey);
   form.append(box);
   const attachments = make("div", "chat-attachments");
   form.append(attachments);
@@ -10069,16 +10913,22 @@ function oneSwarmChatCard(held) {
   });
   form.append(files);
   form.append(aChatRoundPolicy(held.agent));
+  const recipientWords = chatRecipientWords(held.agent);
+  const scope = make("p", "hint swarm-chat-scope", recipientWords.help);
+  scope.setAttribute("role", "status");
+  scope.setAttribute("aria-live", "polite");
+  form.append(scope);
+  const readiness = make("section", "chat-team-readiness swarm-chat-team-readiness");
+  readiness.setAttribute("aria-live", "polite");
+  readiness.setAttribute("aria-label", "Team connection readiness");
+  form.append(readiness);
+  fillChatTeamReadiness(readiness, held.agent);
   const row = make("div", "button-row");
-  const send = make("button", "primary swarm-chat-send", "Send");
+  const send = make("button", "primary swarm-chat-send", recipientWords.direct);
   send.type = "submit";
-  send.title = "Send directly or automatically involve connected agents when useful";
+  send.title = "Send only to this agent";
+  send.setAttribute("aria-label", recipientWords.direct);
   row.append(send);
-  const solo = make("button", "swarm-chat-solo", "Chat with only this agent");
-  solo.type = "button";
-  solo.title = "Send only to this agent; connected agents will not join this turn";
-  solo.addEventListener("click", () => sendWhatIsTypedTo(held.agent, "chat"));
-  row.append(solo);
   const stop = make("button", "danger swarm-chat-stop", "Stop");
   stop.type = "button";
   stop.title = "Stop only this chat's current request";
@@ -10089,9 +10939,10 @@ function oneSwarmChatCard(held) {
   attach.type = "button";
   attach.addEventListener("click", () => files.click());
   row.append(attach);
-  const collaborate = make("button", "swarm-chat-collaborate", "Ask connected agents");
+  const collaborate = make("button", "swarm-chat-collaborate", recipientWords.team);
   collaborate.type = "button";
   collaborate.title = "Immediately relay this prompt to every ready connected agent";
+  collaborate.setAttribute("aria-label", recipientWords.team);
   collaborate.addEventListener("click", () => sendWhatIsTypedTo(held.agent, "collaborate"));
   row.append(collaborate);
   const work = make("button", "swarm-chat-work", "Work on project files");
@@ -10105,11 +10956,20 @@ function oneSwarmChatCard(held) {
   row.append(again);
   row.append(make("span", "swarm-chat-count hint"));
   form.append(row);
+  const workStatus = make("p", "hint swarm-chat-work-status");
+  workStatus.setAttribute("role", "status");
+  workStatus.setAttribute("aria-live", "polite");
+  workStatus.hidden = true;
+  form.append(workStatus);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     sendWhatIsTypedTo(held.agent);
   });
-  box.addEventListener("input", () => countWhatIsTypedTo(held.agent));
+  box.addEventListener("input", () => {
+    rememberSwarmChatComposer(held.agent);
+    countWhatIsTypedTo(held.agent);
+  });
+  box.addEventListener("select", () => rememberSwarmChatComposer(held.agent));
   box.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -10177,36 +11037,83 @@ function sayInTheChatFor(agentId, words) {
   if (card) card.querySelector(".swarm-chat-said").textContent = words;
 }
 
+function bigChatShows(agentId, conversationId = undefined) {
+  return theBigOne === agentId && (
+    conversationId === undefined || activeConversationIdFor(agentId) === conversationId
+  );
+}
+
+function sayInBigChatConversationFor(agentId, words, conversationId = undefined) {
+  if (!bigChatShows(agentId, conversationId)) return false;
+  $("theBigChatConversationSaid").textContent = words;
+  return true;
+}
+
+function sayInRuntimeChat(chatKey, words) {
+  let shown = false;
+  for (const held of swarmChats) {
+    if (swarmChatRuntimeKey(held.agent) !== chatKey) continue;
+    sayInTheChatFor(held.agent, words);
+    if (theBigOne === held.agent) $("theBigChatSaidBack").textContent = words;
+    shown = true;
+  }
+  return shown;
+}
+
 function setWhatCanBePressedInAChat(card) {
   const agent = theSwarmAgent(card.dataset.agent);
-  const busy = swarmBusy.has(card.dataset.agent);
-  const waiting = busy || swarmConversationSwitching.has(card.dataset.agent);
+  const busy = swarmChatIsBusy(card.dataset.agent);
+  const identityChanging = swarmChatIsResetting(card.dataset.agent)
+    || swarmConversationSwitching.has(card.dataset.agent)
+    || swarmChatIsHydrating(card.dataset.agent);
+  const waiting = busy || identityChanging;
+  const lone = isLoneAgentChat(card.dataset.agent);
+  const conversation = activeConversationFor(card.dataset.agent);
+  const bindingProblem = conversation?.binding_problem;
+  const bindingWords = String(bindingProblem?.message || "");
+  const recipientWords = syncChatRecipientWords(card.dataset.agent, card);
+  const unavailablePeers = syncChatTeamReadiness(card.dataset.agent, card);
   // A route can become ready after the chat is opened (for example after the
   // user signs in or chooses an assistant). Keep the draft editable while it
   // is not ready; only actions which contact the provider need to be held.
   // Disabling the textarea threw away a useful distinction between "cannot
   // send yet" and "cannot compose", and made restored draft state unusable.
-  card.querySelector(".swarm-chat-box").disabled = !agent;
-  setSwarmProviderControl(card.querySelector(".swarm-chat-send"),
-    waiting || !agent || !agent.ready, "Send with automatic collaboration");
-  setSwarmProviderControl(card.querySelector(".swarm-chat-solo"),
-    waiting || !agent || !agent.ready, "Ask only this agent");
+  const box = card.querySelector(".swarm-chat-box");
+  box.disabled = !agent || identityChanging;
+  box.title = identityChanging ? "Wait while Nexus opens the selected saved chat." : "";
+  card.querySelector(".swarm-chat-send").disabled =
+    waiting || !agent || !agent.ready || Boolean(bindingProblem);
+  card.querySelector(".swarm-chat-send").title = bindingWords
+    || `${recipientWords.direct}. No connected peer receives this request.`;
   const stop = card.querySelector(".swarm-chat-stop");
-  stop.disabled = !busy || swarmStopping.has(card.dataset.agent);
-  stop.textContent = swarmStopping.has(card.dataset.agent) ? "Stopping…" : "Stop";
-  card.querySelector(".swarm-chat-attach").disabled = waiting || !agent || !agent.ready;
-  setSwarmProviderControl(card.querySelector(".swarm-chat-collaborate"),
-    waiting || !agent || !agent.ready, "Ask connected agents to collaborate");
+  stop.disabled = !busy || swarmChatIsStopping(card.dataset.agent);
+  stop.textContent = swarmChatIsStopping(card.dataset.agent) ? "Stopping…" : "Stop";
+  card.querySelector(".swarm-chat-attach").disabled =
+    waiting || !agent || !agent.ready || Boolean(bindingProblem);
+  card.querySelector(".swarm-chat-collaborate").disabled =
+    waiting || lone || !agent || !agent.ready || Boolean(bindingProblem)
+    || unavailablePeers.length > 0;
+  card.querySelector(".swarm-chat-collaborate").title =
+    bindingWords || (lone
+      ? loneAgentActionMessage("collaborate")
+      : unavailablePeers.length
+      ? `Repair ${unavailablePeers.map((one) => one.name || one.id).join(", ")} before asking the team.`
+      : `${recipientWords.team}. Expected initial replies: ${recipientWords.expected}.`);
   syncChatRoundPolicy(card.dataset.agent);
-  const conversation = activeConversationFor(card.dataset.agent);
-  const workDisabled = waiting || !agent || !agent.ready
+  const workDisabled = waiting || lone || !agent || !agent.ready
+    || Boolean(bindingProblem)
     || Boolean(workRecoveryFor(card.dataset.agent))
     || (Boolean(conversation) && !conversation.project);
-  const workTitle = workRecoveryFor(card.dataset.agent)
+  const workTitle = bindingWords || (lone
+    ? loneAgentActionMessage("work")
+    : workRecoveryFor(card.dataset.agent)
     ? "Resume the saved project-work run before starting another"
-    : "Ask connected project agents to plan, then apply validated file changes";
-  setSwarmProviderControl(card.querySelector(".swarm-chat-work"), workDisabled, workTitle);
-  card.querySelector(".swarm-chat-again").disabled = waiting || !agent;
+    : "Start durable project work with a required contribution from every ready agent in this chat");
+  setSwarmProjectWorkControl(
+    card.querySelector(".swarm-chat-work"), workDisabled, workTitle, card.dataset.agent,
+  );
+  card.querySelector(".swarm-chat-again").disabled =
+    waiting || !agent || Boolean(bindingProblem);
   renderWorkRecoveryButtons(card.dataset.agent);
 }
 
@@ -10215,34 +11122,35 @@ function stoppedChatError(error) {
 }
 
 async function stopChatFor(agentId) {
-  if (!swarmBusy.has(agentId) || swarmStopping.has(agentId)) return;
-  const agent = theSwarmAgent(agentId);
-  const activity = swarmChatActivity.get(agentId);
-  const conversation = activeConversationFor(agentId);
-  swarmStopping.add(agentId);
-  markSwarmChatActivityStopping(agentId);
-  sayInTheChatFor(agentId, "Stopping this chat...");
-  if (theBigOne === agentId) $("theBigChatSaidBack").textContent = "Stopping this chat...";
+  const chatKey = swarmChatRuntimeKey(agentId);
+  if (!swarmBusy.has(chatKey) || swarmStopping.has(chatKey)) return;
+  const activity = swarmChatActivity.get(chatKey);
+  if (!activity) return;
+  swarmStopping.add(chatKey);
+  markSwarmChatActivityStopping(agentId, activity);
+  sayInRuntimeChat(chatKey, "Stopping this chat...");
   setWhatCanBePressedInSwarm();
   try {
     const jobs = [request("/api/swarm/stop-chat", {
       method: "POST", body: JSON.stringify({
-        agent: agentId, activity: activity?.id || "", chat: conversation?.id || "",
+        agent: agentId, activity: activity.id, chat: activity.chatId,
       }),
     })];
-    if (String(agent?.who || "").startsWith("web:") && window.harnessDesktop?.stopWebChat) {
+    if (activity.route.startsWith("web:") && window.harnessDesktop?.stopWebChat) {
       jobs.push(window.harnessDesktop.stopWebChat(
-        agent.who, conversation?.filed_as || ""));
+        activity.route, activity.filedAs));
     }
     const [serverResult] = await Promise.allSettled(jobs);
     if (serverResult.status === "rejected") throw serverResult.reason;
     if (!serverResult.value?.stopped) {
-      swarmStopping.delete(agentId);
+      swarmStopping.delete(chatKey);
       setWhatCanBePressedInSwarm();
-      sayInTheChatFor(agentId, serverResult.value?.note || "This chat is not waiting for an answer.");
+      sayInRuntimeChat(
+        chatKey, serverResult.value?.note || "This chat is not waiting for an answer.",
+      );
     }
   } catch (error) {
-    swarmStopping.delete(agentId);
+    swarmStopping.delete(chatKey);
     setWhatCanBePressedInSwarm();
     showError(String(error?.message || error));
   }
@@ -10346,14 +11254,240 @@ const chatPhaseNames = {
   agent_verification: "Work verification",
   final_answer: "Final answer",
   nexus_error: "Nexus failure",
+  participant_outcome: "Team response status",
 };
 
 function chatPhaseName(phase) { return chatPhaseNames[phase] || ""; }
+
+const PARTICIPANT_OUTCOME_STATUSES = new Set([
+  "answered", "failed", "outcome_unknown",
+  "answered_then_failed", "answered_then_outcome_unknown",
+]);
+
+function normalizedParticipantOutcome(one) {
+  let raw = one?.participant_outcome;
+  if ((!raw || typeof raw !== "object") && one?.phase === "participant_outcome") raw = one;
+  if (!raw || typeof raw !== "object" || Number(raw.schema_version) !== 1) return null;
+  const participants = (Array.isArray(raw.participants) ? raw.participants : [])
+    .slice(0, 32).map((participant) => {
+      const status = String(participant?.status || "failed");
+      return {
+        agentId: String(participant?.agent_id || ""),
+        name: String(participant?.name || "An agent"),
+        route: String(participant?.route || ""),
+        status: PARTICIPANT_OUTCOME_STATUSES.has(status) ? status : "failed",
+        answerSaved: participant?.answer_saved === true,
+        providerReason: String(participant?.provider_reason || ""),
+        outcomeUnknown: participant?.outcome_unknown === true
+          || status.includes("outcome_unknown"),
+      };
+    });
+  const inferredAnswered = participants.filter((participant) => participant.answerSaved).length;
+  const expected = Math.max(participants.length, Math.round(Number(raw.expected_count) || 0));
+  const answered = Math.max(0, Math.min(expected,
+    Math.round(Number(raw.answered_count ?? inferredAnswered) || 0)));
+  const outcome = ["complete", "partial", "none"].includes(String(raw.outcome))
+    ? String(raw.outcome) : answered >= expected && expected ? "complete"
+      : answered ? "partial" : "none";
+  const actions = (Array.isArray(raw.actions) ? raw.actions : []).slice(0, 32)
+    .filter((action) => action && ["repair-provider", "inspect-provider-turn"]
+      .includes(String(action.id || "")))
+    .map((action) => ({
+      id: String(action.id || ""),
+      agentId: String(action.agent_id || ""),
+      route: String(action.route || ""),
+      label: String(action.label || ""),
+    }));
+  return {
+    schemaVersion: 1,
+    outcome,
+    requestedMode: String(raw.requested_mode || "collaborate"),
+    expected,
+    answered,
+    participants,
+    actions,
+  };
+}
+
+function participantOutcomeStatusWords(participant) {
+  if (participant.status === "answered") return "Answer saved";
+  if (participant.status === "answered_then_failed") {
+    return "Answer saved; a later provider turn failed";
+  }
+  if (participant.status === "answered_then_outcome_unknown") {
+    return "Answer saved; a later delivery is unknown — Nexus will not resend";
+  }
+  if (participant.outcomeUnknown) {
+    return "Delivery unknown — Nexus will not resend";
+  }
+  return "Did not answer";
+}
+
+async function openParticipantRepairFlow(action, participant, button) {
+  const agentId = String(action?.agentId || participant?.agentId || "");
+  const route = String(action?.route || participant?.route || "");
+  const current = theSwarmAgent(agentId);
+  if (!current) {
+    sayInSwarm(`${participant?.name || "That agent"} is no longer on this board. Nexus did not change another agent's connection.`);
+    return;
+  }
+  if (route && String(current.who || "") !== route) {
+    const message = (
+      `${current.name}'s failed turn used route “${route}”, but the agent now uses “${current.who || "no route"}”. `
+      + "Nexus did not diagnose or change the replacement route. Open this agent's current Settings to inspect it."
+    );
+    sayInSwarm(message);
+    const item = button?.closest(".participant-outcome-participant");
+    if (item) {
+      const inline = make("p", "warning-one participant-outcome-route-changed", message);
+      item.querySelector(".participant-outcome-route-changed")?.remove();
+      item.append(inline);
+      inline.scrollIntoView({behavior: "smooth", block: "nearest"});
+    }
+    return;
+  }
+  await openAgentRepairFlow(agentId, button);
+}
+
+function restoreParticipantOutcomePrompt(agentId, prompt, row, note) {
+  const words = String(prompt || "").trim();
+  if (!words) {
+    note.textContent = "The original prompt is not available in this transcript view. Nothing was sent.";
+    return;
+  }
+  const inBigChat = Boolean(row.closest("#theBigChat"));
+  const box = inBigChat ? $("theBigChatBox")
+    : row.closest(".swarm-chat-card")?.querySelector(".swarm-chat-box");
+  if (!box) {
+    note.textContent = "Open this saved chat before restoring its prompt. Nothing was sent.";
+    return;
+  }
+  if (box.value.trim() && box.value !== words && !window.confirm(
+    "Replace the draft already in this composer with the original team prompt?\n\nNothing will be sent automatically."
+  )) {
+    note.textContent = "The existing draft was kept. Nothing was sent.";
+    return;
+  }
+  box.value = words;
+  box.dispatchEvent(new Event("input", {bubbles: true}));
+  box.focus();
+  box.setSelectionRange(words.length, words.length);
+  note.textContent = `Prompt restored. Review it, then press ${chatRecipientWords(agentId).team}. Nothing was sent.`;
+}
+
+function appendParticipantOutcome(container, outcome, agent, originalPrompt, row) {
+  if (!outcome) return;
+  row.classList.add("participant-outcome-turn");
+  const card = make("section", "participant-outcome-card");
+  card.dataset.outcome = outcome.outcome;
+  card.setAttribute("aria-label", "Team response status");
+  const summary = outcome.outcome === "complete"
+    ? `${outcome.answered} of ${outcome.expected} agents answered.`
+    : outcome.outcome === "partial"
+      ? `${outcome.answered} of ${outcome.expected} agents answered. Available replies are saved.`
+      : `0 of ${outcome.expected} agents answered. No AI answer was saved.`;
+  card.append(make("h4", "participant-outcome-title", summary));
+  const list = make("ul", "participant-outcome-list");
+  for (const participant of outcome.participants) {
+    const item = make("li", "participant-outcome-participant");
+    item.dataset.status = participant.status;
+    const head = make("div", "participant-outcome-participant-head");
+    head.append(make("strong", "", participant.name));
+    head.append(make("span", "participant-outcome-status",
+      participantOutcomeStatusWords(participant)));
+    item.append(head);
+    if (participant.providerReason) {
+      item.append(make("p", "hint participant-outcome-reason", participant.providerReason));
+    }
+    const offered = outcome.actions.filter((action) => action.agentId === participant.agentId);
+    for (const action of offered) {
+      const repair = make("button", "swarm-repair participant-outcome-repair",
+        `${action.id === "inspect-provider-turn" ? "Inspect" : "Repair"} ${participant.name}`);
+      repair.type = "button";
+      repair.title = action.id === "inspect-provider-turn"
+        ? `Inspect ${participant.name}'s exact provider conversation before any retry`
+        : `Diagnose ${participant.name}'s exact provider route${action.route ? `: ${action.route}` : ""}`;
+      repair.addEventListener("click", () => (
+        openParticipantRepairFlow(action, participant, repair)
+      ));
+      item.append(repair);
+    }
+    list.append(item);
+  }
+  card.append(list);
+  const hasUnknown = outcome.participants.some((participant) => participant.outcomeUnknown);
+  const hasKnownFailure = outcome.participants.some((participant) => (
+    participant.status === "failed" || participant.status === "answered_then_failed"
+  ));
+  if (hasUnknown) {
+    card.append(make("p", "participant-outcome-safety",
+      "At least one delivery is unknown. Nexus will not resend this team request; use that agent's Repair action to inspect the provider conversation first."));
+  }
+  const note = make("p", "hint participant-outcome-action-note");
+  if (hasKnownFailure && !hasUnknown) {
+    const again = make("button", "participant-outcome-ask-again", "Ask all agents again");
+    again.type = "button";
+    again.title = "Restore the original prompt for review. This button does not send it.";
+    again.addEventListener("click", () => (
+      restoreParticipantOutcomePrompt(agent.id, originalPrompt, row, note)
+    ));
+    card.append(again);
+    note.textContent = "Restores the original prompt into this exact composer for review; it never sends automatically.";
+  }
+  if (note.textContent) card.append(note);
+  container.append(card);
+}
 
 function chatTurnSpeaker(one, agent) {
   const from = one.speaker_name
     || (one.who === "you" ? "You" : ((agent && agent.name) || "The assistant"));
   return one.recipient_name ? `${from} → ${one.recipient_name}` : from;
+}
+
+let userQuestionRenderId = 0;
+
+function appendInlineUserQuestions(row, agent, rawQuestions, alreadyAnswered) {
+  const questions = normalizedUserQuestions(rawQuestions);
+  if (!questions.length) return;
+  const answers = {};
+  const card = make("section", "agent-question-card");
+  card.append(make("h4", "", alreadyAnswered ? "Answered" : "Waiting for your answer"));
+  const list = make("div", "agent-question-list");
+  const namespace = `inline-${++userQuestionRenderId}`;
+  for (const question of questions) {
+    list.append(userQuestionFields(
+      question, {}, (answer) => { answers[question.id] = answer; }, namespace,
+    ));
+  }
+  card.append(list);
+  const status = make("p", "hint agent-question-status",
+    alreadyAnswered ? "Your next message answered this request." : "The agent will continue in this exact conversation.");
+  card.append(status);
+  const submit = make("button", "primary agent-question-submit", "Submit answers");
+  submit.type = "button";
+  submit.disabled = alreadyAnswered;
+  submit.addEventListener("click", () => {
+    const compiled = compiledQuestionAnswers(questions, answers);
+    if (compiled.missing.length) {
+      status.textContent = `Answer ${compiled.missing.length === 1 ? "the question" : "all questions"} first.`;
+      return;
+    }
+    const inBigChat = Boolean(row.closest("#theBigChat"));
+    const box = inBigChat ? $("theBigChatBox")
+      : row.closest(".swarm-chat-card")?.querySelector(".swarm-chat-box");
+    if (!box || !agent?.id) return;
+    box.value = compiled.text;
+    box.dispatchEvent(new Event("input", {bubbles: true}));
+    submit.disabled = true;
+    status.textContent = "Sending your answers…";
+    if (inBigChat) void sendFromTheBigChat("chat");
+    else void sendWhatIsTypedTo(agent.id, "chat");
+  });
+  card.append(submit);
+  if (alreadyAnswered) {
+    for (const control of card.querySelectorAll("input, textarea")) control.disabled = true;
+  }
+  row.append(card);
 }
 
 function putTheChatTurnsIn(list, agent, said, scroll = true) {
@@ -10364,22 +11498,39 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
       + "this agent's assistant."));
     return;
   }
-  for (const one of said) {
+  let latestUserPrompt = "";
+  for (const [turnIndex, one] of said.entries()) {
+    if (one.who === "you" && String(one.text || "").trim()) latestUserPrompt = one.text;
+    const participantOutcome = normalizedParticipantOutcome(one);
     const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
       "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
       .includes(one.phase);
     const row = make("li", `talk-turn ${one.who} ${collaboration ? "between" : ""}`);
+    row.classList.toggle("nexus-turn", isNexusChatTurn(one));
     const speaker = agentForChatTurn(one, agent);
     if (one.who !== "you") styleForAgent(row, speaker);
     const heading = make("div", "talk-turn-heading");
-    if (one.who !== "you") heading.append(anAgentFace(speaker, "talk-turn-face", 16));
+    if (one.who !== "you") heading.append(
+      aChatTurnFace(one, speaker, "talk-turn-face", 16));
     heading.append(make("strong", "talk-turn-who", chatTurnSpeaker(one, agent)));
     const phase = chatPhaseName(one.phase);
     if (phase) heading.append(make("span", `chat-turn-phase phase-${one.phase}`, phase));
     row.append(heading);
     const text = make("div", "talk-turn-text");
-    appendChatText(text, one.text);
+    if (participantOutcome) {
+      appendParticipantOutcome(text, participantOutcome, agent, latestUserPrompt, row);
+    } else {
+      appendChatText(text, one.text);
+    }
     row.append(text);
+    if (one.structured_state_unavailable) {
+      row.append(make("p", "hint chat-turn-protocol-warning",
+        "Reply kept exactly as delivered; completion and progress could not be verified."));
+    }
+    appendInlineUserQuestions(
+      row, agent, one.questions,
+      said.slice(turnIndex + 1).some((later) => later.who === "you"),
+    );
     if (Array.isArray(one.attachments) && one.attachments.length) {
       const files = make("div", "talk-attachments");
       for (const attached of one.attachments) {
@@ -10420,6 +11571,17 @@ function keepWhatWasSaidTo(agentId, said, conversationId = activeConversationIdF
   renderTheChatThreadFor(agentId, held.said);
   if (theBigOne === agentId) renderTheBigChat();
   return true;
+}
+
+function keepWhatWasSaidToRuntime(
+  chatKey, said, conversationId,
+) {
+  let kept = false;
+  for (const held of swarmChats) {
+    if (swarmChatRuntimeKey(held.agent) !== chatKey) continue;
+    kept = keepWhatWasSaidTo(held.agent, said, conversationId) || kept;
+  }
+  return kept;
 }
 
 function countWhatIsTypedTo(agentId) {
@@ -10467,13 +11629,71 @@ function automaticRoundStopWords(answered) {
   return "";
 }
 
-function swarmProviderPauseMessage() {
-  return executionPauseWords("Provider contact", swarmSaid.cannot_run);
+function selectedProjectWorkPause(agentId) {
+  const conversation = activeConversationFor(agentId);
+  const unavailable = (conversation?.pair_agents || []).filter((one) => !one.ready);
+  if (unavailable.length) {
+    return `Connected agent${unavailable.length === 1 ? "" : "s"} `
+      + `${unavailable.map((one) => one.name || one.id).join(", ")} `
+      + `${unavailable.length === 1 ? "is" : "are"} not ready for this project. `
+      + "Repair the named provider connection before starting paired file work.";
+  }
+  const authority = conversation?.work_authority;
+  return authority && authority.can_run === false ? String(authority.reason || "") : "";
 }
 
-function setSwarmProviderControl(button, ordinarilyDisabled, ordinaryTitle = "") {
-  setExecutionControl(button, ordinarilyDisabled, swarmSaid.cannot_run, ordinaryTitle,
-    "Provider contact");
+function swarmProjectWorkPauseMessage(agentId = theBigOne) {
+  return executionPauseWords("Project work", selectedProjectWorkPause(agentId));
+}
+
+function setSwarmProjectWorkControl(
+  button, ordinarilyDisabled, ordinaryTitle = "", agentId = theBigOne,
+) {
+  const reason = selectedProjectWorkPause(agentId);
+  const status = button?.id === "theBigChatWork"
+    ? $("theBigChatWorkStatus")
+    : button?.closest(".swarm-chat-card")?.querySelector(".swarm-chat-work-status");
+  let describedBy = "";
+  if (status) {
+    if (!status.id) {
+      status.id = `swarm-work-status-${String(agentId || "agent").replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+    }
+    status.textContent = reason ? executionPauseWords("Project work", reason) : "";
+    status.hidden = !reason;
+    describedBy = reason ? status.id : "";
+  }
+  setExecutionControl(button, ordinarilyDisabled, reason, ordinaryTitle,
+    "Project work", describedBy);
+}
+
+function projectWorkPauseForMessage(mode, words, agentId = theBigOne) {
+  return mode === "work" || (mode === "auto" && looksLikeProjectWork(words))
+    ? swarmProjectWorkPauseMessage(agentId) : "";
+}
+
+async function directLongGoalIntent(conversation, agentId, text, attachments) {
+  const canonical = JSON.stringify({
+    project_id: String(conversation?.project || ""),
+    chat_id: String(conversation?.id || ""),
+    lead_id: String(agentId || ""),
+    text: String(text || ""),
+    attachments: attachments || [],
+  });
+  if (globalThis.crypto?.subtle && globalThis.TextEncoder) {
+    const digest = await globalThis.crypto.subtle.digest(
+      "SHA-256", new TextEncoder().encode(canonical),
+    );
+    return [...new Uint8Array(digest)]
+      .map((one) => one.toString(16).padStart(2, "0")).join("");
+  }
+  // Deterministic compatibility fallback for older embedded renderers. The
+  // server still verifies the full SHA-256 admission digest before reuse.
+  let value = 2166136261;
+  for (let index = 0; index < canonical.length; index += 1) {
+    value ^= canonical.charCodeAt(index);
+    value = Math.imul(value, 16777619);
+  }
+  return `fnv-${(value >>> 0).toString(16)}-${canonical.length}`;
 }
 
 function confirmProjectWork(agent, words, mode) {
@@ -10493,8 +11713,14 @@ function confirmProjectWork(agent, words, mode) {
   const allowed = window.confirm(
     `Allow Nexus to apply file changes proposed by ${agent?.name || "this agent"}`
     + ` to ${project?.name || "its connected project"}?\n\n`
-    + "The agents will discuss, apply, inspect, and revise the result. Nexus validates paths, checks file baselines, and keeps rollback backups."
+    + `Exact folder: ${project?.path || "No folder selected"}\n\n`
+    + "Nexus will give every selected connected agent a concrete contribution task, apply validated changes, inspect evidence, and continue only as needed."
   );
+  if (!allowed) {
+    const message = "Project work was not started, and no files were changed.";
+    sayInTheChatFor(agent?.id, message);
+    if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
+  }
   return {allowed, confirmed: allowed};
 }
 
@@ -10502,6 +11728,21 @@ function workResponseWords(answered, agentName = "The team", ordinaryWords = "")
   const status = String(answered?.status || answered?.verification_status || "");
   const budget = answered?.context_tool_budget?.summary
     ? ` ${answered.context_tool_budget.summary}` : "";
+  const participantOutcome = normalizedParticipantOutcome({
+    participant_outcome: answered?.participant_outcome,
+  });
+  if (participantOutcome && participantOutcome.requestedMode !== "work") {
+    if (participantOutcome.outcome === "complete") {
+      return `${participantOutcome.answered} of ${participantOutcome.expected} agents answered.`;
+    }
+    if (participantOutcome.outcome === "partial") {
+      return `${participantOutcome.answered} of ${participantOutcome.expected} agents answered. The available replies are saved; use the response-status card to repair the missing connection.`;
+    }
+    return `0 of ${participantOutcome.expected} agents answered. No AI answer was saved; use the response-status card to repair the connections.`;
+  }
+  if (status === "waiting_for_user") {
+    return `${agentName} is waiting for your answer. Use the question card in the conversation.`;
+  }
   if (status === "paused_for_user") {
     return "Project work paused safely. Answer the questions in the saved run card to continue." + budget;
   }
@@ -10532,11 +11773,19 @@ function workResponseWords(answered, agentName = "The team", ordinaryWords = "")
 
 async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
   const key = swarmChatKey(agentId);
+  const runtimeKey = swarmChatRuntimeKey(agentId);
   const recovery = swarmWorkRecoveries.get(key);
   const agent = theSwarmAgent(agentId);
   const conversation = activeConversationFor(agentId);
   if (!recovery || !agent || !conversation) return;
-  const executionPause = swarmProviderPauseMessage();
+  if (conversation.binding_problem) {
+    const message = String(conversation.binding_problem.message ||
+      "This chat's setup changed. Start a fresh chat with the current setup.");
+    sayInTheChatFor(agentId, message);
+    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    return;
+  }
+  const executionPause = swarmProjectWorkPauseMessage(agentId);
   if (executionPause) {
     sayInTheChatFor(agentId, executionPause);
     if (theBigOne === agentId) $("theBigChatSaidBack").textContent = executionPause;
@@ -10547,10 +11796,22 @@ async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
     sayInTheChatFor(agentId, agent.why_not || "This agent is not ready yet.");
     return;
   }
-  if (swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId)) return;
-  const answers = String(recovery.answerDraft || "").trim();
+  if (swarmBusy.has(runtimeKey) || swarmChatResetting.has(runtimeKey)
+      || swarmConversationSwitching.has(agentId) || swarmChatIsHydrating(agentId)) return;
+  const structuredAnswers = compiledQuestionAnswers(
+    recovery.questions, recovery.questionAnswers,
+  );
+  const answers = recovery.questions.length
+    ? structuredAnswers.text : String(recovery.answerDraft || "").trim();
   if (recovery.status === "paused_for_user" && !answers) {
     const message = "Answer the paused questions before resuming this run.";
+    sayInTheChatFor(agentId, message);
+    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    renderWorkRecoveryButtons(agentId);
+    return;
+  }
+  if (recovery.status === "paused_for_user" && structuredAnswers.missing.length) {
+    const message = "Answer every paused question before resuming this run.";
     sayInTheChatFor(agentId, message);
     if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
     renderWorkRecoveryButtons(agentId);
@@ -10562,8 +11823,8 @@ async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
     if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
     return;
   }
-  swarmBusy.add(agentId);
-  swarmStopping.delete(agentId);
+  swarmBusy.add(runtimeKey);
+  swarmStopping.delete(runtimeKey);
   nextSwarmChatRevision(agentId);
   const activity = beginSwarmChatActivity(agentId, "work", agent);
   sayInTheChatFor(agentId, recovery.status === "paused_for_user"
@@ -10612,8 +11873,14 @@ async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
           ? {allowed_write_roots: [...recovery.allowedWriteRoots]} : {}),
       }),
     });
-    finishSwarmChatActivity(agentId, true);
-    keepWhatWasSaidTo(agentId, answered.said || [], conversation.id);
+    if (!swarmActivityCanReconcileSuccess(activity)) {
+      if (swarmChatKey(agentId) === key) void refreshTheChatFor(agentId);
+      return answered;
+    }
+    finishSwarmChatActivity(agentId, true, "", activity, answered.participant_outcome);
+    keepWhatWasSaidToRuntime(
+      runtimeKey, answered.said || [], conversation.id,
+    );
     const next = rememberWorkRecoveryForKey(key, answered, recovery.objective, conversation);
     if (next) {
       swarmWorkRecoveries.set(key, frozenWorkRecovery({...next, answerDraft: ""}));
@@ -10621,8 +11888,7 @@ async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
     }
     renderWorkRecovery(agentId);
     const message = workResponseWords(answered, agent.name);
-    sayInTheChatFor(agentId, message);
-    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    sayInRuntimeChat(runtimeKey, message);
     refreshSwarm(true);
     if (goalItem) {
       await refreshBoardGoalQueue(false);
@@ -10630,36 +11896,39 @@ async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
     }
     return answered;
   } catch (error) {
-    await refreshTheChatFor(agentId);
+    if (!swarmActivityCanSettle(activity)) return null;
+    if (swarmChatKey(agentId) === key) void refreshTheChatFor(agentId);
     const message = String(error?.message || error);
-    sayInTheChatFor(agentId, message);
-    if (theBigOne === agentId) $("theBigChatSaidBack").textContent = message;
+    sayInRuntimeChat(runtimeKey, message);
     if (!stoppedChatError(error)) showError(message);
-    finishSwarmChatActivity(agentId, false, message);
+    finishSwarmChatActivity(agentId, false, message, activity);
     return null;
   } finally {
-    swarmBusy.delete(agentId);
-    swarmStopping.delete(agentId);
+    finishSwarmActivityResponse(agentId, activity);
+    if (swarmActivityIsCurrent(activity)) {
+      swarmBusy.delete(runtimeKey);
+      swarmStopping.delete(runtimeKey);
+    }
     setWhatCanBePressedInSwarm();
     renderWorkRecovery(agentId);
   }
 }
 
 async function sendWhatIsTypedTo(agentId) {
-  const mode = arguments[1] || "auto";
+  const mode = arguments[1] || "chat";
   const confirmedPermission = arguments[2] || null;
   const goalQueueItem = arguments[3] || null;
   const card = theChatCardFor(agentId);
   const agent = theSwarmAgent(agentId);
   if (!card || !agent) return;
   const box = card.querySelector(".swarm-chat-box");
-  const executionPause = swarmProviderPauseMessage();
+  const words = box.value.trim();
+  const executionPause = projectWorkPauseForMessage(mode, words, agentId);
   if (executionPause) {
     sayInTheChatFor(agentId, executionPause);
     box.focus();
     return;
   }
-  const words = box.value.trim();
   if (!words) { sayInTheChatFor(agentId, "Type something first."); return; }
   if (words.length > Number(limitsForSwarmChat(agentId).input_characters || 200000)) {
     sayInTheChatFor(agentId,
@@ -10670,33 +11939,107 @@ async function sendWhatIsTypedTo(agentId) {
     sayInTheChatFor(agentId, agent.why_not || "This one is not set up yet.");
     return;
   }
-  if (swarmBusy.has(agentId)) {
+  const conversation = activeConversationFor(agentId);
+  if (conversation?.binding_problem) {
+    sayInTheChatFor(agentId, String(conversation.binding_problem.message ||
+      "This chat's setup changed. Start a fresh chat with the current setup."));
+    return;
+  }
+  const requestChatKey = swarmChatKey(agentId);
+  const runtimeKey = swarmChatRuntimeKey(agentId);
+  if (swarmBusy.has(runtimeKey)) {
     sayInTheChatFor(agentId, "Still waiting for the last answer.");
+    return;
+  }
+  if (swarmChatResetting.has(runtimeKey)) {
+    sayInTheChatFor(agentId, "This exact chat is still starting again.");
+    return;
+  }
+  if (swarmChatIsHydrating(agentId)) {
+    sayInTheChatFor(agentId, "Loading this chat's saved identity first.");
     return;
   }
   if (swarmConversationSwitching.has(agentId)) {
     sayInTheChatFor(agentId, "Finishing the chat switch first.");
     return;
   }
+  if (["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)) {
+    sayInTheChatFor(agentId, loneAgentActionMessage(mode));
+    box.focus();
+    return;
+  }
+  if (mode === "collaborate") {
+    const unavailable = syncChatTeamReadiness(agentId, card);
+    if (unavailable.length) {
+      sayInTheChatFor(agentId,
+        `The team request was not sent. Repair ${unavailable.map((one) => one.name || one.id).join(", ")} first.`);
+      box.focus();
+      return;
+    }
+  }
   const projectPermission = confirmedPermission || confirmProjectWork(agent, words, mode);
   if (!projectPermission.allowed) return;
-  const conversation = activeConversationFor(agentId);
-  const recoveryKey = swarmChatKey(agentId);
-  // One agent at a time, not one chat at a time: two chats open on two
-  // different agents can both be waiting, which is the whole point of having
-  // several of them on the board.
-  swarmBusy.add(agentId);
-  swarmStopping.delete(agentId);
+  const recoveryKey = requestChatKey;
+  // The lease belongs to this immutable saved-chat identity. The selected
+  // chat may change as soon as this request has started, and a sibling chat
+  // under the same agent can acquire its own independent lease.
+  swarmBusy.add(runtimeKey);
+  swarmStopping.delete(runtimeKey);
   nextSwarmChatRevision(agentId);
   setWhatCanBePressedInSwarm();
-  const attachmentKey = swarmChatKey(agentId);
+  const attachmentKey = requestChatKey;
   const attachments = swarmChatAttachments.get(attachmentKey) || [];
+  // A sent prompt is already represented as the activity's local transcript
+  // turn. Free this exact draft now so a newly selected sibling can be typed
+  // into while the answer is pending; delayed completion never clears a DOM
+  // composer that may now belong to another chat.
+  box.value = "";
+  swarmChatComposerDrafts.delete(requestChatKey);
+  rememberSwarmChatComposer(agentId);
   const activity = beginSwarmChatActivity(agentId, mode, agent, words, attachments);
   sayInTheChatFor(agentId, mode === "auto" ? "Deciding whether connected agents should help..."
     : mode === "chat" ? `Asking ${agent.name}...`
     : mode === "collaborate" ? "Relaying to connected agents..."
-    : "Planning and validating project-file work...");
+    : "Starting durable goal work with the next useful task...");
   try {
+    if (mode === "work" && !goalQueueItem) {
+      if (!conversation?.project) throw new Error("Choose this chat's project before starting file work.");
+      const directRequestKey = `nexus.long-horizon.direct-request.${recoveryKey}`;
+      let durableRequest = null;
+      try { durableRequest = JSON.parse(localStorage.getItem(directRequestKey) || "null"); }
+      catch (_) { durableRequest = null; }
+      const directIntent = await directLongGoalIntent(
+        conversation, agentId, words, attachments,
+      );
+      const directRequestId = durableRequest?.intent === directIntent && durableRequest?.id
+        ? durableRequest.id
+        : (globalThis.crypto?.randomUUID
+          ? globalThis.crypto.randomUUID()
+          : `long-goal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      localStorage.setItem(directRequestKey, JSON.stringify({
+        id: directRequestId, intent: directIntent,
+      }));
+      const started = await request("/api/long-horizon/start", {
+        method: "POST", body: JSON.stringify({
+          project_id: conversation.project,
+          lead_id: agentId,
+          chat_id: conversation.id,
+          text: words,
+          attachments,
+          request_id: directRequestId,
+        }),
+      });
+      localStorage.removeItem(directRequestKey);
+      if (!swarmActivityCanReconcileSuccess(activity)) return started;
+      finishSwarmChatActivity(agentId, true, "", activity);
+      clearSwarmActivityAttachments(activity);
+      longGoal = started.goal;
+      localStorage.setItem(LONG_GOAL_SELECTED_KEY, longGoal.goal_id);
+      sayInRuntimeChat(runtimeKey,
+        `Started durable goal ${longGoal.goal_id.slice(0, 8)}. Follow its concrete tasks, evidence, and questions in Mission control.`);
+      await refreshLongGoals(true);
+      return started;
+    }
     const said = await request("/api/swarm/say", {
       method: "POST", body: JSON.stringify({
         agent: agentId, text: words, mode, attachments, activity: activity.id,
@@ -10710,42 +12053,59 @@ async function sendWhatIsTypedTo(agentId) {
         round_limit: selectedChatRoundLimit(agentId),
       }),
     });
-    finishSwarmChatActivity(agentId, true);
+    if (!swarmActivityCanReconcileSuccess(activity)) {
+      if (swarmChatKey(agentId) === requestChatKey) void refreshTheChatFor(agentId);
+      return said;
+    }
+    finishSwarmChatActivity(agentId, true, "", activity, said.participant_outcome);
     rememberWorkRecoveryForKey(recoveryKey, said, words, conversation);
+    clearSwarmActivityAttachments(activity);
     if (!theChatCardFor(agentId)) {
       // The chat was closed while the answer was on its way. It is kept, and is
       // there when it is opened again.
       return;
     }
-    box.value = "";
-    swarmChatAttachments.delete(attachmentKey);
-    renderChatAttachments(agentId);
-    countWhatIsTypedTo(agentId);
-    keepWhatWasSaidTo(agentId, said.said || [], conversation?.id || "");
+    keepWhatWasSaidToRuntime(
+      runtimeKey, said.said || [], conversation?.id || "",
+    );
     renderWorkRecovery(agentId);
-    const ordinaryWords = said.partial_provider_failure || automaticRoundStopWords(said) || (said.changed?.length
+    const participantWords = normalizedParticipantOutcome({
+      participant_outcome: said.participant_outcome,
+    });
+    const ordinaryWords = participantWords
+      ? workResponseWords(said, agent.name)
+      : said.partial_provider_failure || automaticRoundStopWords(said) || (said.changed?.length
       ? `${agent.name} answered. Nexus applied ${said.changed.length} file change(s).`
       : said.routing?.requested === "auto" && said.routing?.selected === "collaborate"
         ? `${agent.name} answered after Nexus automatically involved ${said.collaborated_with?.length || 0} connected agent(s).`
         : said.collaborated_with?.length
           ? `${agent.name} answered after hearing ${said.collaborated_with.length} connected agent(s).`
           : `${agent.name} answered.`);
-    sayInTheChatFor(agentId, workResponseWords(said, agent.name, ordinaryWords));
+    sayInRuntimeChat(
+      runtimeKey, workResponseWords(said, agent.name, ordinaryWords),
+    );
     // The list down the side carries the last thing said under each name, and
     // something was just said.
     refreshSwarm(true);
     return said;
   } catch (error) {
     // Read back what was really kept, so a message that did not get through
-    // stops looking like one that did. The words stay in the box.
-    await refreshTheChatFor(agentId);
+    // stops looking like one that did. Do not keep the composer leased while a
+    // secondary transcript read waits; the activity feed also reconciles a
+    // terminal server run when the original HTTP response is lost.
+    if (!swarmActivityCanSettle(activity)) return null;
+    restoreSwarmChatDraft(requestChatKey, words);
+    if (swarmChatKey(agentId) === requestChatKey) void refreshTheChatFor(agentId);
     if (!stoppedChatError(error)) showError(error.message);
-    sayInTheChatFor(agentId, error.message);
-    finishSwarmChatActivity(agentId, false, String(error.message || error));
+    sayInRuntimeChat(runtimeKey, error.message);
+    finishSwarmChatActivity(agentId, false, String(error.message || error), activity);
     return null;
   } finally {
-    swarmBusy.delete(agentId);
-    swarmStopping.delete(agentId);
+    finishSwarmActivityResponse(agentId, activity);
+    if (swarmActivityIsCurrent(activity)) {
+      swarmBusy.delete(runtimeKey);
+      swarmStopping.delete(runtimeKey);
+    }
     setWhatCanBePressedInSwarm();
   }
 }
@@ -10753,24 +12113,68 @@ async function sendWhatIsTypedTo(agentId) {
 async function startTheChatAgainFor(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
+  if (swarmChatIsHydrating(agentId) || swarmConversationSwitching.has(agentId)) return;
+  const conversation = activeConversationFor(agentId);
+  const chatId = conversation?.id || "";
+  const runtimeKey = swarmChatRuntimeKeyFor(agentId, chatId);
+  if (swarmBusy.has(runtimeKey)) {
+    sayInRuntimeChat(runtimeKey, "Stop this exact chat's current request before starting it again.");
+    return;
+  }
+  if (swarmChatResetting.has(runtimeKey)) return;
+  const route = String(agent.who || "");
+  const agentName = String(agent.name || "This agent");
+  swarmChatResetting.add(runtimeKey);
   nextSwarmChatRevision(agentId);
+  sayInRuntimeChat(runtimeKey, "Starting this exact chat again...");
+  setWhatCanBePressedInSwarm();
   try {
-    const conversation = activeConversationFor(agentId);
     const said = await request("/api/swarm/start-again", {
       method: "POST", body: JSON.stringify({
-        agent: agentId, chat: conversation?.id || "",
+        agent: agentId, chat: chatId,
       }),
     });
-    if (said.web_chat_id && said.web_conversation_key
-        && window.harnessDesktop?.resetWebChat) {
-      await window.harnessDesktop.resetWebChat(
-        agent.who, said.web_conversation_key);
+    keepWhatWasSaidToRuntime(runtimeKey, [], chatId);
+    let cleanupWarning = "";
+    if (window.harnessDesktop?.resetWebChat) {
+      const resets = Array.isArray(said.web_chat_resets)
+        ? said.web_chat_resets.slice(0, 2)
+        : (said.web_chat_id && said.web_conversation_key ? [{
+            route: route.startsWith("web:") ? route : `web:${said.web_chat_id}`,
+            previous_web_conversation_key: (
+              said.previous_web_conversation_key || said.web_conversation_key
+            ),
+          }] : []);
+      let resetFailure = null;
+      for (const reset of resets) {
+        const resetRoute = String(reset?.route || "");
+        const previousKey = String(reset?.previous_web_conversation_key || "");
+        if (resetRoute.startsWith("web:") && previousKey) {
+          try {
+            await window.harnessDesktop.resetWebChat(resetRoute, previousKey);
+          } catch (error) {
+            resetFailure ||= error;
+          }
+        }
+      }
+      if (resetFailure) {
+        const detail = String(resetFailure?.message || resetFailure).slice(0, 240);
+        cleanupWarning = (
+          ` The chat did restart, but Nexus could not remove one old provider-window mapping. ${detail}`
+        );
+      }
     }
-    keepWhatWasSaidTo(agentId, [], conversation?.id || "");
-    sayInTheChatFor(agentId, said.note || `${agent.name} starts again.`);
+    if (chatId) await loadConversationsFor(agentId, false);
+    sayInRuntimeChat(
+      runtimeKey,
+      `${said.note || `${agentName} starts again.`}${cleanupWarning}`,
+    );
   } catch (error) {
     showError(error.message);
-    sayInTheChatFor(agentId, error.message);
+    sayInRuntimeChat(runtimeKey, error.message);
+  } finally {
+    swarmChatResetting.delete(runtimeKey);
+    setWhatCanBePressedInSwarm();
   }
 }
 
@@ -10872,6 +12276,19 @@ let swarmGoalQueue = null;   // durable server-owned board-wide goal cursor
 let swarmGoalQueueWatching = 0;
 let swarmGoalQueueContinuing = false;
 const SWARM_GOAL_QUEUE_REQUEST_KEY = "nexus.swarm.goal-queue-request.v1";
+const LONG_GOAL_SELECTED_KEY = "nexus.long-horizon.selected.v1";
+const LONG_GOAL_REQUEST_KEY = "nexus.long-horizon.board-request.v1";
+const LONG_GOAL_COMPOSER_KEY = "nexus.long-horizon.composer.v1";
+const LONG_GOAL_FORK_REQUEST_KEY = "nexus.long-horizon.fork-request.v1";
+const LONG_GOAL_MAX_CUSTOM_CRITERIA = 29;
+let longGoalDialogInvoker = null;
+let longGoals = [];
+let longGoal = null;
+let longGoalEvents = [];
+let longGoalCursor = 0;
+let longGoalWatching = 0;
+let selectedMissionTaskId = "";
+let longGoalEventNotice = "";
 let swarmWatching = 0;       // the timer that keeps asking how it is going
 let swarmBoardRunId = localStorage.getItem("nexus.swarm.board-run") || "";
 let swarmBoardRequestId = localStorage.getItem("nexus.swarm.board-request") || "";
@@ -10968,21 +12385,19 @@ async function prepareGoalConversation(project, pair) {
 
 function showBoardGoalQueue(queue) {
   swarmGoalQueue = queue || null;
-  const button = $("swarmWorkGoals");
-  const cancel = $("swarmCancelGoals");
+  const button = $("swarmLegacyGoals");
   if (!queue) {
-    button.textContent = "Work until the goals are achieved";
-    cancel.disabled = true;
+    button.textContent = "Use legacy paired workflow";
     return;
   }
   const current = queue.current;
   if (queue.status === "complete") {
-    button.textContent = "Work until the goals are achieved";
+    button.textContent = "Use legacy paired workflow";
     $("swarmGoalWorkSaid").textContent =
       `All ${queue.total} board goal(s) reached verified completion.`;
     localStorage.removeItem(SWARM_GOAL_QUEUE_REQUEST_KEY);
   } else if (queue.status === "cancelled") {
-    button.textContent = "Start the board goals";
+    button.textContent = "Restart legacy paired workflow";
     $("swarmGoalWorkSaid").textContent = queue.note || "The remaining goals were cancelled.";
     localStorage.removeItem(SWARM_GOAL_QUEUE_REQUEST_KEY);
   } else {
@@ -10992,7 +12407,6 @@ function showBoardGoalQueue(queue) {
     $("swarmGoalWorkSaid").textContent = queue.note
       || `Goal ${number} of ${queue.total}: ${current?.lead_name || "the team"} is working in ${current?.project_name || "the project"}.`;
   }
-  cancel.disabled = !["queued", "paused"].includes(queue.status);
   setWhatCanBePressedInSwarm();
 }
 
@@ -11086,7 +12500,7 @@ async function continueBoardGoalQueue({retryPaused = false} = {}) {
   }
 }
 
-async function workOnEveryBoardGoal() {
+async function workOnEveryBoardGoalLegacy() {
   if (swarmGoalWorkRunning) return;
   const existing = await refreshBoardGoalQueue(false);
   if (existing && ["queued", "running", "paused"].includes(existing.status)) {
@@ -11134,6 +12548,706 @@ async function workOnEveryBoardGoal() {
     $("swarmGoalWorkSaid").textContent = words;
     showError(words);
   }
+}
+
+function missionSelectedGoalId() {
+  return String($("missionGoalSelect")?.value
+    || localStorage.getItem(LONG_GOAL_SELECTED_KEY) || "");
+}
+
+function missionStatusWords(goal) {
+  if (!goal) return "No long-horizon goal selected.";
+  const progress = goal.progress || {complete: 0, total: 0};
+  return `${goal.status} · ${progress.complete}/${progress.total} tasks · `
+    + `${goal.budget?.provider_calls || 0}/${goal.budget?.max_provider_calls || 0} provider calls`;
+}
+
+function missionProviderSetupChanged(goal = longGoal) {
+  return Boolean(
+    goal?.provider_setup_changed
+    && goal?.provider_setup_status?.code === "provider_setup_changed"
+  );
+}
+
+function focusCurrentBoardGoalSetup() {
+  const status = longGoal?.provider_setup_status || {};
+  const firstChanged = (status.agents || []).find((one) => one?.agent_id);
+  const currentAgent = firstChanged ? theSwarmAgent(firstChanged.agent_id) : null;
+  if (currentAgent) pickSwarmBox("agent", currentAgent.id);
+  const start = $("swarmWorkGoals");
+  start.scrollIntoView({behavior: "smooth", block: "center"});
+  start.focus({preventScroll: true});
+  const protectedOldGoal = longGoal
+    && !["complete", "cancelled", "failed"].includes(longGoal.status);
+  $("swarmGoalWorkSaid").textContent = protectedOldGoal
+    ? "Review the current board routes. The old goal remains protected; cancel it in Mission control when ready, then press Work until the goals are achieved to create a new goal."
+    : "Review the current board routes, then press Work until the goals are achieved to create a new goal with a fresh history binding.";
+}
+
+async function prepareNewGoalWithCurrentProviderSetup() {
+  if (!missionProviderSetupChanged()) return;
+  const protectedGoal = longGoal;
+  const needsCancellation = !["complete", "cancelled", "failed"].includes(
+    protectedGoal.status
+  );
+  if (needsCancellation && !window.confirm(
+    "Cancel this protected old goal? Its tasks, events, artifacts, and evidence remain available for inspection. Nothing is rebound. After cancellation Nexus will focus the current board’s normal Start control so you can create a separate goal."
+  )) return;
+  try {
+    if (needsCancellation) {
+      await request("/api/long-horizon/control", {
+        method: "POST", body: JSON.stringify({
+          goal_id: protectedGoal.goal_id, action: "cancel", payload: {},
+        }),
+      });
+      await refreshLongGoals(true);
+    }
+    // A new provider binding requires a new request identity. Never let an
+    // interrupted earlier Start attempt turn this explicit migration into an
+    // idempotent replay of old intent.
+    localStorage.removeItem(LONG_GOAL_REQUEST_KEY);
+    localStorage.removeItem(LONG_GOAL_COMPOSER_KEY);
+    focusCurrentBoardGoalSetup();
+    $("swarmGoalWorkSaid").textContent = needsCancellation
+      ? "The old goal was cancelled and its history was kept. Press Work until the goals are achieved to start a separate goal from the current board setup."
+      : "Press Work until the goals are achieved to start a separate goal from the current board setup.";
+  } catch (error) {
+    showError(error.message || String(error));
+  }
+}
+
+function renderMissionControl() {
+  const select = $("missionGoalSelect");
+  const selected = longGoal?.goal_id || missionSelectedGoalId();
+  select.replaceChildren();
+  if (!longGoals.length) {
+    const option = make("option", "", "No goals yet");
+    option.value = "";
+    select.append(option);
+  }
+  for (const goal of longGoals) {
+    const setupLabel = missionProviderSetupChanged(goal) ? " · provider setup changed" : "";
+    const option = make("option", "",
+      `${goal.project?.name || "Project"}: ${String(goal.objective || "").split("\n")[0].slice(0, 70)} [${goal.status}${setupLabel}]`);
+    option.value = goal.goal_id;
+    option.selected = goal.goal_id === selected;
+    select.append(option);
+  }
+  $("missionGoalSummary").textContent = longGoal
+    ? `${longGoal.objective} · Success: ${(longGoal.success_criteria || []).join("; ")}`
+    : "Start a project goal to see durable work here.";
+  const lastActivity = longGoalEvents.length
+    ? ` Last activity ${new Date(longGoalEvents[longGoalEvents.length - 1].at_ms).toLocaleString()}.`
+    : "";
+  $("missionProgress").textContent = longGoal
+    ? `${missionStatusWords(longGoal)}. ${longGoal.note || ""}${lastActivity}` : "";
+  const providerSetupChanged = missionProviderSetupChanged();
+  const setupStatus = longGoal?.provider_setup_status || {};
+  const setupWarning = $("missionProviderSetupChanged");
+  setupWarning.hidden = !providerSetupChanged;
+  $("missionProviderSetupChangedMessage").textContent = providerSetupChanged
+    ? setupStatus.message || "The saved provider setup changed." : "";
+  const setupAgents = $("missionProviderSetupChangedAgents");
+  setupAgents.replaceChildren();
+  for (const agent of providerSetupChanged ? setupStatus.agents || [] : []) {
+    setupAgents.append(make(
+      "li", "",
+      `${agent.name || agent.agent_id || "Agent"}${agent.route ? ` (${agent.route})` : ""}: ${agent.reason || "Provider setup changed."}`,
+    ));
+  }
+  if (longGoal && document.activeElement !== $("missionCriteria")) {
+    $("missionCriteria").value = (longGoal.success_criteria || []).join("\n");
+  }
+  const terminal = !longGoal || ["complete", "cancelled", "failed"].includes(longGoal.status);
+  const immutable = !longGoal || ["complete", "cancelled"].includes(longGoal.status);
+  const hasPendingDecision = Boolean(longGoal?.pending_interrupts?.length);
+  $("missionPause").disabled = !longGoal || terminal || longGoal.status === "paused";
+  $("missionResume").disabled = !longGoal || providerSetupChanged || hasPendingDecision
+    || !["paused", "failed"].includes(longGoal.status);
+  $("missionCancel").disabled = !longGoal || terminal;
+  $("missionFork").disabled = !longGoal || providerSetupChanged || hasPendingDecision;
+  $("missionCriteria").disabled = immutable || hasPendingDecision;
+  $("missionCriteriaSave").disabled = immutable || hasPendingDecision;
+  $("missionSteer").disabled = immutable || providerSetupChanged || hasPendingDecision;
+  $("missionSteerSend").disabled = immutable || providerSetupChanged || hasPendingDecision;
+  $("missionMessageAgent").disabled = immutable || providerSetupChanged || hasPendingDecision;
+
+  const tasks = $("missionTasks");
+  tasks.replaceChildren();
+  for (const state of ["running", "pending_apply", "ready", "waiting", "waiting_review", "blocked", "failed", "complete", "cancelled"]) {
+    const matching = (longGoal?.tasks || []).filter((task) => task.state === state);
+    if (!matching.length) continue;
+    const column = make("section", "mission-task-column");
+    column.append(make("h3", "", `${state.replaceAll("_", " ")} (${matching.length})`));
+    for (const task of matching) {
+      const card = make("button", `mission-task-card${selectedMissionTaskId === task.id ? " selected" : ""}`);
+      card.type = "button";
+      card.dataset.taskId = task.id;
+      card.setAttribute("aria-pressed", String(selectedMissionTaskId === task.id));
+      card.append(make("strong", "", task.title));
+      card.append(make("span", "", `Owner: ${task.assigned_agent_id || "unassigned"} · attempt ${task.attempts || 0}`));
+      if ((task.depends_on || []).length) card.append(make("span", "", `Needs: ${task.depends_on.join(", ")}`));
+      if (task.last_error) card.append(make("span", "warning-one", task.last_error));
+      if ((task.evidence || []).length) card.append(make("span", "", `Evidence: ${task.evidence.slice(-2).join("; ")}`));
+      card.addEventListener("click", () => { selectedMissionTaskId = task.id; renderMissionControl(); });
+      column.append(card);
+    }
+    tasks.append(column);
+  }
+
+  const agents = $("missionAgents");
+  agents.replaceChildren();
+  const changedAgentIds = new Set((setupStatus.agents || []).map((one) => one.agent_id));
+  for (const agent of longGoal?.agents || []) {
+    const owned = (longGoal.tasks || []).filter((task) => task.assigned_agent_id === agent.id);
+    const row = make("article", "mission-agent");
+    row.classList.toggle("provider-setup-changed", changedAgentIds.has(agent.id));
+    row.append(make("strong", "", agent.name));
+    row.append(make("span", "", `${agent.who} · ${owned.filter((task) => task.state === "running").length ? "working" : "available"}`));
+    row.append(make("span", "", `${owned.length} assigned task(s)`));
+    const changedSetup = (setupStatus.agents || []).find((one) => one.agent_id === agent.id);
+    if (changedSetup) row.append(make("span", "warning-one", changedSetup.reason));
+    agents.append(row);
+  }
+  const selectedTask = longGoal?.tasks?.find((one) => one.id === selectedMissionTaskId);
+  const reviewedParent = selectedTask?.kind === "review"
+    ? longGoal?.tasks?.find((one) => one.id === selectedTask.review_of) : null;
+  const reviewedOwner = reviewedParent
+    ? longGoal?.agents?.find((one) => one.id === reviewedParent.assigned_agent_id) : null;
+  const reassign = $("missionReassignAgent");
+  const previousReassign = reassign.value;
+  reassign.replaceChildren();
+  for (const agent of longGoal?.agents || []) {
+    const reviewerIdentity = String(agent.provider_identity_sha256 || "");
+    const ownerIdentity = String(reviewedOwner?.provider_identity_sha256 || "");
+    if (reviewedParent && (
+      agent.id === reviewedParent.assigned_agent_id
+      || !reviewerIdentity || !ownerIdentity || reviewerIdentity === ownerIdentity
+    )) continue;
+    const option = make("option", "", `${agent.name} (${agent.who})`);
+    option.value = agent.id;
+    option.selected = agent.id === previousReassign;
+    reassign.append(option);
+  }
+  $("missionReassign").disabled = immutable || providerSetupChanged || hasPendingDecision || !selectedTask
+    || !["ready", "blocked", "failed", "waiting"].includes(selectedTask.state);
+  $("missionRetry").disabled = immutable || providerSetupChanged || hasPendingDecision || !selectedTask
+    || !["blocked", "failed"].includes(selectedTask.state);
+  const selectedOwner = longGoal?.agents?.find(
+    (one) => one.id === selectedTask?.assigned_agent_id);
+  const independentReviewerAvailable = (longGoal?.agents || []).some(
+    (one) => one.id !== selectedTask?.assigned_agent_id
+      && one.provider_identity_sha256
+      && selectedOwner?.provider_identity_sha256
+      && one.provider_identity_sha256 !== selectedOwner.provider_identity_sha256);
+  $("missionRequestReview").disabled = immutable || providerSetupChanged || hasPendingDecision
+    || !selectedTask || !independentReviewerAvailable;
+  $("missionRequestReview").title = !selectedTask || independentReviewerAvailable
+    ? ""
+    : "Independent review needs an authorized agent on a different provider backend; another route alias is not enough.";
+
+  const pending = longGoal?.pending_interrupts || [];
+  $("missionInboxCount").textContent = pending.length ? `(${pending.length})` : "";
+  const inbox = $("missionInbox");
+  inbox.replaceChildren();
+  if (!pending.length) inbox.append(make("p", "hint", "No agent is waiting for you."));
+  if (pending.length) {
+    const form = make("form", "mission-question");
+    if (immutable || providerSetupChanged) form.setAttribute("aria-disabled", "true");
+    form.append(make("p", "hint",
+      "Answer the complete decision set shown here. Nexus rejects this submission if the goal or pending questions change before you send it."));
+    for (const item of pending) {
+      const fieldset = make("fieldset", "mission-question-set");
+      fieldset.append(make("legend", "", `${item.reason} · task ${item.task_id}`));
+      fieldset.append(make("p", "hint", `Waiting since ${new Date(item.created_ms).toLocaleString()}`));
+    for (const question of item.questions || []) {
+        fieldset.append(make("strong", "", question.prompt));
+      const name = `${item.id}-${question.id}`;
+      for (const option of question.options || []) {
+        const label = make("label", "mission-option");
+        const input = make("input");
+        input.type = question.multiple ? "checkbox" : "radio";
+        input.name = name;
+        input.value = option.label;
+        label.append(input, document.createTextNode(` ${option.label}${option.recommended ? " (recommended)" : ""}`));
+        if (option.description) label.append(make("small", "", option.description));
+          fieldset.append(label);
+      }
+      if (question.allow_other || !(question.options || []).length) {
+        const other = make("textarea", "mission-other");
+        other.rows = 2;
+        other.placeholder = "Or type your own answer";
+        other.dataset.questionName = name;
+          fieldset.append(other);
+        }
+      }
+      form.append(fieldset);
+    }
+    const submit = make("button", "primary", "Send decisions and resume exact tasks");
+    submit.type = "submit";
+    submit.disabled = immutable || providerSetupChanged;
+    form.append(submit);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const answers = {};
+      for (const item of pending) {
+        const parts = [];
+        for (const question of item.questions || []) {
+          const name = `${item.id}-${question.id}`;
+          const chosen = [...form.querySelectorAll(`input[name="${CSS.escape(name)}"]:checked`)].map((one) => one.value);
+          const other = form.querySelector(`[data-question-name="${CSS.escape(name)}"]`)?.value.trim();
+          const answer = other || chosen.join(", ");
+          if (!answer) { showError("Answer every question before resuming."); return; }
+          parts.push(`${question.prompt}: ${answer}`);
+        }
+        answers[item.id] = parts.join("\n");
+      }
+      await request("/api/long-horizon/answer", {method: "POST", body: JSON.stringify({
+        goal_id: longGoal.goal_id,
+        expected_revision: longGoal.revision,
+        pending_ids: pending.map((one) => one.id),
+        answers,
+      })});
+      await refreshLongGoals(true);
+    });
+    inbox.append(form);
+  }
+
+  const evidence = $("missionEvidence");
+  evidence.replaceChildren();
+  if (longGoal?.verification) {
+    const pre = make("pre");
+    pre.textContent = JSON.stringify(longGoal.verification, null, 2);
+    evidence.append(make("h3", "", "Deterministic verification"), pre);
+  }
+  for (const artifact of longGoal?.artifacts || []) {
+    const details = make("details");
+    details.append(make("summary", "", `${artifact.kind || "artifact"} · ${artifact.patch_sha256 || "recorded evidence"}`));
+    const pre = make("pre");
+    pre.textContent = artifact.patch || JSON.stringify(artifact, null, 2);
+    details.append(pre);
+    evidence.append(details);
+  }
+  renderMissionEvents();
+}
+
+function renderMissionEvents() {
+  const list = $("missionEvents");
+  list.replaceChildren();
+  const filter = String($("missionEventFilter")?.value || "");
+  const shown = filter ? longGoalEvents.filter((event) => event.type.includes(filter)) : longGoalEvents;
+  if (longGoalEventNotice) list.append(make("li", "warning-one", longGoalEventNotice));
+  for (const event of shown.slice(-250).reverse()) {
+    const row = make("li", "mission-event");
+    row.append(make("strong", "", event.type.replaceAll("_", " ")));
+    row.append(make("span", "", `${new Date(event.at_ms).toLocaleTimeString()} · r${event.revision} · #${event.seq}`));
+    const payload = make("code", "", JSON.stringify(event.payload || {}));
+    row.append(payload);
+    list.append(row);
+  }
+}
+
+async function loadLongGoal(goalId, resetEvents = false) {
+  if (!goalId) { longGoal = null; longGoalEvents = []; longGoalCursor = 0; renderMissionControl(); return; }
+  if (resetEvents || longGoal?.goal_id !== goalId) { longGoalEvents = []; longGoalCursor = 0; }
+  const goalAnswer = await request(`/api/long-horizon/goal?id=${encodeURIComponent(goalId)}`);
+  longGoal = goalAnswer.goal;
+  for (let page = 0; page < 20; page += 1) {
+    const eventAnswer = await request(
+      `/api/long-horizon/events?id=${encodeURIComponent(goalId)}&after=${longGoalCursor}`);
+    if (eventAnswer.truncated) {
+      longGoalEventNotice = `Older event deltas were compacted; this view starts at event ${eventAnswer.oldest_available}. The authenticated goal snapshot remains current.`;
+    }
+    longGoalEvents.push(...(eventAnswer.events || []).filter(
+      (event) => !longGoalEvents.some((held) => held.event_id === event.event_id)));
+    const next = Number(eventAnswer.next || longGoalCursor);
+    if (!eventAnswer.has_more || next === longGoalCursor) { longGoalCursor = next; break; }
+    longGoalCursor = next;
+  }
+  localStorage.setItem(LONG_GOAL_SELECTED_KEY, goalId);
+  renderMissionControl();
+  if (["queued", "running"].includes(longGoal.status)) watchLongGoal();
+}
+
+async function refreshLongGoals(loadSelected = true) {
+  try {
+    longGoals = (await request("/api/long-horizon/goals")).goals || [];
+    const wanted = missionSelectedGoalId();
+    const selected = longGoals.find((goal) => goal.goal_id === wanted) || longGoals[0] || null;
+    if (loadSelected && selected) await loadLongGoal(selected.goal_id, longGoal?.goal_id !== selected.goal_id);
+    else { longGoal = selected; renderMissionControl(); }
+  } catch (error) {
+    $("missionProgress").textContent = String(error.message || error);
+  }
+}
+
+function watchLongGoal() {
+  if (longGoalWatching) return;
+  longGoalWatching = window.setTimeout(async () => {
+    longGoalWatching = 0;
+    try {
+      if (longGoal?.goal_id) await loadLongGoal(longGoal.goal_id);
+    } catch (error) {
+      longGoalEventNotice = `Live refresh was interrupted: ${String(error.message || error)} Nexus will reconnect automatically.`;
+      renderMissionControl();
+      if (longGoal?.goal_id && ["queued", "running"].includes(longGoal.status)) {
+        watchLongGoal();
+      }
+    }
+  }, 1200);
+}
+
+function savedLongGoalComposer() {
+  try {
+    const held = JSON.parse(localStorage.getItem(LONG_GOAL_COMPOSER_KEY) || "null");
+    return held && held.schema_version === 1 && held.draft && typeof held.draft === "object"
+      ? held : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function availableLongGoalProjects() {
+  return (theSwarmBoard().projects || []).filter((project) => project.is_there === true);
+}
+
+function selectedLongGoalAgentIds() {
+  return [...$("longGoalAgents").querySelectorAll('input[type="checkbox"]:checked')]
+    .map((input) => String(input.value || "")).filter(Boolean).sort();
+}
+
+function longGoalComposerDraft() {
+  return {
+    project_id: String($("longGoalProject").value || ""),
+    objective: String($("longGoalText").value || ""),
+    success_criteria: String($("longGoalCriteria").value || "")
+      .split(/\r?\n/).map((one) => one.trim()).filter(Boolean),
+    agent_ids: selectedLongGoalAgentIds(),
+    lead_id: String($("longGoalLead").value || ""),
+    collaboration_mode: $("longGoalParticipation").value === "adaptive"
+      ? "adaptive" : "every",
+  };
+}
+
+function longGoalIntent(draft) {
+  return JSON.stringify({
+    schema_version: 1,
+    project_id: draft.project_id,
+    objectives: [draft.objective.trim()],
+    success_criteria: [...draft.success_criteria],
+    agent_ids: [...draft.agent_ids].sort(),
+    lead_id: draft.lead_id,
+    collaboration_mode: draft.collaboration_mode,
+  });
+}
+
+function saveLongGoalComposerDraft() {
+  if (!$("longGoalDialog").open) return;
+  const draft = longGoalComposerDraft();
+  const intent = longGoalIntent(draft);
+  const previous = savedLongGoalComposer();
+  localStorage.setItem(LONG_GOAL_COMPOSER_KEY, JSON.stringify({
+    schema_version: 1,
+    draft,
+    intent,
+    request_id: previous?.intent === intent ? String(previous.request_id || "") : "",
+  }));
+}
+
+function showLongGoalComposerError(message = "") {
+  const error = $("longGoalError");
+  error.textContent = message;
+  error.hidden = !message;
+  if (message) error.focus({preventScroll: true});
+}
+
+function renderLongGoalComposerReadiness() {
+  const project = theSwarmProject($("longGoalProject").value);
+  const authority = project
+    ? (swarmSaid.project_authorities || {})[project.id] || null : null;
+  const selected = selectedLongGoalAgentIds();
+  const readyById = new Map((theSwarmBoard().agents || [])
+    .filter((agent) => agent.ready === true && String(agent.who || ""))
+    .map((agent) => [agent.id, agent]));
+  const readySelected = selected.map((id) => readyById.get(id)).filter(Boolean);
+  const participation = $("longGoalParticipation").value;
+  const status = $("longGoalReadiness");
+  status.replaceChildren();
+  status.classList.remove("good", "problem");
+  if (!project) {
+    status.classList.add("problem");
+    status.append(make("p", "", "Add or reconnect a local project folder before starting work."));
+  } else if (authority?.can_run === false) {
+    status.classList.add("problem");
+    status.append(make("p", "",
+      `${project.name}: ${authority.reason || "Project execution is paused."}`));
+    status.append(make("p", "",
+      "Use the host-folder recovery notice, or choose another project. Nexus will not start work through a paused authority."));
+  } else if (!readySelected.length) {
+    status.classList.add("problem");
+    status.append(make("p", "", "Select at least one ready agent. Disabled agents have a connection problem to repair first."));
+  } else {
+    const routes = new Set(readySelected.map((agent) => agent.who));
+    status.classList.add(readySelected.length > 1 ? "good" : "problem");
+    status.append(make("p", "", `${readySelected.length} ready agent${readySelected.length === 1 ? "" : "s"} selected across ${routes.size} route${routes.size === 1 ? "" : "s"}.`));
+    if (participation === "every") {
+      status.append(make("p", "", readySelected.length > 1
+        ? "Nexus will track a distinct required contribution from every selected agent; a missing reply cannot be reported as complete."
+        : "Only one agent is selected, so this goal can produce only one required AI contribution."));
+    } else {
+      status.append(make("p", "", "The lead starts the work and may delegate or request an independent review when the saved task state calls for it."));
+    }
+  }
+  $("longGoalParticipationWhy").textContent = participation === "every"
+    ? "Best when you explicitly need evidence from every vendor or specialist. Each selected agent receives its own durable required task."
+    : "Best when cost and speed matter more than hearing from everyone. All selected agents remain available for delegation and review.";
+  const criteria = $("longGoalCriteria").value.split(/\r?\n/)
+    .map((one) => one.trim()).filter(Boolean);
+  const objective = $("longGoalText").value.trim();
+  $("longGoalTextCount").textContent = `${$("longGoalText").value.length.toLocaleString()} of ${BOARD_TASK_CHARACTER_LIMIT.toLocaleString()} characters.`;
+  $("longGoalStart").disabled = !project || authority?.can_run === false
+    || !readySelected.length || !objective
+    || criteria.length > LONG_GOAL_MAX_CUSTOM_CRITERIA;
+  if (criteria.length > LONG_GOAL_MAX_CUSTOM_CRITERIA) {
+    status.classList.remove("good");
+    status.classList.add("problem");
+    status.append(make("p", "", `Use at most ${LONG_GOAL_MAX_CUSTOM_CRITERIA} custom success checks.`));
+  }
+  saveLongGoalComposerDraft();
+}
+
+function renderLongGoalTeam(preferredIds = null, preferredLead = "") {
+  const projectId = String($("longGoalProject").value || "");
+  const assigned = new Set((theSwarmBoard().works_on || [])
+    .filter((line) => line.project === projectId).map((line) => line.agent));
+  const ready = (theSwarmBoard().agents || []).filter(
+    (agent) => agent.ready === true && String(agent.who || ""));
+  const selected = preferredIds instanceof Set
+    ? preferredIds
+    : assigned.size ? assigned : new Set(ready.map((agent) => agent.id));
+  const list = $("longGoalAgents");
+  list.replaceChildren();
+  for (const agent of theSwarmBoard().agents || []) {
+    const usable = agent.ready === true && String(agent.who || "");
+    const label = make("label", `long-goal-agent${usable ? "" : " not-ready"}`);
+    const tick = document.createElement("input");
+    tick.type = "checkbox";
+    tick.value = agent.id;
+    tick.checked = usable && selected.has(agent.id);
+    tick.disabled = !usable;
+    tick.addEventListener("change", () => {
+      renderLongGoalLead();
+      renderLongGoalComposerReadiness();
+    });
+    label.append(tick, make("strong", "", agent.name || "Agent"));
+    label.append(make("span", "", usable
+      ? `${agent.who}${assigned.has(agent.id) ? " · assigned now" : " · will be assigned"}`
+      : `${agent.who || "No provider selected"} · repair connection first`));
+    list.append(label);
+  }
+  if (!theSwarmBoard().agents.length) {
+    list.append(make("p", "hint", "No agents are on this board yet."));
+  }
+  renderLongGoalLead(preferredLead);
+  renderLongGoalComposerReadiness();
+}
+
+function renderLongGoalLead(preferred = "") {
+  const selected = new Set(selectedLongGoalAgentIds());
+  const lead = $("longGoalLead");
+  const wanted = selected.has(preferred) ? preferred
+    : selected.has(lead.value) ? lead.value : "";
+  lead.replaceChildren();
+  for (const agent of theSwarmBoard().agents || []) {
+    if (!selected.has(agent.id)) continue;
+    const option = make("option", "", `${agent.name} (${agent.who})`);
+    option.value = agent.id;
+    option.selected = agent.id === wanted;
+    lead.append(option);
+  }
+  lead.disabled = !lead.options.length;
+}
+
+function closeLongGoalComposer() {
+  saveLongGoalComposerDraft();
+  if ($("longGoalDialog").open) $("longGoalDialog").close();
+  longGoalDialogInvoker?.focus?.({preventScroll: true});
+}
+
+function openLongGoalComposer() {
+  const dialog = $("longGoalDialog");
+  longGoalDialogInvoker = document.activeElement;
+  const saved = savedLongGoalComposer()?.draft || {};
+  const projects = availableLongGoalProjects();
+  const projectSelect = $("longGoalProject");
+  projectSelect.replaceChildren();
+  if (!projects.length) {
+    const option = make("option", "", "No local project is available");
+    option.value = "";
+    projectSelect.append(option);
+  }
+  const pickedProject = thePickedProject();
+  const preferredProject = projects.find((one) => one.id === saved.project_id)?.id
+    || projects.find((one) => one.id === pickedProject?.id)?.id || projects[0]?.id || "";
+  for (const project of projects) {
+    const option = make("option", "", `${project.name} — ${project.path}`);
+    option.value = project.id;
+    option.selected = project.id === preferredProject;
+    projectSelect.append(option);
+  }
+  const project = projects.find((one) => one.id === preferredProject);
+  $("longGoalText").value = typeof saved.objective === "string" && saved.objective.trim()
+    ? saved.objective : (project?.tasks || []).join("\n\n");
+  $("longGoalCriteria").value = Array.isArray(saved.success_criteria)
+    ? saved.success_criteria.join("\n") : "";
+  $("longGoalParticipation").value = saved.collaboration_mode === "adaptive"
+    ? "adaptive" : "every";
+  showLongGoalComposerError();
+  if (!dialog.open) dialog.showModal();
+  const preferredIds = saved.project_id === preferredProject && Array.isArray(saved.agent_ids)
+    ? new Set(saved.agent_ids) : null;
+  renderLongGoalTeam(preferredIds, String(saved.lead_id || ""));
+  $("longGoalText").focus();
+}
+
+function editLongGoalProjectOnBoard() {
+  const projectId = String($("longGoalProject").value || "");
+  closeLongGoalComposer();
+  if (projectId && theSwarmProject(projectId)) {
+    pickSwarmBox("project", projectId);
+    $("swarmPanel").scrollIntoView({behavior: "smooth", block: "nearest"});
+    $("swarmTaskText").focus({preventScroll: true});
+  } else {
+    $("swarmAddProject").focus({preventScroll: true});
+  }
+}
+
+async function checkLongGoalBoard() {
+  closeLongGoalComposer();
+  await refreshSwarm(false);
+  $("swarmNotReadyTitle").scrollIntoView({behavior: "smooth", block: "center"});
+  $("swarmRefresh").focus({preventScroll: true});
+}
+
+async function startLongGoalFromComposer(event) {
+  event?.preventDefault?.();
+  showLongGoalComposerError();
+  const draft = longGoalComposerDraft();
+  if (!draft.project_id) return showLongGoalComposerError("Choose an available project folder.");
+  if (!draft.objective.trim()) return showLongGoalComposerError("Write the outcome that must be achieved.");
+  if (!draft.agent_ids.length) return showLongGoalComposerError("Select at least one ready agent.");
+  if (draft.success_criteria.length > LONG_GOAL_MAX_CUSTOM_CRITERIA) {
+    return showLongGoalComposerError(`Use at most ${LONG_GOAL_MAX_CUSTOM_CRITERIA} custom success checks.`);
+  }
+  if (!draft.agent_ids.includes(draft.lead_id)) draft.lead_id = draft.agent_ids[0];
+  const intent = longGoalIntent(draft);
+  const previous = savedLongGoalComposer();
+  const requestId = previous?.intent === intent && previous.request_id
+    ? String(previous.request_id) : crypto.randomUUID();
+  localStorage.setItem(LONG_GOAL_COMPOSER_KEY, JSON.stringify({
+    schema_version: 1, draft, intent, request_id: requestId,
+  }));
+  const start = $("longGoalStart");
+  start.disabled = true;
+  start.textContent = "Saving team and starting…";
+  try {
+    const chosen = new Set(draft.agent_ids);
+    const changed = await changeTheSwarmBoard((board) => {
+      board.works_on = (board.works_on || []).filter(
+        (line) => line.project !== draft.project_id || chosen.has(line.agent));
+      const assigned = new Set(board.works_on
+        .filter((line) => line.project === draft.project_id).map((line) => line.agent));
+      for (const agentId of draft.agent_ids) {
+        if (!assigned.has(agentId)) board.works_on.push({agent: agentId, project: draft.project_id});
+      }
+    }, "The selected goal team is assigned to this project.");
+    if (!changed) throw new Error("Nexus could not save the selected team. Review the board and try again.");
+    const goalSpec = {
+      schema_version: 1,
+      project_id: draft.project_id,
+      objectives: [draft.objective.trim()],
+      success_criteria: draft.success_criteria,
+      lead_id: draft.lead_id,
+      collaboration_mode: draft.collaboration_mode,
+      participant_ids: draft.agent_ids,
+    };
+    const said = await request("/api/long-horizon/start-board", {
+      method: "POST", body: JSON.stringify({request_id: requestId, goal: goalSpec}),
+    });
+    localStorage.removeItem(LONG_GOAL_COMPOSER_KEY);
+    localStorage.removeItem(LONG_GOAL_REQUEST_KEY);
+    longGoals = said.goals || [];
+    if (longGoals[0]) {
+      localStorage.setItem(LONG_GOAL_SELECTED_KEY, longGoals[0].goal_id);
+      await refreshLongGoals(true);
+    }
+    $("longGoalDialog").close();
+    $("swarmGoalWorkSaid").textContent =
+      `Started a durable goal with ${draft.agent_ids.length} selected agent${draft.agent_ids.length === 1 ? "" : "s"}. Mission control shows each required contribution and saved checkpoint.`;
+    $("missionControl")?.scrollIntoView({behavior: "smooth", block: "start"});
+  } catch (error) {
+    showLongGoalComposerError(String(error.message || error));
+    $("swarmGoalWorkSaid").textContent = String(error.message || error);
+  } finally {
+    start.textContent = "Start durable goal";
+    renderLongGoalComposerReadiness();
+  }
+}
+
+function workOnEveryBoardGoal() {
+  openLongGoalComposer();
+}
+
+async function missionControl(action, payload = {}) {
+  if (!longGoal) return;
+  const dispatchingActions = new Set([
+    "resume", "retry", "reassign", "steer", "message", "request_review", "fork",
+  ]);
+  if (missionProviderSetupChanged() && dispatchingActions.has(action)) {
+    const message = longGoal.provider_setup_status?.message
+      || "The saved provider setup changed. Start a new goal with the current board setup.";
+    showError(message);
+    $("missionProviderSetupChanged").scrollIntoView({behavior: "smooth", block: "center"});
+    $("missionProviderSetupReview").focus({preventScroll: true});
+    return;
+  }
+  try {
+    let forkRequestId = "";
+    if (action === "fork") {
+      try {
+        const saved = JSON.parse(localStorage.getItem(LONG_GOAL_FORK_REQUEST_KEY) || "null");
+        if (saved?.schema_version === 1 && saved.goal_id === longGoal.goal_id
+            && typeof saved.request_id === "string" && saved.request_id) {
+          forkRequestId = saved.request_id;
+        }
+      } catch (_) { /* A corrupt renderer draft is replaced below. */ }
+      if (!forkRequestId) forkRequestId = crypto.randomUUID();
+      localStorage.setItem(LONG_GOAL_FORK_REQUEST_KEY, JSON.stringify({
+        schema_version: 1, goal_id: longGoal.goal_id, request_id: forkRequestId,
+      }));
+    }
+    const said = await request("/api/long-horizon/control", {method: "POST", body: JSON.stringify({
+      goal_id: longGoal.goal_id, action, payload,
+      ...(action === "fork" ? {request_id: forkRequestId} : {}),
+    })});
+    if (action === "fork") {
+      localStorage.removeItem(LONG_GOAL_FORK_REQUEST_KEY);
+      localStorage.setItem(LONG_GOAL_SELECTED_KEY, said.goal.goal_id);
+    }
+    await refreshLongGoals(true);
+  } catch (error) {
+    // A fail-closed control (especially cancellation reconciliation) may have
+    // committed a safer paused state while rejecting the requested action.
+    // Refresh even when the HTTP result is an error so that recovery guidance
+    // is visible without making the user reload the app.
+    try { await refreshLongGoals(true); } catch (_) { /* Preserve the original control error. */ }
+    showError(error.message);
+  }
+}
+
+async function cancelLongGoal() {
+  if (!longGoal || !window.confirm("Cancel this goal? Completed evidence remains recorded.")) return;
+  await missionControl("cancel");
 }
 
 async function cancelRemainingBoardGoals() {
@@ -11547,7 +13661,16 @@ async function openTheKeptBoard(name) {
     renderSwarmPanel();
     renderTheKeptBoards();
     renderTheChatsOnThisBoard();
+    void Promise.all(swarmChats.map(
+      (held) => loadConversationsFor(held.agent, false)
+    ));
     sayInSwarm(`Opened the board saved as ${name}.`);
+    if (said.provider_status_stale) {
+      // The board is already open and interactive. Discovering installed
+      // provider tools may take many seconds, so decorate readiness in a
+      // separate request instead of making the Open button appear stuck.
+      void refreshSwarm(true);
+    }
   } catch (trouble) {
     sayInSwarm(String(trouble.message || trouble));
   }
@@ -12507,8 +14630,10 @@ function shutTheBigChat() {
   restoreTheBigChatFocus();
 }
 
-function aFaceFor(kind, agent = null) {
-  if (kind !== "you") return anAgentFace(agent, "the-big-chat-face", 24);
+function aFaceFor(kind, agent = null, nexus = false) {
+  if (kind !== "you") return aChatTurnFace(
+    {speaker_id: nexus ? "nexus" : ""}, agent, "the-big-chat-face", 24,
+  );
   const face = make("span", "swarm-agent-face the-big-chat-face");
   face.append(aSwarmDrawing("person", 24));
   return face;
@@ -12541,22 +14666,34 @@ function renderTheConversationSidebar(agentId) {
     for (const conversation of chats) {
       const row = make("div", "the-big-chat-conversation-item");
       const archived = Boolean(conversation.archived_at);
+      const running = swarmChatIsBusy(agentId, conversation.id);
+      const resetting = swarmChatIsResetting(agentId, conversation.id);
+      const bindingProblem = conversation.binding_problem;
       row.classList.toggle("archived", archived);
+      row.classList.toggle("running", running || resetting);
+      row.classList.toggle("binding-broken", Boolean(bindingProblem));
       const pick = make("button", "the-big-chat-conversation-pick");
       pick.type = "button";
       pick.classList.toggle("active", held.conversation === conversation.id);
       pick.dataset.archived = String(archived);
-      pick.disabled = archived || swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId);
+      pick.dataset.conversationAction = "pick";
+      pick.dataset.chatId = conversation.id;
+      // Selection is navigation, not mutation. Keep it available while a
+      // sibling chat works so the user can watch or start another exact chat.
+      pick.disabled = archived || swarmConversationSwitching.has(agentId)
+        || swarmChatIsHydrating(agentId);
       const project = (conversation.projects || []).find(
         (one) => one.id === conversation.project
       );
+      const subtitle = archived ? "Archived — history kept"
+        : bindingProblem ? "Setup changed — transcript protected"
+        : resetting ? "Starting again — sibling chats remain available"
+          : running ? "Working now — you can safely open another chat"
+          : conversation.legacy_source ? "Recovered from an older Nexus chat"
+            : project?.name || ((conversation.projects || []).length
+              ? "No project selected" : "No project shared by this pair");
       pick.append(make("strong", "", conversation.name));
-      pick.append(make("span", "", archived ? "Archived — history kept" : (
-        conversation.legacy_source ? "Recovered from an older Nexus chat" : (
-          project?.name || ((conversation.projects || []).length
-            ? "No project selected" : "No project shared by this pair")
-        )
-      )));
+      pick.append(make("span", "", subtitle));
       pick.addEventListener("click", () => activateConversationFor(agentId, conversation.id));
       row.append(pick);
       const remove = make("button", archived ? "the-big-chat-conversation-delete"
@@ -12564,18 +14701,41 @@ function renderTheConversationSidebar(agentId) {
       remove.type = "button";
       remove.title = `${archived ? "Restore" : "Archive"} ${conversation.name}`;
       remove.setAttribute("aria-label", remove.title);
-      remove.disabled = swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId);
+      remove.dataset.conversationAction = archived ? "restore" : "archive";
+      remove.dataset.chatId = conversation.id;
+      remove.disabled = running || resetting || swarmConversationSwitching.has(agentId)
+        || swarmChatIsHydrating(agentId);
       remove.addEventListener("click", () => archived
         ? restoreConversationFor(agentId, conversation.id)
         : archiveConversationFor(agentId, conversation.id));
       row.append(remove);
+      if (bindingProblem && !archived) {
+        const repair = make("div", "the-big-chat-binding-repair");
+        repair.append(make("p", "", String(bindingProblem.message ||
+          "This chat's provider or project setup changed.")));
+        const fresh = make("button", "primary", String(
+          bindingProblem.action_label || "Start fresh with current setup"
+        ));
+        fresh.type = "button";
+        fresh.dataset.conversationAction = "create";
+        fresh.disabled = swarmConversationSwitching.has(agentId)
+          || swarmChatIsHydrating(agentId);
+        const currentPeer = peer?.id || (connectedPairsFor(agentId)
+          .flat().find((one) => one !== agentId) || "");
+        fresh.addEventListener("click", () =>
+          createConversationFor(agentId, currentPeer));
+        repair.append(fresh);
+        row.append(repair);
+      }
       items.append(row);
     }
     group.append(items);
     if (connectedPairsFor(agentId).some((one) => pairKey(one) === pairKey(pair))) {
       const add = make("button", "the-big-chat-pair-new", "+ New chat for this pair");
       add.type = "button";
-      add.disabled = swarmBusy.has(agentId) || swarmConversationSwitching.has(agentId);
+      add.dataset.conversationAction = "create";
+      add.disabled = swarmConversationSwitching.has(agentId)
+        || swarmChatIsHydrating(agentId);
       add.addEventListener("click", () => createConversationFor(agentId, peer?.id || ""));
       group.append(add);
     }
@@ -12603,10 +14763,13 @@ function renderTheConversationProject(agentId) {
     select.append(option);
   }
   select.value = conversation?.project || "";
-  select.disabled = !conversation || swarmBusy.has(agentId)
-    || swarmConversationSwitching.has(agentId);
+  select.disabled = !conversation || swarmChatIsBusy(agentId)
+    || swarmChatIsResetting(agentId) || swarmConversationSwitching.has(agentId)
+    || swarmChatIsHydrating(agentId) || Boolean(conversation?.binding_problem);
   $("theBigChatProjectHelp").textContent = !conversation
     ? "Create or select a pair chat first."
+    : conversation.binding_problem
+      ? conversation.binding_problem.message
     : conversation.project
       ? "This chat's file work is confined to the selected folder."
       : projects.length
@@ -12640,24 +14803,36 @@ function renderTheBigChat() {
       picture_zoom: one.picture_zoom, picture_hue: one.picture_hue,
     })),
     talks: theSwarmBoard().talks_to || [],
-    busy: swarmBusy.has(theBigOne),
+    busy: (held?.conversations || []).map((one) => [
+      one.id, swarmChatIsBusy(theBigOne, one.id), swarmChatIsResetting(theBigOne, one.id),
+    ]),
     switching: swarmConversationSwitching.has(theBigOne),
+    hydrating: swarmChatIsHydrating(theBigOne),
   })) renderTheConversationSidebar(theBigOne);
   if (bigChatPartChanged("project", {
     id: conversation?.id || "", project: conversation?.project || "",
-    projects: conversation?.projects || [], busy: swarmBusy.has(theBigOne),
+    projects: conversation?.projects || [], busy: swarmChatIsBusy(theBigOne),
+    resetting: swarmChatIsResetting(theBigOne), hydrating: swarmChatIsHydrating(theBigOne),
     switching: swarmConversationSwitching.has(theBigOne),
   })) renderTheConversationProject(theBigOne);
   syncChatRoundPolicy(theBigOne);
+  syncChatRecipientWords(theBigOne);
+  syncChatTeamReadiness(theBigOne);
   const destination = $("theBigChatDestination");
   if (destination && bigChatPartChanged("destination", {
     agent: {id: agent?.id, name: agent?.name, who: agent?.who, ready: agent?.ready,
       why_not: agent?.why_not, chat_destination: agent?.chat_destination},
-    conversation: conversation ? {id: conversation.id, destination: conversation.destination} : null,
+    conversation: conversation ? {
+      id: conversation.id,
+      destination: conversation.destination,
+      collaboration_problem: conversation.collaboration_problem,
+    } : null,
   })) destination.replaceChildren(aChatDestination(agent, {conversation}));
 
   const turns = [];
+  let latestUserPrompt = "";
   for (const one of chatTurnsWhileWorking(theBigOne, keptTranscriptFor(theBigOne))) {
+    if (one.who === "you" && String(one.text || "").trim()) latestUserPrompt = one.text;
     const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
       "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
       .includes(one.phase);
@@ -12672,6 +14847,10 @@ function renderTheBigChat() {
       model: one.model || "",
       milliseconds: Number(one.milliseconds || 0),
       speakerId: one.speaker_id || "",
+      nexus: isNexusChatTurn(one),
+      structuredStateUnavailable: Boolean(one.structured_state_unavailable),
+      participantOutcome: normalizedParticipantOutcome(one),
+      originalPrompt: latestUserPrompt,
     });
   }
   // What this agent said to another agent, and what another said to it. Shown
@@ -12712,16 +14891,25 @@ function renderTheBigChat() {
     for (const one of turns) {
       const row = make("li", `the-big-chat-turn from-${one.kind === "you" ? "you" : "them"} `
         + (one.kind === "between" ? "between" : ""));
-      const speaker = theSwarmAgent(one.speakerId) || agent;
+      row.classList.toggle("nexus-turn", one.nexus);
+      const speaker = one.nexus ? null : (theSwarmAgent(one.speakerId) || agent);
       if (one.kind !== "you") styleForAgent(row, speaker);
-      row.append(aFaceFor(one.kind, speaker));
+      row.append(aFaceFor(one.kind, speaker, one.nexus));
       const what = make("div", "the-big-chat-what");
       const heading = make("div", "the-big-chat-turn-head");
       heading.append(make("span", "the-big-chat-who", `${one.who}${one.at ? ` | ${one.at}` : ""}`));
       const phase = chatPhaseName(one.phase);
       if (phase) heading.append(make("span", `chat-turn-phase phase-${one.phase}`, phase));
       what.append(heading);
-      appendChatText(what, one.text);
+      if (one.participantOutcome) {
+        appendParticipantOutcome(what, one.participantOutcome, agent, one.originalPrompt, row);
+      } else {
+        appendChatText(what, one.text);
+      }
+      if (one.structuredStateUnavailable) {
+        what.append(make("p", "hint chat-turn-protocol-warning",
+          "Reply kept exactly as delivered; completion and progress could not be verified."));
+      }
       if (Array.isArray(one.attachments) && one.attachments.length) {
         const files = make("div", "talk-attachments");
         for (const attached of one.attachments) {
@@ -12777,20 +14965,12 @@ function renderWhatItHasGoingOn(agent) {
   if (agent && agent.how_to_fix_it) {
     list.append(make("li", "the-big-chat-doing-one", agent.how_to_fix_it));
   }
-  if (agent && agent.trouble_last_time && agent.assistant_kind === "claude-cli") {
+  if (agent && (agent.trouble_last_time || !agent.ready)) {
     const row = make("li", "the-big-chat-doing-one");
-    const repair = make("button", "swarm-repair", "Repair Claude access");
+    const repair = make("button", "swarm-repair", "Repair connection");
     repair.type = "button";
-    repair.addEventListener("click", () => repairClaudeAccess(repair));
+    repair.addEventListener("click", () => void openAgentRepairFlow(agent.id, repair));
     row.append(repair);
-    list.append(row);
-  }
-  if (agent && agent.trouble_last_time && agent.assistant_kind === "gemini-cli") {
-    const row = make("li", "the-big-chat-doing-one");
-    const projectHelp = make("button", "swarm-project-help", "Find Cloud project ID");
-    projectHelp.type = "button";
-    projectHelp.addEventListener("click", showGeminiProjectHelp);
-    row.append(projectHelp);
     list.append(row);
   }
 }
@@ -12811,7 +14991,7 @@ function showGeminiProjectHelp() {
   sayInSwarm("Google Cloud Console opened. Choose a project and copy the Project ID from its Welcome page.");
 }
 
-async function repairClaudeAccess(button = null) {
+async function repairClaudeAccess(route, diagnosisFingerprint, button = null) {
   if (!window.confirm(
       "Repair Claude command-line access?\n\n"
       + "This opens a visible terminal, updates Claude, signs the Claude command line out, "
@@ -12826,7 +15006,9 @@ async function repairClaudeAccess(button = null) {
   }
   try {
     const said = await request("/api/team/repair-claude", {
-      method: "POST", body: JSON.stringify({}),
+      method: "POST", body: JSON.stringify({
+        route, diagnosis_fingerprint: diagnosisFingerprint,
+      }),
     });
     sayInSwarm(said.note || "Claude's repair opened in its own terminal.");
   } catch (trouble) {
@@ -12866,52 +15048,321 @@ async function signInThisAssistant(routeOrKind, button = null) {
   }
 }
 
-async function checkAgentLogin(agentId, route) {
+function agentStillUsesRoute(agentId, route) {
+  const agent = theSwarmAgent(agentId);
+  const draft = swarmAgentSettingDrafts.get(agentId);
+  return Boolean(agent) && String(draft?.values?.who ?? agent.who ?? "") === String(route || "");
+}
+
+function renderAgentRepairPanel(agent, route, plan = null) {
+  const panel = $("swarmAgentRepair");
+  const badge = $("swarmAgentRepairBadge");
+  const title = $("swarmAgentRepairTitle");
   const status = $("swarmAgentSessionStatus");
-  if (!route) return;
-  status.textContent = "Checking the provider session…";
+  const steps = $("swarmAgentRepairSteps");
+  const start = $("swarmAgentRepairStart");
+  const action = $("swarmAgentRepairAction");
+  const test = $("swarmAgentLiveTest");
+  const check = $("swarmAgentCheckLogin");
+  const login = $("swarmAgentManualLogin");
+  const stop = $("swarmAgentStopTest");
+  const choices = $("swarmAgentRepairChoices");
+  const note = $("swarmAgentRepairActionNote");
+  const testing = swarmAgentRepairTests.has(agent.id);
+
+  for (const button of [start, action, test, check, login, stop]) {
+    button.hidden = true;
+    button.disabled = false;
+    button.onclick = null;
+  }
+  action.removeAttribute("data-action");
+  choices.replaceChildren();
+  choices.hidden = true;
+  steps.replaceChildren();
+  steps.hidden = true;
+  note.textContent = "";
+
+  if (!route) {
+    panel.dataset.tone = "idle";
+    title.textContent = "Connection";
+    badge.textContent = "No assistant";
+    status.textContent = "Choose an assistant first.";
+    start.hidden = false;
+    start.disabled = true;
+    return;
+  }
+
+  if (testing) {
+    panel.dataset.tone = "attention";
+    title.textContent = "Testing the exact route";
+    badge.textContent = "Working";
+    status.textContent = "Waiting for one real model answer in an empty temporary folder…";
+    note.textContent = "This uses one model request. No project files were supplied to the provider.";
+    stop.hidden = false;
+    stop.onclick = () => stopAgentRouteTest(agent.id, route);
+    return;
+  }
+
+  if (!plan?.repair) {
+    panel.dataset.tone = agent.trouble_last_time || !agent.ready ? "blocked" : "idle";
+    title.textContent = "Connection";
+    badge.textContent = agent.trouble_last_time || !agent.ready ? "Needs attention" : "Not checked";
+    status.textContent = agent.trouble_last_time
+      ? `${agent.trouble_last_time} Repair connection will diagnose this exact route.`
+      : !agent.ready
+        ? (agent.why_not || "This assistant is not ready yet.")
+        : "Check this exact route and get the right recovery steps without sending a model prompt.";
+    start.hidden = false;
+    start.onclick = () => loadAgentRepairPlan(agent.id, route, start);
+    return;
+  }
+
+  const repair = plan.repair;
+  panel.dataset.tone = String(repair.tone || "attention");
+  title.textContent = String(repair.title || "Connection repair");
+  badge.textContent = String(repair.state || "checked").replaceAll("-", " ");
+  status.textContent = String(repair.summary || plan.note || "The route was checked.");
+  for (const words of repair.steps || []) steps.append(make("li", "", String(words)));
+  steps.hidden = !steps.children.length;
+
+  const descriptions = [];
+  for (const offered of repair.actions || []) {
+    const id = String(offered.id || "");
+    if (offered.note) descriptions.push(`${offered.label}: ${offered.note}`);
+    if (id === "check") {
+      check.hidden = false;
+      check.textContent = String(offered.label || "Check again");
+      check.onclick = () => checkAgentLogin(agent.id, route, check);
+    } else if (id === "live-test") {
+      test.hidden = false;
+      test.textContent = String(offered.label || "Run live test");
+      test.classList.toggle("primary", Boolean(offered.primary));
+      test.onclick = () => runAgentRouteTest(agent.id, route);
+    } else if (id === "login") {
+      login.hidden = false;
+      login.textContent = String(offered.label || "Open sign-in");
+      login.classList.toggle("primary", Boolean(offered.primary));
+      login.onclick = () => manuallyLogInAgent(agent.id, route);
+    } else {
+      const choice = make("button", Boolean(offered.primary) ? "primary" : "",
+        String(offered.label || "Continue repair"));
+      choice.type = "button";
+      choice.dataset.action = id;
+      choice.onclick = () => performAgentRepairAction(agent.id, route, offered, choice);
+      choices.append(choice);
+    }
+  }
+  choices.hidden = !choices.children.length;
+  note.textContent = descriptions.join(" ");
+}
+
+async function loadAgentRepairPlan(agentId, route, button = null) {
+  if (!route) return null;
+  const was = button?.textContent || "";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Diagnosing…";
+  }
+  $("swarmAgentRepair").dataset.tone = "attention";
+  $("swarmAgentRepairBadge").textContent = "Checking";
+  $("swarmAgentSessionStatus").textContent = "Checking the exact route without sending a model prompt…";
   try {
-    const said = await request("/api/team/check-login", {
+    const plan = await request("/api/team/repair-plan", {
       method: "POST", body: JSON.stringify({route}),
     });
-    status.dataset.state = String(said.state || "unknown");
-    status.textContent = said.note || (said.authentication === "signed-in"
-      ? "Logged in: the provider session is valid."
-      : said.authentication === "signed-out"
-        ? "Not logged in: use Log in manually to create a valid session."
-        : "The provider session could not be confirmed.");
-    sayInSwarm(`${agentId}: ${status.textContent}`);
+    swarmAgentRepairPlans.set(agentId, {route, plan});
+    if (agentStillUsesRoute(agentId, route)) {
+      renderAgentRepairPanel(theSwarmAgent(agentId), route, plan);
+    }
+    return plan;
   } catch (error) {
-    status.dataset.state = "error";
-    status.textContent = `Login check failed: ${error.message}`;
+    if (agentStillUsesRoute(agentId, route)) {
+      $("swarmAgentRepair").dataset.tone = "error";
+      $("swarmAgentRepairBadge").textContent = "Check failed";
+      $("swarmAgentSessionStatus").textContent = String(error.message || error);
+    }
+    return null;
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = was;
+    }
   }
+}
+
+async function checkAgentLogin(agentId, route, button = null) {
+  return loadAgentRepairPlan(agentId, route, button);
 }
 
 async function manuallyLogInAgent(agentId, route) {
   const status = $("swarmAgentSessionStatus");
   if (!route) return;
   if (route.startsWith("web:")) {
-    status.textContent = "Opening Web AI chats for manual sign-in…";
+    status.textContent = "Opening Web AI chats. Reconnect this provider page, then press Check again.";
     await openWebChatManager();
     return;
   }
-  status.textContent = "Opening the provider's manual sign-in…";
+  status.textContent = "Opening the exact provider route's sign-in…";
+  const said = await signInThisAssistant(route, $("swarmAgentManualLogin"));
+  status.textContent = said?.note || "The sign-in did not open. Use Check again for the current diagnosis.";
+}
+
+async function repairGeminiRoute(agentId, route, button) {
+  const project = await askForOneLine(
+    "Repair Gemini connection",
+    "Enter the Google Cloud Project ID used by this Workspace account. This is the Project ID, not its display name or number.",
+    "",
+    {label: "HOW TO FIND IT (external link)", href: GEMINI_CLI_CLOUD_PROJECT_HELP},
+  );
+  if (project === null) return;
+  if (!project.trim()) {
+    $("swarmAgentSessionStatus").textContent = "No Project ID was entered, so nothing changed.";
+    return;
+  }
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "Saving…";
   try {
-    const said = await signInThisAssistant(route);
-    status.textContent = said?.note || "Manual sign-in could not be opened.";
+    const said = await request("/api/team/set-google-project", {
+      method: "POST", body: JSON.stringify({route, google_project: project.trim()}),
+    });
+    sayInSwarm(said.note || `Saved the Cloud project for ${route}.`);
+    await refreshSwarm(true);
+    await loadAgentRepairPlan(agentId, route);
   } catch (error) {
-    status.textContent = `Manual sign-in failed: ${error.message}`;
+    $("swarmAgentSessionStatus").textContent = String(error.message || error);
+  } finally {
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = was;
+    }
   }
 }
 
-async function sendFromTheBigChat(mode = "auto") {
+async function performAgentRepairAction(agentId, route, offered, button) {
+  const actionId = String(offered?.id || offered || "");
+  if (actionId === "google-project") {
+    await repairGeminiRoute(agentId, route, button);
+  } else if (actionId === "repair-claude") {
+    await repairClaudeAccess(route, offered?.diagnosis_fingerprint || "", button);
+  } else if (actionId === "inspect-provider-turn") {
+    const conversation = activeConversationFor(agentId);
+    const destination = conversation?.destination || {};
+    const webChatId = String(destination.web_chat_id || (route.startsWith("web:") ? route.slice(4) : ""));
+    if (!webChatId || !window.harnessDesktop?.showWebChat) {
+      $("swarmAgentSessionStatus").textContent =
+        "This provider conversation cannot be opened here. Use its provider app before retrying the uncertain turn.";
+      return;
+    }
+    $("swarmAgentSessionStatus").textContent =
+      "Opening the exact provider conversation. Confirm whether the uncertain turn arrived before retrying it.";
+    await showFullWebChatInsideNexus(
+      webChatId,
+      String(destination.web_conversation_key || ""),
+      Boolean(destination.web_prefer_existing_conversation),
+    );
+  } else if (actionId === "web-chat") {
+    const connectionId = String(offered?.connection_id || (route.startsWith("web:") ? route.slice(4) : ""));
+    const providerId = String(offered?.provider || connectionId.split("-", 1)[0] || "")
+      .toLowerCase();
+    const conversation = activeConversationFor(agentId);
+    const destination = conversation?.destination || {};
+    const conversationKey = String(destination.web_conversation_key || conversation?.filed_as || "");
+    const preferExisting = Boolean(destination.web_prefer_existing_conversation);
+    pickSwarmBox("agent", agentId);
+    $("swarmAgentSessionStatus").textContent =
+      "Reconnect the provider chat saved for this exact agent. Nexus will preserve its route and conversation binding.";
+    let providerChoices = webChatProviderChoices;
+    if (providerId) {
+      try {
+        providerChoices = await refreshWebChatProviderChoices();
+      } catch (error) {
+        $("swarmAgentSessionStatus").textContent =
+          `Nexus could not read the local web-chat providers: ${error.message || error}`;
+        return;
+      }
+    }
+    if (providerId && providerChoices.some((one) => one.id === providerId)) {
+      await connectPickedAgentToWebProvider(providerId, {
+        connectionId,
+        conversationKey,
+        preferExisting,
+      });
+    } else {
+      await openWebChatManager();
+    }
+  } else if (actionId === "choose-route" || actionId === "map-route") {
+    pickSwarmBox("agent", agentId);
+    $("swarmAgentSessionStatus").textContent =
+      "Choose an available assistant above. Nexus will keep this agent box and replace only its missing route.";
+    $("swarmAgentWho").focus();
+  } else if (actionId === "settings") {
+    switchView("settings");
+    $("settingsFilter").value = route;
+    await refreshSettings();
+    $("settingsFilter").focus();
+    announce(`Settings are filtered to ${route}. Return to the agent and press Check again after saving.`);
+  }
+}
+
+async function runAgentRouteTest(agentId, route) {
+  if (!route || swarmAgentRepairTests.has(agentId)) return;
+  const controller = new AbortController();
+  swarmAgentRepairTests.set(agentId, {route, controller});
+  renderAgentRepairPanel(theSwarmAgent(agentId), route, swarmAgentRepairPlans.get(agentId)?.plan);
+  try {
+    const said = await request("/api/team/test-route", {
+      method: "POST",
+      body: JSON.stringify({route}),
+      signal: controller.signal,
+    });
+    if (said.plan) swarmAgentRepairPlans.set(agentId, {route, plan: said.plan});
+    sayInSwarm(`${(theSwarmAgent(agentId) || {}).name || agentId}: connection verified.`);
+    await refreshSwarm(true);
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      sayInSwarm(`Live connection test failed: ${error.message || error}`);
+      await loadAgentRepairPlan(agentId, route);
+    }
+  } finally {
+    const active = swarmAgentRepairTests.get(agentId);
+    if (active?.controller === controller) swarmAgentRepairTests.delete(agentId);
+    if (agentStillUsesRoute(agentId, route)) {
+      renderAgentRepairPanel(
+        theSwarmAgent(agentId), route,
+        swarmAgentRepairPlans.get(agentId)?.route === route
+          ? swarmAgentRepairPlans.get(agentId).plan : null,
+      );
+    }
+  }
+}
+
+async function stopAgentRouteTest(agentId, route) {
+  const active = swarmAgentRepairTests.get(agentId);
+  if (!active || active.route !== route) return;
+  const button = $("swarmAgentStopTest");
+  button.disabled = true;
+  button.textContent = "Stopping…";
+  try {
+    await request("/api/team/stop-route-test", {
+      method: "POST", body: JSON.stringify({route}),
+    });
+    active.controller.abort();
+  } catch (error) {
+    $("swarmAgentSessionStatus").textContent = String(error.message || error);
+    button.disabled = false;
+    button.textContent = "Stop test";
+  }
+}
+
+async function sendFromTheBigChat(mode = "chat") {
   const box = $("theBigChatBox");
   const typed = box.value;
   const said = typed.trim();
   if (!theBigOne) return;
   const agentId = theBigOne;
   const agent = theSwarmAgent(agentId);
-  const executionPause = swarmProviderPauseMessage();
+  const executionPause = projectWorkPauseForMessage(mode, said, agentId);
   if (executionPause) {
     $("theBigChatSaidBack").textContent = executionPause;
     box.focus();
@@ -12937,29 +15388,58 @@ async function sendFromTheBigChat(mode = "auto") {
     $("theBigChatSaidBack").textContent = agent?.why_not || "This agent is not ready yet.";
     return;
   }
-  if (swarmBusy.has(agentId)) {
+  const conversation = activeConversationFor(agentId);
+  if (conversation?.binding_problem) {
+    $("theBigChatSaidBack").textContent = String(conversation.binding_problem.message ||
+      "This chat's setup changed. Start a fresh chat with the current setup.");
+    box.focus();
+    return;
+  }
+  const recoveryKey = swarmChatKey(agentId);
+  const runtimeKey = swarmChatRuntimeKey(agentId);
+  if (swarmBusy.has(runtimeKey)) {
     $("theBigChatSaidBack").textContent = "Still waiting for the previous answer.";
+    return;
+  }
+  if (swarmChatResetting.has(runtimeKey)) {
+    $("theBigChatSaidBack").textContent = "This exact chat is still starting again.";
+    return;
+  }
+  if (swarmChatIsHydrating(agentId)) {
+    $("theBigChatSaidBack").textContent = "Loading this chat's saved identity first.";
     return;
   }
   if (swarmConversationSwitching.has(agentId)) {
     $("theBigChatSaidBack").textContent = "Finishing the chat switch first.";
     return;
   }
+  if (["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)) {
+    $("theBigChatSaidBack").textContent = loneAgentActionMessage(mode);
+    box.focus();
+    return;
+  }
+  if (mode === "collaborate") {
+    const unavailable = syncChatTeamReadiness(agentId);
+    if (unavailable.length) {
+      $("theBigChatSaidBack").textContent =
+        `The team request was not sent. Repair ${unavailable.map((one) => one.name || one.id).join(", ")} first.`;
+      box.focus();
+      return;
+    }
+  }
   const projectPermission = confirmProjectWork(agent, said, mode);
   if (!projectPermission.allowed) return;
-  const conversation = activeConversationFor(agentId);
-  const recoveryKey = swarmChatKey(agentId);
-  swarmBusy.add(agentId);
-  swarmStopping.delete(agentId);
+  swarmBusy.add(runtimeKey);
+  swarmStopping.delete(runtimeKey);
   nextSwarmChatRevision(agentId);
   setWhatCanBePressedInSwarm();
   const buttons = [
-    "theBigChatSend", "theBigChatSolo", "theBigChatAttach",
+    "theBigChatSend", "theBigChatAttach",
     "theBigChatCollaborate", "theBigChatWork",
   ]
     .map($).filter(Boolean);
   buttons.forEach((button) => { button.disabled = true; });
-  const attachmentKey = swarmChatKey(agentId);
+  const attachmentKey = recoveryKey;
   const attachments = swarmChatAttachments.get(attachmentKey) || [];
   // The sent text becomes a transcript turn immediately. Clear only that
   // exact draft now; never clear the box when the delayed answer returns,
@@ -12972,8 +15452,44 @@ async function sendFromTheBigChat(mode = "auto") {
     ? "Deciding whether connected agents should help..."
     : mode === "chat" ? "Asking..."
     : mode === "collaborate" ? "Relaying to connected agents..."
-    : "Planning and validating file changes...";
+    : "Starting durable goal work with the next useful task...";
   try {
+    if (mode === "work") {
+      if (!conversation?.project) throw new Error("Choose this chat's project before starting file work.");
+      const directRequestKey = `nexus.long-horizon.direct-request.${recoveryKey}`;
+      let durableRequest = null;
+      try { durableRequest = JSON.parse(localStorage.getItem(directRequestKey) || "null"); }
+      catch (_) { durableRequest = null; }
+      const directIntent = await directLongGoalIntent(
+        conversation, agentId, said, attachments,
+      );
+      const directRequestId = durableRequest?.intent === directIntent && durableRequest?.id
+        ? durableRequest.id
+        : (globalThis.crypto?.randomUUID
+          ? globalThis.crypto.randomUUID()
+          : `long-goal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      localStorage.setItem(directRequestKey, JSON.stringify({
+        id: directRequestId, intent: directIntent,
+      }));
+      const started = await request("/api/long-horizon/start", {
+        method: "POST", body: JSON.stringify({
+          project_id: conversation.project, lead_id: agentId, text: said,
+          chat_id: conversation.id, attachments, request_id: directRequestId,
+        }),
+      });
+      localStorage.removeItem(directRequestKey);
+      if (!swarmActivityCanReconcileSuccess(activity)) return;
+      finishSwarmChatActivity(agentId, true, "", activity);
+      clearSwarmActivityAttachments(activity);
+      longGoal = started.goal;
+      localStorage.setItem(LONG_GOAL_SELECTED_KEY, longGoal.goal_id);
+      sayInRuntimeChat(
+        runtimeKey,
+        `Started durable goal ${longGoal.goal_id.slice(0, 8)}. Mission control shows its exact work, evidence, and questions.`,
+      );
+      await refreshLongGoals(true);
+      return;
+    }
     const answered = await request("/api/swarm/say", {
       method: "POST", body: JSON.stringify({
         agent: agentId, text: said, mode, attachments, activity: activity.id,
@@ -12982,29 +15498,43 @@ async function sendFromTheBigChat(mode = "auto") {
         round_limit: selectedChatRoundLimit(agentId),
       }),
     });
-    finishSwarmChatActivity(agentId, true);
+    if (!swarmActivityCanReconcileSuccess(activity)) {
+      if (swarmChatKey(agentId) === recoveryKey) void refreshTheChatFor(agentId);
+      return;
+    }
+    finishSwarmChatActivity(agentId, true, "", activity, answered.participant_outcome);
     rememberWorkRecoveryForKey(recoveryKey, answered, said, conversation);
-    swarmChatAttachments.delete(attachmentKey);
-    renderChatAttachments(agentId);
-    keepWhatWasSaidTo(agentId, answered.said || [], conversation?.id || "");
+    clearSwarmActivityAttachments(activity);
+    keepWhatWasSaidToRuntime(
+      runtimeKey, answered.said || [], conversation?.id || "",
+    );
     renderWorkRecovery(agentId);
-    $("theBigChatSaidBack").textContent = workResponseWords(answered, agent.name);
+    sayInRuntimeChat(runtimeKey, workResponseWords(answered, agent.name));
     refreshSwarm(true);
   } catch (trouble) {
+    if (!swarmActivityCanSettle(activity)) return;
+    const priorDraft = theBigChatComposerDrafts.get(attachmentKey);
+    if (!priorDraft?.value) {
+      theBigChatComposerDrafts.set(attachmentKey, {
+        value: typed, start: typed.length, end: typed.length, direction: "none",
+      });
+    }
     if (theBigOne === agentId && swarmChatKey(agentId) === attachmentKey && !box.value) {
       box.value = typed;
       box.setSelectionRange(typed.length, typed.length);
       rememberTheBigChatComposer();
     }
-    await refreshTheChatFor(agentId);
+    if (swarmChatKey(agentId) === recoveryKey) void refreshTheChatFor(agentId);
     const words = String(trouble.message || trouble);
-    $("theBigChatSaidBack").textContent = words;
+    sayInRuntimeChat(runtimeKey, words);
     if (!stoppedChatError(trouble)) showError(words);
-    finishSwarmChatActivity(agentId, false, words);
+    finishSwarmChatActivity(agentId, false, words, activity);
   } finally {
-    swarmBusy.delete(agentId);
-    swarmStopping.delete(agentId);
-    buttons.forEach((button) => { button.disabled = false; });
+    finishSwarmActivityResponse(agentId, activity);
+    if (swarmActivityIsCurrent(activity)) {
+      swarmBusy.delete(runtimeKey);
+      swarmStopping.delete(runtimeKey);
+    }
     setWhatCanBePressedInSwarm();
   }
 }
@@ -13025,8 +15555,7 @@ function wireUpTheTray() {
   window.addEventListener("pointerup", finishTheBigChatResize);
   window.addEventListener("pointercancel", finishTheBigChatResize);
   window.addEventListener("resize", applyTheBigChatLayout);
-  $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("auto"));
-  $("theBigChatSolo").addEventListener("click", () => sendFromTheBigChat("chat"));
+  $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("chat"));
   $("theBigChatStop").addEventListener("click", () => stopChatFor(theBigOne));
   $("theBigChatAttach").addEventListener("click", () => $("theBigChatFiles").click());
   $("theBigChatFiles").addEventListener("change", async () => {
@@ -13076,9 +15605,16 @@ let webChatShown = null;
 let webChatBridgeBusy = false;
 let webChatBridgeTimer = 0;
 let webChatHeartbeatTimer = 0;
+let webChatHeartbeatBusy = false;
 let webChatRouteSignature = "";
 let webChatProviderChoices = [];
 let webChatAssignTarget = null;
+let webChatBackgroundMode = false;
+let webChatSettingsRecoveryStatus = null;
+let webChatSettingsRecoveryBusy = false;
+let webChatSettingsRecoveryReadError = "";
+const webChatRelayStatuses = new Map();
+const WEB_CHAT_RELAY_STATUS_LIMIT = 24;
 
 function canUseWebChats() {
   return Boolean(window.harnessDesktop?.webChats && window.harnessDesktop?.answerWebChat);
@@ -13096,17 +15632,34 @@ async function refreshWebChatProviderChoices() {
   return webChatProviderChoices;
 }
 
-async function connectPickedAgentToWebProvider(providerId) {
+async function refreshWebChatPreferences() {
+  if (!window.harnessDesktop?.webChatPreferences) return {backgroundMode: false};
+  const preferences = await window.harnessDesktop.webChatPreferences();
+  webChatBackgroundMode = Boolean(preferences?.backgroundMode);
+  const control = $("webChatBackgroundMode");
+  if (control) control.checked = webChatBackgroundMode;
+  return {backgroundMode: webChatBackgroundMode};
+}
+
+async function connectPickedAgentToWebProvider(providerId, options = {}) {
   const agent = thePickedAgent();
   const provider = webChatProviderChoices.find((one) => one.id === providerId);
   if (!agent || !provider) return false;
+  const connectionId = String(options.connectionId || "");
+  const conversationKey = String(options.conversationKey || "");
+  const preferExisting = Boolean(options.preferExisting);
   webChatAssignTarget = {
-    agentId: agent.id, providerId, expiresAt: Date.now() + 10 * 60 * 1000,
+    agentId: agent.id, providerId, connectionId, conversationKey,
   };
   renderSwarmAgentPanel(agent);
   sayInSwarm(`Sign in to ${provider.label} in the Nexus window, open or start a chat, then press Use this chat in Nexus.`);
   try {
-    await window.harnessDesktop.connectWebChat(providerId);
+    await window.harnessDesktop.connectWebChat(
+      providerId,
+      connectionId,
+      conversationKey,
+      preferExisting,
+    );
     return true;
   } catch (error) {
     webChatAssignTarget = null;
@@ -13117,57 +15670,345 @@ async function connectPickedAgentToWebProvider(providerId) {
 
 async function assignSelectedWebChatToPendingAgent(chat) {
   const target = webChatAssignTarget;
-  if (!target || target.providerId !== chat.provider || target.expiresAt < Date.now()) return false;
-  webChatAssignTarget = null;
+  if (!target || target.providerId !== chat.provider) {
+    return {matched: false, worked: false};
+  }
+  // Signing in or solving a provider challenge can legitimately take longer
+  // than an arbitrary UI timeout. Keep this renderer-local intent until the
+  // user makes an explicit provider selection, cancels it by choosing another
+  // target, or restarts the app. Expiring it used to turn a late-but-valid
+  // selection into a surprising new board agent.
+  // Keep the exact selection until the board save is confirmed. If that save
+  // is refused or the server is temporarily unavailable, the manager can show
+  // a one-click retry instead of making the user reopen the provider and find
+  // the conversation again.
+  target.selectedChat = {...chat};
+  target.lastError = "";
+  if (target.connectionId && target.connectionId !== chat.id) {
+    target.lastError = (
+      `Nexus expected the saved provider connection ${target.connectionId}, but received ${chat.id}. `
+      + "The agent route was not changed. Reopen the saved connection and try again."
+    );
+    sayInSwarm(target.lastError);
+    renderWebChatConnections();
+    return {matched: true, worked: false};
+  }
   const route = `web:${chat.id}`;
+  const current = theSwarmAgent(target.agentId);
+  if (target.connectionId && current?.who === route) {
+    webChatAssignTarget = null;
+    pickSwarmBox("agent", current.id);
+    sayInSwarm(`${chat.title || chat.provider} is reconnected to this agent's saved route.`);
+    renderWebChatConnections();
+    return {matched: true, worked: true};
+  }
   const worked = await changeTheSwarmBoard((board) => {
     const agent = board.agents.find((one) => one.id === target.agentId);
     if (!agent) return false;
     agent.who = route;
   }, () => `${chat.title || chat.provider} is now the web AI chat used by this agent.`);
   const assigned = theSwarmAgent(target.agentId);
-  if (worked && assigned) pickSwarmBox("agent", assigned.id);
-  return worked;
+  if (worked && assigned) {
+    webChatAssignTarget = null;
+    pickSwarmBox("agent", assigned.id);
+  } else {
+    target.lastError = (
+      `Nexus could not save this chat as ${assigned?.name || "the selected agent"}'s route. `
+      + "The selected provider chat is retained below; retry the assignment or add it as a new agent."
+    );
+    sayInSwarm(target.lastError);
+  }
+  renderWebChatConnections();
+  return {matched: true, worked: Boolean(worked && assigned)};
 }
 
-async function heartbeatWebChats(refreshBoard = false) {
+function acceptLocalWebChatConnections(chats) {
+  webChatConnections = Array.isArray(chats) ? chats : [];
+  if ($("webChatDialog")?.open) renderWebChatConnections();
+  return webChatConnections;
+}
+
+async function refreshLocalWebChatConnections() {
+  if (!canUseWebChats()) return [];
+  return acceptLocalWebChatConnections(await window.harnessDesktop.webChats());
+}
+
+function webChatRecoveryNeedsChoice(status = webChatSettingsRecoveryStatus) {
+  return Boolean(status && (
+    status.resolution_required || status.requires_web_chat_resolution
+  ));
+}
+
+function webChatRecoveryNeedsUpdate(status = webChatSettingsRecoveryStatus) {
+  return Boolean(status && (
+    status.update_required || status.write_blocked || status.state === "update_required"
+  ));
+}
+
+function webChatRecoveryNeedsAttention(status = webChatSettingsRecoveryStatus) {
+  return webChatRecoveryNeedsChoice(status) || webChatRecoveryNeedsUpdate(status);
+}
+
+function renderWebChatSettingsRecovery() {
+  const card = $("webChatSettingsRecovery");
+  const needsChoice = webChatRecoveryNeedsChoice();
+  const needsUpdate = webChatRecoveryNeedsUpdate();
+  const needsAttention = needsChoice || needsUpdate;
+  const status = webChatSettingsRecoveryStatus || {};
+  const count = Math.max(0, Number(status.recovered_web_chat_count || 0));
+  const copies = status.copies_disagree || status.copies_currently_disagree
+    ? "disagreed" : "could not both be read safely";
+  const reasonCode = String(status.reason || "").trim();
+  const reason = ({
+    primary_missing: "The main settings copy was missing, so Nexus used the backup.",
+    primary_invalid: "The main settings copy was corrupted or unreadable, so Nexus used the backup.",
+    backup_newer: "The backup settings copy had the newer complete revision.",
+    backup_selected: "The backup was the only settings copy Nexus could select safely.",
+    backup_missing: "The backup settings copy was missing.",
+    backup_invalid: "The backup settings copy was corrupted or unreadable.",
+    primary_newer: "The main settings copy had the newer complete revision.",
+    same_revision_disagreement: "Both settings copies claimed the same revision but contained different data.",
+    copies_disagree: "The two saved settings copies contained different data.",
+    both_copies_invalid: "Neither saved settings copy could be read safely.",
+    primary_invalid_backup_missing: "The main settings copy was unreadable and its backup was missing.",
+    primary_missing_backup_invalid: "The main settings copy was missing and its backup was unreadable.",
+    no_valid_copy: "Nexus could not find a readable saved settings copy.",
+  })[reasonCode] || reasonCode.replaceAll("_", " ");
+  const noReadableCopy = status.selected_source === "none" || [
+    "both_copies_invalid", "primary_invalid_backup_missing",
+    "primary_missing_backup_invalid", "no_valid_copy",
+  ].includes(reasonCode);
+  const foundVersions = Array.isArray(status.found_format_versions)
+    ? status.found_format_versions.map(Number).filter(Number.isFinite) : [];
+  const versions = foundVersions.length ? foundVersions.join(", ") : "newer";
+  const supportedVersion = Number(status.supported_format_version || status.format_version || 1);
+  const message = needsUpdate
+    ? `These desktop settings were written in newer format version ${versions}, but this Nexus `
+      + `app supports version ${supportedVersion}. Nexus left both saved copies and their web-chat `
+      + `routes untouched. Install or reopen the newer Nexus release; this older app keeps desktop `
+      + `settings read-only.`
+    : noReadableCopy
+    ? `Nexus could not read a usable desktop settings copy. Web AI chats remain disconnected `
+      + `instead of Nexus guessing. ${reason} Repair settings copies creates a clean matching `
+      + `pair; no usable web chats were found to restore.`
+    : (
+      `Nexus quarantined ${count} last-known web AI chat${count === 1 ? "" : "s"} because `
+      + `its saved desktop settings copies ${copies}. This prevents an uncertain or corrupted `
+      + `copy from silently restoring the wrong provider conversations.${reason ? ` ${reason}` : ""}`
+    );
+  if (card) {
+    card.hidden = !needsAttention;
+    if (needsAttention) $("webChatSettingsRecoveryMessage").textContent = message;
+    const title = $("webChatSettingsRecoveryTitle");
+    if (title) title.textContent = needsUpdate
+      ? "A newer Nexus version is required" : "Choose how to recover your web AI chats";
+    const hint = $("webChatSettingsRecoveryHint");
+    if (hint) hint.textContent = needsUpdate
+      ? "This older app cannot safely change or convert these files. Close it and install or reopen the newer Nexus release."
+      : "Nexus has not restored or deleted either copy automatically. Your other desktop settings are preserved whichever option you choose.";
+  }
+
+  const banner = $("webChatRecoveryBanner");
+  if (banner) {
+    banner.hidden = !needsAttention;
+    if (needsAttention) $("webChatRecoveryBannerMessage").textContent = message;
+    const title = $("webChatRecoveryBannerTitle");
+    if (title) title.textContent = needsUpdate
+      ? "A newer Nexus version is required" : "Web AI chats need a recovery choice";
+  }
+
+  const settingsCard = $("desktopSettingsRecoveryCard");
+  if (settingsCard) {
+    settingsCard.dataset.state = needsAttention || webChatSettingsRecoveryReadError
+      ? "attention" : "ok";
+    $("desktopSettingsRecoveryMessage").textContent = needsUpdate
+      ? `${message} No recovery choice in this older app can safely convert that data.`
+      : needsChoice
+      ? `${message} Choose here, or open Web AI chats from the board.`
+      : webChatSettingsRecoveryReadError
+        ? `Nexus could not read the desktop recovery status. Nothing was changed: ${webChatSettingsRecoveryReadError}`
+      : webChatSettingsRecoveryStatus
+        ? "The saved desktop settings copies agree. No recovery action is needed."
+        : "Desktop settings recovery is available in the Nexus desktop app.";
+  }
+
+  const restoreLabel = count > 0 ? "Restore recovered web chats" : "Repair settings copies";
+  const restoreButtons = [
+    $("webChatSettingsRecoveryRestore"), $("desktopSettingsRecoveryRestore"),
+  ].filter(Boolean);
+  const discardButtons = [
+    $("webChatSettingsRecoveryDiscard"), $("desktopSettingsRecoveryDiscard"),
+  ].filter(Boolean);
+  for (const button of restoreButtons) {
+    button.hidden = !needsChoice;
+    button.disabled = webChatSettingsRecoveryBusy;
+    button.textContent = webChatSettingsRecoveryBusy ? "Applying recovery choice…" : (
+      button.id === "webChatSettingsRecoveryRestore" && count > 0
+        ? "Restore these chats" : restoreLabel
+    );
+  }
+  for (const button of discardButtons) {
+    button.hidden = !needsChoice || count === 0;
+    button.disabled = webChatSettingsRecoveryBusy;
+    button.textContent = webChatSettingsRecoveryBusy
+      ? "Applying recovery choice…"
+      : button.id === "webChatSettingsRecoveryDiscard"
+        ? "Start with no recovered web chats" : "Discard recovered web chats";
+  }
+  const bannerAction = $("webChatRecoveryBannerAction");
+  if (bannerAction) {
+    bannerAction.hidden = !needsAttention;
+    bannerAction.disabled = webChatSettingsRecoveryBusy;
+    bannerAction.textContent = needsUpdate ? "See update steps" : webChatSettingsRecoveryBusy
+      ? "Applying recovery choice…" : count > 0 ? "Review recovery" : "Repair settings copies";
+  }
+  const backgroundMode = $("webChatBackgroundMode");
+  if (backgroundMode) {
+    backgroundMode.disabled = needsUpdate;
+    backgroundMode.title = needsUpdate
+      ? "Open these settings with the newer Nexus version before changing this preference." : "";
+  }
+}
+
+function setWebChatSettingsRecoveryResult(message) {
+  for (const id of ["webChatSettingsRecoveryResult", "desktopSettingsRecoveryResult"]) {
+    const output = $(id);
+    if (output) output.textContent = String(message || "");
+  }
+}
+
+async function refreshWebChatSettingsRecoveryStatus() {
+  if (!window.harnessDesktop?.desktopSettingsRecoveryStatus) {
+    webChatSettingsRecoveryStatus = null;
+    webChatSettingsRecoveryReadError = "";
+    renderWebChatSettingsRecovery();
+    return null;
+  }
+  try {
+    const wasUnreadable = Boolean(webChatSettingsRecoveryReadError);
+    webChatSettingsRecoveryStatus = (
+      await window.harnessDesktop.desktopSettingsRecoveryStatus()
+    ) || null;
+    webChatSettingsRecoveryReadError = "";
+    if (wasUnreadable) setWebChatSettingsRecoveryResult("");
+    renderWebChatSettingsRecovery();
+    return webChatSettingsRecoveryStatus;
+  } catch (error) {
+    webChatSettingsRecoveryReadError = error.message || String(error);
+    renderWebChatSettingsRecovery();
+    // Retain an already-visible unresolved card if this refresh fails. Hiding
+    // it would imply that the quarantined chats had somehow been resolved.
+    if (webChatRecoveryNeedsAttention()) {
+      setWebChatSettingsRecoveryResult(
+        `Nexus could not refresh the recovery status. Nothing was changed: ${error.message || error}`
+      );
+    } else {
+      setWebChatSettingsRecoveryResult(
+        `Nexus could not read the desktop recovery status. Nothing was changed: ${error.message || error}`
+      );
+    }
+    throw error;
+  }
+}
+
+async function resolveWebChatSettingsRecovery(action) {
+  if (webChatSettingsRecoveryBusy || !webChatRecoveryNeedsChoice()) return false;
+  if (!["restore", "discard_web_chats"].includes(action)) return false;
+  if (!window.harnessDesktop?.resolveDesktopSettingsRecovery) {
+    setWebChatSettingsRecoveryResult(
+      "This Nexus window cannot apply the recovery choice. Restart the updated desktop app; nothing was changed."
+    );
+    return false;
+  }
+  const recoveredCount = Math.max(0, Number(
+    webChatSettingsRecoveryStatus?.recovered_web_chat_count || 0
+  ));
+  webChatSettingsRecoveryBusy = true;
+  setWebChatSettingsRecoveryResult(action === "restore"
+    ? "Restoring the quarantined chat list…"
+    : "Removing only the quarantined web-chat list…");
+  renderWebChatSettingsRecovery();
+  try {
+    const result = await window.harnessDesktop.resolveDesktopSettingsRecovery(action);
+    if (!result || !result.status) {
+      throw new Error("The desktop recovery service did not return its final status.");
+    }
+    webChatSettingsRecoveryStatus = result.status;
+    if (Array.isArray(result.connections)) acceptLocalWebChatConnections(result.connections);
+    let refreshProblem = String(result.reload_error || "");
+    try {
+      await refreshLocalWebChatConnections();
+    } catch (error) {
+      const localRefreshError = error.message || String(error);
+      refreshProblem = refreshProblem
+        ? `${refreshProblem}; ${localRefreshError}` : localRefreshError;
+    }
+    if (webChatRecoveryNeedsChoice()) {
+      throw new Error(
+        result.status.reason || "The settings copies still need a recovery choice."
+      );
+    }
+    renderWebChatConnections();
+    renderWebChatSettingsRecovery();
+    const confirmedRestoredCount = typeof result.restored_connection_count === "number"
+      && Number.isFinite(result.restored_connection_count)
+      ? Math.max(0, Math.min(recoveredCount, result.restored_connection_count)) : null;
+    let message = "";
+    if (result.changed === false) {
+      message = "This recovery was already resolved by another Nexus window or an earlier attempt. Nexus reloaded the current saved chat list; no additional settings were changed.";
+    } else if (action !== "restore") {
+      message = "Started with no recovered web chats. Your other desktop settings were preserved.";
+    } else if (recoveredCount === 0) {
+      message = "Repaired the saved desktop settings copies. No web chats needed restoration.";
+    } else if (refreshProblem && confirmedRestoredCount === null) {
+      message = `Saved your choice to restore ${recoveredCount} recovered web AI chat entr${recoveredCount === 1 ? "y" : "ies"}. Nexus has not yet confirmed how many routes are reachable.`;
+    } else if (confirmedRestoredCount === 0) {
+      message = `No usable web AI chat routes were restored. Nexus safely ignored ${recoveredCount} saved entr${recoveredCount === 1 ? "y" : "ies"} that the current provider engine could not use.`;
+    } else {
+      const restoredCount = confirmedRestoredCount ?? recoveredCount;
+      const unavailableCount = confirmedRestoredCount === null
+        ? 0 : recoveredCount - confirmedRestoredCount;
+      message = `Restored ${restoredCount} usable web AI chat${restoredCount === 1 ? "" : "s"} from the quarantined settings copy.`;
+      if (unavailableCount) {
+        message += ` ${unavailableCount} unavailable saved entr${unavailableCount === 1 ? "y was" : "ies were"} kept disconnected.`;
+      }
+    }
+    if (refreshProblem) {
+      message += ` The recovery choice was saved, but the local chat list could not refresh yet: ${refreshProblem}`;
+    }
+    setWebChatSettingsRecoveryResult(message);
+    $("webChatSaid").textContent = message;
+    void heartbeatWebChats(true, false).catch((error) => {
+      const warning = `${message} Board availability sync will retry automatically: ${error.message || error}`;
+      setWebChatSettingsRecoveryResult(warning);
+      $("webChatSaid").textContent = warning;
+    });
+    return true;
+  } catch (error) {
+    const message = `Nothing was changed. Nexus could not apply that recovery choice: ${error.message || error}`;
+    setWebChatSettingsRecoveryResult(message);
+    $("webChatSaid").textContent = message;
+    renderWebChatSettingsRecovery();
+    return false;
+  } finally {
+    webChatSettingsRecoveryBusy = false;
+    renderWebChatSettingsRecovery();
+  }
+}
+
+async function heartbeatWebChats(refreshBoard = false, refreshLocal = true) {
   if (!canUseWebChats() || !token) return;
   const before = JSON.stringify(webChatConnections);
-  webChatConnections = await window.harnessDesktop.webChats();
+  if (refreshLocal) await refreshLocalWebChatConnections();
   const heartbeat = await request("/api/web-chats/heartbeat", {
     method: "POST", body: JSON.stringify({connections: webChatConnections}),
   });
-  // boot() starts the courier before somebody needs to visit the board.  Load
-  // the real board before using it to decide which connected chats are absent.
-  // If that read lost a race to a newer refresh or failed, do no mutation; the
-  // next bounded heartbeat will try again against durable state.
-  if (!swarmBoardHydrated) {
-    await refreshSwarm(true);
-    if (!swarmBoardHydrated) return;
-  }
-  // A connected web chat is a live agent, not merely a choice hidden in the
-  // Web AI dialog. Materialize it on the board as soon as the Electron
-  // heartbeat confirms it. The route includes the opaque chat id, so this
-  // does not collide with a CLI agent named Claude or with another Claude
-  // browser conversation.
-  let addedToBoard = false;
-  for (const chat of webChatConnections) {
-    const route = `web:${chat.id}`;
-    if (theSwarmBoard().agents.some((one) => one.who === route)) continue;
-    const base = String(chat.title || `${chat.provider} web`).replace(/[^A-Za-z0-9 _.-]/g, " ")
-      .trim().replace(/\s+/g, " ").slice(0, 54) || `${chat.provider} web`;
-    await changeTheSwarmBoard((board) => {
-      if (board.agents.some((one) => one.who === route)) return false;
-      const taken = new Set(board.agents.map((one) => one.name.toLowerCase()));
-      let name = base;
-      for (let number = 2; taken.has(name.toLowerCase()); number += 1) {
-        name = `${base.slice(0, 54 - String(number).length)} ${number}`;
-      }
-      board.agents.push({id: "", name, who: route, job: "",
-        at: aFreeSpotOnTheBoard("agent")});
-    }, () => `${base} was added to the board with the connected ${chat.provider} web chat.`);
-    addedToBoard = true;
-  }
+  // A heartbeat is an availability signal only. Connected browser chats are
+  // global Electron resources, while board membership is project-owned user
+  // intent. Never materialize every global connection on whichever board is
+  // currently open: that made removals reappear, contaminated other boards,
+  // and let a full board block the courier before it could claim pending work.
+  // Explicit "Use this chat" and "Add to board" actions own assignment.
   const routeSignature = JSON.stringify((heartbeat.routes || []).map((one) => ({
     route: one.route, provider: one.provider, title: one.title, url: one.url,
   })));
@@ -13175,7 +16016,7 @@ async function heartbeatWebChats(refreshBoard = false) {
     || routeSignature !== webChatRouteSignature;
   webChatRouteSignature = routeSignature;
   if (!$("webChatDialog").hidden && $("webChatDialog").open) renderWebChatConnections();
-  if ((refreshBoard || changed || addedToBoard) && !$("swarmView").hidden) {
+  if ((refreshBoard || changed) && !$("swarmView").hidden) {
     await refreshSwarm(true);
     // Conversation destinations are server-computed snapshots. An already
     // open pair chat must be re-read too, or its header and controls can keep
@@ -13184,12 +16025,192 @@ async function heartbeatWebChats(refreshBoard = false) {
   }
 }
 
+function scheduleWebChatHeartbeat(refreshBoard = false, refreshLocal = true) {
+  if (webChatHeartbeatBusy) return;
+  webChatHeartbeatBusy = true;
+  void heartbeatWebChats(refreshBoard, refreshLocal).catch((heartbeatError) => {
+    if ($("webChatDialog").open) {
+      $("webChatSaid").textContent = heartbeatError.message || String(heartbeatError);
+    }
+  }).finally(() => { webChatHeartbeatBusy = false; });
+}
+
+function webChatRelayKey(one) {
+  return `${String(one?.request_id || "unknown-request")}\u0000${String(one?.route || "unknown-route")}`;
+}
+
+function renderWebChatRelayStatuses() {
+  const section = $("webChatRelayActivity");
+  const list = $("webChatRelayStatuses");
+  if (!section || !list) return;
+  section.hidden = webChatRelayStatuses.size === 0;
+  list.replaceChildren();
+  for (const status of [...webChatRelayStatuses.values()].reverse()) {
+    const card = make("article", "web-chat-relay-status");
+    card.dataset.state = status.state;
+    card.dataset.terminal = status.terminal ? "true" : "false";
+    card.append(make("strong", "", status.route));
+    card.append(make("p", "", status.detail));
+    const requestId = status.requestId === "unknown-request"
+      ? "unknown request" : `request …${status.requestId.slice(-8)}`;
+    card.append(make(
+      "p", "hint",
+      `${requestId} · ${status.terminal ? "finished" : "working"}`,
+    ));
+    list.append(card);
+  }
+}
+
+function setWebChatRelayStatus(one, state, detail, terminal = false) {
+  const key = webChatRelayKey(one);
+  const record = {
+    requestId: String(one?.request_id || "unknown-request"),
+    route: String(one?.route || "unknown route"),
+    state: String(state || "working"),
+    detail: String(detail || ""),
+    terminal: Boolean(terminal),
+    updatedAt: Date.now(),
+  };
+  // Delete/reinsert moves an updated request to the top without allowing a
+  // concurrent route's terminal result to replace it.
+  webChatRelayStatuses.delete(key);
+  webChatRelayStatuses.set(key, record);
+  while (webChatRelayStatuses.size > WEB_CHAT_RELAY_STATUS_LIMIT) {
+    webChatRelayStatuses.delete(webChatRelayStatuses.keys().next().value);
+  }
+  renderWebChatRelayStatuses();
+  return record;
+}
+
+function webChatReceiptIsRetryable(error) {
+  if (!error?.responseReceived) return true;
+  const status = Number(error.status || 0);
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function waitForWebChatReceiptRetry(milliseconds) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function completeWebChatReceipt(one, receipt) {
+  // This immutable body is retried only to reconcile the already-finished
+  // provider attempt. The provider prompt is never submitted again here.
+  const body = JSON.stringify({
+    ...receipt, request_id: String(one?.request_id || ""),
+  });
+  const retryDelays = [0, 250, 900];
+  let lastError = null;
+  let attempts = 0;
+  for (let attempt = 0; attempt < retryDelays.length; attempt += 1) {
+    if (retryDelays[attempt]) await waitForWebChatReceiptRetry(retryDelays[attempt]);
+    attempts = attempt + 1;
+    try {
+      const response = await request("/api/web-chats/complete", {
+        method: "POST", body,
+      });
+      if (response?.accepted === true) {
+        return {accepted: true, attempts: attempt + 1, reason: ""};
+      }
+      return {
+        accepted: false,
+        attempts: attempt + 1,
+        reason: String(
+          response?.reason || response?.error
+          || "Nexus no longer recognizes this pending relay request.",
+        ),
+      };
+    } catch (error) {
+      lastError = error;
+      if (!webChatReceiptIsRetryable(error) || attempt === retryDelays.length - 1) break;
+    }
+  }
+  return {
+    accepted: null,
+    attempts,
+    reason: String(lastError?.message || lastError || "Nexus receipt confirmation failed."),
+  };
+}
+
+async function relayOneWebChatRequest(one) {
+  const started = performance.now();
+  let answer = "";
+  let error = "";
+  let model = "";
+  let deliveryState = "";
+  let failureCode = "";
+  let diagnostics = {};
+  setWebChatRelayStatus(
+    one, "relaying", `Relaying this exact request through ${one.route}…`, false,
+  );
+  try {
+    const said = await window.harnessDesktop.answerWebChat(
+      one.route, one.prompt, one.attachments || [],
+      one.conversation_key || "", Boolean(one.prefer_existing_conversation));
+    answer = said.answer || "";
+    model = said.model || "";
+    error = said.error || "";
+    deliveryState = said.delivery_state || "";
+    failureCode = said.failure_code || "";
+    diagnostics = said.diagnostics && typeof said.diagnostics === "object"
+      ? said.diagnostics : {};
+  } catch (trouble) {
+    error = trouble.message || String(trouble);
+    deliveryState = "unknown";
+    failureCode = "electron_bridge_failure";
+  }
+
+  setWebChatRelayStatus(
+    one,
+    "confirming",
+    error
+      ? "The provider attempt ended locally. Confirming that exact failure with Nexus…"
+      : "The visible provider reply was captured locally. Confirming receipt with Nexus…",
+    false,
+  );
+  const confirmation = await completeWebChatReceipt(one, {
+    answer, error, model,
+    delivery_state: deliveryState, failure_code: failureCode, diagnostics,
+    milliseconds: Math.round(performance.now() - started),
+  });
+  if (confirmation.accepted === true) {
+    setWebChatRelayStatus(
+      one,
+      error ? "failed" : "confirmed",
+      error
+        ? `Nexus confirmed the stopped relay for this exact request: ${error}`
+        : "Nexus confirmed receipt of the visible reply for this exact request.",
+      true,
+    );
+    return confirmation;
+  }
+  if (confirmation.accepted === false) {
+    setWebChatRelayStatus(
+      one,
+      "unreconciled",
+      `The provider prompt was not resent. Nexus did not accept this receipt: ${confirmation.reason} `
+        + "Inspect the affected chat before starting a new turn.",
+      true,
+    );
+    return confirmation;
+  }
+  const failure = new Error(
+    `Nexus could not confirm this receipt after ${confirmation.attempts} attempts: ${confirmation.reason}. `
+    + "The provider prompt was not resent. Inspect the affected chat before starting a new turn."
+  );
+  failure.webChatTerminalDetail = failure.message;
+  throw failure;
+}
+
 async function serviceWebChatBridge() {
   if (!canUseWebChats() || !token || webChatBridgeBusy) return;
   webChatBridgeBusy = true;
   let claimed = [];
   try {
-    await heartbeatWebChats();
+    // Route availability refresh is useful but is not a prerequisite for
+    // servicing work that the engine already queued. In particular, a stale
+    // or temporarily failed heartbeat must not strand an otherwise reachable
+    // browser conversation until the server-side provider wait expires.
+    scheduleWebChatHeartbeat();
     const pending = await request("/api/web-chats/pending");
     claimed = pending.requests || [];
   } catch (error) {
@@ -13203,28 +16224,22 @@ async function serviceWebChatBridge() {
     // web-chat turn unclaimed until its server-side timeout.
     webChatBridgeBusy = false;
   }
-  await Promise.allSettled(claimed.map(async (one) => {
-      const started = performance.now();
-      let answer = "";
-      let error = "";
-      let model = "";
-      try {
-        $("webChatSaid").textContent = `Relaying a Nexus turn through ${one.route}...`;
-        const said = await window.harnessDesktop.answerWebChat(
-          one.route, one.prompt, one.attachments || [],
-          one.conversation_key || "", Boolean(one.prefer_existing_conversation));
-        answer = said.answer || "";
-        model = said.model || "";
-      } catch (trouble) {
-        error = trouble.message || String(trouble);
-      }
-      await request("/api/web-chats/complete", {method: "POST", body: JSON.stringify({
-        request_id: one.request_id, answer, error, model,
-        milliseconds: Math.round(performance.now() - started),
-      })});
-      $("webChatSaid").textContent = error
-        ? `The web relay stopped: ${error}` : `${one.route} returned its visible reply to Nexus.`;
-    }));
+  const settled = await Promise.allSettled(claimed.map(async (one) => (
+    relayOneWebChatRequest(one)
+  )));
+  settled.forEach((result, index) => {
+    if (result.status !== "rejected") return;
+    const one = claimed[index] || {};
+    setWebChatRelayStatus(
+      one,
+      "unreconciled",
+      String(
+        result.reason?.webChatTerminalDetail || result.reason?.message || result.reason
+        || "The relay ended before Nexus could confirm its receipt. The provider prompt was not resent.",
+      ),
+      true,
+    );
+  });
 }
 
 function startWebChatBridge() {
@@ -13234,8 +16249,9 @@ function startWebChatBridge() {
   }
   if (!webChatHeartbeatTimer) {
     webChatHeartbeatTimer = window.setInterval(
-      () => heartbeatWebChats().catch(() => {}), 4000);
+      () => scheduleWebChatHeartbeat(), 4000);
   }
+  scheduleWebChatHeartbeat();
   void serviceWebChatBridge();
 }
 
@@ -13272,6 +16288,42 @@ async function addWebChatAgent(chat) {
 function renderWebChatConnections() {
   const list = $("webChatConnections");
   list.replaceChildren();
+  const pendingAssignment = webChatAssignTarget;
+  if (pendingAssignment?.selectedChat && pendingAssignment.lastError) {
+    const repair = make("article", "web-chat-assignment-repair");
+    repair.append(make("strong", "", "Selected chat is safe — board assignment needs attention"));
+    repair.append(make("p", "", pendingAssignment.lastError));
+    const actions = make("div", "button-row");
+    const retry = make("button", "primary", "Retry assignment");
+    const addInstead = make("button", "", "Add as a new agent instead");
+    retry.type = "button";
+    addInstead.type = "button";
+    retry.addEventListener("click", async () => {
+      retry.disabled = true;
+      const result = await assignSelectedWebChatToPendingAgent(
+        pendingAssignment.selectedChat
+      );
+      if (!result.worked) renderWebChatConnections();
+    });
+    addInstead.addEventListener("click", async () => {
+      addInstead.disabled = true;
+      const added = await addWebChatAgent(pendingAssignment.selectedChat);
+      if (added && webChatAssignTarget === pendingAssignment) webChatAssignTarget = null;
+      renderWebChatConnections();
+    });
+    actions.append(retry, addInstead);
+    repair.append(actions);
+    list.append(repair);
+  }
+  const persistenceError = String(
+    webChatConnections.find((one) => one?.persistence_error)?.persistence_error || ""
+  );
+  if (persistenceError) {
+    list.append(make(
+      "p", "problem web-chat-persistence-error",
+      `${persistenceError} The connected chats remain open in this session. Fix disk access or space, then press Use this chat in Nexus again to save them for restart.`,
+    ));
+  }
   if (!webChatConnections.length) {
     list.append(make("p", "hint", "No web chats are connected yet. Open a provider above, log in, choose or start a chat, then press Use this chat in Nexus."));
     return;
@@ -13294,7 +16346,12 @@ function renderWebChatConnections() {
     remove.addEventListener("click", async () => {
       if (!window.confirm(`Disconnect ${chat.title}? Its provider login remains in the isolated browser session.`)) return;
       await window.harnessDesktop.removeWebChat(chat.id);
-      await heartbeatWebChats(true);
+      await refreshLocalWebChatConnections();
+      void heartbeatWebChats(true, false).catch((error) => {
+        $("webChatSaid").textContent = (
+          `The chat was disconnected locally. Board availability sync will retry: ${error.message || error}`
+        );
+      });
     });
     actions.append(show, open, agent, remove);
     card.append(actions);
@@ -13307,7 +16364,23 @@ async function openWebChatManager() {
     sayInSwarm("Web AI chats are available in the Electron app. The browser version keeps desktop and command-line agents only.");
     return;
   }
-  const providers = await refreshWebChatProviderChoices();
+  // Open first and render the Electron-owned snapshot already in memory. The
+  // manager must never wait on Python to show a browser chat that Electron
+  // already owns; heartbeat is a best-effort availability sync after this.
+  $("webChatDialog").classList.remove("is-chat-viewing");
+  $("webChatDialogTitle").textContent = "Web AI chats";
+  renderWebChatConnections();
+  renderWebChatRelayStatuses();
+  renderWebChatSettingsRecovery();
+  $("webChatSaid").textContent = "Reading connected chats from this computer…";
+  if (!$("webChatDialog").open) $("webChatDialog").showModal();
+
+  const [providersResult, preferencesResult, connectionsResult, recoveryResult] = await Promise.allSettled([
+    refreshWebChatProviderChoices(), refreshWebChatPreferences(),
+    refreshLocalWebChatConnections(),
+    refreshWebChatSettingsRecoveryStatus(),
+  ]);
+  const providers = providersResult.status === "fulfilled" ? providersResult.value : [];
   const list = $("webChatProviders");
   list.replaceChildren();
   for (const provider of providers) {
@@ -13317,18 +16390,45 @@ async function openWebChatManager() {
       "span", "hint", "Uses a Nexus-owned Chrome or Edge profile for secure sign-in."));
     const connect = make("button", "primary", "Open sign-in or choose a chat");
     connect.type = "button";
+    connect.disabled = webChatRecoveryNeedsUpdate();
+    if (connect.disabled) connect.title = (
+      "Open these settings with the newer Nexus version before connecting a web AI chat."
+    );
     connect.addEventListener("click", () => window.harnessDesktop.connectWebChat(provider.id));
     card.append(connect);
     list.append(card);
   }
-  await heartbeatWebChats();
   renderWebChatConnections();
-  $("webChatDialog").classList.remove("is-chat-viewing");
-  $("webChatDialogTitle").textContent = "Web AI chats";
-  $("webChatSaid").textContent = webChatConnections.length
-    ? `${webChatConnections.length} web chat${webChatConnections.length === 1 ? " is" : "s are"} connected.`
-    : "Connect a provider chat above.";
-  if (!$("webChatDialog").open) $("webChatDialog").showModal();
+  renderWebChatRelayStatuses();
+  const persistenceError = String(
+    webChatConnections.find((one) => one?.persistence_error)?.persistence_error || ""
+  );
+  const localError = connectionsResult.status === "rejected"
+    ? connectionsResult.reason?.message || String(connectionsResult.reason) : "";
+  const preferenceError = preferencesResult.status === "rejected"
+    ? preferencesResult.reason?.message || String(preferencesResult.reason) : "";
+  const providerError = providersResult.status === "rejected"
+    ? providersResult.reason?.message || String(providersResult.reason) : "";
+  const recoveryError = recoveryResult.status === "rejected"
+    ? recoveryResult.reason?.message || String(recoveryResult.reason) : "";
+  $("webChatSaid").textContent = webChatRecoveryNeedsUpdate()
+    ? "A newer Nexus version is required. Desktop settings and saved web-chat routes remain untouched and read-only."
+    : webChatRecoveryNeedsChoice()
+    ? "Your saved web-chat list needs one recovery choice. Nothing has been restored or deleted automatically."
+    : persistenceError
+    ? `${persistenceError} Fix disk access or space, then press Use this chat in Nexus again.`
+    : localError
+      ? `Connected-chat state could not be read from Electron: ${localError}`
+      : webChatConnections.length
+        ? `${webChatConnections.length} web chat${webChatConnections.length === 1 ? " is" : "s are"} connected on this computer.`
+        : providerError || preferenceError || recoveryError
+          ? `Local provider controls need attention: ${providerError || preferenceError || recoveryError}`
+          : "Connect a provider chat above.";
+  void heartbeatWebChats(true, connectionsResult.status !== "fulfilled").catch((error) => {
+    $("webChatSaid").textContent = (
+      `Connected chats are shown from this computer. Board availability sync will retry automatically: ${error.message || error}`
+    );
+  });
 }
 
 async function showFullWebChatInsideNexus(
@@ -13339,7 +16439,14 @@ async function showFullWebChatInsideNexus(
     return false;
   }
   if (!$("webChatDialog").open) await openWebChatManager();
-  else await heartbeatWebChats();
+  else {
+    try {
+      await refreshLocalWebChatConnections();
+    } catch (error) {
+      $("webChatSaid").textContent = error.message || String(error);
+    }
+    void heartbeatWebChats(false, false).catch(() => {});
+  }
   const chat = webChatConnections.find((one) => one.id === String(id));
   if (!chat) {
     const said = "That web AI chat is no longer connected. Choose it again below to view it.";
@@ -13398,6 +16505,44 @@ function wireUpWebChats() {
   $("swarmWebChats").addEventListener("click", openWebChatManager);
   $("webChatDialogClose").addEventListener("click", closeWebChatManager);
   $("webChatViewerClose").addEventListener("click", hideEmbeddedWebChat);
+  $("webChatSettingsRecoveryRestore").addEventListener(
+    "click", () => resolveWebChatSettingsRecovery("restore")
+  );
+  $("webChatSettingsRecoveryDiscard").addEventListener(
+    "click", () => resolveWebChatSettingsRecovery("discard_web_chats")
+  );
+  $("desktopSettingsRecoveryRestore").addEventListener(
+    "click", () => resolveWebChatSettingsRecovery("restore")
+  );
+  $("desktopSettingsRecoveryDiscard").addEventListener(
+    "click", () => resolveWebChatSettingsRecovery("discard_web_chats")
+  );
+  $("webChatRecoveryBannerAction").addEventListener("click", () => {
+    if (webChatRecoveryNeedsUpdate()) {
+      switchView("settings");
+      $("desktopSettingsRecoveryCard")?.scrollIntoView({block: "center"});
+      return;
+    }
+    const count = Math.max(0, Number(
+      webChatSettingsRecoveryStatus?.recovered_web_chat_count || 0
+    ));
+    if (count === 0) void resolveWebChatSettingsRecovery("restore");
+    else void openWebChatManager();
+  });
+  $("webChatBackgroundMode").addEventListener("change", async (event) => {
+    const enabled = Boolean(event.currentTarget.checked);
+    try {
+      const preferences = await window.harnessDesktop.setWebChatBackgroundMode(enabled);
+      webChatBackgroundMode = Boolean(preferences?.backgroundMode);
+      event.currentTarget.checked = webChatBackgroundMode;
+      $("webChatSaid").textContent = webChatBackgroundMode
+        ? "Relayed web AI turns will keep provider browser windows minimized."
+        : "Relayed web AI turns may show their provider browser window.";
+    } catch (error) {
+      event.currentTarget.checked = webChatBackgroundMode;
+      $("webChatSaid").textContent = error.message || String(error);
+    }
+  });
   $("webChatOpenWindow").addEventListener("click", async () => {
     if (!webChatShown) return;
     await window.harnessDesktop.openWebChatWindow(
@@ -13414,19 +16559,45 @@ function wireUpWebChats() {
   });
   if (window.harnessDesktop?.onWebChatsChanged) {
     window.harnessDesktop.onWebChatsChanged(async (chats, selected) => {
-      webChatConnections = Array.isArray(chats) ? chats : [];
+      acceptLocalWebChatConnections(chats);
       renderWebChatConnections();
-      await heartbeatWebChats(true);
+      void refreshWebChatSettingsRecoveryStatus().catch(() => {});
       // "Use this chat in Nexus" is the user's choice to put this web AI on
       // the board.  Do not make them discover and press a second button in a
-      // different window before anything visible happens.
-      if (selected?.id && !(await assignSelectedWebChatToPendingAgent(selected))) {
-        await addWebChatAgent(selected);
+      // different window before anything visible happens. Apply that explicit
+      // choice before heartbeat: a failed Python availability sync must not
+      // prevent or erase the assignment the user just made in Electron.
+      try {
+        if (selected?.id) {
+          const assignment = await assignSelectedWebChatToPendingAgent(selected);
+          if (!assignment.matched) await addWebChatAgent(selected);
+          if (assignment.matched && !assignment.worked) {
+            $("webChatSaid").textContent = webChatAssignTarget?.lastError
+              || "The selected chat is retained, but its board assignment needs attention.";
+          }
+        }
+      } catch (error) {
+        if (selected?.id && webChatAssignTarget?.providerId === selected.provider) {
+          webChatAssignTarget.selectedChat = {...selected};
+          webChatAssignTarget.lastError = (
+            `The selected provider chat is retained, but Nexus could not apply it to the board: ${error.message || error}`
+          );
+        }
+        $("webChatSaid").textContent = webChatAssignTarget?.lastError
+          || `The selected chat is retained locally, but its board change failed: ${error.message || error}`;
+        renderWebChatConnections();
       }
+      void heartbeatWebChats(true, false).catch((error) => {
+        if (webChatAssignTarget?.lastError) return;
+        $("webChatSaid").textContent = (
+          `The Electron chat selection is shown. Board availability sync will retry: ${error.message || error}`
+        );
+      });
     });
   }
   if (canUseWebChats()) {
     refreshWebChatProviderChoices().catch(() => {});
+    void refreshWebChatSettingsRecoveryStatus().catch(() => {});
     startWebChatBridge();
     window.addEventListener("focus", () => void serviceWebChatBridge());
     document.addEventListener("visibilitychange", () => {
@@ -13462,7 +16633,86 @@ function wireUpTheSwarmBoard() {
   wireUpWebChats();
   $("swarmStart").addEventListener("click", setThemGoing);
   $("swarmWorkGoals").addEventListener("click", workOnEveryBoardGoal);
-  $("swarmCancelGoals").addEventListener("click", cancelRemainingBoardGoals);
+  $("longGoalForm").addEventListener("submit", startLongGoalFromComposer);
+  $("longGoalClose").addEventListener("click", closeLongGoalComposer);
+  $("longGoalCancel").addEventListener("click", closeLongGoalComposer);
+  $("longGoalEditBoard").addEventListener("click", editLongGoalProjectOnBoard);
+  $("longGoalCheckBoard").addEventListener("click", checkLongGoalBoard);
+  $("longGoalProject").addEventListener("change", () => renderLongGoalTeam());
+  $("longGoalLead").addEventListener("change", renderLongGoalComposerReadiness);
+  $("longGoalParticipation").addEventListener("change", renderLongGoalComposerReadiness);
+  $("longGoalText").addEventListener("input", renderLongGoalComposerReadiness);
+  $("longGoalCriteria").addEventListener("input", renderLongGoalComposerReadiness);
+  $("longGoalDialog").addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeLongGoalComposer();
+  });
+  $("longGoalDialog").addEventListener("close", () => {
+    longGoalDialogInvoker?.focus?.({preventScroll: true});
+  });
+  $("swarmCancelGoals").addEventListener("click", cancelLongGoal);
+  $("swarmLegacyGoals").addEventListener("click", workOnEveryBoardGoalLegacy);
+  $("missionGoalSelect").addEventListener("change", (event) => {
+    const goalId = String(event.target.value || "");
+    localStorage.setItem(LONG_GOAL_SELECTED_KEY, goalId);
+    void loadLongGoal(goalId, true);
+  });
+  $("missionRefresh").addEventListener("click", () => refreshLongGoals(true));
+  $("missionProviderSetupReview").addEventListener("click", focusCurrentBoardGoalSetup);
+  $("missionProviderSetupPrepare").addEventListener(
+    "click", prepareNewGoalWithCurrentProviderSetup);
+  $("missionPause").addEventListener("click", () => missionControl("pause"));
+  $("missionResume").addEventListener("click", () => missionControl("resume"));
+  $("missionCancel").addEventListener("click", cancelLongGoal);
+  $("missionFork").addEventListener("click", () => missionControl("fork"));
+  $("missionEventFilter").addEventListener("change", renderMissionEvents);
+  $("missionSteerSend").addEventListener("click", async () => {
+    const text = $("missionSteer").value.trim();
+    if (!text) return showError("Write the steering instruction first.");
+    await missionControl("steer", {text, task_id: selectedMissionTaskId});
+    $("missionSteer").value = "";
+  });
+  $("missionMessageAgent").addEventListener("click", async () => {
+    const task = longGoal?.tasks?.find((one) => one.id === selectedMissionTaskId);
+    const text = $("missionSteer").value.trim();
+    if (!task || !text) return showError("Select a task and write a message first.");
+    await missionControl("message", {text, task_id: task.id, agent_id: task.assigned_agent_id});
+    $("missionSteer").value = "";
+  });
+  $("missionRequestReview").addEventListener("click", async () => {
+    const task = longGoal?.tasks?.find((one) => one.id === selectedMissionTaskId);
+    const owner = longGoal?.agents?.find((one) => one.id === task?.assigned_agent_id);
+    const reviewer = longGoal?.agents?.find(
+      (one) => one.id !== task?.assigned_agent_id
+        && one.provider_identity_sha256
+        && owner?.provider_identity_sha256
+        && one.provider_identity_sha256 !== owner.provider_identity_sha256);
+    if (!task || !reviewer) return showError(
+      "Select a task with an authorized agent on a different provider backend. Route aliases for the same backend are not independent reviewers."
+    );
+    await missionControl("request_review", {task_id: task.id, agent_id: reviewer.id});
+  });
+  $("missionCriteriaSave").addEventListener("click", async () => {
+    const successCriteria = $("missionCriteria").value.split(/\r?\n/).map((one) => one.trim()).filter(Boolean);
+    await missionControl("criteria", {success_criteria: successCriteria});
+  });
+  $("missionReassign").addEventListener("click", async () => {
+    if (!selectedMissionTaskId) return showError("Select a task first.");
+    await missionControl("reassign", {
+      task_id: selectedMissionTaskId, agent_id: $("missionReassignAgent").value,
+    });
+  });
+  $("missionRetry").addEventListener("click", async () => {
+    const task = longGoal?.tasks?.find((one) => one.id === selectedMissionTaskId);
+    if (!task) return showError("Select a blocked or failed task first.");
+    const needsReconciliation = task.outcome_unknown === true
+      || task.reconciliation_required === true;
+    const reconciled = needsReconciliation && window.confirm(
+      "This task has a prior provider or file effect that Nexus will not repeat automatically. Retry only after inspecting the saved provider conversation and project state. Confirm that you reconciled the original effect and want one fresh attempt?"
+    );
+    if (needsReconciliation && !reconciled) return;
+    await missionControl("retry", {task_id: task.id, reconciled});
+  });
   $("swarmStop").addEventListener("click", stopThemGoing);
   $("swarmAgentSave").addEventListener("click", saveTheSwarmAgent);
   $("swarmAgentWho").addEventListener("change", async (event) => {

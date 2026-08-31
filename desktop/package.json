@@ -17,6 +17,7 @@
     "smoke:built": "node built.smoke.js",
     "smoke:asking": "node asking.smoke.js",
     "smoke:board": "node board.smoke.js",
+    "e2e:multi-vendor": "node multi-vendor.e2e.js",
     "smoke:automations": "node automations.smoke.js",
     "smoke:web-chat": "node web-chat.smoke.js",
     "smoke:claude-browser": "node claude-browser.smoke.js"
@@ -30,6 +31,7 @@
     "productName": "Nexus Harness",
     "files": [
       "main.js",
+      "settings-store.js",
       "server.js",
       "guards.js",
       "preload.js",
@@ -45,6 +47,7 @@
       "!packaged.smoke.js",
       "!built.smoke.js",
       "!asking.smoke.js",
+      "!multi-vendor.e2e.js",
       "!web-chat.smoke.js"
     ],
     "win": {

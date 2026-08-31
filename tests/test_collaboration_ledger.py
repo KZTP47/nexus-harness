@@ -14,7 +14,9 @@ from pathlib import Path
 from unittest import mock
 
 from our_harness import chat, collaboration_ledger as collaboration_ledger_module
-from our_harness.collaboration_ledger import CollaborationLedger, ledger_paths
+from our_harness.collaboration_ledger import (
+    CollaborationLedger, collaboration_problem, ledger_paths, remove_ledger,
+)
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
 
@@ -89,6 +91,48 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         codex = ledger.projection_for("agent-2")
         self.assertIn('"speaker": "User"', codex)
         self.assertIn("The new tokenizer tests pass.", codex)
+
+    def test_a_new_session_receives_the_previous_terminal_outcome_not_prior_chatter(self) -> None:
+        first = self.ledger()
+        first.record_contribution({
+            "speaker_id": "agent-2", "speaker_name": "Codex",
+            "speaker_route": "codex", "phase": "agent_reply",
+            "text": "PRIOR-CHATTER-MUST-NOT-BE-REPLAYED",
+        })
+        first.finish(
+            "Gemini could not join because its provider turn failed.",
+            complete=False,
+            stopped_because="partial_provider_failure",
+            remaining=["Reconnect Gemini before resuming."],
+        )
+        second = CollaborationLedger(
+            self.config, "claude", "pair-chat-1", session_id="session-two"
+        ).begin("Why did Gemini not answer?", self.participants, mode="discussion")
+
+        projection = second.projection_for("agent-1")
+
+        self.assertIn("IMMEDIATELY PREVIOUS SESSION STATUS", projection)
+        self.assertIn("Gemini could not join because its provider turn failed.", projection)
+        self.assertIn('"stopped_because": "partial_provider_failure"', projection)
+        self.assertIn("Sequence numbers are global", projection)
+        self.assertIn("current session begins at global seq 4", projection)
+        self.assertNotIn("PRIOR-CHATTER-MUST-NOT-BE-REPLAYED", projection)
+
+    def test_an_interrupted_immediate_session_does_not_relabel_an_older_outcome(self) -> None:
+        first = self.ledger()
+        first.finish("OLD-TERMINAL-OUTCOME", complete=True, stopped_because="complete")
+        CollaborationLedger(
+            self.config, "claude", "pair-chat-1", session_id="session-two"
+        ).begin("This session is interrupted", self.participants, mode="discussion")
+        third = CollaborationLedger(
+            self.config, "claude", "pair-chat-1", session_id="session-three"
+        ).begin("What happened immediately before this?", self.participants, mode="discussion")
+
+        projection = third.projection_for("agent-1")
+
+        self.assertIn('"session_id": "session-two"', projection)
+        self.assertIn('"status": "no_terminal_outcome_recorded"', projection)
+        self.assertNotIn("OLD-TERMINAL-OUTCOME", projection)
 
     def test_200k_goal_is_canonical_and_projection_is_chunked_not_corrupted(self) -> None:
         goal = "long-goal:" + ("g" * 200_000)
@@ -446,6 +490,59 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         self.assertFalse(paths.jsonl.exists())
         self.assertFalse(paths.markdown.exists())
         self.assertFalse(paths.cursors.exists())
+
+    def test_unanchored_legacy_record_offers_only_a_transcript_preserving_reset(self) -> None:
+        ledger = self.ledger()
+        ledger.record_state("legacy-progress", {"round": 1})
+        transcript = chat.where_it_is_kept(
+            self.config, "claude", "pair-chat-1"
+        )
+        chat.keep_exchange(
+            self.config, "claude", "kept question", "kept answer",
+            filed_as="pair-chat-1",
+        )
+        events = self.events(ledger)
+        for event in events:
+            event.pop("previous_mac", None)
+            event.pop("integrity_mac", None)
+        ledger.paths.jsonl.write_text(
+            "".join(
+                collaboration_ledger_module._canonical(event) + "\n"
+                for event in events
+            ),
+            encoding="utf-8",
+        )
+        collaboration_ledger_module._ledger_anchor_path(
+            ledger.paths.jsonl
+        ).unlink()
+
+        problem = collaboration_problem(
+            self.config, "claude", "pair-chat-1"
+        )
+
+        self.assertEqual(problem["code"], "collaboration_record_untrusted")
+        self.assertEqual(problem["action"], "reset_collaboration_record")
+        self.assertTrue(problem["preserves_transcript"])
+        self.assertFalse(problem["automatic_resend"])
+        remove_ledger(self.config, "claude", "pair-chat-1")
+        self.assertFalse(ledger.paths.jsonl.exists())
+        self.assertFalse(ledger.paths.markdown.exists())
+        self.assertTrue(transcript.exists())
+        self.assertEqual(
+            [one.text for one in chat.read_it(
+                self.config, "claude", "pair-chat-1"
+            )],
+            ["kept question", "kept answer"],
+        )
+        self.assertIsNone(collaboration_problem(
+            self.config, "claude", "pair-chat-1"
+        ))
+
+    def test_healthy_collaboration_record_never_offers_reset(self) -> None:
+        self.ledger()
+        self.assertIsNone(collaboration_problem(
+            self.config, "claude", "pair-chat-1"
+        ))
 
     def test_markdown_mirror_does_not_render_agent_supplied_html(self) -> None:
         ledger = self.ledger()

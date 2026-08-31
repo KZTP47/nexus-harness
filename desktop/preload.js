@@ -6,6 +6,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 contextBridge.exposeInMainWorld("harnessDesktop", {
+  appIconDataUrl: () => ipcRenderer.invoke("harness:appIconDataUrl"),
   chooseProject: () => ipcRenderer.invoke("harness:chooseProject"),
   // Only says which folder was picked. Opening it is a separate decision, made
   // by whoever asked - the list in the panel adds it without leaving the
@@ -64,8 +65,16 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   setFullScreen: (on) => ipcRenderer.invoke("harness:setFullScreen", Boolean(on)),
   webChatProviders: () => ipcRenderer.invoke("harness:webChatProviders"),
   webChats: () => ipcRenderer.invoke("harness:webChats"),
-  connectWebChat: (provider) => ipcRenderer.invoke(
-    "harness:webChatConnect", String(provider || "")),
+  desktopSettingsRecoveryStatus: () => ipcRenderer.invoke(
+    "harness:desktopSettingsRecoveryStatus"),
+  resolveDesktopSettingsRecovery: (action) => ipcRenderer.invoke(
+    "harness:resolveDesktopSettingsRecovery", String(action || "")),
+  webChatPreferences: () => ipcRenderer.invoke("harness:webChatPreferences"),
+  setWebChatBackgroundMode: (enabled) => ipcRenderer.invoke(
+    "harness:webChatBackgroundMode", Boolean(enabled)),
+  connectWebChat: (provider, connectionId, conversationKey, preferExisting) => ipcRenderer.invoke(
+    "harness:webChatConnect", String(provider || ""), String(connectionId || ""),
+    String(conversationKey || ""), Boolean(preferExisting)),
   openWebChatWindow: (id, conversationKey, preferExisting) => ipcRenderer.invoke(
     "harness:webChatOpen", String(id || ""), String(conversationKey || ""),
     Boolean(preferExisting)),

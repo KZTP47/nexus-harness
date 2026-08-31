@@ -342,6 +342,14 @@ async function main() {
       };
       const originalRequest = request;
       const agent = theSwarmAgent(agentId);
+      const board = theSwarmBoard();
+      const originalAgents = board.agents;
+      const syntheticPeer = {
+        id: "synthetic-connected-peer", name: "Synthetic connected peer",
+        who: "synthetic-peer", ready: false,
+        why_not: "Synthetic provider is unavailable for this deterministic smoke.",
+      };
+      board.agents = [...(originalAgents || []), syntheticPeer];
       const conversation = (id, name) => ({
         id, name, pair: [agentId], pair_agents: [{id: agentId, name: agent.name}],
         projects: [], project: "", destination: {
@@ -360,6 +368,70 @@ async function main() {
         held.saidFor = alpha.id;
         held.said = [{who: "them", text: "ALPHA TRANSCRIPT MARKER", at: ""}];
         renderTheBigChat();
+
+        setWhatCanBePressedInSwarm();
+        const activity = document.getElementById("theBigChatActivity");
+        if (activity.parentElement?.className !== "the-big-chat-transcript"
+            || activity !== activity.parentElement.lastElementChild) {
+          throw new Error("chat progress is not anchored inside the transcript bottom");
+        }
+        if (!document.getElementById("theBigChatCollaborate").disabled
+            || !document.getElementById("theBigChatWork").disabled
+            || document.getElementById("theBigChatSend").disabled
+            || document.getElementById("theBigChatAttach").disabled) {
+          throw new Error("a lone-agent chat exposes the wrong set of actions");
+        }
+        if (document.getElementById("theBigChatUnlimited").checked
+            || document.getElementById("theBigChatRoundLimit").value !== "3") {
+          throw new Error("new chats do not start with the finite three-round collaboration limit");
+        }
+        const project = (theSwarmBoard().projects || []).find((one) => one.is_there);
+        alpha.pair = [agentId, "synthetic-connected-peer"];
+        alpha.pair_agents = [
+          {id: agentId, name: agent.name, who: agent.who, ready: true},
+          {id: "synthetic-connected-peer", name: "Synthetic connected peer",
+            who: "synthetic-peer", ready: false},
+        ];
+        if (project) {
+          alpha.project = project.id;
+          alpha.projects = [{id: project.id, name: project.name, is_there: true}];
+        }
+        setWhatCanBePressedInSwarm();
+        if (!document.getElementById("theBigChatCollaborate").disabled
+            || !document.getElementById("theBigChatTeamReadiness").textContent
+              .includes("Repair Synthetic connected peer")) {
+          throw new Error("an unavailable pair participant is not named with its Repair action");
+        }
+        alpha.pair_agents[1].ready = true;
+        syntheticPeer.ready = true;
+        setWhatCanBePressedInSwarm();
+        if (document.getElementById("theBigChatCollaborate").disabled) {
+          throw new Error("a connected-pair chat incorrectly disables collaboration");
+        }
+        if (document.getElementById("theBigChatSend").textContent
+              !== `Ask ${agent.name} only`
+            || document.getElementById("theBigChatCollaborate").textContent
+              !== "Ask both agents"
+            || !document.getElementById("theBigChatScopeHint").textContent
+              .includes("expected initial replies: 2")) {
+          throw new Error("the chat does not name direct versus two-agent recipients explicitly");
+        }
+        const originalSendFromTheBigChat = sendFromTheBigChat;
+        let workMode = "";
+        try {
+          sendFromTheBigChat = async (mode) => { workMode = mode; };
+          document.getElementById("theBigChatWork").disabled = false;
+          document.getElementById("theBigChatWork").click();
+        } finally {
+          sendFromTheBigChat = originalSendFromTheBigChat;
+        }
+        if (workMode !== "work") {
+          throw new Error("the Work together on project files button has no work action");
+        }
+        alpha.pair = [agentId];
+        alpha.pair_agents = [{id: agentId, name: agent.name}];
+        alpha.project = "";
+        alpha.projects = [];
 
         applyConversationList(agentId, {active: beta.id, chats: [alpha, beta]});
         const visibleAfterSwitch = document.getElementById("theBigChatSaid").textContent;
@@ -403,8 +475,193 @@ async function main() {
             || finalWords.includes("STALE ALPHA ANSWER")) {
           throw new Error("a stale transcript response crossed into the selected chat");
         }
+
+        // A participant outcome is an append-only transcript turn, not a
+        // transient toast. Rebuild the real maximised renderer as though the
+        // desktop had restarted, then exercise only local recovery actions.
+        alpha.pair = [agentId, "synthetic-connected-peer"];
+        alpha.pair_agents = [
+          {id: agentId, name: agent.name, who: agent.who, ready: true},
+          {id: "synthetic-connected-peer", name: "Synthetic connected peer",
+            who: "synthetic-peer", ready: true},
+        ];
+        held.conversation = alpha.id;
+        held.saidFor = alpha.id;
+        held.said = [
+          {who: "you", speaker_name: "You", text: "ORIGINAL TEAM PROMPT",
+            phase: "user_prompt"},
+          {who: "them", speaker_id: "synthetic-connected-peer",
+            speaker_name: "Synthetic connected peer", text: "A saved answer",
+            phase: "final_answer"},
+          {who: "them", speaker_id: "nexus", speaker_name: "Nexus",
+            recipient_name: "You", text: "1 of 2 agents answered.",
+            phase: "participant_outcome", participant_outcome: {
+              schema_version: 1, outcome: "partial", requested_mode: "collaborate",
+              expected_count: 2, answered_count: 1,
+              participants: [
+                {agent_id: agentId, name: agent.name, route: agent.who,
+                  status: "failed", answer_saved: false,
+                  provider_reason: "synthetic provider failure"},
+                {agent_id: "synthetic-connected-peer", name: "Synthetic connected peer",
+                  route: "synthetic-peer", status: "answered", answer_saved: true},
+              ],
+              actions: [{id: "repair-provider", agent_id: agentId,
+                route: agent.who, label: `Repair ${agent.name}`}],
+            }},
+        ];
+        document.getElementById("theBigChatBox").value = "";
+        renderTheBigChat();
+        const outcome = document.querySelector(
+          '#theBigChatSaid .participant-outcome-card[data-outcome="partial"]');
+        if (!outcome || !outcome.textContent.includes("1 of 2 agents answered")
+            || !outcome.textContent.includes(`Repair ${agent.name}`)
+            || !outcome.textContent.includes("Ask all agents again")) {
+          throw new Error("the durable one-of-two participant outcome did not render its recovery actions");
+        }
+        const originalRepair = openAgentRepairFlow;
+        let repairedAgent = "";
+        try {
+          openAgentRepairFlow = async (id) => { repairedAgent = id; };
+          outcome.querySelector(".participant-outcome-repair").click();
+          await Promise.resolve();
+        } finally {
+          openAgentRepairFlow = originalRepair;
+        }
+        if (repairedAgent !== agentId) {
+          throw new Error("participant repair targeted a different agent");
+        }
+        const requestBeforeLocalRetry = request;
+        let retryRequests = 0;
+        try {
+          request = async () => { retryRequests += 1; throw new Error("must not send"); };
+          outcome.querySelector(".participant-outcome-ask-again").click();
+        } finally {
+          request = requestBeforeLocalRetry;
+        }
+        if (retryRequests !== 0
+            || document.getElementById("theBigChatBox").value !== "ORIGINAL TEAM PROMPT"
+            || !outcome.textContent.includes("Nothing was sent")) {
+          throw new Error("Ask all agents again did not remain a review-only composer restore");
+        }
+
+        const outcomeTurn = held.said[2];
+        outcomeTurn.text = "0 of 2 agents answered.";
+        outcomeTurn.participant_outcome = {
+          schema_version: 1, outcome: "none", requested_mode: "collaborate",
+          expected_count: 2, answered_count: 0,
+          participants: [
+            {agent_id: agentId, name: agent.name, route: "obsolete-smoke-route",
+              status: "outcome_unknown", answer_saved: false,
+              outcome_unknown: true, provider_reason: "synthetic uncertain delivery"},
+            {agent_id: "synthetic-connected-peer", name: "Synthetic connected peer",
+              route: "synthetic-peer", status: "failed", answer_saved: false},
+          ],
+          actions: [
+            {id: "inspect-provider-turn", agent_id: agentId,
+              route: "obsolete-smoke-route", label: `Inspect ${agent.name}`},
+            {id: "repair-provider", agent_id: "synthetic-connected-peer",
+              route: "synthetic-peer", label: "Repair Synthetic connected peer"},
+          ],
+        };
+        renderTheBigChat();
+        const zeroOutcome = document.querySelector(
+          '#theBigChatSaid .participant-outcome-card[data-outcome="none"]');
+        if (!zeroOutcome || !zeroOutcome.textContent.includes("0 of 2 agents answered")
+            || !zeroOutcome.textContent.includes("No AI answer was saved")
+            || !zeroOutcome.textContent.includes("Nexus will not resend")
+            || zeroOutcome.querySelector(".participant-outcome-ask-again")) {
+          throw new Error("the zero-answer unknown-delivery card permits an unsafe resend");
+        }
+        const originalChangedRouteRepair = openAgentRepairFlow;
+        let changedRouteRepairTarget = "";
+        try {
+          openAgentRepairFlow = async (id) => { changedRouteRepairTarget = id; };
+          zeroOutcome.querySelector(".participant-outcome-repair").click();
+          await Promise.resolve();
+        } finally {
+          openAgentRepairFlow = originalChangedRouteRepair;
+        }
+        if (changedRouteRepairTarget) {
+          throw new Error("a changed participant route diagnosed the replacement connection");
+        }
+
+        outcomeTurn.text = "2 of 2 agents answered.";
+        outcomeTurn.participant_outcome = {
+          schema_version: 1, outcome: "complete", requested_mode: "collaborate",
+          expected_count: 2, answered_count: 2,
+          participants: [
+            {agent_id: agentId, name: agent.name, route: agent.who,
+              status: "answered", answer_saved: true},
+            {agent_id: "synthetic-connected-peer", name: "Synthetic connected peer",
+              route: "synthetic-peer", status: "answered", answer_saved: true},
+          ], actions: [],
+        };
+        renderTheBigChat();
+        const completeOutcome = document.querySelector(
+          '#theBigChatSaid .participant-outcome-card[data-outcome="complete"]');
+        if (!completeOutcome || !completeOutcome.textContent.includes("2 of 2 agents answered")
+            || completeOutcome.querySelector(".participant-outcome-repair")
+            || completeOutcome.querySelector(".participant-outcome-ask-again")) {
+          throw new Error("the complete participant outcome exposes unnecessary recovery controls");
+        }
+
+        // The integrity-recovery control must remain scoped to the exact saved
+        // chat and must not share any path with provider dispatch. Exercise the
+        // real packaged renderer/button while replacing only its local HTTP
+        // boundary; the server endpoint has its own full HTTP integration test.
+        alpha.collaboration_problem = {
+          schema_version: 1,
+          code: "collaboration_record_untrusted",
+          message: "Synthetic collaboration record needs recovery.",
+          action: "reset_collaboration_record",
+          action_label: "Reset collaboration record",
+          preserves_transcript: true,
+          automatic_resend: false,
+        };
+        renderTheBigChat();
+        const resetButton = document.querySelector(
+          "#theBigChatDestination .collaboration-record-reset");
+        if (!resetButton || !resetButton.textContent.includes("Reset collaboration record")) {
+          throw new Error("the scoped collaboration reset is not visible for an untrusted record");
+        }
+        const requestBeforeReset = request;
+        const loadBeforeReset = loadConversationsFor;
+        const refreshBeforeReset = refreshTheChatFor;
+        const confirmBeforeReset = window.confirm;
+        const resetCalls = [];
+        let confirmation = "";
+        try {
+          window.confirm = (message) => { confirmation = String(message || ""); return true; };
+          request = async (url, options = {}) => {
+            if (url !== "/api/swarm/collaboration/reset") {
+              throw new Error(`collaboration reset made an unexpected request: ${url}`);
+            }
+            resetCalls.push({url, body: JSON.parse(options.body || "{}")});
+            return {note: "Synthetic record reset without provider contact."};
+          };
+          loadConversationsFor = async () => {};
+          refreshTheChatFor = async () => {};
+          resetButton.click();
+          for (let attempt = 0; attempt < 20 && resetCalls.length === 0; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+        } finally {
+          request = requestBeforeReset;
+          loadConversationsFor = loadBeforeReset;
+          refreshTheChatFor = refreshBeforeReset;
+          window.confirm = confirmBeforeReset;
+          delete alpha.collaboration_problem;
+        }
+        if (resetCalls.length !== 1
+            || resetCalls[0].body.agent !== agentId
+            || resetCalls[0].body.chat !== alpha.id
+            || !confirmation.includes("transcript, attachments, and provider conversations are preserved")
+            || !confirmation.includes("No prompt is sent")) {
+          throw new Error("the collaboration reset was not exact, explicit, and provider-free");
+        }
       } finally {
         request = originalRequest;
+        board.agents = originalAgents;
         held.conversations = original.conversations;
         held.conversation = original.conversation;
         held.said = original.said;
@@ -416,6 +673,9 @@ async function main() {
       }
     }, which);
     console.log("pass  selected chat, title, project, and transcript stay atomic under stale reads");
+    console.log("pass  lone-chat actions and in-transcript progress follow the selected chat type");
+    console.log("pass  direct/team labels, finite rounds, readiness repair, and durable complete/partial/zero outcomes work without live providers");
+    console.log("pass  damaged collaboration recovery resets only the exact record and sends no provider prompt");
     await page.click("#theBigChatSmall");
 
     await page.fill(`.swarm-chat-card[data-agent="${which}"] .swarm-chat-box`,

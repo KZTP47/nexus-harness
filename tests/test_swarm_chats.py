@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import multiprocessing
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,59 @@ from unittest import mock
 from our_harness import chat, swarm, swarm_chats
 from our_harness.collaboration_ledger import CollaborationLedger
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
-from our_harness.models import ProviderResponse
+from our_harness.models import HarnessError, ProviderResponse
+
+
+def _spawned_config(root: str) -> LoadedConfig:
+    config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(root), [], {})
+    config.data["providers"] = {
+        "claude": {"kind": "claude-cli", "model": "claude"},
+        "codex": {"kind": "codex-cli", "model": "codex"},
+    }
+    return config
+
+
+def _pause_chat_project_write(
+    root: str, board: dict, chat_id: str, before_write, release_write,
+) -> None:
+    config = _spawned_config(root)
+    original_write = swarm_chats._write
+
+    def paused_write(config: LoadedConfig, registry: dict) -> None:
+        before_write.set()
+        if not release_write.wait(20.0):
+            raise RuntimeError("Timed out waiting to release the paused registry write")
+        original_write(config, registry)
+
+    with mock.patch.object(swarm_chats, "_write", side_effect=paused_write):
+        swarm_chats.select_project(
+            config, board, "agent-1", chat_id, "project-2"
+        )
+
+
+def _signal_chat_project_read(
+    root: str, board: dict, chat_id: str, started, read_entered,
+) -> None:
+    config = _spawned_config(root)
+    original_read = swarm_chats._read
+
+    def signalled_read(config: LoadedConfig) -> dict:
+        read_entered.set()
+        return original_read(config)
+
+    started.set()
+    with mock.patch.object(swarm_chats, "_read", side_effect=signalled_read):
+        swarm_chats.select_project(
+            config, board, "agent-1", chat_id, "project-2"
+        )
+
+
+def _stop_process(process: multiprocessing.Process) -> None:
+    if process.is_alive():
+        process.terminate()
+    process.join(5.0)
+    if not process.is_alive():
+        process.close()
 
 
 class PairScopedChatsTests(unittest.TestCase):
@@ -82,6 +135,129 @@ class PairScopedChatsTests(unittest.TestCase):
         self.assertEqual(chat.read_it(
             self.config, "claude", second_chat["filed_as"]
         )[-1].text, "second answer")
+
+    def test_two_processes_cannot_overwrite_different_chat_project_updates(self) -> None:
+        listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        first_chat = listed["chats"][0]
+        made = swarm_chats.create(
+            self.config, self.board, "agent-1", "agent-2"
+        )
+        second_chat = next(
+            one for one in made["chats"] if one["id"] != first_chat["id"]
+        )
+        context = multiprocessing.get_context("spawn")
+        first_before_write = context.Event()
+        release_first_write = context.Event()
+        second_started = context.Event()
+        second_read_entered = context.Event()
+        first = context.Process(
+            target=_pause_chat_project_write,
+            args=(
+                str(self.root), self.board, first_chat["id"],
+                first_before_write, release_first_write,
+            ),
+        )
+        second = context.Process(
+            target=_signal_chat_project_read,
+            args=(
+                str(self.root), self.board, second_chat["id"],
+                second_started, second_read_entered,
+            ),
+        )
+        first.start()
+        self.addCleanup(_stop_process, first)
+        try:
+            self.assertTrue(
+                first_before_write.wait(15.0),
+                "The first process never reached its paused registry write",
+            )
+            second.start()
+            self.addCleanup(_stop_process, second)
+            self.assertTrue(
+                second_started.wait(15.0),
+                "The second process never attempted its registry mutation",
+            )
+            self.assertFalse(
+                second_read_entered.wait(1.0),
+                "A sibling process read a stale registry while the first RMW was open",
+            )
+        finally:
+            release_first_write.set()
+
+        first.join(20.0)
+        second.join(20.0)
+        self.assertEqual(first.exitcode, 0)
+        self.assertEqual(second.exitcode, 0)
+
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        by_id = {one["id"]: one for one in registry["chats"]}
+        self.assertEqual(by_id[first_chat["id"]]["project"], "project-2")
+        self.assertEqual(by_id[second_chat["id"]]["project"], "project-2")
+
+    def test_registry_lock_link_is_rejected_without_touching_its_target(self) -> None:
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        target = Path(outside.name) / "outside-lock-target"
+        target.write_bytes(b"outside sentinel")
+        lock_path = (
+            self.root / ".harness" / "chats" / "_board-conversations.lock"
+        )
+        lock_path.parent.mkdir(parents=True)
+        try:
+            lock_path.symlink_to(target)
+        except (NotImplementedError, OSError) as exc:
+            self.skipTest(f"File symlinks are unavailable on this platform: {exc}")
+
+        with self.assertRaisesRegex(HarnessError, "Linked path components"):
+            swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual(target.read_bytes(), b"outside sentinel")
+
+    def test_registry_lock_is_released_when_writer_process_dies(self) -> None:
+        listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        chat_id = listed["active"]
+        context = multiprocessing.get_context("spawn")
+        first_before_write = context.Event()
+        never_release = context.Event()
+        first = context.Process(
+            target=_pause_chat_project_write,
+            args=(
+                str(self.root), self.board, chat_id,
+                first_before_write, never_release,
+            ),
+        )
+        first.start()
+        self.addCleanup(_stop_process, first)
+        self.assertTrue(
+            first_before_write.wait(15.0),
+            "The doomed process never acquired and reached the registry write",
+        )
+        first.terminate()
+        first.join(10.0)
+        self.assertFalse(first.is_alive())
+        self.assertNotEqual(first.exitcode, 0)
+
+        second_started = context.Event()
+        second_read_entered = context.Event()
+        second = context.Process(
+            target=_signal_chat_project_read,
+            args=(
+                str(self.root), self.board, chat_id,
+                second_started, second_read_entered,
+            ),
+        )
+        second.start()
+        self.addCleanup(_stop_process, second)
+        second.join(15.0)
+        self.assertFalse(second.is_alive())
+        self.assertEqual(second.exitcode, 0)
+        self.assertTrue(second_started.is_set())
+        self.assertTrue(second_read_entered.is_set())
+
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        registry = json.loads(registry_path.read_text(encoding="utf-8"))
+        persisted = next(one for one in registry["chats"] if one["id"] == chat_id)
+        self.assertEqual(persisted["project"], "project-2")
 
     def test_legacy_agent_transcript_is_never_adopted_by_a_pair(self) -> None:
         legacy = "Claude"
@@ -163,8 +339,61 @@ class PairScopedChatsTests(unittest.TestCase):
             self.config, "claude", "Claude"
         )[-1].text, "wrong pair")
         persisted = json.loads(registry_path.read_text(encoding="utf-8"))
-        self.assertEqual(persisted["schema_version"], 5)
+        self.assertEqual(
+            persisted["schema_version"], swarm_chats.REGISTRY_SCHEMA_VERSION
+        )
         self.assertEqual(persisted["chats"][0]["filed_as"], conversation["filed_as"])
+
+    def test_schema_six_adds_stable_web_key_without_rekeying_local_chat(self) -> None:
+        listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        original = listed["chats"][0]
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        backup_path = registry_path.with_name(swarm_chats.BACKUP_NAME)
+        version_six = json.loads(registry_path.read_text(encoding="utf-8"))
+        version_six["schema_version"] = 6
+        for conversation in version_six["chats"]:
+            conversation.pop("web_conversation_key", None)
+        version_six["integrity_sha256"] = swarm_chats._registry_integrity(version_six)
+        version_six_text = json.dumps(version_six, indent=2) + "\n"
+        registry_path.write_text(version_six_text, encoding="utf-8")
+        backup_path.write_text(version_six_text, encoding="utf-8")
+
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        reopened.data["providers"] = copy.deepcopy(self.config.data["providers"])
+        migrated = swarm_chats.list_for_agent(reopened, self.board, "agent-1")
+        migrated_chat = migrated["chats"][0]
+        self.assertEqual(migrated_chat["id"], original["id"])
+        self.assertEqual(migrated_chat["filed_as"], original["filed_as"])
+        self.assertEqual(
+            migrated_chat["web_conversation_key"], original["filed_as"]
+        )
+
+        persisted_text = registry_path.read_text(encoding="utf-8")
+        persisted = json.loads(persisted_text)
+        persisted_chat = persisted["chats"][0]
+        self.assertEqual(
+            persisted["schema_version"], swarm_chats.REGISTRY_SCHEMA_VERSION
+        )
+        self.assertGreater(persisted["revision"], version_six["revision"])
+        self.assertEqual(
+            persisted["integrity_sha256"], swarm_chats._registry_integrity(persisted)
+        )
+        self.assertEqual(persisted_chat["id"], original["id"])
+        self.assertEqual(persisted_chat["filed_as"], original["filed_as"])
+        self.assertEqual(persisted_chat["web_conversation_key"], original["filed_as"])
+
+        reopened_again = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        reopened_again.data["providers"] = copy.deepcopy(
+            self.config.data["providers"]
+        )
+        stable = swarm_chats.list_for_agent(
+            reopened_again, self.board, "agent-1"
+        )["chats"][0]
+        self.assertEqual(
+            (stable["id"], stable["filed_as"], stable["web_conversation_key"]),
+            (original["id"], original["filed_as"], original["filed_as"]),
+        )
+        self.assertEqual(registry_path.read_text(encoding="utf-8"), persisted_text)
 
     def test_proven_legacy_pair_blocks_are_recovered_but_unlabelled_turns_are_not(self) -> None:
         chat.keep_exchange(
@@ -248,7 +477,7 @@ class PairScopedChatsTests(unittest.TestCase):
             one for one in board["works_on"]
             if not (one["agent"] == "agent-2" and one["project"] == "project-2")
         ]
-        with self.assertRaisesRegex(Exception, "Both agents"):
+        with self.assertRaisesRegex(Exception, "both agents"):
             swarm_chats.select_project(
                 self.config, board, "agent-1", chat_id, "project-2"
             )
@@ -388,6 +617,96 @@ class PairScopedChatsTests(unittest.TestCase):
             )["chats"]},
             expected,
         )
+
+    def test_valid_older_shortened_primary_never_beats_newer_backup(self) -> None:
+        swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        made = swarm_chats.create(self.config, self.board, "agent-1", "agent-2")
+        expected = {one["id"] for one in made["chats"]}
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        backup_path = registry_path.with_name(swarm_chats.BACKUP_NAME)
+        complete = json.loads(backup_path.read_text(encoding="utf-8"))
+        self.assertGreater(complete["revision"], 0)
+        self.assertEqual(
+            complete["integrity_sha256"],
+            swarm_chats._registry_integrity(complete),
+        )
+
+        shortened = copy.deepcopy(complete)
+        shortened["revision"] -= 1
+        shortened["chats"] = shortened["chats"][:1]
+        shortened["integrity_sha256"] = swarm_chats._registry_integrity(shortened)
+        registry_path.write_text(json.dumps(shortened, indent=2) + "\n", encoding="utf-8")
+
+        recovered = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual({one["id"] for one in recovered["chats"]}, expected)
+        self.assertEqual(recovered["registry_recovered_from"], swarm_chats.BACKUP_NAME)
+        rewritten = json.loads(registry_path.read_text(encoding="utf-8"))
+        self.assertGreater(rewritten["revision"], complete["revision"])
+        self.assertEqual(
+            rewritten["integrity_sha256"],
+            swarm_chats._registry_integrity(rewritten),
+        )
+
+    def test_valid_json_with_broken_integrity_recovers_from_backup(self) -> None:
+        made = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        expected = {one["id"] for one in made["chats"]}
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        damaged = json.loads(registry_path.read_text(encoding="utf-8"))
+        damaged["chats"] = []
+        # Deliberately retain the old seal: the JSON is valid but incomplete.
+        registry_path.write_text(json.dumps(damaged, indent=2) + "\n", encoding="utf-8")
+
+        recovered = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual({one["id"] for one in recovered["chats"]}, expected)
+        self.assertEqual(recovered["registry_recovered_from"], swarm_chats.BACKUP_NAME)
+
+    def test_future_registry_schema_is_not_downgraded(self) -> None:
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        future = {
+            "schema_version": swarm_chats.REGISTRY_SCHEMA_VERSION + 1,
+            "revision": 99,
+            "chats": [], "active": {}, "chosen_active": {}, "known_pairs": [],
+        }
+        registry_path.write_text(json.dumps(future), encoding="utf-8")
+
+        with self.assertRaisesRegex(Exception, "newer saved-chat schema"):
+            swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual(
+            json.loads(registry_path.read_text(encoding="utf-8"))["schema_version"],
+            swarm_chats.REGISTRY_SCHEMA_VERSION + 1,
+        )
+
+    def test_registry_backup_symlink_is_rejected_before_read(self) -> None:
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        target = Path(outside.name) / "outside.json"
+        target.write_text(json.dumps(swarm_chats._empty()), encoding="utf-8")
+        backup = registry_path.with_name(swarm_chats.BACKUP_NAME)
+        try:
+            backup.symlink_to(target)
+        except OSError as exc:
+            self.skipTest(f"This host cannot create a file symlink: {exc}")
+
+        with self.assertRaisesRegex(Exception, "Linked path components"):
+            swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+
+    def test_registry_history_symlink_is_rejected_before_recovery(self) -> None:
+        registry_path = self.root / swarm_chats.WHERE_THEY_LIVE
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text("{broken", encoding="utf-8")
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        history = registry_path.with_name(swarm_chats.HISTORY_FOLDER)
+        try:
+            history.symlink_to(Path(outside.name), target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"This host cannot create a directory symlink: {exc}")
+
+        with self.assertRaisesRegex(Exception, "Linked path components"):
+            swarm_chats.list_for_agent(self.config, self.board, "agent-1")
 
     def test_disconnected_pair_is_preserved_but_cannot_be_used(self) -> None:
         listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")

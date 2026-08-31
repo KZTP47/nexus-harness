@@ -116,6 +116,14 @@ The legacy `provider` object remains valid. Use trusted `providers` and `agents`
 
 Each named profile reads only its `api_key_env`. It does not fall back to `HARNESS_API_KEY`. Provider profiles, agent definitions, and price data are rejected when they come from shareable project config. Put them in user config, a trusted `.harness/config.local.json`, or an explicit reviewed config.
 
+`max_concurrency` also bounds saved-chat provider dispatches for that profile.
+The slot pool is shared by every Nexus process using the same project, while
+different saved chat IDs retain independent transcripts, cancellation, and
+progress state. A chat above the limit waits for a slot instead of colliding
+with a live CLI/account request; Stop remains available while it waits. Set a
+value above `1` only for a provider profile whose connection is known to support
+parallel requests.
+
 `allow_project_graphs: true` lets a graph submitted by a project or the visual editor select that profile. Keep this opt-in in trusted config only. It grants that graph permission to send its selected state to the profile endpoint. Built-in workflows and the legacy `provider` route do not need this flag.
 
 OpenAI, Anthropic, Gemini, Ollama, OpenAI-compatible, local-process, and optional Codex CLI profiles can coexist. Anthropic, Gemini, and Ollama retain provider-native tool state between a tool call and its result. Continuation state is bound to its provider and model. Gemini uses the Interactions API at `/v1beta/interactions`.
@@ -149,7 +157,7 @@ A trusted local profile can delegate a structured turn to Codex using an existin
 
 Put this profile in user config, a trusted `.harness/config.local.json`, or an explicitly reviewed config file. Shareable project config cannot enable it. Run `codex login` once, then run `harness doctor`. Doctor executes both `codex --version` and `codex login status`; finding a filename on `PATH` is not enough. In particular, a WindowsApps alias installed with the desktop app can be visible but refuse execution. Install an executable Codex CLI/runtime when doctor reports that error.
 
-The adapter runs `codex exec` in an empty private temporary directory. Before each request, it asks that executable for `debug models --bundled`, validates the selected model, writes the emitted catalog unchanged to a mode-0600 temporary file, and passes it through `model_catalog_json`. This avoids parsing or changing another Codex installation's model cache. The adapter ignores user and project rules, selects the read-only sandbox, sends the prompt through stdin, requests a JSON Schema result, applies byte and wall-clock limits, validates the result again, and removes the temporary directory. `reasoning_effort` is passed as a fixed Codex config override. It does not read or copy Codex credentials. It does not expose native harness tools or continuation state.
+The adapter runs `codex exec` in an empty private temporary directory. Before each request, it asks that executable for `debug models --bundled`, validates the selected model and that model's advertised reasoning levels, writes the emitted catalog unchanged to a mode-0600 temporary file, and passes it through `model_catalog_json`. This avoids parsing or changing another Codex installation's model cache. The adapter proves that the configured executable supports `exec --ignore-user-config`, ignores user and project rules, selects the read-only sandbox, sends the prompt through stdin, requests a JSON Schema result, applies byte and wall-clock limits, validates the result again, and removes the temporary directory. If an older CLI's `login status` cannot parse newer user settings, Nexus defers the authentication verdict to that immediate isolated request instead of blocking before it. `reasoning_effort` is passed as a fixed Codex config override and must be supported by the selected model. It does not read or copy Codex credentials. It does not expose native harness tools or continuation state.
 
 ChatGPT plan, workspace, model, and rate limits still apply. A subscription run has no API price snapshot. Usage records set `cost_microusd` to `null` and `price_status` to `subscription-unpriced`; they never treat the call as free or apply API token prices. Do not copy account authentication into public CI. See the official [Codex authentication](https://developers.openai.com/codex/auth) and [non-interactive mode](https://developers.openai.com/codex/noninteractive) documentation.
 

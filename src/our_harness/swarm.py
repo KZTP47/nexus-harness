@@ -41,6 +41,7 @@ import hashlib
 import re
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import wraps
@@ -53,6 +54,18 @@ from .models import HarnessError
 # stays something a machine can read quickly.
 MOST_AGENTS = 24
 MOST_PROJECTS = 12
+BOARD_BINDING_SCHEMA_VERSION = 1
+_WORKSPACE_ID = re.compile(
+    r"^workspace-(?:[0-9a-f]{32}|legacy-[0-9a-f]{24}|saved-[0-9a-f]{24})$"
+)
+
+
+def _new_workspace_id() -> str:
+    """Return an opaque identity for one board/chat workspace lineage."""
+
+    return f"workspace-{uuid.uuid4().hex}"
+
+
 MOST_TASKS = 40
 # The most answers kept from one run of the board. Each agent on the second
 # round is shown one answer per agent it may hear from, so a project with
@@ -186,6 +199,11 @@ class OneProject:
 
 @dataclass
 class Board:
+    # Agent and project ids are short, human-editable canvas identifiers. They
+    # are not sufficient chat ownership: an imported or separately saved board
+    # can legitimately contain the same ids. This opaque, server-owned id
+    # scopes every durable pair chat to one board lineage.
+    workspace_id: str = field(default_factory=_new_workspace_id)
     # How many times this board has been written. Sent out with it and sent
     # back with a save, so a window that has been looking at an old board is
     # told rather than quietly writing over somebody else's change.
@@ -213,6 +231,8 @@ class Board:
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 1,
+            "binding_schema_version": BOARD_BINDING_SCHEMA_VERSION,
+            "workspace_id": self.workspace_id,
             "version": self.version,
             "made_agents": self.made_agents,
             "made_projects": self.made_projects,
@@ -394,6 +414,33 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
 
     if not isinstance(said, dict):
         raise SwarmError("A board is written as an object")
+    schema_version = said.get("schema_version")
+    if schema_version is not None and (
+        isinstance(schema_version, bool) or schema_version != 1
+    ):
+        qualifier = (
+            "a newer" if isinstance(schema_version, int) and schema_version > 1
+            else "an unsupported"
+        )
+        raise SwarmError(
+            f"This board uses {qualifier} schema version ({schema_version!r}). "
+            "Nexus did not reinterpret or rewrite it."
+        )
+    binding_schema_version = said.get("binding_schema_version")
+    if binding_schema_version is not None and (
+        isinstance(binding_schema_version, bool)
+        or binding_schema_version != BOARD_BINDING_SCHEMA_VERSION
+    ):
+        qualifier = (
+            "a newer"
+            if isinstance(binding_schema_version, int)
+            and binding_schema_version > BOARD_BINDING_SCHEMA_VERSION
+            else "an unsupported"
+        )
+        raise SwarmError(
+            f"This board uses {qualifier} chat-binding schema version "
+            f"({binding_schema_version!r}). Nexus did not reinterpret or rewrite it."
+        )
     raw_agents_value = said.get("agents", [])
     raw_projects_value = said.get("projects", [])
     if not isinstance(raw_agents_value, list) or not all(
@@ -553,7 +600,18 @@ def read_it(said: Any, made_agents: int = 0, made_projects: int = 0) -> Board:
     active_saved_board = _some_words(said.get("active_saved_board"), 48)
     if not A_NAME.fullmatch(active_saved_board):
         active_saved_board = ""
+    workspace_id = str(said.get("workspace_id") or "").strip().lower()
+    if workspace_id and not _WORKSPACE_ID.fullmatch(workspace_id):
+        # Absence is the one compatibility bridge for a pre-identity board.
+        # A non-empty malformed identity is corruption, not legacy data: making
+        # it legacy would orphan its scoped chats and could let it claim an
+        # unrelated unscoped registry.
+        raise SwarmError(
+            "This board has an invalid workspace identity. Nexus kept it unchanged "
+            "and did not claim or retarget any saved chats."
+        )
     return Board(
+        workspace_id=workspace_id,
         version=_how_many_times(said.get("version")),
         made_agents=made_agents,
         made_projects=made_projects,
@@ -686,11 +744,19 @@ def load() -> Board:
             "did not pretend your agents, projects, or goals were gone."
         ) from exc
     try:
-        return read_it(said)
+        board = read_it(said)
+        if not board.workspace_id:
+            # One deterministic bridge lets the live board which predates
+            # workspace identities claim its existing project-local chat
+            # registry exactly once. It is persisted on the next normal save.
+            canonical = os.path.normcase(str(where.resolve(strict=False)))
+            marked = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+            board.workspace_id = f"workspace-legacy-{marked}"
+        return board
     except SwarmError as exc:
         raise SwarmError(
             f"The active board at {where} is invalid. Nexus preserved it and did "
-            "not replace it with an empty board: {exc}"
+            f"not replace it with an empty board: {exc}"
         ) from exc
 
 
@@ -724,6 +790,7 @@ def _save_while_board_authority_is_held(
     config: Any,
     *,
     allow_command_approval_changes: bool = False,
+    workspace_id_override: str | None = None,
 ) -> Board:
     """Write the whole board down, if it is still the board that was read.
 
@@ -755,6 +822,16 @@ def _save_while_board_authority_is_held(
     # something held around both of them the check below proves nothing.
     now = load()
     board = read_it(said, now.made_agents, now.made_projects)
+    # Workspace identity is server-owned. A stale panel may omit it and a
+    # hand-edited request may try to substitute it; neither may retarget saved
+    # conversations. Opening a locally validated named board is the one
+    # explicit internal replacement path.
+    if workspace_id_override is None:
+        board.workspace_id = now.workspace_id or _new_workspace_id()
+    elif _WORKSPACE_ID.fullmatch(str(workspace_id_override or "")):
+        board.workspace_id = str(workspace_id_override)
+    else:
+        raise SwarmError("That saved board has an invalid workspace identity.")
     if not allow_command_approval_changes:
         # Execution approval is not ordinary board layout. A caller that can
         # move boxes or save task text must not be able to smuggle a digest in
@@ -877,6 +954,28 @@ def _how_much_was_said_to(config, who: str, filed: str) -> dict[str, Any]:
     return held
 
 
+def discover_who_can_be_used(config) -> list[dict[str, Any]]:
+    """Probe provider routes without reading or locking the durable board.
+
+    Installed command-line providers can take many seconds to answer a version
+    or readiness probe. Keeping that machine discovery separate from board
+    hydration lets the server perform it outside the topology mutation lock, so
+    a visible board remains editable while provider status is refreshed.
+    """
+
+    from . import chat as chat_lab
+
+    can_talk = [
+        one for one in chat_lab.who_can_talk(config) if one.get("route")
+    ]
+    for one in can_talk:
+        one["can_be_connected"] = (
+            "" if one.get("ready")
+            else _which_one_to_connect(one.get("route", ""), one)
+        )
+    return can_talk
+
+
 def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """The board, and everything the panel needs to draw and judge it.
 
@@ -899,14 +998,14 @@ def how_it_stands(config, *, known_routes: list[dict[str, Any]] | None = None) -
     # sent to Your team, where one press makes them.
     probing = known_routes is None
     can_talk = (
-        [one for one in chat_lab.who_can_talk(config) if one.get("route")]
+        discover_who_can_be_used(config)
         if probing else [dict(one) for one in known_routes or []]
     )
     # Which of them one press would connect: on this machine, and nothing
     # pointing at it yet. Anything else must not offer a button, because a
     # button that fails is worse than no button.
     for one in can_talk:
-        if probing or "can_be_connected" not in one:
+        if "can_be_connected" not in one:
             one["can_be_connected"] = (
                 "" if one.get("ready") else _which_one_to_connect(one.get("route", ""), one))
     ready = {one["route"]: one for one in can_talk}
@@ -2857,6 +2956,9 @@ def export_kept_board(name: str) -> dict[str, Any]:
     # restored on the next computer. Command approval is local authority, not
     # portable board content: another machine/path must ask explicitly again.
     checked = read_it(board)
+    if not checked.workspace_id:
+        marked = hashlib.sha256(opened_as.casefold().encode("utf-8")).hexdigest()[:24]
+        checked.workspace_id = f"workspace-saved-{marked}"
     for project in checked.projects:
         project.approved_test_command_digest = ""
     return _portable_board_document(
@@ -2895,6 +2997,10 @@ def import_kept_board(document: Any, name: str = "") -> dict[str, Any]:
     # cleared so opening the snapshot requires a visible local approval.
     for project in checked.projects:
         project.approved_test_command_digest = ""
+    # An imported layout starts a new local workspace. Portable agent ids and
+    # a workspace id from another computer are not authority to claim this
+    # installation's transcripts or provider conversations.
+    checked.workspace_id = _new_workspace_id()
     # A board imported as a saved snapshot is not silently made the active
     # board. The person chooses when to replace the canvas by opening it.
     checked.active_saved_board = ""
@@ -2939,12 +3045,22 @@ def _check_import_shape(board: dict[str, Any]) -> None:
     if set(board) - {
         "schema_version", "version", "made_agents", "made_projects", "agents",
         "projects", "works_on", "talks_to", "active_saved_board",
+        "binding_schema_version", "workspace_id",
     }:
         raise SwarmError(
             "The imported board contains unsupported board fields. Nothing was imported."
         )
     if "schema_version" in board and board["schema_version"] != 1:
         raise SwarmError("The imported board uses an unsupported schema version.")
+    if (
+        "binding_schema_version" in board
+        and board["binding_schema_version"] != BOARD_BINDING_SCHEMA_VERSION
+    ):
+        raise SwarmError("The imported board uses an unsupported binding schema version.")
+    if "workspace_id" in board and not _WORKSPACE_ID.fullmatch(
+        str(board.get("workspace_id") or "").strip().lower()
+    ):
+        raise SwarmError("The imported board has an invalid workspace identity.")
     for key in ("version", "made_agents", "made_projects"):
         if key in board and not _is_a_count(board[key]):
             raise SwarmError(
@@ -3192,10 +3308,24 @@ def keep_this_board(name: str, config: Any) -> dict[str, Any]:
     where.mkdir(parents=True, exist_ok=True)
     with ProjectTransactionLock(where.parent).held(timeout_seconds=10):
         filed = _filed_under(name)
+        saved_name = " ".join(str(name).split())
+        live = load()
+        # Save-as is a fork, not an alias. Two separately named boards may use
+        # the same short agent/project ids, so copying the live workspace id
+        # into both would make their pair chats indistinguishable. Saving the
+        # board which is currently open back onto that same name is an update
+        # and deliberately retains its identity and conversations.
+        workspace_id = (
+            live.workspace_id
+            if live.active_saved_board == saved_name
+            else _new_workspace_id()
+        )
+        snapshot = live.to_dict()
+        snapshot["workspace_id"] = workspace_id
         held = {
-            "name": " ".join(str(name).split()),
+            "name": saved_name,
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "board": load().to_dict(),
+            "board": snapshot,
         }
         _portable_board_document(
             held["name"], held["saved_at"], read_it(held["board"])
@@ -3232,13 +3362,25 @@ def open_this_board(name: str, config: Any) -> Board:
         board = held.get("board") if isinstance(held, dict) else None
         if not isinstance(board, dict):
             raise SwarmError(f"The board saved as {name} cannot be read.")
+        checked = read_it(board)
+        workspace_id = checked.workspace_id
+        if not workspace_id:
+            # Old local snapshots did not carry a workspace id. Bind one to
+            # the exact saved-board file/name so reopening it is stable, while
+            # remaining distinct from the legacy live board and every import.
+            identity = f"{where.resolve(strict=False)}\0{opened_as.casefold()}"
+            marked = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            workspace_id = f"workspace-saved-{marked}"
         # The global authority is already held, so do the validated file write
         # directly instead of trying to acquire the non-reentrant lease twice.
         return _save_while_board_authority_is_held(dict(
-            board,
+            checked.to_dict(),
             version=None,
             active_saved_board=opened_as,
-        ), config, allow_command_approval_changes=True)
+        ), config,
+            allow_command_approval_changes=True,
+            workspace_id_override=workspace_id,
+        )
 
 
 @_requires_board_qa_access

@@ -86,6 +86,18 @@ class ReadingTheTeamTests(PanelTestCase):
         self.ask("/api/who-is-on-it")
         self.assertFalse(list((self.root / ".harness").glob("workflows/*.json")))
 
+    def test_opening_the_view_supplies_explicit_native_provider_choices(self) -> None:
+        status, said = self.ask("/api/who-is-on-it")
+        self.assertEqual(status, 200)
+        choices = {one["kind"]: one for one in said["model_providers"]}
+        self.assertEqual(
+            set(choices), {"openai", "anthropic", "gemini", "ollama", "openai-compatible"}
+        )
+        self.assertEqual(choices["openai"]["default_endpoint"], "https://api.openai.com/v1")
+        self.assertEqual(choices["anthropic"]["default_key_name"], "ANTHROPIC_API_KEY")
+        self.assertEqual(choices["gemini"]["ways_in"], ["with-a-key"])
+        self.assertEqual(choices["ollama"]["ways_in"], ["on-this-machine"])
+
     def test_a_team_that_has_gone_does_not_take_the_view_with_it(self) -> None:
         status, said = self.ask("/api/who-is-on-it?name=never-saved")
         self.assertEqual(status, 200, "the whole view still comes back")
@@ -142,11 +154,43 @@ class WritingTheTeamTests(PanelTestCase):
         status, _said = self.ask("/api/who-is-on-it/remove", {"name": "Going"})
         self.assertEqual(status, 400, "and says so the second time")
 
+    def test_blank_customary_provider_values_are_saved_and_visible_after_reload(self) -> None:
+        status, done = self.ask("/api/who-is-on-it/add-a-model", {"model": {
+            "route": "new_anthropic",
+            "way_in": "with-a-key",
+            "provider": "anthropic",
+            "model": "fixture-claude",
+            "endpoint": "",
+            "key_name": "",
+        }})
+        self.assertEqual(status, 200)
+        self.assertEqual(done["provider"], "anthropic")
+        self.assertEqual(done["endpoint"], "https://api.anthropic.com/v1")
+        self.assertEqual(done["key_name"], "ANTHROPIC_API_KEY")
+
+        saved = json.loads(
+            (self.root / ".harness" / "config.local.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(saved["providers"]["new_anthropic"], {
+            "kind": "anthropic",
+            "model": "fixture-claude",
+            "endpoint": "https://api.anthropic.com/v1",
+            "api_key_env": "ANTHROPIC_API_KEY",
+        })
+        status, reopened = self.ask("/api/who-is-on-it")
+        self.assertEqual(status, 200)
+        member = next(
+            one for one in reopened["who"]["members"] if one["route"] == "new_anthropic"
+        )
+        self.assertEqual(member["kind"], "anthropic")
+        self.assertEqual(member["version"], "fixture-claude")
+
     def test_everything_here_needs_the_token(self) -> None:
         for path, body in (
             ("/api/who-is-on-it", None),
             ("/api/who-is-on-it/save", {"name": "x", "team": {}}),
             ("/api/who-is-on-it/remove", {"name": "x"}),
+            ("/api/who-is-on-it/add-a-model", {"model": {}}),
             ("/api/who-is-on-it/check", {"team": {}}),
         ):
             with self.subTest(path=path):
@@ -180,7 +224,10 @@ class TheTabAndTheModuleAgreeTests(unittest.TestCase):
         served = (Path(__file__).resolve().parents[1] / "src/our_harness/server.py").read_text(
             encoding="utf-8"
         )
-        for path in ("/api/who-is-on-it", "/api/who-is-on-it/save", "/api/who-is-on-it/remove", "/api/who-is-on-it/check"):
+        for path in (
+            "/api/who-is-on-it", "/api/who-is-on-it/save", "/api/who-is-on-it/remove",
+            "/api/who-is-on-it/add-a-model", "/api/who-is-on-it/check",
+        ):
             with self.subTest(path=path):
                 self.assertIn(path, self.panel)
                 self.assertIn(f'"{path}"', served)
@@ -214,6 +261,16 @@ class TheTabAndTheModuleAgreeTests(unittest.TestCase):
         # harness could not run cannot happen. This is the guard on that.
         self.assertIn("said.jobs", self.panel)
         self.assertNotIn('teamJobs = [{', self.panel)
+
+    def test_the_add_model_window_uses_server_owned_provider_defaults(self) -> None:
+        self.assertIn('id="teamModelProvider"', self.page)
+        self.assertIn('id="teamModelEndpointHelp"', self.page)
+        self.assertIn('id="teamModelKeyHelp"', self.page)
+        self.assertIn("teamModelProviders = said.model_providers || []", self.panel)
+        self.assertIn("one.ways_in.includes(selectedWay)", self.panel)
+        self.assertIn('provider: $("teamModelProvider").value', self.panel)
+        self.assertIn('provider?.default_endpoint || ""', self.panel)
+        self.assertIn('provider?.default_key_name || ""', self.panel)
 
 
 if __name__ == "__main__":

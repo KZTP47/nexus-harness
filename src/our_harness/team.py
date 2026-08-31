@@ -35,6 +35,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -44,6 +46,7 @@ from .config import (
     LoadedConfig,
     SYSTEM_PROMPT_MAX_CHARACTERS,
     is_project_local_config_trusted,
+    load_config,
     trust_project_local_config,
 )
 from .graphs import migrate_graph, validate_graph
@@ -116,11 +119,88 @@ WAYS_IN: tuple[tuple[str, str, str], ...] = (
     ),
 )
 WAY_IN_NAMES = {key for key, _label, _means in WAYS_IN}
-# What each way in is written as in the settings.
-KIND_FOR_WAY_IN = {"on-this-machine": "ollama", "with-a-key": "openai-compatible"}
 ROUTE_SHAPE = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
 KEY_NAME_SHAPE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 MOST_PROMPT_LETTERS = SYSTEM_PROMPT_MAX_CHARACTERS
+
+
+@dataclass(frozen=True)
+class ModelProviderChoice:
+    """One provider the new-model window can write without guessing a protocol."""
+
+    kind: str
+    label: str
+    means: str
+    ways_in: tuple[str, ...]
+    default_endpoint: str
+    default_key_name: str
+    model_hint: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "label": self.label,
+            "means": self.means,
+            "ways_in": list(self.ways_in),
+            "default_endpoint": self.default_endpoint,
+            "default_key_name": self.default_key_name,
+            "model_hint": self.model_hint,
+        }
+
+
+# These are transport choices, not merely labels. Selecting Anthropic or Gemini
+# must write their native provider kind; treating every keyed service as an
+# OpenAI-compatible endpoint is how a valid key ended up speaking the wrong wire
+# protocol. The endpoint and environment-variable values are editable defaults,
+# so a customary setup needs no memorised URL while a gateway remains possible.
+MODEL_PROVIDER_CHOICES: tuple[ModelProviderChoice, ...] = (
+    ModelProviderChoice(
+        "ollama",
+        "Ollama",
+        "A local Ollama server. No account or key is needed.",
+        ("on-this-machine",),
+        "http://127.0.0.1:11434",
+        "",
+        "qwen2.5-coder:7b",
+    ),
+    ModelProviderChoice(
+        "openai",
+        "OpenAI",
+        "OpenAI's native API, including its Responses protocol.",
+        ("with-a-key",),
+        "https://api.openai.com/v1",
+        "OPENAI_API_KEY",
+        "gpt-5.6-terra",
+    ),
+    ModelProviderChoice(
+        "anthropic",
+        "Anthropic",
+        "Anthropic's native Messages API.",
+        ("with-a-key",),
+        "https://api.anthropic.com/v1",
+        "ANTHROPIC_API_KEY",
+        "claude-sonnet-5",
+    ),
+    ModelProviderChoice(
+        "gemini",
+        "Google Gemini",
+        "Google Gemini's native Interactions API.",
+        ("with-a-key",),
+        "https://generativelanguage.googleapis.com/v1beta",
+        "GEMINI_API_KEY",
+        "gemini-3.5-flash",
+    ),
+    ModelProviderChoice(
+        "openai-compatible",
+        "OpenAI-compatible endpoint",
+        "A local or hosted service that implements the OpenAI Chat Completions protocol.",
+        ("on-this-machine", "with-a-key"),
+        "http://127.0.0.1:8000/v1",
+        "OPENAI_COMPATIBLE_API_KEY",
+        "model-name",
+    ),
+)
+MODEL_PROVIDER_BY_KIND = {choice.kind: choice for choice in MODEL_PROVIDER_CHOICES}
 
 # How many boxes one team may hold. Past this it stops being a picture somebody
 # can read, which is the whole point of it.
@@ -430,6 +510,7 @@ class ItsOwnWayIn:
 
     route: str
     way_in: str
+    provider: str
     model: str
     endpoint: str = ""
     key_name: str = ""
@@ -438,6 +519,7 @@ class ItsOwnWayIn:
         return {
             "route": self.route,
             "way_in": self.way_in,
+            "provider": self.provider,
             "model": self.model,
             "endpoint": self.endpoint,
             "key_name": self.key_name,
@@ -447,11 +529,10 @@ class ItsOwnWayIn:
         """The same thing written the way the settings file keeps it."""
 
         written: dict[str, Any] = {
-            "kind": KIND_FOR_WAY_IN.get(self.way_in, "openai-compatible"),
+            "kind": self.provider,
             "model": self.model,
+            "endpoint": self.endpoint,
         }
-        if self.endpoint:
-            written["endpoint"] = self.endpoint
         if self.key_name:
             written["api_key_env"] = self.key_name
         return written
@@ -468,6 +549,24 @@ def check_its_own_way_in(said: Any) -> ItsOwnWayIn:
             "Choose how it is reached: a tool you are signed in to, a model on this "
             "machine, or a service with its key in an environment variable."
         )
+    provider = str(said.get("provider") or "").strip().lower()
+    if not provider:
+        # Old panels did not send a provider kind. Preserve their exact former
+        # meaning while current panels make the wire protocol an explicit choice.
+        provider = "ollama" if way_in == "on-this-machine" else "openai-compatible"
+    choice = MODEL_PROVIDER_BY_KIND.get(provider)
+    if choice is None:
+        raise TeamError(
+            "Choose a supported provider: OpenAI, Anthropic, Google Gemini, "
+            "Ollama, or an OpenAI-compatible endpoint."
+        )
+    if way_in not in choice.ways_in:
+        allowed = (
+            "a model on this machine"
+            if choice.ways_in == ("on-this-machine",)
+            else "a service with its key in an environment variable"
+        )
+        raise TeamError(f"{choice.label} must be reached as {allowed}.")
     route = str(said.get("route") or "").strip().lower()
     if not ROUTE_SHAPE.fullmatch(route):
         raise TeamError(
@@ -477,12 +576,25 @@ def check_its_own_way_in(said: Any) -> ItsOwnWayIn:
     model = str(said.get("model") or "").strip()
     if not 1 <= len(model) <= 120:
         raise TeamError("Say which model to use, in up to 120 letters.")
-    endpoint = str(said.get("endpoint") or "").strip()
+    endpoint = str(said.get("endpoint") or choice.default_endpoint).strip()
     if endpoint and not endpoint.startswith(("http://", "https://")):
         raise TeamError("An address starts with http:// or https://.")
     if len(endpoint) > 300:
         raise TeamError("That address is too long.")
-    key_name = str(said.get("key_name") or "").strip()
+    if way_in == "on-this-machine":
+        try:
+            parsed_endpoint = urllib.parse.urlsplit(endpoint)
+        except ValueError as exc:
+            raise TeamError("That local model address is not a valid address.") from exc
+        if parsed_endpoint.scheme != "http" or parsed_endpoint.hostname not in {
+            "127.0.0.1", "localhost", "::1",
+        }:
+            raise TeamError(
+                "A model marked as running on this machine must use a local http:// "
+                "address (127.0.0.1, localhost, or ::1)."
+            )
+    customary_key_name = choice.default_key_name if way_in == "with-a-key" else ""
+    key_name = str(said.get("key_name") or customary_key_name).strip()
     if key_name and not KEY_NAME_SHAPE.fullmatch(key_name):
         raise TeamError(
             "Give the name of the environment variable the key is kept in, like "
@@ -493,13 +605,23 @@ def check_its_own_way_in(said: Any) -> ItsOwnWayIn:
             "Say which environment variable holds the key. The harness reads the key "
             "from there when it runs, so nothing secret is written down here."
         )
+    if way_in == "on-this-machine" and key_name:
+        raise TeamError(
+            "A model marked as running on this machine does not use a key here. "
+            "Choose the service-with-a-key option if this endpoint requires one."
+        )
     if key_name and _looks_like_a_key(key_name):
         raise TeamError(
             "That looks like a key rather than the name of one. Put the key in an "
             "environment variable and give the name of that variable here."
         )
     return ItsOwnWayIn(
-        route=route, way_in=way_in, model=model, endpoint=endpoint, key_name=key_name
+        route=route,
+        way_in=way_in,
+        provider=provider,
+        model=model,
+        endpoint=endpoint,
+        key_name=key_name,
     )
 
 
@@ -742,11 +864,30 @@ def add_its_own_way_in(config: LoadedConfig, said: Any) -> dict[str, Any]:
     settings["providers"] = routes
     body = json.dumps(settings, indent=2) + "\n"
     local.parent.mkdir(parents=True, exist_ok=True)
-    # Written beside and moved into place, so a machine turned off in the middle
-    # cannot leave half a settings file behind.
-    beside = local.with_name(f"{local.name}.{os.getpid()}.part")
-    beside.write_text(body, encoding="utf-8")
-    os.replace(beside, local)
+    # Validate the complete candidate through the same layered production
+    # loader startup will use. Merely checking the form fields is insufficient:
+    # native providers have protocol-specific requirements, and an invalid
+    # profile must never replace the last settings file that could start Nexus.
+    # The candidate is written beside the destination so the loader sees exact
+    # bytes, then atomically published only after the reload succeeds.
+    beside = local.with_name(
+        f".{local.name}.{os.getpid()}.{uuid.uuid4().hex}.part"
+    )
+    try:
+        beside.write_text(body, encoding="utf-8")
+        try:
+            load_config(config.project_root, explicit=beside)
+        except (HarnessError, OSError, ValueError) as exc:
+            raise TeamError(
+                "Those provider settings would prevent Nexus from loading its "
+                f"configuration, so the existing settings were left unchanged: {exc}"
+            ) from exc
+        os.replace(beside, local)
+    finally:
+        try:
+            beside.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     trusted = False
     needs_your_say = False
@@ -770,6 +911,9 @@ def add_its_own_way_in(config: LoadedConfig, said: Any) -> dict[str, Any]:
     return {
         "route": wanted.route,
         "way_in": wanted.way_in,
+        "provider": wanted.provider,
+        "endpoint": wanted.endpoint,
+        "key_name": wanted.key_name,
         "written_over": replaced,
         "settings_file": local.as_posix(),
         "contents": body,
@@ -792,6 +936,7 @@ def everything(config: LoadedConfig) -> dict[str, Any]:
         "ways_in": [
             {"way_in": key, "label": label, "means": means} for key, label, means in WAYS_IN
         ],
+        "model_providers": [choice.to_dict() for choice in MODEL_PROVIDER_CHOICES],
         "ways_of_asking": [
             {"asking": key, "label": label, "means": means}
             for key, label, means in WAYS_OF_ASKING

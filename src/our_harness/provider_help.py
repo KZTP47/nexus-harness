@@ -199,22 +199,50 @@ def _signed_in_tool(
         refusals = what_would_not_answer(config)
         problem = next((refusals[name]["why"] for name, _command in routes if name in refusals), "")
         authentication = "unknown"
+        connection: dict[str, Any] = {}
         if routes or in_use:
             from .providers.subscription_cli import connection_status
 
-            authentication = str(
-                connection_status(
-                    identifier, use_cache=True, probe=True,
-                    command=configured or None,
-                ).get("authentication")
-                or "unknown"
+            connection = connection_status(
+                identifier, use_cache=True, probe=True,
+                command=configured or None,
             )
-        if authentication == "signed-out":
+            authentication = str(connection.get("authentication") or "unknown")
+        connection_state = str(connection.get("state") or "")
+        from .providers.codex_cli import codex_config_load_error
+
+        isolated_transport_superseded_problem = bool(
+            connection_state == "isolated-ready"
+            and problem
+            and codex_config_load_error(problem)
+        )
+        if connection_state == "configuration-error":
+            state = ATTENTION
+            reason = (
+                "Installed and connected, but its command line cannot load the current user configuration. "
+                + str(connection.get("problem") or connection.get("note") or "").strip()
+            ).strip()
+            steps = (
+                "Update the configured command or repair the reported configuration before sending work.",
+                "Nexus will not label this route ready when isolated execution is unavailable.",
+            )
+        elif authentication == "signed-out":
             state = ATTENTION
             reason = "Installed and connected, but its own command line reports that it is signed out."
             steps = (
                 "Press the sign-in action on the agent card, or run the assistant's login command.",
                 "Come back and press Check again. Nexus will not start a run through a signed-out route.",
+            )
+        elif connection_state == "isolated-ready" and (
+            not problem or isolated_transport_superseded_problem
+        ):
+            state = READY
+            reason = (
+                "Installed and connected. Agent turns use an isolated command that ignores the "
+                "incompatible user configuration; the first request verifies ChatGPT authentication."
+            )
+            steps = (
+                "Send the first small request. Nexus will show the exact authentication error if the subscription session has expired.",
             )
         elif problem:
             state = ATTENTION

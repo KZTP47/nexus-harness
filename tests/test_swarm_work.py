@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import contextlib
 import json
 import os
 import shutil
@@ -17,7 +18,10 @@ from our_harness import chat, playwright_runtime, swarm_work
 from our_harness import cancellation
 from our_harness.changes import FileTransaction, file_sha256
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
-from our_harness.models import ChangePlan, HarnessError, ProviderRequest, ProviderResponse
+from our_harness.models import (
+    ChangePlan, HarnessError, ProviderOutcomeUnknown, ProviderRequest,
+    ProviderResponse, ResponseFormat,
+)
 from our_harness.collaboration_ledger import CollaborationLedger, _event_hash
 from our_harness.providers.base import AnthropicProvider, OllamaProvider, OpenAIProvider
 from our_harness.providers.gemini import GeminiProvider
@@ -70,22 +74,22 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertIn("END-OF-CONVERSATION:", transcript)
         self.assertGreater(len(transcript), 210_000)
 
-    def test_original_realmat_prompt_derives_all_and_only_authorized_destinations(self) -> None:
-        prompt = (Path(__file__).parent / "fixtures" / "realmat_original_prompt.txt").read_text(
+    def test_complex_prompt_derives_all_and_only_authorized_destinations(self) -> None:
+        prompt = (Path(__file__).parent / "fixtures" / "complex_project_contract.txt").read_text(
             encoding="utf-8"
         ).replace("{ROOT}", str(self.project))
         authority = swarm_work._path_authority_from_goal(self.project, prompt)
         expected_writable = [
-            "2_Github repos/3_WITH my tests",
-            "2_Github repos/4_upload to github",
-            "3_test traceability",
-            "4_LangGraph for this project",
-            "0_Obsidian vault",
+            "repository variants/qa workspace",
+            "repository variants/release bundle",
+            "test traceability",
+            "LangGraph policy",
+            "project memory",
         ]
         expected_read_only = [
-            "2_Github repos/0_OLD",
-            "2_Github repos/1_day one, untouched version made by devs",
-            "2_Github repos/2_current version, read only",
+            "repository variants/archive",
+            "repository variants/vendor baseline",
+            "repository variants/upstream snapshot",
         ]
         self.assertEqual(authority["writable"], expected_writable)
         self.assertEqual(authority["read_only"], expected_read_only)
@@ -96,7 +100,7 @@ class SwarmWorkTests(unittest.TestCase):
             for root in expected_writable
         ], expected_writable)
         self.assertEqual(len(accepted), 5)
-        for denied in [*expected_read_only, "2_Github repos/2_current", "myPages/reference"]:
+        for denied in [*expected_read_only, "repository variants/upstream", "references/example"]:
             with self.subTest(denied=denied), self.assertRaisesRegex(
                 HarnessError, "outside the explicit write destinations"
             ):
@@ -228,16 +232,18 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertEqual(result["collaborated_with"][0]["name"], "Codex")
         transcript = chat.read_it(self.config, "claude", "Claude")
         self.assertEqual([one.speaker_name for one in transcript], [
-            "You", "Claude", "Codex", "Claude", "Codex", "Claude",
+            "You", "Claude", "Codex", "Claude", "Codex", "Claude", "Nexus",
         ])
         self.assertEqual([one.phase for one in transcript], [
             "user_prompt", "lead_draft", "agent_reply",
             "agent_discussion", "agent_discussion", "final_answer",
+            "participant_outcome",
         ])
         self.assertEqual(transcript[2].text, "answer from codex")
         self.assertEqual(transcript[2].recipient_name, "Claude")
         self.assertEqual(transcript[2].speaker_route, "codex")
-        self.assertEqual(transcript[-1].text, "answer from claude")
+        self.assertEqual(transcript[-2].text, "answer from claude")
+        self.assertEqual(transcript[-1].participant_outcome["outcome"], "complete")
 
     def test_collaboration_reports_real_relay_stages(self) -> None:
         stages: list[tuple[str, str]] = []
@@ -424,7 +430,80 @@ class SwarmWorkTests(unittest.TestCase):
             with self.assertRaisesRegex(cancellation.ChatCancelled, "Stopped by you"):
                 chat.ask_once(self.config, "claude", "continue")
 
-    def test_structured_provider_failure_pauses_without_becoming_agent_speech(self) -> None:
+    def test_ask_once_preserves_typed_unknown_provider_outcome(self) -> None:
+        class VanishedProvider:
+            def complete(self, _request):
+                raise ProviderOutcomeUnknown("renderer vanished after the marked Send")
+
+        with mock.patch.object(chat, "create_provider", return_value=VanishedProvider()):
+            with self.assertRaisesRegex(ProviderOutcomeUnknown, "unreconciled provider turn"):
+                chat.ask_once(self.config, "claude", "continue")
+
+    def test_schema_repair_journals_each_physical_provider_call(self) -> None:
+        responses = iter([
+            ProviderResponse("not json"),
+            ProviderResponse('{"done":true}'),
+        ])
+
+        class RepairableProvider:
+            structured_retry_is_safe = True
+
+            def complete(self, _request):
+                return next(responses)
+
+        effects: list[str] = []
+
+        @contextlib.contextmanager
+        def effect(_config, _route, _conversation, digest):
+            effects.append(digest)
+            yield
+
+        response_format = ResponseFormat("repair-test", {
+            "type": "object", "properties": {"done": {"type": "boolean"}},
+            "required": ["done"], "additionalProperties": False,
+        })
+        with mock.patch.object(chat, "create_provider", return_value=RepairableProvider()), \
+                mock.patch("our_harness.swarm_runs.provider_effect", side_effect=effect):
+            result = chat.ask_once(
+                self.config, "claude", "return JSON", response_format=response_format,
+            )
+
+        self.assertEqual(result["text"], '{"done":true}')
+        self.assertEqual(len(effects), 2)
+        self.assertNotEqual(effects[0], effects[1])
+
+    def test_ask_once_records_dispatch_only_after_provider_capacity_admission(self) -> None:
+        order: list[str] = []
+
+        class Provider:
+            def complete(self, _request):
+                order.append("provider body")
+                return ProviderResponse("answer")
+
+        @contextlib.contextmanager
+        def effect(
+            _config, _route, _conversation, _digest, *, before_dispatch=None,
+        ):
+            order.append("capacity admitted")
+            self.assertIsNotNone(before_dispatch)
+            before_dispatch()
+            order.append("effect journaled")
+            yield
+            order.append("effect acknowledged")
+
+        with mock.patch.object(chat, "create_provider", return_value=Provider()), \
+                mock.patch("our_harness.swarm_runs.provider_effect", side_effect=effect):
+            chat.ask_once(
+                self.config, "claude", "continue",
+                before_provider_dispatch=lambda phase: order.append(f"dispatch {phase}"),
+            )
+
+        self.assertEqual(order, [
+            "capacity admitted", "dispatch initial", "effect journaled",
+            "provider body", "effect acknowledged",
+        ])
+
+    def test_structured_provider_failure_degrades_without_erasing_healthy_agent_work(self) -> None:
         discussion_calls = 0
 
         def answer(_config, route, _text, **kwargs):
@@ -445,21 +524,82 @@ class SwarmWorkTests(unittest.TestCase):
             return {"text": f"initial or final answer from {route}", "milliseconds": 1, "model": route}
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
-            with self.assertRaisesRegex(
-                swarm_work.SwarmError, "paused this collaboration"
-            ):
-                swarm_work.collaborate(
-                    self.config, self.board, "agent-1", "Are you ChatGPT or Gemini?",
-                    round_limit=None,
-                )
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Are you ChatGPT or Gemini?",
+                round_limit=None,
+            )
 
-        self.assertEqual(discussion_calls, 1)
+        self.assertGreater(discussion_calls, 1)
+        self.assertTrue(any(
+            one["name"] == "Claude" and one["kind"] == "protocol"
+            for one in result["provider_failures"]
+        ))
         ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.md"))
         saved = ledger.read_text(encoding="utf-8")
-        self.assertIn("provider_transport_failure", saved)
+        self.assertIn("provider_protocol_failure", saved)
+        self.assertIn('"status": "degraded"', saved)
         self.assertNotIn("This agent could not continue", saved)
 
-    def test_initial_provider_failure_does_not_start_a_reasoning_round(self) -> None:
+    def test_web_discussion_preserves_delivered_prose_without_inventing_schema_state(self) -> None:
+        board = copy.deepcopy(self.board)
+        board["agents"][0]["who"] = "web:lead-arbitrary-47"
+        board["agents"][1]["who"] = "web:peer-arbitrary-91"
+        delivered = {
+            "web:lead-arbitrary-47": "I inspected the relay queue and found the claim is still live.",
+            "web:peer-arbitrary-91": "I checked the peer evidence; the saved transcript contains the turn.",
+        }
+        turns: list[dict] = []
+
+        def answer(_config, route, prompt, **kwargs):
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                if "STRUCTURED FORMAT CORRECTION" in prompt:
+                    return {
+                        "text": "I still cannot produce that JSON, but this is a separate correction reply.",
+                        "milliseconds": 3, "model": f"{route}-model",
+                    }
+                return {
+                    "text": delivered[route], "milliseconds": 2, "model": f"{route}-model",
+                }
+            return {"text": f"ordinary reply from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, board, "agent-1", "Investigate the relay together",
+                round_limit=1, live_turn=turns.append,
+            )
+
+        discussion = [one for one in turns if one.get("phase") == "agent_discussion"]
+        self.assertEqual([one["text"] for one in discussion], list(delivered.values()))
+        self.assertTrue(all(one.get("structured_state_unavailable") is True for one in discussion))
+        self.assertTrue(all("semantic_state" not in one for one in discussion))
+        self.assertEqual(result["stopped_because"], "round_limit")
+        self.assertNotEqual(result["stopped_because"], "provider_unavailable")
+        self.assertEqual(len(result["provider_failures"]), 2)
+        self.assertTrue(all(one.get("usable_contribution") is True for one in result["provider_failures"]))
+
+        ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.md"))
+        saved = ledger.read_text(encoding="utf-8")
+        for exact_text in delivered.values():
+            self.assertIn(exact_text, saved)
+        self.assertNotIn("separate correction reply", saved)
+        self.assertIn('"usable_contribution": true', saved)
+
+    def test_web_protocol_degradation_does_not_promote_invalid_control_payloads(self) -> None:
+        web = {"who": "web:opaque-route"}
+        self.assertEqual(
+            swarm_work._natural_language_web_contribution(
+                web, {"text": '{"message":"plausible prose","goal_complete":"yes"}'},
+            ),
+            "",
+        )
+        self.assertEqual(
+            swarm_work._natural_language_web_contribution(
+                {"who": "codex"}, {"text": "A genuine CLI reply."},
+            ),
+            "",
+        )
+
+    def test_initial_provider_failure_preserves_the_successful_agent_answer(self) -> None:
         calls: list[tuple[str, object]] = []
 
         def answer(_config, route, _text, **kwargs):
@@ -469,20 +609,263 @@ class SwarmWorkTests(unittest.TestCase):
             return {"text": "lead draft", "milliseconds": 1, "model": route}
 
         with mock.patch.object(chat, "ask_once", side_effect=answer):
-            with self.assertRaisesRegex(
-                swarm_work.SwarmError, "not counted as an agent reply or a discussion round"
-            ):
-                swarm_work.collaborate(
-                    self.config, self.board, "agent-1", "Investigate together",
-                    round_limit=None,
-                )
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Investigate together",
+                round_limit=None,
+            )
 
         self.assertEqual(len(calls), 2)
         self.assertTrue(all(response_format is None for _route, response_format in calls))
+        self.assertEqual(result["answer"]["text"], "lead draft")
+        self.assertEqual(result["stopped_because"], "partial_provider_failure")
         ledger = next((self.root / ".harness" / "chats").glob("*.collaboration.md"))
         saved = ledger.read_text(encoding="utf-8")
-        self.assertIn("provider_unavailable", saved)
+        self.assertIn("partial_provider_failure", saved)
         self.assertIn("the web submit control rejected the turn", saved)
+
+    def test_lead_failure_preserves_peer_answer_under_the_peer_identity(self) -> None:
+        def answer(_config, route, _text, **_kwargs):
+            if route == "claude":
+                raise HarnessError("lead provider rejected the turn")
+            return {"text": "peer answer", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Investigate together",
+                round_limit=None,
+            )
+
+        self.assertEqual(result["answer"]["text"], "peer answer")
+        self.assertEqual(result["answer"]["speaker_id"], "agent-2")
+        self.assertEqual(result["answer"]["speaker_name"], "Codex")
+        self.assertFalse(result["goal_complete"])
+        self.assertTrue(result["remaining"])
+
+    def test_arbitrary_adapter_exception_is_one_participant_failure_not_fanout_loss(self) -> None:
+        def answer(_config, route, _text, **_kwargs):
+            if route == "claude":
+                raise RuntimeError("adapter callback exploded")
+            return {"text": "peer survived", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Investigate together",
+                round_limit=None,
+            )
+
+        self.assertEqual(result["status"], "paused_provider")
+        self.assertEqual(result["answer"]["text"], "peer survived")
+        self.assertEqual(result["answer"]["speaker_id"], "agent-2")
+        outcome = result["participant_outcome"]
+        self.assertEqual(outcome["outcome"], "partial")
+        self.assertEqual(outcome["answered_count"], 1)
+        by_id = {one["agent_id"]: one for one in outcome["participants"]}
+        self.assertEqual(by_id["agent-1"]["status"], "failed")
+        self.assertEqual(by_id["agent-2"]["status"], "answered")
+        self.assertIn("adapter callback exploded", by_id["agent-1"]["provider_reason"])
+        transcript = chat.read_it(self.config, "claude", "Claude")
+        self.assertEqual([one.phase for one in transcript], [
+            "user_prompt", "final_answer", "participant_outcome",
+        ])
+        self.assertEqual(
+            sum(one.text == "peer survived" for one in transcript), 1,
+        )
+
+    def test_zero_answers_are_a_durable_paused_participant_outcome(self) -> None:
+        def answer(_config, route, _text, **_kwargs):
+            if route == "claude":
+                raise RuntimeError("adapter returned an unexpected exception")
+            raise ProviderOutcomeUnknown("provider may have accepted Send")
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Investigate together",
+                round_limit=None,
+            )
+
+        self.assertEqual(result["status"], "paused_provider")
+        self.assertTrue(result["requires_recovery"])
+        self.assertEqual(result["participant_outcome"]["outcome"], "none")
+        self.assertEqual(result["participant_outcome"]["expected_count"], 2)
+        self.assertEqual(result["participant_outcome"]["answered_count"], 0)
+        self.assertEqual(result["answered_participants"], [])
+        self.assertEqual(result["collaborated_with"], [])
+        self.assertEqual(result["answer"]["speaker_id"], "nexus")
+        self.assertEqual(result["answer"]["phase"], "participant_outcome")
+        by_id = {
+            one["agent_id"]: one
+            for one in result["participant_outcome"]["participants"]
+        }
+        self.assertEqual(by_id["agent-1"]["status"], "failed")
+        self.assertTrue(by_id["agent-1"]["repair_allowed"])
+        self.assertEqual(by_id["agent-2"]["status"], "outcome_unknown")
+        self.assertIs(by_id["agent-2"]["retry_allowed"], False)
+        self.assertIs(by_id["agent-2"]["repair_allowed"], False)
+        self.assertCountEqual(
+            [one["id"] for one in result["participant_outcome"]["actions"]],
+            ["repair-provider", "inspect-provider-turn"],
+        )
+        transcript = chat.read_it(self.config, "claude", "Claude")
+        self.assertEqual(
+            [one.phase for one in transcript],
+            ["user_prompt", "participant_outcome"],
+        )
+        self.assertEqual(transcript[-1].participant_outcome, result["participant_outcome"])
+
+    def test_saved_unknown_outcome_fails_closed_without_explicit_no_retry_flags(self) -> None:
+        outcome = swarm_work.collaboration_outcomes.build(
+            self.board["agents"],
+            answered_agent_ids=[],
+            failures=[{
+                "id": "agent-1",
+                "provider_reason": "delivery could not be reconciled",
+                "outcome_unknown": True,
+            }, {
+                "id": "agent-2",
+                "provider_reason": "known refusal",
+            }],
+            requested_mode="collaborate",
+        )
+        outcome["participants"][0].pop("retry_allowed")
+
+        with self.assertRaisesRegex(ValueError, "must forbid retry"):
+            swarm_work.collaboration_outcomes.frozen(outcome)
+
+    def test_final_report_failure_uses_truthful_nexus_fallback_without_roster_crash(self) -> None:
+        def answer(_config, route, text, **kwargs):
+            if "FINAL TEAM REPORT" in text:
+                raise HarnessError("reporter provider failed after team completion")
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                return {
+                    "text": json.dumps({
+                        "message": f"verified by {route}",
+                        "goal_complete": True, "remaining": [],
+                    }),
+                    "milliseconds": 1, "model": route,
+                }
+            return {"text": f"initial contribution from {route}", "milliseconds": 1, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Reach a team conclusion",
+                round_limit=1,
+            )
+
+        self.assertEqual(result["answer"]["speaker_id"], "nexus")
+        self.assertEqual(result["answer"]["speaker_name"], "Nexus")
+        self.assertIn("preserved the completed team transcript", result["answer"]["text"])
+        self.assertTrue(any(
+            one["kind"] == "final_report" for one in result["provider_failures"]
+        ))
+        self.assertEqual(result["status"], "paused_provider")
+        self.assertEqual(result["participant_outcome"]["outcome"], "partial")
+        reporter = next(
+            one for one in result["participant_outcome"]["participants"]
+            if one["agent_id"] == "agent-1"
+        )
+        self.assertEqual(reporter["status"], "answered_then_failed")
+        self.assertTrue(reporter["answer_saved"])
+
+    def test_stop_during_final_report_is_never_relabelled_as_provider_failure(self) -> None:
+        def answer(_config, route, text, **kwargs):
+            if "FINAL TEAM REPORT" in text:
+                raise cancellation.ChatCancelled(cancellation.STOPPED_MESSAGE)
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                return {
+                    "text": json.dumps({
+                        "message": f"verified by {route}",
+                        "goal_complete": True,
+                        "remaining": [],
+                    }),
+                    "milliseconds": 1,
+                    "model": route,
+                }
+            return {
+                "text": f"initial contribution from {route}",
+                "milliseconds": 1,
+                "model": route,
+            }
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            with self.assertRaisesRegex(cancellation.ChatCancelled, "Stopped by you"):
+                swarm_work.collaborate(
+                    self.config, self.board, "agent-1", "Reach a team conclusion",
+                    round_limit=1,
+                )
+
+    def test_all_later_unknown_outcomes_use_saved_transcript_without_resend(self) -> None:
+        calls: list[tuple[str, str, object]] = []
+
+        def answer(_config, route, text, **kwargs):
+            calls.append((route, text, kwargs.get("response_format")))
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                raise ProviderOutcomeUnknown(f"{route} may have accepted the discussion turn")
+            return {
+                "text": f"initial contribution from {route}",
+                "milliseconds": 1,
+                "model": route,
+            }
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, self.board, "agent-1", "Reach a team conclusion",
+                round_limit=1,
+            )
+
+        self.assertEqual(len(calls), 4)
+        self.assertFalse(any("FINAL TEAM REPORT" in text for _route, text, _format in calls))
+        self.assertEqual(result["answer"]["speaker_id"], "nexus")
+        self.assertEqual(result["status"], "paused_provider")
+        self.assertEqual(result["stopped_because"], "provider_unavailable")
+        outcome = result["participant_outcome"]
+        self.assertEqual(outcome["outcome"], "partial")
+        self.assertEqual(outcome["answered_count"], 2)
+        self.assertTrue(all(
+            one["status"] == "answered_then_outcome_unknown"
+            and one["answer_saved"] is True
+            and one["retry_allowed"] is False
+            for one in outcome["participants"]
+        ))
+        self.assertEqual(
+            {one["id"] for one in outcome["actions"]},
+            {"inspect-provider-turn"},
+        )
+
+    def test_later_ledger_failure_is_not_misreported_as_provider_failure(self) -> None:
+        acknowledgements = 0
+        real_ack = swarm_work._ack_shared
+
+        def acknowledge(ledger, one):
+            nonlocal acknowledgements
+            acknowledgements += 1
+            if acknowledgements == 3:
+                raise RuntimeError("collaboration ledger write failed")
+            return real_ack(ledger, one)
+
+        def answer(_config, route, _text, **kwargs):
+            if kwargs.get("response_format") is swarm_work.DISCUSSION_FORMAT:
+                return {
+                    "text": json.dumps({
+                        "message": f"verified by {route}",
+                        "goal_complete": True,
+                        "remaining": [],
+                    }),
+                    "milliseconds": 1,
+                    "model": route,
+                }
+            return {
+                "text": f"initial contribution from {route}",
+                "milliseconds": 1,
+                "model": route,
+            }
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer), \
+                mock.patch.object(swarm_work, "_ack_shared", side_effect=acknowledge):
+            with self.assertRaisesRegex(RuntimeError, "ledger write failed"):
+                swarm_work.collaborate(
+                    self.config, self.board, "agent-1", "Reach a team conclusion",
+                    round_limit=1,
+                )
 
     def test_unlimited_collaboration_stops_a_two_state_oscillation(self) -> None:
         discussion_calls = 0
@@ -626,15 +1009,15 @@ class SwarmWorkTests(unittest.TestCase):
         )
         self.assertEqual(decision["mode"], "relay")
 
-    def test_selected_pair_chat_relays_casual_messages_without_keywords(self) -> None:
+    def test_selected_pair_chat_keeps_casual_messages_direct(self) -> None:
         with mock.patch.object(chat, "ask_once") as ask:
             decision = swarm_work.automatic_mode(
                 self.config, self.board, "agent-1", "Can you tell them hi?",
                 peer_id="agent-2",
             )
-        self.assertEqual(decision["mode"], "collaborate")
-        self.assertIn("selected pair chat", decision["reason"])
-        self.assertTrue(decision["pair_chat_implicit_collaboration"])
+        self.assertEqual(decision["mode"], "chat")
+        self.assertIn("Send stayed direct", decision["reason"])
+        self.assertNotIn("pair_chat_implicit_collaboration", decision)
         ask.assert_not_called()
 
     def test_implicit_pair_keeps_the_lead_answer_when_a_peer_provider_fails(self) -> None:
@@ -663,8 +1046,12 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertIn("Claude answered", result["partial_provider_failure"])
         self.assertIn("Codex could not join", result["partial_provider_failure"])
         transcript = chat.read_it(self.config, "claude", "pair-chat")
-        self.assertEqual([one.phase for one in transcript], ["user_prompt", "final_answer"])
-        self.assertEqual(transcript[-1].text, "I am Claude.")
+        self.assertEqual([one.phase for one in transcript], [
+            "user_prompt", "final_answer", "participant_outcome",
+        ])
+        self.assertEqual(transcript[-2].text, "I am Claude.")
+        self.assertEqual(transcript[-1].participant_outcome["outcome"], "partial")
+        self.assertEqual(result["answer"]["text"], "I am Claude.")
         ledger = self.root / result["collaboration_ledger"]["canonical_path"]
         saved = ledger.read_text(encoding="utf-8")
         self.assertIn("provider_transport_failure", saved)
@@ -676,9 +1063,7 @@ class SwarmWorkTests(unittest.TestCase):
         def answer(_config, route, text, **kwargs):
             context = kwargs.get("context", "")
             calls.append((route, text, context))
-            if "DIRECTED RELAY — FINAL USER REPORT" in context:
-                value = "I am Claude. Codex replied: relay received."
-            elif route == "claude":
+            if route == "claude":
                 value = "Codex, please confirm this relay."
             else:
                 value = "Claude, relay received."
@@ -690,28 +1075,68 @@ class SwarmWorkTests(unittest.TestCase):
                 "Are you Claude? Send a message to Codex.",
             )
 
-        self.assertEqual([one[0] for one in calls], ["claude", "codex", "claude"])
+        self.assertEqual([one[0] for one in calls], ["claude", "codex"])
         self.assertEqual(calls[1][1], "Message relayed by Nexus from Claude:\nCodex, please confirm this relay.")
-        self.assertNotEqual(calls[2][1], "Are you Claude? Send a message to Codex.")
-        self.assertIn("NEXUS CURRENT TURN", calls[2][1])
-        self.assertIn("Are you Claude? Send a message to Codex.", calls[2][2])
         self.assertIn("not to Codex", calls[0][2])
         self.assertIn("Reply to Claude", calls[1][2])
         self.assertTrue(result["relay_complete"])
         transcript = chat.read_it(self.config, "claude", "Claude")
         self.assertEqual([one.phase for one in transcript], [
             "user_prompt", "lead_draft", "agent_reply", "final_answer",
+            "participant_outcome",
         ])
         self.assertEqual(transcript[2].speaker_name, "Codex")
         self.assertEqual(transcript[2].recipient_name, "Claude")
+        self.assertEqual(transcript[3].speaker_name, "Nexus")
+        self.assertIn("Codex replied", transcript[3].text)
+        self.assertEqual(transcript[4].participant_outcome["outcome"], "complete")
 
-    def test_implicit_team_request_is_routed_locally_without_a_provider_control_turn(self) -> None:
+    def test_directed_relay_peer_failure_preserves_lead_and_durable_outcome(self) -> None:
+        def answer(_config, route, _text, **_kwargs):
+            if route == "codex":
+                raise RuntimeError("peer adapter crashed")
+            return {"text": "Message intended for Codex", "milliseconds": 2, "model": route}
+
+        with mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.relay(
+                self.config, self.board, "agent-1", "Send this to Codex.",
+            )
+
+        self.assertFalse(result["relay_complete"])
+        self.assertEqual(result["status"], "paused_provider")
+        self.assertEqual(result["answer"]["text"], "Message intended for Codex")
+        self.assertEqual(result["answer"]["speaker_id"], "agent-1")
+        self.assertEqual(result["participant_outcome"]["outcome"], "partial")
+        transcript = chat.read_it(self.config, "claude", "Claude")
+        self.assertEqual([one.phase for one in transcript], [
+            "user_prompt", "final_answer", "participant_outcome",
+        ])
+        self.assertEqual(transcript[-1].participant_outcome["answered_count"], 1)
+
+    def test_directed_relay_lead_failure_saves_zero_answer_outcome(self) -> None:
+        with mock.patch.object(
+            chat, "ask_once", side_effect=RuntimeError("lead adapter crashed"),
+        ):
+            result = swarm_work.relay(
+                self.config, self.board, "agent-1", "Send this to Codex.",
+            )
+
+        self.assertFalse(result["relay_complete"])
+        self.assertEqual(result["status"], "paused_provider")
+        self.assertEqual(result["participant_outcome"]["outcome"], "none")
+        self.assertEqual(result["answer"]["speaker_id"], "nexus")
+        transcript = chat.read_it(self.config, "claude", "Claude")
+        self.assertEqual([one.phase for one in transcript], [
+            "user_prompt", "participant_outcome",
+        ])
+
+    def test_vague_multi_perspective_request_stays_direct_without_a_provider_control_turn(self) -> None:
         with mock.patch.object(chat, "ask_once") as ask:
             decision = swarm_work.automatic_mode(
                 self.config, self.board, "agent-1",
                 "Assess the design from implementation and review perspectives.",
             )
-        self.assertEqual(decision["mode"], "collaborate")
+        self.assertEqual(decision["mode"], "chat")
         ask.assert_not_called()
 
     def test_web_chat_greeting_never_receives_an_internal_json_routing_turn(self) -> None:
@@ -760,13 +1185,18 @@ class SwarmWorkTests(unittest.TestCase):
                 }
             return {"text": json.dumps(value), "milliseconds": 1, "model": route}
 
-        with mock.patch.object(chat, "ask_once", side_effect=answer):
+        with mock.patch.object(chat, "ask_once", side_effect=answer), \
+                mock.patch.object(
+                    swarm_work.swarm_runs, "post_provider_mutation",
+                    wraps=swarm_work.swarm_runs.post_provider_mutation,
+                ) as linearized:
             result = swarm_work.work_together(
                 self.config, self.board, "agent-1", "Create a marker file"
             )
         self.assertEqual((self.project / "made-by-team.txt").read_text(), "claude + codex\n")
         self.assertEqual(result["changed"], ["made-by-team.txt"])
         self.assertTrue(result["transaction_id"])
+        self.assertGreaterEqual(linearized.call_count, 1)
         self.assertTrue(result["verified"])
         self.assertEqual(result["verification_status"], "deterministically_verified")
         transcript = chat.read_it(self.config, "claude", "Claude")
@@ -1359,6 +1789,37 @@ os._exit(23)
                 "ChatGPT", swarm_work.PLAN_FORMAT,
             )
 
+    def test_structured_web_standalone_json_label_and_private_marker_are_accepted(self) -> None:
+        payload = json.dumps({
+            "contribution": "plan", "message_to_lead": "go", "needs_files": [],
+        })
+
+        for prefix in ("JSON\n", "json  \r\n", "\ufeffJSON\n", "\ue056\njson\n"):
+            with self.subTest(prefix=ascii(prefix)):
+                decoded = swarm_work._decode(
+                    {"text": prefix + payload}, "Web provider", swarm_work.PLAN_FORMAT,
+                )
+                self.assertEqual(decoded["contribution"], "plan")
+
+    def test_structured_web_json_label_never_extracts_from_arbitrary_prose(self) -> None:
+        payload = json.dumps({
+            "contribution": "plan", "message_to_lead": "go", "needs_files": [],
+        })
+        rejected = (
+            "Here is JSON\n" + payload,
+            "JSON " + payload,
+            "JSON\n" + payload + "\nFinished.",
+            "note\nJSON\n" + payload,
+        )
+
+        for text in rejected:
+            with self.subTest(text=text[:20]), self.assertRaises(
+                swarm_work.StructuredCollaborationError
+            ):
+                swarm_work._decode(
+                    {"text": text}, "Web provider", swarm_work.PLAN_FORMAT,
+                )
+
     def test_fenced_web_file_payload_preserves_source_operators_exactly(self) -> None:
         source = "const width = Math.round(canvas.width * dpr);\nbody{height:100vh}"
         answer = {"text": "```json\n" + json.dumps({
@@ -1393,7 +1854,10 @@ os._exit(23)
         self.assertEqual(decoded["remaining"], [])
         self.assertIn("STRUCTURED FORMAT CORRECTION", asked.call_args.args[2])
         self.assertIs(asked.call_args.kwargs["response_format"], swarm_work.DISCUSSION_FORMAT)
-        ledger.acknowledge.assert_called_once_with("agent-web")
+        # The owning call site acknowledges the shared ledger projection after
+        # the initial provider reply. This helper owns only a format correction
+        # in the same provider turn and must not advance the ledger cursor again.
+        ledger.acknowledge.assert_not_called()
 
     def test_project_plans_are_published_as_each_agent_finishes(self) -> None:
         turns: list[dict] = []
@@ -1460,7 +1924,7 @@ os._exit(23)
         self.assertTrue(result["resume_token"])
         self.assertTrue((self.project / "claimed.txt").is_file())
 
-    def test_realmat_style_false_green_and_missing_runner_dependencies_fail_preflight(self) -> None:
+    def test_complex_project_false_green_and_missing_runner_dependencies_fail_preflight(self) -> None:
         (self.project / "package.json").write_text(json.dumps({
             "scripts": {"test": "node -e \"console.log('No unit tests to run')\" || exit 0"},
             "devDependencies": {},
@@ -2184,8 +2648,8 @@ os._exit(23)
                 self.project, protected_goal, ["parser.py"], required_effect_paths=["notes.md"]
             )
 
-    def test_realmat_contract_has_no_procedural_phantom_artifacts_and_exact_ci_path_is_exact(self) -> None:
-        prompt = (Path(__file__).parent / "fixtures" / "realmat_original_prompt.txt").read_text(
+    def test_complex_contract_has_no_procedural_phantom_artifacts_and_exact_ci_path_is_exact(self) -> None:
+        prompt = (Path(__file__).parent / "fixtures" / "complex_project_contract.txt").read_text(
             encoding="utf-8"
         ).replace("{ROOT}", str(self.project))
         contract = swarm_work._derive_requirement_contract(self.project, prompt)
@@ -2218,20 +2682,20 @@ os._exit(23)
         self.assertFalse(absent["passed"], absent)
 
         deliverables = {
-            "2_Github repos/3_WITH my tests/tests/UNIT/test_unit.py": (
+            "repository variants/qa workspace/tests/UNIT/test_unit.py": (
                 "import unittest\nclass Unit(unittest.TestCase):\n    def test_unit(self): self.assertTrue(True)\n"
             ),
-            "2_Github repos/3_WITH my tests/tests/API/test_api.py": (
+            "repository variants/qa workspace/tests/API/test_api.py": (
                 "import unittest\nclass API(unittest.TestCase):\n    def test_api(self): self.assertTrue(True)\n"
             ),
-            "2_Github repos/3_WITH my tests/tests/E2E/test_e2e.py": (
+            "repository variants/qa workspace/tests/E2E/test_e2e.py": (
                 "import unittest\nclass E2E(unittest.TestCase):\n    def test_e2e(self): self.assertTrue(True)\n"
             ),
-            "3_test traceability/run/workbook.html": "<html>traceability</html>",
-            "4_LangGraph for this project/workflow.py": "graph = 'enforced'\n",
-            "2_Github repos/4_upload to github/run/source.py": "copied = True\n",
-            "2_Github repos/4_upload to github/run/commit-message.md": "Fix: tests\n",
-            "0_Obsidian vault/session.md": "# Durable memory\n",
+            "test traceability/run/workbook.html": "<html>traceability</html>",
+            "LangGraph policy/workflow.py": "graph = 'enforced'\n",
+            "repository variants/release bundle/run/source.py": "copied = True\n",
+            "repository variants/release bundle/run/commit-message.md": "Fix: tests\n",
+            "project memory/session.md": "# Durable memory\n",
             ci_relative: "name: tests\n",
         }
         for relative, content in deliverables.items():
@@ -2349,17 +2813,20 @@ os._exit(23)
         self.assertNotIn("tree truncated", manifest)
 
     def test_explicit_destination_contract_rejects_top_level_lookalike(self) -> None:
-        allowed = ["2_Github repos/4_upload to github/20260827-14"]
+        allowed = ["repository variants/release bundle/20260827-14"]
         with self.assertRaisesRegex(Exception, "outside the explicit write destinations"):
             swarm_work._validated_changes(self.project, [{
-                "path": "4_upload to github/commit-message.md",
+                "path": "release bundle/commit-message.md",
                 "content": "wrong nesting\n", "reason": "upload",
             }], allowed)
         changes = swarm_work._validated_changes(self.project, [{
-            "path": "2_Github repos/4_upload to github/20260827-14/commit-message.md",
+            "path": "repository variants/release bundle/20260827-14/commit-message.md",
             "content": "correct nesting\n", "reason": "upload",
         }], allowed)
-        self.assertEqual(changes[0].path, "2_Github repos/4_upload to github/20260827-14/commit-message.md")
+        self.assertEqual(
+            changes[0].path,
+            "repository variants/release bundle/20260827-14/commit-message.md",
+        )
 
     def test_plan_can_pause_for_user_and_resume_the_same_durable_session(self) -> None:
         resumed = False
@@ -2373,7 +2840,21 @@ os._exit(23)
                 value = {
                     "contribution": "plan", "message_to_lead": "ready" if resumed else "ask",
                     "needs_files": [], "ready_to_execute": resumed, "remaining": [],
-                    "questions": [] if resumed else ["Which compatibility target is required?"],
+                    "questions": [] if resumed else [{
+                        "id": "compatibility-target",
+                        "prompt": "Which compatibility target is required?",
+                        "options": [{
+                            "label": "Windows 11",
+                            "description": "Use the current supported desktop target.",
+                            "recommended": True,
+                        }, {
+                            "label": "Windows 10",
+                            "description": "Retain compatibility with the older target.",
+                            "recommended": False,
+                        }],
+                        "multiple": False,
+                        "allow_other": True,
+                    }],
                 }
             elif response_format is swarm_work.WORK_VERIFICATION_FORMAT:
                 value = {"goal_complete": True, "feedback": "Verified.", "remaining": []}
@@ -2404,6 +2885,8 @@ os._exit(23)
             )
 
         self.assertEqual(paused["status"], "paused_for_user")
+        self.assertEqual(paused["questions"][0]["id"], "compatibility-target")
+        self.assertTrue(paused["questions"][0]["options"][0]["recommended"])
         self.assertFalse((self.project / "output" / "target.txt").exists() and not done["goal_complete"])
         self.assertEqual(done["collaboration_ledger"]["session_id"], paused["resume_token"])
         self.assertTrue(done["goal_complete"])
@@ -4062,21 +4545,21 @@ os._exit(23)
 
     def test_loop15_root_and_exact_capabilities_compose_without_broadening(self) -> None:
         roots = [
-            "2_Github repos/3_WITH my tests",
-            "2_Github repos/4_upload to github",
-            "3_test traceability",
-            "4_LangGraph for this project",
-            "0_Obsidian vault",
+            "repository variants/qa workspace",
+            "repository variants/release bundle",
+            "test traceability",
+            "LangGraph policy",
+            "project memory",
         ]
         raw = [
             {"path": root + "/loop15-proof.txt", "content": root, "reason": "deliverable"}
             for root in roots
         ] + [{
-            "path": "2_Github repos/3_WITH my tests/TEST-ci.yml",
+            "path": "repository variants/qa workspace/TEST-ci.yml",
             "content": "name: tests\n", "reason": "exact artifact",
         }]
         exact = {
-            "2_github repos/3_with my tests/test-ci.yml": {"CREATE_OR_MODIFY"},
+            "repository variants/qa workspace/test-ci.yml": {"CREATE_OR_MODIFY"},
         }
         accepted = swarm_work._validated_changes(
             self.project, raw, allowed_write_roots=roots,
@@ -4091,11 +4574,11 @@ os._exit(23)
         with self.assertRaisesRegex(HarnessError, "not authorized"):
             swarm_work._validated_changes(
                 self.project, [{
-                    "path": "2_Github repos/3_WITH my tests/TEST-ci.yml",
+                    "path": "repository variants/qa workspace/TEST-ci.yml",
                     "content": "name: changed\n",
                 }], allowed_write_roots=roots,
                 exact_write_grants={
-                    "2_github repos/3_with my tests/test-ci.yml": {"CREATE"},
+                    "repository variants/qa workspace/test-ci.yml": {"CREATE"},
                 },
             )
         with self.assertRaisesRegex(HarnessError, "not authorized"):
@@ -4111,8 +4594,8 @@ os._exit(23)
                 allowed_write_roots=roots, exact_write_grants=exact,
             )
 
-    def test_loop15_original_realmat_prompt_authorizes_every_intended_deliverable(self) -> None:
-        prompt = (Path(__file__).parent / "fixtures" / "realmat_original_prompt.txt").read_text(
+    def test_loop15_complex_prompt_authorizes_every_intended_deliverable(self) -> None:
+        prompt = (Path(__file__).parent / "fixtures" / "complex_project_contract.txt").read_text(
             encoding="utf-8"
         ).replace("{ROOT}", str(self.project))
         authority = swarm_work._path_authority_from_goal(self.project, prompt)
@@ -4122,14 +4605,14 @@ os._exit(23)
             for path, capabilities in spec["write_policy"]["exact_capabilities"].items()
         }
         deliverables = [
-            "2_Github repos/3_WITH my tests/tests/UNIT/test_unit.py",
-            "2_Github repos/3_WITH my tests/tests/API/test_api.py",
-            "2_Github repos/3_WITH my tests/tests/E2E/test_e2e.py",
-            "2_Github repos/3_WITH my tests/TEST-ci.yml",
-            "2_Github repos/4_upload to github/20260828-08/commit-message.md",
-            "3_test traceability/20260828-08/index.html",
-            "4_LangGraph for this project/workflow.py",
-            "0_Obsidian vault/session.md",
+            "repository variants/qa workspace/tests/UNIT/test_unit.py",
+            "repository variants/qa workspace/tests/API/test_api.py",
+            "repository variants/qa workspace/tests/E2E/test_e2e.py",
+            "repository variants/qa workspace/TEST-ci.yml",
+            "repository variants/release bundle/20260828-08/commit-message.md",
+            "test traceability/20260828-08/index.html",
+            "LangGraph policy/workflow.py",
+            "project memory/session.md",
         ]
         accepted = swarm_work._validated_changes(
             self.project,
@@ -4425,7 +4908,7 @@ os._exit(23)
         self.assertEqual("paused_for_user", paused["status"])
         self.assertFalse(paused["goal_complete"])
         self.assertEqual([], paused["changed"])
-        self.assertIn("parse", paused["questions"][0])
+        self.assertIn("parse", paused["questions"][0]["prompt"])
         ratified = swarm_work._acceptance_target_decision(
             self.project, goal, spec, "Use parse",
         )

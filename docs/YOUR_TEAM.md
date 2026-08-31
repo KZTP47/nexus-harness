@@ -10,8 +10,6 @@ whose work.
 
 That is this tab.
 
-![Your team](images/your-team.png)
-
 ---
 
 ## On this machine

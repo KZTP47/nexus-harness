@@ -34,7 +34,7 @@ class VerificationEvidenceTests(unittest.TestCase):
     def test_legacy_application_and_quick_start_path_use_the_same_positive_analyzer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data = copy.deepcopy(DEFAULT_CONFIG)
-            command = ["realmat-check"]
+            command = ["synthetic-project-check"]
             data["project"]["test_commands"] = [command]
             app = HarnessApplication.__new__(HarnessApplication)
             app.config = LoadedConfig(data, Path(temporary), [], {})
@@ -49,7 +49,7 @@ class VerificationEvidenceTests(unittest.TestCase):
         self.assertFalse(found["passed"])
         self.assertTrue(found["no_test_evidence"])
 
-    def test_realmat_no_test_phrase_arbitrary_ok_and_logs_never_pass(self) -> None:
+    def test_no_test_phrase_arbitrary_ok_and_logs_never_pass(self) -> None:
         for command, output in (
             (["company-test"], "No unit tests to run"),
             (["go", "test", "./..."], "ok"),

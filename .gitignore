@@ -31,10 +31,12 @@ AGENTS.md
 .harness/qa/*report*.json
 .harness/transaction.lock
 
-# The private project memory lives outside this repository. These names are a
-# second boundary in case anybody accidentally copies the vault under the root.
-Persistent memory for Nexus harness project/
-Nexus Harness Memory/
+# Private project memory belongs outside this repository. These generic names
+# are a second boundary in case somebody accidentally copies a vault under the
+# source root.
+.nexus-memory/
+.nexus-vault/
+private-project-memory/
 **/.nexus-project-memory.json
 
 # Dependencies and build output
@@ -57,6 +59,30 @@ dist/
 __pycache__/
 *.py[cod]
 
+# Developer-local environment, package-manager, editor, and assistant state.
+# Examples remain safe to share; populated files and machine launch profiles do
+# not.  Keep these rules here rather than relying on one developer's global Git
+# excludes, so a fresh contributor gets the same protection automatically.
+.env
+.env.*
+!.env.example
+.npmrc
+.pypirc
+.claude/
+.codex/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Private signing/authentication material is supplied by the release secret
+# store.  Public trust metadata has an explicit non-secret .txt file under
+# release/ and remains tracked.
+*.key
+*.pem
+*.p12
+*.pfx
+
 # Local scratch
 %SystemDrive%/
 .codex-remote-attachments/
@@ -69,6 +95,7 @@ __pycache__/
 benchmark-logs/
 benchmark-archive/
 reports/
+harness-setup.json
 
 # A killed counterexample check can leave its isolated project copy behind.
 # It is recovery/scratch data and can contain source from the current checkout.

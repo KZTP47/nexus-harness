@@ -996,7 +996,7 @@ def validate_config(data: dict[str, Any]) -> None:
             raise HarnessError(f"{dotted}.command must not be empty for a local provider")
         auth_mode = _require_string(profile.get("auth_mode", ""), f"{dotted}.auth_mode")
         reasoning_effort = profile.get("reasoning_effort")
-        if reasoning_effort is not None and reasoning_effort not in ("none", "low", "medium", "high", "xhigh", "max"):
+        if reasoning_effort is not None and reasoning_effort not in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
             raise HarnessError(f"{dotted}.reasoning_effort is invalid")
         if name == "codex-cli":
             if not command:
@@ -1057,7 +1057,7 @@ def validate_config(data: dict[str, Any]) -> None:
         if agent.get("max_output_tokens") is not None:
             _require_int(agent["max_output_tokens"], f"{dotted}.max_output_tokens", 1, RESOURCE_LIMIT_MAXIMA["provider.max_output_tokens"])
         effort = agent.get("reasoning_effort")
-        if effort is not None and effort not in ("none", "low", "medium", "high", "xhigh", "max"):
+        if effort is not None and effort not in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
             raise HarnessError(f"{dotted}.reasoning_effort is invalid")
 
     pricing = data["pricing"]

@@ -110,6 +110,35 @@ class PanelTestCase(unittest.TestCase):
         except urllib.error.HTTPError as exc:
             return exc.code, json.loads(exc.read().decode("utf-8"))
 
+    def test_orphaned_web_completion_is_not_claimed_as_an_accepted_receipt(self) -> None:
+        status, answer = self.ask("/api/web-chats/complete", {
+            "request_id": "a" * 32,
+            "answer": "No matching pending request exists",
+        })
+        self.assertEqual(status, 200)
+        self.assertFalse(answer["accepted"])
+        self.assertEqual(answer["receipt_state"], "expired_or_unknown")
+
+    def test_web_completion_requires_an_exact_true_receipt(self) -> None:
+        # Compatibility fakes must acknowledge the exact request explicitly.
+        # None used to be interpreted as success and could make Electron stop
+        # retrying a completion that Python had never durably reconciled.
+        for receipt, accepted in ((True, True), (False, False), (None, False), (1, False)):
+            with self.subTest(receipt=receipt):
+                with mock.patch.object(
+                    self.panel.web_chats, "complete", return_value=receipt,
+                ):
+                    status, answer = self.ask("/api/web-chats/complete", {
+                        "request_id": "b" * 32,
+                        "answer": "A compatibility relay response",
+                    })
+                self.assertEqual(status, 200)
+                self.assertIs(answer["accepted"], accepted)
+                self.assertEqual(
+                    answer["receipt_state"],
+                    "recorded" if accepted else "expired_or_unknown",
+                )
+
 
 class OpeningTheTab(PanelTestCase):
     def test_it_says_who_can_be_talked_to(self) -> None:
@@ -381,15 +410,29 @@ class WhenSomethingWillNotAnswer(PanelTestCase):
 
 
 class TheLocksAreBounded(unittest.TestCase):
-    def test_a_stream_of_made_up_names_cannot_fill_the_machine(self) -> None:
-        """The lock for a conversation is kept. Kept for ever is a leak."""
+    def test_idle_conversation_locks_are_evicted_without_a_shared_fallback(self) -> None:
+        """History is not a leak or a reason for unrelated chats to serialize."""
 
         before = dict(chat._locks)
         try:
             chat._locks.clear()
-            for number in range(chat.MOST_LOCKS + 50):
-                chat._the_lock_for(f"made-up-{number}")
-            self.assertLessEqual(len(chat._locks), chat.MOST_LOCKS + 1)
+            for number in range(150):
+                with chat._the_lock_for(f"made-up-{number}"):
+                    self.assertEqual(len(chat._locks), 1)
+            self.assertEqual(chat._locks, {})
+
+            scopes = [chat._the_lock_for(f"simultaneous-{number}") for number in range(80)]
+            locks = [scope.__enter__() for scope in scopes]
+            self.assertEqual(len({id(one) for one in locks}), 80)
+            self.assertEqual(len(chat._locks), 80)
+            for scope in reversed(scopes):
+                scope.__exit__(None, None, None)
+            self.assertEqual(chat._locks, {})
+
+            with self.assertRaisesRegex(RuntimeError, "kept visible"):
+                with chat._the_lock_for("failing-chat"):
+                    raise RuntimeError("kept visible")
+            self.assertEqual(chat._locks, {})
         finally:
             chat._locks.clear()
             chat._locks.update(before)

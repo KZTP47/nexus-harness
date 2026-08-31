@@ -77,14 +77,52 @@ class ServerRequestTests(unittest.TestCase):
 
     def test_claude_repair_endpoint_opens_only_the_safe_provider_flow(self) -> None:
         opened = {"opened": True, "kind": "claude-cli", "note": "repair opened", "process": 42}
+        command = ["configured-claude", "--profile", "work"]
+        self.server.config.data["provider"]["name"] = "claude-cli"
+        self.server.config.data["provider"]["command"] = command
+        plan = {
+            "repair": {
+                "diagnosis_fingerprint": "exact-diagnosis",
+                "actions": [{
+                    "id": "repair-claude", "route": "default",
+                    "diagnosis_fingerprint": "exact-diagnosis",
+                }],
+            },
+        }
         with mock.patch(
                 "our_harness.providers.subscription_cli.start_claude_repair",
                 return_value=opened,
-        ) as repair:
-            status, body = self.call("POST", "/api/team/repair-claude", "{}")
+        ) as repair, mock.patch(
+            "our_harness.provider_repair.repair_plan", return_value=plan,
+        ):
+            status, body = self.call("POST", "/api/team/repair-claude", json.dumps({
+                "route": "default", "diagnosis_fingerprint": "exact-diagnosis",
+            }))
         self.assertEqual(status, 200)
-        self.assertEqual(body, opened)
-        repair.assert_called_once_with()
+        self.assertEqual(body, {**opened, "route": "default"})
+        repair.assert_called_once_with(command=command)
+
+    def test_claude_repair_endpoint_rejects_a_stale_diagnosis(self) -> None:
+        plan = {
+            "repair": {
+                "diagnosis_fingerprint": "current",
+                "actions": [{
+                    "id": "repair-claude", "route": "default",
+                    "diagnosis_fingerprint": "current",
+                }],
+            },
+        }
+        with mock.patch(
+            "our_harness.provider_repair.repair_plan", return_value=plan,
+        ), mock.patch(
+            "our_harness.providers.subscription_cli.start_claude_repair",
+        ) as repair:
+            status, body = self.call("POST", "/api/team/repair-claude", json.dumps({
+                "route": "default", "diagnosis_fingerprint": "older",
+            }))
+        self.assertEqual(status, 400)
+        self.assertIn("diagnosis changed", body["error"])
+        repair.assert_not_called()
 
     def test_json_nested_far_too_deep_is_refused_politely(self) -> None:
         deep = "[" * 60_000 + "]" * 60_000

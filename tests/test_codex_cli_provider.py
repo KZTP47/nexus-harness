@@ -43,11 +43,27 @@ record = option("--record")
 if "--version" in args:
     print("codex-cli 9.9.9")
     raise SystemExit(0)
+if "exec" in args and "--help" in args:
+    print("Usage: codex exec [--ignore-rules]" + (
+        "" if mode == "config-error-no-isolation" else " [--ignore-user-config]"
+    ))
+    raise SystemExit(0)
 if "login" in args and "status" in args:
+    if mode in {"config-error", "config-error-no-isolation", "config-error-auth-failure"}:
+        print("Error loading configuration: unknown variant ultra", file=sys.stderr)
+        raise SystemExit(1)
+    if mode == "signed-out":
+        print("Not logged in", file=sys.stderr)
+        raise SystemExit(1)
     print("Logged in using ChatGPT")
     raise SystemExit(0)
 if "debug" in args and "models" in args and "--bundled" in args:
-    print(json.dumps({"models": [{"slug": "fixture-codex", "display_name": "Fixture Codex"}]}))
+    print(json.dumps({"models": [{
+        "slug": "fixture-codex", "display_name": "Fixture Codex",
+        "supported_reasoning_levels": [
+            {"effort": one} for one in ("minimal", "low", "medium", "high", "xhigh", "ultra")
+        ],
+    }]}))
     raise SystemExit(0)
 if "exec" not in args:
     raise SystemExit(8)
@@ -71,6 +87,9 @@ if mode == "timeout":
     time.sleep(5)
 if mode == "nonzero":
     print("fixture failure", file=sys.stderr)
+    raise SystemExit(17)
+if mode == "config-error-auth-failure":
+    print("ChatGPT authentication required", file=sys.stderr)
     raise SystemExit(17)
 if mode == "stdout-oversize":
     print("x" * 5000)
@@ -148,7 +167,10 @@ class CodexCLIProviderTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 3)
         self.assertIsInstance(errors[0], cancellation.ChatCancelled)
 
-    def make_provider(self, root: Path, mode: str = "ok", *, output_limit: int = 250_000):
+    def make_provider(
+        self, root: Path, mode: str = "ok", *, output_limit: int = 250_000,
+        reasoning_effort: str | None = None,
+    ):
         script = root / "fake_codex.py"
         script.write_text(FAKE_CODEX, encoding="utf-8")
         record = root / "record.json"
@@ -159,8 +181,9 @@ class CodexCLIProviderTests(unittest.TestCase):
                     "subscription": {
                         "kind": "codex-cli",
                         "model": "fixture-codex",
-                        "command": [sys.executable, str(script), "--fake-mode", mode, "--record", str(record)],
-                        "auth_mode": "chatgpt",
+                    "command": [sys.executable, str(script), "--fake-mode", mode, "--record", str(record)],
+                    "auth_mode": "chatgpt",
+                    **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
                     }
                 },
                 "execution": {"max_output_bytes": output_limit},
@@ -229,6 +252,95 @@ class CodexCLIProviderTests(unittest.TestCase):
             argv = json.loads(record.read_text(encoding="utf-8"))["argv"]
         self.assertIn('model_reasoning_effort="high"', argv)
         self.assertLess(argv.index('model_reasoning_effort="high"'), argv.index("exec"))
+
+    def test_reasoning_effort_is_checked_against_the_selected_model_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _config, provider, record = self.make_provider(Path(temporary))
+            request = ProviderRequest(**{**self.request().__dict__, "reasoning_effort": "max"})
+            with self.assertRaisesRegex(
+                HarnessError, "does not support reasoning effort max.*supported efforts"
+            ):
+                provider.complete(request)
+            self.assertFalse(record.exists())
+
+    def test_new_reasoning_effort_names_are_accepted_then_model_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config, provider, record = self.make_provider(root)
+            request = ProviderRequest(**{**self.request().__dict__, "reasoning_effort": "ultra"})
+            provider.complete(request)
+            argv = json.loads(record.read_text(encoding="utf-8"))["argv"]
+            self.assertIn('model_reasoning_effort="ultra"', argv)
+            self.assertEqual(
+                config.data["providers"]["subscription"].get("reasoning_effort"), None
+            )
+
+    def test_profile_and_agent_accept_current_effort_names_and_schema_matches(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        schema = json.loads((repository / "harness.schema.json").read_text(encoding="utf-8"))
+        profile_enum = set(
+            schema["$defs"]["providerProfile"]["properties"]["reasoning_effort"]["enum"]
+        )
+        agent_enum = set(
+            schema["$defs"]["agentSpec"]["properties"]["reasoning_effort"]["enum"]
+        )
+        self.assertEqual(profile_enum, set(codex_cli.CODEX_REASONING_EFFORTS))
+        self.assertEqual(agent_enum, set(codex_cli.CODEX_REASONING_EFFORTS))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for effort in ("minimal", "ultra"):
+                config = load_isolated_config(root, {
+                    "providers": {"codex": {
+                        "kind": "codex-cli", "model": "fixture-codex",
+                        "command": ["codex"], "auth_mode": "chatgpt",
+                        "reasoning_effort": effort,
+                    }},
+                    "agents": {"worker": {"provider_ref": "codex", "reasoning_effort": effort}},
+                })
+                self.assertEqual(config.get("providers.codex.reasoning_effort"), effort)
+                self.assertEqual(config.get("agents.worker.reasoning_effort"), effort)
+            with self.assertRaisesRegex(HarnessError, "reasoning_effort is invalid"):
+                load_isolated_config(root, {
+                    "providers": {"codex": {
+                        "kind": "codex-cli", "model": "fixture-codex",
+                        "command": ["codex"], "auth_mode": "chatgpt",
+                        "reasoning_effort": "impossible",
+                    }},
+                })
+
+    def test_config_broken_login_probe_defers_to_isolated_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, provider, _record = self.make_provider(Path(temporary), "config-error")
+            response = provider.complete(self.request())
+            doctor = run_doctor(config)
+            check = next(one for one in doctor["checks"] if one["name"] == "provider:subscription")
+        self.assertEqual(json.loads(response.text), {"answer": "ok"})
+        self.assertEqual(check["level"], "warn")
+        self.assertIn("first isolated request", check["message"])
+
+    def test_config_broken_login_probe_fails_closed_without_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _config, provider, record = self.make_provider(
+                Path(temporary), "config-error-no-isolation"
+            )
+            with self.assertRaisesRegex(HarnessError, "does not support exec --ignore-user-config"):
+                provider.complete(self.request())
+            self.assertFalse(record.exists())
+
+    def test_an_ordinary_signed_out_status_is_not_bypassed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _config, provider, record = self.make_provider(Path(temporary), "signed-out")
+            with self.assertRaisesRegex(HarnessError, "login status failed.*Not logged in"):
+                provider.complete(self.request())
+            self.assertFalse(record.exists())
+
+    def test_deferred_authentication_failure_from_exec_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            _config, provider, _record = self.make_provider(
+                Path(temporary), "config-error-auth-failure"
+            )
+            with self.assertRaisesRegex(HarnessError, "exited 17.*authentication required"):
+                provider.complete(self.request())
 
     def test_bundled_catalog_rejects_an_unavailable_model_before_exec(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -326,6 +438,16 @@ class CodexCLIProviderTests(unittest.TestCase):
             check = next(item for item in result["checks"] if item["name"] == "provider:subscription")
             self.assertEqual(check["level"], "ok")
             self.assertIn("signed in with ChatGPT", check["message"])
+
+    def test_doctor_rejects_effort_not_supported_by_the_selected_catalog_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config, _provider, _record = self.make_provider(
+                Path(temporary), reasoning_effort="max",
+            )
+            result = run_doctor(config)
+            check = next(item for item in result["checks"] if item["name"] == "provider:subscription")
+        self.assertEqual(check["level"], "fail")
+        self.assertIn("does not support reasoning effort max", check["message"])
 
 
 class WhatATruncatedAnswerReadsAsTests(unittest.TestCase):

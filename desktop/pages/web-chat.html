@@ -40,16 +40,28 @@
       document.getElementById("external").hidden = false;
       document.getElementById("said").textContent = "A secure Nexus browser window is handling this provider.";
     }
-    document.getElementById("new").onclick = () => window.nexusWebChatWindow.startNew();
+    const explain = (error) => String(error?.message || error || "")
+      .replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, "");
+    document.getElementById("new").onclick = async () => {
+      const said = document.getElementById("said");
+      try {
+        await window.nexusWebChatWindow.startNew();
+        said.textContent = "A new provider chat is open. Send or select a conversation, then press Use this chat in Nexus.";
+        said.title = "";
+      } catch (error) {
+        const message = explain(error);
+        said.textContent = message;
+        said.title = message;
+      }
+    };
     document.getElementById("use").onclick = async () => {
       const said = document.getElementById("said");
       try {
         const chat = await window.nexusWebChatWindow.useCurrent();
-        said.textContent = `${chat.title} was sent to the Nexus board. You can close this window or keep using it here.`;
+        said.textContent = `${chat.title} was saved as a Nexus web chat. Return to the board to confirm which agent uses it; you can keep this window open.`;
         said.title = "";
       } catch (error) {
-        const raw = error.message || String(error);
-        const message = raw.replace(/^Error invoking remote method '[^']+':\s*Error:\s*/i, "");
+        const message = explain(error);
         said.textContent = message;
         said.title = message;
       }

@@ -38,7 +38,7 @@ window, not as an installed Electron release.
 ## What source development needs first
 
 - Python 3.11 or newer, with the harness and test runner installed for it (`python -m pip install ".[test]"`)
-- Node.js 18 or newer, to build or run the window
+- Node.js 22.12 or newer, to build or run the window
 
 ## Run it from source
 
@@ -60,10 +60,11 @@ npm run build
 npm run smoke:packaged
 ```
 
-The first command produces an NSIS installer on Windows, a DMG on macOS, and an
-AppImage on Linux, under `desktop/build-output`. The second opens the packed
-archive that installer ships and confirms every file the app loads is really
-inside it.
+The supported release build currently produces an NSIS installer on Windows
+under `desktop/build-output`. The second command opens the packed archive that
+installer ships and confirms every file the app loads is really inside it.
+The Python CLI remains cross-platform; macOS and Linux desktop packages are not
+part of this release contract yet.
 
 That second step matters. The installer ships only the files named in
 `package.json`, and a file the app loads but nobody listed is simply missing at

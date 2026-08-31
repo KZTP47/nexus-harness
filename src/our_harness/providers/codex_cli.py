@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,18 @@ from .base import Provider
 
 
 _AUTH_MODE = "chatgpt"
+CODEX_AUTH_DEFERRED = "isolated-exec-authentication-deferred"
+CODEX_REASONING_EFFORTS = frozenset({
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+})
+_CONFIG_LOAD_MARKERS = (
+    "error loading configuration",
+    "failed to load configuration",
+    "could not load configuration",
+    "error loading config.toml",
+    "failed to load config.toml",
+    "could not load config.toml",
+)
 _FALLBACK_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -302,12 +315,79 @@ def _bundled_model_catalog(
     return result.stdout
 
 
+def _validate_model_reasoning_effort(catalog: str, model: str, effort: str) -> None:
+    """Validate an explicit effort against this exact binary/model catalog."""
+    if not effort:
+        return
+    if effort not in CODEX_REASONING_EFFORTS:
+        raise HarnessError("Codex CLI reasoning effort is invalid")
+    try:
+        value = _load_json(catalog)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HarnessError("Codex CLI bundled model catalog is not valid JSON") from exc
+    models = value.get("models") if isinstance(value, dict) else None
+    selected = next((
+        one for one in (models or []) if isinstance(one, dict)
+        and str(one.get("slug") or "") == model
+    ), None)
+    if selected is None:
+        raise HarnessError(f"Codex CLI bundled model catalog does not contain configured model: {model}")
+    levels = selected.get("supported_reasoning_levels")
+    supported = {
+        str(one.get("effort") or "")
+        for one in levels if isinstance(one, dict) and str(one.get("effort") or "")
+    } if isinstance(levels, list) else set()
+    if not supported:
+        raise HarnessError(
+            f"Codex CLI bundled model catalog does not report reasoning levels for {model}"
+        )
+    if effort not in supported:
+        raise HarnessError(
+            f"Codex CLI model {model} does not support reasoning effort {effort}; "
+            f"supported efforts: {', '.join(sorted(supported))}"
+        )
+
+
+def _isolated_exec_help(
+    command: list[str], *, cwd: Path, timeout_seconds: float, max_output_bytes: int,
+) -> str:
+    """Prove that the configured binary supports the isolation flag we use."""
+    result = _run_bounded(
+        [*command, "exec", "--help"], cwd=cwd, stdin_text=None,
+        timeout_seconds=timeout_seconds, max_output_bytes=max_output_bytes,
+    )
+    if result.timed_out:
+        raise HarnessError("Codex CLI exec --help timed out")
+    if result.output_truncated:
+        raise HarnessError("Codex CLI exec --help output exceeded its byte limit")
+    if result.exit_code != 0:
+        detail = bounded_redacted_text(
+            CredentialRedactor(), (result.stderr or result.stdout).strip(), 2_000
+        )
+        raise HarnessError(f"Codex CLI exec --help failed ({result.exit_code}): {detail}")
+    help_text = f"{result.stdout}\n{result.stderr}"
+    if "--ignore-user-config" not in help_text:
+        raise HarnessError(
+            "The configured Codex CLI does not support exec --ignore-user-config, "
+            "which Nexus requires to isolate agent turns from incompatible user settings"
+        )
+    return help_text
+
+
+def codex_config_load_error(value: object) -> bool:
+    """Recognize only Codex failures caused by loading its user config."""
+
+    text = str(value or "").casefold()
+    return any(marker in text for marker in _CONFIG_LOAD_MARKERS)
+
+
 def codex_cli_preflight(
     command: list[str],
     *,
     auth_mode: str,
     timeout_seconds: float,
     model: str = "",
+    reasoning_effort: str = "",
     max_output_bytes: int = 32_000,
 ) -> tuple[str, str]:
     """Execute the binary and auth checks. Path lookup alone is not sufficient."""
@@ -331,6 +411,10 @@ def codex_cli_preflight(
                 CredentialRedactor(), (version.stderr or version.stdout).strip(), 2_000
             )
             raise HarnessError(f"Codex CLI --version failed ({version.exit_code}): {detail}")
+        _isolated_exec_help(
+            command, cwd=cwd, timeout_seconds=_remaining(deadline_at),
+            max_output_bytes=max_output_bytes,
+        )
         login = _run_bounded(
             [*command, "login", "status"], cwd=cwd, stdin_text=None,
             timeout_seconds=_remaining(deadline_at), max_output_bytes=max_output_bytes,
@@ -339,21 +423,30 @@ def codex_cli_preflight(
             raise HarnessError("Codex CLI login status timed out")
         if login.output_truncated:
             raise HarnessError("Codex CLI login status output exceeded its byte limit")
-        if login.exit_code != 0:
+        status = f"{login.stdout}\n{login.stderr}".strip()
+        if login.exit_code != 0 and codex_config_load_error(status):
+            # `login status` in older Codex builds loads the user's whole
+            # config before it can inspect authentication.  A newer setting
+            # can therefore break this probe even though the same binary can
+            # make an authenticated, isolated request.  The immediate
+            # `exec --ignore-user-config` call is authoritative for auth.
+            status = CODEX_AUTH_DEFERRED
+        elif login.exit_code != 0:
             detail = bounded_redacted_text(
                 CredentialRedactor(), (login.stderr or login.stdout).strip(), 2_000
             )
             raise HarnessError(f"Codex CLI login status failed ({login.exit_code}): {detail}")
-        status = f"{login.stdout}\n{login.stderr}".strip()
-        if auth_mode == _AUTH_MODE and "chatgpt" not in status.casefold():
+        if status != CODEX_AUTH_DEFERRED and auth_mode == _AUTH_MODE \
+                and "chatgpt" not in status.casefold():
             raise HarnessError("Codex CLI is not signed in with ChatGPT")
-        _bundled_model_catalog(
+        catalog = _bundled_model_catalog(
             command,
             cwd=cwd,
             model=model,
             timeout_seconds=_remaining(deadline_at),
             max_output_bytes=1_000_000,
         )
+        _validate_model_reasoning_effort(catalog, model, reasoning_effort)
         return version.stdout.strip() or version.stderr.strip(), status
 
 
@@ -449,6 +542,30 @@ class CodexCLIProvider(Provider):
 
     structured_retry_is_safe = True
 
+    def _effective_dispatch_command(self) -> list[str] | None:
+        return self._command()
+
+    def _effective_dispatch_version(
+        self, command: list[str],
+    ) -> dict[str, Any]:
+        result = _run_bounded(
+            [*command, "--version"], cwd=Path.cwd(), stdin_text=None,
+            timeout_seconds=3.0, max_output_bytes=8_000,
+        )
+        material = json.dumps({
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "output_truncated": result.output_truncated,
+            "stdout": self._redactor.text(result.stdout),
+            "stderr": self._redactor.text(result.stderr),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            "state": "timed-out" if result.timed_out else "observed",
+            "version_output_sha256": hashlib.sha256(
+                material.encode("utf-8")
+            ).hexdigest(),
+        }
+
     def _command(self) -> list[str]:
         command = self.settings.get("command", [])
         if not isinstance(command, list) or not command or any(not isinstance(part, str) or not part for part in command):
@@ -486,6 +603,7 @@ class CodexCLIProvider(Provider):
                 auth_mode=auth_mode,
                 timeout_seconds=_remaining(deadline_at),
                 model=request.model,
+                reasoning_effort=str(request.reasoning_effort or "").strip(),
                 max_output_bytes=min(32_000, output_limit),
             )
             self._preflight_complete = True
@@ -511,8 +629,7 @@ class CodexCLIProvider(Provider):
                 with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
                     stream.write(payload)
             effort = str(request.reasoning_effort or "").strip()
-            if effort and effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
-                raise HarnessError("Codex CLI reasoning effort is invalid")
+            _validate_model_reasoning_effort(catalog, request.model, effort)
             argv = [
                 *command,
                 "-c", "model_catalog_json=" + json.dumps(str(catalog_path)),

@@ -39,8 +39,6 @@ instead of two.
 If you would rather not do any of the steps below by hand, the harness can do
 them for you. Run `harness ui`, stay on the Start view, and work down:
 
-![Setting up the assistants you already pay for](images/seats.png)
-
 | Button | What it does | The steps it replaces |
 | --- | --- | --- |
 | Find the assistants | Looks for each tool, asks its version, says which are ready | Before you start |

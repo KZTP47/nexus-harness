@@ -3,9 +3,11 @@ from __future__ import annotations
 import codecs
 import copy
 import http.client
+import hashlib
 import json
 import os
 import queue
+import shutil
 import socket
 import threading
 import time
@@ -13,6 +15,7 @@ import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from .. import cancellation
@@ -34,6 +37,36 @@ from ..redaction import CredentialRedactor, bounded_redacted_text
 # public answer contract permits eight million characters; a JSON encoder can
 # represent each non-BMP character as a twelve-byte surrogate pair.
 MAX_PROVIDER_RESPONSE_BYTES = 100_000_000
+EFFECTIVE_DISPATCH_FINGERPRINT_VERSION = 1
+_EFFECTIVE_CONFIG_FIELDS = (
+    "name", "model", "endpoint", "api_mode", "api_key_env", "command",
+    "arguments", "auth_mode", "google_project", "microsoft_app",
+    "microsoft_organisation", "time_zone", "reasoning_effort",
+    "max_output_tokens", "temperature", "prompt_cache_retention",
+)
+_dispatch_version_lock = threading.Lock()
+_dispatch_version_cache: dict[tuple[object, ...], dict[str, Any]] = {}
+
+
+def effective_dispatch_fingerprint(
+    contract: str, material: dict[str, Any],
+) -> dict[str, Any]:
+    """Return only a versioned digest for non-secret dispatch material."""
+
+    canonical = json.dumps(
+        {
+            "effective_dispatch_version": EFFECTIVE_DISPATCH_FINGERPRINT_VERSION,
+            "effective_dispatch_contract": str(contract),
+            "material": material,
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=lambda value: f"<{type(value).__name__}>",
+    ).encode("utf-8")
+    return {
+        "effective_dispatch_version": EFFECTIVE_DISPATCH_FINGERPRINT_VERSION,
+        "effective_dispatch_fingerprint_sha256": hashlib.sha256(canonical).hexdigest(),
+        "effective_dispatch_contract": str(contract),
+    }
 
 
 class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -72,6 +105,128 @@ class Provider(ABC):
         # stream, and embedding traffic on the reviewed endpoint.
         self._http_opener = urllib.request.build_opener(_RejectRedirectHandler())
         self._redactor = CredentialRedactor(config)
+
+    def _effective_dispatch_contract(self) -> str:
+        kind = str(self.settings.get("name") or self.__class__.__name__).strip()
+        return f"{kind}/effective-dispatch/v1"
+
+    def _effective_dispatch_command(self) -> list[str] | None:
+        """The command the adapter will execute, or None for network adapters."""
+
+        return None
+
+    def _effective_dispatch_version(
+        self, command: list[str],
+    ) -> dict[str, Any]:
+        """A bounded, non-secret version observation for a resolved command."""
+
+        return {"state": "not-probed-by-adapter"}
+
+    def _effective_dispatch_config(self) -> dict[str, Any]:
+        """Configuration which materially selects this adapter's dispatch."""
+
+        return {
+            key: copy.deepcopy(self.settings.get(key))
+            for key in _EFFECTIVE_CONFIG_FIELDS if key in self.settings
+        }
+
+    def effective_dispatch_fingerprint(self) -> dict[str, Any]:
+        """Fingerprint the executable and configuration this adapter will use.
+
+        No command path, version output, provider setting, or environment value
+        leaves this boundary. The persisted contract contains only a digest and
+        version labels. Executable lookup is observational: it never installs,
+        creates, repairs, signs in, or sends a provider request.
+        """
+
+        contract = self._effective_dispatch_contract()
+        executable: dict[str, Any]
+        try:
+            command = self._effective_dispatch_command()
+        except Exception as exc:  # Adapter resolution is itself dispatch state.
+            command = None
+            executable = {
+                "state": "unavailable",
+                "error_class": type(exc).__name__,
+            }
+        else:
+            if command is None:
+                executable = {"state": "not-applicable"}
+            elif (
+                not isinstance(command, list) or not command
+                or any(not isinstance(part, str) or not part for part in command)
+            ):
+                executable = {"state": "invalid-command"}
+            else:
+                requested = command[0]
+                found = shutil.which(requested)
+                if not found:
+                    candidate = Path(requested)
+                    found = str(candidate) if candidate.is_file() else ""
+                if not found:
+                    executable = {
+                        "state": "unavailable",
+                        "requested_sha256": hashlib.sha256(
+                            requested.encode("utf-8")
+                        ).hexdigest(),
+                    }
+                else:
+                    try:
+                        resolved = Path(found).resolve(strict=True)
+                        observed = resolved.stat()
+                    except (OSError, RuntimeError) as exc:
+                        executable = {
+                            "state": "unavailable",
+                            "error_class": type(exc).__name__,
+                        }
+                    else:
+                        signature = (
+                            os.path.normcase(str(resolved)), int(observed.st_dev),
+                            int(observed.st_ino), int(observed.st_size),
+                            int(observed.st_mtime_ns), tuple(command), contract,
+                        )
+                        with _dispatch_version_lock:
+                            version = copy.deepcopy(
+                                _dispatch_version_cache.get(signature)
+                            )
+                        if version is None:
+                            try:
+                                version = self._effective_dispatch_version(
+                                    [str(resolved), *command[1:]]
+                                )
+                            except Exception as exc:
+                                version = {
+                                    "state": "probe-failed",
+                                    "error_class": type(exc).__name__,
+                                }
+                            if version.get("state") not in {
+                                "probe-failed", "timed-out",
+                            }:
+                                with _dispatch_version_lock:
+                                    if len(_dispatch_version_cache) >= 128:
+                                        _dispatch_version_cache.pop(
+                                            next(iter(_dispatch_version_cache)), None
+                                        )
+                                    _dispatch_version_cache[signature] = copy.deepcopy(
+                                        version
+                                    )
+                        executable = {
+                            "state": "resolved",
+                            "path": os.path.normcase(str(resolved)),
+                            "device": str(int(observed.st_dev)),
+                            "file_id": str(int(observed.st_ino)),
+                            "size": int(observed.st_size),
+                            "modified_ns": int(observed.st_mtime_ns),
+                            "command_tail": command[1:],
+                            "version": version,
+                        }
+        return effective_dispatch_fingerprint(contract, {
+            "adapter": f"{self.__class__.__module__}.{self.__class__.__qualname__}",
+            "configuration": self._redactor.value(
+                self._effective_dispatch_config()
+            ),
+            "executable": executable,
+        })
 
     @abstractmethod
     def complete(self, request: ProviderRequest) -> ProviderResponse: ...
@@ -916,6 +1071,29 @@ class OpenAIProvider(Provider):
 
 class AnthropicProvider(Provider):
     structured_retry_is_safe = True
+
+    @staticmethod
+    def _accepts_custom_sampling(model: str) -> bool:
+        """Return whether Anthropic accepts a non-default temperature.
+
+        New Anthropic families can deliberately narrow their request contract.
+        Keep that compatibility decision beside payload construction so every
+        caller, including streams and tool continuations, gets the same shape.
+        Dated model IDs retain the family name and are covered by the prefix.
+        """
+
+        normalized = str(model or "").strip().casefold().replace(".", "-")
+        default_sampling_only = (
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+        )
+        return not any(family in normalized for family in default_sampling_only)
+
     @staticmethod
     def _tools(request: ProviderRequest) -> list[dict[str, Any]]:
         output: list[dict[str, Any]] = []
@@ -991,10 +1169,11 @@ class AnthropicProvider(Provider):
             "model": request.model,
             "system": system,
             "messages": messages,
-            "temperature": request.temperature,
             "max_tokens": request.max_output_tokens,
             "stream": stream,
         }
+        if self._accepts_custom_sampling(request.model):
+            payload["temperature"] = request.temperature
         if request.tools:
             payload["tools"] = self._tools(request)
         if request.response_format is not None:
@@ -1391,6 +1570,25 @@ class OllamaProvider(Provider):
 
 
 class LocalProcessProvider(Provider):
+    def _effective_dispatch_command(self) -> list[str] | None:
+        command = self.settings.get("command", [])
+        if not isinstance(command, list) or not command:
+            raise HarnessError(
+                "provider.command must be a non-empty argv list for the local provider"
+            )
+        if self.config.get("execution.mode") == "docker":
+            return ["docker"]
+        return list(command)
+
+    def _effective_dispatch_config(self) -> dict[str, Any]:
+        configured = super()._effective_dispatch_config()
+        configured["execution"] = {
+            "mode": self.config.get("execution.mode"),
+            "docker_image": self.config.get("execution.docker_image"),
+            "docker_network": self.config.get("execution.docker_network"),
+        }
+        return configured
+
     def complete(self, request: ProviderRequest) -> ProviderResponse:
         command = self.settings.get("command", [])
         if not isinstance(command, list) or not command:

@@ -37,16 +37,19 @@ import re
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
-from . import cancellation
+from . import cancellation, collaboration_outcomes, user_questions
 from .config import LoadedConfig
-from .models import HarnessError, ProviderRequest, ResponseFormat
+from .models import HarnessError, ProviderOutcomeUnknown, ProviderRequest, ResponseFormat
 from .providers import ProviderRegistry, create_provider
+from .providers.base import effective_dispatch_fingerprint
 from .redaction import CredentialRedactor, bounded_redacted_text
 from .safety import confined_path
 
@@ -63,6 +66,27 @@ LONGEST_NO = 800
 # says nothing about Monday, and a note nobody can clear is a note that stops
 # being read. Anything getting through clears it long before this.
 A_NO_IS_WORTH_MENTIONING_FOR = 24 * 60 * 60
+# Persisted failures are observations about one exact route *and* the engine
+# transport that dispatched it.  Keeping that context machine-readable lets a
+# different installation, a changed command, or a newer adapter invalidate an
+# obsolete warning automatically instead of requiring somebody to edit a
+# private JSON file by hand.
+FAILURE_CONTEXT_VERSION = 1
+PROVIDER_PRINCIPAL_VERSION = 1
+PROVIDER_PRINCIPAL_CONTRACT = "nexus/provider-principal/v1"
+PROVIDER_TRANSPORT_CONTRACT_REVISIONS: dict[str, str] = {
+    "codex-cli": "codex-cli/isolated-exec/v1",
+    "claude-cli": "claude-cli/subscription-exec/v1",
+    "gemini-cli": "gemini-cli/subscription-exec/v1",
+    "copilot-cli": "copilot-cli/subscription-exec/v1",
+    "assistant-cli": "assistant-cli/subscription-exec/v1",
+    "m365-copilot": "m365-copilot/local-broker/v1",
+    # v2 promotes a late marked turn only when the answer poll can causally
+    # pair a non-empty reply with it.  Changing the contract invalidates v1
+    # route-failure notes so a repaired relay is not left looking broken after
+    # upgrade; the durable provider-effect journal remains the replay fence.
+    "web-chat": "web-chat/electron-relay/v2",
+}
 # A long-horizon goal is often a real specification.  This is a disclosed hard
 # safety boundary, not a convenient UI size: the browser and server advertise
 # the same value and reject an over-limit request instead of silently clipping
@@ -204,6 +228,11 @@ _CLAUDE_SUBSCRIPTION_REFUSALS = (
     "subscription_access_disabled",
     "anthropic rejected the command-line subscription request",
 )
+_GEMINI_PROJECT_REFUSALS = (
+    "google_cloud_project",
+    "google cloud project",
+    "google_project",
+)
 
 
 def _claude_subscription_repair() -> str:
@@ -231,11 +260,10 @@ def _without_personal_account_details(said: str) -> str:
     return held
 
 
-# How many conversations get a lock of their own before they start sharing one.
-# Far above the number of assistants anybody has; low enough that a stream of
-# made-up names cannot fill this machine's memory with locks.
-MOST_LOCKS = 64
-_locks: dict[str, threading.Lock] = {}
+# Only conversations currently entering or holding a turn retain a local lock.
+# Historical chat names must not fill memory, and crossing an arbitrary count
+# must never make unrelated later chats share one global provider-wait lock.
+_locks: dict[str, tuple[threading.Lock, int]] = {}
 _locks_lock = threading.Lock()
 
 
@@ -243,7 +271,8 @@ class ChatError(HarnessError):
     """Something that could not be said, or an answer that did not come."""
 
 
-def _the_lock_for(filed: str) -> threading.Lock:
+@contextmanager
+def _the_lock_for(filed: str) -> Iterator[threading.Lock]:
     """The lock for one conversation.
 
     Kept here rather than beside the panel's other locks, so that every way of
@@ -253,16 +282,21 @@ def _the_lock_for(filed: str) -> threading.Lock:
     """
 
     with _locks_lock:
-        held = _locks.get(filed)
-        if held is None:
-            if len(_locks) >= MOST_LOCKS:
-                # Past the point of one each, they share. Sharing is slower and
-                # still correct; growing for ever is neither.
-                held = _locks.setdefault("", threading.Lock())
-            else:
-                held = threading.Lock()
-                _locks[filed] = held
-        return held
+        entry = _locks.get(filed)
+        held, references = entry if entry is not None else (threading.Lock(), 0)
+        _locks[filed] = (held, references + 1)
+    held.acquire()
+    try:
+        yield held
+    finally:
+        held.release()
+        with _locks_lock:
+            current = _locks.get(filed)
+            if current is not None and current[0] is held:
+                if current[1] <= 1:
+                    _locks.pop(filed, None)
+                else:
+                    _locks[filed] = (held, current[1] - 1)
 
 
 @dataclass
@@ -281,6 +315,8 @@ class Said:
     recipient_id: str = ""
     recipient_name: str = ""
     phase: str = ""
+    questions: list[dict[str, Any]] = field(default_factory=list)
+    participant_outcome: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         value = {
@@ -298,6 +334,12 @@ class Said:
             held = getattr(self, key)
             if held:
                 value[key] = held
+        if self.questions:
+            value["questions"] = user_questions.frozen(self.questions)
+        if self.participant_outcome:
+            value["participant_outcome"] = collaboration_outcomes.frozen(
+                self.participant_outcome
+            )
         return value
 
 
@@ -653,6 +695,179 @@ def _where_the_noes_are(config: LoadedConfig) -> Path:
         config.project_root, WHERE_THE_NOES_LIVE, allow_missing=True, allow_control=True)
 
 
+def _route_failure_context(config: LoadedConfig, route: str) -> tuple[str, dict[str, Any]]:
+    """Return a private, portable identity for one route's dispatch semantics.
+
+    The digest contains no provider configuration in plaintext.  It changes
+    when a route is moved to another command/path/computer, when its relevant
+    configuration changes, or when the owning adapter's contract revision is
+    bumped.  That makes stale-diagnostic invalidation a product behavior rather
+    than a repair performed on one user's data.
+    """
+
+    named = str(route or "").strip()
+    routes = config.get("providers", {}) or {}
+    profile = routes.get(named) if isinstance(routes, dict) else None
+    if not isinstance(profile, dict) and named in ("", "default"):
+        profile = config.get("provider", {}) or {}
+    if not isinstance(profile, dict):
+        profile = {}
+    kind = str(profile.get("kind") or profile.get("name") or "").strip()
+    if named.startswith("web:"):
+        kind = "web-chat"
+    contract = PROVIDER_TRANSPORT_CONTRACT_REVISIONS.get(
+        kind, f"{kind or 'unknown-provider'}/dispatch/v1"
+    )
+    safe_profile = CredentialRedactor(config).value(profile)
+    if kind == "web-chat":
+        effective = effective_dispatch_fingerprint(
+            "web-chat/effective-dispatch/v1",
+            {"route": named, "profile": safe_profile, "transport_contract": contract},
+        )
+    else:
+        try:
+            if config.get("providers"):
+                routed = ProviderRegistry(config).provider_config(named or "default")
+            else:
+                routed = config
+            # Use the real factory rather than this module's dispatch alias.
+            # Focused tests replace the alias with an answer stub; that must not
+            # silently change the persisted identity of the configured adapter.
+            from .providers.base import create_provider as identity_provider
+
+            provider = identity_provider(routed)
+            effective = provider.effective_dispatch_fingerprint()
+        except Exception as exc:
+            effective = effective_dispatch_fingerprint(
+                f"{kind or 'unknown-provider'}/effective-dispatch/v1",
+                {
+                    "state": "unavailable",
+                    "error_class": type(exc).__name__,
+                    "route": named,
+                    "profile": safe_profile,
+                },
+            )
+    principal_material: dict[str, Any] | None
+    if kind == "web-chat":
+        # Electron deliberately has one signed-in browser profile per vendor.
+        # Conversation IDs are dispatch destinations, not independent reviewer
+        # principals, so two ChatGPT tabs remain the same physical authority.
+        from . import web_chats
+
+        connected = web_chats.active().route(named)
+        principal_material = ({
+            "provider": re.sub(
+                r"[^a-z0-9]+", "-",
+                str(connected.get("provider") or "web").lower(),
+            ).strip("-") or "web",
+            "physical_resource_id": str(
+                connected.get("physical_resource_id") or ""
+            ),
+            "model_family": "consumer-web-chat",
+            "transport_class": contract,
+        } if isinstance(connected, dict) else None)
+    else:
+        endpoint = str(profile.get("endpoint") or "").strip()
+        parsed = urlsplit(endpoint) if endpoint else None
+        endpoint_authority = (
+            f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{parsed.path.rstrip('/')}"
+            if parsed and parsed.scheme and parsed.netloc else endpoint
+        )
+        provider_kind = kind or str(
+            effective.get("effective_dispatch_contract") or "unknown"
+        ).split("/", 1)[0]
+        principal_material = {
+            "provider": provider_kind,
+            "endpoint_authority": endpoint_authority,
+            "credential_slot": str(profile.get("api_key_env") or ""),
+            "account_scope": {
+                key: profile.get(key)
+                for key in (
+                    "auth_mode", "google_project", "microsoft_app",
+                    "microsoft_organisation",
+                ) if profile.get(key) is not None and profile.get(key) != ""
+            },
+            "model_family": str(profile.get("model") or ""),
+            "transport_class": contract,
+            # Local/CLI providers have no tenant identifier. Their resolved
+            # executable+profile identity is the strongest available principal.
+            "local_dispatch_identity": (
+                effective.get("effective_dispatch_fingerprint_sha256")
+                if not endpoint_authority and not profile.get("api_key_env") else ""
+            ),
+        }
+    principal_fingerprint = ""
+    if principal_material and all(
+        str(principal_material.get(key) or "")
+        for key in ("provider", "transport_class")
+    ):
+        principal_fingerprint = hashlib.sha256(json.dumps({
+            "provider_principal_version": PROVIDER_PRINCIPAL_VERSION,
+            "provider_principal_contract": PROVIDER_PRINCIPAL_CONTRACT,
+            "material": principal_material,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    canonical = json.dumps(
+        {
+            "route": named,
+            "kind": kind,
+            "profile": profile,
+            "transport_contract": contract,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=lambda value: f"<{type(value).__name__}>",
+    ).encode("utf-8")
+    return kind, {
+        "failure_context_version": FAILURE_CONTEXT_VERSION,
+        "route_fingerprint_sha256": hashlib.sha256(canonical).hexdigest(),
+        "transport_contract": contract,
+        **effective,
+        "provider_principal_version": PROVIDER_PRINCIPAL_VERSION,
+        "provider_principal_fingerprint_sha256": principal_fingerprint,
+        "provider_principal_contract": PROVIDER_PRINCIPAL_CONTRACT,
+    }
+
+
+def _stored_failure_context_is_current(
+    config: LoadedConfig, route: str, refusal: dict[str, Any],
+) -> bool | None:
+    """True/False for versioned records; None for a legacy record."""
+
+    version = refusal.get("failure_context_version")
+    if version is None:
+        return None
+    if version != FAILURE_CONTEXT_VERSION:
+        return False
+    _kind, current = _route_failure_context(config, route)
+    return bool(
+        refusal.get("route_fingerprint_sha256") == current["route_fingerprint_sha256"]
+        and refusal.get("transport_contract") == current["transport_contract"]
+        and (
+            "effective_dispatch_version" not in refusal
+            or (
+                refusal.get("effective_dispatch_version")
+                    == current.get("effective_dispatch_version")
+                and refusal.get("effective_dispatch_fingerprint_sha256")
+                    == current.get("effective_dispatch_fingerprint_sha256")
+                and refusal.get("effective_dispatch_contract")
+                    == current.get("effective_dispatch_contract")
+            )
+        )
+        and (
+            "provider_principal_version" not in refusal
+            or (
+                refusal.get("provider_principal_version")
+                    == current.get("provider_principal_version")
+                and refusal.get("provider_principal_fingerprint_sha256")
+                    == current.get("provider_principal_fingerprint_sha256")
+                and refusal.get("provider_principal_contract")
+                    == current.get("provider_principal_contract")
+            )
+        )
+    )
+
+
 def what_would_not_answer(config: LoadedConfig) -> dict[str, dict[str, Any]]:
     """What each route said the last time it would not answer, if it still counts.
 
@@ -676,6 +891,8 @@ def what_would_not_answer(config: LoadedConfig) -> dict[str, dict[str, Any]]:
         redactor = CredentialRedactor(config)
         for route, one in held.items():
             if not isinstance(one, dict) or not isinstance(one.get("why"), str):
+                cleaned.pop(route, None)
+                changed = True
                 continue
             safe_why = bounded_redacted_text(
                 redactor, _without_personal_account_details(one["why"]), 65_536
@@ -685,11 +902,43 @@ def what_would_not_answer(config: LoadedConfig) -> dict[str, dict[str, Any]]:
                 changed = True
             when = one.get("when")
             if not isinstance(when, (int, float)) or now - when > A_NO_IS_WORTH_MENTIONING_FOR:
+                cleaned.pop(route, None)
+                changed = True
                 continue
+            current = _stored_failure_context_is_current(config, str(route), one)
+            if current is False:
+                cleaned.pop(route, None)
+                changed = True
+                continue
+            if current is None:
+                # One bounded compatibility migration for records written by
+                # the pre-context engine.  All records written from this build
+                # onward use the provider-neutral fingerprint above.
+                kind, _context = _route_failure_context(config, str(route))
+                if kind == "codex-cli":
+                    from .providers.codex_cli import codex_config_load_error
+
+                    if codex_config_load_error(safe_why):
+                        cleaned.pop(route, None)
+                        changed = True
+                        continue
             kept[str(route)] = {
                 "why": safe_why,
                 "when": float(when),
                 "at": str(one.get("at") or ""),
+                **{
+                    key: one[key]
+                    for key in (
+                        "failure_context_version", "route_fingerprint_sha256",
+                        "transport_contract", "effective_dispatch_version",
+                        "effective_dispatch_fingerprint_sha256",
+                        "effective_dispatch_contract",
+                        "provider_principal_version",
+                        "provider_principal_fingerprint_sha256",
+                        "provider_principal_contract",
+                    )
+                    if key in one
+                },
             }
         # Earlier builds persisted the whole auth-status line. Clean it from
         # the existing file as soon as it is read, not only from the screen.
@@ -721,6 +970,7 @@ def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) ->
             where = _where_the_noes_are(config)
             held = what_would_not_answer(config)
             if why:
+                _kind, context = _route_failure_context(config, route)
                 held[route] = {
                     "why": bounded_redacted_text(
                         CredentialRedactor(config),
@@ -729,6 +979,7 @@ def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) ->
                     ),
                     "when": time.time(),
                     "at": _now(),
+                    **context,
                 }
             elif route not in held:
                 return
@@ -743,6 +994,40 @@ def _write_down_that_it_would_not(config: LoadedConfig, route: str, why: str) ->
             os.replace(beside, where)
     except (OSError, ValueError):
         return
+
+
+def _known_route_setup_problem(config: LoadedConfig, route: str) -> str:
+    """A proven, still-unrepaired prerequisite that makes dispatch pointless.
+
+    Gemini CLI can spend the full provider deadline rediscovering that a
+    Workspace/Code Assist account has no Cloud project. Once its own response
+    has established that fact, keep stale browser clients and direct API calls
+    from launching the same doomed provider process again. A project entered
+    in the route is a real configuration change, so it immediately re-enables
+    one verification attempt; only a successful answer clears the audit note.
+    """
+
+    named = str(route or "").strip()
+    if not named or named.startswith("web:"):
+        return ""
+    try:
+        routed = ProviderRegistry(config).provider_config(named)
+    except HarnessError:
+        return ""
+    if str(routed.get("provider.name") or "") != "gemini-cli":
+        return ""
+    if str(routed.get("provider.google_project") or "").strip():
+        return ""
+    refusal = what_would_not_answer(config).get(named)
+    reason = str((refusal or {}).get("why") or "")
+    if not any(mark in reason.lower() for mark in _GEMINI_PROJECT_REFUSALS):
+        return ""
+    return (
+        "Gemini CLI cannot answer this Workspace/Code Assist account until the "
+        "route has a Google Cloud Project ID. Nexus did not launch another "
+        "doomed provider turn. Use Set Cloud project on the agent card, enter "
+        "the project ID, and send again."
+    )
 
 
 def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
@@ -775,17 +1060,20 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
         # says it cannot make any request until a route setting is supplied.
         # Calling that route ready leaves the input enabled but provides no
         # place to enter the value that every retry will keep asking for.
-        needs_setup = bool(
+        project_was_configured = bool(str(held.get("google_project") or "").strip())
+        project_refusal = bool(
             kind == "gemini-cli"
             and no
-            and any(mark in no["why"].lower() for mark in (
-                "google_cloud_project", "google cloud project", "google_project"
-            ))
+            and any(mark in no["why"].lower() for mark in _GEMINI_PROJECT_REFUSALS)
         )
+        needs_setup = project_refusal and not project_was_configured
+        # Suppress only this now-obsolete prerequisite warning. Keep its
+        # durable note until a real answer proves the repaired route works.
+        visible_no = None if project_refusal and project_was_configured else no
         claude_needs_attention = bool(
             kind == "claude-cli"
-            and no
-            and any(mark in no["why"].lower() for mark in _CLAUDE_SUBSCRIPTION_REFUSALS)
+            and visible_no
+            and any(mark in visible_no["why"].lower() for mark in _CLAUDE_SUBSCRIPTION_REFUSALS)
         )
         found.append({
             "route": str(name),
@@ -811,13 +1099,13 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
                 if needs_setup else ""
             ),
             "how_to_fix_it": (
-                "Press Set Cloud project on the agent card (or Connect it in the "
-                "readiness list) and enter the Project ID. No API key is needed."
+                "Press Repair connection for this exact agent, then Set Cloud "
+                "project and enter the Project ID. No API key is needed."
                 if needs_setup else (_claude_subscription_repair() if claude_needs_attention else "")
             ),
             "connection_state": (
                 "needs setup" if needs_setup else (
-                    "needs attention" if no else "connected"
+                    "needs attention" if visible_no else "connected"
                 )
             ),
             "retryable": not needs_setup,
@@ -830,9 +1118,9 @@ def already_set_up(config: LoadedConfig) -> list[dict[str, Any]]:
                     if needs_setup else
                     f"The last time this was asked something, it would not answer: {no['why']}"
                 )
-                if no else ""
+                if visible_no else ""
             ),
-            "when_that_was": no["at"] if no else "",
+            "when_that_was": visible_no["at"] if visible_no else "",
             "chat_destination": chat_destination(config, str(name)),
         })
     if not found:
@@ -964,6 +1252,15 @@ def _said_from_dicts(held: object) -> list[Said]:
                 f"Saved conversation turn {index + 1} has invalid timing metadata. "
                 "Nexus did not skip it."
             ) from exc
+        try:
+            participant_outcome = collaboration_outcomes.frozen(
+                one.get("participant_outcome")
+            )
+        except ValueError as exc:
+            raise ChatError(
+                f"Saved conversation turn {index + 1} has malformed participant "
+                "delivery metadata. Nexus did not silently drop it."
+            ) from exc
         kept.append(Said(
             who=who, text=text, at=str(one.get("at") or ""),
             milliseconds=milliseconds, model=str(one.get("model") or ""),
@@ -974,6 +1271,8 @@ def _said_from_dicts(held: object) -> list[Said]:
             recipient_id=str(one.get("recipient_id") or "")[:120],
             recipient_name=str(one.get("recipient_name") or "")[:500],
             phase=str(one.get("phase") or "")[:80],
+            questions=user_questions.frozen(one.get("questions")),
+            participant_outcome=participant_outcome,
         ))
     return kept
 
@@ -1434,7 +1733,10 @@ def _contract_failure(text: str, response_format: ResponseFormat) -> str:
 
 
 def _complete_with_one_schema_repair(
-    provider, request: ProviderRequest, redactor: CredentialRedactor
+    provider, request: ProviderRequest, redactor: CredentialRedactor,
+    before_provider_dispatch: Callable[[str], None] | None = None,
+    complete_provider: Callable[[ProviderRequest, str], Any] | None = None,
+    after_provider_response: Callable[[str], None] | None = None,
 ):  # type: ignore[no-untyped-def]
     """Complete once, with exactly one correction for a malformed contract.
 
@@ -1444,7 +1746,17 @@ def _complete_with_one_schema_repair(
     uncertain browser side effect.
     """
 
-    response = provider.complete(request)
+    def complete(one: ProviderRequest, phase: str):  # type: ignore[no-untyped-def]
+        if complete_provider is not None:
+            return complete_provider(one, phase)
+        if before_provider_dispatch is not None:
+            before_provider_dispatch(phase)
+        response = provider.complete(one)
+        if after_provider_response is not None:
+            after_provider_response(phase)
+        return response
+
+    response = complete(request, "initial")
     if request.response_format is None:
         return response
     failure = _contract_failure(response.text, request.response_format)
@@ -1477,12 +1789,12 @@ def _complete_with_one_schema_repair(
         f"PREVIOUS ANSWER (sha256 {hashlib.sha256(rejected.encode('utf-8')).hexdigest()})\n"
         + rejected_excerpt
     )
-    repaired = provider.complete(replace(
+    repaired = complete(replace(
         request,
         messages=[*request.messages, {"role": "assistant", "content": rejected_excerpt},
                   {"role": "user", "content": correction}],
         prefer_existing_conversation=False,
-    ))
+    ), "schema_repair")
     second_failure = _contract_failure(repaired.text, request.response_format)
     if second_failure:
         raise ChatError(
@@ -1532,6 +1844,9 @@ def say(
     redactor = CredentialRedactor(config)
     registry = ProviderRegistry(config)
     named = str(route or "").strip()
+    known_problem = _known_route_setup_problem(config, named)
+    if known_problem:
+        raise ChatError(known_problem)
     try:
         if named.startswith("web:"):
             from . import web_chats
@@ -1563,8 +1878,14 @@ def say(
         kept_files, provider_files, attachment_text = keep_attachments(
             config, route, attachments, filed_as
         )
+        direct_question_protocol = (
+            user_questions.provider_instruction() if speaker else ""
+        )
         dynamic = "\n\n".join(
-            one for one in (str(context or "").strip(), attachment_text) if one
+            one for one in (
+                str(context or "").strip(), attachment_text,
+                direct_question_protocol,
+            ) if one
         )
         return _ask_and_keep(
             config,
@@ -1583,6 +1904,7 @@ def say(
             conversation_key=conversation_key,
             prefer_existing_conversation=prefer_existing_conversation,
             max_output_tokens=int(routed.get("provider.max_output_tokens") or 65_536),
+            reasoning_effort=str(routed.get("provider.reasoning_effort") or "") or None,
         )
 
 
@@ -1622,7 +1944,22 @@ def _project_chat_history(
         })
     messages.extend({
         "role": "user" if one.who == "you" else "assistant",
-        "content": text,
+        "content": (
+            text
+            + (
+                "\n\nQuestions this assistant asked the user:\n"
+                + "\n".join(
+                    f"- {question['prompt']}"
+                    + (
+                        " Options: "
+                        + "; ".join(option["label"] for option in question["options"])
+                        if question["options"] else ""
+                    )
+                    for question in user_questions.normalize(one.questions)
+                )
+                if one.who == "them" and one.questions else ""
+            )
+        ),
     } for one, text in selected)
     return messages
 
@@ -1645,6 +1982,7 @@ def _ask_and_keep(
     conversation_key="",
     prefer_existing_conversation=False,
     max_output_tokens=65_536,
+    reasoning_effort=None,
 ) -> dict[str, Any]:
     so_far = read_it(config, route, filed_as)
     eligible = [
@@ -1652,7 +1990,7 @@ def _ask_and_keep(
         if one.phase not in {
             "agent_reply", "lead_draft", "agent_plan", "lead_plan",
             "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution",
-            "agent_verification",
+            "agent_verification", "participant_outcome",
         }
     ]
     messages = _project_chat_history(
@@ -1669,6 +2007,7 @@ def _ask_and_keep(
         temperature=0.3,
         max_output_tokens=max(1, int(max_output_tokens)),
         timeout_seconds=LONGEST_WAIT_SECONDS,
+        reasoning_effort=str(reasoning_effort or "") or None,
         attachments=list(provider_attachments or []),
         conversation_key=str(
             conversation_key or _filed_under(filed_as or route)
@@ -1677,19 +2016,39 @@ def _ask_and_keep(
     )
     started = time.monotonic()
     try:
-        from .swarm_runs import provider_effect
+        from .swarm_runs import post_provider_mutation, provider_effect
 
-        effect_digest = hashlib.sha256(json.dumps({
-            "route": route, "conversation_key": request.conversation_key,
-            "messages": request.messages, "response_format": bool(request.response_format),
-        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-        with provider_effect(config, route, request.conversation_key, effect_digest):
-            answered = _complete_with_one_schema_repair(provider, request, redactor)
+        def complete_provider(one_request: ProviderRequest, phase: str):  # type: ignore[no-untyped-def]
+            effect_digest = hashlib.sha256(json.dumps({
+                "route": route, "conversation_key": one_request.conversation_key,
+                "messages": one_request.messages,
+                "response_format": bool(one_request.response_format),
+                "phase": phase,
+            }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            with provider_effect(
+                config, route, one_request.conversation_key, effect_digest
+            ):
+                return provider.complete(one_request)
+
+        answered = _complete_with_one_schema_repair(
+            provider, request, redactor, complete_provider=complete_provider
+        )
     except cancellation.ChatCancelled:
         # Stop is control flow, not a provider refusal.  Turning it into a
         # ChatError makes multi-round collaboration treat the user's stop as a
         # recoverable failed turn and immediately ask the agents again.
         raise
+    except ProviderOutcomeUnknown as exc:
+        # Preserve the typed uncertainty boundary. Flattening this into a
+        # ChatError made orchestration retry an effect whose browser delivery
+        # could not be reconciled, while also hiding the real cause.
+        safe_reason = _without_personal_account_details(
+            redactor.text(_in_plain_words(exc))
+        )
+        _write_down_that_it_would_not(config, route, safe_reason)
+        raise ProviderOutcomeUnknown(
+            f"{named or 'The assistant'} has an unreconciled provider turn: {safe_reason}"
+        ) from exc
     except HarnessError as exc:  # noqa: PERF203 - one shape of failure, one sentence
         # Remembered against the route, so the board can say this before the
         # next person types rather than after.
@@ -1703,12 +2062,12 @@ def _ask_and_keep(
                 f"{_in_plain_words(exc)}"
             ))
         ) from exc
-    # It answered, so whatever it said last time is over.
-    _write_down_that_it_would_not(config, route, "")
-    back = _checked_answer(
+    raw_back = _checked_answer(
         redactor.text(str(getattr(answered, "text", "") or "")),
         named or "The assistant",
     )
+    back, questions = user_questions.extract(raw_back)
+    back = _checked_answer(back, named or "The assistant")
     turns = so_far + [
         Said(
             who="you",
@@ -1736,13 +2095,23 @@ def _ask_and_keep(
             if speaker else "",
             recipient_name="You" if speaker else "",
             phase="final_answer" if speaker else "",
+            questions=user_questions.frozen(questions),
         ),
     ]
-    _keep_it(config, route, turns, filed_as)
+    # Stop and the post-provider transcript commit share one durable write
+    # reservation. Either the complete answer lands before Stop is accepted,
+    # or an accepted Stop prevents both the route-status and transcript
+    # mutations from starting. There is no check-then-write gap across Nexus
+    # processes.
+    with post_provider_mutation():
+        # It answered, so whatever it said last time is over.
+        _write_down_that_it_would_not(config, route, "")
+        _keep_it(config, route, turns, filed_as)
     return {
         "route": named,
         "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
         "answer": turns[-1].to_dict(),
+        **({"status": "waiting_for_user", "questions": questions} if questions else {}),
     }
 
 
@@ -1756,12 +2125,18 @@ def ask_once(
     response_format: ResponseFormat | None = None,
     conversation_key: str = "",
     prefer_existing_conversation: bool = False,
+    before_provider_dispatch: Callable[[str], None] | None = None,
+    after_provider_response: Callable[[str], None] | None = None,
+    working_directory: str = "",
 ) -> dict[str, Any]:
     """Ask without touching a transcript, for a bounded collaboration round."""
 
     asked = _check_what_was_typed(text)
     redactor = CredentialRedactor(config)
     named = str(route or "").strip()
+    known_problem = _known_route_setup_problem(config, named)
+    if known_problem:
+        raise ChatError(known_problem)
     try:
         if named.startswith("web:"):
             from . import web_chats
@@ -1779,38 +2154,81 @@ def ask_once(
             temperature=0.2,
             max_output_tokens=max(1, int(routed.get("provider.max_output_tokens") or 65_536)),
             timeout_seconds=LONGEST_WAIT_SECONDS,
+            reasoning_effort=str(routed.get("provider.reasoning_effort") or "") or None,
             response_format=response_format,
             attachments=list(provider_attachments or []),
             conversation_key=str(conversation_key or _filed_under(named)),
             prefer_existing_conversation=bool(prefer_existing_conversation),
+            working_directory=str(working_directory or ""),
         )
         started = time.monotonic()
         from .swarm_runs import provider_effect
 
-        effect_digest = hashlib.sha256(json.dumps({
-            "route": named, "conversation_key": request.conversation_key,
-            "messages": request.messages, "response_format": bool(response_format),
-        }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-        with provider_effect(config, named, request.conversation_key, effect_digest):
-            response = (
-                provider.complete(request)
-                if named.startswith("web:")
-                else _complete_with_one_schema_repair(provider, request, redactor)
+        def complete_provider(one_request: ProviderRequest, phase: str):  # type: ignore[no-untyped-def]
+            effect_digest = hashlib.sha256(json.dumps({
+                "route": named, "conversation_key": one_request.conversation_key,
+                "messages": one_request.messages,
+                "response_format": bool(one_request.response_format),
+                "phase": phase,
+            }, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            effect_options = {}
+            if before_provider_dispatch is not None:
+                effect_options["before_dispatch"] = (
+                    lambda: before_provider_dispatch(phase)
+                )
+            with provider_effect(
+                config, named, one_request.conversation_key, effect_digest,
+                **effect_options,
+            ):
+                completed = provider.complete(one_request)
+            if after_provider_response is not None:
+                after_provider_response(phase)
+            return completed
+
+        if named.startswith("web:"):
+            response = complete_provider(request, "initial")
+        else:
+            response = _complete_with_one_schema_repair(
+                provider, request, redactor,
+                complete_provider=complete_provider,
+                after_provider_response=None,
             )
     except cancellation.ChatCancelled:
         # Collaboration catches this exact type and aborts the whole request.
         # Do not flatten it into an ordinary per-agent failure that the next
         # discussion round will retry.
         raise
+    except ProviderOutcomeUnknown as exc:
+        safe_reason = _without_personal_account_details(
+            redactor.text(_in_plain_words(exc))
+        )
+        _write_down_that_it_would_not(config, named, safe_reason)
+        raise ProviderOutcomeUnknown(
+            f"{named or 'The assistant'} has an unreconciled provider turn: {safe_reason}"
+        ) from exc
     except HarnessError as exc:
+        safe_reason = _without_personal_account_details(
+            redactor.text(_in_plain_words(exc))
+        )
+        # ask_once owns collaboration and relay calls. Their failures are as
+        # real as ordinary chat failures and must update route health too, or a
+        # broken provider remains falsely ready and gets relaunched forever.
+        _write_down_that_it_would_not(config, named, safe_reason)
         raise ChatError(
             _without_personal_account_details(
-                redactor.text(f"{named or 'The assistant'} was asked and did not answer: {_in_plain_words(exc)}")
+                redactor.text(
+                    f"{named or 'The assistant'} was asked and did not answer: {safe_reason}"
+                )
             )
         ) from exc
     answer = _checked_answer(
         redactor.text(str(response.text or "")), named or "The assistant"
     )
+    # Collaboration/relay calls use ask_once rather than the transcript-owning
+    # say() path. A valid reply proves the remembered route-level failure is
+    # over just as strongly here; leaving it behind kept obsolete login/config
+    # errors on the agent card after the provider had started answering again.
+    _write_down_that_it_would_not(config, named, "")
     return {
         "text": answer,
         "milliseconds": int((time.monotonic() - started) * 1000),
@@ -1834,13 +2252,16 @@ def keep_exchange(
 ) -> dict[str, Any]:
     """Record a harness-orchestrated exchange after its side effects succeed."""
 
+    from .swarm_runs import post_provider_mutation
+
     redactor = CredentialRedactor(config)
     with _the_lock_for(_filed_under(filed_as or route)):
         turns = read_it(config, route, filed_as) + [
             Said("you", redactor.text(_check_what_was_typed(text)), _now(), attachments=list(attachments or [])),
             Said("them", _checked_answer(redactor.text(answer)), _now(), milliseconds, model),
         ]
-        _keep_it(config, route, turns, filed_as)
+        with post_provider_mutation():
+            _keep_it(config, route, turns, filed_as)
     return {
         "route": str(route or "").strip(),
         "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
@@ -1926,6 +2347,63 @@ def keep_failed_exchange(
     }
 
 
+def _participant_outcome_turn(
+    outcome: dict[str, Any], at: str,
+) -> Said:
+    frozen = collaboration_outcomes.frozen(outcome)
+    return Said(
+        "them",
+        collaboration_outcomes.notice_text(frozen),
+        at,
+        model="nexus/participant-delivery-v1",
+        speaker_id="nexus",
+        speaker_name="Nexus",
+        recipient_name="You",
+        phase="participant_outcome",
+        participant_outcome=frozen,
+    )
+
+
+def keep_participant_outcome_exchange(
+    config: LoadedConfig,
+    route: str,
+    text: str,
+    *,
+    filed_as: str,
+    participant_outcome: dict[str, Any],
+    attachments: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Persist a truthful zero-answer team result without inventing AI speech."""
+
+    from .swarm_runs import post_provider_mutation
+
+    redactor = CredentialRedactor(config)
+    outcome = collaboration_outcomes.frozen(participant_outcome)
+    with _the_lock_for(_filed_under(filed_as or route)):
+        turns = read_it(config, route, filed_as)
+        now = _now()
+        turns.append(Said(
+            "you", redactor.text(_check_what_was_typed(text)), now,
+            attachments=list(attachments or []), speaker_name="You",
+            recipient_id=",".join(
+                str(one.get("agent_id") or "") for one in outcome["participants"]
+            ),
+            recipient_name=", ".join(
+                str(one.get("name") or "An agent") for one in outcome["participants"]
+            ),
+            phase="user_prompt",
+        ))
+        notice = _participant_outcome_turn(outcome, now)
+        turns.append(notice)
+        with post_provider_mutation():
+            _keep_it(config, route, turns, filed_as)
+    return {
+        "route": str(route or "").strip(),
+        "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
+        "answer": notice.to_dict(),
+    }
+
+
 def keep_multiparty_exchange(
     config: LoadedConfig,
     route: str,
@@ -1934,11 +2412,13 @@ def keep_multiparty_exchange(
     *,
     filed_as: str,
     lead: dict[str, Any],
+    final_speaker: dict[str, Any] | None = None,
     participants: list[dict[str, Any]],
     contributions: list[dict[str, Any]],
     attachments: list[dict[str, Any]] | None = None,
     model: str = "",
     milliseconds: int = 0,
+    participant_outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Keep every real turn from a bounded fan-out/fan-in exchange.
 
@@ -1949,9 +2429,14 @@ def keep_multiparty_exchange(
     that the orchestrator did not actually run.
     """
 
+    from .swarm_runs import post_provider_mutation
+
     redactor = CredentialRedactor(config)
     lead_id = str(lead.get("id") or "")
     lead_name = str(lead.get("name") or "The lead agent")
+    final_owner = final_speaker or lead
+    final_owner_id = str(final_owner.get("id") or lead_id)
+    final_owner_name = str(final_owner.get("name") or lead_name)
     team_name = ", ".join(str(one.get("name") or "an agent") for one in participants)
     team_ids = ",".join(str(one.get("id") or "") for one in participants)
     with _the_lock_for(_filed_under(filed_as or route)):
@@ -1987,18 +2472,26 @@ def keep_multiparty_exchange(
                     "lead_draft" if is_lead else "agent_reply"
                 ))[:80],
             ))
-        turns.append(Said(
+        final_turn = Said(
             "them", _checked_answer(redactor.text(answer)), now,
             milliseconds, model,
-            speaker_id=lead_id, speaker_name=lead_name,
-            speaker_route=str(lead.get("who") or "")[:120],
+            speaker_id=final_owner_id, speaker_name=final_owner_name,
+            speaker_route=str(final_owner.get("who") or "")[:120],
             recipient_name="You", phase="final_answer",
-        ))
-        _keep_it(config, route, turns, filed_as)
+        )
+        turns.append(final_turn)
+        if participant_outcome:
+            turns.append(_participant_outcome_turn(participant_outcome, now))
+        with post_provider_mutation():
+            _keep_it(config, route, turns, filed_as)
     return {
         "route": str(route or "").strip(),
         "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
-        "answer": turns[-1].to_dict(),
+        # The durable Nexus delivery notice follows the final AI answer in the
+        # transcript, but it must never replace that real answer in the response
+        # contract. Zero-answer collaboration uses
+        # keep_participant_outcome_exchange() instead.
+        "answer": final_turn.to_dict(),
     }
 
 

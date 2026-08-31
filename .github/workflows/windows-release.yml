@@ -97,6 +97,10 @@ jobs:
         working-directory: desktop
         run: npm run smoke:built
 
+      - name: Exercise unpacked multi-vendor dispatch and recovery
+        working-directory: desktop
+        run: npm run e2e:multi-vendor
+
       - name: Install and smoke-test the real per-user package
         shell: pwsh
         run: |
@@ -107,7 +111,10 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "Installer stopped with code $($process.ExitCode)." }
           if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) { throw "Installer did not create $installed." }
           Push-Location desktop
-          try { npm run smoke:built -- "$installed" } finally { Pop-Location }
+          try {
+            npm run smoke:built -- "$installed"
+            npm run e2e:multi-vendor -- "$installed"
+          } finally { Pop-Location }
 
       - name: Verify the installer Authenticode signature
         if: env.NEXUS_SIGNED_BUILD == '1'
@@ -143,6 +150,15 @@ jobs:
           $installer = $installers[0]
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $installer.FullName).Hash.ToLowerInvariant()
           "$hash  $($installer.Name)" | Set-Content -Encoding ascii -NoNewline -LiteralPath "$($installer.FullName).sha256"
+          $unpackedBytes = (Get-ChildItem -LiteralPath desktop/build-output/win-unpacked -File -Recurse | Measure-Object -Property Length -Sum).Sum
+          if (-not $unpackedBytes) { throw "The unpacked application size could not be measured." }
+          [ordered]@{
+            schema_version = 1
+            installer_bytes = $installer.Length
+            installer_mib = [math]::Round($installer.Length / 1MB, 1)
+            unpacked_bytes = $unpackedBytes
+            unpacked_mib = [math]::Round($unpackedBytes / 1MB, 1)
+          } | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath desktop/build-output/release-metadata.json
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -151,6 +167,7 @@ jobs:
           path: |
             desktop/build-output/Nexus-Harness-Setup-*.exe
             desktop/build-output/Nexus-Harness-Setup-*.exe.sha256
+            desktop/build-output/release-metadata.json
 
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -180,8 +197,16 @@ jobs:
             echo "Expected exactly the installer and checksum, found ${#assets[@]}." >&2
             exit 1
           fi
+          metadata="release/release-metadata.json"
+          if [[ ! -f "$metadata" ]]; then
+            echo "Release size metadata is missing." >&2
+            exit 1
+          fi
+          installer_mib="$(jq -er '.installer_mib | numbers' "$metadata")"
+          unpacked_mib="$(jq -er '.unpacked_mib | numbers' "$metadata")"
           notes="Windows installer: exact bytes are protected by the accompanying SHA-256. This release is not Authenticode-signed, so Windows may show an unknown-publisher warning."
           if [[ ! "${assets[*]}" =~ -UNSIGNED\.exe ]]; then
             notes="Windows installer: SHA-256 and the pinned Authenticode publisher are both verified by the release workflow."
           fi
+          notes="$notes Measured download size: ${installer_mib} MiB; unpacked application: ${unpacked_mib} MiB. Allow at least 2 GiB free while installing."
           gh release create "$tag" "${assets[@]}" --verify-tag --generate-notes --notes "$notes" --title "Nexus Harness $tag"

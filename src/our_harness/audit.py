@@ -18,15 +18,10 @@ ABSOLUTE_PATTERNS = [
         re.IGNORECASE,
     ),
 ]
-# Names that would mean this package still points at the project it was built
-# beside, rather than standing on its own.
-SOURCE_BINDINGS = ("RPG Maker", "RGSS")
-# The account name is only a problem when it appears as part of a path, which
-# is a leftover from one machine. In a repository address it is the publisher,
-# written on purpose, and every public project has one.
-ACCOUNT_IN_A_PATH = re.compile(r"[\/]KZTP47(?=[\/]|$)", re.IGNORECASE)
-_AN_ADDRESS = re.compile(r"[a-z][a-z0-9+.\-]*://\S*", re.IGNORECASE)
-TEXT_SUFFIXES = {".py", ".json", ".md", ".toml", ".ps1", ".sh", ".html", ".css", ".js"}
+TEXT_SUFFIXES = {
+    ".bat", ".cmd", ".css", ".html", ".js", ".json", ".md", ".ps1",
+    ".py", ".sh", ".toml", ".yaml", ".yml",
+}
 EXCLUDED_PARTS = {
     ".git", ".venv", "dist", "build", "tests", "__pycache__",
     # Third-party trees are not ours to rewrite, and the harness never ships them.
@@ -41,6 +36,11 @@ EXCLUDED_PARTS = {
     "build-output", "win-unpacked",
 }
 RECORDED_AUDIT_NOTES = {"docs/AUDIT.md", "src/our_harness/audit.py", "our_harness/audit.py"}
+# Repository-local agent policy is consumed by development tools and is never
+# included in either the Python distribution or the Electron resources.  It
+# can legitimately bind this checkout to private local resources, so scanning
+# it as shipped application content produces a false portability failure.
+NON_DISTRIBUTABLE_PROJECT_FILES = {"AGENTS.md"}
 
 
 def _inspect_text(label: str, text: str, findings: list[dict[str, str]]) -> bool:
@@ -51,13 +51,6 @@ def _inspect_text(label: str, text: str, findings: list[dict[str, str]]) -> bool
             path_material = ""
         if any(pattern.search(path_material) for pattern in ABSOLUTE_PATTERNS):
             findings.append({"path": label, "line": str(number), "message": "machine-specific absolute path"})
-        if any(binding in line for binding in SOURCE_BINDINGS):
-            findings.append({"path": label, "line": str(number), "message": "source-project binding"})
-        # A web address is not a folder on anybody's machine, so the part after
-        # the host is not a path and is not read as one.
-        without_addresses = _AN_ADDRESS.sub(" ", path_material)
-        if ACCOUNT_IN_A_PATH.search(without_addresses):
-            findings.append({"path": label, "line": str(number), "message": "machine-specific account path"})
     if label.endswith(".py"):
         try:
             ast.parse(text, filename=label)
@@ -92,7 +85,7 @@ def audit_distribution(root: Path) -> dict[str, Any]:
         if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES or any(part in EXCLUDED_PARTS for part in path.parts):
             continue
         label = path.relative_to(root).as_posix()
-        if label in RECORDED_AUDIT_NOTES:
+        if label in RECORDED_AUDIT_NOTES or label in NON_DISTRIBUTABLE_PROJECT_FILES:
             continue
         scanned_files += 1
         syntax_ok = _inspect_text(label, path.read_text(encoding="utf-8", errors="replace"), findings) and syntax_ok

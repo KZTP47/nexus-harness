@@ -88,9 +88,9 @@
   </details>
 
   <section id="authorityRepairNotice" class="callout authority-repair" role="status" hidden>
-    <strong>Project work is paused for this folder</strong>
+    <strong>Host-folder execution is paused</strong>
     <p id="authorityRepairReason"></p>
-    <p>Your saved boards, chats and transcripts, and automation definitions are still present and editable.</p>
+    <p>Your saved boards, chats and transcripts, and automation definitions are still present and editable. You can keep talking to assistants and connected agents. A different board-project folder has its own authority status beside that chat's Work control.</p>
     <button id="authorityRepairButton" type="button" hidden>
       Use this folder as a new local project
     </button>
@@ -213,7 +213,7 @@
       <dl class="tab-guide">
         <dt>Checks</dt><dd>Your tests. Each one says what to do and what a good result looks like. Run them any time. That tab can also point at a thing on a page to name it for you, keep a picture of a page to compare later, and pack up the evidence when you need somebody's help.</dd>
         <dt>Workflow</dt><dd>For later. It draws the agents as boxes so you can change who does what, and in which order.</dd>
-        <dt>AI Agent Swarm orchestrator</dt><dd>One picture of every agent you have, the projects you want worked on, and the lines between them. Every box has a gear for its settings and a button that opens its own chat on the board; every line has a gear that says whether those two may talk. Press Set them going and each agent is asked about the projects it is on, then shown what the others said.</dd>
+        <dt>AI Agent Swarm orchestrator</dt><dd>One picture of every agent, project, and allowed connection. Start goal work to let Nexus assign concrete tasks to useful agents until the evidence-backed goal is achieved. Connected-agent advice and the legacy paired workflow remain explicit optional modes.</dd>
         <dt>Memory</dt><dd>What the harness has read and remembered about this project, and which agent wrote each note.</dd>
         <dt>Prompt history</dt><dd>The instructions the harness gives its agents, and how they changed. Nothing changes without your review.</dd>
       </dl>
@@ -734,6 +734,56 @@
     </form>
   </dialog>
 
+  <dialog id="longGoalDialog" class="long-goal-dialog"
+          aria-labelledby="longGoalDialogTitle" aria-describedby="longGoalDialogWhy">
+    <form id="longGoalForm">
+      <div class="dialog-heading">
+        <h2 id="longGoalDialogTitle">Start a long-horizon goal</h2>
+        <button id="longGoalClose" type="button" aria-label="Close goal setup">×</button>
+      </div>
+      <p id="longGoalDialogWhy" class="hint">This starts real project work. Nexus saves every
+        step, pauses for decisions, and resumes from the exact saved checkpoint after a restart.</p>
+
+      <label for="longGoalProject">Project to work in</label>
+      <select id="longGoalProject"></select>
+
+      <label for="longGoalText">What must be achieved</label>
+      <textarea id="longGoalText" rows="8" maxlength="200000"
+        aria-describedby="longGoalTextCount"
+        placeholder="Describe the outcome, constraints, and what must remain unchanged."></textarea>
+      <p id="longGoalTextCount" class="field-help" role="status"></p>
+
+      <label for="longGoalCriteria">How Nexus can prove it is done <span class="hint">(optional; one check per line)</span></label>
+      <textarea id="longGoalCriteria" rows="4" maxlength="30000"
+        placeholder="The packaged Electron flow succeeds after restart&#10;All selected providers leave a saved reply"></textarea>
+
+      <fieldset class="long-goal-team">
+        <legend>Team for this goal</legend>
+        <p class="field-help">Tick the agents that may work in this project. This also updates
+          the board’s project assignments, so the same team is visible after a restart.</p>
+        <div id="longGoalAgents" class="long-goal-agents"></div>
+        <label for="longGoalLead">Lead agent</label>
+        <select id="longGoalLead"></select>
+        <label for="longGoalParticipation">How they participate</label>
+        <select id="longGoalParticipation">
+          <option value="every">Every selected agent must make a distinct contribution</option>
+          <option value="adaptive">Adaptive team — the lead may delegate only when useful</option>
+        </select>
+        <p id="longGoalParticipationWhy" class="field-help"></p>
+      </fieldset>
+
+      <section id="longGoalReadiness" class="long-goal-readiness" role="status"
+        aria-live="polite"></section>
+      <p id="longGoalError" class="form-error" role="alert" tabindex="-1" hidden></p>
+      <div class="dialog-actions long-goal-actions">
+        <button id="longGoalEditBoard" type="button">Edit this project on the board</button>
+        <button id="longGoalCheckBoard" type="button">Check connections</button>
+        <button id="longGoalCancel" type="button">Cancel</button>
+        <button id="longGoalStart" class="primary" type="submit">Start durable goal</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="pipelineAskDialog" aria-labelledby="pipelineAskDialogTitle">
     <form id="pipelineAskForm" method="dialog">
       <h2 id="pipelineAskDialogTitle">Before this runs</h2>
@@ -877,12 +927,15 @@
       <ul id="swarmChats" class="swarm-chats" aria-labelledby="swarmChatsTitle"></ul>
 
       <h3 id="swarmGoalWorkTitle">Achieve the goals</h3>
-      <p class="hint">Connected agents plan, edit, test, review, and repair each written
-        project goal. Nexus keeps the run resumable and does not call it complete until
-        deterministic verification passes.</p>
+      <p class="hint">Write the goal here, choose its project and team, then watch every
+        durable step in Mission control. You can require every selected agent to contribute,
+        or let a lead delegate only when useful. Work uses the event-driven goal engine and
+        survives an app restart from its saved checkpoints.</p>
       <div class="button-row">
         <button id="swarmWorkGoals" class="primary" type="button">Work until the goals are achieved</button>
         <button id="swarmCancelGoals" type="button">Cancel remaining goals</button>
+        <button id="swarmLegacyGoals" type="button"
+          title="Use the older paired plan-review-execute workflow">Use legacy paired workflow</button>
       </div>
       <p id="swarmGoalWorkSaid" class="hint operational-status" role="status" aria-live="polite"></p>
 
@@ -911,7 +964,15 @@
             the arrow keys.</p>
         </div>
       </div>
-      <p id="swarmSaid" class="callout" role="status">Add an agent to get started.</p>
+      <p id="swarmSaid" class="callout" role="status">Loading your saved board…</p>
+      <section id="webChatRecoveryBanner" class="web-chat-recovery-banner" hidden
+        role="alert" aria-labelledby="webChatRecoveryBannerTitle">
+        <div>
+          <strong id="webChatRecoveryBannerTitle">Web AI chats need a recovery choice</strong>
+          <p id="webChatRecoveryBannerMessage"></p>
+        </div>
+        <button id="webChatRecoveryBannerAction" class="primary" type="button">Review recovery</button>
+      </section>
 
       <div id="swarmStage" class="swarm-stage">
         <div id="swarmBoard" class="swarm-board" role="group" aria-label="The board"
@@ -942,7 +1003,8 @@
           <button id="swarmAddProject" type="button">Add another project folder</button>
           <button id="swarmRemoveProject" class="danger" type="button">Remove selected project folder</button>
           <button id="swarmTidy" type="button" title="Lay every box out in rows again">Tidy the board</button>
-          <button id="swarmRefresh" type="button">Look again</button>
+          <button id="swarmRefresh" type="button"
+            title="Refresh every provider and show direct fixes for this board">Check board</button>
           <button id="swarmWebChats" type="button"
             title="Connect ordinary provider web chats without changing desktop agent routes">Web AI chats</button>
         </div>
@@ -966,15 +1028,44 @@
             sandboxed browser session. A login in Chrome, Edge, or a provider desktop app does not
             log in here; use the provider window once and Nexus will retain that session. Nexus never
             receives the password or cookies. Provider page layouts can change, so Nexus reports a
-            stopped relay instead of guessing at a message.</p>
+            stopped relay instead of guessing at a message. Chats for the same provider share this
+            one Nexus sign-in, account, and quota, so Nexus relays them one at a time. Different
+            providers can still work in parallel.</p>
+          <section id="webChatSettingsRecovery" class="web-chat-settings-recovery" hidden
+            role="alert" aria-labelledby="webChatSettingsRecoveryTitle">
+            <h3 id="webChatSettingsRecoveryTitle">Choose how to recover your web AI chats</h3>
+            <p id="webChatSettingsRecoveryMessage"></p>
+            <p id="webChatSettingsRecoveryHint" class="hint">Nexus has not restored or deleted either copy automatically. Your other
+              desktop settings are preserved whichever option you choose.</p>
+            <div class="button-row">
+              <button id="webChatSettingsRecoveryRestore" class="primary" type="button">Restore these chats</button>
+              <button id="webChatSettingsRecoveryDiscard" type="button">Start with no recovered web chats</button>
+            </div>
+            <p id="webChatSettingsRecoveryResult" class="hint" role="status" aria-live="polite"></p>
+          </section>
+          <label class="web-chat-background-choice">
+            <input id="webChatBackgroundMode" type="checkbox">
+            <span><strong>Run relayed web AI turns in the background</strong><br>
+              Keep the ordinary provider browser minimized while agents work. Sign-in and explicit
+              “Show” actions still open it so you remain in control.</span>
+          </label>
+          <p class="hint">This is a hidden-window mode, not Chromium headless mode; providers such as
+            Claude reject headless browsers.</p>
           <section aria-labelledby="webChatProvidersTitle">
             <h3 id="webChatProvidersTitle">Connect a provider</h3>
             <div id="webChatProviders" class="web-chat-providers"></div>
           </section>
           <section aria-labelledby="webChatConnectionsTitle">
-            <h3 id="webChatConnectionsTitle">Chats connected to this board</h3>
+            <h3 id="webChatConnectionsTitle">Chats connected on this computer</h3>
             <p id="webChatSaid" class="hint" role="status" aria-live="polite"></p>
             <div id="webChatConnections" class="web-chat-connections"></div>
+          </section>
+          <section id="webChatRelayActivity" hidden aria-labelledby="webChatRelayActivityTitle">
+            <h3 id="webChatRelayActivityTitle">Relay delivery</h3>
+            <p class="hint">Each request keeps its own receipt status. A captured provider reply is
+              shown as delivered only after Nexus confirms that exact request.</p>
+            <div id="webChatRelayStatuses" class="web-chat-relay-statuses"
+              role="status" aria-live="polite"></div>
           </section>
           <section id="webChatViewer" class="web-chat-viewer" hidden aria-labelledby="webChatViewerTitle">
             <div class="web-chat-viewer-heading">
@@ -1007,7 +1098,7 @@
               <div class="the-big-chat-conversations-head">
                 <div>
                   <h4 id="theBigChatConversationsTitle">Agent chats</h4>
-                  <p>Each chat belongs to one connected pair.</p>
+                  <p>Each chat belongs to one agent or one connected pair.</p>
                 </div>
               </div>
               <div id="theBigChatConversationList" class="the-big-chat-conversation-list"></div>
@@ -1024,8 +1115,20 @@
                 aria-label="Resize where this chat happens" aria-controls="theBigChatDestination"
                 title="Drag up or down. Double-click to reset this pane."><span aria-hidden="true"></span></button>
               <div class="the-big-chat-middle">
-                <ol id="theBigChatSaid" class="the-big-chat-said"
-                  aria-labelledby="theBigChatTitle"></ol>
+                <div class="the-big-chat-transcript">
+                  <ol id="theBigChatSaid" class="the-big-chat-said"
+                    aria-labelledby="theBigChatTitle"></ol>
+                  <section id="theBigChatActivity" class="chat-activity" hidden
+                    role="status" aria-live="polite" aria-atomic="true">
+                    <div class="chat-activity-heading">
+                      <span class="chat-activity-spinner" aria-hidden="true"></span>
+                      <strong class="chat-activity-stage">Starting the request</strong>
+                      <span class="chat-activity-elapsed">Working now</span>
+                    </div>
+                    <p class="chat-activity-detail">Nexus is preparing the agent connection.</p>
+                    <div class="chat-activity-track" aria-hidden="true"><span></span></div>
+                  </section>
+                </div>
                 <button id="theBigChatActivityResize" class="the-big-chat-resizer vertical" type="button"
                   role="separator" aria-orientation="vertical"
                   aria-label="Resize the activity pane" aria-controls="theBigChatSaid theBigChatDoing"
@@ -1040,34 +1143,25 @@
                 aria-label="Resize the message composer and controls" aria-controls="theBigChatBox"
                 title="Drag up or down. Double-click to reset this pane."><span aria-hidden="true"></span></button>
               <div class="the-big-chat-bottom">
-            <section id="theBigChatActivity" class="chat-activity" hidden
-              role="status" aria-live="polite" aria-atomic="true">
-              <div class="chat-activity-heading">
-                <span class="chat-activity-spinner" aria-hidden="true"></span>
-                <strong class="chat-activity-stage">Starting the request</strong>
-                <span class="chat-activity-elapsed">Working now</span>
-              </div>
-              <p class="chat-activity-detail">Nexus is preparing the agent connection.</p>
-              <div class="chat-activity-track" aria-hidden="true"><span></span></div>
-            </section>
             <section id="theBigChatWorkRecovery" class="work-recovery the-big-chat-work-recovery"
               hidden aria-live="polite" aria-label="Saved project-work run"></section>
             <div class="the-big-chat-project-row">
               <label for="theBigChatProject">This chat writes to</label>
               <select id="theBigChatProject" aria-describedby="theBigChatProjectHelp"></select>
-              <span id="theBigChatProjectHelp" class="hint">Both agents must work on the selected project.</span>
+              <span id="theBigChatProjectHelp" class="hint">Work uses one or more ready agents assigned to the selected project.</span>
             </div>
             <div class="chat-round-policy the-big-chat-round-policy">
-              <label class="chat-round-maximum" for="theBigChatRoundLimit">Maximum team rounds
-                <input id="theBigChatRoundLimit" type="number" min="1" max="10000" value="12"
-                  aria-describedby="theBigChatRoundHelp" disabled>
+              <strong>Connected-agent collaboration only</strong>
+              <label class="chat-round-maximum" for="theBigChatRoundLimit">Maximum relay rounds
+                <input id="theBigChatRoundLimit" type="number" min="1" max="10000" value="3"
+                  aria-describedby="theBigChatRoundHelp">
               </label>
               <label class="chat-round-unlimited" for="theBigChatUnlimited">
-                <input id="theBigChatUnlimited" type="checkbox" checked>
-                Unlimited while progress continues
+                <input id="theBigChatUnlimited" type="checkbox">
+                Unlimited while progress continues (advanced opt-in)
               </label>
               <span id="theBigChatRoundHelp" class="hint chat-round-help">
-                Applies to each team phase. Nexus still stops repeated no-progress cycles.
+                Ask connected agents stops after 3 relay rounds by default. Unlimited is an explicit opt-in. Project-file Work uses the separate goal engine and ignores this limit.
               </span>
             </div>
             <label class="sr-only" for="theBigChatBox">What to say to this agent</label>
@@ -1077,13 +1171,14 @@
             <input id="theBigChatFiles" class="sr-only" type="file" multiple
               aria-label="Attach files or screenshots to this chat"
               accept="image/*,.txt,.md,.json,.yaml,.yml,.toml,.ini,.csv,.py,.js,.ts,.tsx,.jsx,.css,.html,.xml">
-            <p class="hint chat-auto-hint">Send automatically involves connected agents when their
-              expertise would help. Explicit file tasks ask for confirmation before project files change.</p>
+            <p id="theBigChatScopeHint" class="hint chat-auto-hint">Ask the selected agent only sends
+              to one assistant. Ask connected agents is the explicit team action. Project-file work always
+              asks for confirmation.</p>
+            <section id="theBigChatTeamReadiness" class="chat-team-readiness" hidden
+              aria-live="polite" aria-label="Team connection readiness"></section>
             <div class="button-row">
               <button id="theBigChatSend" class="primary" type="button"
-                title="Send directly or automatically involve connected agents when useful">Send</button>
-              <button id="theBigChatSolo" type="button"
-                title="Send only to the selected agent; connected agents will not join this turn">Chat with only this agent</button>
+                title="Send only to the selected agent">Ask selected agent only</button>
               <button id="theBigChatStop" class="danger" type="button"
                 title="Stop only this chat's current request" disabled>Stop</button>
               <button id="theBigChatAttach" type="button">Attach files or screenshots</button>
@@ -1092,6 +1187,7 @@
               <span id="theBigChatCount" class="hint" aria-live="polite"></span>
               <span id="theBigChatSaidBack" class="hint" role="status" aria-live="polite"></span>
             </div>
+            <p id="theBigChatWorkStatus" class="hint" role="status" aria-live="polite" hidden></p>
               </div>
             </div>
           </div>
@@ -1138,6 +1234,91 @@
         <ol id="swarmExchangeList" class="swarm-exchange-list"
           aria-labelledby="swarmExchangeTitle"></ol>
       </details>
+
+      <section id="missionControl" class="mission-control" aria-labelledby="missionControlTitle">
+        <div class="mission-heading">
+          <div>
+            <h2 id="missionControlTitle">Mission control</h2>
+            <p id="missionGoalSummary" class="hint">Start a project goal to see durable work here.</p>
+          </div>
+          <label for="missionGoalSelect">Goal
+            <select id="missionGoalSelect" aria-label="Long-horizon goal"></select>
+          </label>
+        </div>
+        <div class="mission-controls button-row" role="group" aria-label="Goal controls">
+          <button id="missionPause" type="button">Pause</button>
+          <button id="missionResume" type="button">Resume</button>
+          <button id="missionCancel" class="danger" type="button">Cancel</button>
+          <button id="missionFork" type="button">Fork safely</button>
+          <button id="missionRefresh" type="button">Refresh</button>
+        </div>
+        <div id="missionProgress" class="mission-progress" role="status" aria-live="polite"></div>
+        <section id="missionProviderSetupChanged" class="mission-provider-setup-changed"
+          role="alert" aria-labelledby="missionProviderSetupChangedTitle" hidden>
+          <h3 id="missionProviderSetupChangedTitle">Saved provider setup changed — old goal protected</h3>
+          <p id="missionProviderSetupChangedMessage"></p>
+          <ul id="missionProviderSetupChangedAgents"></ul>
+          <p class="hint">Nexus will not redirect this goal’s history to the current provider setup.
+            You can keep the old goal for inspection. To continue the work, review the current board,
+            cancel the protected old goal when ready, then start the current board as a new goal.</p>
+          <div class="button-row">
+            <button id="missionProviderSetupReview" type="button">Review current board setup</button>
+            <button id="missionProviderSetupPrepare" class="primary" type="button">Cancel old goal and prepare a new one</button>
+          </div>
+        </section>
+        <details>
+          <summary>Edit success criteria</summary>
+          <label for="missionCriteria">One criterion per line</label>
+          <textarea id="missionCriteria" rows="4" maxlength="12000"></textarea>
+          <button id="missionCriteriaSave" type="button">Save revision</button>
+        </details>
+        <details open>
+          <summary>Tasks and dependencies</summary>
+          <div id="missionTasks" class="mission-task-board"></div>
+        </details>
+        <details open>
+          <summary>Agents</summary>
+          <div id="missionAgents" class="mission-agent-list"></div>
+        </details>
+        <details id="missionInboxBox" open>
+          <summary>Decision inbox <span id="missionInboxCount"></span></summary>
+          <div id="missionInbox" class="mission-inbox"></div>
+        </details>
+        <details>
+          <summary>Artifacts, diffs, tests, and reviews</summary>
+          <div id="missionEvidence" class="mission-evidence"></div>
+        </details>
+        <details open>
+          <summary>Typed event timeline</summary>
+          <label for="missionEventFilter">Filter
+            <select id="missionEventFilter">
+              <option value="">Everything</option>
+              <option value="task">Tasks</option>
+              <option value="provider">Provider calls</option>
+              <option value="artifact">Artifacts</option>
+              <option value="review">Reviews</option>
+              <option value="interrupt">Questions</option>
+              <option value="goal">Goal controls</option>
+            </select>
+          </label>
+          <ol id="missionEvents" class="mission-events"></ol>
+        </details>
+        <div class="mission-steer">
+          <label for="missionSteer">Steer the goal or selected task</label>
+          <textarea id="missionSteer" rows="3" maxlength="20000"
+            placeholder="Add a constraint, correct course, or message an agent…"></textarea>
+          <div class="button-row">
+            <button id="missionSteerSend" type="button">Steer goal</button>
+            <button id="missionMessageAgent" type="button">Message selected agent</button>
+            <button id="missionRequestReview" type="button">Request targeted review</button>
+            <label for="missionReassignAgent">Reassign to
+              <select id="missionReassignAgent"></select>
+            </label>
+            <button id="missionReassign" type="button">Reassign selected task</button>
+            <button id="missionRetry" type="button">Retry selected task</button>
+          </div>
+        </div>
+      </section>
     </section>
 
     <aside id="swarmPanel" class="swarm-panel" aria-labelledby="swarmPanelTitle">
@@ -1158,11 +1339,30 @@
         <select id="swarmAgentWho">
           <option value="">Not chosen yet</option>
         </select>
-        <div class="button-row swarm-agent-session-actions" aria-label="Assistant session actions">
-          <button id="swarmAgentCheckLogin" type="button">Check if logged in</button>
-          <button id="swarmAgentManualLogin" type="button">Log in manually</button>
-        </div>
-        <p id="swarmAgentSessionStatus" class="field-help" role="status" aria-live="polite"></p>
+        <p id="swarmAgentRouteIdentity" class="swarm-agent-route-identity" role="status"></p>
+        <section id="swarmAgentRepair" class="swarm-agent-repair" data-tone="idle"
+          aria-labelledby="swarmAgentRepairTitle">
+          <div class="swarm-agent-repair-heading">
+            <strong id="swarmAgentRepairTitle">Connection</strong>
+            <span id="swarmAgentRepairBadge" class="swarm-agent-repair-badge">Not checked</span>
+          </div>
+          <p id="swarmAgentSessionStatus" class="swarm-agent-repair-summary"
+            role="status" aria-live="polite">Choose an assistant first.</p>
+          <ol id="swarmAgentRepairSteps" class="swarm-agent-repair-steps" hidden></ol>
+          <div class="button-row swarm-agent-session-actions" aria-label="Assistant connection repair actions">
+            <button id="swarmAgentRepairStart" class="primary" type="button">Repair connection</button>
+            <button id="swarmAgentRepairAction" class="primary" type="button" hidden>Continue repair</button>
+            <button id="swarmAgentLiveTest" type="button" hidden>Run live test</button>
+            <button id="swarmAgentCheckLogin" type="button" hidden>Check again</button>
+            <button id="swarmAgentManualLogin" type="button" hidden>Open sign-in</button>
+            <button id="swarmAgentStopTest" class="danger" type="button" hidden>Stop test</button>
+          </div>
+          <div id="swarmAgentRepairChoices" class="button-row swarm-agent-repair-choices"
+            aria-label="Additional connection recovery choices" hidden></div>
+          <p id="swarmAgentRepairActionNote" class="field-help"></p>
+          <p class="swarm-agent-repair-privacy">Diagnosis is free and never sends a model prompt.
+            A live test is always a separate press and uses one model request in an empty temporary folder.</p>
+        </section>
 
         <label for="swarmAgentJob">What it is for</label>
         <textarea id="swarmAgentJob" rows="4" aria-describedby="swarmAgentJobCount"
@@ -1475,16 +1675,21 @@
       <label for="teamModelWayIn">How it is reached</label>
       <select id="teamModelWayIn"></select>
       <p id="teamModelWayMeans" class="hint"></p>
+      <label for="teamModelProvider">Provider</label>
+      <select id="teamModelProvider" aria-describedby="teamModelProviderMeans"></select>
+      <p id="teamModelProviderMeans" class="hint"></p>
       <label for="teamModelRoute">A short name for it</label>
       <input id="teamModelRoute" type="text" maxlength="40" placeholder="my-model">
       <label for="teamModelModel">Which model</label>
       <input id="teamModelModel" type="text" maxlength="120" placeholder="qwen2.5-coder:7b">
-      <label for="teamModelEndpoint">Address, if it is not the usual one</label>
-      <input id="teamModelEndpoint" type="text" maxlength="300" placeholder="http://127.0.0.1:11434">
+      <label for="teamModelEndpoint">Provider address</label>
+      <input id="teamModelEndpoint" type="text" maxlength="300"
+        aria-describedby="teamModelEndpointHelp" placeholder="http://127.0.0.1:11434">
+      <p id="teamModelEndpointHelp" class="hint">The customary address is filled in. Change it only when your provider or gateway uses another one.</p>
       <label for="teamModelKeyName">Which environment variable holds the key</label>
-      <input id="teamModelKeyName" type="text" maxlength="64" placeholder="OPENAI_API_KEY">
-      <p class="hint">The name of the variable, never the key itself. The harness reads the
-        key from there when it runs, so nothing secret is written down.</p>
+      <input id="teamModelKeyName" type="text" maxlength="64"
+        aria-describedby="teamModelKeyHelp" placeholder="OPENAI_API_KEY">
+      <p id="teamModelKeyHelp" class="hint">This is only the variable name. Never paste the key itself here.</p>
       <p id="teamModelSaid" class="hint" role="status"></p>
       <div class="dialog-buttons">
         <button id="teamModelCancel" type="button">Cancel</button>
@@ -1612,6 +1817,18 @@
         </div>
         <label class="check-row"><input id="moreOptionsEnabled" type="checkbox"> Enable More options</label>
       </div>
+      <section id="desktopSettingsRecoveryCard" class="desktop-settings-recovery-card"
+        aria-labelledby="desktopSettingsRecoveryTitle">
+        <div>
+          <h3 id="desktopSettingsRecoveryTitle">Desktop settings recovery</h3>
+          <p id="desktopSettingsRecoveryMessage">Checking whether the saved desktop settings copies agree.</p>
+        </div>
+        <div class="button-row">
+          <button id="desktopSettingsRecoveryRestore" class="primary" type="button" hidden>Restore recovered web chats</button>
+          <button id="desktopSettingsRecoveryDiscard" type="button" hidden>Discard recovered web chats</button>
+        </div>
+        <p id="desktopSettingsRecoveryResult" class="field-help" role="status" aria-live="polite"></p>
+      </section>
       <p id="settingsSaid" class="field-help" role="status">Reading your settings.</p>
       <div id="settingsList" class="settings-list"></div>
     </section>

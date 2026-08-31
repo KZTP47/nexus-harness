@@ -12,9 +12,10 @@ A local test lab and coding assistant for your project. It writes and runs your
 checks, tells you plainly what broke, and can ask a model to fix it — all on
 your own machine.
 
-Python 3.11 or newer. The core uses only the standard library: no packages to
-install and no account to create. The installed Windows app already contains
-its private verification runtime. A source checkout transparently downloads
+Python 3.11 or newer. Source installation brings the bounded LangGraph runtime
+dependencies declared in `pyproject.toml`; no model account is required when
+you use a local provider. The installed Windows app already contains its
+private verification runtime. A source checkout transparently downloads
 the pinned official CPython embeddable archive from `python.org` the first time
 it must run a contained Python verification, checks its SHA-256 before use, and
 caches it for that Windows user. No project code or project data is sent with
@@ -109,8 +110,6 @@ opened through Nexus. A project box is a real local folder. The lines between
 them are not decoration: they say which agent works on which project and which
 two agents are allowed to exchange messages.
 
-![The AI Agent Swarm orchestrator board](docs/images/agent-swarm-board.png)
-
 On this board you can:
 
 - add agents and project folders, move them freely, tidy the layout, zoom, or
@@ -138,12 +137,15 @@ state too, so switching chats does not silently carry the previous folder into
 the next one.
 
 Ordinary chat is read-only with respect to project files. A file-changing task
-uses the explicit **Work together on project files** action, gathers structured
-contributions, validates the bounded transaction, checks the baseline, and
-keeps rollback material. That makes the board useful for real project work
-without making every message an implicit write permission.
+uses the explicit **Work on project files** action and starts a durable,
+event-driven goal. One agent may finish it alone; Nexus delegates, hands off,
+or requests an independent review only when the task or risk calls for it.
+Mission control shows the task graph, owners, questions, diffs, tests, budgets,
+and event history. The older paired plan/review/execute loop remains available
+behind the clearly labelled **Use legacy paired workflow** action.
 
-See [AGENT_BOARD.md](docs/AGENT_BOARD.md) for the board model and
+See [LONG_HORIZON_GOALS.md](docs/LONG_HORIZON_GOALS.md) for the goal engine,
+[AGENT_BOARD.md](docs/AGENT_BOARD.md) for the board model, and
 [TALK_TO_THEM.md](docs/TALK_TO_THEM.md) for conversations and collaboration.
 
 ### visual test automation
@@ -268,7 +270,7 @@ first.
 ## Install
 
 The released Windows app is self-contained. Source development requires
-Python 3.11+; building Electron also requires Node.js.
+Python 3.11+; building Electron also requires Node.js 22.12+.
 
 ```bash
 git clone https://github.com/KZTP47/nexus-harness.git
@@ -328,8 +330,11 @@ it would remove without changing anything, use
 python -m pip install ".[test]"
 ```
 
-Or build a single self-contained file and a launcher, with no pip and no
-network:
+The legacy zipapp launchers below package Nexus's own Python source, but they
+reuse the selected Python installation and its installed dependencies. They are
+intended for the dependency-light core CLI, not as an offline or self-contained
+desktop installation. Install the project first with `pip install ".[test]"`
+if you need the long-horizon engine through this route:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
@@ -339,9 +344,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 sh ./scripts/install.sh
 ```
 
-Or run it straight out of the folder, with nothing installed at all. The code
+Or run the dependency-light core CLI/UI straight out of the folder. The code
 lives in `src`, which Python does not look in by itself, so there is a launcher
-that puts it on the path for you:
+that puts it on the path for you. Install `.[test]` first if the UI must run
+long-horizon goals or other features backed by the declared runtime packages:
 
 ```bash
 python scripts/harness.py ui
@@ -428,13 +434,20 @@ Most organisations have seats, not keys — somebody signed in to Claude,
 somebody signed in to Copilot. Both come with a command line tool that is
 already signed in, and the harness can drive either of them.
 
-![Your team](docs/images/your-team.png)
-
 The team tab looks on your machine, says who it found and whether each one is
 ready, and draws a team you can change: a box per assistant with a job on it,
 an arrow per hand-over. The ready-made one has the first assistant plan the
 work, the second write it, and the first read that work back — because two
 assistants trained apart tend not to share a blind spot.
+
+On a new computer, open **Your team** and press **Add another model**. Choose
+whether it runs locally or uses a key, then choose OpenAI, Anthropic, Google
+Gemini, Ollama, or an OpenAI-compatible service. Nexus fills the provider's
+customary address and environment-variable name; you only choose the model and
+a short route name. The window asks for the *name* of the key variable and
+never for the secret itself. Nexus validates the complete candidate settings
+before replacing the last working configuration, so a typo remains a visible,
+repairable form error instead of breaking the next launch.
 
 A job is only ever offered to an assistant really found here, and a team that
 could not run is never saved. A saved team is an ordinary workflow file, so
@@ -446,8 +459,6 @@ See [YOUR_TEAM.md](docs/YOUR_TEAM.md).
 
 A box to type in, and whichever assistant you have hooked up answers.
 
-![Talk to them](docs/images/talk-to-them.png)
-
 Everything set up on this machine is in the list on the left. Pick one and
 type. It is a conversation, not a row of unrelated questions - what was said
 before goes with the next thing you say - and it is kept, so you can close the
@@ -458,11 +469,13 @@ the same time, and lays the answers side by side. That is what two
 subscriptions are actually for: one model's blind spot is not usually the
 other's.
 
-**Send** decides whether the selected agent should answer directly or ask its
-ready, green-line-connected peers first. It can automatically relay, but it can
-never change project files. You can attach bounded text files and screenshots
-for the agents to inspect. **Ask connected agents** forces that relay when you
-want it regardless of the automatic decision. In the full board chat, a left
+**Send** talks only to the selected agent. Nexus does not automatically turn a
+pair chat into a multi-agent ritual. It can never change project files. You can
+attach bounded text files and screenshots for the agent to inspect. **Ask
+connected agents** starts collaboration explicitly when you want it. If an
+agent needs a decision, Nexus can show an inline question card with recommended
+options and a custom-answer field, then continue the same conversation after
+you answer. In the full board chat, a left
 pane keeps multiple durable chats for each exact two-agent pair, and each chat
 has its own active-project dropdown. **Work together on project files** gathers
 structured contributions from that pair and applies validated,
@@ -860,8 +873,6 @@ the code, and the two send notes to each other as they go.
 
 Open `harness ui`, stay on the Start view, and work down the three steps.
 
-![Setting up the assistants you already pay for](docs/images/seats.png)
-
 1. **Find the assistants.** It looks for each tool on this machine, asks its
    version, and says which ones are ready. If one is missing it tells you what
    to install.
@@ -1051,8 +1062,8 @@ Cloning a repository never gives that repository the right to run code.
 PYTHONPATH=src python -m unittest discover -s tests -t tests -q
 ```
 
-1324 tests, no test dependencies beyond the standard library. The project also
-checks itself with its own tool:
+The complete Python suite uses the test dependencies declared in
+`pyproject.toml`. The project also checks itself with its own tool:
 
 ```bash
 PYTHONPATH=src python -m our_harness qa run --suite .harness/qa/suite.json

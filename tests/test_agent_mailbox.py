@@ -347,6 +347,23 @@ class SubscriptionConnectionState(unittest.TestCase):
         self.assertEqual(found["authentication"], "unknown")
         self.assertEqual(found["state"], "installed")
 
+    def test_a_configuration_error_is_not_mistaken_for_being_signed_out(self) -> None:
+        with mock.patch.object(subscription_cli, "available", return_value="codex.exe"), \
+             mock.patch.object(
+                 subscription_cli, "_run_bounded",
+                 return_value=self.result(
+                     1,
+                     error=(
+                         "Error loading configuration: config.toml:5:16: "
+                         "unknown variant `default`, expected `fast` or `flex`"
+                     ),
+                 ),
+             ):
+            found = subscription_cli.connection_status("codex-cli")
+        self.assertEqual(found["authentication"], "unknown")
+        self.assertEqual(found["state"], "configuration-error")
+        self.assertIn("unknown variant", found["problem"])
+
     @unittest.skipUnless(subscription_cli.os.name == "nt", "Windows login window")
     def test_interactive_login_never_captures_credentials_or_output(self) -> None:
         started = mock.Mock(pid=42)
@@ -355,10 +372,32 @@ class SubscriptionConnectionState(unittest.TestCase):
              mock.patch.object(subscription_cli.subprocess, "Popen", return_value=started) as popen:
             found = subscription_cli.start_interactive_login("claude-cli")
         call = popen.call_args
-        self.assertEqual(call.args[0], ["claude.exe", "auth", "login"])
+        self.assertEqual(call.args[0][:4], [
+            subscription_cli.os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/k",
+        ])
+        self.assertIn("claude.exe", call.args[0][4])
+        self.assertIn("auth login", call.args[0][4])
         self.assertIsNone(call.kwargs["stdout"])
         self.assertIsNone(call.kwargs["stderr"])
         self.assertNotIn("account", json.dumps(found).lower())
+
+    @unittest.skipUnless(subscription_cli.os.name == "nt", "Windows login window")
+    def test_interactive_login_keeps_the_exact_quoted_command_visible(self) -> None:
+        started = mock.Mock(pid=43)
+        program = r"C:\Program Files\Codex\codex.cmd"
+        configured = [program, "--profile", "work"]
+        with mock.patch.object(
+                subscription_cli, "available", return_value=program), \
+             mock.patch.object(subscription_cli.subprocess, "Popen", return_value=started) as popen:
+            subscription_cli.start_interactive_login("codex-cli", command=configured)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:4], [
+            subscription_cli.os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/k",
+        ])
+        self.assertEqual(
+            command[4],
+            subscription_cli.subprocess.list2cmdline([*configured, "login"]),
+        )
 
     @unittest.skipUnless(subscription_cli.os.name == "nt", "Windows repair window")
     def test_claude_repair_is_visible_fixed_and_captures_nothing(self) -> None:
@@ -380,6 +419,31 @@ class SubscriptionConnectionState(unittest.TestCase):
         self.assertIsNone(call.kwargs["stderr"])
         self.assertFalse(call.kwargs["shell"])
         self.assertNotIn("account", json.dumps(found).lower())
+
+    @unittest.skipUnless(subscription_cli.os.name == "nt", "Windows repair window")
+    def test_claude_repair_keeps_the_exact_configured_route_command(self) -> None:
+        started = mock.Mock(pid=85)
+        program = r"C:\Program Files\Claude Work\claude.cmd"
+        configured = [program, "--profile", "work"]
+        with mock.patch.object(
+                subscription_cli, "available", return_value=program) as available, \
+             mock.patch.object(subscription_cli.subprocess, "Popen", return_value=started) as popen:
+            subscription_cli.start_claude_repair(command=configured)
+
+        available.assert_called_once_with("claude-cli", configured)
+        terminal_command = popen.call_args.args[0]
+        expected_chain = " && ".join(
+            subscription_cli.subprocess.list2cmdline(one)
+            for one in (
+                [*configured, "update"],
+                [*configured, "auth", "logout"],
+                [*configured, "auth", "login"],
+            )
+        )
+        self.assertEqual(terminal_command, [
+            subscription_cli.os.environ.get("COMSPEC", "cmd.exe"),
+            "/d", "/s", "/k", expected_chain,
+        ])
 
 
 if __name__ == "__main__":

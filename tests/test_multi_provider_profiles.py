@@ -324,6 +324,33 @@ class NativeToolAdapterTests(unittest.TestCase):
             result = payloads[1]["messages"][-1]["content"][0]
             self.assertEqual(result["tool_use_id"], "call-a")
 
+    def test_anthropic_payload_respects_model_sampling_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = AnthropicProvider(
+                self.provider_config(Path(temporary), "anthropic")
+            )
+            for model in (
+                "claude-fable-5",
+                "claude-mythos-5",
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-sonnet-5-20260801",
+                "claude-opus-4.7",
+                "claude-opus-4-8-20260801",
+            ):
+                with self.subTest(model=model):
+                    payload, _ = provider._payload(
+                        request(model=model, temperature=0.2), stream=False
+                    )
+                    self.assertNotIn("temperature", payload)
+                    self.assertNotIn("top_p", payload)
+                    self.assertNotIn("top_k", payload)
+
+            older, _ = provider._payload(
+                request(model="claude-sonnet-4-6", temperature=0.2), stream=False
+            )
+            self.assertEqual(older["temperature"], 0.2)
+
     def test_anthropic_requires_an_explicit_stop_reason(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             provider = AnthropicProvider(

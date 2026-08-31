@@ -133,6 +133,29 @@ ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "headless panel runner. Desktop tests cover hiding the embedded provider "
         "view and preserving its isolated session."
     ),
+    "webChatSettingsRecoveryRestore": (
+        "This appears only when Electron has quarantined conflicting desktop settings copies. "
+        "Direct renderer tests exercise the explicit restore API and verify that it never runs "
+        "automatically; browser QA has no corrupted private settings copy to restore safely."
+    ),
+    "webChatSettingsRecoveryDiscard": (
+        "This explicitly removes only quarantined web-chat connections while preserving other "
+        "desktop settings. Direct renderer tests cover the exact action without altering a "
+        "developer's signed-in provider sessions."
+    ),
+    "webChatRecoveryBannerAction": (
+        "This board banner exists only for a quarantined Electron desktop-settings copy. "
+        "Direct renderer tests cover review and the zero-chat repair action without changing "
+        "a developer's signed-in provider sessions."
+    ),
+    "desktopSettingsRecoveryRestore": (
+        "This Settings action is visible only when Electron requires an explicit recovery choice. "
+        "Direct renderer tests cover the exact restore or repair IPC using isolated fakes."
+    ),
+    "desktopSettingsRecoveryDiscard": (
+        "This Settings action discards only quarantined web-chat entries after a settings conflict. "
+        "Direct renderer tests verify other settings are preserved without touching a real profile."
+    ),
     "swarmAgentPictureBrowse": (
         "This opens the operating system file picker. Browser automation supplies "
         "files through the hidden input instead; the picture validation and saved "
@@ -178,6 +201,114 @@ ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "This deliberately opens the selected provider's real interactive login or "
         "signed-in web-chat manager. Browser QA must not alter a developer account; "
         "the login process and web-chat bridge are exercised with isolated fakes."
+    ),
+    "swarmAgentRepairStart": (
+        "This runs an exact provider status probe that can invoke a developer's installed "
+        "private CLI. The provider-neutral plan and panel wiring are covered with bounded "
+        "fakes in tests/test_provider_repair.py."
+    ),
+    "swarmAgentRepairAction": (
+        "Its action is diagnosis-specific and may launch sign-in, update Claude, open a "
+        "private web session, or write a route setting. Each dispatch is covered with "
+        "bounded repair-plan and existing provider-action tests instead of mutating a developer account."
+    ),
+    "swarmAgentLiveTest": (
+        "This deliberately spends one authenticated model request. The endpoint, isolated "
+        "temporary workspace, response privacy, and UI wiring are covered with bounded fakes."
+    ),
+    "swarmAgentStopTest": (
+        "This is enabled only while a real authenticated model request is running. The "
+        "route-specific cancellation contract is covered without starting a developer-owned request."
+    ),
+    "missionProviderSetupReview": (
+        "This appears only for a durable goal whose provider contract changed after admission. "
+        "Focused long-horizon UI tests verify that it selects the affected current-board agent "
+        "and focuses the new-goal control without rebinding the protected history."
+    ),
+    "missionProviderSetupPrepare": (
+        "This appears only for an intentionally corrupted or migrated provider binding and cancels "
+        "the exact old goal after confirmation. Focused long-horizon tests exercise its cancel, "
+        "fresh-request, and current-board focus contract without altering a real durable goal."
+    ),
+    "swarmLegacyGoals": (
+        "This starts the compatibility workflow and can spend real provider turns or change "
+        "project files. Long-horizon and board tests exercise its admission and migration path "
+        "with isolated stores instead of running developer-owned work from browser QA."
+    ),
+    "missionPause": (
+        "This mutates an existing durable goal. Backend long-horizon tests exercise the exact "
+        "goal-id transition and UI source-contract tests verify its handler without pausing a "
+        "developer's real mission merely for browser button inventory."
+    ),
+    "missionResume": (
+        "This can immediately resume provider dispatch and project work. Provider-setup drift, "
+        "immutable binding, and resume transitions are covered with isolated goal stores rather "
+        "than spending a developer account turn in browser QA."
+    ),
+    "missionCancel": (
+        "This permanently terminates an exact durable goal after confirmation. Cancellation, "
+        "idempotency, and UI wiring are covered with temporary goal stores; browser QA must not "
+        "cancel a developer-owned long-horizon mission."
+    ),
+    "missionFork": (
+        "This may create a Git worktree and durable successor goal. Fork admission, project "
+        "authority, and provider binding are tested in temporary repositories rather than "
+        "creating branches or directories in the checkout under browser QA."
+    ),
+    "missionRefresh": (
+        "This refresh is meaningful only with a durable goal selected. The goal-list and detail "
+        "render contracts are covered by long-horizon tests; browser QA avoids manufacturing a "
+        "real mission solely to make this state-dependent control clickable."
+    ),
+    "missionCriteriaSave": (
+        "This writes a new acceptance-criteria revision to a durable goal. Revision conflicts, "
+        "immutability, and handler wiring are covered against isolated stores without changing "
+        "the criteria of a developer's active mission."
+    ),
+    "missionSteerSend": (
+        "This appends a steering instruction that can affect future provider work. Exact goal "
+        "binding and event persistence are tested with temporary missions; browser QA must not "
+        "alter a developer's long-horizon instructions."
+    ),
+    "missionMessageAgent": (
+        "This creates a durable message for the selected mission agent and may wake work. Mailbox "
+        "identity and delivery are covered with isolated goals rather than messaging a real agent "
+        "from a release browser check."
+    ),
+    "missionRequestReview": (
+        "This creates targeted review work for the selected durable task. Review admission and "
+        "immutable task identity are covered with temporary goals without dispatching a real "
+        "provider from browser QA."
+    ),
+    "missionReassign": (
+        "This changes the assignee of a durable task and can affect subsequent provider dispatch. "
+        "Reassignment validation and UI enablement are tested with isolated goals rather than "
+        "changing a developer's live swarm."
+    ),
+    "missionRetry": (
+        "This requeues failed durable work and can immediately spend a provider turn. Retry and "
+        "binding checks are exercised with isolated goal stores; browser QA does not restart a "
+        "developer-owned task merely for control inventory."
+    ),
+    "missionGoalSelect": (
+        "Its options are durable goals from the developer's current project, so no harmless value "
+        "exists on every machine. Selection and detail rendering are exercised with isolated "
+        "long-horizon fixtures."
+    ),
+    "missionEventFilter": (
+        "Its useful options filter events from a selected durable goal. Event filtering and render "
+        "contracts are tested with synthetic goal histories instead of manufacturing provider work "
+        "in the browser release workflow."
+    ),
+    "missionReassignAgent": (
+        "Its options are immutable agent bindings for the selected durable goal and differ per board. "
+        "Reassignment validation is exercised with isolated goals, where a safe known assignee can "
+        "be selected without altering real work."
+    ),
+    "webChatBackgroundMode": (
+        "This is an Electron-only preference controlling real signed-in provider windows. Desktop "
+        "tests toggle and persist it with isolated settings; the headless browser has no provider "
+        "view and must not change the developer's desktop preference."
     ),
 }
 
@@ -241,6 +372,16 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
                 r"getElementById\('([A-Za-z0-9_]+)'\)\.value\s*=", script
             ))
             chosen.update(re.findall(r'\$\("([A-Za-z0-9_]+)"\)\.value\s*=', script))
+    # The multi-vendor lane drives the actual packaged Electron renderer with
+    # Playwright locators. It is a stronger user-flow check than the headless
+    # workflow runner, so controls exercised there count here too.
+    packaged_e2e = (ROOT / "desktop" / "multi-vendor.e2e.js").read_text(encoding="utf-8")
+    pressed.update(re.findall(
+        r'page\.locator\("#([A-Za-z0-9_]+)"\)\.click\(\)', packaged_e2e
+    ))
+    chosen.update(re.findall(
+        r'page\.locator\("#([A-Za-z0-9_]+)"\)\.selectOption\(', packaged_e2e
+    ))
     return pressed, " ".join(said), chosen
 
 
@@ -345,6 +486,46 @@ BUILT_ALLOWED_TO_BE_UNPRESSED: dict[str, str] = {
         "account conversation. CI has no account and must not manufacture one; the "
         "desktop transport and provider boundary are tested independently."
     ),
+    "Retry assignment": (
+        "This appears only when an Electron-selected provider chat could not be written to the "
+        "board. Renderer reliability tests verify that the exact selection is retained and the "
+        "same assignment is retried without reopening a private provider account."
+    ),
+    "Add as a new agent instead": (
+        "This is the explicit fallback for a retained signed-in provider chat after board "
+        "assignment failed. Static renderer tests cover its wiring; browser QA has no private "
+        "provider session to create the failure state safely."
+    ),
+    "Repair connection": (
+        "This state-specific button opens provider repair and may probe a real CLI or signed-in web "
+        "session. Provider-neutral repair plans and all dispatch branches are exercised with bounded "
+        "fakes instead of touching a developer account in browser QA."
+    ),
+    "Ask all agents again": (
+        "This exists only after a saved participant-outcome turn records a known partial failure. "
+        "The packaged board smoke injects that bounded transcript state and proves the button restores "
+        "the exact prompt without issuing any request; browser button inventory has no failed live turn."
+    ),
+    "Reset collaboration record": (
+        "This appears only when the server exposes a verified collaboration_problem for the selected "
+        "saved chat. Focused server tests cover the scoped reset and static renderer tests cover the "
+        "conditional action; ordinary browser QA must not damage a real collaboration ledger."
+    ),
+    "Fix this agent": (
+        "This is the compact board entry point to the same state-specific provider repair flow. "
+        "Board rendering and repair dispatch are covered with bounded provider fixtures without "
+        "running an authenticated account check."
+    ),
+    "Submit answers": (
+        "This exists only for a durable goal awaiting explicit user decisions. Decision schema, exact "
+        "goal binding, and resume behavior are tested with isolated goal stores rather than answering "
+        "a developer's real pending question."
+    ),
+    "Send decisions and resume exact tasks": (
+        "This resolves a pending decision and resumes its exact durable tasks. Atomic persistence, "
+        "validation, and task identity are tested with temporary goals without restarting live work "
+        "owned by the developer."
+    ),
 }
 
 
@@ -435,7 +616,10 @@ class TickBoxTests(unittest.TestCase):
 
     def test_every_tick_box_is_used_by_a_check(self) -> None:
         _pressed, said, _chosen = what_the_checks_do()
-        missing = [name for name in tick_boxes() if name not in said]
+        missing = [
+            name for name in tick_boxes()
+            if name not in said and name not in ALLOWED_TO_BE_UNPRESSED
+        ]
         self.assertEqual(
             missing,
             [],

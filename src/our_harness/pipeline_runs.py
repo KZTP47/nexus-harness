@@ -19,7 +19,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-from typing import Any, Iterator
+from typing import Any, Iterator, NamedTuple
 import uuid
 
 from .config import LoadedConfig
@@ -37,6 +37,11 @@ AUTHORITY_REGISTRY = "authority-registry.sqlite3"
 INTEGRITY_KEY = "integrity.key"
 INTEGRITY_ANCHOR = "integrity.anchor"
 _REQUEST_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@+\-]{0,199}\Z")
+_WINDOWS_FILESYSTEM_KEY_PREFIX = "win-file-id-v1:"
+_WINDOWS_FILESYSTEM_KEY = re.compile(
+    rf"{re.escape(_WINDOWS_FILESYSTEM_KEY_PREFIX)}([0-9a-f]{{8}}):([0-9a-f]{{16}})\Z"
+)
+_LEGACY_FILESYSTEM_KEY = re.compile(r"(-?\d+):(\d+)\Z")
 
 
 class PipelineRunConflict(HarnessError):
@@ -141,14 +146,102 @@ def _runtime_base() -> Path:
     return (base / "our-harness" / "pipeline-runs").resolve()
 
 
-def _filesystem_key(root: Path) -> str:
+class _FilesystemIdentity(NamedTuple):
+    key: str
+    legacy_inode: int
+
+
+def _windows_file_id(root: Path) -> tuple[int, int]:
+    """Return the native, unsigned Windows volume and directory file IDs."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation)]
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    native_path = str(root)
+    if not native_path.startswith("\\\\?\\"):
+        if native_path.startswith("\\\\"):
+            native_path = "\\\\?\\UNC\\" + native_path[2:]
+        else:
+            native_path = "\\\\?\\" + native_path
+    handle = create_file(
+        native_path,
+        0x0080,  # FILE_READ_ATTRIBUTES
+        0x0001 | 0x0002 | 0x0004,  # FILE_SHARE_READ | WRITE | DELETE
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), "CreateFileW could not open the project root")
+    information = ByHandleFileInformation()
+    try:
+        if not get_information(handle, ctypes.byref(information)):
+            raise OSError(
+                ctypes.get_last_error(),
+                "GetFileInformationByHandle could not identify the project root",
+            )
+    finally:
+        close_handle(handle)
+    file_id = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)
+    return int(information.dwVolumeSerialNumber), file_id
+
+
+def _filesystem_identity(root: Path) -> _FilesystemIdentity:
     metadata = root.stat()
-    device, inode = int(metadata.st_dev), int(metadata.st_ino)
+    inode = int(metadata.st_ino)
     if inode <= 0:
         raise PipelineRunConflict(
             "This filesystem does not expose a stable project identity; automation runs are paused."
         )
-    return f"{device}:{inode}"
+    if os.name == "nt":
+        try:
+            volume_serial, file_id = _windows_file_id(root)
+        except (AttributeError, OSError) as exc:
+            raise PipelineRunConflict(
+                "Windows could not expose a stable project identity; automation runs are paused."
+            ) from exc
+        if file_id <= 0:
+            raise PipelineRunConflict(
+                "Windows did not expose a stable project identity; automation runs are paused."
+            )
+        return _FilesystemIdentity(
+            f"{_WINDOWS_FILESYSTEM_KEY_PREFIX}{volume_serial:08x}:{file_id:016x}",
+            inode,
+        )
+    return _FilesystemIdentity(f"{int(metadata.st_dev)}:{inode}", inode)
+
+
+def _filesystem_key(root: Path) -> str:
+    return _filesystem_identity(root).key
 
 
 def _reject_reparse_or_link(path: Path) -> None:
@@ -215,6 +308,74 @@ def _authority_schema(connection: sqlite3.Connection) -> None:
                updated_at_ms INTEGER NOT NULL
            )"""
     )
+
+
+def _authority_rows(
+    connection: sqlite3.Connection, *, described_id: str,
+    filesystem_key: str, canonical_path: str,
+) -> tuple[sqlite3.Row | None, sqlite3.Row | None, sqlite3.Row | None]:
+    by_identity = connection.execute(
+        "SELECT * FROM project_authorities WHERE filesystem_key=?", (filesystem_key,)
+    ).fetchone()
+    by_path = connection.execute(
+        "SELECT * FROM project_authorities WHERE canonical_path=?", (canonical_path,)
+    ).fetchone()
+    by_descriptor = connection.execute(
+        "SELECT * FROM project_authorities WHERE project_authority_id=?", (described_id,)
+    ).fetchone() if described_id else None
+    return by_identity, by_path, by_descriptor
+
+
+def _migrate_legacy_windows_filesystem_key(
+    connection: sqlite3.Connection, *, identity: _FilesystemIdentity,
+    described_id: str, canonical_path: str,
+    by_identity: sqlite3.Row | None, by_path: sqlite3.Row | None,
+    by_descriptor: sqlite3.Row | None,
+) -> bool:
+    """Upgrade only a legacy row proven to describe this exact directory.
+
+    Old keys used CPython's integer representation of ``st_dev``.  Windows
+    runtimes have exposed both the raw volume serial and a wider value whose
+    low 32 bits are that same serial.  Migration therefore requires both that
+    native volume serial and the native file ID/inode to agree.  A copied
+    descriptor cannot pass this test, while the same directory can still be
+    recognized after a runtime change or a rename.
+    """
+
+    native_match = _WINDOWS_FILESYSTEM_KEY.fullmatch(identity.key)
+    if native_match is None:
+        return False
+    if not described_id or by_identity is not None:
+        return False
+    if by_descriptor is None:
+        return False
+    if str(by_descriptor["project_authority_id"]) != described_id:
+        return False
+    if by_path is not None and str(by_path["project_authority_id"]) != described_id:
+        return False
+    legacy_key = str(by_descriptor["filesystem_key"])
+    legacy_match = _LEGACY_FILESYSTEM_KEY.fullmatch(legacy_key)
+    if legacy_match is None:
+        return False
+    legacy_device = int(legacy_match.group(1))
+    legacy_inode = int(legacy_match.group(2))
+    native_volume = int(native_match.group(1), 16)
+    native_file_id = int(native_match.group(2), 16)
+    if legacy_device & 0xFFFFFFFF != native_volume:
+        return False
+    if legacy_inode != identity.legacy_inode or legacy_inode != native_file_id:
+        return False
+    changed = connection.execute(
+        "UPDATE project_authorities "
+        "SET filesystem_key=?,revision=revision+1,updated_at_ms=? "
+        "WHERE project_authority_id=? AND filesystem_key=? "
+        "AND canonical_path=? AND revision=?",
+        (
+            identity.key, _now_ms(), described_id, legacy_key,
+            str(by_descriptor["canonical_path"]), int(by_descriptor["revision"]),
+        ),
+    ).rowcount
+    return changed == 1
 
 
 def _authority_fingerprint(
@@ -293,7 +454,7 @@ def _authority_state_from_rows(
 
 
 def inspect_project_authority(project_root: Path) -> dict[str, Any]:
-    """Read execution authority status without creating stores or registrations."""
+    """Read status without registering; verified legacy identities may be upgraded."""
 
     supplied = project_root.expanduser().absolute()
     _reject_reparse_or_link(supplied)
@@ -303,7 +464,8 @@ def inspect_project_authority(project_root: Path) -> dict[str, Any]:
     if base == root or root in base.parents:
         raise PipelineRunConflict("Pipeline runtime storage must be outside the project tree.")
     described_id = _read_descriptor(root / AUTHORITY_DESCRIPTOR)
-    filesystem_key = _filesystem_key(root)
+    identity = _filesystem_identity(root)
+    filesystem_key = identity.key
     canonical_path = os.path.normcase(str(root))
     registry = base / AUTHORITY_REGISTRY
     if not registry.exists():
@@ -317,24 +479,38 @@ def inspect_project_authority(project_root: Path) -> dict[str, Any]:
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(
-            f"file:{registry.as_posix()}?mode=ro", uri=True, timeout=10.0
+            f"file:{registry.as_posix()}?mode=rw", uri=True, timeout=10.0
         )
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("PRAGMA synchronous=FULL")
         table = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_authorities'"
         ).fetchone()
         if table is None:
             by_identity = by_path = by_descriptor = None
         else:
-            by_identity = connection.execute(
-                "SELECT * FROM project_authorities WHERE filesystem_key=?", (filesystem_key,)
-            ).fetchone()
-            by_path = connection.execute(
-                "SELECT * FROM project_authorities WHERE canonical_path=?", (canonical_path,)
-            ).fetchone()
-            by_descriptor = connection.execute(
-                "SELECT * FROM project_authorities WHERE project_authority_id=?", (described_id,)
-            ).fetchone() if described_id else None
+            by_identity, by_path, by_descriptor = _authority_rows(
+                connection, described_id=described_id,
+                filesystem_key=filesystem_key, canonical_path=canonical_path,
+            )
+            migrated = _migrate_legacy_windows_filesystem_key(
+                connection, identity=identity, described_id=described_id,
+                canonical_path=canonical_path, by_identity=by_identity,
+                by_path=by_path, by_descriptor=by_descriptor,
+            )
+            migration_attempted = connection.in_transaction
+            if migrated:
+                connection.commit()
+            elif migration_attempted:
+                connection.rollback()
+            if migrated or migration_attempted:
+                # Another inspector may have won the conditional migration;
+                # report its committed result instead of a transient conflict.
+                by_identity, by_path, by_descriptor = _authority_rows(
+                    connection, described_id=described_id,
+                    filesystem_key=filesystem_key, canonical_path=canonical_path,
+                )
     except sqlite3.Error as exc:
         raise PipelineRunConflict("The project authority registry could not be verified.") from exc
     finally:
@@ -563,7 +739,8 @@ def project_identity(project_root: Path) -> str:
     registry = base / AUTHORITY_REGISTRY
     descriptor = root / AUTHORITY_DESCRIPTOR
     described_id = _read_descriptor(descriptor)
-    filesystem_key = _filesystem_key(root)
+    identity = _filesystem_identity(root)
+    filesystem_key = identity.key
     canonical_path = os.path.normcase(str(root))
     connection = sqlite3.connect(registry, timeout=10.0)
     connection.row_factory = sqlite3.Row
@@ -576,15 +753,19 @@ def project_identity(project_root: Path) -> str:
         _authority_schema(connection)
         connection.commit()
         connection.execute("BEGIN IMMEDIATE")
-        by_identity = connection.execute(
-            "SELECT * FROM project_authorities WHERE filesystem_key=?", (filesystem_key,)
-        ).fetchone()
-        by_path = connection.execute(
-            "SELECT * FROM project_authorities WHERE canonical_path=?", (canonical_path,)
-        ).fetchone()
-        by_descriptor = connection.execute(
-            "SELECT * FROM project_authorities WHERE project_authority_id=?", (described_id,)
-        ).fetchone() if described_id else None
+        by_identity, by_path, by_descriptor = _authority_rows(
+            connection, described_id=described_id,
+            filesystem_key=filesystem_key, canonical_path=canonical_path,
+        )
+        if _migrate_legacy_windows_filesystem_key(
+            connection, identity=identity, described_id=described_id,
+            canonical_path=canonical_path, by_identity=by_identity,
+            by_path=by_path, by_descriptor=by_descriptor,
+        ):
+            by_identity, by_path, by_descriptor = _authority_rows(
+                connection, described_id=described_id,
+                filesystem_key=filesystem_key, canonical_path=canonical_path,
+            )
         if described_id:
             if by_descriptor is None:
                 raise PipelineRunConflict(

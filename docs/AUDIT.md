@@ -8,7 +8,7 @@ The source harness was inspected read-only. The new package was written in a sep
 
 | Binding | Source examples | Portable replacement |
 |---|---|---|
-| Domain policy | RMVX, RPG Maker, RGSS, live Ruby placement, map formats | Explicit configuration and enabled plugin rules; absent from the core |
+| Domain policy | Product-specific formats, runtime placement, and build rules | Explicit configuration and enabled plugin rules; absent from the core |
 | Fixed memory location | Named Obsidian vault, fixed current-state and session notes | Configured SQLite database and standards-file list |
 | Fixed generated indexes | `.vault-index`, `.codegraph`, `graphify-out` | One index port with SQLite FTS, dependency edges, and plugin adapters |
 | Fixed build tree | Win32 release folder, named DLL and converter | Manifest detectors and configured build/test argv arrays |

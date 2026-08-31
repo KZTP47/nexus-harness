@@ -10,7 +10,7 @@ from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness import provider_help
-from our_harness.provider_help import INSTALLED, NEEDS_SETUP, READY, provider_options, setup_advice
+from our_harness.provider_help import ATTENTION, INSTALLED, NEEDS_SETUP, READY, provider_options, setup_advice
 from our_harness.providers import subscription_cli
 
 
@@ -127,6 +127,87 @@ class ProviderHelpTests(unittest.TestCase):
         available.assert_called_once_with(
             "claude-cli", ["C:/Company Tools/claude-wrapper.exe", "--work-seat"]
         )
+
+    def test_codex_provider_help_preserves_isolated_ready_and_configuration_error(self) -> None:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "codex": {
+                "kind": "codex-cli", "model": "gpt-5.5",
+                "command": ["C:/Tools/codex.exe"], "auth_mode": "chatgpt",
+            }
+        }
+        config = LoadedConfig(data, self.root, [], {})
+        with mock.patch.object(subscription_cli, "available", return_value=True), \
+             mock.patch("our_harness.chat.what_would_not_answer", return_value={}), \
+             mock.patch.object(subscription_cli, "connection_status", return_value={
+                 "authentication": "unknown", "installed": True,
+                 "state": "isolated-ready", "problem": "newer config",
+             }):
+            isolated = provider_help._signed_in_tool("codex-cli", config, True)
+        self.assertEqual(isolated.state, READY)
+        self.assertIn("isolated command", isolated.reason)
+
+        with mock.patch.object(subscription_cli, "available", return_value=True), \
+             mock.patch("our_harness.chat.what_would_not_answer", return_value={}), \
+             mock.patch.object(subscription_cli, "connection_status", return_value={
+                 "authentication": "unknown", "installed": True,
+                 "state": "configuration-error", "problem": "no isolation flag",
+             }):
+            broken = provider_help._signed_in_tool("codex-cli", config, True)
+        self.assertEqual(broken.state, ATTENTION)
+        self.assertIn("no isolation flag", broken.reason)
+
+    def test_codex_provider_help_does_not_let_an_obsolete_config_refusal_outrank_isolation(self) -> None:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "codex": {
+                "kind": "codex-cli", "model": "gpt-5.5",
+                "command": ["C:/Tools/codex.exe"], "auth_mode": "chatgpt",
+            }
+        }
+        config = LoadedConfig(data, self.root, [], {})
+        old = {
+            "codex": {
+                "why": "Error loading configuration: config.toml: unknown variant ultra"
+            }
+        }
+        isolated_status = {
+            "authentication": "unknown", "installed": True,
+            "state": "isolated-ready", "problem": old["codex"]["why"],
+        }
+        with mock.patch.object(subscription_cli, "available", return_value=True), \
+             mock.patch("our_harness.chat.what_would_not_answer", return_value=old), \
+             mock.patch.object(
+                 subscription_cli, "connection_status", return_value=isolated_status,
+             ):
+            option = provider_help._signed_in_tool("codex-cli", config, True)
+
+        self.assertEqual(option.state, READY)
+        self.assertIn("isolated command", option.reason)
+
+        old["codex"]["why"] = "ChatGPT authentication required"
+        with mock.patch.object(subscription_cli, "available", return_value=True), \
+             mock.patch("our_harness.chat.what_would_not_answer", return_value=old), \
+             mock.patch.object(
+                 subscription_cli, "connection_status", return_value=isolated_status,
+             ):
+            still_real = provider_help._signed_in_tool("codex-cli", config, True)
+        self.assertEqual(still_real.state, ATTENTION)
+        self.assertIn("authentication required", still_real.reason)
+
+    def test_codex_isolated_ready_counts_as_effective_first_request_readiness(self) -> None:
+        from our_harness import server as server_module
+
+        status = {
+            "route": "default", "kind": "codex-cli", "installed": True,
+            "state": "isolated-ready", "authentication": "unknown",
+            "note": "User config is newer than this binary.",
+        }
+        with mock.patch.object(server_module, "connection_status", return_value=status):
+            found = server_module.effective_route_readiness(self.config("codex-cli"))[0]
+        self.assertTrue(found["ready"])
+        self.assertTrue(found["ready_for_first_request"])
+        self.assertIn("first isolated request", found["note"])
 
     def test_unknown_gemini_auth_is_allowed_as_a_labelled_first_request(self) -> None:
         from our_harness import server as server_module

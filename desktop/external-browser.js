@@ -48,7 +48,7 @@ async function reserveLoopbackPort() {
 }
 
 class ExternalPageContents extends EventEmitter {
-  constructor(transport, initialUrl) {
+  constructor(transport, initialUrl, options = {}) {
     super();
     this.transport = transport;
     this.url = String(initialUrl || "about:blank");
@@ -57,7 +57,8 @@ class ExternalPageContents extends EventEmitter {
     this.loading = true;
     this.page = null;
     this.boundPages = new WeakSet();
-    this.ready = transport.openPage(this.url).then(async (page) => {
+    this.foreground = Boolean(options.foreground);
+    this.ready = transport.openPage(this.url, {foreground: this.foreground}).then(async (page) => {
       if (this.closed) {
         await page.close().catch(() => {});
         throw new Error(`${transport.provider.label}'s browser page was closed`);
@@ -259,7 +260,12 @@ class ExternalPageContents extends EventEmitter {
 
   async bringToFront() {
     const page = await this.pageForOperation();
-    await page.bringToFront();
+    await this.transport.showPage(page);
+  }
+
+  async keepInBackground() {
+    const page = await this.pageForOperation();
+    return this.transport.minimizePage(page);
   }
 
   close() {
@@ -286,6 +292,7 @@ class ExternalBrowserTransport {
     this.initialPage = null;
     this.initialClaimed = false;
     this.pages = new Set();
+    this.backgroundMode = Boolean(options.backgroundMode);
   }
 
   async playwright() {
@@ -309,6 +316,7 @@ class ExternalBrowserTransport {
         "--no-first-run", "--no-default-browser-check", "--disable-session-crashed-bubble",
         "--new-window", String(initialUrl || this.provider.home),
       ];
+      if (this.backgroundMode) args.splice(args.length - 2, 0, "--start-minimized");
       // Do not use --enable-automation, --headless, or --remote-debugging-port=0.
       // Claude's Cloudflare policy rejects those identities. A fixed loopback
       // endpoint lets Nexus attach after an ordinary browser has started while
@@ -350,14 +358,50 @@ class ExternalBrowserTransport {
     return this.starting;
   }
 
-  createContents(initialUrl) {
-    const contents = new ExternalPageContents(this, initialUrl);
+  createContents(initialUrl, options = {}) {
+    const contents = new ExternalPageContents(this, initialUrl, options);
     this.pages.add(contents);
     contents.once("destroyed", () => this.pages.delete(contents));
     return contents;
   }
 
-  async openPage(initialUrl) {
+  async windowState(page, state) {
+    if (!page || page.isClosed?.() || !this.context?.newCDPSession) return false;
+    const session = await this.context.newCDPSession(page);
+    try {
+      const {windowId} = await session.send("Browser.getWindowForTarget");
+      await session.send("Browser.setWindowBounds", {
+        windowId, bounds: {windowState: state},
+      });
+      return true;
+    } finally {
+      if (typeof session.detach === "function") await session.detach().catch(() => {});
+    }
+  }
+
+  async minimizePage(page) {
+    return this.windowState(page, "minimized").catch(() => false);
+  }
+
+  async showPage(page) {
+    await this.windowState(page, "normal").catch(() => false);
+    await page.bringToFront();
+    return true;
+  }
+
+  async setBackgroundMode(enabled) {
+    this.backgroundMode = Boolean(enabled);
+    if (!this.context) return this.backgroundMode;
+    const pages = this.context.pages().filter((page) => page && !page.isClosed?.());
+    if (this.backgroundMode) {
+      await Promise.all(pages.map((page) => this.minimizePage(page)));
+    } else if (pages.length) {
+      await this.showPage(pages.at(-1));
+    }
+    return this.backgroundMode;
+  }
+
+  async openPage(initialUrl, options = {}) {
     const context = await this.start(initialUrl);
     let page = null;
     if (!this.initialClaimed && this.initialPage && !this.initialPage.isClosed()) {
@@ -376,7 +420,8 @@ class ExternalBrowserTransport {
     if (page.url() === "about:blank" || (savedConversation && page.url() !== initialUrl)) {
       await page.goto(initialUrl, {waitUntil: "domcontentloaded", timeout: 90000});
     }
-    await page.bringToFront();
+    if (this.backgroundMode && !options.foreground) await this.minimizePage(page);
+    else await this.showPage(page);
     return page;
   }
 

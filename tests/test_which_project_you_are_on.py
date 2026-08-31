@@ -507,63 +507,43 @@ class MovingToAnotherOne(ProjectTestCase):
         self.panel.move_to(str(self.second))
         self.assertEqual(self.panel.config.project_root, self.second)
 
-    def test_talk_authority_check_and_provider_call_stay_on_the_same_project(self) -> None:
+    def test_talk_remains_available_when_project_execution_is_paused(self) -> None:
         # Give alpha a valid local authority and make beta the copied project
-        # whose execution must remain paused.
+        # whose file execution must remain paused. Conversation is deliberately
+        # still available: a provider turn cannot run project commands or write
+        # project files, and the project-admission lock pins it to beta.
         self.panel.pipeline_store
         descriptor = self.first / ".harness" / "project-authority.json"
         copied = self.second / ".harness" / "project-authority.json"
         copied.write_bytes(descriptor.read_bytes())
-
-        authority_entered = threading.Event()
-        release_authority = threading.Event()
         provider_roots: list[Path] = []
-        original_status = self.panel.project_authority_status
-
-        def blocked_authority() -> dict:
-            status = original_status()
-            authority_entered.set()
-            if not release_authority.wait(5):
-                raise RuntimeError("test did not release authority inspection")
-            return status
 
         def answer(config: LoadedConfig, _who: str, _text: str) -> dict:
             provider_roots.append(config.project_root)
-            return {"said": "alpha answer"}
+            return {"said": "beta conversation"}
 
-        result: list[tuple[int, dict]] = []
-        with mock.patch.object(
-            self.panel, "project_authority_status", side_effect=blocked_authority
-        ), mock.patch.object(chat, "say", side_effect=answer):
-            request = threading.Thread(
-                target=lambda: result.append(self.ask(
-                    "/api/chat/say", {"who": "codex", "text": "stay in alpha"}
-                )),
-                daemon=True,
+        self.panel.move_to(str(self.second))
+        self.assertEqual(self.panel.config.project_root, self.second)
+
+        # The copied target is visibly execution-paused instead of inheriting
+        # alpha's authority.
+        standing = self.panel.project_authority_status()
+        self.assertTrue(standing["reason"], standing)
+        self.assertFalse(standing["can_run"], standing)
+
+        with mock.patch.object(chat, "say", side_effect=answer):
+            status, result = self.ask(
+                "/api/chat/say", {"who": "codex", "text": "stay in beta"}
             )
-            request.start()
-            self.assertTrue(authority_entered.wait(5))
-            try:
-                # The read-only fast precheck may overlap a move. Its answer
-                # must never authorize the later provider call: the admitted
-                # recheck sees beta's copied authority and refuses it.
-                self.panel.move_to(str(self.second))
-                self.assertEqual(self.panel.config.project_root, self.second)
-            finally:
-                release_authority.set()
-            request.join(5)
 
-        self.assertFalse(request.is_alive())
-        self.assertEqual(result[0][0], 400, result)
-        self.assertIn("copied or substituted", result[0][1]["error"])
-        self.assertEqual(provider_roots, [])
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["said"], "beta conversation")
+        self.assertEqual(provider_roots, [self.second])
 
-        # The copied target remains visibly execution-paused instead of
-        # inheriting alpha's earlier check.
-        status, standing = self.ask("/api/chat")
-        self.assertEqual(status, 200, standing)
-        self.assertTrue(standing["cannot_run"], standing)
-        self.assertFalse(standing["authority"]["can_run"], standing)
+        # Conversation never repairs or weakens the execution fence.
+        standing = self.panel.project_authority_status()
+        self.assertTrue(standing["reason"], standing)
+        self.assertFalse(standing["can_run"], standing)
 
     def test_moving_says_the_page_will_be_read_again(self) -> None:
         _status, said = self.ask("/api/projects/open", {"path": str(self.second)})

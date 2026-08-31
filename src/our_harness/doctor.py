@@ -16,7 +16,7 @@ from typing import Any
 from .config import LoadedConfig, is_project_local_config_trusted
 from .detect import combined_commands, detect_project
 from .plugins import load_plugins
-from .providers import ProviderRegistry, codex_cli_preflight
+from .providers import CODEX_AUTH_DEFERRED, ProviderRegistry, codex_cli_preflight
 
 
 @dataclass(frozen=True)
@@ -54,22 +54,29 @@ def _codex_profile_checks(config: LoadedConfig) -> list[Check]:
         if profile.name != "codex-cli":
             continue
         try:
-            version, _status = codex_cli_preflight(
+            version, status = codex_cli_preflight(
                 list(profile.command),
                 auth_mode=profile.auth_mode,
                 timeout_seconds=min(10, profile.timeout_seconds),
                 model=profile.model,
+                reasoning_effort=str(profile.reasoning_effort or ""),
             )
         except Exception as exc:
             checks.append(Check("fail", f"provider:{profile.id}", str(exc)))
         else:
-            checks.append(
-                Check(
-                    "ok",
-                    f"provider:{profile.id}",
+            if status == CODEX_AUTH_DEFERRED:
+                checks.append(Check(
+                    "warn", f"provider:{profile.id}",
+                    "Codex CLI is executable and supports isolated agent turns, but its "
+                    "login-status command cannot load the user's newer configuration. "
+                    "The first isolated request will verify ChatGPT authentication "
+                    f"({version or 'version reported'}).",
+                ))
+            else:
+                checks.append(Check(
+                    "ok", f"provider:{profile.id}",
                     f"Codex CLI is executable and signed in with ChatGPT ({version or 'version reported'})",
-                )
-            )
+                ))
     return checks
 
 

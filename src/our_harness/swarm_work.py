@@ -1,8 +1,8 @@
 """Explicit, provider-neutral collaboration and project-file work from the board.
 
-Ordinary chat stays conversational. Explicit actions can request collaboration
-or project work directly, while normal Send may route an unmistakable team/file
-goal into the same path after the user confirms mutation. Provider text is never
+Ordinary Send stays a faithful one-agent conversation. Explicit actions request
+collaboration or project work, while an unmistakable file-changing request may
+enter the same bounded work path only after the user confirms mutation. Provider text is never
 treated as a command; file proposals cross the confined, baseline-checked
 transaction boundary owned by Nexus.
 """
@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import chat as chat_lab
-from . import cancellation
+from . import cancellation, collaboration_outcomes, swarm_runs, user_questions
 from .changes import FileTransaction, atomic_write, file_sha256, sha256_bytes
 from .agent_tools import AgentToolSession
 from .collaboration_ledger import CollaborationLedger
@@ -38,7 +38,10 @@ from .detect import combined_commands, detect_project
 from .execution import CommandRunner
 from .indexer import WorkspaceIndexer
 from .memory import MemoryStore
-from .models import ChangePlan, Deadline, DeadlineExpired, HarnessError, ResponseFormat
+from .models import (
+    ChangePlan, Deadline, DeadlineExpired, HarnessError,
+    ProviderOutcomeUnknown, ResponseFormat,
+)
 from .safety import confined_path
 from .redaction import bounded_redacted_text
 from .swarm import SwarmError, may_they_talk
@@ -75,6 +78,10 @@ class ResumableSwarmError(SwarmError):
         self.payload = payload
 
 
+class StructuredCollaborationError(HarnessError):
+    """A provider reply arrived, but its Nexus control payload is invalid."""
+
+
 class ContextToolBudgetExhausted(DeadlineExpired):
     """Only active context-tool execution time exhausted its user-set budget."""
 
@@ -95,6 +102,54 @@ def _provider_reason(ledger: CollaborationLedger, cause: Exception | None) -> st
     return bounded_redacted_text(
         ledger.redactor, chat_lab._in_plain_words(cause), 65_536
     ).strip()
+
+
+def _provider_failure(
+    ledger: CollaborationLedger,
+    one: dict[str, Any],
+    cause: Exception,
+    **details: Any,
+) -> dict[str, Any]:
+    """Normalize one adapter failure without letting it erase sibling replies."""
+
+    reason = _provider_reason(ledger, cause)
+    unknown = isinstance(cause, ProviderOutcomeUnknown)
+    return {
+        "id": str(one.get("id") or ""),
+        "name": str(one.get("name") or "An agent"),
+        "route": str(one.get("who") or ""),
+        **({"outcome_unknown": True} if unknown else {}),
+        **({"provider_reason": reason} if reason else {}),
+        **details,
+    }
+
+
+def _delivery_fields(
+    participants: list[dict[str, Any]],
+    answered_agent_ids: set[str],
+    provider_failures: list[dict[str, Any]],
+    *,
+    requested_mode: str,
+    lead_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    outcome = collaboration_outcomes.build(
+        participants,
+        answered_agent_ids=answered_agent_ids,
+        failures=provider_failures,
+        requested_mode=requested_mode,
+    )
+    fields = collaboration_outcomes.result_fields(outcome)
+    fields["collaborated_with"] = [
+        {
+            "id": one.get("id"),
+            "name": one.get("name"),
+            "route": one.get("who"),
+        }
+        for one in participants
+        if str(one.get("id") or "") != str(lead_id or "")
+        and str(one.get("id") or "") in answered_agent_ids
+    ]
+    return outcome, fields
 
 
 def _pause_provider_failure(
@@ -421,8 +476,7 @@ PLAN_REVIEW_FORMAT = ResponseFormat("nexus_board_plan_review_v1", {
             "items": {"type": "string", "maxLength": 500},
         },
         "questions": {
-            "type": "array", "maxItems": 6,
-            "items": {"type": "string", "maxLength": 500},
+            **copy.deepcopy(user_questions.QUESTIONS_SCHEMA),
         },
         "progress": {
             "type": "array", "maxItems": 24,
@@ -821,13 +875,6 @@ _DIRECT_COLLABORATION = re.compile(
     r"|both\s+of\s+you|all\s+of\s+you|team\s+up|peer\s+review|second\s+opinion|compare\s+your\s+answers)\b",
     re.IGNORECASE,
 )
-_IMPLICIT_COLLABORATION = re.compile(
-    r"\b(?:independent|different|multiple|several|competing)\s+"
-    r"(?:opinions?|perspectives?|approaches?|reviews?)\b"
-    r"|\b(?:assess|analy[sz]e|evaluate|review|check|audit|verify)\b.{0,100}"
-    r"\b(?:perspectives?|trade[ -]?offs?|risks?|implementation|security|testing|design)\b",
-    re.IGNORECASE | re.DOTALL,
-)
 _REFUSE_COLLABORATION = re.compile(
     r"\b(?:do\s+not|don't|without)\b.{0,60}\b(?:collaborat|other\s+agents?|team|peer|together)\b",
     re.IGNORECASE | re.DOTALL,
@@ -996,40 +1043,16 @@ def automatic_mode(
             ),
         }
 
-    # A pair chat is an explicit user choice of two participants.  Treating
-    # it like an ordinary one-agent chat made the second agent effectively
-    # decorative: casual prompts ("say hi", "what do you think?") never
-    # crossed the selected communication line.  The pair itself is the
-    # collaboration intent; only an explicit refusal above opts out.
-    if peer_id:
-        peer = next(
-            (one for one in peers if str(one.get("id") or "") == str(peer_id)),
-            None,
-        )
-        peer_name = str(peer.get("name") or "the connected agent") if peer else "the connected agent"
-        _report(
-            progress, "Connected-agent collaboration selected",
-            f"This pair chat explicitly includes {peer_name}; Nexus will relay the turn so both agents can respond.",
-        )
-        return {
-            "mode": "collaborate",
-            "reason": f"This selected pair chat includes {peer_name}, so Nexus relayed the turn to both agents.",
-            "pair_chat_implicit_collaboration": True,
-        }
-
-    use_team = bool(_IMPLICIT_COLLABORATION.search(asked))
+    # Selecting a pair describes who is available in this conversation, not
+    # permission to turn every message into a multi-round team ritual.  Send
+    # remains a faithful one-provider relay. The explicit collaboration and
+    # project-work actions above are the only automatic expansion points.
     reason = (
-        "The request asks for analysis that benefits from independent connected-agent perspectives."
-        if use_team else
-        "The request does not explicitly need another agent, so Nexus kept the conversation direct."
+        "The request did not explicitly ask Nexus to involve another agent, so Send stayed direct."
     )
-    _report(
-        progress,
-        "Connected-agent collaboration selected" if use_team else f"Waiting for {lead.get('name')}",
-        reason,
-    )
+    _report(progress, f"Waiting for {lead.get('name')}", reason)
     return {
-        "mode": "collaborate" if use_team else "chat",
+        "mode": "chat",
         "reason": reason,
     }
 
@@ -1593,7 +1616,18 @@ def _schema_problem(value: object, schema: dict[str, Any], path: str = "result")
 def _decode(
     answer: dict[str, Any], label: str, response_format: ResponseFormat
 ) -> dict[str, Any]:
-    raw = str(answer.get("text") or "").strip().lstrip("\ufeff")
+    raw = str(answer.get("text") or "").strip()
+    # Consumer web renderers sometimes prefix the visible answer with a BOM or
+    # a private-use formatting glyph (the observed Claude marker is U+E056).
+    # Ignore only those leading marker code points; arbitrary prose remains a
+    # hard schema failure.
+    while raw and (
+        raw[0] == "\ufeff"
+        or 0xE000 <= ord(raw[0]) <= 0xF8FF
+        or 0xF0000 <= ord(raw[0]) <= 0xFFFFD
+        or 0x100000 <= ord(raw[0]) <= 0x10FFFD
+    ):
+        raw = raw[1:].lstrip()
     # API providers can enforce response_format natively; consumer web chats
     # cannot. ChatGPT and Gemini occasionally wrap an otherwise exact JSON
     # object in a Markdown JSON fence. Accept that presentation wrapper while
@@ -1602,15 +1636,29 @@ def _decode(
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", raw, re.IGNORECASE | re.DOTALL)
     if fenced:
         raw = fenced.group(1).strip()
+    else:
+        # Some provider pages render their language badge as a standalone text
+        # line instead of fence chrome. Accept exactly that label followed by
+        # an otherwise exact JSON object. Same-line labels, arbitrary prose,
+        # and text after the object still fail json.loads below.
+        labelled = re.fullmatch(
+            r"json[ \t]*\r?\n(?P<body>\{[\s\S]*\})", raw, re.IGNORECASE
+        )
+        if labelled:
+            raw = labelled.group("body").strip()
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise HarnessError(f"{label} did not return the structured collaboration result Nexus requested") from exc
+        raise StructuredCollaborationError(
+            f"{label} did not return the structured collaboration result Nexus requested"
+        ) from exc
     if not isinstance(value, dict):
-        raise HarnessError(f"{label} returned the wrong collaboration result shape")
+        raise StructuredCollaborationError(
+            f"{label} returned the wrong collaboration result shape"
+        )
     problem = _schema_problem(value, response_format.schema)
     if problem:
-        raise HarnessError(
+        raise StructuredCollaborationError(
             f"{label} returned an invalid {response_format.name} result: {problem}"
         )
     return value
@@ -1655,8 +1703,31 @@ def _decode_with_one_web_repair(
             conversation_key=conversation_key,
             prefer_existing_conversation=prefer_existing_conversation,
         )
-        _ack_shared(ledger, one)
         return _decode(corrected, label, response_format)
+
+
+def _natural_language_web_contribution(
+    one: dict[str, Any], answer: dict[str, Any],
+) -> str:
+    """Return only visibly delivered web prose that is safe to keep as speech.
+
+    Invalid JSON remains invalid control data: Nexus must not mine a partial
+    object for completion, remaining-work, or peer-message fields. A genuine
+    prose reply is still useful team speech, though, so preserve that exact
+    provider text after the one strict format correction has failed.
+    """
+
+    if not str(one.get("who") or "").startswith("web:"):
+        return ""
+    raw = str(answer.get("text") or "").strip().lstrip("\ufeff")
+    if not raw or not any(character.isalpha() for character in raw):
+        return ""
+    # JSON-/markup-shaped payloads are control data or provider-page chrome,
+    # not natural-language turns. Keep the boundary conservative rather than
+    # extracting a plausible-looking message from an invalid object.
+    if raw.lstrip().startswith(("{", "[", "```", "<")):
+        return ""
+    return raw
 
 
 def relay(
@@ -1706,6 +1777,8 @@ def relay(
         config, str(lead.get("who") or ""), attachments,
         filed_as or str(lead.get("name") or ""),
     )
+    answered_agent_ids: set[str] = set()
+    provider_failures: list[dict[str, Any]] = []
 
     def identity(one: dict[str, Any], paired_with: str) -> str:
         return board_context(
@@ -1716,22 +1789,60 @@ def relay(
         progress, f"Asking {lead.get('name')} what to relay",
         f"The user's request is addressed to {lead.get('name')}; Nexus has not contacted {peer.get('name')} yet.",
     )
-    lead_answer = chat_lab.ask_once(
-        config, str(lead.get("who") or ""), text,
-        context=(
-            identity(lead, str(peer.get("id") or ""))
-            + "\n\nDIRECTED RELAY — LEAD TURN\n"
-            + f"The quoted user request is addressed to you, {lead.get('name')}, not to {peer.get('name')}. "
-              f"Write the exact useful message you want Nexus to relay to {peer.get('name')}. "
-              f"Do not answer as {peer.get('name')} and do not claim the relay already happened."
-            + ("\n\n" + attachment_text if attachment_text else "")
-            + _shared_context(ledger, lead, {"stage": "lead_draft"})
-        ),
-        provider_attachments=provider_files,
-        conversation_key=conversation_key,
-        prefer_existing_conversation=prefer_existing_conversation,
-    )
+    try:
+        lead_answer = chat_lab.ask_once(
+            config, str(lead.get("who") or ""), text,
+            context=(
+                identity(lead, str(peer.get("id") or ""))
+                + "\n\nDIRECTED RELAY — LEAD TURN\n"
+                + f"The quoted user request is addressed to you, {lead.get('name')}, not to {peer.get('name')}. "
+                  f"Write the exact useful message you want Nexus to relay to {peer.get('name')}. "
+                  f"Do not answer as {peer.get('name')} and do not claim the relay already happened."
+                + ("\n\n" + attachment_text if attachment_text else "")
+                + _shared_context(ledger, lead, {"stage": "lead_draft"})
+            ),
+            provider_attachments=provider_files,
+            conversation_key=conversation_key,
+            prefer_existing_conversation=prefer_existing_conversation,
+        )
+    except cancellation.ChatCancelled:
+        raise
+    except Exception as exc:
+        failure = _provider_failure(ledger, lead, exc, stage="lead_draft")
+        provider_failures.append(failure)
+        ledger.record_state("provider_transport_failure", {
+            "stage": "lead_draft", "status": "paused",
+            "failed_agents": [failure],
+        })
+        participant_outcome, delivery_fields = _delivery_fields(
+            [lead, peer], answered_agent_ids, provider_failures,
+            requested_mode="relay", lead_id=str(lead.get("id") or ""),
+        )
+        note = collaboration_outcomes.notice_text(participant_outcome)
+        remaining = [
+            f"Reconnect or reconcile {lead.get('name') or 'the lead agent'}'s provider turn before resuming."
+        ]
+        kept = chat_lab.keep_participant_outcome_exchange(
+            config, str(lead.get("who") or ""), text,
+            filed_as=filed_as or str(lead.get("name") or ""),
+            participant_outcome=participant_outcome, attachments=public,
+        )
+        ledger.finish(
+            note, complete=False, stopped_because="provider_unavailable",
+            remaining=remaining,
+        )
+        return {
+            **kept, **delivery_fields,
+            "collaboration_ledger": ledger.describe(),
+            "provider_failures": provider_failures,
+            "partial_provider_failure": note,
+            "goal_complete": False,
+            "stopped_because": "provider_unavailable",
+            "remaining": remaining,
+            "relay_complete": False,
+        }
     _ack_shared(ledger, lead)
+    answered_agent_ids.add(str(lead.get("id") or ""))
     lead_turn = _contribution(
         lead, lead_answer, "lead_draft", str(lead_answer.get("text") or ""),
         recipient_id=str(peer.get("id") or ""),
@@ -1745,23 +1856,70 @@ def relay(
         "Nexus is sending the lead agent's actual words, not rebroadcasting the user's request.",
     )
     relayed = str(lead_answer.get("text") or "").strip()
-    peer_answer = chat_lab.ask_once(
-        config, str(peer.get("who") or ""),
-        f"Message relayed by Nexus from {lead.get('name')}:\n{relayed}",
-        context=(
-            identity(peer, str(lead.get("id") or ""))
-            + "\n\nDIRECTED RELAY — PEER TURN\n"
-            + f"The quoted task above is a real message from {lead.get('name')} to you, {peer.get('name')}. "
-              f"Reply to {lead.get('name')}. Do not treat the end user's earlier first-person wording as addressed to you, "
-              f"and never impersonate {lead.get('name')}."
-            + ("\n\n" + attachment_text if attachment_text else "")
-            + _shared_context(ledger, peer, {"stage": "peer_reply"})
-        ),
-        provider_attachments=provider_files,
-        conversation_key=conversation_key,
-        prefer_existing_conversation=prefer_existing_conversation,
-    )
+    try:
+        peer_answer = chat_lab.ask_once(
+            config, str(peer.get("who") or ""),
+            f"Message relayed by Nexus from {lead.get('name')}:\n{relayed}",
+            context=(
+                identity(peer, str(lead.get("id") or ""))
+                + "\n\nDIRECTED RELAY — PEER TURN\n"
+                + f"The quoted task above is a real message from {lead.get('name')} to you, {peer.get('name')}. "
+                  f"Reply to {lead.get('name')}. Do not treat the end user's earlier first-person wording as addressed to you, "
+                  f"and never impersonate {lead.get('name')}."
+                + ("\n\n" + attachment_text if attachment_text else "")
+                + _shared_context(ledger, peer, {"stage": "peer_reply"})
+            ),
+            provider_attachments=provider_files,
+            conversation_key=conversation_key,
+            prefer_existing_conversation=prefer_existing_conversation,
+        )
+    except cancellation.ChatCancelled:
+        raise
+    except Exception as exc:
+        failure = _provider_failure(ledger, peer, exc, stage="peer_reply")
+        provider_failures.append(failure)
+        ledger.record_state("provider_transport_failure", {
+            "stage": "peer_reply", "status": "paused",
+            "failed_agents": [failure],
+        })
+        participant_outcome, delivery_fields = _delivery_fields(
+            [lead, peer], answered_agent_ids, provider_failures,
+            requested_mode="relay", lead_id=str(lead.get("id") or ""),
+        )
+        note = collaboration_outcomes.notice_text(participant_outcome)
+        remaining = [
+            f"Reconnect or reconcile {peer.get('name') or 'the peer agent'}'s provider turn before resuming."
+        ]
+        kept = chat_lab.keep_multiparty_exchange(
+            config, str(lead.get("who") or ""), text,
+            str(lead_answer.get("text") or ""),
+            filed_as=filed_as or str(lead.get("name") or ""),
+            lead=lead, final_speaker=lead, participants=[lead, peer],
+            contributions=[], attachments=public,
+            model=str(lead_answer.get("model") or ""),
+            milliseconds=int(lead_answer.get("milliseconds") or 0),
+            participant_outcome=participant_outcome,
+        )
+        _share_turn(ledger, _contribution(
+            lead, lead_answer, "final_answer", str(lead_answer.get("text") or ""),
+            recipient_name="User",
+        ))
+        ledger.finish(
+            note, complete=False, stopped_because="partial_provider_failure",
+            remaining=remaining,
+        )
+        return {
+            **kept, **delivery_fields,
+            "collaboration_ledger": ledger.describe(),
+            "provider_failures": provider_failures,
+            "partial_provider_failure": note,
+            "goal_complete": False,
+            "stopped_because": "partial_provider_failure",
+            "remaining": remaining,
+            "relay_complete": False,
+        }
     _ack_shared(ledger, peer)
+    answered_agent_ids.add(str(peer.get("id") or ""))
     peer_turn = _contribution(
         peer, peer_answer, "agent_reply", str(peer_answer.get("text") or ""),
         recipient_id=str(lead.get("id") or ""),
@@ -1770,55 +1928,46 @@ def relay(
     _show_turn(live_turn, {"who": "them", **peer_turn})
     _share_turn(ledger, peer_turn, {"stage": "final_report"})
 
-    _report(
-        progress, f"Waiting for {lead.get('name')} to report the relay",
-        f"{lead.get('name')} is receiving {peer.get('name')}'s actual reply and will answer the user as itself.",
-    )
-    conversation = _actual_conversation([lead_turn, peer_turn])
-    began = time.monotonic()
-    final = chat_lab.ask_once(
-        config, str(lead.get("who") or ""),
-        _continuation_turn(
-            "FINAL RELAY REPORT",
-            f"Report the completed relay to the user and clearly attribute {peer.get('name')}'s actual reply.",
+    # The relay is already complete after two provider turns. Asking the lead
+    # a third time merely to restate the exchange added latency, cost, and a
+    # fresh failure point. Nexus can report the two saved, attributed turns
+    # deterministically without inventing or paraphrasing agent speech.
+    final = {
+        "text": (
+            f"Relay complete between {lead.get('name')} and {peer.get('name')}.\n\n"
+            f"{lead.get('name')} sent:\n{lead_turn['text']}\n\n"
+            f"{peer.get('name')} replied:\n{peer_turn['text']}"
         ),
-        context=(
-            identity(lead, str(peer.get("id") or ""))
-            + "\n\nORIGINAL USER GOAL\n" + text
-            + "\n\nDIRECTED RELAY — FINAL USER REPORT\n"
-            + "Nexus completed this relay. Here is the exact exchange:\n"
-            + conversation
-            + f"\n\nAnswer the user as {lead.get('name')}. Clearly attribute {peer.get('name')}'s real reply; "
-              f"do not answer as {peer.get('name')} and do not invent any additional relay."
-            + _shared_context(ledger, lead, {"stage": "final_report"})
-        ),
-        provider_attachments=provider_files,
-        conversation_key=conversation_key,
-        prefer_existing_conversation=prefer_existing_conversation,
+        "model": "nexus/deterministic-relay-receipt", "milliseconds": 0,
+    }
+    nexus = {"id": "nexus", "name": "Nexus", "who": ""}
+    participant_outcome, delivery_fields = _delivery_fields(
+        [lead, peer], answered_agent_ids, provider_failures,
+        requested_mode="relay", lead_id=str(lead.get("id") or ""),
     )
-    _ack_shared(ledger, lead)
     kept = chat_lab.keep_multiparty_exchange(
         config, str(lead.get("who") or ""), text, str(final.get("text") or ""),
         filed_as=filed_as or str(lead.get("name") or ""),
-        lead=lead, participants=[lead, peer],
+        lead=lead, final_speaker=nexus, participants=[lead, peer],
         contributions=[lead_turn, peer_turn], attachments=public,
-        model=final.get("model", ""), milliseconds=int((time.monotonic() - began) * 1000),
+        model=final.get("model", ""), milliseconds=0,
+        participant_outcome=participant_outcome,
     )
-    final_turn = _contribution(
-        lead, final, "final_answer", str(final.get("text") or ""),
-        recipient_name="User",
-    )
-    _share_turn(ledger, final_turn)
+    ledger.record_state("deterministic_relay_receipt", {
+        "speaker_id": "nexus", "speaker_name": "Nexus",
+        "lead_id": str(lead.get("id") or ""),
+        "peer_id": str(peer.get("id") or ""),
+        "provider_calls": 2,
+    })
     ledger.finish(
         str(final.get("text") or ""), complete=True,
         stopped_because="relay_complete",
     )
     return {
         **kept,
+        **delivery_fields,
         "collaboration_ledger": ledger.describe(),
-        "collaborated_with": [{
-            "id": peer.get("id"), "name": peer.get("name"), "route": peer.get("who"),
-        }],
+        "provider_failures": [],
         "relay_complete": True,
     }
 
@@ -1891,16 +2040,17 @@ def collaborate(
                 conversation_key=conversation_key,
                 prefer_existing_conversation=prefer_existing_conversation,
             )
-            _ack_shared(ledger, one)
-            return one, answer
         except cancellation.ChatCancelled:
             raise
-        except HarnessError as exc:
+        except Exception as exc:
+            failure = _provider_failure(ledger, one, exc)
             return one, {
                 "text": "", "milliseconds": 0, "model": "",
                 "_provider_failed": True,
-                "_provider_reason": _provider_reason(ledger, exc),
+                "_provider_failure": failure,
             }
+        _ack_shared(ledger, one)
+        return one, answer
 
     completed: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     provider_failures: list[dict[str, Any]] = []
@@ -1910,10 +2060,12 @@ def collaborate(
             one, answer = future.result()
             completed[str(one.get("id"))] = (one, answer)
             if answer.get("_provider_failed"):
-                provider_failures.append({
-                    **one,
-                    "_provider_reason": str(answer.get("_provider_reason") or ""),
-                })
+                provider_failures.append(dict(answer.get("_provider_failure") or {
+                    "id": one.get("id"), "name": one.get("name"),
+                    "route": one.get("who"),
+                    "provider_reason": "The provider adapter failed before returning an answer.",
+                    "outcome_unknown": False,
+                }))
                 continue
             live = {
                 "who": "them",
@@ -1933,10 +2085,25 @@ def collaborate(
         failed_names = [str(one.get("name") or "An agent") for one in provider_failures]
         lead_result = completed.get(str(lead.get("id") or ""))
         lead_answer = lead_result[1] if lead_result else {}
-        can_keep_lead = bool(
-            allow_partial_lead_answer
-            and lead_result
-            and not lead_answer.get("_provider_failed")
+        successful_results = [
+            (one, draft) for one, draft in (
+                completed.get(str(candidate.get("id") or ""), (candidate, {}))
+                for candidate in participants
+            )
+            if not draft.get("_provider_failed") and str(draft.get("text") or "").strip()
+        ]
+        selected_result = (
+            lead_result if lead_result and not lead_answer.get("_provider_failed")
+            else successful_results[0] if successful_results else None
+        )
+        responder, responder_answer = selected_result if selected_result else ({}, {})
+        can_keep_lead = bool(selected_result)
+        answered_ids = {
+            str(one.get("id") or "") for one, _draft in successful_results
+        }
+        participant_outcome, delivery_fields = _delivery_fields(
+            participants, answered_ids, provider_failures,
+            requested_mode="collaborate", lead_id=str(lead.get("id") or ""),
         )
         ledger.record_state("provider_transport_failure", {
             "stage": "independent_first_round",
@@ -1945,10 +2112,11 @@ def collaborate(
                 {
                     "id": str(one.get("id") or ""),
                     "name": str(one.get("name") or "An agent"),
-                    "route": str(one.get("who") or ""),
+                    "route": str(one.get("route") or ""),
+                    "outcome_unknown": bool(one.get("outcome_unknown")),
                     "failure_code": "provider_turn_failed",
-                    **({"provider_reason": str(one.get("_provider_reason") or "")}
-                       if one.get("_provider_reason") else {}),
+                    **({"provider_reason": str(one.get("provider_reason") or "")}
+                       if one.get("provider_reason") else {}),
                 }
                 for one in provider_failures
             ],
@@ -1958,13 +2126,11 @@ def collaborate(
             for name in failed_names
         ]
         if can_keep_lead:
-            # A casual Send in an explicitly selected pair asks both agents, but
-            # the selected/lead agent's real answer is still useful when a peer
-            # has a transient provider failure. The old all-or-nothing path
-            # discarded that successful reply and made the chat look completely
-            # dead. Preserve the truthful lead answer while recording exactly
-            # which peer did not participate; explicit Collaborate actions keep
-            # the stricter all-agents-required behavior below.
+            # A provider failure must not erase truthful work that another agent
+            # already completed. This applies to explicit collaboration too:
+            # strict all-or-nothing transport turned one unavailable peer into a
+            # useless failed chat. Prefer the lead's answer, or the first healthy
+            # peer's concrete contribution when the lead itself is unavailable.
             successful_peer_contributions = [
                 _contribution(
                     one, draft, "agent_reply", str(draft.get("text") or ""),
@@ -1973,83 +2139,90 @@ def collaborate(
                 )
                 for one, draft in completed.values()
                 if one.get("id") != lead.get("id")
+                and one.get("id") != responder.get("id")
                 and not draft.get("_provider_failed")
             ]
             kept = chat_lab.keep_multiparty_exchange(
                 config,
                 str(lead.get("who") or ""),
                 text,
-                str(lead_answer.get("text") or ""),
+                str(responder_answer.get("text") or ""),
                 filed_as=filed_as or str(lead.get("name") or ""),
                 lead=lead,
+                final_speaker=responder,
                 participants=participants,
                 contributions=successful_peer_contributions,
                 attachments=public,
-                model=str(lead_answer.get("model") or ""),
-                milliseconds=int(lead_answer.get("milliseconds") or 0),
+                model=str(responder_answer.get("model") or ""),
+                milliseconds=int(responder_answer.get("milliseconds") or 0),
+                participant_outcome=participant_outcome,
             )
             final_turn = _contribution(
-                lead, lead_answer, "final_answer", str(lead_answer.get("text") or ""),
+                responder, responder_answer, "final_answer",
+                str(responder_answer.get("text") or ""),
                 recipient_name="User",
             )
             _share_turn(ledger, final_turn)
             partial_note = (
-                f"{lead.get('name') or 'The selected agent'} answered. "
+                f"{responder.get('name') or 'A connected agent'} answered. "
                 + ", ".join(failed_names)
-                + " could not join this turn, so Nexus kept the successful answer instead of discarding it."
+                + " could not join this turn. "
+                + collaboration_outcomes.notice_text(participant_outcome)
             )
             partial_reasons = [
-                f"{one.get('name')}: {one.get('_provider_reason')}"
-                for one in provider_failures if one.get("_provider_reason")
+                f"{one.get('name')}: {one.get('provider_reason')}"
+                for one in provider_failures if one.get("provider_reason")
             ]
             if partial_reasons:
                 partial_note += " Provider reason: " + " | ".join(partial_reasons)
             ledger.finish(
-                partial_note, complete=True,
+                partial_note, complete=False,
                 stopped_because="partial_provider_failure",
+                remaining=remaining,
             )
             return {
                 **kept,
                 "collaboration_ledger": ledger.describe(),
-                "collaborated_with": [
-                    {"id": one.get("id"), "name": one.get("name"), "route": one.get("who")}
-                    for one, draft in completed.values()
-                    if one.get("id") != lead.get("id")
-                    and not draft.get("_provider_failed")
-                ],
-                "provider_failures": [
-                    {
-                        "id": one.get("id"), "name": one.get("name"),
-                        "route": one.get("who"),
-                        **({"provider_reason": one.get("_provider_reason")}
-                           if one.get("_provider_reason") else {}),
-                    }
-                    for one in provider_failures
-                ],
+                **delivery_fields,
+                "provider_failures": provider_failures,
                 "partial_provider_failure": partial_note,
-                "goal_complete": True,
+                "goal_complete": False,
                 "discussion_rounds": 0,
                 "round_limit": round_limit,
                 "stopped_because": "partial_provider_failure",
-                "remaining": [],
+                "remaining": remaining,
             }
-        report = (
-            "Nexus paused this collaboration because "
-            + ", ".join(failed_names)
-            + " could not complete a provider turn. The failure was not counted as "
-              "an agent reply or a discussion round."
-        )
+        report = collaboration_outcomes.notice_text(participant_outcome)
         reasons = [
-            f"{one.get('name')}: {one.get('_provider_reason')}"
-            for one in provider_failures if one.get("_provider_reason")
+            f"{one.get('name')}: {one.get('provider_reason')}"
+            for one in provider_failures if one.get("provider_reason")
         ]
         if reasons:
             report += " Provider reason: " + " | ".join(reasons)
+        kept = chat_lab.keep_participant_outcome_exchange(
+            config,
+            str(lead.get("who") or ""),
+            text,
+            filed_as=filed_as or str(lead.get("name") or ""),
+            participant_outcome=participant_outcome,
+            attachments=public,
+        )
         ledger.finish(
             report, complete=False, stopped_because="provider_unavailable",
             remaining=remaining,
         )
-        raise SwarmError(report)
+        return {
+            **kept,
+            "collaboration_ledger": ledger.describe(),
+            **delivery_fields,
+            "provider_failures": provider_failures,
+            "partial_provider_failure": report,
+            "goal_complete": False,
+            "discussion_rounds": 0,
+            "round_limit": round_limit,
+            "stopped_because": "provider_unavailable",
+            "remaining": remaining,
+        }
     # The screen shows actual completion order. The lead receives stable board
     # order so provider timing does not make otherwise identical runs drift.
     drafts = [completed[str(one.get("id"))] for one in participants]
@@ -2063,6 +2236,9 @@ def collaborate(
         )
         for one, draft in drafts
     ]
+    answered_agent_ids = {
+        str(one.get("id") or "") for one, _draft in drafts
+    }
     _report(
         progress, "Starting goal-directed team discussion",
         "Each agent will see the real conversation so far and the team will continue until everyone reports the goal complete."
@@ -2072,6 +2248,8 @@ def collaborate(
     discussion_rounds = 0
     stopped_because = ""
     progress_guard = _ProgressGuard()
+    active_participants = list(participants)
+    degraded_provider_failures: list[dict[str, Any]] = []
     for round_number in _round_numbers(round_limit):
         discussion_rounds = round_number
         cycle_complete = True
@@ -2085,7 +2263,7 @@ def collaborate(
             progress, f"Team discussion round {round_number}",
             "Agents are responding in board order, so every later reply sees every earlier reply."
         )
-        for one in participants:
+        for one in list(active_participants):
             is_lead = one.get("id") == lead.get("id")
             turn_role = (
                 f"You are the lead agent {lead.get('name')}; continue toward a user-facing answer."
@@ -2117,8 +2295,11 @@ def collaborate(
                     "previous_remaining": remaining,
                 })
             )
+            answer: dict[str, Any] = {}
+            failed = False
+            degraded_protocol = False
+            failure_cause: Exception | None = None
             try:
-                failed = False
                 answer = chat_lab.ask_once(
                     config, str(one.get("who") or ""),
                     _continuation_turn(
@@ -2130,51 +2311,108 @@ def collaborate(
                     conversation_key=conversation_key,
                     prefer_existing_conversation=prefer_existing_conversation,
                 )
-                _ack_shared(ledger, one)
-                value = _decode_with_one_web_repair(
-                    config, one, answer, DISCUSSION_FORMAT, ledger,
-                    conversation_key, prefer_existing_conversation,
-                )
-                message = str(value.get("message") or "").strip()
-                one_remaining = _remaining(value)
-                one_complete = value.get("goal_complete") is True and not one_remaining
             except cancellation.ChatCancelled:
                 raise
-            except HarnessError as exc:
+            except Exception as exc:
+                failure_cause = exc
+            else:
+                # Ledger integrity is not a provider outcome. A ledger failure
+                # here must escape rather than being converted into a repair-
+                # provider status for this participant.
+                _ack_shared(ledger, one)
+                try:
+                    value = _decode_with_one_web_repair(
+                        config, one, answer, DISCUSSION_FORMAT, ledger,
+                        conversation_key, prefer_existing_conversation,
+                    )
+                    message = str(value.get("message") or "").strip()
+                    one_remaining = _remaining(value)
+                    one_complete = value.get("goal_complete") is True and not one_remaining
+                except cancellation.ChatCancelled:
+                    raise
+                except Exception as exc:
+                    failure_cause = exc
+            if failure_cause is not None:
+                exc = failure_cause
                 failed_name = str(one.get("name") or "An agent")
                 safe_reason = _provider_reason(ledger, exc)
+                protocol_failure = isinstance(exc, StructuredCollaborationError)
+                outcome_unknown = isinstance(exc, ProviderOutcomeUnknown)
+                delivered_text = (
+                    _natural_language_web_contribution(one, answer)
+                    if protocol_failure else ""
+                )
+                usable_contribution = bool(delivered_text)
+                correction_note = (
+                    " even after one format correction"
+                    if str(one.get("who") or "").startswith("web:") else ""
+                )
                 report = (
-                    f"Nexus paused this collaboration because {failed_name} could not "
-                    "complete its provider turn. The failure was not counted as agent "
-                    "speech or reasoning progress."
+                    f"{failed_name}'s delivered reply did not match the collaboration format"
+                    f"{correction_note}."
+                    if protocol_failure else
+                    f"{failed_name} could not complete this provider turn."
                 )
                 if safe_reason:
                     report += f" Provider reason: {safe_reason}"
-                one_remaining = [
-                    f"Reconnect or reconcile {failed_name}'s provider turn before resuming."
-                ]
-                ledger.record_state("provider_transport_failure", {
+                ledger.record_state(
+                    "provider_protocol_failure" if protocol_failure
+                    else "provider_transport_failure", {
                     "stage": "team_discussion",
                     "round": round_number,
-                    "status": "paused",
+                    "status": "degraded",
                     "failed_agent": {
                         "id": str(one.get("id") or ""),
                         "name": failed_name,
                         "route": str(one.get("who") or ""),
                     },
-                    "failure_code": "provider_turn_failed",
+                    "failure_code": "invalid_structured_result" if protocol_failure
+                    else "provider_turn_failed",
+                    "outcome_unknown": outcome_unknown,
+                    "usable_contribution": usable_contribution,
                     **({"provider_reason": safe_reason} if safe_reason else {}),
                 })
-                ledger.finish(
-                    report, complete=False, stopped_because="provider_unavailable",
-                    remaining=one_remaining,
-                )
-                raise SwarmError(report) from exc
+                degraded_provider_failures.append({
+                    "id": one.get("id"), "name": failed_name,
+                    "route": one.get("who"), "round": round_number,
+                    "kind": "protocol" if protocol_failure else "transport",
+                    "outcome_unknown": outcome_unknown,
+                    "usable_contribution": usable_contribution,
+                    **({"provider_reason": safe_reason} if safe_reason else {}),
+                })
+                if usable_contribution:
+                    # The provider genuinely answered, but Nexus cannot trust
+                    # the failed schema as machine control state. Keep the
+                    # exact prose as team speech, keep the agent reachable,
+                    # and conservatively claim neither completion nor progress.
+                    failed = True
+                    degraded_protocol = True
+                    value = {}
+                    message = delivered_text
+                    one_remaining = []
+                    one_complete = False
+                    _report(
+                        progress, f"Keeping {failed_name}'s delivered reply",
+                        report + " Nexus kept the exact natural-language contribution, "
+                        "but did not infer completion, remaining work, or peer text from it.",
+                    )
+                else:
+                    active_participants = [
+                        candidate for candidate in active_participants
+                        if candidate.get("id") != one.get("id")
+                    ]
+                    _report(
+                        progress, f"Continuing without {failed_name}",
+                        report + " Nexus preserved the completed team work and kept the healthy agents running.",
+                    )
+                    continue
             contribution = _contribution(
                 one, answer, "agent_discussion", message,
                 recipient_name="Team deliberation",
                 semantic=value,
             )
+            if degraded_protocol:
+                contribution["structured_state_unavailable"] = True
             contributions.append(contribution)
             _show_turn(live_turn, {"who": "them", **contribution})
             _share_turn(ledger, contribution, {
@@ -2182,12 +2420,17 @@ def collaborate(
                 "round": round_number,
                 "speaker_complete": one_complete,
                 "speaker_remaining": one_remaining,
+                "structured_state_unavailable": degraded_protocol,
             })
             cycle_remaining.extend(one_remaining)
             cycle_complete = cycle_complete and one_complete
             cycle_state.append(_canonical_progress_state(
                 str(one.get("id") or ""), one_complete, failed, value
             ))
+        if not active_participants:
+            remaining.append("No connected agent remains available to continue the team conversation.")
+            stopped_because = "provider_unavailable"
+            break
         remaining = list(dict.fromkeys(cycle_remaining))
         ledger.record_state("discussion_round_state", {
             "stage": "team_discussion",
@@ -2212,40 +2455,104 @@ def collaborate(
         stopped_because = "round_limit"
 
     began = time.monotonic()
-    _report(
-        progress, f"Waiting for {lead.get('name')} to report the outcome",
-        "The lead agent is preparing a truthful completion report from the full visible discussion."
-    )
-    final = chat_lab.ask_once(
-        config,
-        str(lead.get("who") or ""),
-        _continuation_turn(
-            "FINAL TEAM REPORT",
-            "Give the user the current team outcome from the completed conversation and Nexus completion state.",
-        ),
-        context=(
-            board_context(board, agent_id, peer_id, project_id)
-            + "\n\nORIGINAL USER GOAL\n" + text
-            + "\n\nFULL ACTUAL TEAM CONVERSATION\n"
-            + _prompt_conversation(contributions)
-            + f"\n\nNEXUS COMPLETION STATE: {'complete' if goal_complete else 'incomplete'}"
-            + f"\nNEXUS STOP REASON: {stopped_because}"
-            + ("\nREMAINING WORK: " + "; ".join(remaining) if remaining else "")
-            + "\n\nGive the user a truthful final report. Name disagreements plainly. "
-              "If Nexus says incomplete, explicitly say the goal is incomplete and list what remains; do not present discussion or suggested work as completed work."
-            + ("\n\n" + attachment_text if attachment_text else "")
-            + _shared_context(ledger, lead, {
-                "stage": "final_report",
-                "goal_complete": goal_complete,
-                "stopped_because": stopped_because,
-                "remaining": remaining,
+
+    def preserved_transcript_report(why: str) -> dict[str, Any]:
+        latest = next((
+            contribution for contribution in reversed(contributions)
+            if str(contribution.get("text") or "").strip()
+        ), {})
+        source_name = str(latest.get("speaker_name") or "an agent")
+        source_text = str(
+            latest.get("text") or "The team stopped before a final report was generated."
+        )
+        return {
+            "text": (
+                f"Nexus preserved the completed team transcript, but {why}. "
+                f"The latest real contribution was from {source_name}:\n\n{source_text}\n\n"
+                f"Nexus status: {'complete' if goal_complete else 'incomplete'}"
+                + (f". Remaining: {'; '.join(remaining)}" if remaining else ".")
+            ),
+            "model": "nexus/deterministic-fallback", "milliseconds": 0,
+        }
+
+    reporter: dict[str, Any] = {}
+    if active_participants:
+        reporter = next((
+            one for one in active_participants if one.get("id") == lead.get("id")
+        ), active_participants[0])
+        _report(
+            progress, f"Waiting for {reporter.get('name')} to report the outcome",
+            "The lead agent is preparing a truthful completion report from the full visible discussion."
+        )
+        final_speaker = reporter
+        try:
+            final = chat_lab.ask_once(
+                config,
+                str(reporter.get("who") or ""),
+                _continuation_turn(
+                    "FINAL TEAM REPORT",
+                    "Give the user the current team outcome from the completed conversation and Nexus completion state.",
+                ),
+                context=(
+                    board_context(board, str(reporter.get("id") or ""), peer_id, project_id)
+                    + "\n\nORIGINAL USER GOAL\n" + text
+                    + "\n\nFULL ACTUAL TEAM CONVERSATION\n"
+                    + _prompt_conversation(contributions)
+                    + f"\n\nNEXUS COMPLETION STATE: {'complete' if goal_complete else 'incomplete'}"
+                    + f"\nNEXUS STOP REASON: {stopped_because}"
+                    + ("\nREMAINING WORK: " + "; ".join(remaining) if remaining else "")
+                    + "\n\nGive the user a truthful final report. Name disagreements plainly. "
+                      "If Nexus says incomplete, explicitly say the goal is incomplete and list what remains; do not present discussion or suggested work as completed work."
+                    + ("\n\n" + attachment_text if attachment_text else "")
+                    + _shared_context(ledger, reporter, {
+                        "stage": "final_report",
+                        "goal_complete": goal_complete,
+                        "stopped_because": stopped_because,
+                        "remaining": remaining,
+                    })
+                ),
+                provider_attachments=provider_files,
+                conversation_key=conversation_key,
+                prefer_existing_conversation=prefer_existing_conversation,
+            )
+        except cancellation.ChatCancelled:
+            raise
+        except Exception as exc:
+            safe_reason = _provider_reason(ledger, exc)
+            outcome_unknown = isinstance(exc, ProviderOutcomeUnknown)
+            degraded_provider_failures.append({
+                "id": reporter.get("id"), "name": reporter.get("name"),
+                "route": reporter.get("who"), "kind": "final_report",
+                "outcome_unknown": outcome_unknown,
+                **({"provider_reason": safe_reason} if safe_reason else {}),
             })
-        ),
-        provider_attachments=provider_files,
-        conversation_key=conversation_key,
-        prefer_existing_conversation=prefer_existing_conversation,
+            final = preserved_transcript_report(
+                f"{reporter.get('name') or 'the reporter'} could not generate the final synthesis"
+            )
+            final_speaker = {"id": "nexus", "name": "Nexus", "who": ""}
+        else:
+            # A collaboration-ledger failure is an engine-integrity failure,
+            # not evidence that the provider failed. Keep it outside the
+            # provider exception boundary so it remains visible and fail-closed.
+            _ack_shared(ledger, reporter)
+    else:
+        # Every provider already failed or has an uncertain delivery outcome.
+        # Do not silently retry one of those turns merely to obtain a final
+        # report: preserve the received transcript and make reconciliation a
+        # deliberate user action.
+        final = preserved_transcript_report(
+            "no connected agent remained available to generate the final synthesis"
+        )
+        final_speaker = {"id": "nexus", "name": "Nexus", "who": ""}
+    participant_outcome, delivery_fields = _delivery_fields(
+        participants, answered_agent_ids, degraded_provider_failures,
+        requested_mode="collaborate", lead_id=str(lead.get("id") or ""),
     )
-    _ack_shared(ledger, lead)
+    delivery_complete = participant_outcome["outcome"] == "complete"
+    delivery_note = (
+        "" if delivery_complete
+        else collaboration_outcomes.notice_text(participant_outcome)
+    )
     kept = chat_lab.keep_multiparty_exchange(
         config,
         str(lead.get("who") or ""),
@@ -2253,33 +2560,52 @@ def collaborate(
         final["text"],
         filed_as=filed_as or str(lead.get("name") or ""),
         lead=lead,
+        final_speaker=final_speaker,
         participants=participants,
         contributions=contributions,
         attachments=public,
         model=final.get("model", ""),
         milliseconds=int((time.monotonic() - began) * 1000),
+        participant_outcome=participant_outcome,
     )
     final_turn = _contribution(
-        lead, final, "final_answer", str(final.get("text") or ""),
+        final_speaker, final, "final_answer", str(final.get("text") or ""),
         recipient_name="User",
     )
-    _share_turn(ledger, final_turn)
+    if str(final_speaker.get("id") or "") == "nexus":
+        ledger.record_state("deterministic_final_report_fallback", {
+            "speaker_id": "nexus", "speaker_name": "Nexus",
+            "failed_reporter_id": str(reporter.get("id") or ""),
+            "reason": "provider_failure" if reporter else "no_active_participant",
+            "goal_complete": goal_complete,
+        })
+    else:
+        _share_turn(ledger, final_turn)
+    # Keep a concrete orchestration stop (round limit, stalled, or no provider
+    # remaining) while the structured delivery status independently exposes
+    # degradation. A delivery failure replaces only a nominal completion.
+    delivery_stop = (
+        "partial_provider_failure"
+        if not delivery_complete and stopped_because in {"", "complete"}
+        else stopped_because or "goal_complete"
+    )
     ledger.finish(
-        str(final.get("text") or ""), complete=goal_complete,
-        stopped_because=stopped_because, remaining=remaining,
+        delivery_note or str(final.get("text") or ""),
+        complete=goal_complete and delivery_complete,
+        stopped_because=delivery_stop,
+        remaining=remaining,
     )
     return {
         **kept,
         "collaboration_ledger": ledger.describe(),
-        "collaborated_with": [
-            {"id": one.get("id"), "name": one.get("name"), "route": one.get("who")}
-            for one in participants if one.get("id") != agent_id
-        ],
-        "goal_complete": goal_complete,
+        **delivery_fields,
+        "goal_complete": goal_complete and delivery_complete,
         "discussion_rounds": discussion_rounds,
         "round_limit": round_limit,
-        "stopped_because": stopped_because,
+        "stopped_because": delivery_stop,
         "remaining": remaining,
+        "provider_failures": degraded_provider_failures,
+        **({"partial_provider_failure": delivery_note} if delivery_note else {}),
     }
 
 
@@ -2694,7 +3020,7 @@ def _validated_changes(
         )
         # Exact operation grants and explicitly authorized destination roots
         # are additive capabilities.  An exact artifact such as TEST-ci.yml
-        # must not turn the other user-authorized RealMat output roots into a
+        # must not turn the other user-authorized output roots into a
         # global deny-list.  With no root grant, exact-only goals remain exact.
         if exact_write_grants is not None:
             allowed = {
@@ -9806,9 +10132,10 @@ def work_together(
     }
     if acceptance_target.get("status") == "needs_clarification":
         question = str(acceptance_target.get("question") or "Clarify the acceptance target.")
+        structured_questions = [user_questions.one("acceptance-target", question)]
         clarification_state = {
             **write_authority_state,
-            "questions": [question],
+            "questions": structured_questions,
             "resume_token": ledger.session_id,
             "acceptance_target": acceptance_target,
             "baseline_merkle": acceptance_target.get("baseline_merkle"),
@@ -9837,7 +10164,7 @@ def work_together(
             "goal_complete": False, "verified": False,
             "verification_status": "paused_for_user",
             "status": "paused_for_user", "stopped_because": "paused_for_user",
-            "questions": [question], "resume_token": ledger.session_id,
+            "questions": structured_questions, "resume_token": ledger.session_id,
             "acceptance_target": acceptance_target,
             **write_authority_state,
             "round_limit": round_limit, "plan_rounds": 0,
@@ -9967,7 +10294,7 @@ def work_together(
     plan_rounds = 0
     plan_remaining: list[str] = []
     plan_stopped_because = ""
-    paused_questions: list[str] = []
+    paused_questions: list[dict[str, Any]] = []
     for round_number in _round_numbers(round_limit):
         plan_rounds = round_number
         everyone_ready = True
@@ -10002,7 +10329,7 @@ def work_together(
                           "ready_to_execute means no more planning or input is needed before Nexus starts the file transaction; it does not mean the files already exist. "
                           "Execution and post-transaction verification steps belong in the plan and are not remaining planning work. "
                           "When the plan already specifies the requested changes and how to verify them, set ready_to_execute true and remaining to an empty list. "
-                          "If and only if an essential user decision cannot be inferred safely, put concise questions in questions, keep ready_to_execute false, and Nexus will pause for an answer. Never hide a user question in remaining. "
+                          "If and only if an essential user decision cannot be inferred safely, put structured questions in questions, keep ready_to_execute false, and Nexus will pause for an answer. Give two or three clear options when useful, mark at most one recommended option, and allow_other unless a custom value would be invalid. Never hide a user question in remaining. "
                           "When a canonical planning checkpoint really changes, include progress entries with stable IDs, exact states, and concrete evidence; keep the same ID for the same checkpoint."
                         + _shared_context(ledger, one, {
                             "stage": "plan_review",
@@ -10034,10 +10361,7 @@ def work_together(
             value["_model"] = str(answer.get("model") or "")
             latest[str(one.get("id"))] = (one, value)
             one_remaining = _remaining(value)
-            one_questions = [
-                str(question).strip() for question in value.get("questions", [])
-                if str(question).strip()
-            ] if isinstance(value.get("questions"), list) else []
+            one_questions = user_questions.normalize(value.get("questions"))
             paused_questions.extend(one_questions)
             one_ready = value.get("ready_to_execute") is True and not one_remaining and not one_questions
             everyone_ready = everyone_ready and one_ready
@@ -10063,7 +10387,7 @@ def work_together(
             "round": round_number,
             "all_agents_ready": everyone_ready,
             "remaining": plan_remaining,
-            "questions": list(dict.fromkeys(paused_questions)),
+            "questions": user_questions.frozen(paused_questions),
         })
         if paused_questions:
             plan_stopped_because = "user_input"
@@ -10085,10 +10409,11 @@ def work_together(
 
     plans = [latest[str(one.get("id"))] for one in participants]
     if paused_questions:
-        paused_questions = list(dict.fromkeys(paused_questions))
+        paused_questions = user_questions.normalize(paused_questions)
+        question_prompts = user_questions.prompts(paused_questions)
         reply = (
             "Nexus paused before changing files because the team needs a user decision.\nQuestions:\n- "
-            + "\n- ".join(paused_questions)
+            + "\n- ".join(question_prompts)
             + "\n\nAnswer these questions to resume this exact project-work session. Nexus applied no project-file changes."
         )
         kept = chat_lab.keep_multiparty_exchange(
@@ -10100,7 +10425,7 @@ def work_together(
         )
         ledger.finish(
             reply, complete=False, stopped_because="paused_for_user",
-            remaining=paused_questions, status="paused_for_user",
+            remaining=question_prompts, status="paused_for_user",
             state={
                 "questions": paused_questions,
                 "resume_token": ledger.session_id,
@@ -10119,7 +10444,7 @@ def work_together(
             "reviewer_correlation": reviewer_correlation,
             **write_authority_state,
             "round_limit": round_limit, "plan_rounds": plan_rounds,
-            "work_passes": 0, "remaining": paused_questions,
+            "work_passes": 0, "remaining": question_prompts,
         }
     if not everyone_ready:
         plan_remaining = list(dict.fromkeys(
@@ -10429,27 +10754,28 @@ def work_together(
                     "Nexus is checking paths and fresh baselines before opening the atomic transaction."
                 )
                 try:
-                    transaction_id = FileTransaction.new_transaction_id()
-                    mutation_saga.prepare(transaction_id)
-                    manifest = FileTransaction(
-                        root,
-                        max_files=12,
-                        max_bytes=int(config.get("execution.max_changed_bytes")),
-                    ).apply(
-                        changes, transaction_id=transaction_id,
-                        allowed_exact_capabilities=pass_grants,
-                        allowed_write_roots=(
-                            explicit_write_roots
-                            if write_scope_restricted and explicit_write_roots else None
-                        ),
-                        protected_paths=[
-                            str(one) for one in requirement_contract.get("protected_paths", [])
-                            if isinstance(one, str)
-                        ],
-                    )
-                    _record_applied_transaction(
-                        ledger, mutation_saga, transaction_id, manifest,
-                    )
+                    with swarm_runs.post_provider_mutation():
+                        transaction_id = FileTransaction.new_transaction_id()
+                        mutation_saga.prepare(transaction_id)
+                        manifest = FileTransaction(
+                            root,
+                            max_files=12,
+                            max_bytes=int(config.get("execution.max_changed_bytes")),
+                        ).apply(
+                            changes, transaction_id=transaction_id,
+                            allowed_exact_capabilities=pass_grants,
+                            allowed_write_roots=(
+                                explicit_write_roots
+                                if write_scope_restricted and explicit_write_roots else None
+                            ),
+                            protected_paths=[
+                                str(one) for one in requirement_contract.get("protected_paths", [])
+                                if isinstance(one, str)
+                            ],
+                        )
+                        _record_applied_transaction(
+                            ledger, mutation_saga, transaction_id, manifest,
+                        )
                 except HarnessError as exc:
                     recovery = mutation_saga.compensate("transaction_failed")
                     ledger.record_state("mutation_failed", {

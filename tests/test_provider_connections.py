@@ -75,6 +75,48 @@ class RouteAwareConnectionChecks(unittest.TestCase):
             [["work.exe"], ["personal.exe"]],
         )
 
+    def test_a_cli_configuration_error_does_not_tell_somebody_to_log_in(self) -> None:
+        config = self.config({
+            "codex": {
+                "kind": "codex-cli", "model": "gpt", "command": ["codex.exe"],
+            },
+        })
+        native = {
+            "kind": "codex-cli", "installed": True,
+            "authentication": "unknown", "state": "configuration-error",
+            "can_login": True, "problem": "Error loading configuration: bad value",
+        }
+        with mock.patch.object(
+            subscription_cli, "connection_status", return_value=native,
+        ):
+            found = connections.connection_status(config, "codex")
+        self.assertEqual(found["state"], "configuration-error")
+        self.assertIn("signing in again will not help", found["note"])
+        self.assertNotIn("Not logged in", found["note"])
+
+    def test_codex_isolation_capability_turns_a_config_error_into_deferred_readiness(self) -> None:
+        config = self.config({
+            "codex": {
+                "kind": "codex-cli", "model": "gpt", "command": ["codex.exe"],
+            },
+        })
+        native = {
+            "kind": "codex-cli", "installed": True,
+            "authentication": "unknown", "state": "isolated-ready",
+            "can_login": False, "config_ignored_for_exec": True,
+            "problem": "Error loading configuration: unknown variant ultra",
+        }
+        with mock.patch.object(
+            subscription_cli, "connection_status", return_value=native,
+        ):
+            found = connections.connection_status(config, "codex")
+        self.assertEqual(found["state"], "isolated-ready")
+        self.assertIn("first isolated request", found["note"])
+        self.assertIn("sign-in again is not required", found["note"])
+        self.assertNotIn("unknown variant", found["note"])
+        self.assertIn("not a current agent-turn failure", found["note"])
+        self.assertFalse(found["can_login"])
+
     def test_web_routes_report_the_live_electron_connection(self) -> None:
         config = self.config({})
         out = connections.connection_status(config, "web:claude-1")
@@ -136,6 +178,44 @@ class ExactConfiguredCliChecks(unittest.TestCase):
             [exact, "--profile", "work", "auth", "status"],
         )
         self.assertEqual(found["authentication"], "signed-in")
+
+    def test_codex_config_error_probes_and_reports_isolated_exec_readiness(self) -> None:
+        exact = r"C:\exact\codex.exe"
+        responses = [
+            self.result(1, error="Error loading configuration: unknown variant ultra"),
+            self.result(0, out="Usage: codex exec --ignore-user-config"),
+        ]
+        with mock.patch.object(subscription_cli, "available", return_value=exact), \
+             mock.patch.object(
+                 subscription_cli, "_run_bounded", side_effect=responses,
+             ) as run:
+            found = subscription_cli.connection_status(
+                "codex-cli", command=[exact], use_cache=False,
+            )
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[1].args[0], [exact, "exec", "--help"])
+        self.assertEqual(found["state"], "isolated-ready")
+        self.assertTrue(found["config_ignored_for_exec"])
+        self.assertEqual(found["authentication"], "unknown")
+        self.assertFalse(found["can_login"])
+
+    def test_truncated_codex_help_cannot_claim_isolated_readiness(self) -> None:
+        exact = r"C:\exact\codex.exe"
+        responses = [
+            self.result(1, error="Error loading config.toml: unknown variant ultra"),
+            CommandResult(
+                [exact, "exec", "--help"], ".", 0,
+                "Usage: codex exec --ignore-user-config", "", 1,
+                output_truncated=True,
+            ),
+        ]
+        with mock.patch.object(subscription_cli, "available", return_value=exact), \
+             mock.patch.object(subscription_cli, "_run_bounded", side_effect=responses):
+            found = subscription_cli.connection_status(
+                "codex-cli", command=[exact], use_cache=False,
+            )
+        self.assertEqual(found["state"], "configuration-error")
+        self.assertNotEqual(found["state"], "isolated-ready")
 
     def test_an_explicit_missing_command_does_not_fall_back_to_another_build(self) -> None:
         with mock.patch.object(subscription_cli.shutil, "which", return_value=None), \

@@ -30,6 +30,11 @@ turn remains on disk. The ordinary chat panel and its next provider request use
 the most recent 40 complete turns as a projection; that display/request bound
 does not delete the older turns.
 
+Ordinary conversation stays available if Nexus has paused project execution
+because a folder was copied or its local authority registration needs repair.
+Talking to an assistant cannot run project commands or change project files, so
+it does not borrow that mutation authority.
+
 Long-horizon team work keeps its full canonical history in the append-only,
 paged collaboration ledger. Every discussion, planning, execution,
 verification, and final-synthesis request uses the same disclosed projection:

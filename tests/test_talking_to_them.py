@@ -22,7 +22,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from our_harness import chat, web_chats
+from our_harness import chat, user_questions, web_chats
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError, ResponseFormat
 
@@ -110,6 +110,22 @@ class OneConversation(TalkingTestCase):
         self.assertEqual([one["who"] for one in got["said"]], ["you", "them"])
         self.assertEqual(got["said"][0]["text"], "What is a unit test for?")
 
+    def test_visual_chat_and_bounded_agent_turn_preserve_the_routed_codex_effort(self) -> None:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "codex": {
+                "kind": "codex-cli", "model": "gpt-5.5",
+                "command": ["codex"], "auth_mode": "chatgpt",
+                "reasoning_effort": "high",
+            },
+        }
+        config = LoadedConfig(data, self.root, [], {})
+        provider = Answering()
+        with self.standing_in(provider):
+            chat.say(config, "codex", "Remember the visual chat effort")
+            chat.ask_once(config, "codex", "Run one bounded agent turn")
+        self.assertEqual([one.reasoning_effort for one in provider.asked], ["high", "high"])
+
     def test_it_is_a_conversation_and_not_a_row_of_questions(self) -> None:
         """The whole point: the second thing said knows about the first."""
 
@@ -123,6 +139,59 @@ class OneConversation(TalkingTestCase):
         )
         self.assertEqual(sent[0]["content"], "What is a unit test for?")
         self.assertEqual(sent[-1]["content"], "And in three words?")
+
+    def test_board_agent_can_return_structured_questions_and_resume_in_the_same_chat(self) -> None:
+        envelope = {
+            "questions": [{
+                "id": "procurement",
+                "prompt": "How should device procurement work?",
+                "options": [{
+                    "label": "Request-based",
+                    "description": "Employees submit requests for fulfillment.",
+                    "recommended": True,
+                }, {
+                    "label": "Self-service catalog",
+                    "description": "Employees order from an approved catalog.",
+                    "recommended": False,
+                }],
+                "multiple": False,
+                "allow_other": True,
+            }],
+        }
+        answering = Answering(
+            "I need one product decision.\n```nexus-user-input\n"
+            + json.dumps(envelope) + "\n```"
+        )
+        speaker = {"id": "agent-1", "name": "Claude", "who": "claude"}
+        with self.standing_in(answering):
+            paused = chat.say(
+                self.config, "", "Write the PRD", filed_as="pair-chat",
+                speaker=speaker, recipients=[speaker],
+            )
+
+        self.assertEqual(paused["status"], "waiting_for_user")
+        self.assertEqual(paused["answer"]["text"], "I need one product decision.")
+        self.assertEqual(paused["questions"][0]["id"], "procurement")
+        self.assertTrue(paused["questions"][0]["options"][0]["recommended"])
+        saved = chat.read_it(self.config, "", "pair-chat")
+        self.assertEqual(saved[-1].questions, paused["questions"])
+        self.assertIn("NEXUS USER-INPUT CAPABILITY", answering.asked[0].dynamic_context)
+
+        answering.text = "Thanks, continuing with request-based procurement."
+        with self.standing_in(answering):
+            chat.say(
+                self.config, "", "Request-based.", filed_as="pair-chat",
+                speaker=speaker, recipients=[speaker],
+            )
+        history = "\n".join(message["content"] for message in answering.asked[-1].messages)
+        self.assertIn("How should device procurement work?", history)
+        self.assertIn("Request-based", history)
+
+    def test_invalid_question_envelope_is_kept_as_agent_text(self) -> None:
+        text = "Question\n```nexus-user-input\n{not json}\n```"
+        visible, questions = user_questions.extract(text)
+        self.assertEqual(visible, text)
+        self.assertEqual(questions, [])
 
     def test_it_is_still_there_after_the_panel_is_closed(self) -> None:
         with self.standing_in(Answering()):
@@ -731,11 +800,59 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
         route = chat.already_set_up(self.config)[0]
         self.assertFalse(route["ready"])
         self.assertIn("project id", route["why_not"])
-        self.assertIn("Connect it", route["how_to_fix_it"])
+        self.assertIn("Repair connection", route["how_to_fix_it"])
         self.assertIn("Set Cloud project", route["how_to_fix_it"])
         self.assertIn("installed", route["trouble_last_time"])
         self.assertIn("reached", route["trouble_last_time"])
         self.assertNotIn("GOOGLE_CLOUD_PROJECT", route["trouble_last_time"])
+
+    def test_configuring_the_missing_gemini_project_reenables_one_verification(self) -> None:
+        self.config.data["providers"] = {
+            "gemini": {"kind": "gemini-cli", "model": "gemini-2.5-pro"}
+        }
+        chat._write_down_that_it_would_not(
+            self.config,
+            "gemini",
+            "This account requires setting the GOOGLE_CLOUD_PROJECT env var",
+        )
+        self.config.data["providers"]["gemini"]["google_project"] = "configured-project"
+
+        route = chat.already_set_up(self.config)[0]
+
+        self.assertTrue(route["ready"])
+        self.assertEqual(route["why_not"], "")
+        self.assertEqual(route["trouble_last_time"], "")
+        self.assertNotIn("gemini", chat.what_would_not_answer(self.config))
+
+    def test_collaboration_remembers_a_gemini_project_failure_and_stops_relaunching(self) -> None:
+        self.config.data["providers"] = {
+            "gemini": {"kind": "gemini-cli", "model": "gemini-2.5-pro"}
+        }
+
+        class MissingProject:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def complete(self, _request):
+                self.calls += 1
+                raise HarnessError(
+                    "This account requires setting the GOOGLE_CLOUD_PROJECT env var"
+                )
+
+        provider = MissingProject()
+        with self.standing_in(provider), self.assertRaises(chat.ChatError):
+            chat.ask_once(self.config, "gemini", "hello")
+
+        route = chat.already_set_up(self.config)[0]
+        self.assertEqual(provider.calls, 1)
+        self.assertFalse(route["ready"])
+        self.assertIn("Project ID", route["trouble_last_time"])
+
+        with self.standing_in(provider), self.assertRaisesRegex(
+            chat.ChatError, "did not launch another doomed provider turn"
+        ):
+            chat.ask_once(self.config, "gemini", "try again")
+        self.assertEqual(provider.calls, 1)
 
     def test_a_claude_subscription_refusal_stays_retryable_and_private(self) -> None:
         chat._write_down_that_it_would_not(
@@ -809,6 +926,122 @@ class WhatHappenedLastTimeTests(TalkingTestCase):
         with self.standing_in(Answering("here you go")):
             chat.say(self.config, "claude", "hello")
         self.assertEqual(self.only_one()["trouble_last_time"], "")
+
+    def test_a_collaboration_reply_clears_the_old_route_failure_too(self) -> None:
+        chat._write_down_that_it_would_not(
+            self.config, "claude", "old command-line configuration error"
+        )
+        with self.standing_in(Answering("here you go")):
+            answer = chat.ask_once(self.config, "claude", "hello")
+        self.assertEqual(answer["text"], "here you go")
+        self.assertEqual(self.only_one()["trouble_last_time"], "")
+
+    def test_current_codex_isolation_migrates_the_obsolete_config_refusal(self) -> None:
+        self.config.data["providers"] = {
+            "codex": {
+                "kind": "codex-cli", "model": "gpt-5.5",
+                "command": ["C:/Tools/codex.exe"], "auth_mode": "chatgpt",
+            }
+        }
+        # This is the shape written by builds before failure context became a
+        # versioned engine contract. It deliberately has no fingerprint.
+        where = chat._where_the_noes_are(self.config)
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps({
+            "codex": {
+                "why": "Codex CLI login status failed (1): Error loading configuration: "
+                       "config.toml:3:26: unknown variant `ultra`",
+                "when": time.time(),
+                "at": "2026-08-29T21:42:57Z",
+            }
+        }), encoding="utf-8")
+
+        route = chat.already_set_up(self.config)[0]
+
+        self.assertTrue(route["ready"])
+        self.assertEqual(route["connection_state"], "connected")
+        self.assertEqual(route["trouble_last_time"], "")
+        self.assertNotIn("codex", chat.what_would_not_answer(self.config))
+
+    def test_codex_isolation_does_not_hide_an_unrelated_real_refusal(self) -> None:
+        self.config.data["providers"] = {
+            "codex": {
+                "kind": "codex-cli", "model": "gpt-5.5",
+                "command": ["C:/Tools/codex.exe"], "auth_mode": "chatgpt",
+            }
+        }
+        chat._write_down_that_it_would_not(
+            self.config, "codex", "ChatGPT authentication required",
+        )
+
+        route = chat.already_set_up(self.config)[0]
+
+        self.assertEqual(route["connection_state"], "needs attention")
+        self.assertIn("authentication required", route["trouble_last_time"])
+        self.assertIn("codex", chat.what_would_not_answer(self.config))
+
+    def test_versioned_failure_survives_restart_when_route_and_engine_are_identical(self) -> None:
+        self.config.data["providers"]["claude"]["command"] = ["C:/Tools/claude.exe"]
+        chat._write_down_that_it_would_not(self.config, "claude", "Temporary provider refusal")
+        restarted = LoadedConfig(copy.deepcopy(self.config.data), self.root, [], {})
+
+        refusal = chat.what_would_not_answer(restarted)["claude"]
+
+        self.assertEqual(refusal["failure_context_version"], chat.FAILURE_CONTEXT_VERSION)
+        self.assertEqual(len(refusal["route_fingerprint_sha256"]), 64)
+        self.assertEqual(
+            refusal["transport_contract"],
+            chat.PROVIDER_TRANSPORT_CONTRACT_REVISIONS["claude-cli"],
+        )
+
+    def test_machine_specific_route_change_invalidates_failure_without_manual_cleanup(self) -> None:
+        old_command = "C:/Users/Another User/AppData/Local/claude.exe"
+        self.config.data["providers"]["claude"]["command"] = [old_command]
+        chat._write_down_that_it_would_not(self.config, "claude", "Temporary provider refusal")
+        raw = chat._where_the_noes_are(self.config).read_text(encoding="utf-8")
+        self.assertNotIn(old_command, raw, "the portable context must store only a digest")
+
+        moved_data = copy.deepcopy(self.config.data)
+        moved_data["providers"]["claude"]["command"] = ["D:/Portable Apps/claude.exe"]
+        moved_computer = LoadedConfig(moved_data, self.root, [], {})
+
+        self.assertNotIn("claude", chat.what_would_not_answer(moved_computer))
+        self.assertEqual(chat.already_set_up(moved_computer)[0]["trouble_last_time"], "")
+
+    def test_engine_transport_revision_invalidates_failure_for_every_installation(self) -> None:
+        chat._write_down_that_it_would_not(self.config, "claude", "Temporary provider refusal")
+
+        with mock.patch.dict(
+            chat.PROVIDER_TRANSPORT_CONTRACT_REVISIONS,
+            {"claude-cli": "claude-cli/subscription-exec/v2"},
+        ):
+            self.assertNotIn("claude", chat.what_would_not_answer(self.config))
+
+    def test_pre_fix_web_relay_failure_is_invalidated_by_the_v2_receipt_contract(self) -> None:
+        route = "web:chatgpt-portable-17"
+        with mock.patch.dict(
+            chat.PROVIDER_TRANSPORT_CONTRACT_REVISIONS,
+            {"web-chat": "web-chat/electron-relay/v1"},
+        ):
+            chat._write_down_that_it_would_not(
+                self.config, route, "The marked provider turn could not be reconciled",
+            )
+            self.assertIn(route, chat.what_would_not_answer(self.config))
+
+        self.assertNotIn(route, chat.what_would_not_answer(self.config))
+
+    def test_unrelated_legacy_failure_remains_visible_until_success_or_expiry(self) -> None:
+        where = chat._where_the_noes_are(self.config)
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps({
+            "claude": {
+                "why": "ChatGPT authentication required",
+                "when": time.time(),
+                "at": "2026-08-29T21:42:57Z",
+            }
+        }), encoding="utf-8")
+
+        self.assertIn("claude", chat.what_would_not_answer(self.config))
 
     def test_a_refusal_from_another_day_is_let_go(self) -> None:
         """A service that was down on Friday says nothing about Monday, and a

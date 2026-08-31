@@ -13,6 +13,7 @@ const path = require("node:path");
 const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
 const { attachGuards, onlyOnce, isHarnessVersionMismatch, whyItReallyIs } = require("./guards");
 const { WebChatManager } = require("./web-chats");
+const { DesktopSettingsStore } = require("./settings-store");
 
 function readBuildInfo() {
   try {
@@ -37,6 +38,7 @@ let projectPath = "";
 let repairAvailable = false;
 let webChatManager = null;
 let reviewedTrust = null;
+let desktopSettingsStore = null;
 const pendingJsonExports = new Map();
 const ownsApplicationInstance = app.requestSingleInstanceLock();
 
@@ -56,21 +58,36 @@ function settingsFile() {
   return path.join(app.getPath("userData"), "settings.json");
 }
 
-function readSettings() {
-  try {
-    const value = JSON.parse(fs.readFileSync(settingsFile(), "utf8"));
-    return value && typeof value === "object" ? value : {};
-  } catch (error) {
-    return {};
+function settingsBackupFile() {
+  return path.join(app.getPath("userData"), "settings.last-good.json");
+}
+
+function settingsStore() {
+  if (!desktopSettingsStore) {
+    desktopSettingsStore = new DesktopSettingsStore({
+      primaryFile: settingsFile(), backupFile: settingsBackupFile(),
+    });
   }
+  return desktopSettingsStore;
+}
+
+function readSettings() {
+  return settingsStore().read();
 }
 
 function writeSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Nexus desktop settings must be an object");
+  }
+  const target = settingsFile();
   try {
-    fs.mkdirSync(path.dirname(settingsFile()), { recursive: true });
-    fs.writeFileSync(settingsFile(), JSON.stringify(value, null, 2));
+    settingsStore().write(value);
+    return true;
   } catch (error) {
-    /* a missing settings file only costs one extra folder pick */
+    if (error?.code === "NEXUS_SETTINGS_UPDATE_REQUIRED") throw error;
+    throw new Error(
+      `Nexus could not save its desktop settings. Check available disk space and access to ${path.dirname(target)}, then try again. ${error.message || error}`,
+    );
   }
 }
 
@@ -139,6 +156,10 @@ function rememberCurrentProject(chosen) {
   const resolved = existingProject(chosen);
   if (!resolved) return "";
   projectPath = resolved;
+  // A prior app may still open the selected project read-only so its recovery
+  // banner is reachable, but it must not rewrite a newer desktop-settings
+  // envelope merely to remember the current folder.
+  if (settingsStore().status().write_blocked) return resolved;
   writeSettings({
     ...readSettings(),
     lastProject: resolved,
@@ -611,26 +632,128 @@ ipcMain.handle("harness:abortLargeJsonFile", (event, identity) => {
   closeLargeJsonExport(key);
   return true;
 });
-ipcMain.handle("harness:setFullScreen", (_event, on) => {
-  if (!window || window.isDestroyed()) return false;
-  window.setFullScreen(Boolean(on));
-  return Boolean(on);
+ipcMain.handle("harness:setFullScreen", (event, on) => {
+  if (!fromHarnessWindow(event) || !window || window.isDestroyed()) return false;
+  const target = window;
+  const wanted = Boolean(on);
+  if (target.isFullScreen() === wanted) return wanted;
+  // BrowserWindow#setFullScreen only starts the native transition. Resolve the
+  // IPC request after Electron confirms it so renderer-side focus restoration
+  // cannot race the OS taking focus during that transition.
+  return new Promise((resolve, reject) => {
+    const changedEvent = wanted ? "enter-full-screen" : "leave-full-screen";
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      target.removeListener(changedEvent, changed);
+      target.removeListener("closed", closed);
+    };
+    const finish = (value) => {
+      cleanup();
+      resolve(Boolean(value));
+    };
+    const changed = () => finish(wanted);
+    const closed = () => finish(false);
+    target.once(changedEvent, changed);
+    target.once("closed", closed);
+    timer = setTimeout(() => finish(
+      !target.isDestroyed() && target.isFullScreen(),
+    ), 5_000);
+    try {
+      target.setFullScreen(wanted);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
 });
 ipcMain.handle("harness:webChatProviders", (event) => (
   fromHarnessWindow(event) && webChatManager ? webChatManager.providers() : []
 ));
+ipcMain.handle("harness:appIconDataUrl", (event) => {
+  if (!fromHarnessWindow(event)) return "";
+  try {
+    return `data:image/x-icon;base64,${fs.readFileSync(
+      path.join(__dirname, "nexus-harness.ico")).toString("base64")}`;
+  } catch (_error) {
+    return "";
+  }
+});
 ipcMain.handle("harness:focusHarness", (event) => {
   if (!fromHarnessWindow(event) || !window || window.isDestroyed()) return false;
   window.focus();
   window.webContents.focus();
   return true;
 });
+ipcMain.handle("harness:desktopSettingsRecoveryStatus", (event) => (
+  fromHarnessWindow(event) ? settingsStore().status() : {
+    state: "unavailable", resolution_required: false,
+    requires_web_chat_resolution: false, recovered_web_chat_count: 0,
+  }
+));
+ipcMain.handle("harness:resolveDesktopSettingsRecovery", (event, action) => {
+  if (!fromHarnessWindow(event)) throw new Error("Desktop settings recovery is not available");
+  const choice = String(action || "");
+  if (!new Set(["restore", "discard_web_chats"]).has(choice)) {
+    throw new Error("Choose whether to restore or discard the recovered web chats");
+  }
+  let routesBefore = new Set();
+  if (webChatManager) {
+    try {
+      routesBefore = new Set(webChatManager.list().map((one) => String(one.id || "")));
+    } catch (_error) { /* only used for truthful restored-route count */ }
+  }
+  let outcome;
+  try {
+    outcome = settingsStore().resolve(choice);
+  } catch (error) {
+    if (error?.code === "NEXUS_SETTINGS_UPDATE_REQUIRED") throw error;
+    throw new Error(
+      `Nexus could not save its desktop settings. Check available disk space and access to ${path.dirname(settingsFile())}, then try again. ${error.message || error}`,
+    );
+  }
+  try {
+    const connections = webChatManager ? webChatManager.reloadFromSettings() : [];
+    const restoredConnectionCount = choice === "restore" && outcome.changed && webChatManager
+      ? connections.filter((one) => !routesBefore.has(String(one.id || ""))).length
+      : 0;
+    return {
+      ...outcome, connections,
+      restored_connection_count: restoredConnectionCount,
+    };
+  } catch (error) {
+    // The durable choice already committed. Do not turn a subsequent in-memory
+    // route refresh failure into the false renderer claim that nothing changed.
+    // A retry/restart can reconcile the manager from the now-authoritative files.
+    return {
+      ...outcome,
+      connections: webChatManager ? webChatManager.list() : [],
+      reload_error: String(error?.message || error),
+    };
+  }
+});
 ipcMain.handle("harness:webChats", (event) => (
   fromHarnessWindow(event) && webChatManager ? webChatManager.list() : []
 ));
-ipcMain.handle("harness:webChatConnect", (event, provider) => {
+ipcMain.handle("harness:webChatPreferences", (event) => (
+  fromHarnessWindow(event) && webChatManager
+    ? webChatManager.preferences() : {backgroundMode: false}
+));
+ipcMain.handle("harness:webChatBackgroundMode", (event, enabled) => {
+  if (!fromHarnessWindow(event) || !webChatManager) return {backgroundMode: false};
+  return webChatManager.setBackgroundMode(Boolean(enabled));
+});
+ipcMain.handle("harness:webChatConnect", (
+  event, provider, connectionId, conversationKey, preferExisting
+) => {
   if (!fromHarnessWindow(event) || !webChatManager) return false;
-  return webChatManager.openSetup(String(provider || ""));
+  const exactId = String(connectionId || "").toLowerCase();
+  if (exactId && !/^[a-z0-9][a-z0-9-]{5,63}$/.test(exactId)) {
+    throw new Error("That web-chat connection ID is not valid");
+  }
+  return webChatManager.openSetup(
+    String(provider || ""), exactId, String(conversationKey || ""),
+    Boolean(preferExisting));
 });
 ipcMain.handle("harness:webChatOpen", (event, id, conversationKey, preferExisting) => {
   if (!fromHarnessWindow(event) || !webChatManager) return false;
@@ -672,9 +795,22 @@ ipcMain.handle("harness:webChatAnswer", async (
       return relative && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
         && parts[0] === ".harness" && parts[1] === "chats" && parts[2] === "attachments";
     });
-  return webChatManager.ask(
-    found[1], String(prompt || ""), safeAttachments,
-    String(conversationKey || ""), Boolean(preferExisting));
+  try {
+    return await webChatManager.ask(
+      found[1], String(prompt || ""), safeAttachments,
+      String(conversationKey || ""), Boolean(preferExisting));
+  } catch (error) {
+    // Electron does not preserve custom Error properties across invoke().
+    // Return the bounded transport receipt explicitly so Python can tell a
+    // known provider failure from a genuinely ambiguous delivery.
+    return {
+      answer: "", model: "", error: String(error?.message || error),
+      delivery_state: String(error?.deliveryState || "unknown"),
+      failure_code: String(error?.failureCode || "web_chat_failure"),
+      diagnostics: error?.diagnostics && typeof error.diagnostics === "object"
+        ? error.diagnostics : {},
+    };
+  }
 });
 ipcMain.handle("harness:webChatStop", async (event, route, conversationKey) => {
   if (!fromHarnessWindow(event) || !webChatManager) return false;

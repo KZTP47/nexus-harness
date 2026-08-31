@@ -61,6 +61,7 @@ test("the external transport starts a normal loopback-controlled browser without
       assert.equal(endpoint, "http://127.0.0.1:23456");
       return browser;
     }},
+    backgroundMode: true,
   });
 
   const contents = transport.createContents("https://claude.ai/");
@@ -73,10 +74,43 @@ test("the external transport starts a normal loopback-controlled browser without
   assert.ok(launched[0].args.includes("--remote-debugging-port=23456"));
   assert.ok(launched[0].args.includes("--remote-debugging-address=127.0.0.1"));
   assert.ok(launched[0].args.includes(`--user-data-dir=${profilePath}`));
+  assert.ok(launched[0].args.includes("--start-minimized"));
   assert.ok(!launched[0].args.some((one) => /enable-automation|headless|remote-debugging-port=0/.test(one)));
   assert.equal(launched[0].options.windowsHide, false);
   await transport.close();
   assert.equal(contents.isDestroyed(), true);
+});
+
+test("background mode minimizes ordinary provider windows through the loopback CDP session", async () => {
+  const commands = [];
+  let detached = 0;
+  const page = {isClosed: () => false};
+  const context = {
+    pages: () => [page],
+    newCDPSession: async (selected) => {
+      assert.equal(selected, page);
+      return {
+        send: async (method, payload) => {
+          commands.push([method, payload]);
+          return method === "Browser.getWindowForTarget" ? {windowId: 42} : {};
+        },
+        detach: async () => { detached += 1; },
+      };
+    },
+  };
+  const transport = new ExternalBrowserTransport({
+    provider: {id: "claude", label: "Claude", home: "https://claude.ai/"},
+    profilePath: "nexus-test-profile",
+  });
+  transport.context = context;
+
+  assert.equal(await transport.setBackgroundMode(true), true);
+
+  assert.deepEqual(commands, [
+    ["Browser.getWindowForTarget", undefined],
+    ["Browser.setWindowBounds", {windowId: 42, bounds: {windowState: "minimized"}}],
+  ]);
+  assert.equal(detached, 1);
 });
 
 test("the first restored provider tab navigates to the requested saved conversation", async () => {

@@ -6,12 +6,27 @@ const {EventEmitter} = require("node:events");
 const path = require("node:path");
 const vm = require("node:vm");
 const {
-  PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
+  PROVIDERS, WebChatManager, WebChatTurnError, allowedProviderUrl,
+  specificConversationUrl, genericConversationUrl, providerReadinessScript,
   composerTextSelectionScript,
   automationScript, submissionBaselineScript, submitControlScript, submissionScript,
   answerScript, retryScript, stopScript,
   browserLikeUserAgent, authStorageAccessIsTrusted,
 } = require("./web-chats");
+
+test("a missing connection is a proven pre-submission failure", async () => {
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  await assert.rejects(
+    () => manager.askNow("missing-connection", "test", []),
+    (error) => error instanceof WebChatTurnError
+      && error.deliveryState === "not_accepted"
+      && error.failureCode === "connection_missing",
+  );
+});
 
 test("provider pages and explicit sign-in hosts stay inside the remote browser boundary", () => {
   assert.equal(allowedProviderUrl(PROVIDERS.claude, "https://claude.ai/new"), true);
@@ -21,6 +36,52 @@ test("provider pages and explicit sign-in hosts stay inside the remote browser b
   assert.equal(allowedProviderUrl(PROVIDERS.claude, "https://claude.ai.attacker.example/"), false);
   const localFile = "file:" + "///" + ["C:", "Windows", "System32"].join("/");
   assert.equal(allowedProviderUrl(PROVIDERS.claude, localFile), false);
+});
+
+test("only provider-specific editable conversation URLs can own a Nexus chat", () => {
+  const conversations = {
+    chatgpt: "https://chatgpt.com/c/portable-chat",
+    claude: "https://claude.ai/chat/portable-chat",
+    gemini: "https://gemini.google.com/app/portable-chat",
+    copilot: "https://copilot.microsoft.com/chats/portable-chat",
+  };
+  for (const [providerId, url] of Object.entries(conversations)) {
+    assert.equal(specificConversationUrl(PROVIDERS[providerId], url), true, providerId);
+    assert.equal(genericConversationUrl(
+      PROVIDERS[providerId], PROVIDERS[providerId].newChat), true, providerId);
+  }
+  assert.equal(specificConversationUrl(
+    PROVIDERS.chatgpt, "https://platform.openai.com/settings"), false);
+  assert.equal(specificConversationUrl(
+    PROVIDERS.claude, "https://claude.ai/settings/profile"), false);
+  assert.equal(specificConversationUrl(
+    PROVIDERS.gemini, "https://gemini.google.com/settings"), false);
+  assert.equal(specificConversationUrl(
+    PROVIDERS.copilot, "https://account.microsoft.com/"), false);
+  assert.equal(allowedProviderUrl(
+    PROVIDERS.gemini, "https://accounts.google.com/AccountChooser"), false);
+  assert.equal(allowedProviderUrl(
+    PROVIDERS.gemini, "https://accounts.google.com/AccountChooser", true), true);
+  assert.equal(allowedProviderUrl(
+    PROVIDERS.gemini, "https://www.google.com/search?q=nexus"), false);
+});
+
+test("restart drops legacy provider-page bindings that are not conversations", () => {
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({webChats: [
+      {id: "gemini-valid", provider: "gemini", title: "Valid",
+        url: "https://gemini.google.com/app/portable-chat"},
+      {id: "gemini-auth-page", provider: "gemini", title: "Wrong",
+        url: "https://accounts.google.com/AccountChooser"},
+      {id: "chatgpt-settings", provider: "chatgpt", title: "Wrong",
+        url: "https://chatgpt.com/settings"},
+    ]}),
+    writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+
+  assert.deepEqual(manager.list().map((one) => one.id), ["gemini-valid"]);
 });
 
 test("Claude authorization identity and provider-declared challenge storage stay narrow", () => {
@@ -113,6 +174,74 @@ test("Claude uses the provider-configured external browser transport", () => {
   assert.equal(manager.providers().find((one) => one.id === "gemini").external, false);
 });
 
+test("background web-chat mode is persisted and applied to external transports", async () => {
+  let settings = {webChatBackgroundMode: true};
+  const applied = [];
+  let received = null;
+  const manager = new WebChatManager({
+    electron: {app: {getPath: () => "NexusData"}}, owner: null,
+    readSettings: () => settings,
+    writeSettings: (value) => { settings = value; },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    externalBrowserFactory: (options) => {
+      received = options;
+      return {setBackgroundMode: async (enabled) => applied.push(enabled)};
+    },
+  });
+  manager.externalTransportFor("claude");
+
+  assert.deepEqual(manager.preferences(), {backgroundMode: true});
+  assert.equal(received.backgroundMode, true);
+
+  assert.deepEqual(await manager.setBackgroundMode(false), {backgroundMode: false});
+  assert.equal(settings.webChatBackgroundMode, false);
+  assert.deepEqual(applied, [false]);
+});
+
+test("desktop settings write failures stay visible and background mode rolls back", async () => {
+  const manager = new WebChatManager({
+    electron: {app: {getPath: () => "NexusData"}}, owner: null,
+    readSettings: () => ({webChatBackgroundMode: false}),
+    writeSettings: () => { throw new Error("disk is read-only"); },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+
+  await assert.rejects(() => manager.setBackgroundMode(true), /disk is read-only/);
+  assert.equal(manager.preferences().backgroundMode, false);
+  assert.match(manager.preferences().persistence_error, /disk is read-only/);
+});
+
+test("a failed connection save is disclosed and a failed removal is rolled back", () => {
+  const changed = [];
+  let closed = 0;
+  const manager = new WebChatManager({
+    electron: {}, owner: {
+      isDestroyed: () => false,
+      webContents: {send: (...args) => changed.push(args)},
+    },
+    readSettings: () => ({}),
+    writeSettings: () => { throw new Error("settings volume is full"); },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.connections.set("chatgpt-persist", {
+    id: "chatgpt-persist", provider: "chatgpt", title: "Persist me",
+    url: "https://chatgpt.com/c/persist", threads: {},
+  });
+  manager.views.set("chatgpt-persist", {webContents: {
+    isDestroyed: () => false, close: () => { closed += 1; },
+  }});
+
+  assert.throws(() => manager.save(null, true), /settings volume is full/);
+  assert.match(manager.list()[0].persistence_error, /settings volume is full/);
+  assert.equal(changed.at(-1)[2], null);
+  assert.throws(() => manager.remove("chatgpt-persist"), /settings volume is full/);
+  assert.equal(manager.connections.has("chatgpt-persist"), true);
+  assert.deepEqual(changed.at(-1)[1].map((one) => one.id), ["chatgpt-persist"]);
+  assert.equal(changed.at(-1)[2], null);
+  assert.equal(closed, 0);
+  assert.equal(manager.views.has("chatgpt-persist"), true);
+});
+
 test("the remote-page script contains fixed selectors and safely encoded prompt text", () => {
   const prompt = "hello `); require('node:fs').rmSync('x'); //";
   const script = automationScript(PROVIDERS.chatgpt, prompt);
@@ -179,6 +308,197 @@ test("Claude's current streaming transcript boundary yields the completed marked
   assert.equal(PROVIDERS.claude.replies[0], "[data-is-streaming] .standard-markdown");
   assert.equal(state.changed, true);
   assert.equal(state.answer, "CLAUDE_CURRENT_TRANSCRIPT_OK");
+  assert.equal(state.markerSource, "user_selector");
+});
+
+test("Claude marked turns remain pairable when its user-message test id disappears", () => {
+  const element = (text) => ({
+    innerText: text, textContent: text, getClientRects: () => [1],
+    getAttribute: () => "", contains: () => false,
+  });
+  const marker = "NEXUS TRANSPORT TURN claude-without-testid";
+  const promptFragment = element(`[${marker}]`);
+  const broadWrapper = element(`[${marker}]\nThe full board context`);
+  const answer = element("CLAUDE_REPLY_AFTER_MARKER");
+  const composer = element("");
+  promptFragment.compareDocumentPosition = (node) => node === answer ? 4 : 2;
+  broadWrapper.compareDocumentPosition = promptFragment.compareDocumentPosition;
+  const began = {
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0, beforeUserLast: "",
+    beforeError: "", submittedPrompt: `[${marker}]\nThe full board context`,
+    submittedMarker: marker,
+  };
+  const context = {
+    document: {querySelectorAll: (selector) => {
+      if (selector === "[data-is-streaming] .standard-markdown") return [answer];
+      if (selector === "body *") return [broadWrapper, promptFragment];
+      if (PROVIDERS.claude.composer.includes(selector)) return [composer];
+      return [];
+    }},
+    getComputedStyle: () => ({visibility: "visible"}),
+  };
+
+  const state = vm.runInNewContext(answerScript(PROVIDERS.claude, began), context);
+
+  assert.equal(state.changed, true);
+  assert.equal(state.answer, "CLAUDE_REPLY_AFTER_MARKER");
+  assert.equal(state.markerSource, "broad_fallback");
+});
+
+test("Claude broad marker fallback cannot pair a stale following reply", () => {
+  const element = (text) => ({
+    innerText: text, textContent: text, getClientRects: () => [1],
+    getAttribute: () => "", contains: () => false,
+  });
+  const marker = "NEXUS TRANSPORT TURN claude-stale-following-reply";
+  const promptPreview = element(`[${marker}]\nDraft preview outside the editor`);
+  const staleAnswer = element("CLAUDE_REPLY_FROM_BEFORE_SEND");
+  const composer = element("");
+  promptPreview.compareDocumentPosition = (node) => node === staleAnswer ? 4 : 2;
+  const began = {
+    beforeCount: 1, beforeLast: staleAnswer.innerText,
+    beforeUserCount: 0, beforeUserLast: "", beforeError: "",
+    submittedPrompt: `[${marker}]\nThe current request`, submittedMarker: marker,
+  };
+  const context = {
+    document: {querySelectorAll: (selector) => {
+      if (selector === "[data-is-streaming] .standard-markdown") return [staleAnswer];
+      if (selector === "body *") return [promptPreview];
+      if (PROVIDERS.claude.composer.includes(selector)) return [composer];
+      return [];
+    }},
+    getComputedStyle: () => ({visibility: "visible"}),
+  };
+
+  const state = vm.runInNewContext(answerScript(PROVIDERS.claude, began), context);
+
+  assert.equal(state.markerFound, true);
+  assert.equal(state.markerSource, "broad_fallback");
+  assert.equal(state.changed, false);
+  assert.equal(state.answer, "");
+});
+
+test("a visible marker outside the composer stays uncertain without a paired reply", async () => {
+  const visible = (text) => ({
+    innerText: text, textContent: text, contains: () => false,
+    getBoundingClientRect: () => ({width: 100, height: 30}),
+  });
+  const marker = "NEXUS TRANSPORT TURN accepted-without-testid";
+  const prompt = `[${marker}]\nA long Nexus request`;
+  const marked = visible(prompt);
+  const composer = visible("");
+  const began = {
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0, beforeUserLast: "",
+    submittedMarker: marker, sendActivated: true,
+  };
+  const context = {
+    document: {querySelectorAll: (selector) => {
+      if (selector === "body *") return [marked];
+      if (PROVIDERS.claude.composer.includes(selector)) return [composer];
+      return [];
+    }},
+    getComputedStyle: () => ({visibility: "visible", display: "block"}),
+    setTimeout: (resolve) => resolve(),
+    HTMLTextAreaElement: class {}, HTMLInputElement: class {},
+  };
+
+  const state = await vm.runInNewContext(
+    submissionScript(PROVIDERS.claude, prompt, began), context);
+
+  assert.equal(state.ok, true);
+  assert.equal(state.submissionState, "outcome_unknown");
+});
+
+test("an unsent Gemini draft cannot use its composer wrapper as a transport receipt", async () => {
+  const marker = "NEXUS TRANSPORT TURN gemini-unsent-wrapper";
+  const prompt = `[${marker}]\nCreate the requested files`;
+  const visible = {
+    getBoundingClientRect: () => ({width: 100, height: 30}),
+    getClientRects: () => [1],
+  };
+  const composer = {
+    ...visible, innerText: prompt, textContent: prompt,
+    contains: (one) => one === composer,
+  };
+  const wrapper = {
+    ...visible, innerText: prompt, textContent: prompt,
+    contains: (one) => one === composer,
+  };
+  const send = {
+    ...visible, disabled: false, hasAttribute: () => false,
+    getAttribute: () => "false",
+  };
+  const began = {
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0, beforeUserLast: "",
+    beforeError: "", submittedPrompt: prompt, submittedMarker: marker,
+    sendActivated: true,
+  };
+  const context = {
+    document: {
+      visibilityState: "hidden",
+      querySelectorAll: (selector) => {
+        if (selector === "body *") return [wrapper, composer];
+        if (PROVIDERS.gemini.composer.includes(selector)) return [composer];
+        if (PROVIDERS.gemini.send.includes(selector)) return [send];
+        return [];
+      },
+    },
+    getComputedStyle: () => ({visibility: "visible", display: "block"}),
+    setTimeout: (resolve) => resolve(),
+    HTMLTextAreaElement: class {}, HTMLInputElement: class {},
+  };
+
+  const submission = await vm.runInNewContext(
+    submissionScript(PROVIDERS.gemini, prompt, began), context);
+  const answer = vm.runInNewContext(answerScript(PROVIDERS.gemini, began), context);
+
+  assert.notEqual(submission.submissionState, "acknowledged");
+  assert.equal(submission.submissionState, "not_accepted");
+  assert.equal(submission.needsTrustedEnter, true);
+  assert.equal(answer.markerFound, false);
+  assert.equal(answer.changed, false);
+  assert.equal(answer.userCount, 0);
+  assert.equal(answer.replyCount, 0);
+});
+
+test("an unsent Claude draft cannot use its composer wrapper as a marker receipt", async () => {
+  const marker = "NEXUS TRANSPORT TURN claude-unsent-wrapper";
+  const prompt = `[${marker}]\nWait in the composer`;
+  const visible = {
+    getBoundingClientRect: () => ({width: 100, height: 30}),
+    getClientRects: () => [1],
+  };
+  const composer = {
+    ...visible, innerText: prompt, textContent: prompt,
+    contains: (one) => one === composer,
+  };
+  const wrapper = {
+    ...visible, innerText: prompt, textContent: prompt,
+    contains: (one) => one === composer,
+  };
+  const began = {
+    beforeCount: 0, beforeLast: "", beforeUserCount: 0, beforeUserLast: "",
+    beforeError: "", submittedPrompt: prompt, submittedMarker: marker,
+    sendActivated: true,
+  };
+  const context = {
+    document: {querySelectorAll: (selector) => {
+      if (selector === "body *") return [wrapper, composer];
+      if (PROVIDERS.claude.composer.includes(selector)) return [composer];
+      return [];
+    }},
+    getComputedStyle: () => ({visibility: "visible", display: "block"}),
+    setTimeout: (resolve) => resolve(),
+    HTMLTextAreaElement: class {}, HTMLInputElement: class {},
+  };
+
+  const submission = await vm.runInNewContext(
+    submissionScript(PROVIDERS.claude, prompt, began), context);
+  const answer = vm.runInNewContext(answerScript(PROVIDERS.claude, began), context);
+
+  assert.notEqual(submission.submissionState, "acknowledged");
+  assert.equal(answer.markerFound, false);
+  assert.equal(answer.changed, false);
 });
 
 test("one Send button matching exact and fallback selectors remains one safe target", () => {
@@ -584,6 +904,90 @@ test("using the current chat identifies it to the board as the selected connecti
   assert.deepEqual(sent[0][2], selected);
 });
 
+test("reconnecting a missing route preserves its exact ID and conversation key", async () => {
+  let settings = {};
+  const held = {
+    providerId: "chatgpt",
+    connectionId: "chatgpt-abcdef123456",
+    conversationKey: "portable-board-chat-17",
+    preferExisting: true,
+    view: {webContents: {
+      isLoading: () => false,
+      executeJavaScript: async () => ({ready: true}),
+      getURL: () => "https://chatgpt.com/c/reconnected-conversation",
+      getTitle: async () => "Reconnected helper",
+    }},
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => settings,
+    writeSettings: (value) => { settings = value; },
+    shellPage: "file:///web-chat.html",
+    shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.shellFor = () => held;
+
+  const selected = await manager.useCurrent({});
+
+  assert.equal(selected.id, "chatgpt-abcdef123456");
+  assert.equal(held.connectionId, "chatgpt-abcdef123456");
+  assert.equal(settings.webChats.length, 1);
+  assert.equal(settings.webChats[0].id, "chatgpt-abcdef123456");
+  assert.deepEqual(settings.webChats[0].threads["portable-board-chat-17"], {
+    url: "https://chatgpt.com/c/reconnected-conversation",
+    title: "Reconnected helper",
+  });
+});
+
+test("an exact reconnect cannot reuse a connection owned by another provider", () => {
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({webChats: [{
+      id: "portable-route-17", provider: "gemini", title: "Gemini helper",
+      url: "https://gemini.google.com/app/portable-conversation",
+    }]}),
+    writeSettings: () => {},
+    shellPage: "file:///web-chat.html",
+    shellPreload: "web-chat-shell-preload.js",
+  });
+
+  assert.throws(
+    () => manager.openSetup("chatgpt", "portable-route-17", "portable-key", true),
+    /belongs to a different provider/,
+  );
+});
+
+test("a failed Use this chat save cannot leave a reachable ghost connection", async () => {
+  const sent = [];
+  const held = {
+    providerId: "chatgpt", connectionId: "", view: {webContents: {
+      isLoading: () => false,
+      executeJavaScript: async () => ({ready: true}),
+      getURL: () => "https://chatgpt.com/c/unsaved",
+      getTitle: async () => "Unsaved helper",
+    }},
+  };
+  const manager = new WebChatManager({
+    electron: {},
+    owner: {
+      isDestroyed: () => false,
+      webContents: {send: (...args) => sent.push(args)},
+    },
+    readSettings: () => ({}),
+    writeSettings: () => { throw new Error("settings volume is full"); },
+    shellPage: "file:///web-chat.html",
+    shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.shellFor = () => held;
+
+  await assert.rejects(() => manager.useCurrent({}), /settings volume is full/);
+
+  assert.equal(manager.connections.size, 0);
+  assert.equal(held.connectionId, "");
+  assert.deepEqual(sent.at(-1)[1], []);
+  assert.equal(sent.at(-1)[2], null);
+});
+
 test("using Claude current chat adopts the selected replacement browser tab first", async () => {
   let settings = {};
   let adopted = 0;
@@ -669,6 +1073,96 @@ test("a provider SPA navigation replaces the generic saved page with the real co
   assert.equal(settings.webChats[0].url, contents.url);
   assert.equal(settings.webChats[0].title, contents.title);
   assert.equal(sent.at(-1)[0], "harness:webChatsChanged");
+});
+
+test("background navigation cannot silently rebind an owned provider conversation", () => {
+  let settings = {webChats: [{
+    id: "gemini-example", provider: "gemini", title: "Owned Gemini chat",
+    url: "https://gemini.google.com/app/original-chat",
+  }]};
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => settings,
+    writeSettings: (value) => { settings = value; },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  const contents = Object.assign(new EventEmitter(), {
+    url: "https://gemini.google.com/app/original-chat", title: "Original",
+    getURL() { return this.url; }, getTitle() { return this.title; },
+    isDestroyed: () => false,
+  });
+  manager.trackConnectionPage("gemini-example", contents);
+
+  for (const drift of [
+    "https://gemini.google.com/settings",
+    "https://gemini.google.com/app/different-chat",
+    "https://accounts.google.com/AccountChooser",
+  ]) {
+    contents.url = drift;
+    contents.title = "Wrong page";
+    contents.emit("did-navigate");
+  }
+
+  assert.equal(manager.connections.get("gemini-example").url,
+    "https://gemini.google.com/app/original-chat");
+  assert.equal(settings.webChats[0].url,
+    "https://gemini.google.com/app/original-chat");
+});
+
+test("prefer-existing thread ownership rolls back when its durable save fails", () => {
+  const changed = [];
+  const manager = new WebChatManager({
+    electron: {}, owner: {
+      isDestroyed: () => false,
+      webContents: {send: (...args) => changed.push(args)},
+    },
+    readSettings: () => ({}),
+    writeSettings: () => { throw new Error("portable settings failure"); },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  const connection = {
+    id: "chatgpt-example", provider: "chatgpt", title: "Existing",
+    url: "https://chatgpt.com/c/original-chat", threads: {},
+  };
+  manager.connections.set(connection.id, connection);
+
+  assert.throws(
+    () => manager.threadFor(connection, "pair-chat-portable", true),
+    /portable settings failure/,
+  );
+  assert.equal(connection.threads["pair-chat-portable"], undefined);
+  assert.deepEqual(changed.at(-1)[1].map((one) => one.id), [connection.id]);
+  assert.equal(changed.at(-1)[2], null);
+});
+
+test("automatic conversation ownership rolls back when its durable save fails", () => {
+  const changed = [];
+  const manager = new WebChatManager({
+    electron: {}, owner: {
+      isDestroyed: () => false,
+      webContents: {send: (...args) => changed.push(args)},
+    },
+    readSettings: () => ({}),
+    writeSettings: () => { throw new Error("portable settings failure"); },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.connections.set("gemini-example", {
+    id: "gemini-example", provider: "gemini", title: "Gemini",
+    url: PROVIDERS.gemini.newChat, threads: {},
+  });
+  const contents = {
+    isDestroyed: () => false,
+    getURL: () => "https://gemini.google.com/app/new-owned-chat",
+    getTitle: () => "New owned chat",
+  };
+
+  assert.throws(
+    () => manager.rememberConnectionPage("gemini-example", contents),
+    /portable settings failure/,
+  );
+  assert.equal(manager.connections.get("gemini-example").url, PROVIDERS.gemini.newChat);
+  assert.equal(changed.at(-1)[1][0].url, PROVIDERS.gemini.newChat);
+  assert.equal(changed.at(-1)[2], null);
 });
 
 test("a newly created conversation replaces the stale generic page in an open provider window", async () => {
@@ -781,6 +1275,69 @@ test("starting a Nexus chat again discards only that chat's remote binding", () 
   assert.ok(settings.webChats[0].threads["pair-chat-one"]);
   assert.equal(settings.webChats[0].threads["pair-chat-two"], undefined);
   assert.equal(manager.views.has("gemini-example\npair-chat-two"), false);
+});
+
+test("Start new keeps the durable binding when provider navigation fails", async () => {
+  let settings = {webChats: [{
+    id: "gemini-example", provider: "gemini", title: "Gemini",
+    url: "https://gemini.google.com/app/base", threads: {
+      "pair-chat": {url: "https://gemini.google.com/app/owned", title: "Owned"},
+    },
+  }]};
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => settings,
+    writeSettings: (value) => { settings = value; },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  const remote = {
+    isLoading: () => false,
+    loadURL: async () => { throw new Error("provider navigation failed"); },
+  };
+  manager.shellFor = () => ({
+    providerId: "gemini", connectionId: "gemini-example",
+    conversationKey: "pair-chat", view: {webContents: remote},
+  });
+
+  await assert.rejects(() => manager.startNew({}), /provider navigation failed/);
+
+  assert.equal(manager.connections.get("gemini-example").threads["pair-chat"].url,
+    "https://gemini.google.com/app/owned");
+  assert.equal(settings.webChats[0].threads["pair-chat"].url,
+    "https://gemini.google.com/app/owned");
+});
+
+test("Start new restores the binding and visible route when its save fails", async () => {
+  const loads = [];
+  let url = "https://gemini.google.com/app/owned";
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}),
+    writeSettings: () => { throw new Error("settings are unwritable"); },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.connections.set("gemini-example", {
+    id: "gemini-example", provider: "gemini", title: "Gemini",
+    url: "https://gemini.google.com/app/base", threads: {
+      "pair-chat": {url, title: "Owned"},
+    },
+  });
+  const remote = {
+    isLoading: () => false, getURL: () => url,
+    loadURL: async (next) => { loads.push(next); url = next; },
+  };
+  manager.shellFor = () => ({
+    providerId: "gemini", connectionId: "gemini-example",
+    conversationKey: "pair-chat", view: {webContents: remote},
+  });
+
+  await assert.rejects(() => manager.startNew({}), /settings are unwritable/);
+
+  assert.equal(manager.connections.get("gemini-example").threads["pair-chat"].url,
+    "https://gemini.google.com/app/owned");
+  assert.deepEqual(loads, [
+    PROVIDERS.gemini.newChat, "https://gemini.google.com/app/owned",
+  ]);
 });
 
 test("a background provider view gets a real hidden rendering host", () => {
@@ -933,6 +1490,148 @@ test("stopping a web turn marks only that chat cancelled and clicks the provider
   assert.ok(stopScript(PROVIDERS.chatgpt).includes("stop-button"));
 });
 
+test("preflight refuses a drifted conversation before any provider submission", async () => {
+  let scripts = 0;
+  let closed = 0;
+  const contents = {
+    isLoading: () => false, isDestroyed: () => false,
+    getURL: () => "https://gemini.google.com/app/different-chat",
+    getTitle: () => "Different",
+    executeJavaScript: async () => { scripts += 1; return {}; },
+    close: () => { closed += 1; },
+  };
+  const view = {webContents: contents};
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.connections.set("gemini-example", {
+    id: "gemini-example", provider: "gemini", title: "Gemini",
+    url: "https://gemini.google.com/app/owned-chat", threads: {},
+  });
+  manager.views.set("gemini-example", view);
+
+  await assert.rejects(
+    () => manager.askNow("gemini-example", "Do not misdeliver", []),
+    (error) => error instanceof WebChatTurnError
+      && error.deliveryState === "not_accepted"
+      && error.failureCode === "conversation_binding_drift",
+  );
+  assert.equal(scripts, 0);
+  assert.equal(closed, 1);
+  assert.equal(manager.views.has("gemini-example"), false);
+});
+
+test("preflight refuses a newly discovered chat when its binding cannot be saved", async () => {
+  let submissions = 0;
+  const contents = {
+    isLoading: () => false, isDestroyed: () => false,
+    getURL: () => "https://gemini.google.com/app/discovered-chat",
+    getTitle: () => "Discovered",
+    executeJavaScript: async () => { submissions += 1; return {}; },
+    close: () => {},
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}),
+    writeSettings: () => { throw new Error("settings are unwritable"); },
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  manager.connections.set("gemini-example", {
+    id: "gemini-example", provider: "gemini", title: "Gemini",
+    url: PROVIDERS.gemini.newChat, threads: {},
+  });
+  const view = {webContents: contents};
+  manager.views.set("gemini-example", view);
+
+  await assert.rejects(
+    () => manager.askNow("gemini-example", "Do not send without a route", []),
+    (error) => error instanceof WebChatTurnError
+      && error.deliveryState === "not_accepted"
+      && error.failureCode === "conversation_binding_not_saved",
+  );
+  assert.equal(submissions, 0);
+  assert.equal(manager.connections.get("gemini-example").url, PROVIDERS.gemini.newChat);
+});
+
+test("a never-loading page times out before submission and the next queued turn recovers", async () => {
+  let created = 0;
+  let firstClosed = 0;
+  const stuck = Object.assign(new EventEmitter(), {
+    isLoading: () => true, isDestroyed: () => false,
+    getURL: () => "https://gemini.google.com/app/owned-chat",
+    getTitle: () => "Owned",
+    loadURL: async () => {}, close: () => { firstClosed += 1; },
+  });
+  const recovered = Object.assign(new EventEmitter(), {
+    isLoading: () => false, isDestroyed: () => false,
+    getURL: () => "https://gemini.google.com/app/owned-chat",
+    getTitle: () => "Gemini",
+    loadURL: async () => {}, close: () => {},
+    executeJavaScript: async (script) => script.includes("const prompt =")
+      ? {ok: true, submissionState: "acknowledged", beforeCount: 0, beforeLast: ""}
+      : {answer: "Recovered answer", changed: true, stopping: false, error: ""},
+  });
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    preSubmitDeadlineMs: 15, answerPollMs: 1, answerDeadlineMs: 1000,
+  });
+  manager.connections.set("gemini-example", {
+    id: "gemini-example", provider: "gemini", title: "Gemini",
+    url: "https://gemini.google.com/app/owned-chat", threads: {},
+  });
+  manager.makeRemoteView = () => ({webContents: created++ === 0 ? stuck : recovered});
+  manager.parkBackgroundView = () => {};
+
+  await assert.rejects(
+    () => manager.ask("gemini-example", "First turn", []),
+    (error) => error instanceof WebChatTurnError
+      && error.deliveryState === "not_accepted"
+      && error.failureCode === "pre_submission_timeout",
+  );
+  const result = await manager.ask("gemini-example", "Second turn", []);
+
+  assert.equal(firstClosed, 1);
+  assert.equal(created, 2);
+  assert.equal(result.answer, "Recovered answer");
+});
+
+test("Stop wakes a pre-submit load wait without waiting for its deadline", async () => {
+  let closed = 0;
+  const stuck = Object.assign(new EventEmitter(), {
+    isLoading: () => true, isDestroyed: () => false,
+    getURL: () => "https://gemini.google.com/app/owned-chat",
+    loadURL: async () => {}, close: () => { closed += 1; },
+  });
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    preSubmitDeadlineMs: 5000,
+  });
+  manager.connections.set("gemini-example", {
+    id: "gemini-example", provider: "gemini", title: "Gemini",
+    url: "https://gemini.google.com/app/owned-chat", threads: {},
+  });
+  manager.makeRemoteView = () => ({webContents: stuck});
+  manager.parkBackgroundView = () => {};
+
+  const turn = manager.ask("gemini-example", "Cancel before send", []);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(await manager.stop("gemini-example"), true);
+  await assert.rejects(
+    () => turn,
+    (error) => error instanceof WebChatTurnError
+      && error.deliveryState === "not_accepted"
+      && error.failureCode === "pre_submission_cancelled",
+  );
+  assert.equal(closed, 1);
+  assert.equal(manager.activeAsks.has("gemini-example"), false);
+});
+
 test("an accepted Gemini turn with no reply progress is never resubmitted", async () => {
   let submissions = 0;
   let stops = 0;
@@ -969,7 +1668,7 @@ test("an accepted Gemini turn with no reply progress is never resubmitted", asyn
 
   await assert.rejects(
     () => manager.askNow("gemini-example", "Please answer", []),
-    /did not finish a visible reply/,
+    /did not observe a finished visible reply/,
   );
   assert.equal(submissions, 1);
   assert.ok(stops >= 1);
@@ -1098,6 +1797,91 @@ test("the embedded trusted Enter fallback focuses the composer and sends key tex
   assert.equal(commands[2][1].type, "keyUp");
 });
 
+async function uncertainChatGptAnswerTimeout(markerFound, answer = "Incomplete answer") {
+  let stops = 0;
+  const contents = {
+    isDestroyed: () => false,
+    getURL: () => PROVIDERS.chatgpt.home,
+    executeJavaScript: async (script) => {
+      if (script.includes("const prompt =")) {
+        return {
+          ok: true, submissionState: "outcome_unknown",
+          beforeCount: 0, beforeLast: "", beforeUserCount: 0,
+          beforeUserLast: "", beforeError: "", beforeStopping: false,
+        };
+      }
+      if (script.includes("const began =")) {
+        return {
+          answer, changed: Boolean(answer), stopping: true, error: "",
+          markerFound, replyCount: 1, userCount: markerFound ? 1 : 0,
+          visibility: "visible",
+        };
+      }
+      stops += 1;
+      return true;
+    },
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    answerPollMs: 1, answerDeadlineMs: 1000,
+  });
+  // Keep the regression fast without changing the production lower bound.
+  manager.answerDeadlineMs = 30;
+  manager.connections.set("chatgpt-example", {
+    id: "chatgpt-example", provider: "chatgpt", title: "ChatGPT", url: PROVIDERS.chatgpt.home,
+  });
+  manager.viewFor = () => ({webContents: contents});
+  manager.waitForLoad = async () => {};
+  manager.attachFiles = async () => {};
+  manager.rememberConnectionPage = () => false;
+  manager.showCreatedConversationInOpenShells = () => {};
+
+  let failure;
+  await assert.rejects(
+    () => manager.askNow("chatgpt-example", "Please answer", []),
+    (error) => {
+      failure = error;
+      return error instanceof WebChatTurnError;
+    },
+  );
+  return {failure, stops};
+}
+
+test("a late ChatGPT transport marker promotes an uncertain send before answer timeout", async () => {
+  const {failure, stops} = await uncertainChatGptAnswerTimeout(true);
+
+  assert.equal(failure.deliveryState, "accepted");
+  assert.equal(failure.failureCode, "reply_completion_timeout");
+  assert.equal(failure.diagnostics.submission_state, "acknowledged");
+  assert.equal(failure.diagnostics.marker_found, true);
+  assert.equal(failure.diagnostics.marked_reply_found, true);
+  assert.equal(stops, 1);
+});
+
+test("an uncertain ChatGPT answer timeout stays conservative without its transport marker", async () => {
+  const {failure, stops} = await uncertainChatGptAnswerTimeout(false);
+
+  assert.equal(failure.deliveryState, "unknown");
+  assert.equal(failure.failureCode, "turn_match_unknown");
+  assert.equal(failure.diagnostics.submission_state, "outcome_unknown");
+  assert.equal(failure.diagnostics.marker_found, false);
+  assert.equal(failure.diagnostics.marked_reply_found, false);
+  assert.equal(stops, 1);
+});
+
+test("a ChatGPT marker without a causally paired reply does not clear uncertainty", async () => {
+  const {failure, stops} = await uncertainChatGptAnswerTimeout(true, "");
+
+  assert.equal(failure.deliveryState, "unknown");
+  assert.equal(failure.failureCode, "turn_match_unknown");
+  assert.equal(failure.diagnostics.submission_state, "outcome_unknown");
+  assert.equal(failure.diagnostics.marker_found, true);
+  assert.equal(failure.diagnostics.marked_reply_found, false);
+  assert.equal(stops, 1);
+});
+
 test("a stable partial Gemini reply is not committed while its Stop control stays stuck", async () => {
   let stoppedRemote = false;
   let stops = 0;
@@ -1135,8 +1919,51 @@ test("a stable partial Gemini reply is not committed while its Stop control stay
 
   await assert.rejects(
     () => manager.askNow("gemini-example", "Please answer", []),
-    /did not finish a visible reply/,
+    /did not observe a finished visible reply/,
   );
+  assert.equal(stops, 1);
+});
+
+test("a Stop control already visible before submission still prevents a partial reply commit", async () => {
+  let answerChecks = 0;
+  let stops = 0;
+  const contents = {
+    isDestroyed: () => false,
+    executeJavaScript: async (script) => {
+      if (script.includes("const prompt =")) {
+        return {
+          ok: true, submissionState: "acknowledged",
+          beforeCount: 0, beforeLast: "", beforeError: "", beforeStopping: true,
+        };
+      }
+      if (script.includes("const began =")) {
+        answerChecks += 1;
+        return {answer: "Finished answer", changed: true, stopping: true, error: ""};
+      }
+      stops += 1;
+      return true;
+    },
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner: null,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+    answerPollMs: 2, answerDeadlineMs: 1000, staleStopGraceMs: 6,
+  });
+  manager.connections.set("gemini-example", {
+    id: "gemini-example", provider: "gemini", title: "Gemini", url: PROVIDERS.gemini.home,
+  });
+  manager.viewFor = () => ({webContents: contents});
+  manager.waitForLoad = async () => {};
+  manager.attachFiles = async () => {};
+  manager.rememberConnectionPage = () => false;
+  manager.showCreatedConversationInOpenShells = () => {};
+
+  await assert.rejects(
+    () => manager.askNow("gemini-example", "Please answer", []),
+    /did not observe a finished visible reply/,
+  );
+  assert.ok(answerChecks >= 4);
   assert.equal(stops, 1);
 });
 

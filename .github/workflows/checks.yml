@@ -39,12 +39,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Install the test-only runtime dependency
+      - name: Install the test-only runtime dependencies
         # scripts/run_tests.py deliberately proves that a plain source
         # download works before the harness is installed. Install LangGraph,
-        # which the persistent-memory tests exercise, without installing this
-        # project and invalidating that plain-download test.
-        run: python -m pip install "langgraph>=1.2.11,<2"
+        # which the persistent-memory and long-horizon tests exercise, without
+        # installing this project and invalidating that plain-download test.
+        run: python -m pip install "langgraph>=1.2.11,<2" "langgraph-checkpoint-sqlite>=3.1.1,<4"
       - name: Run this part of the tests
         run: python scripts/run_tests.py --part ${{ matrix.part }}/4 --quiet
 
@@ -62,8 +62,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install the test-only runtime dependency
-        run: python -m pip install "langgraph>=1.2.11,<2"
+      - name: Install the test-only runtime dependencies
+        run: python -m pip install "langgraph>=1.2.11,<2" "langgraph-checkpoint-sqlite>=3.1.1,<4"
       - name: Run this part of the tests
         # All eight parts together still cover the whole suite on the oldest
         # Python we promise to support. Matrix jobs run beside one another, so
@@ -264,12 +264,12 @@ jobs:
   desktop:
     name: Desktop app
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -288,6 +288,14 @@ jobs:
         # somebody else's machine, silently.
         working-directory: desktop
         run: node packaging.test.js
+      - name: Build the exact unpacked desktop acceptance target
+        working-directory: desktop
+        env:
+          NEXUS_UNSIGNED_DEV: "1"
+        run: npm run build -- --win dir
+      - name: Exercise real multi-vendor dispatch and recovery in packaged Electron
+        working-directory: desktop
+        run: npm run e2e:multi-vendor
 
   package:
     name: What we would hand out

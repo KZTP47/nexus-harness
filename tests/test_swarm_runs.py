@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, contextmanager
 import json
 import multiprocessing
 import os
@@ -15,10 +15,11 @@ import unittest
 from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
-from our_harness.models import HarnessError
-from our_harness import cancellation, swarm
+from our_harness.models import HarnessError, ProviderOutcomeUnknown
+from our_harness import cancellation, chat, swarm, swarm_work
 from our_harness.swarm_runs import (
     SwarmRunStore, bind, global_board_change_pause_reason, provider_effect,
+    _provider_resource_conversation_key,
 )
 
 
@@ -94,6 +95,20 @@ def _hold_conversation_turn(
             time.sleep(0.02)
 
 
+def _hold_provider_capacity(
+    root: str, runtime: str, ready_marker: str, release_marker: str,
+) -> None:
+    os.environ["OUR_HARNESS_SWARM_RUN_DIR"] = runtime
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["providers"] = {"limited": {"max_concurrency": 1}}
+    config = LoadedConfig(data, Path(root), [], {})
+    with provider_effect(config, "limited", "child-chat", "child-digest"):
+        Path(ready_marker).write_text("ready", encoding="utf-8")
+        limit = time.time() + 10
+        while time.time() < limit and not Path(release_marker).exists():
+            time.sleep(0.02)
+
+
 class SwarmRunStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -121,10 +136,33 @@ class SwarmRunStoreTests(unittest.TestCase):
         else:
             os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = self.prior_authority_override
 
+    def test_communication_journal_is_durable_without_granting_project_authority(self) -> None:
+        descriptor = self.root / ".harness" / "project-authority.json"
+        store = SwarmRunStore.for_communication(self.config)
+        self.assertTrue(store.authority.startswith("communication-"))
+        self.assertFalse(descriptor.exists())
+        accepted, created = store.accept("plain-chat", {"kind": "chat"})
+        self.assertTrue(created)
+        store.start(accepted["run_id"])
+        store.finish(accepted["run_id"], {"answer": "hello"})
+        reopened = SwarmRunStore.for_communication(self.config)
+        self.assertEqual(reopened.get("plain-chat")["result"]["answer"], "hello")
+        self.assertFalse(descriptor.exists())
+
     def _running(self, request: str = "request", snapshot: dict | None = None):
         store = SwarmRunStore(self.config)
         accepted, _ = store.accept(request, snapshot or {"objective": "test"})
         return store, store.start(accepted["run_id"])["run_id"]
+
+    def test_active_runs_returns_every_verified_active_run(self) -> None:
+        store, older_run = self._running("older-active", {"kind": "work", "name": "older"})
+        accepted, _ = store.accept("newer-active", {"kind": "chat", "name": "newer"})
+        newer_run = store.start(accepted["run_id"])["run_id"]
+
+        active = store.active_runs()
+
+        self.assertEqual({one["run_id"] for one in active}, {older_run, newer_run})
+        self.assertTrue(all(one["status"] == "running" for one in active))
 
     def test_logical_chat_turn_is_exclusive_across_processes_but_other_chats_run(self) -> None:
         ready = self.container / "chat-owner-ready"
@@ -156,6 +194,191 @@ class SwarmRunStoreTests(unittest.TestCase):
                 process.terminate()
                 process.join(2)
         self.assertEqual(process.exitcode, 0)
+
+    def test_execution_and_communication_journals_share_the_exact_chat_lease(self) -> None:
+        execution = SwarmRunStore(self.config)
+        communication = SwarmRunStore.for_communication(self.config)
+        owner, _ = execution.accept("execution-chat-owner", {"kind": "work"})
+        same, _ = communication.accept("communication-same-chat", {"kind": "chat"})
+        other, _ = communication.accept("communication-other-chat", {"kind": "chat"})
+
+        with execution.conversation_turn(owner["run_id"], "chat-one", timeout=0):
+            with self.assertRaisesRegex(HarnessError, "already working"):
+                with communication.conversation_turn(
+                    same["run_id"], "chat-one", timeout=0,
+                ):
+                    self.fail("the communication journal entered an execution-owned chat")
+            with communication.conversation_turn(
+                other["run_id"], "chat-two", timeout=0,
+            ):
+                pass
+
+    def _capacity_config(self, maximum: int) -> LoadedConfig:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {"limited": {"max_concurrency": maximum}}
+        return LoadedConfig(data, self.root, [], {})
+
+    def test_provider_profile_capacity_serializes_distinct_chats_at_one(self) -> None:
+        config = self._capacity_config(1)
+        first_entered = threading.Event()
+        second_dispatched = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        release_second = threading.Event()
+        failures: list[BaseException] = []
+
+        def call(
+            conversation: str, entered: threading.Event, release: threading.Event,
+            before_dispatch=None,
+        ) -> None:
+            try:
+                with provider_effect(
+                    config, "limited", conversation, "digest-" + conversation,
+                    before_dispatch=before_dispatch,
+                ):
+                    entered.set()
+                    self.assertTrue(release.wait(5))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        first = threading.Thread(
+            target=call, args=("chat-one", first_entered, release_first),
+        )
+        second = threading.Thread(
+            target=call,
+            args=("chat-two", second_entered, release_second, second_dispatched.set),
+        )
+        first.start()
+        self.assertTrue(first_entered.wait(5))
+        second.start()
+        self.assertFalse(second_dispatched.wait(0.15))
+        self.assertFalse(second_entered.is_set())
+        release_first.set()
+        self.assertTrue(second_dispatched.wait(5))
+        self.assertTrue(second_entered.wait(5))
+        release_second.set()
+        first.join(5)
+        second.join(5)
+        self.assertFalse(failures)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+
+    def test_provider_profile_capacity_allows_declared_parallelism_only(self) -> None:
+        config = self._capacity_config(2)
+        entered = [threading.Event() for _ in range(3)]
+        release = [threading.Event() for _ in range(3)]
+        failures: list[BaseException] = []
+
+        def call(index: int) -> None:
+            try:
+                with provider_effect(
+                    config, "limited", f"chat-{index}", f"digest-{index}",
+                ):
+                    entered[index].set()
+                    self.assertTrue(release[index].wait(5))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        threads = [threading.Thread(target=call, args=(index,)) for index in range(3)]
+        threads[0].start()
+        threads[1].start()
+        self.assertTrue(entered[0].wait(5))
+        self.assertTrue(entered[1].wait(5))
+        threads[2].start()
+        self.assertFalse(entered[2].wait(0.15))
+        release[0].set()
+        self.assertTrue(entered[2].wait(5))
+        release[1].set()
+        release[2].set()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(failures)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    def test_provider_profile_capacity_is_shared_across_processes(self) -> None:
+        config = self._capacity_config(1)
+        ready = self.container / "provider-capacity-ready"
+        release = self.container / "provider-capacity-release"
+        process = multiprocessing.Process(
+            target=_hold_provider_capacity,
+            args=(str(self.root), str(self.runtime), str(ready), str(release)),
+        )
+        process.start()
+        entered = threading.Event()
+        failure: list[BaseException] = []
+
+        def contender() -> None:
+            try:
+                with provider_effect(
+                    config, "limited", "parent-chat", "parent-digest",
+                ):
+                    entered.set()
+            except BaseException as exc:  # pragma: no cover - asserted below
+                failure.append(exc)
+
+        thread = threading.Thread(target=contender)
+        try:
+            limit = time.time() + 5
+            while time.time() < limit and not ready.exists():
+                time.sleep(0.02)
+            self.assertTrue(ready.exists(), "the child did not claim provider capacity")
+            thread.start()
+            self.assertFalse(entered.wait(0.15))
+            release.write_text("release", encoding="utf-8")
+            self.assertTrue(entered.wait(5))
+            thread.join(5)
+            process.join(5)
+        finally:
+            release.write_text("release", encoding="utf-8")
+            if thread.is_alive():
+                thread.join(5)
+            if process.is_alive():
+                process.terminate()
+                process.join(2)
+        self.assertFalse(failure)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(process.exitcode, 0)
+
+    def test_queued_provider_capacity_wait_is_cancellable_before_dispatch(self) -> None:
+        config = self._capacity_config(1)
+        owner_entered = threading.Event()
+        release_owner = threading.Event()
+        queued_dispatched = threading.Event()
+        queued_body = threading.Event()
+        queued_cancelled = threading.Event()
+        token = cancellation.Cancellation()
+
+        def owner() -> None:
+            with provider_effect(config, "limited", "owner", "owner-digest"):
+                owner_entered.set()
+                self.assertTrue(release_owner.wait(5))
+
+        def queued() -> None:
+            try:
+                with cancellation.use(token):
+                    with provider_effect(
+                        config, "limited", "queued", "queued-digest",
+                        before_dispatch=queued_dispatched.set,
+                    ):
+                        queued_body.set()
+            except cancellation.ChatCancelled:
+                queued_cancelled.set()
+
+        first = threading.Thread(target=owner)
+        second = threading.Thread(target=queued)
+        first.start()
+        self.assertTrue(owner_entered.wait(5))
+        second.start()
+        self.assertFalse(queued_dispatched.wait(0.15))
+        token.cancel()
+        self.assertTrue(queued_cancelled.wait(5))
+        self.assertFalse(queued_dispatched.is_set())
+        self.assertFalse(queued_body.is_set())
+        release_owner.set()
+        first.join(5)
+        second.join(5)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
 
     def test_integrity_read_uses_one_snapshot_while_another_connection_appends(self) -> None:
         store, run_id = self._running("snapshot-read")
@@ -239,33 +462,281 @@ class SwarmRunStoreTests(unittest.TestCase):
             len([one for one in finished["events"] if one["kind"] == "complete"]), 1
         )
 
-    def test_delivery_unknown_effect_cannot_checkpoint_dispatch_again_or_complete(self) -> None:
+    def test_delivery_unknown_effect_blocks_only_its_resource_and_unsafe_completion(self) -> None:
         store, run_id = self._running("unknown-effect")
         effect = store.begin_effect(run_id, "resource", "digest")
         store.finish_effect(run_id, effect, False)
-        self.assertEqual(store.get(run_id)["status"], "delivery_unknown")
+        self.assertEqual(store.get(run_id)["status"], "running")
+        self.assertEqual(store.get(run_id)["effect_status"], "delivery_unknown")
         with self.assertRaises(HarnessError):
             store.checkpoint(run_id, "unsafe", {})
         with self.assertRaises(HarnessError):
             store.begin_effect(run_id, "resource", "digest-two")
+        healthy = store.begin_effect(run_id, "different-resource", "digest-three")
+        store.finish_effect(run_id, healthy, True)
         with self.assertRaises(HarnessError):
             store.finish(run_id, {"complete": True})
         store.fail(run_id, "provider rejected the schema")
         projected = store.projection(run_id)
         self.assertEqual(projected["error"], "provider rejected the schema")
-        self.assertEqual(projected["events"][-1]["kind"], "failure_detail")
+        self.assertEqual(projected["status"], "delivery_unknown")
 
-    def test_one_uncertain_parallel_effect_keeps_the_whole_run_uncertain(self) -> None:
+    def test_one_uncertain_parallel_effect_preserves_and_completes_healthy_work(self) -> None:
         store, run_id = self._running("parallel-uncertain")
         failed = store.begin_effect(run_id, "resource-a", "digest-a")
         succeeded = store.begin_effect(run_id, "resource-b", "digest-b")
         store.finish_effect(run_id, failed, False)
         store.finish_effect(run_id, succeeded, True)
         projected = store.get(run_id)
-        self.assertEqual(projected["status"], "delivery_unknown")
+        self.assertEqual(projected["status"], "running")
         self.assertEqual(projected["effect_status"], "delivery_unknown")
         with self.assertRaises(HarnessError):
             store.checkpoint(run_id, "unsafe", {})
+        result = {
+            "answer": "healthy peer answer",
+            "provider_failures": [{"route": "resource-a", "outcome_unknown": True}],
+        }
+        store.checkpoint(run_id, "degraded_result_saved", result)
+        store.finish(run_id, result)
+        self.assertEqual(store.get(run_id)["status"], "complete")
+        next_store, next_run = self._running("parallel-uncertain-restart")
+        with self.assertRaisesRegex(HarnessError, "uncertain prior delivery"):
+            next_store.begin_effect(next_run, "resource-a", "must-not-resend")
+        independent = next_store.begin_effect(
+            next_run, "resource-c", "different-provider-conversation"
+        )
+        next_store.finish_effect(next_run, independent, True)
+        next_store.checkpoint(next_run, "independent_saved", {"ok": True})
+        next_store.finish(next_run, {"ok": True})
+        other_root = self.container / "other-uncertain-project"
+        (other_root / ".harness").mkdir(parents=True)
+        other = SwarmRunStore(LoadedConfig(
+            copy.deepcopy(DEFAULT_CONFIG), other_root, [], {}
+        ))
+        accepted, _created = other.accept(
+            "cross-authority-uncertain", {"objective": "must not replay"}
+        )
+        other.start(accepted["run_id"])
+        with self.assertRaisesRegex(HarnessError, "uncertain prior delivery"):
+            other.begin_effect(
+                accepted["run_id"], "resource-a", "cross-authority-resend"
+            )
+        other.fail(accepted["run_id"], "did not dispatch", stopped=True)
+
+    def test_explicit_provider_failure_is_known_and_does_not_poison_the_run(self) -> None:
+        store, run_id = self._running("known-provider-failure")
+        with bind(store, run_id):
+            with self.assertRaisesRegex(HarnessError, "provider refused"):
+                with provider_effect(self.config, "claude", "pair-chat", "digest"):
+                    raise HarnessError("provider refused the request")
+
+        projected = store.projection(run_id)
+        self.assertEqual(projected["status"], "running")
+        self.assertEqual(projected["effect_status"], "acknowledged")
+        self.assertIn("acknowledged", [one["kind"] for one in projected["events"]])
+
+    def test_only_typed_provider_ambiguity_becomes_delivery_unknown(self) -> None:
+        store, run_id = self._running("typed-provider-unknown")
+        with bind(store, run_id):
+            with self.assertRaises(ProviderOutcomeUnknown):
+                with provider_effect(self.config, "web:gemini", "pair-chat", "digest"):
+                    raise ProviderOutcomeUnknown("renderer vanished after Send")
+
+        projected = store.get(run_id)
+        self.assertEqual(projected["status"], "running")
+        self.assertEqual(projected["effect_status"], "delivery_unknown")
+
+    def test_stateless_uncertainty_blocks_exact_replay_but_not_a_new_turn(self) -> None:
+        store, run_id = self._running("stateless-provider-unknown")
+        with bind(store, run_id):
+            with self.assertRaises(ProviderOutcomeUnknown):
+                with provider_effect(self.config, "codex", "pair-chat", "digest-one"):
+                    raise ProviderOutcomeUnknown("process vanished after dispatch")
+        store.fail(run_id, "uncertain Codex result")
+
+        next_store, next_run = self._running("stateless-provider-next-turn")
+        with bind(next_store, next_run):
+            with self.assertRaisesRegex(HarnessError, "uncertain prior delivery"):
+                with provider_effect(self.config, "codex", "pair-chat", "digest-one"):
+                    self.fail("the exact uncertain request must not be replayed")
+            with provider_effect(self.config, "codex", "pair-chat", "digest-two"):
+                pass
+        next_store.checkpoint(next_run, "new_turn_saved", {"answer": "new"})
+        next_store.finish(next_run, {"answer": "new"})
+
+    def test_stateless_same_route_requests_do_not_share_a_conversation_lease(self) -> None:
+        self.assertNotEqual(
+            _provider_resource_conversation_key("codex", "pair-chat", "digest-one"),
+            _provider_resource_conversation_key("codex", "pair-chat", "digest-two"),
+        )
+        self.assertEqual(
+            _provider_resource_conversation_key(
+                "web:chatgpt", "pair-chat", "digest-one",
+            ),
+            _provider_resource_conversation_key(
+                "web:chatgpt", "pair-chat", "digest-two",
+            ),
+        )
+
+        self.config.data["providers"] = {
+            "codex": {
+                "kind": "codex-cli", "model": "codex", "max_concurrency": 2,
+            },
+        }
+        store, run_id = self._running("same-stateless-route-parallel")
+        original_resource = store.resource
+
+        @contextmanager
+        def short_resource(one_run, route, conversation_key, timeout=180.0):
+            with original_resource(one_run, route, conversation_key, timeout=0.3) as key:
+                yield key
+
+        both_entered = threading.Barrier(2)
+
+        def ask(digest: str) -> None:
+            with provider_effect(self.config, "codex", "pair-chat", digest):
+                both_entered.wait(timeout=2)
+
+        with bind(store, run_id), mock.patch.object(
+            store, "resource", side_effect=short_resource,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [
+                    cancellation.submit(pool, ask, digest)
+                    for digest in ("digest-one", "digest-two")
+                ]
+                for future in futures:
+                    future.result(timeout=5)
+        store.checkpoint(run_id, "both_saved", {"answers": 2})
+        store.finish(run_id, {"answers": 2})
+
+    def test_web_uncertainty_still_fences_the_whole_remote_conversation(self) -> None:
+        store, run_id = self._running("web-provider-unknown")
+        with bind(store, run_id):
+            with self.assertRaises(ProviderOutcomeUnknown):
+                with provider_effect(self.config, "web:gemini", "pair-chat", "digest-one"):
+                    raise ProviderOutcomeUnknown("renderer vanished after Send")
+        store.fail(run_id, "uncertain web-chat result")
+
+        next_store, next_run = self._running("web-provider-next-turn")
+        with bind(next_store, next_run):
+            with self.assertRaisesRegex(HarnessError, "uncertain prior delivery"):
+                with provider_effect(self.config, "web:gemini", "pair-chat", "digest-two"):
+                    self.fail("a stateful provider conversation must remain fenced")
+        next_store.fail(next_run, "web conversation needs reconciliation")
+
+    def test_restart_repairs_pre_fix_web_fence_with_affirmative_marker_receipt(self) -> None:
+        store, run_id = self._running("marked-web-receipt")
+        effect = store.begin_effect(run_id, "web-conversation-resource", "digest-one")
+        store.finish_effect(run_id, effect, False)
+        store.fail(
+            run_id,
+            "web:chatgpt-abcdef has an unreconciled provider turn: ChatGPT may "
+            "have accepted this message, but Nexus could not match its marked turn "
+            "and reply. [relay diagnostic: "
+            "submission_state=outcome_unknown, reply_seen=True, "
+            "answer_characters=17, stop_visible=True, "
+            "stale_stop_at_submission=False, stop_cleared_after_submission=True, "
+            "stable_polls=181, polls=182, marker_found=True, reply_count=1, "
+            "user_count=1, document_visibility=visible, "
+            "page_url=https://chatgpt.com/c/example]",
+        )
+
+        reopened = SwarmRunStore(self.config)
+        repaired = reopened.projection(run_id)
+
+        self.assertEqual(repaired["status"], "failed")
+        self.assertEqual(repaired["effect_status"], "acknowledged")
+        self.assertIn(
+            "provider_late_receipt_reconciled",
+            [one["kind"] for one in repaired["events"]],
+        )
+        next_store, next_run = self._running("marked-web-receipt-next-turn")
+        retried = next_store.begin_effect(
+            next_run, "web-conversation-resource", "digest-two",
+        )
+        next_store.finish_effect(next_run, retried, True)
+
+    def test_restart_keeps_web_fence_when_marker_receipt_is_incomplete(self) -> None:
+        store, run_id = self._running("incomplete-web-receipt")
+        effect = store.begin_effect(run_id, "still-uncertain-resource", "digest-one")
+        store.finish_effect(run_id, effect, False)
+        store.fail(
+            run_id,
+            "web:chatgpt-abcdef has an unreconciled provider turn: ChatGPT may "
+            "have accepted this message, but Nexus could not match its marked turn "
+            "and reply. [relay diagnostic: "
+            "submission_state=outcome_unknown, reply_seen=True, "
+            "answer_characters=17, stop_cleared_after_submission=True, "
+            "marker_found=False, reply_count=1, user_count=1]",
+        )
+
+        reopened = SwarmRunStore(self.config)
+        self.assertEqual(reopened.get(run_id)["status"], "delivery_unknown")
+        next_store, next_run = self._running("incomplete-web-receipt-next-turn")
+        with self.assertRaisesRegex(HarnessError, "uncertain prior delivery"):
+            next_store.begin_effect(
+                next_run, "still-uncertain-resource", "must-not-resend",
+            )
+        next_store.fail(next_run, "still requires reconciliation")
+
+    def test_restart_never_applies_legacy_receipt_to_a_multi_effect_run(self) -> None:
+        store, run_id = self._running("multi-effect-web-receipt")
+        accepted = store.begin_effect(run_id, "accepted-resource", "digest-one")
+        store.finish_effect(run_id, accepted, True)
+        uncertain = store.begin_effect(run_id, "uncertain-resource", "digest-two")
+        store.finish_effect(run_id, uncertain, False)
+        store.fail(
+            run_id,
+            "web:chatgpt-abcdef has an unreconciled provider turn: ChatGPT may "
+            "have accepted this message, but Nexus could not match its marked turn "
+            "and reply. [relay diagnostic: "
+            "submission_state=outcome_unknown, reply_seen=True, "
+            "answer_characters=17, stop_cleared_after_submission=True, "
+            "marker_found=True, reply_count=1, user_count=1]",
+        )
+
+        reopened = SwarmRunStore(self.config)
+        self.assertEqual(reopened.get(run_id)["status"], "delivery_unknown")
+        next_store, next_run = self._running("multi-effect-web-receipt-next-turn")
+        with self.assertRaisesRegex(HarnessError, "uncertain prior delivery"):
+            next_store.begin_effect(next_run, "uncertain-resource", "must-not-resend")
+        next_store.fail(next_run, "multi-effect run requires explicit reconciliation")
+
+    def test_bound_collaboration_saves_healthy_answer_with_one_unknown_peer(self) -> None:
+        store, run_id = self._running("bound-degraded-collaboration")
+        board = {
+            "agents": [
+                {"id": "lead", "name": "Lead", "who": "web:lead-route", "ready": True},
+                {"id": "peer", "name": "Peer", "who": "web:peer-route", "ready": True},
+            ],
+            "talks_to": [{"one": "lead", "other": "peer"}],
+            "projects": [], "works_on": [],
+        }
+        calls: list[str] = []
+
+        def answer(_config, route, _text, **_kwargs):
+            calls.append(route)
+            if route == "web:peer-route":
+                # Exercise the real effect wrapper so the bound run owns one
+                # unresolved provider effect while the lead succeeds.
+                with provider_effect(self.config, route, "pair-chat", "peer-digest"):
+                    raise ProviderOutcomeUnknown("peer browser vanished after Send")
+            with provider_effect(self.config, route, "pair-chat", "lead-digest"):
+                return {"text": "healthy lead answer", "milliseconds": 1, "model": route}
+
+        with bind(store, run_id), mock.patch.object(chat, "ask_once", side_effect=answer):
+            result = swarm_work.collaborate(
+                self.config, board, "lead", "Work together", round_limit=None,
+            )
+        store.checkpoint(run_id, "degraded_answer_saved", result)
+        store.finish(run_id, result)
+
+        self.assertCountEqual(calls, ["web:lead-route", "web:peer-route"])
+        self.assertEqual(result["answer"]["text"], "healthy lead answer")
+        self.assertTrue(result["provider_failures"])
+        self.assertIs(result["provider_failures"][0]["outcome_unknown"], True)
+        self.assertEqual(store.get(run_id)["status"], "complete")
 
     def test_parallel_workers_journal_overlapping_provider_effects_before_final_checkpoint(self) -> None:
         store, run_id = self._running("parallel-provider-effects")
@@ -303,6 +774,27 @@ class SwarmRunStoreTests(unittest.TestCase):
         store.checkpoint(run_id, "all_turns_saved", {"agents": 2})
         store.finish(run_id, {"complete": True})
 
+    def test_acknowledged_reply_with_local_protocol_failure_is_not_outcome_unknown(self) -> None:
+        store, run_id = self._running("known-invalid-reply")
+        effect = store.begin_effect(run_id, "web:claude", "reply-digest")
+        store.finish_effect(run_id, effect, True)
+
+        store.fail(
+            run_id,
+            "Claude returned an invalid structured collaboration result",
+            acknowledged_outcome=True,
+        )
+
+        projected = store.projection(run_id)
+        self.assertEqual(projected["status"], "failed")
+        self.assertEqual(
+            projected["checkpoint_ordinal"], projected["effect_ordinal"]
+        )
+        self.assertIn(
+            "provider_reply_received_before_failure",
+            [one["kind"] for one in projected["events"]],
+        )
+
     def test_begin_effect_requires_a_real_running_run(self) -> None:
         store = SwarmRunStore(self.config)
         accepted, _ = store.accept("accepted", {"objective": "one"})
@@ -321,6 +813,32 @@ class SwarmRunStoreTests(unittest.TestCase):
         self.assertEqual(
             len([one for one in events if one["kind"] == "stop_requested"]), 1
         )
+
+    def test_exact_run_id_wins_over_a_colliding_caller_request_alias(self) -> None:
+        store = SwarmRunStore(self.config)
+        first, _created = store.accept("ordinary-request", {"objective": "first"})
+        first_id = first["run_id"]
+        store.start(first_id)
+        alias, alias_created = store.accept(first_id, {"objective": "alias"})
+        self.assertTrue(alias_created)
+        self.assertNotEqual(alias["run_id"], first_id)
+
+        self.assertEqual(store.get(first_id)["snapshot"]["objective"], "first")
+        stopped = store.request_stop(first_id)
+        self.assertEqual(stopped["run_id"], first_id)
+        self.assertEqual(stopped["status"], "stopping")
+        self.assertEqual(store.get(alias["run_id"])["status"], "accepted")
+
+    def test_accepted_stop_fences_orchestrated_success_transcript_commit(self) -> None:
+        store, run_id = self._running("fenced-success-transcript")
+        with bind(store, run_id):
+            store.request_stop(run_id)
+            with self.assertRaisesRegex(HarnessError, "Stop was accepted"):
+                chat.keep_exchange(
+                    self.config, "claude", "question", "late answer",
+                    filed_as="exact-chat",
+                )
+        self.assertEqual(chat.read_it(self.config, "claude", "exact-chat"), [])
 
     def test_restart_closes_dispatched_effect_as_delivery_unknown_without_resend(self) -> None:
         marker = self.container / "run-id"

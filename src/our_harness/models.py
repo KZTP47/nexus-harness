@@ -9,6 +9,16 @@ class HarnessError(RuntimeError):
     """Expected user-facing failure."""
 
 
+class ProviderOutcomeUnknown(HarnessError):
+    """A provider may have acted, but Nexus cannot prove the terminal outcome.
+
+    Ordinary provider errors are *known failures*: the call returned control and
+    Nexus can safely preserve other agents' work or hand the task to another
+    provider.  Only transports with concrete ambiguity should raise this type;
+    durable run recovery then refuses an automatic resend.
+    """
+
+
 class DeadlineExpired(HarnessError):
     """A bounded operation exhausted its owning workflow or tool clock."""
 
@@ -148,6 +158,11 @@ class ProviderRequest:
     # The first chat attached to a manually selected provider conversation may
     # adopt that existing remote thread. Later Nexus chats always start new.
     prefer_existing_conversation: bool = False
+    # Optional isolated working folder for answer-only health checks. Command
+    # providers start in this folder so a connectivity probe cannot discover
+    # or alter the user's project merely because the CLI normally inherits the
+    # harness process's current directory.
+    working_directory: str = ""
 
 
 @dataclass(frozen=True)

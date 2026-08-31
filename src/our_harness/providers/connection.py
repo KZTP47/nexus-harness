@@ -96,6 +96,21 @@ def connection_status(
                 f"Logged in. Nexus verified {label}'s own authentication status for route “{named}”. "
                 "This is the command-line session this agent actually uses."
             )
+        elif status.get("state") == "isolated-ready":
+            note = (
+                f"Nexus found {label} for route “{named}” and verified that it supports "
+                "isolated agent turns. Its login-status command cannot read the user's "
+                "newer configuration, so the first isolated request will verify ChatGPT "
+                "authentication; opening sign-in again is not required. This compatibility "
+                "warning applies only to the status probe and is not a current agent-turn failure."
+            )
+        elif status.get("state") == "configuration-error":
+            detail = str(status.get("problem") or "").strip()
+            note = (
+                f"{label} could not read its local configuration for route “{named}”. "
+                "Fix the reported configuration entry; signing in again will not help."
+                + (f" {detail}" if detail else "")
+            )
         elif authentication == "signed-out":
             note = (
                 f"Not logged in. {label}'s own status command says this route needs sign-in."

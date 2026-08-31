@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, validate_config
-from our_harness.models import HarnessError, ProviderRequest, ResponseFormat
+from our_harness.models import CommandResult, HarnessError, ProviderRequest, ResponseFormat
 from our_harness.providers import subscription_cli
 from our_harness.providers.subscription_cli import (
     CLAUDE_RECIPE,
@@ -578,6 +578,26 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(answer.text, "the real request answered")
         self.assertLess(time.monotonic() - started, 8)
 
+    def test_gemini_skips_the_advisory_version_process_before_its_real_request(self) -> None:
+        tool = fake_tool(self.folder, "gemini", "print('unused')\n")
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return CommandResult(
+                argv=argv, cwd="", exit_code=0,
+                stdout=json.dumps({"response": "the real request answered"}),
+                stderr="", duration_ms=1, timed_out=False,
+                output_truncated=False,
+            )
+
+        with mock.patch.object(subscription_cli, "_run_bounded", side_effect=run):
+            answer = self.provider("gemini-cli", tool).complete(self.request())
+
+        self.assertEqual(answer.text, "the real request answered")
+        self.assertEqual(len(calls), 1)
+        self.assertIsNotNone(calls[0][1]["stdin_text"])
+
     def test_a_tool_that_is_not_installed_says_how_to_get_it(self) -> None:
         data = copy.deepcopy(DEFAULT_CONFIG)
         data["provider"].update({"name": "claude-cli", "model": "m", "endpoint": "", "api_key_env": ""})
@@ -670,6 +690,7 @@ class RunningTests(unittest.TestCase):
         self.assertEqual(provider.complete(self.request()).text, "done")
         argv = json.loads(seen.read_text(encoding="utf-8"))
         self.assertNotIn("--allowed-tools", argv)
+        self.assertEqual(argv[argv.index("--extensions") + 1], "none")
         self.assertFalse(provider.structured_retry_is_safe)
 
 

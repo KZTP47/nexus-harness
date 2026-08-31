@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import closing
 import multiprocessing
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ import unittest
 from unittest import mock
 
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
-from our_harness import editor, pipelines
+from our_harness import editor, pipeline_runs, pipelines
 from our_harness.pipeline_runs import (
     PipelineRunConflict,
     PipelineRunNotFound,
@@ -356,6 +357,160 @@ class PipelineRunStoreTests(unittest.TestCase):
             PipelineRunStore(moved_config).accept(
                 _definition("Changed"), source="panel", request_id="across-rename"
             )
+
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem identity regression")
+    def test_legacy_windows_device_drift_self_heals_and_survives_restart(self) -> None:
+        authority_id = project_identity(self.root)
+        identity = pipeline_runs._filesystem_identity(self.root)
+        volume_serial = int(identity.key.split(":")[1], 16)
+        wider_runtime_device = (0x04B6F904 << 32) | volume_serial
+        legacy_key = f"{wider_runtime_device}:{identity.legacy_inode}"
+        registry = self.runtime / pipeline_runs.AUTHORITY_REGISTRY
+        with closing(sqlite3.connect(registry)) as connection:
+            connection.execute(
+                "UPDATE project_authorities SET filesystem_key=? "
+                "WHERE project_authority_id=?",
+                (legacy_key, authority_id),
+            )
+            connection.commit()
+
+        status = inspect_project_authority(self.root)
+        self.assertTrue(status["can_run"])
+        self.assertEqual(status["reason_code"], "registered")
+        with closing(sqlite3.connect(registry)) as connection:
+            migrated = connection.execute(
+                "SELECT filesystem_key,revision FROM project_authorities "
+                "WHERE project_authority_id=?",
+                (authority_id,),
+            ).fetchone()
+        self.assertEqual(migrated, (identity.key, 2))
+
+        restarted_config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        self.assertEqual(PipelineRunStore(restarted_config).authority_id, authority_id)
+
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem identity regression")
+    def test_legacy_migration_rejects_changed_inode_at_the_registered_path(self) -> None:
+        authority_id = project_identity(self.root)
+        identity = pipeline_runs._filesystem_identity(self.root)
+        volume_serial = int(identity.key.split(":")[1], 16)
+        legacy_key = f"{volume_serial}:{identity.legacy_inode}"
+        registry = self.runtime / pipeline_runs.AUTHORITY_REGISTRY
+        with closing(sqlite3.connect(registry)) as connection:
+            connection.execute(
+                "UPDATE project_authorities SET filesystem_key=? "
+                "WHERE project_authority_id=?",
+                (legacy_key, authority_id),
+            )
+            connection.commit()
+        substituted = pipeline_runs._FilesystemIdentity(
+            identity.key, identity.legacy_inode + 1
+        )
+
+        with mock.patch.object(
+            pipeline_runs, "_filesystem_identity", return_value=substituted
+        ):
+            status = inspect_project_authority(self.root)
+        self.assertFalse(status["can_run"])
+        self.assertEqual(status["reason_code"], "ambiguous_registry")
+        with closing(sqlite3.connect(registry)) as connection:
+            stored_key = connection.execute(
+                "SELECT filesystem_key FROM project_authorities "
+                "WHERE project_authority_id=?",
+                (authority_id,),
+            ).fetchone()[0]
+        self.assertEqual(stored_key, legacy_key)
+
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem identity regression")
+    def test_legacy_migration_rejects_another_volume_at_the_registered_path(self) -> None:
+        authority_id = project_identity(self.root)
+        identity = pipeline_runs._filesystem_identity(self.root)
+        volume_serial = int(identity.key.split(":")[1], 16)
+        other_volume = (volume_serial + 1) & 0xFFFFFFFF
+        legacy_key = f"{other_volume}:{identity.legacy_inode}"
+        registry = self.runtime / pipeline_runs.AUTHORITY_REGISTRY
+        with closing(sqlite3.connect(registry)) as connection:
+            connection.execute(
+                "UPDATE project_authorities SET filesystem_key=? "
+                "WHERE project_authority_id=?",
+                (legacy_key, authority_id),
+            )
+            connection.commit()
+
+        status = inspect_project_authority(self.root)
+        self.assertFalse(status["can_run"])
+        self.assertEqual(status["reason_code"], "ambiguous_registry")
+        with closing(sqlite3.connect(registry)) as connection:
+            stored_key = connection.execute(
+                "SELECT filesystem_key FROM project_authorities "
+                "WHERE project_authority_id=?",
+                (authority_id,),
+            ).fetchone()[0]
+        self.assertEqual(stored_key, legacy_key)
+
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem identity regression")
+    def test_legacy_migration_never_adopts_a_copied_folder(self) -> None:
+        authority_id = project_identity(self.root)
+        identity = pipeline_runs._filesystem_identity(self.root)
+        volume_serial = int(identity.key.split(":")[1], 16)
+        legacy_key = f"{volume_serial}:{identity.legacy_inode}"
+        registry = self.runtime / pipeline_runs.AUTHORITY_REGISTRY
+        with closing(sqlite3.connect(registry)) as connection:
+            connection.execute(
+                "UPDATE project_authorities SET filesystem_key=? "
+                "WHERE project_authority_id=?",
+                (legacy_key, authority_id),
+            )
+            connection.commit()
+        copied = self.container / "legacy-copied-project"
+        shutil.copytree(self.root, copied)
+        colliding_inode = pipeline_runs._FilesystemIdentity(
+            f"win-file-id-v1:{volume_serial:08x}:{identity.legacy_inode + 1:016x}",
+            identity.legacy_inode,
+        )
+
+        with mock.patch.object(
+            pipeline_runs, "_filesystem_identity", return_value=colliding_inode
+        ):
+            status = inspect_project_authority(copied)
+        self.assertFalse(status["can_run"])
+        self.assertEqual(status["reason_code"], "copied_or_substituted")
+        with closing(sqlite3.connect(registry)) as connection:
+            stored_key = connection.execute(
+                "SELECT filesystem_key FROM project_authorities "
+                "WHERE project_authority_id=?",
+                (authority_id,),
+            ).fetchone()[0]
+        self.assertEqual(stored_key, legacy_key)
+
+    @unittest.skipUnless(os.name == "nt", "Windows filesystem identity regression")
+    def test_legacy_windows_identity_migrates_after_directory_rename(self) -> None:
+        authority_id = project_identity(self.root)
+        identity = pipeline_runs._filesystem_identity(self.root)
+        volume_serial = int(identity.key.split(":")[1], 16)
+        legacy_key = f"{volume_serial}:{identity.legacy_inode}"
+        registry = self.runtime / pipeline_runs.AUTHORITY_REGISTRY
+        with closing(sqlite3.connect(registry)) as connection:
+            connection.execute(
+                "UPDATE project_authorities SET filesystem_key=? "
+                "WHERE project_authority_id=?",
+                (legacy_key, authority_id),
+            )
+            connection.commit()
+        moved = self.container / "legacy-renamed-project"
+        self.root.rename(moved)
+        self.root = moved
+
+        status = inspect_project_authority(moved)
+        self.assertTrue(status["can_run"])
+        self.assertEqual(status["reason_code"], "registered")
+        self.assertEqual(project_identity(moved), authority_id)
+        with closing(sqlite3.connect(registry)) as connection:
+            migrated = connection.execute(
+                "SELECT filesystem_key,canonical_path FROM project_authorities "
+                "WHERE project_authority_id=?",
+                (authority_id,),
+            ).fetchone()
+        self.assertEqual(migrated, (identity.key, os.path.normcase(str(moved))))
 
     def test_copied_project_descriptor_cannot_open_the_original_authority(self) -> None:
         original = PipelineRunStore(self.config)

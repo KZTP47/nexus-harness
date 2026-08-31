@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import contextvars
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import base64
 import hmac
@@ -15,13 +15,15 @@ import re
 import sqlite3
 import threading
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 import uuid
 
 from .config import LoadedConfig
-from .models import HarnessError
+from .models import HarnessError, ProviderOutcomeUnknown
 from .pipeline_runs import _owner_is_alive, _process_token, project_identity
 from .redaction import CredentialRedactor, bounded_redacted_text
+from . import cancellation, user_questions
+from .providers.registry import ProviderRegistry
 from .runtime_integrity import atomic_text, mac, quarantine_marker
 
 
@@ -51,6 +53,22 @@ def _base() -> Path:
     state = os.environ.get("XDG_STATE_HOME", "").strip()
     root = Path(state) if state else Path.home() / ".local" / "state"
     return (root / "our-harness" / "swarm-runs").resolve()
+
+
+def _records_degraded_provider_result(value: object) -> bool:
+    """True only when a saved projection explicitly owns provider failures.
+
+    An uncertain effect may coexist with useful work from other agents.  The
+    result is safe to save when it names those failed providers; saving it does
+    not reconcile or resend their remote turn, and the per-effect journal keeps
+    the uncertainty durable.
+    """
+
+    return isinstance(value, dict) and isinstance(value.get("provider_failures"), list) \
+        and any(
+            isinstance(one, dict) and one.get("outcome_unknown") is True
+            for one in value.get("provider_failures", [])
+        )
 
 
 class _ProviderResourceStore:
@@ -371,10 +389,38 @@ class SwarmRunStore:
         self.authority = project_identity(config.project_root)
         self._open_storage(config)
 
+    @classmethod
+    def for_communication(cls, config: LoadedConfig) -> "SwarmRunStore":
+        """Open the durable chat journal without granting project execution.
+
+        Ordinary conversation needs idempotency, provider-effect reconciliation,
+        and cross-process chat leases, but it does not execute the checked-out
+        project.  Its authority is therefore the canonical local folder path,
+        not the mutation authority descriptor that deliberately rejects copied
+        projects.  Callers must still use the normal constructor for any mode
+        that can run commands or change project files.
+        """
+
+        root = config.project_root.resolve(strict=True)
+        held = cls.__new__(cls)
+        held.authority = "communication-" + hashlib.sha256(
+            os.path.normcase(str(root)).encode("utf-8")
+        ).hexdigest()
+        held._open_storage(config)
+        return held
+
     def _open_storage(self, config: LoadedConfig) -> None:
         self.redactor = CredentialRedactor(config)
         self.root = _base()
         project = config.project_root.resolve()
+        # Execution and communication journals deliberately use different
+        # authorities, but they still refer to the same physical project's
+        # saved chats. Conversation leases therefore need one authority-neutral
+        # project scope or a copied-project communication turn could overlap an
+        # execution-journal turn for the same chat.
+        self.chat_scope = hashlib.sha256(
+            os.path.normcase(str(project)).encode("utf-8")
+        ).hexdigest()
         runtime = self.root.resolve()
         if runtime == project or project in runtime.parents or runtime in project.parents:
             raise HarnessError("Swarm runtime storage must be external to the project authority")
@@ -701,6 +747,7 @@ class SwarmRunStore:
                     "INSERT OR REPLACE INTO swarm_integrity_meta(key,value) VALUES('version',?)",
                     (INTEGRITY_VERSION,),
                 )
+            self._reconcile_legacy_marked_web_receipts(db)
             if db.execute("PRAGMA foreign_key_check").fetchone():
                 raise HarnessError("The durable Swarm run journal failed its authority migration check.")
             db.commit()
@@ -722,6 +769,116 @@ class SwarmRunStore:
             raise
         finally:
             db.close()
+
+    @staticmethod
+    def _legacy_marked_web_receipt(error: str) -> bool:
+        """Recognise the one pre-fix relay diagnostic that proves acceptance.
+
+        Older desktop relays could keep ``submission_state=outcome_unknown``
+        after the answer poll had found Nexus's unique marker in a newly-added
+        provider user turn.  A paired reply and a cleared post-submit Stop state
+        make that a known accepted delivery, even when the reply itself later
+        timed out.  Keep this parser deliberately narrower than the public
+        error prose: it is only a compatibility bridge for already-signed
+        journals and must never turn a genuinely ambiguous delivery into one
+        that may be retried.
+        """
+
+        held = str(error or "")
+        if not re.match(
+            r"^web:chatgpt-[a-z0-9-]{1,55} has an unreconciled provider turn: "
+            r"ChatGPT may have accepted this message, but Nexus could not match "
+            r"its marked turn and reply\.",
+            held,
+        ):
+            return False
+        match = re.search(r"\[relay diagnostic: ([^\]]+)\]", held)
+        if match is None:
+            return False
+        fields: dict[str, str] = {}
+        for item in match.group(1).split(", "):
+            key, separator, value = item.partition("=")
+            if separator and re.fullmatch(r"[a-z_]+", key):
+                fields[key] = value
+        try:
+            answer_characters = int(fields.get("answer_characters", "0"))
+            reply_count = int(fields.get("reply_count", "0"))
+            user_count = int(fields.get("user_count", "0"))
+        except ValueError:
+            return False
+        return (
+            fields.get("submission_state") == "outcome_unknown"
+            and fields.get("marker_found") == "True"
+            and fields.get("reply_seen") == "True"
+            and fields.get("stop_cleared_after_submission") == "True"
+            and answer_characters > 0
+            and reply_count > 0
+            and user_count > 0
+        )
+
+    def _reconcile_legacy_marked_web_receipts(
+        self, db: sqlite3.Connection,
+    ) -> None:
+        """Repair false delivery fences created by the pre-fix web relay.
+
+        This never resends a request.  It only promotes the sole uncertain
+        effect of a signed terminal run when that run contains the exact DOM
+        receipt evidence above.  Runs with multiple uncertain effects or any
+        weaker evidence remain fenced for explicit human reconciliation.
+        """
+
+        for run in db.execute(
+            "SELECT * FROM runs WHERE status='delivery_unknown' "
+            "AND effect_status='delivery_unknown'"
+        ).fetchall():
+            if not self._legacy_marked_web_receipt(str(run["error"] or "")):
+                continue
+            effects = db.execute(
+                "SELECT * FROM provider_effects WHERE run_id=? ORDER BY ordinal",
+                (run["run_id"],),
+            ).fetchall()
+            # The pre-fix diagnostic did not persist an effect ID.  Only a run
+            # with one total effect can therefore prove which signed effect the
+            # receipt describes. Multi-provider runs stay fenced.
+            if len(effects) != 1:
+                continue
+            effect = effects[0]
+            self._verify_effect(effect)
+            if (
+                str(effect["status"]) != "delivery_unknown"
+                or str(effect["effect_id"]) != str(run["effect_id"])
+                or int(effect["ordinal"]) != int(run["effect_ordinal"])
+                or str(effect["digest"]) != str(run["effect_digest"])
+            ):
+                continue
+            now = int(time.time() * 1000)
+            db.execute(
+                "UPDATE provider_effects SET status='acknowledged',updated_ms=? "
+                "WHERE effect_id=? AND status='delivery_unknown'",
+                (now, effect["effect_id"]),
+            )
+            self._seal_effect(db, str(effect["effect_id"]))
+            remaining = int(db.execute(
+                "SELECT COUNT(*) FROM provider_effects WHERE run_id=? "
+                "AND status='delivery_unknown'",
+                (run["run_id"],),
+            ).fetchone()[0])
+            if remaining:
+                continue
+            db.execute(
+                "UPDATE runs SET status='failed',effect_status='acknowledged',"
+                "checkpoint_ordinal=effect_ordinal,updated_ms=? WHERE run_id=? "
+                "AND status='delivery_unknown' AND effect_status='delivery_unknown'",
+                (now, run["run_id"]),
+            )
+            self._seal_run(db, str(run["run_id"]))
+            self._append(
+                db, str(run["run_id"]), "provider_late_receipt_reconciled", {
+                    "effect_id": str(effect["effect_id"]),
+                    "basis": "marked_user_turn_and_reply_observed",
+                    "automatic_resend": False,
+                },
+            )
 
     @staticmethod
     def _run_material(row: sqlite3.Row) -> list[Any]:
@@ -1120,7 +1277,11 @@ class SwarmRunStore:
                 (run_id, self.authority),
             ).fetchone()
             self._verify_run(db, row)
-            if not row or row["status"] not in ACTIVE or row["effect_status"] not in {"", "acknowledged"}:
+            degraded = _records_degraded_provider_result(payload)
+            if not row or row["status"] not in ACTIVE or (
+                row["effect_status"] not in {"", "acknowledged"}
+                and not (row["effect_status"] == "delivery_unknown" and degraded)
+            ):
                 raise HarnessError(
                     "A Swarm checkpoint requires an active run with no provider delivery in doubt"
                 )
@@ -1139,9 +1300,14 @@ class SwarmRunStore:
             self._verify_run(db, row)
             if not row or row["status"] != "running":
                 raise HarnessError("A provider effect requires this project's running Swarm run")
-            if row["effect_status"] == "delivery_unknown":
+            prior_unknown = db.execute(
+                "SELECT 1 FROM provider_effects "
+                "WHERE resource_key=? AND status='delivery_unknown' LIMIT 1",
+                (resource_key,),
+            ).fetchone()
+            if prior_unknown:
                 raise HarnessError(
-                    "A prior provider delivery is uncertain; Nexus will not dispatch another"
+                    "This provider conversation has an uncertain prior delivery; Nexus will not resend to it"
                 )
             ordinal = int(row["effect_ordinal"]) + 1
             effect_id = hashlib.sha256(f"{run_id}:{ordinal}:{resource_key}:{digest}".encode()).hexdigest()
@@ -1195,13 +1361,11 @@ class SwarmRunStore:
                 "dispatched" if remaining else "acknowledged"
             )
             db.execute(
-                "UPDATE runs SET effect_status=?,status=CASE WHEN ? THEN status ELSE 'delivery_unknown' END,updated_ms=? "
+                "UPDATE runs SET effect_status=?,updated_ms=? "
                 "WHERE run_id=? AND project_authority=?",
-                (summary, 1 if accepted else 0, now, run_id, self.authority),
+                (summary, now, run_id, self.authority),
             )
             self._append(db, run_id, status, {"effect_id": effect_id})
-            if not accepted:
-                self._release_board_lease(db, run_id)
 
     def finish(self, run_id: str, result: dict[str, Any]) -> None:
         clean_result = self.redactor.value(result)
@@ -1223,18 +1387,27 @@ class SwarmRunStore:
                 (run_id, self.authority),
             ).fetchone()
             self._verify_run(db, before)
+            degraded = _records_degraded_provider_result(clean_result)
             changed = db.execute(
                 "UPDATE runs SET status='complete',result_json=?,updated_ms=? "
-                "WHERE run_id=? AND status='running' AND effect_status IN ('','acknowledged') "
+                "WHERE run_id=? AND status='running' "
+                "AND (effect_status IN ('','acknowledged') OR (effect_status='delivery_unknown' AND ?)) "
                 "AND checkpoint_ordinal=effect_ordinal AND project_authority=?",
-                (_canonical(clean_result), int(time.time()*1000), run_id, self.authority),
+                (_canonical(clean_result), int(time.time()*1000), run_id,
+                 1 if degraded else 0, self.authority),
             ).rowcount
             if changed != 1:
                 raise HarnessError("That Swarm run cannot be completed from its current state")
             self._append(db, run_id, "complete", {"result_saved": True})
             self._release_board_lease(db, run_id)
 
-    def fail(self, run_id: str, message: str, stopped: bool = False) -> None:
+    def fail(
+        self,
+        run_id: str,
+        message: str,
+        stopped: bool = False,
+        acknowledged_outcome: bool = False,
+    ) -> None:
         clean_message = bounded_redacted_text(self.redactor, message, 65_536)
         with self._tx() as db:
             row = db.execute("SELECT * FROM runs WHERE run_id=? AND project_authority=?", (run_id, self.authority)).fetchone()
@@ -1254,9 +1427,28 @@ class SwarmRunStore:
                     )
                     self._append(db, run_id, "failure_detail", {"error": clean_message})
                 return
+            checkpoint_ordinal = int(row["checkpoint_ordinal"])
+            if (
+                acknowledged_outcome
+                and row["effect_status"] == "acknowledged"
+                and int(row["effect_ordinal"]) > checkpoint_ordinal
+            ):
+                # The provider reply was received, but a later local protocol
+                # or validation step failed. Persist that receipt atomically
+                # with the failure classification so it cannot be mislabeled
+                # outcome_unknown merely because no success checkpoint exists.
+                checkpoint_ordinal = int(row["effect_ordinal"])
+                self._append(db, run_id, "provider_reply_received_before_failure", {
+                    "error": clean_message,
+                })
+                db.execute(
+                    "UPDATE runs SET checkpoint_ordinal=?,updated_ms=? "
+                    "WHERE run_id=? AND project_authority=?",
+                    (checkpoint_ordinal, int(time.time() * 1000), run_id, self.authority),
+                )
             status = (
                 "delivery_unknown" if row["effect_status"] in {"dispatched", "delivery_unknown"}
-                else "outcome_unknown" if int(row["effect_ordinal"]) > int(row["checkpoint_ordinal"])
+                else "outcome_unknown" if int(row["effect_ordinal"]) > checkpoint_ordinal
                 else "stopped" if stopped else "failed"
             )
             changed = db.execute("UPDATE runs SET status=?,error=?,updated_ms=? WHERE run_id=? AND status IN ('accepted','running','stopping') AND project_authority=?", (status, clean_message, int(time.time()*1000), run_id, self.authority)).rowcount
@@ -1268,10 +1460,14 @@ class SwarmRunStore:
     def request_stop(self, run_id: str) -> dict[str, Any]:
         with self._tx() as db:
             row = db.execute(
-                "SELECT * FROM runs WHERE project_authority=? "
-                "AND (run_id=? OR request_id=?)",
-                (self.authority, run_id, run_id),
+                "SELECT * FROM runs WHERE project_authority=? AND run_id=?",
+                (self.authority, run_id),
             ).fetchone()
+            if row is None:
+                row = db.execute(
+                    "SELECT * FROM runs WHERE project_authority=? AND request_id=?",
+                    (self.authority, run_id),
+                ).fetchone()
             if not row:
                 raise HarnessError("That Swarm run does not exist")
             self._verify_run(db, row)
@@ -1318,11 +1514,26 @@ class SwarmRunStore:
                 raise HarnessError(
                     "Stop was accepted before this post-provider mutation; Nexus refused the mutation."
                 )
-            yield
+            # The durable reservation above linearizes against Stop requests
+            # from every process. This local boundary also covers fail-closed
+            # watcher cancellation when the journal itself cannot be polled.
+            with cancellation.mutation_boundary():
+                yield
 
     def get(self, identity: str) -> dict[str, Any]:
         with self._read() as db:
-            row = db.execute("SELECT * FROM runs WHERE project_authority=? AND (run_id=? OR request_id=?)", (self.authority, identity, identity)).fetchone()
+            # Exact run IDs are authoritative. A caller-controlled request ID
+            # may coincidentally equal another row's generated run ID; a single
+            # OR query leaves SQLite free to return the request alias instead.
+            row = db.execute(
+                "SELECT * FROM runs WHERE project_authority=? AND run_id=?",
+                (self.authority, identity),
+            ).fetchone()
+            if row is None:
+                row = db.execute(
+                    "SELECT * FROM runs WHERE project_authority=? AND request_id=?",
+                    (self.authority, identity),
+                ).fetchone()
             if not row:
                 raise HarnessError("That Swarm run does not exist")
             self._verify_run(db, row)
@@ -1376,6 +1587,25 @@ class SwarmRunStore:
                 self._verify_run(db, row)
                 return self._row(row)
         return None
+
+    def active_runs(self) -> list[dict[str, Any]]:
+        """Return every verified active command for this project authority.
+
+        Callers which fence project ownership must inspect the complete active
+        set: a newer unrelated chat or work run must not hide an older run that
+        still owns the project being admitted.
+        """
+
+        with self._read() as db:
+            rows = db.execute(
+                "SELECT * FROM runs WHERE project_authority=? "
+                "AND status IN ('accepted','running','stopping') "
+                "ORDER BY updated_ms DESC, run_id DESC",
+                (self.authority,),
+            ).fetchall()
+            for row in rows:
+                self._verify_run(db, row)
+            return [self._row(row) for row in rows]
 
     def recoverable_work(self, limit: int = 50) -> dict[str, Any]:
         """Return the newest durable project-work outcome for each pair chat.
@@ -1505,7 +1735,7 @@ class SwarmRunStore:
                 ),
                 "write_scope_restricted": bool(result.get("write_scope_restricted")),
                 "context_tool_budget": budget(result.get("context_tool_budget")),
-                "questions": strings(result.get("questions"), 6, 500),
+                "questions": user_questions.frozen(result.get("questions")),
                 "remaining": strings(result.get("remaining"), 12, 500),
                 "project": {
                     "id": project_id[:160],
@@ -1717,7 +1947,7 @@ class SwarmRunStore:
         route/conversation leases and unrelated chats remain parallel.
         """
 
-        logical_key = f"{self.authority}\0{str(conversation_key or '').strip()}"
+        logical_key = f"{self.chat_scope}\0{str(conversation_key or '').strip()}"
         scope = self.resource(
             run_id, "nexus-logical-chat-turn", logical_key, timeout=timeout,
         )
@@ -1743,6 +1973,21 @@ def bind(store: SwarmRunStore, run_id: str) -> Iterator[None]:
         yield
     finally:
         _CURRENT.reset(token)
+
+
+@contextmanager
+def post_provider_mutation() -> Iterator[None]:
+    """Linearize a mutation for the durable run bound to this worker."""
+
+    current = _CURRENT.get()
+    if current is None:
+        # Direct unit callers without a durable server run retain the file
+        # transaction's own atomicity and fresh-baseline checks.
+        yield
+        return
+    store, run_id = current
+    with store.post_provider_mutation(run_id):
+        yield
 
 
 @contextmanager
@@ -1779,22 +2024,197 @@ def _unscoped_store(config: LoadedConfig) -> _ProviderResourceStore:
         return held
 
 
+def _provider_capacity_spec(
+    config: LoadedConfig, route: str,
+) -> tuple[str, str, int, float] | None:
+    """Return the cross-process capacity domain for one configured profile."""
+
+    named = str(route or "").strip()
+    if named.startswith("web:"):
+        # Electron owns consumer-web-chat concurrency. Each saved provider
+        # conversation has its own view and queue there; it is not a trusted
+        # ProviderRegistry profile and must not be folded into a CLI slot.
+        return None
+    project_scope = hashlib.sha256(
+        os.path.normcase(str(config.project_root.resolve())).encode("utf-8")
+    ).hexdigest()
+    if not named:
+        # The legacy unnamed route reads the top-level provider directly and
+        # has no profile entry. Preserve its conservative single-flight
+        # behavior while named profiles use their declared capacity.
+        return (
+            project_scope, "legacy-default", 1,
+            float(config.get("provider.timeout_seconds") or 600),
+        )
+    registry = ProviderRegistry(config)
+    try:
+        profile = registry.profile(named)
+    except HarnessError as exc:
+        if not str(exc).startswith("Unknown provider profile:"):
+            raise
+        # Provider-effect tests and plugin/legacy callers may supply a route
+        # which was resolved outside ProviderRegistry. Unknown capacity is
+        # conservative single-flight, never unlimited.
+        return (
+            project_scope, f"unregistered-{named}", 1,
+            float(config.get("provider.timeout_seconds") or 600),
+        )
+    return (
+        project_scope, profile.id, max(1, int(profile.max_concurrency)),
+        float(max(1, int(profile.timeout_seconds))),
+    )
+
+
+def _capacity_checkpoint(store: object, run_id: str) -> None:
+    cancellation.checkpoint()
+    if isinstance(store, SwarmRunStore) and store.should_stop(run_id):
+        raise cancellation.ChatCancelled(cancellation.STOPPED_MESSAGE)
+
+
 @contextmanager
-def provider_effect(config: LoadedConfig, route: str, conversation_key: str, digest: str) -> Iterator[None]:
+def _provider_capacity_slot(
+    store: object, run_id: str, project_scope: str, profile_id: str,
+    maximum: int, timeout: float,
+) -> Iterator[str]:
+    """Claim one configured provider slot using the crash-fenced lease table."""
+
+    count = max(1, min(32, int(maximum)))
+    keys = [
+        hashlib.sha256(
+            f"nexus-provider-profile-capacity-v1\0{project_scope}\0{profile_id}\0{slot}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        for slot in range(count)
+    ]
+    began = time.monotonic()
+    pid = os.getpid()
+    owner_token = _process_token(pid)
+    claimed = ""
+    while not claimed:
+        _capacity_checkpoint(store, run_id)
+        # Both SwarmRunStore and its lightweight unscoped counterpart expose
+        # the same private transactional resource table boundary.
+        with store._tx() as db:  # type: ignore[attr-defined]
+            for key in keys:
+                held = db.execute(
+                    "SELECT * FROM resources WHERE resource_key=?", (key,)
+                ).fetchone()
+                if held and _owner_is_alive(
+                    int(held["owner_pid"]), str(held["owner_token"])
+                ):
+                    continue
+                db.execute(
+                    "INSERT OR REPLACE INTO resources"
+                    "(resource_key,run_id,owner_pid,owner_token,acquired_ms) "
+                    "VALUES(?,?,?,?,?)",
+                    (key, run_id, pid, owner_token, int(time.time() * 1000)),
+                )
+                claimed = key
+                break
+        if claimed:
+            break
+        if time.monotonic() - began >= max(1.0, float(timeout)):
+            raise HarnessError(
+                f"Provider profile {profile_id} is still at its configured capacity "
+                f"of {count} concurrent request{'s' if count != 1 else ''}. "
+                "The queued chat was left intact; try again after another answer finishes."
+            )
+        time.sleep(0.05)
+    try:
+        _capacity_checkpoint(store, run_id)
+        yield claimed
+    finally:
+        with store._tx() as db:  # type: ignore[attr-defined]
+            db.execute(
+                "DELETE FROM resources WHERE resource_key=? AND run_id=? "
+                "AND owner_pid=? AND owner_token=?",
+                (claimed, run_id, pid, owner_token),
+            )
+
+
+def _provider_effect_key(route: str, conversation_key: str, digest: str) -> str:
+    """Journal uncertainty at the provider's real remote-effect boundary.
+
+    Electron web chats reuse one visible provider-site conversation, so an
+    ambiguous send fences that whole conversation until it is reconciled.
+    API and command providers ignore ``conversation_key`` and execute one
+    stateless request at a time. For those routes, fence only the exact request
+    digest: an automatic replay of the uncertain request remains blocked, but
+    one interrupted call cannot poison every future turn in the Nexus chat.
+    """
+
+    identity = f"{route}\0{conversation_key}"
+    if not str(route or "").startswith("web:"):
+        identity += f"\0{digest}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def _provider_resource_conversation_key(
+    route: str, conversation_key: str, digest: str,
+) -> str:
+    """Serialize only provider requests which share mutable remote state.
+
+    A consumer web route owns one visible conversation, so every turn for that
+    conversation must remain single-flight. CLI/API routes are stateless and
+    their configured profile capacity is the concurrency authority; including
+    the request digest here prevents an unrelated slow request from occupying
+    the conversation lease for another agent on the same route.
+    """
+
+    if str(route or "").startswith("web:"):
+        return str(conversation_key or "")
+    return f"{conversation_key}\0{digest}"
+
+
+@contextmanager
+def provider_effect(
+    config: LoadedConfig, route: str, conversation_key: str, digest: str,
+    *, before_dispatch: Callable[[], None] | None = None,
+) -> Iterator[None]:
     current = _CURRENT.get()
     # Durable runs use their already-validated signed store. Ordinary chats use
     # only the shared ephemeral resource-lease boundary; validating every
     # historical run here would turn first-use fan-out into serialized setup.
     store = current[0] if current else _unscoped_store(config)
     run_id = current[1] if current else f"unscoped-{os.getpid()}-{uuid.uuid4().hex}"
-    with store.resource(run_id, route, conversation_key):
-        effect_id = store.begin_effect(run_id, hashlib.sha256(f"{route}\0{conversation_key}".encode()).hexdigest(), digest) if current else ""
-        try:
-            yield
-        except Exception:
-            if current:
-                store.finish_effect(run_id, effect_id, False)
-            raise
-        else:
-            if current:
-                store.finish_effect(run_id, effect_id, True)
+    capacity = _provider_capacity_spec(config, route)
+    with store.resource(
+        run_id, route,
+        _provider_resource_conversation_key(route, conversation_key, digest),
+    ):
+        capacity_scope = (
+            _provider_capacity_slot(store, run_id, *capacity)
+            if capacity is not None else nullcontext("web")
+        )
+        with capacity_scope:
+            _capacity_checkpoint(store, run_id)
+            if before_dispatch is not None:
+                before_dispatch()
+            _capacity_checkpoint(store, run_id)
+            effect_id = store.begin_effect(
+                run_id, _provider_effect_key(route, conversation_key, digest), digest
+            ) if current else ""
+            try:
+                yield
+                # Stop can win while the provider is returning. Check again
+                # before acknowledging its effect or allowing transcript/file
+                # mutation so a durable cross-process Stop has a linear edge.
+                _capacity_checkpoint(store, run_id)
+            except ProviderOutcomeUnknown:
+                if current:
+                    store.finish_effect(run_id, effect_id, False)
+                raise
+            except Exception:
+                # Returning an explicit exception is itself a terminal receipt. It
+                # may be a refusal, provider error, invalid reply, or acknowledged
+                # response timeout, but it is not the crash/restart ambiguity that
+                # delivery_unknown exists to represent. Providers must use
+                # ProviderOutcomeUnknown only when the remote effect really cannot
+                # be reconciled. This distinction lets healthy peers keep working.
+                if current:
+                    store.finish_effect(run_id, effect_id, True)
+                raise
+            else:
+                if current:
+                    store.finish_effect(run_id, effect_id, True)

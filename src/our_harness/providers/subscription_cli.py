@@ -14,6 +14,7 @@ someone describe a tool the harness has never heard of without changing code.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -26,10 +27,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..models import HarnessError, ProviderRequest, ProviderResponse
-from ..redaction import bounded_redacted_text
+from ..redaction import CredentialRedactor, bounded_redacted_text
 from .base import Provider
 from .codex_cli import (
     _minimal_codex_environment, _provider_capture_limit, _remaining, _run_bounded,
+    codex_config_load_error,
 )
 
 SUBSCRIPTION_KINDS = ("claude-cli", "copilot-cli", "assistant-cli")
@@ -287,7 +289,17 @@ GEMINI_RECIPE = CliRecipe(
     # auto-approve tools, but it is not a discovery-disable guarantee because
     # machine/user policy can authorize tools; this route is therefore never
     # automatically replayed for schema repair.
-    arguments=("--output-format", "json", "--approval-mode", "default", "--model", "{model}"),
+    arguments=(
+        "--output-format", "json",
+        "--approval-mode", "default",
+        # Ordinary Nexus chat is answer-only. User-installed Gemini extensions
+        # can start MCP/tool processes and materially delay even a setup
+        # refusal; loading them also expands a chat turn beyond this provider's
+        # declared contract. Gemini's supported `none` override keeps this
+        # transport deterministic without changing the user's global settings.
+        "--extensions", "none",
+        "--model", "{model}",
+    ),
     text_field="response",
     # It says so with an object rather than a flag.
     error_when_present="error",
@@ -372,6 +384,8 @@ RECIPES: dict[str, CliRecipe] = {
 _connection_cache_lock = threading.Lock()
 _connection_cache: dict[tuple[str, str, int], tuple[float, dict[str, Any]]] = {}
 CONNECTION_STATUS_CACHE_SECONDS = 60.0
+_tool_version_cache_lock = threading.Lock()
+_tool_version_cache: dict[tuple[object, ...], tuple[float, tuple[int, ...]]] = {}
 
 
 def recipe_for(kind: str) -> CliRecipe:
@@ -480,6 +494,40 @@ def connection_status(
     if result.timed_out:
         return done(dict(base, state="installed"))
     answer = f"{result.stdout}\n{result.stderr}".lower()
+    if result.exit_code != 0 and codex_config_load_error(answer):
+        problem = bounded_redacted_text(
+            CredentialRedactor(),
+            (result.stderr or result.stdout).strip(),
+            2_000,
+        )
+        if kind == "codex-cli":
+            try:
+                capability = _run_bounded(
+                    [*argv, "exec", "--help"], cwd=Path.cwd(), stdin_text=None,
+                    timeout_seconds=max(1.0, min(float(timeout_seconds), 15.0)),
+                    max_output_bytes=32_000,
+                )
+            except HarnessError:
+                capability = None
+            help_text = (
+                f"{capability.stdout}\n{capability.stderr}" if capability is not None else ""
+            )
+            if capability is not None and not capability.timed_out \
+                    and not capability.output_truncated \
+                    and capability.exit_code == 0 \
+                    and "--ignore-user-config" in help_text:
+                return done(dict(
+                    base,
+                    authentication="unknown",
+                    state="isolated-ready",
+                    problem=problem,
+                    config_ignored_for_exec=True,
+                    can_login=False,
+                ))
+        return done(dict(
+            base, authentication="unknown", state="configuration-error",
+            problem=problem,
+        ))
     compact = answer.replace(" ", "")
     negative = (
         '"loggedin":false', '"logged_in":false', "not logged in",
@@ -534,25 +582,27 @@ def start_interactive_login(
     program = available(kind, configured)
     if not program:
         raise HarnessError(f"{recipe.label} is not installed. {recipe.install_hint}")
-    command = [program, *(configured[1:] if configured is not None else ()), *arguments]
+    login_command = [
+        program,
+        *(configured[1:] if configured is not None else ()),
+        *arguments,
+    ]
     if os.name != "nt":
         raise HarnessError(
             f"Open a terminal and run {Path(program).name} "
             f"{' '.join(arguments)}. The app can open the interactive login "
             "window automatically on Windows."
         )
-    # .cmd launchers need cmd.exe, while a real executable starts directly.
-    # Both are fixed commands from the built-in recipe; no user text is placed
-    # in this command line.
-    if Path(program).suffix.lower() in {".cmd", ".bat"}:
-        command = [
-            os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
-            subprocess.list2cmdline([
-                program,
-                *(configured[1:] if configured is not None else ()),
-                *arguments,
-            ]),
-        ]
+    # Keep the terminal after the provider exits. A successful login command
+    # can return immediately when the account is already signed in, while a
+    # malformed provider config can fail just as quickly. Launching the real
+    # executable directly made both cases look like an unexplained flash.
+    # list2cmdline quotes each fixed/configured argv word for cmd.exe; no chat
+    # text or credential is placed in the command line.
+    command = [
+        os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/k",
+        subprocess.list2cmdline(login_command),
+    ]
     try:
         process = subprocess.Popen(
             command,
@@ -571,7 +621,8 @@ def start_interactive_login(
         "kind": kind,
         "note": (
             f"The {recipe.label} sign-in opened in its own terminal. Finish it "
-            "there, then come back and send the message again."
+            "there, then come back and send the message again. The terminal "
+            "stays open so an immediate success or configuration error remains readable."
         ),
         # Useful only to establish that a process really started. Never an
         # executable path, command, account name, or token.
@@ -579,7 +630,9 @@ def start_interactive_login(
     }
 
 
-def start_claude_repair() -> dict[str, Any]:
+def start_claude_repair(
+    command: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Open Claude's own update/logout/login repair in a visible terminal.
 
     The repair deliberately stays outside this process.  Nexus neither reads
@@ -590,7 +643,12 @@ def start_claude_repair() -> dict[str, Any]:
 
     kind = "claude-cli"
     recipe = recipe_for(kind)
-    program = available(kind)
+    configured = list(command) if command is not None else None
+    if configured is not None and (
+        not configured or any(not isinstance(part, str) or not part for part in configured)
+    ):
+        raise HarnessError(f"{recipe.label} command must be a non-empty list of words")
+    program = available(kind, configured)
     if not program:
         raise HarnessError(f"{recipe.label} is not installed. {recipe.install_hint}")
     if os.name != "nt":
@@ -603,18 +661,22 @@ def start_claude_repair() -> dict[str, Any]:
     # Update before logging out.  If updating cannot start, the fixed `&&`
     # chain stops and leaves the existing account session alone.  Every word
     # here is built in; no request text or setting is inserted into a shell.
+    exact_command = [
+        program,
+        *(configured[1:] if configured is not None else ()),
+    ]
     repairs = (
-        [program, "update"],
-        [program, "auth", "logout"],
-        [program, "auth", "login"],
+        [*exact_command, "update"],
+        [*exact_command, "auth", "logout"],
+        [*exact_command, "auth", "login"],
     )
     chain = " && ".join(subprocess.list2cmdline(one) for one in repairs)
-    command = [
+    terminal_command = [
         os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/k", chain,
     ]
     try:
         process = subprocess.Popen(
-            command,
+            terminal_command,
             cwd=Path.cwd(),
             env=_minimal_codex_environment(),
             stdin=None,
@@ -738,6 +800,61 @@ class SubscriptionCLIProvider(Provider):
             and self.recipe.id == "claude-cli"
         )
 
+    def _effective_dispatch_contract(self) -> str:
+        return f"{self.recipe.id}/effective-dispatch/v1"
+
+    def _effective_dispatch_command(self) -> list[str] | None:
+        return self._command()
+
+    def _effective_dispatch_config(self) -> dict[str, Any]:
+        configured = super()._effective_dispatch_config()
+        configured["recipe"] = {
+            "id": self.recipe.id,
+            "arguments": list(self.recipe.arguments),
+            "version_arguments": list(self.recipe.version_arguments),
+            "needs_handing_over": [list(one) for one in self.recipe.needs_handing_over],
+            "key_it_reads": self.recipe.key_it_reads,
+        }
+        return configured
+
+    def _effective_dispatch_version(
+        self, command: list[str],
+    ) -> dict[str, Any]:
+        # Gemini currently initializes extensions/auth before --version and can
+        # hang; a custom assistant's version flag is not an engine-owned safe
+        # contract. Their resolved file identity and recipe/config contract are
+        # still bound without executing anything extra.
+        if self.recipe.id in {"gemini-cli", "assistant-cli"}:
+            return {"state": "not-probed-by-adapter"}
+        resolved = Path(command[0]).resolve(strict=False)
+        for packaged, version in _every_build_of(self.recipe.kept_under):
+            if packaged.resolve(strict=False) == resolved and version:
+                material = ".".join(str(one) for one in version)
+                return {
+                    "state": "observed-from-versioned-install-path",
+                    "version_output_sha256": hashlib.sha256(
+                        material.encode("utf-8")
+                    ).hexdigest(),
+                }
+        result = _run_bounded(
+            [*command, *self.recipe.version_arguments],
+            cwd=Path.cwd(), stdin_text=None,
+            timeout_seconds=3.0, max_output_bytes=8_000,
+        )
+        material = json.dumps({
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "output_truncated": result.output_truncated,
+            "stdout": self._redactor.text(result.stdout),
+            "stderr": self._redactor.text(result.stderr),
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return {
+            "state": "timed-out" if result.timed_out else "observed",
+            "version_output_sha256": hashlib.sha256(
+                material.encode("utf-8")
+            ).hexdigest(),
+        }
+
     def _command(self) -> list[str]:
         configured = self.settings.get("command") or list(self.recipe.command)
         if not isinstance(configured, list) or not configured:
@@ -835,7 +952,7 @@ class SubscriptionCLIProvider(Provider):
         recipe.check()
         return recipe
 
-    def _preflight(self, command: list[str], deadline_at: float) -> None:
+    def _preflight(self, command: list[str], deadline_at: float, cwd: Path) -> None:
         if self._checked:
             return
         # A version banner is only a diagnostic, not the work somebody asked
@@ -845,9 +962,17 @@ class SubscriptionCLIProvider(Provider):
         # gate hid the real answer behind a thirty-second, misleading failure.
         # Keep the probe short and advisory; the actual request below remains
         # bounded by the caller's deadline and is the authoritative check.
-        result = _run_bounded(
+        if self.recipe.id == "gemini-cli":
+            # Gemini 0.22 on Windows initializes authentication and extensions
+            # before printing --version. It can outlive this advisory probe,
+            # and killing that startup immediately before the real request can
+            # leave the request waiting on the same extension/auth resources.
+            # The real bounded JSON request is already authoritative.
+            self._checked = True
+            return
+        _run_bounded(
             [*command, *self.recipe.version_arguments],
-            cwd=Path.cwd(),
+            cwd=cwd,
             stdin_text=None,
             timeout_seconds=min(3.0, _remaining(deadline_at)),
             max_output_bytes=32_000,
@@ -879,7 +1004,13 @@ class SubscriptionCLIProvider(Provider):
         timeout = self._timeout(request.timeout_seconds)
         deadline_at = time.monotonic() + timeout
         self._deadline = deadline_at
-        self._preflight(command, deadline_at)
+        request_cwd = (
+            Path(request.working_directory).resolve()
+            if str(request.working_directory or "").strip() else Path.cwd()
+        )
+        if not request_cwd.is_dir():
+            raise HarnessError("The provider request's isolated working folder is unavailable")
+        self._preflight(command, deadline_at, request_cwd)
         # Provider result transport must be able to carry the response schemas
         # Nexus itself supplies.  It is not the same budget as stdout from a
         # project test command.
@@ -946,7 +1077,7 @@ class SubscriptionCLIProvider(Provider):
         started = time.monotonic()
         result = _run_bounded(
             argv,
-            cwd=Path.cwd(),
+            cwd=request_cwd,
             stdin_text=stdin_text,
             timeout_seconds=_remaining(deadline_at),
             max_output_bytes=output_limit,
@@ -1454,16 +1585,38 @@ def _the_version_of(program: str) -> tuple[int, ...]:
     """
 
     try:
+        where = Path(program).resolve(strict=True)
+        observed = where.stat()
+        signature = (
+            os.path.normcase(str(where)), int(observed.st_dev), int(observed.st_ino),
+            int(observed.st_size), int(observed.st_mtime_ns),
+        )
+    except (OSError, RuntimeError):
+        signature = (str(program), "unavailable")
+    with _tool_version_cache_lock:
+        remembered = _tool_version_cache.get(signature)
+    if remembered:
+        age = time.monotonic() - remembered[0]
+        if age < (300.0 if remembered[1] else 5.0):
+            return remembered[1]
+    try:
         done = _run_bounded(
             [program, "--version"], cwd=Path.cwd(), stdin_text=None,
-            timeout_seconds=20.0, max_output_bytes=8_000,
+            timeout_seconds=3.0, max_output_bytes=8_000,
         )
     except HarnessError:
-        return ()
-    if done.timed_out or done.exit_code != 0:
-        return ()
-    found = re.search(r"(\d+(?:\.\d+)+)", done.stdout or "")
-    return _as_numbers(found.group(1)) if found else ()
+        version = ()
+    else:
+        if done.timed_out or done.exit_code != 0:
+            version = ()
+        else:
+            found = re.search(r"(\d+(?:\.\d+)+)", done.stdout or "")
+            version = _as_numbers(found.group(1)) if found else ()
+    with _tool_version_cache_lock:
+        if len(_tool_version_cache) >= 128:
+            _tool_version_cache.pop(next(iter(_tool_version_cache)), None)
+        _tool_version_cache[signature] = (time.monotonic(), version)
+    return version
 
 
 def _in_a_few_words(said: str) -> str:

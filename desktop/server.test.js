@@ -542,7 +542,9 @@ test("the page can ask the real Electron window to enter and leave full screen",
 
   const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
   assert.ok(main.includes('ipcMain.handle("harness:setFullScreen"'));
-  assert.ok(main.includes("window.setFullScreen(Boolean(on))"));
+  assert.ok(main.includes('wanted ? "enter-full-screen" : "leave-full-screen"'),
+    "the IPC reply waits for the native transition instead of racing focus restoration");
+  assert.ok(main.includes("target.setFullScreen(wanted)"));
   assert.ok(main.includes('send("harness:fullScreenChanged"'));
 });
 

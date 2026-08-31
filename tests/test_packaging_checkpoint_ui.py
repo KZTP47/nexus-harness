@@ -188,6 +188,39 @@ class PackagingTests(unittest.TestCase):
             self.assertFalse(result["passed"])
             self.assertTrue(any(item["message"] == "machine-specific absolute path" for item in result["findings"]))
 
+    def test_distribution_audit_detects_arbitrary_windows_user_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "src" / "our_harness"
+            package.mkdir(parents=True)
+            (package / "module.py").write_text(
+                'LOCATION = r"D:\\Users\\somebody-else\\Desktop\\project"\n',
+                encoding="utf-8",
+            )
+
+            result = audit_distribution(root)
+
+            self.assertFalse(result["passed"])
+            self.assertTrue(any(
+                item["message"] == "machine-specific absolute path"
+                for item in result["findings"]
+            ))
+
+    def test_distribution_audit_ignores_repository_only_agent_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "src" / "our_harness"
+            package.mkdir(parents=True)
+            (package / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text(
+                "Use the private vault at C:\\\\Users\\\\person\\\\vault only in this checkout.\n",
+                encoding="utf-8",
+            )
+
+            result = audit_distribution(root)
+
+            self.assertTrue(result["passed"], result["findings"])
+
     def test_distribution_audit_ignores_generated_published_runtime_vendor_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -409,27 +442,34 @@ class UITests(unittest.TestCase):
     def test_workspace_run_reservation_is_exclusive(self) -> None:
         from our_harness.server import HarnessHandler, HarnessHTTPServer
 
-        server = SimpleNamespace(run_lock=threading.Lock())
-        server.reserve_run = lambda: HarnessHTTPServer.reserve_run(server)
-        server.release_run = lambda: HarnessHTTPServer.release_run(server)
-        server.require_project_execution_authority = lambda: None
-        self.assertTrue(HarnessHTTPServer.reserve_run(server))
-        self.assertFalse(HarnessHTTPServer.reserve_run(server))
+        with tempfile.TemporaryDirectory() as temporary:
+            config = load_isolated_config(Path(temporary), {})
+            server = SimpleNamespace(
+                run_lock=threading.Lock(),
+                project_admission_lock=threading.Lock(),
+                config=config,
+            )
+            server.reserve_run = lambda: HarnessHTTPServer.reserve_run(server)
+            server.release_run = lambda: HarnessHTTPServer.release_run(server)
+            server.require_project_execution_authority = lambda _root=None: None
+            server.require_no_long_horizon_path = lambda root: root
+            self.assertTrue(HarnessHTTPServer.reserve_run(server))
+            self.assertFalse(HarnessHTTPServer.reserve_run(server))
 
-        responses = []
-        handler = object.__new__(HarnessHandler)
-        handler.server = server
-        handler.path = "/api/run"
-        handler._authorize = lambda: None
-        handler._body = lambda: {"task": "one", "dry_run": False}
-        handler._json = lambda value, status=200: responses.append((value, status))
-        handler.send_error = lambda status: self.fail(f"unexpected HTTP error {status}")
-        HarnessHandler.do_POST(handler)
-        self.assertEqual(responses, [({"error": "A workspace run is already active"}, HTTPStatus.CONFLICT)])
+            responses = []
+            handler = object.__new__(HarnessHandler)
+            handler.server = server
+            handler.path = "/api/run"
+            handler._authorize = lambda: None
+            handler._body = lambda: {"task": "one", "dry_run": False}
+            handler._json = lambda value, status=200: responses.append((value, status))
+            handler.send_error = lambda status: self.fail(f"unexpected HTTP error {status}")
+            HarnessHandler.do_POST(handler)
+            self.assertEqual(responses, [({"error": "A workspace run is already active"}, HTTPStatus.CONFLICT)])
 
-        HarnessHTTPServer.release_run(server)
-        self.assertTrue(HarnessHTTPServer.reserve_run(server))
-        HarnessHTTPServer.release_run(server)
+            HarnessHTTPServer.release_run(server)
+            self.assertTrue(HarnessHTTPServer.reserve_run(server))
+            HarnessHTTPServer.release_run(server)
 
     def test_semantic_and_keyboard_surfaces_exist(self) -> None:
         html = (ROOT / "src" / "our_harness" / "ui" / "index.html").read_text(encoding="utf-8")

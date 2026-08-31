@@ -4,10 +4,31 @@ const crypto = require("node:crypto");
 const path = require("node:path");
 const {ExternalBrowserTransport} = require("./external-browser");
 
+class WebChatTurnError extends Error {
+  constructor(message, options = {}) {
+    super(String(message || "The provider web chat failed"));
+    this.name = "WebChatTurnError";
+    this.deliveryState = ["accepted", "not_accepted", "unknown"].includes(options.deliveryState)
+      ? options.deliveryState : "unknown";
+    this.failureCode = String(options.failureCode || "web_chat_failure")
+      .toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 80);
+    this.diagnostics = options.diagnostics && typeof options.diagnostics === "object"
+      ? options.diagnostics : {};
+  }
+}
+
+function controlError(message, code) {
+  const error = new Error(String(message || "The provider web chat was interrupted"));
+  error.code = String(code || "NEXUS_WEB_CHAT_CONTROL_ERROR");
+  return error;
+}
+
 const PROVIDERS = Object.freeze({
   chatgpt: {
     id: "chatgpt", label: "ChatGPT", home: "https://chatgpt.com/", newChat: "https://chatgpt.com/",
     hosts: ["chatgpt.com", "openai.com"],
+    conversationHosts: ["chatgpt.com"],
+    conversationPaths: [/^\/c\/[^/]+\/?$/, /^\/g\/[^/]+\/c\/[^/]+\/?$/],
     authHosts: ["auth0.openai.com", "accounts.google.com", "login.microsoftonline.com", "appleid.apple.com"],
     readyComposer: ["#prompt-textarea", "#mobile-composer-prompt", "textarea[data-mobile-composer-prompt]"],
     composer: ["#prompt-textarea", "#mobile-composer-prompt", "textarea[data-mobile-composer-prompt]", "[contenteditable='true'][data-placeholder]", "textarea"],
@@ -26,6 +47,8 @@ const PROVIDERS = Object.freeze({
   claude: {
     id: "claude", label: "Claude", home: "https://claude.ai/", newChat: "https://claude.ai/new",
     hosts: ["claude.ai", "anthropic.com"],
+    conversationHosts: ["claude.ai"],
+    conversationPaths: [/^\/chat\/[^/]+\/?$/],
     authHosts: ["accounts.google.com", "login.microsoftonline.com", "appleid.apple.com"],
     browserLikeUserAgent: true,
     // Claude's current Cloudflare policy repeatedly challenges embedded or
@@ -55,11 +78,21 @@ const PROVIDERS = Object.freeze({
     signedOutPaths: ["/login", "/oauth", "/onboarding"],
     attach: ["button[aria-label*='Add content']", "button[aria-label*='Attach']"],
     pairRepliesToUsers: true,
+    // Claude has shipped transcript wrappers without its usual user-message
+    // attributes.  Only this provider may use the unique transport marker as
+    // a fallback receipt outside the composer; providers with stable user-turn
+    // selectors must prove that an actual submitted turn exists.
+    markerReceiptFallback: true,
     trustedInput: true,
   },
   gemini: {
     id: "gemini", label: "Gemini", home: "https://gemini.google.com/app", newChat: "https://gemini.google.com/app",
-    hosts: ["gemini.google.com", "google.com"], authHosts: ["accounts.google.com"],
+    // google.com used to be a normal provider host here. That made account,
+    // search, and settings pages look like Gemini conversations. Authentication
+    // remains explicitly allowed only while the navigation guard requests it.
+    hosts: ["gemini.google.com"], authHosts: ["accounts.google.com"],
+    conversationHosts: ["gemini.google.com"],
+    conversationPaths: [/^\/app\/[^/]+\/?$/],
     readyComposer: ["rich-textarea [contenteditable='true']", ".ql-editor[contenteditable='true']"],
     composer: ["rich-textarea [contenteditable='true']", ".ql-editor[contenteditable='true']", "textarea"],
     send: ["button[aria-label*='Send']", ".send-button"],
@@ -74,6 +107,8 @@ const PROVIDERS = Object.freeze({
   copilot: {
     id: "copilot", label: "Microsoft Copilot", home: "https://copilot.microsoft.com/", newChat: "https://copilot.microsoft.com/",
     hosts: ["copilot.microsoft.com", "microsoft.com"],
+    conversationHosts: ["copilot.microsoft.com"],
+    conversationPaths: [/^\/chats\/[^/]+\/?$/],
     authHosts: ["login.live.com", "login.microsoftonline.com", "account.microsoft.com"],
     readyComposer: ["textarea[data-testid*='composer']", "textarea", "[contenteditable='true']"],
     composer: ["textarea[data-testid*='composer']", "textarea", "[contenteditable='true']"],
@@ -151,14 +186,39 @@ function specificConversationUrl(provider, candidate) {
   if (!allowedProviderUrl(provider, candidate)) return false;
   try {
     const actual = new URL(candidate);
-    const generic = [provider.home, provider.newChat].map((one) => new URL(one));
-    return !generic.some((one) => (
-      actual.origin === one.origin
-      && actual.pathname.replace(/\/+$/, "") === one.pathname.replace(/\/+$/, "")
-    ));
+    return (provider.conversationHosts || []).includes(actual.hostname.toLowerCase())
+      && (provider.conversationPaths || []).some((pattern) => pattern.test(actual.pathname));
   } catch (_error) {
     return false;
   }
+}
+
+function sameProviderLocation(left, right) {
+  try {
+    const one = new URL(String(left || ""));
+    const two = new URL(String(right || ""));
+    const cleanPath = (value) => value.replace(/\/+$/, "") || "/";
+    return one.protocol === two.protocol && one.hostname.toLowerCase() === two.hostname.toLowerCase()
+      && cleanPath(one.pathname) === cleanPath(two.pathname);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function genericConversationUrl(provider, candidate) {
+  if (!allowedProviderUrl(provider, candidate)) return false;
+  return [provider.home, provider.newChat].some((one) => sameProviderLocation(one, candidate));
+}
+
+function conversationPageUrl(provider, candidate) {
+  return genericConversationUrl(provider, candidate)
+    || specificConversationUrl(provider, candidate);
+}
+
+function sameSpecificConversation(provider, left, right) {
+  return specificConversationUrl(provider, left)
+    && specificConversationUrl(provider, right)
+    && sameProviderLocation(left, right);
 }
 
 function savedConnection(one) {
@@ -577,6 +637,7 @@ function answerScript(provider, began) {
     const selectors = ${JSON.stringify({
       users: provider.users || [], replies: provider.replies, stop: provider.stop,
       errors: provider.errors || [], pairRepliesToUsers: Boolean(provider.pairRepliesToUsers),
+      markerReceiptFallback: Boolean(provider.markerReceiptFallback),
     })};
     const began = ${JSON.stringify(began)};
     const visible = (one) => one && one.getClientRects().length && getComputedStyle(one).visibility !== "hidden";
@@ -610,6 +671,7 @@ function answerScript(provider, began) {
     const answer = added.at(-1) || (latest && latest !== began.beforeLast ? latest : "");
     let promptIndex = -1;
     let promptNode = null;
+    let markerSource = "";
     if (began.submittedPrompt) {
       // Provider editors reflow long multi-line prompts when rendering the
       // user's bubble. Comparing innerText with the byte-for-byte submitted
@@ -640,8 +702,31 @@ function answerScript(provider, began) {
         if ((isNewIndex || replacedLast) && promptMatches(value)) {
           promptIndex = index;
           promptNode = userNodes[index];
+          markerSource = "user_selector";
         }
       });
+      if (promptIndex < 0 && marker && selectors.markerReceiptFallback) {
+        // Provider DOM attributes are not a durable protocol. The marker is:
+        // it is generated once for this exact dispatch and is never reused.
+        // Locate the smallest visible element containing it, excluding the
+        // composer draft, and use actual DOM order to pair only a later reply.
+        const composers = [];
+        for (const selector of ${JSON.stringify(provider.composer || [])}) {
+          composers.push(...document.querySelectorAll(selector));
+        }
+        promptNode = [...document.querySelectorAll("body *")]
+          .filter(visible)
+          .filter((one) => normal(one.innerText || one.textContent || "").includes(marker))
+          .filter((one) => !composers.some(
+            (composer) => composer === one || composer.contains?.(one)
+              || one.contains?.(composer)))
+          .sort((left, right) => normal(left.innerText || left.textContent || "").length
+            - normal(right.innerText || right.textContent || "").length)[0] || null;
+        if (promptNode) {
+          promptIndex = Math.max(began.beforeUserCount, users.length);
+          markerSource = "broad_fallback";
+        }
+      }
     }
     const userAdvanced = selectors.pairRepliesToUsers ? promptIndex >= 0
       : users.length > began.beforeUserCount
@@ -657,12 +742,27 @@ function answerScript(provider, began) {
       const followingReplies = replyNodes.filter(
         (one) => Boolean(promptNode.compareDocumentPosition(one) & 4));
       const pairedAnswer = textOf(followingReplies.at(-1));
-      return {answer: pairedAnswer, changed: Boolean(pairedAnswer), stopping, error};
+      // A provider-owned user selector identifies an actual transcript turn.
+      // Claude's compatibility fallback is deliberately broader: a prompt
+      // preview outside the primary composer can also contain the fresh marker.
+      // DOM order alone cannot make a pre-existing reply causal in that case,
+      // so require evidence that the reply projection advanced after Send.
+      const acceptedAnswer = markerSource !== "broad_fallback" || replyAdvanced
+        ? pairedAnswer : "";
+      return {
+        answer: acceptedAnswer, changed: Boolean(acceptedAnswer), stopping, error,
+        markerFound: promptIndex >= 0, markerSource, replyCount: replyNodes.length,
+        userCount: userNodes.length, visibility: document.visibilityState || "unknown",
+      };
     }
     const paired = !selectors.pairRepliesToUsers
       || (promptIndex >= 0 && userAdvanced && replyAdvanced);
     const changed = Boolean(answer) && paired;
-    return {answer, changed, stopping, error};
+    return {
+      answer, changed, stopping, error,
+      markerFound: promptIndex >= 0, markerSource, replyCount: replyNodes.length,
+      userCount: userNodes.length, visibility: document.visibilityState || "unknown",
+    };
   })()`;
 }
 
@@ -709,6 +809,7 @@ class WebChatManager {
     this.activeAsks = new Map();
     this.externalTransports = new Map();
     this.backgroundHosts = new Map();
+    this.persistenceError = "";
     this.externalBrowserFactory = options.externalBrowserFactory || ((transportOptions) => (
       new ExternalBrowserTransport(transportOptions)
     ));
@@ -720,10 +821,20 @@ class WebChatManager {
     this.providerReadyDeadlineMs = Math.max(
       1000, Number(options.providerReadyDeadlineMs) || 15000);
     this.providerReadyPollMs = Math.max(1, Number(options.providerReadyPollMs) || 200);
+    this.preSubmitDeadlineMs = Math.max(
+      10, Number(options.preSubmitDeadlineMs) || 30000);
     this.trackedContents = new WeakMap();
-    const saved = this.readSettings().webChats;
+    const settings = this.readSettings();
+    this.backgroundMode = Boolean(settings.webChatBackgroundMode);
+    this.connections = this.connectionsFromSettings(settings);
+  }
+
+  connectionsFromSettings(settings = {}) {
+    const connections = new Map();
+    const saved = settings.webChats;
     for (const raw of Array.isArray(saved) ? saved : []) {
-      if (!raw || !PROVIDERS[raw.provider] || !allowedProviderUrl(PROVIDERS[raw.provider], raw.url)) continue;
+      if (!raw || !PROVIDERS[raw.provider]
+          || !conversationPageUrl(PROVIDERS[raw.provider], raw.url)) continue;
       const id = String(raw.id || "").toLowerCase();
       if (!/^[a-z0-9][a-z0-9-]{5,63}$/.test(id)) continue;
       const threads = {};
@@ -739,25 +850,100 @@ class WebChatManager {
           };
         }
       }
-      this.connections.set(id, {
+      connections.set(id, {
         id, provider: raw.provider,
         title: String(raw.title || PROVIDERS[raw.provider].label).slice(0, 120),
         url: raw.url, threads,
       });
     }
+    return connections;
+  }
+
+  reloadFromSettings() {
+    const settings = this.readSettings();
+    const before = this.connections;
+    const next = this.connectionsFromSettings(settings);
+    const changedIdentity = (id) => {
+      const oldValue = before.get(id);
+      const nextValue = next.get(id);
+      return !oldValue || !nextValue
+        || JSON.stringify(savedConnection(oldValue)) !== JSON.stringify(savedConnection(nextValue));
+    };
+    for (const [channel, view] of [...this.views.entries()]) {
+      const id = channel.split("\n", 1)[0];
+      if (changedIdentity(id)) this.discardView(id, channel.includes("\n")
+        ? channel.slice(channel.indexOf("\n") + 1) : "", view);
+    }
+    for (const held of [...this.shells.values()]) {
+      if (held.connectionId && changedIdentity(held.connectionId)
+          && !held.shell.isDestroyed()) held.shell.close();
+    }
+    this.connections = next;
+    this.backgroundMode = Boolean(settings.webChatBackgroundMode);
+    this.persistenceError = "";
+    // Recovery resolution changes route reachability. Publish the exact fresh
+    // list immediately so neither heartbeat nor manual assignment can retain a
+    // quarantined/removed route in the renderer.
+    this.changed(null);
+    return this.list();
   }
 
   providers() { return Object.values(PROVIDERS).map(({id, label, home, externalBrowser}) => (
     {id, label, home, external: Boolean(externalBrowser)}
   )); }
-  list() { return [...this.connections.values()].map(publicConnection); }
+  list() {
+    return [...this.connections.values()].map((one) => ({
+      ...publicConnection(one),
+      ...(this.persistenceError ? {persistence_error: this.persistenceError} : {}),
+    }));
+  }
 
-  save(selected = null) {
-    this.writeSettings({
-      ...this.readSettings(),
-      webChats: [...this.connections.values()].map(savedConnection),
-    });
+  preferences() {
+    return {
+      backgroundMode: this.backgroundMode,
+      ...(this.persistenceError ? {persistence_error: this.persistenceError} : {}),
+    };
+  }
+
+  async setBackgroundMode(enabled) {
+    const before = this.backgroundMode;
+    this.backgroundMode = Boolean(enabled);
+    try {
+      this.writeSettings({
+        ...this.readSettings(), webChatBackgroundMode: this.backgroundMode,
+      });
+      this.persistenceError = "";
+    } catch (error) {
+      this.backgroundMode = before;
+      this.persistenceError = String(error?.message || error);
+      this.changed();
+      throw error;
+    }
+    await Promise.all([...this.externalTransports.values()].map((transport) => (
+      typeof transport.setBackgroundMode === "function"
+        ? transport.setBackgroundMode(this.backgroundMode) : false
+    )));
+    return this.preferences();
+  }
+
+  save(selected = null, strict = false) {
+    try {
+      this.writeSettings({
+        ...this.readSettings(),
+        webChats: [...this.connections.values()].map(savedConnection),
+      });
+      this.persistenceError = "";
+    } catch (error) {
+      this.persistenceError = String(error?.message || error);
+      // A selected connection event is also the board-assignment signal. A
+      // failed durable save must never auto-create an agent whose route will
+      // disappear at restart, so publish health without claiming selection.
+      this.changed(null);
+      if (strict) throw error;
+      return false;
+    }
     this.changed(selected);
+    return true;
   }
 
   changed(selected = null) {
@@ -805,6 +991,7 @@ class WebChatManager {
         provider,
         preferred: provider.externalBrowser.preferred,
         profilePath: path.join(userData, "external-web-chat", providerId),
+        backgroundMode: this.backgroundMode,
       });
       this.externalTransports.set(providerId, transport);
     }
@@ -822,7 +1009,15 @@ class WebChatManager {
     );
     if (preferExisting && !baseAlreadyOwned && specificConversationUrl(provider, one.url)) {
       one.threads[key] = {url: one.url, title: one.title};
-      this.save();
+      try {
+        this.save(null, true);
+      } catch (error) {
+        delete one.threads[key];
+        // save() published the failed candidate so the persistence problem is
+        // visible. Publish the restored runtime state as the authoritative one.
+        this.changed(null);
+        throw error;
+      }
       return {key, ...one.threads[key]};
     }
     return {key, url: provider.newChat, title: provider.label};
@@ -833,7 +1028,7 @@ class WebChatManager {
     if (!one || !contents || contents.isDestroyed?.()) return false;
     const provider = PROVIDERS[one.provider];
     const url = String(contents.getURL?.() || "");
-    if (!allowedProviderUrl(provider, url)) return false;
+    if (!conversationPageUrl(provider, url)) return false;
     const title = String(contents.getTitle?.() || "").trim().slice(0, 120);
     const key = cleanConversationKey(conversationKey);
     if (key) {
@@ -843,15 +1038,40 @@ class WebChatManager {
       if (!specificConversationUrl(provider, url)) return false;
       one.threads ||= {};
       const before = one.threads[key];
-      if (before?.url === url && (!title || before.title === title)) return false;
+      // Once a Nexus conversation owns a provider conversation, background
+      // navigation must not silently reassign it to another chat. Rebinding is
+      // an explicit Use-this-chat action handled by useCurrent().
+      if (before && !sameSpecificConversation(provider, before.url, url)) return false;
+      if (before && sameProviderLocation(before.url, url)
+          && (!title || before.title === title)) return false;
       one.threads[key] = {url, title: title || before?.title || provider.label};
-      this.save();
+      try {
+        this.save(null, true);
+      } catch (error) {
+        if (before) one.threads[key] = before;
+        else delete one.threads[key];
+        this.changed(null);
+        throw error;
+      }
       return true;
     }
-    if (url === one.url && (!title || title === one.title)) return false;
+    const boundIsSpecific = specificConversationUrl(provider, one.url);
+    if (boundIsSpecific && !sameSpecificConversation(provider, one.url, url)) return false;
+    // Generic compose/home pages carry no durable conversation identity. They
+    // may be replaced by the first real provider URL, but cannot replace one.
+    if (!boundIsSpecific && !specificConversationUrl(provider, url)) return false;
+    if (sameProviderLocation(url, one.url) && (!title || title === one.title)) return false;
+    const before = {url: one.url, title: one.title};
     one.url = url;
     if (title) one.title = title;
-    this.save();
+    try {
+      this.save(null, true);
+    } catch (error) {
+      one.url = before.url;
+      one.title = before.title;
+      this.changed(null);
+      throw error;
+    }
     return true;
   }
 
@@ -864,7 +1084,9 @@ class WebChatManager {
     if (typeof contents.on !== "function") return;
     const remember = () => {
       if (this.trackedContents.get(contents) === tracked) {
-        this.rememberConnectionPage(id, contents, key);
+        // Persistence health is already published by save(). Event callbacks
+        // must not turn a disk failure into an uncaught Electron exception.
+        try { this.rememberConnectionPage(id, contents, key); } catch (_error) {}
       }
     };
     for (const event of ["did-navigate", "did-navigate-in-page", "page-title-updated"]) {
@@ -901,14 +1123,15 @@ class WebChatManager {
     }
   }
 
-  makeRemoteView(providerId, initialUrl = "") {
+  makeRemoteView(providerId, initialUrl = "", foreground = false) {
     const {WebContentsView} = this.electron;
     const provider = PROVIDERS[providerId];
     const external = this.externalTransportFor(providerId);
     if (external) {
       return {
         external: true,
-        webContents: external.createContents(initialUrl || provider.home),
+        webContents: external.createContents(
+          initialUrl || provider.home, {foreground: Boolean(foreground)}),
         setBounds: () => {},
       };
     }
@@ -972,11 +1195,60 @@ class WebChatManager {
     if (!host.isDestroyed()) host.close();
   }
 
-  async waitForLoad(contents) {
+  discardView(id, conversationKey = "", expected = null) {
+    const channel = channelKey(id, conversationKey);
+    const view = this.views.get(channel);
+    if (!view || (expected && view !== expected)) return false;
+    if (this.activeEmbedded === channel) this.hideEmbedded();
+    this.releaseBackgroundHost(view);
+    if (!view.external && this.owner && !this.owner.isDestroyed()) {
+      try { this.owner.contentView.removeChildView(view); } catch (_error) {}
+    }
+    if (!view.webContents.isDestroyed?.()) view.webContents.close?.();
+    this.views.delete(channel);
+    return true;
+  }
+
+  async preSubmitOperation(operation, active, deadlineAt, timeoutMessage) {
+    if (active?.cancelled) throw controlError("Stopped by you.", "NEXUS_WEB_CHAT_CANCELLED");
+    const remaining = Math.max(0, Number(deadlineAt) - Date.now());
+    if (!remaining) throw controlError(
+      timeoutMessage, "NEXUS_WEB_CHAT_PRE_SUBMIT_TIMEOUT");
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        active?.cancelWaiters?.delete(cancelled);
+      };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+      const cancelled = () => finish(
+        reject, controlError("Stopped by you.", "NEXUS_WEB_CHAT_CANCELLED"));
+      const timer = setTimeout(() => finish(
+        reject, controlError(timeoutMessage, "NEXUS_WEB_CHAT_PRE_SUBMIT_TIMEOUT")), remaining);
+      active?.cancelWaiters?.add(cancelled);
+      Promise.resolve(operation).then(
+        (value) => finish(resolve, value),
+        (error) => finish(reject, error),
+      );
+    });
+  }
+
+  async waitForLoad(contents, options = {}) {
     if (!contents.isLoading()) return;
+    const active = options.active || null;
+    const deadlineAt = Number(options.deadlineAt)
+      || (Date.now() + this.preSubmitDeadlineMs);
+    if (active?.cancelled) throw controlError("Stopped by you.", "NEXUS_WEB_CHAT_CANCELLED");
     await new Promise((resolve, reject) => {
       let settled = false;
       const cleanup = () => {
+        clearTimeout(timer);
+        active?.cancelWaiters?.delete(cancelled);
         contents.removeListener("did-finish-load", finished);
         contents.removeListener("did-fail-load", failed);
       };
@@ -992,6 +1264,22 @@ class WebChatManager {
         cleanup();
         reject(new Error(`${description} (${code})`));
       };
+      const cancelled = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(controlError("Stopped by you.", "NEXUS_WEB_CHAT_CANCELLED"));
+      };
+      const timeout = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(controlError(
+          "The provider page did not finish loading before Nexus's pre-submit safety limit. Nexus did not send the message.",
+          "NEXUS_WEB_CHAT_PRE_SUBMIT_TIMEOUT"));
+      };
+      const timer = setTimeout(timeout, Math.max(0, deadlineAt - Date.now()));
+      active?.cancelWaiters?.add(cancelled);
       contents.on("did-finish-load", finished);
       contents.on("did-fail-load", failed);
       // Loading can finish between the first isLoading() check and attaching
@@ -1000,14 +1288,26 @@ class WebChatManager {
     });
   }
 
-  async waitForProviderReady(contents, provider) {
-    const deadline = Date.now() + this.providerReadyDeadlineMs;
+  async waitForProviderReady(contents, provider, options = {}) {
+    const active = options.active || null;
+    const deadline = Math.min(
+      Number(options.deadlineAt) || Number.POSITIVE_INFINITY,
+      Date.now() + this.providerReadyDeadlineMs,
+    );
     let readiness = null;
     do {
-      readiness = await contents.executeJavaScript(providerReadinessScript(provider), true);
+      readiness = await this.preSubmitOperation(
+        contents.executeJavaScript(providerReadinessScript(provider), true),
+        active, deadline,
+        `${provider.label} did not become ready before Nexus's pre-submit safety limit. Nexus did not send the message.`,
+      );
       if (readiness?.ready) return readiness;
       if (Date.now() >= deadline) break;
-      await new Promise((resolve) => setTimeout(resolve, this.providerReadyPollMs));
+      await this.preSubmitOperation(
+        new Promise((resolve) => setTimeout(resolve, this.providerReadyPollMs)),
+        active, deadline,
+        `${provider.label} did not become ready before Nexus's pre-submit safety limit. Nexus did not send the message.`,
+      );
     } while (true);
     throw new Error(
       readiness?.reason || `${provider.label} is not showing a usable chat yet.`);
@@ -1016,6 +1316,15 @@ class WebChatManager {
   openSetup(providerId, connectionId = "", conversationKey = "", preferExisting = false) {
     const provider = PROVIDERS[providerId];
     if (!provider) throw new Error("That web-chat provider is not supported");
+    connectionId = String(connectionId || "").toLowerCase();
+    if (connectionId && !/^[a-z0-9][a-z0-9-]{5,63}$/.test(connectionId)) {
+      throw new Error("That web-chat connection ID is not valid");
+    }
+    const key = cleanConversationKey(conversationKey);
+    const connection = this.connections.get(connectionId);
+    if (connection && connection.provider !== provider.id) {
+      throw new Error("That web-chat connection belongs to a different provider");
+    }
     const {BrowserWindow} = this.electron;
     const external = Boolean(provider.externalBrowser);
     const shell = new BrowserWindow({
@@ -1025,12 +1334,13 @@ class WebChatManager {
       backgroundColor: "#071922",
       webPreferences: {preload: this.shellPreload, contextIsolation: true, nodeIntegration: false, sandbox: true},
     });
-    const key = cleanConversationKey(conversationKey);
-    const connection = this.connections.get(connectionId);
     const thread = connection
       ? this.threadFor(connection, key, preferExisting)
       : {url: provider.home};
-    const view = this.makeRemoteView(providerId, thread.url);
+    // Setup and explicitly opened provider windows remain visible even when
+    // relayed turns run in background mode: the user must be able to sign in,
+    // pick a chat, or inspect the provider on demand.
+    const view = this.makeRemoteView(providerId, thread.url, true);
     if (!view.external) shell.contentView.addChildView(view);
     const resize = () => {
       const [width, height] = shell.getContentSize();
@@ -1058,17 +1368,51 @@ class WebChatManager {
     return shell ? this.shells.get(shell.id) : null;
   }
 
-  startNew(contents) {
+  async startNew(contents) {
     const held = this.shellFor(contents);
     if (!held) return false;
-    if (held.connectionId && held.conversationKey) {
-      const one = this.connections.get(held.connectionId);
-      if (one?.threads?.[held.conversationKey]) {
-        delete one.threads[held.conversationKey];
-        this.save();
-      }
+    const provider = PROVIDERS[held.providerId];
+    const remote = held.view.webContents;
+    // Navigation happens first. A failed provider load therefore cannot erase
+    // the last durable route that the user can still reopen and recover.
+    const navigationDeadlineAt = Date.now() + this.preSubmitDeadlineMs;
+    await this.preSubmitOperation(
+      remote.loadURL(provider.newChat), null, navigationDeadlineAt,
+      `${provider.label} did not open a new chat before Nexus's safety limit. The previous binding was kept.`,
+    );
+    await this.waitForLoad(remote, {deadlineAt: navigationDeadlineAt});
+    if (!genericConversationUrl(provider, remote.getURL?.() || "")) {
+      throw new Error(
+        `${provider.label} did not open a new-chat page. The previous Nexus chat binding was kept.`);
     }
-    held.view.webContents.loadURL(PROVIDERS[held.providerId].newChat);
+    if (!held.connectionId) return true;
+    const one = this.connections.get(held.connectionId);
+    if (!one) return true;
+    const key = cleanConversationKey(held.conversationKey);
+    const previous = key ? one.threads?.[key] : {url: one.url, title: one.title};
+    if (!previous) return true;
+    if (key) delete one.threads[key];
+    else {
+      one.url = provider.newChat;
+      one.title = provider.label;
+    }
+    try {
+      this.save(null, true);
+    } catch (error) {
+      if (key) one.threads[key] = previous;
+      else {
+        one.url = previous.url;
+        one.title = previous.title;
+      }
+      this.changed(null);
+      // Put the visible provider window back on the route that remains durable.
+      // This is best effort; the original persistence error remains primary.
+      try {
+        await remote.loadURL(previous.url);
+        await this.waitForLoad(remote);
+      } catch (_recoveryError) {}
+      throw error;
+    }
     return true;
   }
 
@@ -1081,14 +1425,24 @@ class WebChatManager {
     }
     await this.waitForLoad(held.view.webContents);
     const url = held.view.webContents.getURL();
-    if (!allowedProviderUrl(provider, url)) throw new Error("Open a chat on the provider site before adding it to Nexus");
+    if (!allowedProviderUrl(provider, url)) throw new Error(
+      "Open a chat on the provider site before adding it to Nexus");
     const readiness = await held.view.webContents.executeJavaScript(
       providerReadinessScript(provider), true);
     if (!readiness?.ready) throw new Error(
       readiness?.reason || `Finish setting up ${provider.label}, then open a chat.`);
+    if (!conversationPageUrl(provider, url)) throw new Error(
+      "Open a new or existing conversation on the provider site before adding it to Nexus");
     const title = (await held.view.webContents.getTitle()) || provider.label;
     const id = held.connectionId || `${provider.id}-${crypto.randomBytes(6).toString("hex")}`;
     const existing = this.connections.get(id);
+    const previousConnection = existing ? {
+      ...existing,
+      threads: Object.fromEntries(Object.entries(existing.threads || {}).map(
+        ([key, thread]) => [key, {...thread}],
+      )),
+    } : null;
+    const previousHeldConnectionId = held.connectionId;
     const selected = existing || {
       id, provider: provider.id, title: title.slice(0, 120), url, threads: {},
     };
@@ -1107,7 +1461,18 @@ class WebChatManager {
     // A deliberate press of "Use this chat in Nexus" is stronger than an
     // ordinary connection-list refresh.  Tell the board which chat was chosen
     // so it can create (or select) the matching agent box immediately.
-    this.save(selected);
+    try {
+      this.save(selected, true);
+    } catch (error) {
+      if (previousConnection) this.connections.set(id, previousConnection);
+      else this.connections.delete(id);
+      held.connectionId = previousHeldConnectionId;
+      // save() already disclosed the persistence failure. Publish the rolled-
+      // back list too, so a renderer cannot heartbeat or manually assign the
+      // connection during the remainder of this process.
+      this.changed(null);
+      throw error;
+    }
     return publicConnection(selected);
   }
 
@@ -1186,6 +1551,17 @@ class WebChatManager {
   remove(id) {
     id = String(id);
     if (!this.connections.has(id)) return false;
+    const removed = this.connections.get(id);
+    this.connections.delete(id);
+    try {
+      this.save(null, true);
+    } catch (error) {
+      this.connections.set(id, removed);
+      this.changed(null);
+      throw error;
+    }
+    // Destroy provider state only after the deletion is durable. If settings
+    // are unwritable the restored connection and its recovery view stay usable.
     if (this.activeEmbedded === id || this.activeEmbedded.startsWith(`${id}\n`)) {
       this.hideEmbedded();
     }
@@ -1200,8 +1576,6 @@ class WebChatManager {
       }
       this.views.delete(channel);
     }
-    this.connections.delete(id);
-    this.save();
     return true;
   }
 
@@ -1223,10 +1597,61 @@ class WebChatManager {
     const one = this.connections.get(id);
     const changed = Boolean(one.threads?.[key]);
     if (changed) {
+      const oldThread = one.threads[key];
       delete one.threads[key];
-      this.save();
+      try {
+        this.save(null, true);
+      } catch (error) {
+        one.threads[key] = oldThread;
+        throw error;
+      }
     }
     return true;
+  }
+
+  preflightConnectionPage(id, contents, conversationKey = "") {
+    const one = this.connections.get(String(id));
+    if (!one) throw new WebChatTurnError("That web chat is no longer connected", {
+      deliveryState: "not_accepted", failureCode: "connection_missing",
+      diagnostics: {failure_stage: "before_submission"},
+    });
+    const provider = PROVIDERS[one.provider];
+    const key = cleanConversationKey(conversationKey);
+    const bound = key ? one.threads?.[key] : {url: one.url, title: one.title};
+    // Electron and external-browser contents always expose getURL(). A bound
+    // fallback keeps intentionally tiny unit doubles useful without weakening
+    // the production check when a real getURL() returns an empty value.
+    const currentUrl = String(typeof contents?.getURL === "function"
+      ? contents.getURL() : (bound?.url || provider.newChat));
+    if (!conversationPageUrl(provider, currentUrl)) {
+      throw new WebChatTurnError(
+        `${provider.label} is not on a new or existing conversation. Open the intended chat, then try again. Nexus did not send the message.`, {
+          deliveryState: "not_accepted", failureCode: "invalid_conversation_page",
+          diagnostics: {failure_stage: "before_submission"},
+        });
+    }
+    if (bound && specificConversationUrl(provider, bound.url)) {
+      if (!sameSpecificConversation(provider, bound.url, currentUrl)) {
+        throw new WebChatTurnError(
+          `${provider.label} is showing a different conversation from the one bound to this Nexus chat. Open the bound chat or explicitly use the current chat to rebind it. Nexus did not send the message.`, {
+            deliveryState: "not_accepted", failureCode: "conversation_binding_drift",
+            diagnostics: {failure_stage: "before_submission"},
+          });
+      }
+      return currentUrl;
+    }
+    if (specificConversationUrl(provider, currentUrl)) {
+      try {
+        this.rememberConnectionPage(id, contents, key);
+      } catch (error) {
+        throw new WebChatTurnError(
+          `Nexus could not durably save this ${provider.label} conversation before sending: ${error?.message || error}. Nexus did not send the message.`, {
+            deliveryState: "not_accepted", failureCode: "conversation_binding_not_saved",
+            diagnostics: {failure_stage: "before_submission"},
+          });
+      }
+    }
+    return currentUrl;
   }
 
   ask(
@@ -1251,6 +1676,11 @@ class WebChatManager {
     const active = this.activeAsks.get(channel);
     if (!active) return false;
     active.cancelled = true;
+    for (const wake of [...(active.cancelWaiters || [])]) wake();
+    if (active.phase === "pre_submission") {
+      this.discardView(id, conversationKey, this.views.get(channel));
+      return true;
+    }
     try {
       const one = this.connections.get(id);
       const view = this.views.get(channel);
@@ -1474,27 +1904,60 @@ class WebChatManager {
     id, prompt, attachments = [], conversationKey = "", preferExisting = false
   ) {
     const one = this.connections.get(id);
-    if (!one) throw new Error("That web chat is no longer connected");
+    if (!one) throw new WebChatTurnError("That web chat is no longer connected", {
+      deliveryState: "not_accepted", failureCode: "connection_missing",
+      diagnostics: {failure_stage: "before_submission"},
+    });
     const key = cleanConversationKey(conversationKey);
     const channel = channelKey(id, key);
-    const active = {cancelled: false};
+    const active = {cancelled: false, cancelWaiters: new Set(), phase: "pre_submission"};
     this.activeAsks.set(channel, active);
     const stopped = () => {
       if (active.cancelled) throw new Error("Stopped by you.");
     };
     try {
-      const view = this.viewFor(id, key, preferExisting);
-      const provider = PROVIDERS[one.provider];
-      await this.waitForLoad(view.webContents);
-      if (provider.externalBrowser) {
-        await this.waitForProviderReady(view.webContents, provider);
+      let view;
+      let provider;
+      let priorUrl;
+      const preSubmitDeadlineAt = Date.now() + this.preSubmitDeadlineMs;
+      try {
+        view = this.viewFor(id, key, preferExisting);
+        provider = PROVIDERS[one.provider];
+        await this.waitForLoad(view.webContents, {
+          active, deadlineAt: preSubmitDeadlineAt,
+        });
+        if (this.backgroundMode && provider.externalBrowser
+            && typeof view.webContents.keepInBackground === "function") {
+          await this.preSubmitOperation(
+            view.webContents.keepInBackground(), active, preSubmitDeadlineAt,
+            `${provider.label} did not become ready before Nexus's pre-submit safety limit. Nexus did not send the message.`,
+          );
+        }
+        if (provider.externalBrowser) {
+          await this.waitForProviderReady(view.webContents, provider, {
+            active, deadlineAt: preSubmitDeadlineAt,
+          });
+        }
+        stopped();
+        priorUrl = this.preflightConnectionPage(id, view.webContents, key);
+        await this.preSubmitOperation(
+          this.attachFiles(view.webContents, provider, attachments),
+          active, preSubmitDeadlineAt,
+          `${provider.label} did not finish preparing the message before Nexus's pre-submit safety limit. Nexus did not send the message.`,
+        );
+        stopped();
+      } catch (error) {
+        this.discardView(id, key, view);
+        if (error instanceof WebChatTurnError) throw error;
+        const failureCode = error?.code === "NEXUS_WEB_CHAT_PRE_SUBMIT_TIMEOUT"
+          ? "pre_submission_timeout"
+          : error?.code === "NEXUS_WEB_CHAT_CANCELLED"
+            ? "pre_submission_cancelled" : "pre_submission_failure";
+        throw new WebChatTurnError(error?.message || error, {
+          deliveryState: "not_accepted", failureCode,
+          diagnostics: {failure_stage: "before_submission"},
+        });
       }
-      stopped();
-      const priorUrl = String(view.webContents.getURL?.() || (
-        this.threadFor(one, key, preferExisting).url
-      ));
-      await this.attachFiles(view.webContents, provider, attachments);
-      stopped();
       const nextSubmission = () => {
         const marker = `NEXUS TRANSPORT TURN ${crypto.randomUUID()}`;
         return {marker, prompt: `[${marker}]\n\n${prompt}`};
@@ -1541,17 +2004,51 @@ class WebChatManager {
           if (this.owner && !this.owner.isDestroyed?.()) this.owner.webContents?.focus?.();
         }
       };
+      active.phase = "submitting";
       let submission = nextSubmission();
       let began = await submitTurn(submission);
-      if (!began?.ok) throw new Error(began?.error || "The provider web chat could not be sent a message");
+      if (!began?.ok) throw new WebChatTurnError(
+        began?.error || "The provider web chat could not be sent a message", {
+          deliveryState: began?.submissionState === "outcome_unknown" ? "unknown" : "not_accepted",
+          failureCode: began?.failureCode || "submission_rejected",
+          diagnostics: {
+            submission_state: began?.submissionState || "not_accepted",
+            failure_stage: began?.failureStage || "submission",
+          },
+        });
+      active.phase = "submitted";
       const started = Date.now();
       let retriedVisibleError = false;
       let stable = 0;
       let previous = "";
+      let polls = 0;
+      let lastState = {};
+      let submissionState = began?.submissionState || "acknowledged";
+      let markerFound = false;
+      let markerSource = "";
+      let markedReplyFound = false;
+      const staleStopAtSubmission = Boolean(began?.beforeStopping);
+      let stopClearedAfterSubmission = !staleStopAtSubmission;
       while (Date.now() - started < this.answerDeadlineMs) {
         await new Promise((resolve) => setTimeout(resolve, this.answerPollMs));
         stopped();
         const state = await view.webContents.executeJavaScript(answerScript(provider, began), true);
+        polls += 1;
+        lastState = state && typeof state === "object" ? state : {};
+        if (state?.markerFound) {
+          markerFound = true;
+          if (state.markerSource === "user_selector" || !markerSource) {
+            markerSource = String(state.markerSource || "unknown");
+          }
+          // A marker outside the composer identifies the candidate turn, but
+          // some provider layouts also render drafts/previews outside their
+          // primary editor. Promote uncertainty only after answerScript has
+          // causally paired a non-empty reply with that marked user turn.
+          if (state?.changed && state?.answer) {
+            markedReplyFound = true;
+            if (submissionState === "outcome_unknown") submissionState = "acknowledged";
+          }
+        }
         stopped();
         if (state?.error) {
           if (provider.retryVisibleError && !retriedVisibleError) {
@@ -1564,7 +2061,11 @@ class WebChatManager {
               continue;
             }
           }
-          throw new Error(`${provider.label} reported: ${state.error}`);
+          throw new WebChatTurnError(`${provider.label} reported: ${state.error}`, {
+            deliveryState: submissionState === "outcome_unknown" ? "unknown" : "accepted",
+            failureCode: "provider_visible_error",
+            diagnostics: {submission_state: submissionState, polls},
+          });
         }
         if (!state?.changed || !state.answer) { stable = 0; continue; }
         if (state.answer === previous) stable += 1; else stable = 0;
@@ -1573,9 +2074,12 @@ class WebChatManager {
         // stability is not a completion receipt: providers can pause while
         // reasoning, using tools, or waiting on their own backend. Never stop
         // and commit a partial response merely because its DOM stayed still.
+        if (!state.stopping) stopClearedAfterSubmission = true;
         if (state.stopping) continue;
         if (stable >= 2) {
-          this.rememberConnectionPage(id, view.webContents, key);
+          // Delivery already happened. A settings-volume failure must stay
+          // visible, but must not discard a genuine provider answer.
+          try { this.rememberConnectionPage(id, view.webContents, key); } catch (_error) {}
           this.showCreatedConversationInOpenShells(
             id, key, view.webContents, priorUrl);
           return {answer: state.answer, milliseconds: Date.now() - started, model: `${provider.label} web chat`};
@@ -1584,15 +2088,40 @@ class WebChatManager {
       // Do not leave a provider generation running after the local broker has
       // stopped waiting. Any text still accompanied by a Stop control is
       // incomplete and must never be committed as agent speech.
+      // Persist the actual conversation identity and capture bounded state
+      // before Stop mutates the provider DOM, so the timeout is diagnosable.
+      try { this.rememberConnectionPage(id, view.webContents, key); } catch (_error) {}
+      this.showCreatedConversationInOpenShells(id, key, view.webContents, priorUrl);
       try {
         await view.webContents.executeJavaScript(stopScript(provider), true);
       } catch (error) {
         if (active.cancelled) throw error;
       }
-      throw new Error(
-        began?.submissionState === "outcome_unknown"
+      const unknown = submissionState === "outcome_unknown";
+      throw new WebChatTurnError(
+        unknown
           ? `${provider.label} may have accepted this message, but Nexus could not match its marked turn and reply. Nexus did not resend it, to prevent a duplicate. Open the provider chat to reconcile or start this chat again.`
-          : `${provider.label} did not finish a visible reply before the Nexus chat wait ended`);
+          : `${provider.label} accepted the message but Nexus did not observe a finished visible reply before the chat wait ended`, {
+          deliveryState: unknown ? "unknown" : "accepted",
+          failureCode: unknown ? "turn_match_unknown" : "reply_completion_timeout",
+          diagnostics: {
+            submission_state: submissionState,
+            reply_seen: Boolean(lastState?.changed && lastState?.answer),
+            answer_characters: String(lastState?.answer || "").length,
+            stop_visible: Boolean(lastState?.stopping),
+            stale_stop_at_submission: staleStopAtSubmission,
+            stop_cleared_after_submission: stopClearedAfterSubmission,
+            stable_polls: stable,
+            polls,
+            marker_found: markerFound,
+            marker_source: markerSource,
+            marked_reply_found: markedReplyFound,
+            reply_count: Number(lastState?.replyCount || 0),
+            user_count: Number(lastState?.userCount || 0),
+            document_visibility: String(lastState?.visibility || "unknown"),
+            page_url: String(view.webContents.getURL?.() || "").slice(0, 1000),
+          },
+        });
     } finally {
       if (this.activeAsks.get(channel) === active) this.activeAsks.delete(channel);
     }
@@ -1611,7 +2140,8 @@ class WebChatManager {
 }
 
 module.exports = {
-  PROVIDERS, WebChatManager, allowedProviderUrl, providerReadinessScript,
+  PROVIDERS, WebChatManager, WebChatTurnError, allowedProviderUrl,
+  specificConversationUrl, genericConversationUrl, providerReadinessScript,
   composerTextSelectionScript,
   automationScript, submissionBaselineScript, submitControlScript, submissionScript,
   answerScript, retryScript, stopScript,
