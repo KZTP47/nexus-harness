@@ -224,6 +224,17 @@ not signed in to GitHub yet, sign in once or download both assets from the
 Releases page in a signed-in browser. Anonymous one-click downloads require the
 repository—or a separate distribution repository—to be public.
 
+For a browser download of `0.2.0`, open PowerShell in the download folder and
+run:
+
+```powershell
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.0-UNSIGNED.exe').Hash.ToLowerInvariant()
+$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.0-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+$actual -eq $expected
+```
+
+The last command must print `True` before you run the installer.
+
 The current 0.2.0 build is about 234 MiB to download and about 810 MiB unpacked.
 Allow at least 2 GiB free while installing so the download, temporary unpacking,
 and installed app can coexist. It includes a private Python 3.11 runtime and locked
@@ -233,15 +244,17 @@ version from the same Releases page when one is published. When the repository
 pins a real publisher certificate, the same bootstrap automatically requires
 that exact valid Authenticode signer and rejects unsigned assets.
 
-Source developers who intentionally want an uninstalled browser
-window can create a development shortcut with:
+Source developers who intentionally want a shortcut tied to this checkout can
+create one with:
 
 ```bash
 python scripts/put_it_on_your_desktop.py
 ```
 
-That shortcut remains tied to the cloned folder and is labelled as a source
-fallback. See [THE_THING_ON_YOUR_DESKTOP.md](docs/THE_THING_ON_YOUR_DESKTOP.md).
+It chooses the best compatible local target: a desktop app built in this
+checkout, a compatible installed app, or a source browser-window fallback. It
+remains tied to the cloned folder. See
+[THE_THING_ON_YOUR_DESKTOP.md](docs/THE_THING_ON_YOUR_DESKTOP.md).
 
 ---
 
@@ -307,8 +320,10 @@ instead of the release:
 python scripts/put_it_on_your_desktop.py
 ```
 
-That development shortcut opens a local source fallback when no built app is
-present. It is not an installation and it stops working if the checkout moves.
+That development shortcut chooses the checkout's built desktop app first, a
+compatible installed app second, and a source browser-window fallback when no
+desktop app is usable. It is not an installation and it stops working if the
+checkout moves.
 
 ### Uninstall on Windows
 

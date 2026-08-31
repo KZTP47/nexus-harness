@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ctypes
 import http.server
 import json
 import io
+import os
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -164,8 +168,272 @@ class ProviderRoutingTests(unittest.TestCase):
                 with self.assertRaisesRegex(HarnessError, message):
                     provider.complete(self._request())
 
+    def test_local_provider_timeout_releases_fast_descendant_cwd_before_return(self) -> None:
+        # A child created as the first provider instruction inherits both the
+        # command pipes and project cwd.  On Windows, returning before the
+        # complete tree is reaped makes TemporaryDirectory cleanup fail with
+        # WinError 32 even though the directory is otherwise empty.
+        program = (
+            "import subprocess,sys,time; "
+            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
+            "time.sleep(30)"
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = self._local_provider(Path(temporary), program, timeout=1)
+            started = time.monotonic()
+            with self.assertRaisesRegex(HarnessError, "timed out"):
+                provider.complete(self._request())
+            self.assertLess(time.monotonic() - started, 4.0)
+
 
 class MCPTests(unittest.TestCase):
+    @staticmethod
+    def _seed_windows_tracker_root(client: MCPClient, pid: int) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(
+            0x00100000 | 0x1000,  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+            False,
+            pid,
+        )
+        if not handle:
+            raise AssertionError("could not retain fixture root process identity")
+        token = client._windows_process_creation_token(int(handle))
+        if token is None:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+            raise AssertionError("could not read fixture root process identity")
+        with client._windows_tree_lock:
+            client._windows_tree_tokens[pid] = token
+            client._windows_tree_parents[pid] = 0
+            client._windows_tree_handles[pid] = int(handle)
+
+    def test_windows_process_lifetime_ignores_live_process_exit_time_garbage(self) -> None:
+        class FakeFunction:
+            def __init__(self, implementation):
+                self.implementation = implementation
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self.implementation(*args)
+
+        def get_process_times(_handle, created, exited, kernel, user):
+            created._obj.dwLowDateTime = 41
+            created._obj.dwHighDateTime = 0
+            # Microsoft documents ExitTime as undefined until the process is
+            # signaled.  Deliberately make that garbage nonzero.
+            exited._obj.dwLowDateTime = 999
+            exited._obj.dwHighDateTime = 7
+            kernel._obj.dwLowDateTime = 0
+            user._obj.dwLowDateTime = 0
+            return 1
+
+        fake_kernel32 = type("FakeKernel32", (), {})()
+        fake_kernel32.WaitForSingleObject = FakeFunction(
+            lambda _handle, _milliseconds: 0x00000102  # WAIT_TIMEOUT: still live
+        )
+        fake_kernel32.GetProcessTimes = FakeFunction(get_process_times)
+        with patch.object(ctypes, "WinDLL", return_value=fake_kernel32, create=True):
+            self.assertEqual(MCPClient._windows_process_lifetime(123), (41, None))
+
+    def test_close_is_idempotently_bounded_with_uninterruptible_worker(self) -> None:
+        client = MCPClient({"transport": "http", "url": "https://example.test/mcp"})
+        release = threading.Event()
+        worker = threading.Thread(target=release.wait, daemon=True)
+        worker.start()
+        client.stdio_reader_thread = worker
+        try:
+            for _ in range(2):
+                started = time.monotonic()
+                with patch.object(client, "_cancel_windows_synchronous_io"):
+                    client.close()
+                self.assertLess(time.monotonic() - started, 0.8)
+                self.assertIs(client.stdio_reader_thread, worker)
+                self.assertTrue(worker.is_alive())
+        finally:
+            release.set()
+            worker.join(timeout=2)
+            client.close()
+        self.assertIsNone(client.stdio_reader_thread)
+
+    def test_connect_preserves_authoritative_error_when_cleanup_itself_fails(self) -> None:
+        client = MCPClient(
+            {
+                "transport": "http",
+                "url": "https://example.test/mcp",
+                "protocol_mode": "not-a-protocol",
+            }
+        )
+        with patch.object(client, "close", side_effect=RuntimeError("cleanup failed")):
+            with self.assertRaisesRegex(HarnessError, "protocol_mode must be"):
+                client.connect()
+
+    def test_posix_cleanup_never_signals_group_for_pre_reaped_pid(self) -> None:
+        class ReapedProcess:
+            pid = 424242
+            returncode = 0
+
+            @staticmethod
+            def poll():
+                return 0
+
+            @staticmethod
+            def kill():
+                raise AssertionError("a pre-reaped process must not be killed by PID")
+
+            @staticmethod
+            def wait(timeout=None):
+                return 0
+
+        client = MCPClient({"transport": "http", "url": "https://example.test/mcp"})
+        with (
+            patch("our_harness.mcp.os.name", "posix"),
+            patch("our_harness.mcp.os.killpg", create=True) as killpg,
+        ):
+            self.assertTrue(client._terminate_process_tree(ReapedProcess()))
+        killpg.assert_not_called()
+
+    def test_windows_repeated_close_never_taskkills_pre_reaped_root(self) -> None:
+        class ReapedProcess:
+            pid = 424242
+            returncode = 0
+            stdin = None
+            stdout = None
+            stderr = None
+
+            @staticmethod
+            def poll():
+                return 0
+
+            @staticmethod
+            def kill():
+                raise AssertionError("a pre-reaped process must not be killed by PID")
+
+            @staticmethod
+            def wait(timeout=None):
+                return 0
+
+        class StuckWorker:
+            @staticmethod
+            def is_alive():
+                return True
+
+            @staticmethod
+            def join(timeout=None):
+                return None
+
+        client = MCPClient({"transport": "http", "url": "https://example.test/mcp"})
+        client.process = ReapedProcess()
+        client.stdio_reader_thread = StuckWorker()
+        # This is the state of a later close after the first close consumed the
+        # job handle but retained process while a worker was still winding down.
+        client._windows_job = None
+        with (
+            patch("our_harness.mcp.os.name", "nt"),
+            patch.object(client, "_terminate_remembered_windows_processes", return_value=True),
+            patch.object(client, "_cancel_windows_synchronous_io"),
+            patch("our_harness.mcp.subprocess.run") as taskkill,
+        ):
+            client.close()
+        taskkill.assert_not_called()
+        self.assertIsNotNone(client.process)
+
+    def test_windows_no_job_fallback_still_taskkills_live_root(self) -> None:
+        class LiveProcess:
+            pid = 434343
+            returncode = None
+
+            def __init__(self):
+                self.poll_count = 0
+
+            def poll(self):
+                self.poll_count += 1
+                if self.poll_count == 1:
+                    return None
+                self.returncode = 1
+                return self.returncode
+
+            @staticmethod
+            def kill():
+                raise AssertionError("taskkill should stop the live fixture root")
+
+            @staticmethod
+            def wait(timeout=None):
+                return 1
+
+        process = LiveProcess()
+        client = MCPClient({"transport": "http", "url": "https://example.test/mcp"})
+        with (
+            patch("our_harness.mcp.os.name", "nt"),
+            patch.object(client, "_terminate_remembered_windows_processes", return_value=True),
+            patch("our_harness.mcp.subprocess.run") as taskkill,
+        ):
+            self.assertTrue(client._terminate_process_tree(process))
+        taskkill.assert_called_once()
+        self.assertEqual(
+            taskkill.call_args.args[0],
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+        )
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX escaped-process-group boundary")
+    def test_stdio_setsid_descendant_cannot_make_timeout_or_repeated_close_hang(self) -> None:
+        child_pid: int | None = None
+        client: MCPClient | None = None
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "escaped-child-pid.txt"
+            server_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],"
+                f"stdout=sys.stdout,stderr=sys.stderr,cwd={temporary!r},start_new_session=True)\n"
+                f"pathlib.Path({str(marker)!r}).write_text(str(child.pid))\n"
+                "sys.stdin.readline()\n"
+                "time.sleep(30)\n"
+            )
+            client = MCPClient(
+                {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", server_code]},
+                timeout=0.2,
+            )
+            try:
+                client._start_stdio()
+                marker_deadline = time.monotonic() + 3.0
+                while not marker.exists() and time.monotonic() < marker_deadline:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists(), "escaped fixture child did not start")
+                child_pid = int(marker.read_text())
+
+                started = time.monotonic()
+                with self.assertRaisesRegex(HarnessError, "timed out"):
+                    client.request("fixture/never-answers", {})
+                self.assertLess(time.monotonic() - started, 0.9)
+
+                reader = client.stdio_reader_thread
+                self.assertIsNotNone(reader)
+                self.assertTrue(reader.is_alive())
+                self.assertIsNotNone(client.process)
+
+                # A normal caller commonly closes again from an exception
+                # handler or __exit__.  It must remain bounded and must retain,
+                # rather than falsely clear, the still-blocked worker.
+                started = time.monotonic()
+                client.close()
+                self.assertLess(time.monotonic() - started, 0.8)
+                self.assertIs(client.stdio_reader_thread, reader)
+                self.assertTrue(reader.is_alive())
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.killpg(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if client is not None:
+                    for worker in (client.stdio_reader_thread, client.stderr_thread):
+                        if worker is not None:
+                            worker.join(timeout=2)
+                    client.close()
+        self.assertIsNone(client.stdio_reader_thread)
+        self.assertIsNone(client.stderr_thread)
+
     def test_modern_http_is_stateless_and_self_describing(self) -> None:
         discover = _ChunkResponse(
             [json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
@@ -516,22 +784,261 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(client.cache_hints["tools/list"], {"ttlMs": 500, "cacheScope": "public"})
 
     def test_stdio_descendant_retaining_pipes_does_not_extend_deadline(self) -> None:
-        server_code = (
-            "import subprocess,sys\n"
-            "subprocess.Popen([sys.executable,'-c','import time; time.sleep(2)'],stdout=sys.stdout,stderr=sys.stderr)\n"
-            "sys.stdin.readline()\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "descendant-started.txt"
+            server_code = (
+                "import subprocess,sys\n"
+                f"subprocess.Popen([sys.executable,'-c','import time;time.sleep(10)'],"
+                f"stdout=sys.stdout,stderr=sys.stderr,cwd={temporary!r})\n"
+                f"open({str(marker)!r},'w').close()\n"
+                "sys.stdin.readline()\n"
+            )
+            client = MCPClient(
+                {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", server_code]},
+                timeout=0.2,
+            )
+            try:
+                # Process launch and endpoint-security latency are not part of
+                # the request deadline being tested.  Confirm the fast child
+                # exists first; it now owns both the pipe and temporary cwd.
+                client._start_stdio()
+                marker_deadline = time.monotonic() + 3.0
+                while not marker.exists() and time.monotonic() < marker_deadline:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists(), "fixture descendant did not start")
+                process = client.process
+                self.assertIsNotNone(process)
+
+                started = time.monotonic()
+                with self.assertRaisesRegex(HarnessError, "timed out"):
+                    client.request("fixture/never-answers", {})
+                elapsed = time.monotonic() - started
+                self.assertGreaterEqual(elapsed, 0.18)
+                self.assertLess(elapsed, 0.8)
+                self.assertIsNotNone(process.poll())
+                self.assertFalse(any(
+                    thread.name in {"harness-mcp-stdio-reader", "harness-mcp-stdio-writer"}
+                    and thread.is_alive()
+                    for thread in threading.enumerate()
+                ))
+            finally:
+                client.close()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows suspended-job boundary")
+    def test_stdio_never_resumes_when_windows_job_assignment_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "server-ran.txt"
+            server_code = f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"
+            client = MCPClient(
+                {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", server_code]},
+                timeout=0.5,
+            )
+            with patch.object(MCPClient, "_create_windows_job", return_value=None):
+                with self.assertRaisesRegex(HarnessError, "isolated Windows process job"):
+                    client._start_stdio()
+            self.assertFalse(marker.exists())
+            self.assertIsNone(client.process)
+            self.assertFalse(any(
+                thread.name in {"harness-mcp-stdio-reader", "harness-mcp-stdio-writer"}
+                and thread.is_alive()
+                for thread in threading.enumerate()
+            ))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows suspended-job boundary")
+    def test_stdio_resume_failure_kills_suspended_server_without_masking_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "server-ran.txt"
+            server_code = f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"
+            client = MCPClient(
+                {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", server_code]},
+                timeout=0.5,
+            )
+            with patch.object(MCPClient, "_resume_windows_process", return_value=False):
+                with self.assertRaisesRegex(
+                    HarnessError, "could not be resumed after process isolation"
+                ):
+                    client._start_stdio()
+            self.assertFalse(marker.exists())
+            self.assertIsNone(client.process)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows process identity boundary")
+    def test_stdio_tracker_rejects_pid_created_after_toolhelp_cutoff(self) -> None:
+        candidate = subprocess.Popen(
+            [getattr(sys, "_base_executable", sys.executable), "-c", "import time;time.sleep(10)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        client = MCPClient(
-            {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", server_code]},
-            timeout=0.2,
-        )
-        started = time.monotonic()
-        with self.assertRaisesRegex(HarnessError, "timed out"):
-            client.connect()
-        elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 0.18)
-        self.assertLess(elapsed, 0.8)
-        self.assertFalse(any(thread.name == "harness-mcp-stdio-reader" and thread.is_alive() for thread in threading.enumerate()))
+        client = MCPClient({"transport": "http", "url": "https://example.test/mcp"})
+        root_pid = os.getpid()
+        self._seed_windows_tracker_root(client, root_pid)
+        try:
+            # The row says candidate belonged to our tree, but cutoff=0 means
+            # the process occupying that PID was created only after the stale
+            # Toolhelp snapshot began.  It must never be enrolled or killed.
+            with patch.object(
+                client,
+                "_windows_process_snapshot",
+                return_value=({root_pid: 0, candidate.pid: root_pid}, 0),
+            ):
+                client._remember_windows_process_tree()
+            self.assertNotIn(candidate.pid, client._windows_tree_tokens)
+            self.assertIsNone(candidate.poll())
+        finally:
+            client.close()
+            candidate.kill()
+            candidate.wait(timeout=2)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows broker enrollment boundary")
+    def test_stdio_tracker_retains_first_seen_intermediate_that_exits_after_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = root / "broker-ready.txt"
+            trigger = root / "spawn-now.txt"
+            child_marker = root / "child-pid.txt"
+            broker_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"ready=pathlib.Path({str(ready)!r}); trigger=pathlib.Path({str(trigger)!r})\n"
+                "ready.write_text('ready')\n"
+                "while not trigger.exists(): time.sleep(0.005)\n"
+                f"child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(10)'],cwd={temporary!r})\n"
+                f"pathlib.Path({str(child_marker)!r}).write_text(str(child.pid))\n"
+            )
+            broker = subprocess.Popen(
+                [getattr(sys, "_base_executable", sys.executable), "-u", "-c", broker_code],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            client = MCPClient({"transport": "http", "url": "https://example.test/mcp"})
+            root_pid = os.getpid()
+            self._seed_windows_tracker_root(client, root_pid)
+            try:
+                ready_deadline = time.monotonic() + 3.0
+                while not ready.exists() and time.monotonic() < ready_deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "fixture broker did not start")
+
+                original_token = client._windows_process_creation_token
+                fired = False
+
+                def pin_then_exit(handle):
+                    nonlocal fired
+                    token = original_token(handle)
+                    if not fired:
+                        fired = True
+                        # Toolhelp has already named the broker and OpenProcess
+                        # has pinned it.  Exit before enrollment finishes, while
+                        # leaving a new child whose PPID is this dead broker.
+                        trigger.write_text("spawn")
+                        child_deadline = time.monotonic() + 3.0
+                        while not child_marker.exists() and time.monotonic() < child_deadline:
+                            time.sleep(0.005)
+                        self.assertTrue(child_marker.exists(), "fixture child did not start")
+                        broker.wait(timeout=2)
+                    return token
+
+                with patch.object(
+                    client,
+                    "_windows_process_creation_token",
+                    side_effect=pin_then_exit,
+                ):
+                    client._remember_windows_process_tree()
+                self.assertTrue(fired)
+                self.assertIn(broker.pid, client._windows_tree_tokens)
+                child_pid = int(child_marker.read_text())
+                self.assertNotIn(child_pid, client._windows_tree_tokens)
+
+                # A later real scan must continue ancestry through the retained
+                # exited broker and enroll/terminate its live child safely.
+                client._remember_windows_process_tree()
+                self.assertIn(child_pid, client._windows_tree_tokens)
+                self.assertTrue(client._terminate_remembered_windows_processes(
+                    root_pid, time.monotonic() + 1.5,
+                ))
+            finally:
+                client._terminate_remembered_windows_processes(
+                    root_pid, time.monotonic() + 1.5,
+                )
+                client.close()
+                if broker.poll() is None:
+                    broker.kill()
+                    broker.wait(timeout=2)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows broker descendant boundary")
+    def test_stdio_tracker_rescans_after_snapshot_and_follows_exited_intermediate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ready = root / "broker-ready.txt"
+            trigger = root / "spawn-now.txt"
+            child_marker = root / "child-pid.txt"
+            broker_code = (
+                "import pathlib,subprocess,sys,time\n"
+                f"ready=pathlib.Path({str(ready)!r}); trigger=pathlib.Path({str(trigger)!r})\n"
+                "ready.write_text('ready')\n"
+                "while not trigger.exists(): time.sleep(0.005)\n"
+                f"child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(10)'],cwd={temporary!r})\n"
+                f"pathlib.Path({str(child_marker)!r}).write_text(str(child.pid))\n"
+            )
+            broker = subprocess.Popen(
+                [getattr(sys, "_base_executable", sys.executable), "-u", "-c", broker_code],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            client = MCPClient({"transport": "http", "url": "https://example.test/mcp"})
+            root_pid = os.getpid()
+            self._seed_windows_tracker_root(client, root_pid)
+            try:
+                ready_deadline = time.monotonic() + 3.0
+                while not ready.exists() and time.monotonic() < ready_deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "fixture broker did not start")
+                enroll_deadline = time.monotonic() + 3.0
+                while broker.pid not in client._windows_tree_tokens and time.monotonic() < enroll_deadline:
+                    client._remember_windows_process_tree()
+                    time.sleep(0.01)
+                self.assertIn(broker.pid, client._windows_tree_tokens)
+
+                original_snapshot = client._windows_process_snapshot
+                fired = False
+
+                def snapshot_then_spawn():
+                    nonlocal fired
+                    snapshot = original_snapshot()
+                    if not fired:
+                        fired = True
+                        # The cleanup scan has already captured its supposedly
+                        # final rows.  Spawn now, let the remembered broker exit,
+                        # then return that stale snapshot to force a stable rescan.
+                        trigger.write_text("spawn")
+                        child_deadline = time.monotonic() + 3.0
+                        while not child_marker.exists() and time.monotonic() < child_deadline:
+                            time.sleep(0.005)
+                        self.assertTrue(child_marker.exists(), "fixture child did not start")
+                        broker.wait(timeout=2)
+                    return snapshot
+
+                started = time.monotonic()
+                with patch.object(client, "_windows_process_snapshot", side_effect=snapshot_then_spawn):
+                    stopped = client._terminate_remembered_windows_processes(
+                        root_pid, time.monotonic() + 1.5,
+                    )
+                self.assertTrue(stopped)
+                self.assertLess(time.monotonic() - started, 1.5)
+                child_pid = int(child_marker.read_text())
+                self.assertIn(child_pid, client._windows_tree_tokens)
+            finally:
+                # Re-run real stable cleanup if an assertion interrupted the
+                # injected path, then release retained identity handles.
+                client._terminate_remembered_windows_processes(
+                    root_pid, time.monotonic() + 1.5,
+                )
+                client.close()
+                if broker.poll() is None:
+                    broker.kill()
+                    broker.wait(timeout=2)
 
     def test_stdio_large_write_obeys_deadline_and_stops_child_and_writer(self) -> None:
         server_code = (
@@ -544,10 +1051,13 @@ class MCPTests(unittest.TestCase):
         )
         client = MCPClient(
             {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", server_code]},
-            timeout=0.2,
+            timeout=1,
             max_response_bytes=1_000_000,
         )
         client.connect()
+        # Isolate the blocked-write deadline from Windows process creation and
+        # initialization time; only the tool request is meant to have 200 ms.
+        client.timeout = 0.2
         process = client.process
         self.assertIsNotNone(process)
         started = time.monotonic()
@@ -575,10 +1085,13 @@ class MCPTests(unittest.TestCase):
         )
         client = MCPClient(
             {"transport": "stdio", "command": sys.executable, "args": ["-u", "-c", server_code]},
-            timeout=0.5,
+            timeout=2,
             max_response_bytes=1024,
         )
         client.connect()
+        # The bound below applies to the deliberately malformed tools/list
+        # response, independently of process-launch and initialization load.
+        client.timeout = 0.5
         process = client.process
         self.assertIsNotNone(process)
         started = time.monotonic()

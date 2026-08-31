@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from our_harness import config as config_module
 from our_harness.config import (
     DEFAULT_CONFIG,
     PROJECT_RUNTIME_IGNORE_FOOTER,
@@ -17,6 +22,7 @@ from our_harness.config import (
     SHARED_NON_ESCALATING_LIMITS,
     HarnessError,
     ensure_private_runtime_ignores,
+    is_project_local_config_trusted,
     load_config,
     load_isolated_config,
     trust_project_local_config,
@@ -134,6 +140,259 @@ class ConfigTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(HarnessError, "harness trust"):
                     load_config(root)
+
+    def test_concurrent_processes_merge_trust_records_without_disrupting_readers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            user_config = base / "user-config"
+            projects = [base / name for name in ("baseline", "first", "second")]
+            for index, root in enumerate(projects):
+                local = root / ".harness" / "config.local.json"
+                local.parent.mkdir(parents=True)
+                local.write_text(
+                    json.dumps({"provider": {"name": f"provider-{index}"}}),
+                    encoding="utf-8",
+                )
+
+            environment = os.environ.copy()
+            environment.update({
+                "APPDATA": str(user_config),
+                "XDG_CONFIG_HOME": str(user_config),
+            })
+            source_root = Path(__file__).resolve().parents[1] / "src"
+            environment["PYTHONPATH"] = os.pathsep.join(filter(None, (
+                str(source_root), environment.get("PYTHONPATH", ""),
+            )))
+            child = r"""
+import sys
+import time
+from pathlib import Path
+from our_harness import config
+
+root = Path(sys.argv[1])
+started = Path(sys.argv[2])
+at_publish = Path(sys.argv[3])
+release = Path(sys.argv[4])
+lock_blocked = Path(sys.argv[5])
+real_publish = config.put_this_file_in_place
+
+if config.os.name == "nt":
+    import msvcrt
+    real_lock = msvcrt.locking
+    def observed_lock(stream, operation, size):
+        try:
+            return real_lock(stream, operation, size)
+        except OSError:
+            if operation == msvcrt.LK_NBLCK:
+                lock_blocked.write_text("blocked", encoding="utf-8")
+            raise
+    msvcrt.locking = observed_lock
+else:
+    import fcntl
+    real_lock = fcntl.flock
+    def observed_lock(stream, operation):
+        try:
+            return real_lock(stream, operation)
+        except OSError:
+            if operation & fcntl.LOCK_EX:
+                lock_blocked.write_text("blocked", encoding="utf-8")
+            raise
+    fcntl.flock = observed_lock
+
+def pause_publish(path, text):
+    at_publish.write_text("ready", encoding="utf-8")
+    deadline = time.monotonic() + 20
+    while not release.exists():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("parent never released trust-store publication")
+        time.sleep(0.01)
+    return real_publish(path, text)
+
+config.put_this_file_in_place = pause_publish
+started.write_text("started", encoding="utf-8")
+config.trust_project_local_config(
+    root, root / ".harness" / "config.local.json"
+)
+"""
+
+            def wait_for(path: Path, process: subprocess.Popen, label: str) -> None:
+                deadline = time.monotonic() + 15
+                while not path.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        output, error = process.communicate()
+                        self.fail(
+                            f"{label} exited before its barrier: {process.returncode}\n"
+                            f"stdout: {output}\nstderr: {error}"
+                        )
+                    time.sleep(0.01)
+                self.assertTrue(path.exists(), f"timed out waiting for {label}")
+
+            def start_child(root: Path, label: str):
+                started = base / f"{label}.started"
+                at_publish = base / f"{label}.publish"
+                release = base / f"{label}.release"
+                lock_blocked = base / f"{label}.lock-blocked"
+                process = subprocess.Popen(
+                    [
+                        sys.executable, "-c", child, str(root), str(started),
+                        str(at_publish), str(release), str(lock_blocked),
+                    ],
+                    env=environment, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                )
+                return process, started, at_publish, release, lock_blocked
+
+            children: list[subprocess.Popen] = []
+            stop_reading = threading.Event()
+            reader_executed = threading.Event()
+            reader_failures: list[str] = []
+            with patch.dict(os.environ, environment, clear=False):
+                trust_project_local_config(
+                    projects[0], projects[0] / ".harness" / "config.local.json"
+                )
+
+                def keep_reading() -> None:
+                    while not stop_reading.is_set():
+                        try:
+                            if not is_project_local_config_trusted(projects[0]):
+                                reader_failures.append("baseline trust disappeared")
+                                return
+                            reader_executed.set()
+                        except Exception as exc:  # reported with the exact type below
+                            reader_failures.append(f"{type(exc).__name__}: {exc}")
+                            return
+                        stop_reading.wait(0.001)
+
+                reader = threading.Thread(target=keep_reading, daemon=True)
+                reader.start()
+                try:
+                    self.assertTrue(
+                        reader_executed.wait(5), "the concurrent reader never executed"
+                    )
+                    (
+                        first, first_started, first_publish, release_first,
+                        _first_lock_blocked,
+                    ) = start_child(projects[1], "first")
+                    children.append(first)
+                    wait_for(first_started, first, "first writer startup")
+                    wait_for(first_publish, first, "first writer publication")
+
+                    (
+                        second, second_started, second_publish, release_second,
+                        second_lock_blocked,
+                    ) = start_child(projects[2], "second")
+                    children.append(second)
+                    wait_for(second_started, second, "second writer startup")
+                    # The first writer is paused after its read while holding
+                    # the transaction. An unlocked second writer would now
+                    # reach its own publication barrier with the same old JSON.
+                    wait_for(
+                        second_lock_blocked, second,
+                        "second writer's blocked OS-lock attempt",
+                    )
+                    self.assertFalse(
+                        second_publish.exists(),
+                        "the second process crossed the trust-store transaction lock",
+                    )
+
+                    release_first.write_text("go", encoding="utf-8")
+                    first_output, first_error = first.communicate(timeout=15)
+                    self.assertEqual(
+                        first.returncode, 0,
+                        f"first writer failed\nstdout: {first_output}\nstderr: {first_error}",
+                    )
+                    wait_for(second_publish, second, "second writer publication")
+                    release_second.write_text("go", encoding="utf-8")
+                    second_output, second_error = second.communicate(timeout=15)
+                    self.assertEqual(
+                        second.returncode, 0,
+                        f"second writer failed\nstdout: {second_output}\nstderr: {second_error}",
+                    )
+                finally:
+                    for release in (base / "first.release", base / "second.release"):
+                        release.write_text("cleanup", encoding="utf-8")
+                    for process in children:
+                        if process.poll() is None:
+                            process.kill()
+                        process.communicate()
+                    stop_reading.set()
+                    reader.join(timeout=5)
+
+                self.assertFalse(reader.is_alive(), "the concurrent reader did not stop")
+                self.assertEqual(reader_failures, [])
+                for root in projects:
+                    self.assertTrue(
+                        is_project_local_config_trusted(root),
+                        f"the merged trust record lost {root.name}",
+                    )
+                trust_store = user_config / "our-harness" / "trusted-projects.json"
+                stored = json.loads(trust_store.read_text(encoding="utf-8"))
+                self.assertEqual(stored["schema_version"], 1)
+                self.assertEqual(len(stored["projects"]), 3)
+                leftovers = [
+                    path.name for path in trust_store.parent.iterdir()
+                    if path.suffix in {".part", ".tmp"}
+                ]
+                self.assertEqual(leftovers, [], "atomic trust writes left temporary files")
+
+    def test_writer_revalidates_config_after_waiting_for_the_trust_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            baseline = base / "baseline"
+            candidate = base / "candidate"
+            for root, value in ((baseline, "baseline"), (candidate, "reviewed")):
+                local = root / ".harness" / "config.local.json"
+                local.parent.mkdir(parents=True)
+                local.write_text(json.dumps({"value": value}), encoding="utf-8")
+            trust_store = base / "user" / "trusted-projects.json"
+            waiting_for_store = threading.Event()
+            result: dict[str, object] = {}
+            real_transaction = config_module._project_trust_store_transaction
+
+            @contextlib.contextmanager
+            def observed_transaction(path: Path):
+                waiting_for_store.set()
+                with real_transaction(path):
+                    yield
+
+            def trust_candidate() -> None:
+                try:
+                    result["path"] = trust_project_local_config(
+                        candidate, candidate / ".harness" / "config.local.json"
+                    )
+                except BaseException as exc:
+                    result["error"] = exc
+
+            with patch.object(
+                config_module, "project_trust_store_path", return_value=trust_store,
+            ):
+                trust_project_local_config(
+                    baseline, baseline / ".harness" / "config.local.json"
+                )
+                before = trust_store.read_bytes()
+                with real_transaction(trust_store), patch.object(
+                    config_module,
+                    "_project_trust_store_transaction",
+                    observed_transaction,
+                ):
+                    writer = threading.Thread(target=trust_candidate, daemon=True)
+                    writer.start()
+                    self.assertTrue(
+                        waiting_for_store.wait(5),
+                        "the candidate writer did not reach the held transaction",
+                    )
+                    (candidate / ".harness" / "config.local.json").write_text(
+                        json.dumps({"value": "changed while waiting"}),
+                        encoding="utf-8",
+                    )
+                writer.join(10)
+
+                self.assertFalse(writer.is_alive(), "the candidate writer stayed blocked")
+                self.assertNotIn("path", result, result)
+                self.assertIsInstance(result.get("error"), ValueError, result)
+                self.assertIn("changed while waiting", str(result["error"]))
+                self.assertEqual(trust_store.read_bytes(), before)
+                self.assertFalse(is_project_local_config_trusted(candidate))
 
     def test_init_creates_out_of_project_trust_record_for_detected_commands(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

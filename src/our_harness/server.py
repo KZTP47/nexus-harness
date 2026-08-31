@@ -3138,6 +3138,74 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 goal_queue_id = str(body.get("goal_queue_id") or "")
                 goal_item_id = str(body.get("goal_item_id") or "")
                 goal_queue_claimed = False
+                replay_response = None
+                replay_status = HTTPStatus.OK
+                response_to_deliver = None
+                response_delivery_status = HTTPStatus.OK
+
+                def release_chat_ownership() -> None:
+                    """End the durable turn before any terminal response I/O.
+
+                    A client can finish reading a small loopback response before
+                    ``BaseHTTPRequestHandler`` returns from ``_json``. Keeping
+                    the whole-chat lease until the outer ``finally`` therefore
+                    creates a real window where the next user turn is rejected
+                    as though the completed request were still running.
+                    """
+
+                    nonlocal stop_watch_thread, run_scope
+                    nonlocal cancel_token, cancel_scope, chat_scope
+                    stop_watch_done.set()
+                    cleanup_error: BaseException | None = None
+
+                    watcher = stop_watch_thread
+                    stop_watch_thread = None
+                    if watcher is not None:
+                        try:
+                            # ``Thread.start`` itself can fail. Joining that
+                            # never-started object raises RuntimeError and used
+                            # to abort cleanup before the cancellation/context
+                            # and whole-chat lease were released.
+                            if watcher.ident is not None:
+                                watcher.join(0.25)
+                        except BaseException as exc:
+                            cleanup_error = cleanup_error or exc
+
+                    bound_run = run_scope
+                    run_scope = None
+                    if bound_run is not None:
+                        try:
+                            bound_run.__exit__(None, None, None)
+                        except BaseException as exc:
+                            cleanup_error = cleanup_error or exc
+
+                    token = cancel_token
+                    cancel_token = None
+                    if token is not None:
+                        try:
+                            cancellations.finish(chat_key, token)
+                        except BaseException as exc:
+                            cleanup_error = cleanup_error or exc
+
+                    cancellation_scope = cancel_scope
+                    cancel_scope = None
+                    if cancellation_scope is not None:
+                        try:
+                            cancellation_scope.__exit__(None, None, None)
+                        except BaseException as exc:
+                            cleanup_error = cleanup_error or exc
+
+                    owned_chat = chat_scope
+                    chat_scope = None
+                    if owned_chat is not None:
+                        try:
+                            owned_chat.__exit__(None, None, None)
+                        except BaseException as exc:
+                            cleanup_error = cleanup_error or exc
+
+                    if cleanup_error is not None:
+                        raise cleanup_error
+
                 try:
                     # Validate every message before accepting a durable run or
                     # taking a conversation lease. Reusing this checked value
@@ -3340,19 +3408,34 @@ class HarnessHandler(BaseHTTPRequestHandler):
                                         accepted["result"],
                                         run_id=str(accepted.get("run_id") or ""),
                                     )
-                                self._json(accepted["result"])
+                                replay_response = accepted["result"]
                             else:
-                                self._json({
+                                replay_response = {
                                     "run_id": run_id, "request_id": request_id,
                                     "state": accepted["status"], "idempotent": True,
                                     "note": "This exact request is already recorded; Nexus did not dispatch it again.",
-                                }, HTTPStatus.ACCEPTED)
-                            return
-                        run_store.start(run_id)
-                        chat_owned = True
+                                }
+                                replay_status = HTTPStatus.ACCEPTED
+                        else:
+                            run_store.start(run_id)
+                            chat_owned = True
+                    if replay_response is not None:
+                        response_to_deliver = replay_response
+                        response_delivery_status = replay_status
+                        return
                     cancel_token = cancellations.begin(chat_key, run_id)
                     cancel_scope = cancellation.use(cancel_token)
                     cancel_scope.__enter__()
+
+                    # The watcher can be inside a slow cross-process journal
+                    # read after the request has completed and the bounded
+                    # cleanup join has elapsed. Capture its collaborators by
+                    # value: cleanup may retire the handler's registry/context
+                    # references, but the late watcher must still be able to
+                    # cancel its own immutable token safely.
+                    watch_run_store = run_store
+                    watch_run_id = run_id
+                    watch_cancel_token = cancel_token
 
                     def watch_durable_stop() -> None:
                         # Exact Stop may be pressed in another Nexus process.
@@ -3361,8 +3444,8 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         # cancellation without touching any sibling chat.
                         while not stop_watch_done.is_set():
                             try:
-                                if run_store.should_stop(run_id):
-                                    cancel_token.cancel()
+                                if watch_run_store.should_stop(watch_run_id):
+                                    watch_cancel_token.cancel()
                                     return
                             except Exception:
                                 # Losing trustworthy stop state is a reason to
@@ -3373,10 +3456,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                                 # the fail-closed fallback if persistence is
                                 # itself unavailable.
                                 try:
-                                    run_store.request_stop(run_id)
+                                    watch_run_store.request_stop(watch_run_id)
                                 except Exception:
                                     pass
-                                cancel_token.cancel()
+                                watch_cancel_token.cancel()
                                 return
                             stop_watch_done.wait(0.075)
 
@@ -3518,7 +3601,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         self.server.swarm_goal_queue.record_result(
                             goal_queue_id, goal_item_id, response, run_id=run_id
                         )
-                    self._json(response)
+                    response_to_deliver = response
                 except Exception as exc:
                     if isinstance(exc, swarm_work.ResumableSwarmError):
                         response = dict(
@@ -3555,7 +3638,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                                     goal_queue_id, goal_item_id, response,
                                     run_id=run_id,
                                 )
-                            self._json(response)
+                            response_to_deliver = response
                             return
                     stopped = isinstance(exc, cancellation.ChatCancelled) or bool(
                         cancel_token is not None and cancel_token.cancelled
@@ -3632,17 +3715,13 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         ) from exc
                     raise
                 finally:
-                    stop_watch_done.set()
-                    if stop_watch_thread is not None:
-                        stop_watch_thread.join(0.25)
-                    if run_scope is not None:
-                        run_scope.__exit__(None, None, None)
-                    if cancel_token is not None:
-                        cancellations.finish(chat_key, cancel_token)
-                    if cancel_scope is not None:
-                        cancel_scope.__exit__(None, None, None)
-                    if chat_scope is not None:
-                        chat_scope.__exit__(None, None, None)
+                    release_chat_ownership()
+                    if response_to_deliver is not None:
+                        # Socket delivery is deliberately outside the execution
+                        # classifier above. A page closing after a durable
+                        # result/replay must not turn an existing running or
+                        # completed run, activity, or goal into a failure.
+                        self._json(response_to_deliver, response_delivery_status)
             elif self.path == "/api/team/connect":
                 # One press to make an assistant usable. Somebody had Claude
                 # installed and signed in, an agent set to use it, and the board

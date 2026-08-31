@@ -23,6 +23,7 @@ import base64
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2503,7 +2504,7 @@ class MovingAroundTheBoard(unittest.TestCase):
             self.script.index("function makeTheChatCardDraggable")
         ]
         refreshed = self.script[
-            self.script.index("async function refreshTheChatFor(agentId)"):
+            self.script.index("async function refreshTheChatFor(agentId"):
             self.script.index("function countWhatIsTypedTo")
         ]
         answered = self.script[
@@ -2522,6 +2523,17 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("keptTranscriptFor(theBigOne)", big)
         self.assertIn("if (theBigOne === agentId) renderTheBigChat()", refreshed)
 
+    def test_removed_agent_closes_a_stale_big_chat_before_rendering_it(self) -> None:
+        rendered = self.script[
+            self.script.index("function renderTheBigChat()"):
+            self.script.index("function renderWhatItHasGoingOn")
+        ]
+        self.assertLess(
+            rendered.index("if (!agent || !held)"),
+            rendered.index("`${agent.name} — Nexus chat`"),
+        )
+        self.assertIn("minimiseTheBigChat(false)", rendered)
+
     def test_selected_chat_and_visible_transcript_share_one_identity(self) -> None:
         kept = self.script[
             self.script.index("function keptTranscriptFor(agentId)"):
@@ -2539,11 +2551,213 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertIn("before !== held.conversation", applied)
         self.assertIn("held.said = []", applied)
         self.assertIn("held.saidFor = transcriptIdentityFor(agentId)", applied)
+        self.assertIn("return identityChanged", applied)
         self.assertLess(switched.index("held.conversation = chatId"),
                         switched.index('request("/api/swarm/chats/activate"'))
         self.assertIn("swarmConversationSwitching.has(agentId)", switched)
         self.assertNotIn("swarmBusy", switched)
         self.assertNotIn("swarmChatIsBusy", switched)
+
+    def test_chat_notices_survive_renders_without_leaking_to_another_conversation(self) -> None:
+        kept = self.script[
+            self.script.index("function keptChatNoticeFor(agentId)"):
+            self.script.index("function nextConversationListRevision")
+        ]
+        rendered = self.script[
+            self.script.index("function oneSwarmChatCard(held)"):
+            self.script.index("function makeTheChatCardDraggable")
+        ]
+        announced = self.script[
+            self.script.index("function sayInTheChatFor(agentId, words)"):
+            self.script.index("function bigChatShows")
+        ]
+        self.assertIn("held?.noticeFor === transcriptIdentityFor(agentId)", kept)
+        self.assertIn("keptChatNoticeFor(held.agent)", rendered)
+        self.assertIn('held.notice = String(words || "")', announced)
+        self.assertIn("held.noticeFor = transcriptIdentityFor(agentId)", announced)
+        self.assertLess(
+            announced.index("held.noticeFor = transcriptIdentityFor(agentId)"),
+            announced.index('card.querySelector(".swarm-chat-said").textContent'),
+        )
+
+    def test_chat_identity_lifecycle_is_locked_and_inflight_reads_are_cancelled(self) -> None:
+        card = self.script[
+            self.script.index("function oneSwarmChatCard(held)"):
+            self.script.index("function makeTheChatCardDraggable")
+        ]
+        restarted = self.script[
+            self.script.index("async function startTheChatAgainFor(agentId)"):
+            self.script.index("// ---- what they said to each other")
+        ]
+        loaded = self.script[
+            self.script.index("async function loadConversationsFor(agentId"):
+            self.script.index("function finishConversationSwitch")
+        ]
+        refreshed = self.script[
+            self.script.index("async function refreshTheChatFor(agentId"):
+            self.script.index("async function copyChatCode")
+        ]
+        kept = self.script[
+            self.script.index("function keepTheSwarmPick()"):
+            self.script.index("function renderSwarmNotReady")
+        ]
+        closed = self.script[
+            self.script.index("function closeTheChatFor(agentId)"):
+            self.script.index("function setProjectVerificationApproval")
+        ]
+        self.assertLess(
+            card.index("setWhatCanBePressedInAChat(card)"),
+            card.index("return card"),
+        )
+        self.assertIn("Loading this chat's saved identity", restarted)
+        self.assertIn("await loadConversationsFor(agentId)", restarted)
+        self.assertNotIn(
+            "if (swarmChatIsHydrating(agentId) || swarmConversationSwitching.has(agentId)) return",
+            restarted,
+        )
+        self.assertIn(
+            "beginConversationRead(swarmConversationListControllers, agentId)", loaded
+        )
+        self.assertIn(
+            "beginConversationRead(swarmConversationTranscriptControllers, agentId)",
+            refreshed,
+        )
+        self.assertIn("{signal: controller.signal}", loaded)
+        self.assertIn("{signal: controller.signal}", refreshed)
+        self.assertIn("|| identityChanged", loaded)
+        self.assertIn("boardVersion !== swarmConversationBoardVersion", kept)
+        self.assertIn(
+            "cancelConversationReadsFor(held.agent, Boolean(theSwarmAgent(held.agent)))",
+            kept,
+        )
+        self.assertIn("cancelConversationReadsFor(agentId)", closed)
+
+    def test_metadata_and_transcript_read_lanes_preserve_each_others_deferred_intent(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is needed for the renderer concurrency contract")
+        helpers = self.script[
+            self.script.index("function beginConversationRead(controllers, agentId)"):
+            self.script.index("function cancelConversationReadsFor(agentId")
+        ]
+        probe = f"""
+{helpers}
+const deferred = () => {{
+  let resolve;
+  const promise = new Promise(done => {{ resolve = done; }});
+  return {{promise, resolve}};
+}};
+async function transcriptWhileMetadataWaits() {{
+  const metadata = new Map(), transcripts = new Map();
+  const metadataGate = deferred(), transcriptGate = deferred();
+  const metadataController = beginConversationRead(metadata, "agent");
+  const metadataTask = metadataGate.promise.then(() => metadataController.signal.aborted);
+  const transcriptController = beginConversationRead(transcripts, "agent");
+  const transcriptTask = transcriptGate.promise.then(() => transcriptController.signal.aborted);
+  transcriptGate.resolve(); metadataGate.resolve();
+  const [metadataAborted, transcriptAborted] = await Promise.all([metadataTask, transcriptTask]);
+  if (metadataAborted || transcriptAborted) throw new Error("transcript cancelled initial metadata");
+}}
+async function metadataWhileTranscriptWaits() {{
+  const metadata = new Map(), transcripts = new Map();
+  const transcriptGate = deferred(), metadataGate = deferred();
+  const transcriptController = beginConversationRead(transcripts, "agent");
+  const transcriptTask = transcriptGate.promise.then(() => transcriptController.signal.aborted);
+  const metadataController = beginConversationRead(metadata, "agent");
+  const metadataTask = metadataGate.promise.then(() => metadataController.signal.aborted);
+  metadataGate.resolve(); transcriptGate.resolve();
+  const [transcriptAborted, metadataAborted] = await Promise.all([transcriptTask, metadataTask]);
+  if (transcriptAborted || metadataAborted) throw new Error("metadata cancelled durable transcript");
+}}
+async function cancellingLaneAbortsEveryGeneration() {{
+  const metadata = new Map();
+  const older = beginConversationRead(metadata, "agent");
+  const newer = beginConversationRead(metadata, "agent");
+  if (older.signal.aborted || newer.signal.aborted) {{
+    throw new Error("routine same-lane supersession aborted a valid request");
+  }}
+  cancelConversationReadLane(metadata, "agent");
+  if (!older.signal.aborted || !newer.signal.aborted || metadata.has("agent")) {{
+    throw new Error("board/close cancellation did not abort every generation");
+  }}
+}}
+Promise.all([
+  transcriptWhileMetadataWaits(), metadataWhileTranscriptWaits(),
+  cancellingLaneAbortsEveryGeneration(),
+])
+  .then(() => process.stdout.write("independent"))
+  .catch(error => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            [node, "-e", probe], capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "independent")
+
+    def test_board_revision_preserves_an_inflight_transcript_intent_until_metadata_retries_it(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is needed for the renderer concurrency contract")
+        helpers = self.script[
+            self.script.index("function beginConversationRead(controllers, agentId)"):
+            self.script.index("function conversationReadWasCancelled(error)")
+        ]
+        probe = f"""
+const swarmConversationListControllers = new Map();
+const swarmConversationTranscriptControllers = new Map();
+const swarmConversationTranscriptRefreshes = new Set();
+let listRevision = 0, chatRevision = 0;
+function nextConversationListRevision() {{ listRevision += 1; }}
+function nextSwarmChatRevision() {{ chatRevision += 1; }}
+{helpers}
+const deferred = () => {{
+  let resolve;
+  const promise = new Promise(done => {{ resolve = done; }});
+  return {{promise, resolve}};
+}};
+async function boardRevisionWhileTranscriptWaits() {{
+  const activeChat = "chat-one";
+  const oldTranscriptGate = deferred();
+  const oldTranscript = beginConversationRead(
+    swarmConversationTranscriptControllers, "agent"
+  );
+  const oldTranscriptDone = oldTranscriptGate.promise.then(
+    () => oldTranscript.signal.aborted
+  );
+
+  cancelConversationReadsFor("agent", true);
+  if (!oldTranscript.signal.aborted
+      || !swarmConversationTranscriptRefreshes.has("agent")) {{
+    throw new Error("board revision discarded the in-flight transcript intent");
+  }}
+
+  const metadataGate = deferred();
+  const metadata = beginConversationRead(swarmConversationListControllers, "agent");
+  const metadataDone = metadataGate.promise.then(() => ({{active: activeChat}}));
+  metadataGate.resolve();
+  const said = await metadataDone;
+  finishConversationRead(swarmConversationListControllers, "agent", metadata);
+  if (said.active !== activeChat) throw new Error("the active chat unexpectedly changed");
+
+  const retryRequested = swarmConversationTranscriptRefreshes.delete("agent");
+  if (!retryRequested) throw new Error("metadata did not inherit transcript intent");
+  const retriedTranscript = beginConversationRead(
+    swarmConversationTranscriptControllers, "agent"
+  );
+  oldTranscriptGate.resolve();
+  if (!await oldTranscriptDone || retriedTranscript.signal.aborted) {{
+    throw new Error("the stale transcript won or its replacement was cancelled");
+  }}
+}}
+boardRevisionWhileTranscriptWaits()
+  .then(() => process.stdout.write("retried"))
+  .catch(error => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            [node, "-e", probe], capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "retried")
 
     def test_busy_controls_and_activity_are_scoped_to_the_exact_saved_chat(self) -> None:
         controls = self.script[
@@ -2846,7 +3060,7 @@ class MovingAroundTheBoard(unittest.TestCase):
 
     def test_an_old_chat_read_cannot_erase_a_new_answer(self) -> None:
         refreshed = self.script[
-            self.script.index("async function refreshTheChatFor(agentId)"):
+            self.script.index("async function refreshTheChatFor(agentId"):
             self.script.index("function putTheChatTurnsIn")
         ]
         answered = self.script[
@@ -3408,7 +3622,7 @@ class WhatThePanelIsTold(BoardTestCase):
 
     def assert_panel_requests_finished(self) -> None:
         self.assertTrue(
-            self.panel.wait_for_request_workers(5),
+            self.panel.wait_for_request_workers(self.HTTP_TIMEOUT_SECONDS),
             "the panel test left an HTTP request worker running after shutdown",
         )
 
@@ -4170,6 +4384,373 @@ class WhatThePanelIsTold(BoardTestCase):
             self.assertEqual(activity["stage"], stage)
             self.assertIn(detail, activity["detail"])
 
+    def test_completed_chat_turn_releases_ownership_before_response_io(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        lead_id = saved["board"]["agents"][0]["id"]
+        peer_id = saved["board"]["agents"][1]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        listed_status, listed = self.ask(f"/api/swarm/chats?agent={lead_id}")
+        self.assertEqual(listed_status, 200, listed)
+        conversation = next(
+            one for one in listed["chats"]
+            if one["pair"] == [lead_id, peer_id]
+        )
+
+        response_started = threading.Event()
+        release_response = threading.Event()
+        self.addCleanup(release_response.set)
+        first_result: list[tuple[int, dict]] = []
+        original_json = server.HarnessHandler._json
+
+        def block_first_response(handler, value, response_status=200):
+            if (
+                handler.path == "/api/swarm/say"
+                and isinstance(value, dict)
+                and value.get("request_id") == "request-response-held-1"
+            ):
+                response_started.set()
+                if not release_response.wait(self.HTTP_TIMEOUT_SECONDS):
+                    raise RuntimeError("test did not release the first chat response")
+            return original_json(handler, value, response_status)
+
+        def send_first() -> None:
+            first_result.append(self.ask("/api/swarm/say", {
+                "agent": lead_id, "chat": conversation["id"],
+                "text": "first turn", "mode": "collaborate",
+                "activity": "activity-response-held-1",
+                "request_id": "request-response-held-1",
+            }))
+
+        with mock.patch.object(
+            swarm_work, "collaborate", return_value={"said": []}
+        ), mock.patch.object(
+            server.HarnessHandler, "_json", block_first_response
+        ):
+            first = threading.Thread(target=send_first, daemon=True)
+            first.start()
+            try:
+                self.assertTrue(
+                    response_started.wait(self.HTTP_TIMEOUT_SECONDS),
+                    "the first durable result did not reach response delivery",
+                )
+                second_status, second = self.ask("/api/swarm/say", {
+                    "agent": lead_id, "chat": conversation["id"],
+                    "text": "second turn", "mode": "collaborate",
+                    "activity": "activity-response-held-2",
+                    "request_id": "request-response-held-2",
+                })
+                self.assertEqual(second_status, 200, second)
+            finally:
+                release_response.set()
+                first.join(self.HTTP_TIMEOUT_SECONDS)
+
+        self.assertFalse(first.is_alive(), "the first response did not finish")
+        self.assertEqual(first_result[0][0], 200, first_result)
+
+    def test_idempotent_replays_release_admission_locks_before_response_io(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "The replayed chat", "who": "claude"},
+            {"name": "The unrelated chat", "who": "claude"},
+        ]}})
+        self.assertEqual(status, 200, saved)
+        replay_agent, unrelated_agent = [
+            one["id"] for one in saved["board"]["agents"]
+        ]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        authority = self.panel.project_authority_status()
+        run_store = (
+            self.panel.swarm_runs
+            if authority.get("can_run")
+            else self.panel.swarm_communication_runs
+        )
+        original_accept = run_store.accept
+        original_json = server.HarnessHandler._json
+
+        for replay_kind, replay_state, stored_result, expected_status in (
+            ("terminal", "complete", True, 200),
+            ("in-progress", "running", False, 202),
+        ):
+            with self.subTest(replay=replay_kind):
+                replay_request = f"request-{replay_kind}-replay-123"
+                unrelated_request = f"request-{replay_kind}-unrelated-123"
+                accepted = {
+                    "run_id": f"run-{replay_kind}-replay-123",
+                    "request_id": replay_request,
+                    "status": replay_state,
+                    "result": (
+                        {"request_id": replay_request, "said": [], "replayed": True}
+                        if stored_result else None
+                    ),
+                }
+                response_started = threading.Event()
+                release_response = threading.Event()
+                unrelated_provider_started = threading.Event()
+                replay_observed: dict[str, object] = {}
+                unrelated_observed: dict[str, object] = {}
+
+                def accept_or_replay(request_id, snapshot):
+                    if request_id == replay_request:
+                        return accepted, False
+                    return original_accept(request_id, snapshot)
+
+                def block_replay_response(handler, value, response_status=200):
+                    if (
+                        handler.path == "/api/swarm/say"
+                        and isinstance(value, dict)
+                        and value.get("request_id") == replay_request
+                    ):
+                        response_started.set()
+                        if not release_response.wait(self.HTTP_TIMEOUT_SECONDS):
+                            raise RuntimeError("test did not release the replay response")
+                    return original_json(handler, value, response_status)
+
+                def answer_unrelated(*_args, **_kwargs):
+                    unrelated_provider_started.set()
+                    return {"said": []}
+
+                def send_replay() -> None:
+                    try:
+                        replay_observed["result"] = self.ask("/api/swarm/say", {
+                            "agent": replay_agent,
+                            "text": "return the existing request",
+                            "mode": "chat",
+                            "request_id": replay_request,
+                        })
+                    except BaseException as exc:
+                        replay_observed["error"] = exc
+
+                def send_unrelated() -> None:
+                    try:
+                        unrelated_observed["result"] = self.ask("/api/swarm/say", {
+                            "agent": unrelated_agent,
+                            "text": "admit this independent request",
+                            "mode": "chat",
+                            "request_id": unrelated_request,
+                        })
+                    except BaseException as exc:
+                        unrelated_observed["error"] = exc
+
+                replay_thread = threading.Thread(target=send_replay, daemon=True)
+                unrelated_thread = threading.Thread(target=send_unrelated, daemon=True)
+                with mock.patch.object(
+                    run_store, "accept", side_effect=accept_or_replay,
+                ), mock.patch.object(
+                    server.HarnessHandler, "_json", block_replay_response,
+                ), mock.patch.object(
+                    chat, "say", side_effect=answer_unrelated,
+                ):
+                    replay_thread.start()
+                    try:
+                        self.assertTrue(
+                            response_started.wait(self.HTTP_TIMEOUT_SECONDS),
+                            f"the {replay_kind} replay never reached response delivery",
+                        )
+                        unrelated_thread.start()
+                        self.assertTrue(
+                            unrelated_provider_started.wait(self.HTTP_TIMEOUT_SECONDS),
+                            f"the {replay_kind} replay response held admission locks",
+                        )
+                        unrelated_thread.join(self.HTTP_TIMEOUT_SECONDS)
+                        self.assertFalse(
+                            unrelated_thread.is_alive(),
+                            "the unrelated chat did not finish while replay I/O was blocked",
+                        )
+                    finally:
+                        release_response.set()
+                        replay_thread.join(self.HTTP_TIMEOUT_SECONDS)
+                        if unrelated_thread.ident is not None:
+                            unrelated_thread.join(self.HTTP_TIMEOUT_SECONDS)
+
+                self.assertFalse(replay_thread.is_alive(), replay_observed)
+                self.assertFalse(unrelated_thread.is_alive(), unrelated_observed)
+                self.assertNotIn("error", replay_observed, replay_observed)
+                self.assertNotIn("error", unrelated_observed, unrelated_observed)
+                replay_status, replayed = replay_observed["result"]
+                unrelated_status, unrelated = unrelated_observed["result"]
+                self.assertEqual(replay_status, expected_status, replayed)
+                if replay_kind == "terminal":
+                    self.assertTrue(replayed["replayed"], replayed)
+                else:
+                    self.assertTrue(replayed["idempotent"], replayed)
+                    self.assertEqual(replayed["state"], "running")
+                self.assertEqual(unrelated_status, 200, unrelated)
+
+    def test_in_progress_replay_disconnect_does_not_fail_the_existing_run(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "The replay owner", "who": "claude"},
+        ]}})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        authority = self.panel.project_authority_status()
+        store = (
+            self.panel.swarm_runs
+            if authority.get("can_run")
+            else self.panel.swarm_communication_runs
+        )
+        request_id = "request-replay-disconnect-123"
+        accepted, created = store.accept(request_id, {"chat_key": agent_id})
+        self.assertTrue(created)
+        run_id = store.start(accepted["run_id"])["run_id"]
+        real_accept = store.accept
+        delivery_attempted = threading.Event()
+        original_json = server.HarnessHandler._json
+
+        def accept_existing(seen_request_id, snapshot):
+            if seen_request_id == request_id:
+                return store.get(run_id), False
+            return real_accept(seen_request_id, snapshot)
+
+        def disconnect_replay(handler, value, response_status=200):
+            if (
+                handler.path == "/api/swarm/say"
+                and isinstance(value, dict)
+                and value.get("request_id") == request_id
+            ):
+                delivery_attempted.set()
+                raise ConnectionError("the replay client disconnected")
+            return original_json(handler, value, response_status)
+
+        client_error = None
+        with mock.patch.object(
+            store, "accept", side_effect=accept_existing,
+        ), mock.patch.object(
+            server.HarnessHandler, "_json", disconnect_replay,
+        ):
+            try:
+                self.ask("/api/swarm/say", {
+                    "agent": agent_id,
+                    "text": "return the running request",
+                    "mode": "chat",
+                    "activity": "activity-replay-disconnect-123",
+                    "request_id": request_id,
+                })
+            except Exception as exc:  # the server deliberately closes this response
+                client_error = exc
+
+        self.assertTrue(delivery_attempted.is_set())
+        self.assertIsNotNone(client_error, "the disconnected client received a response")
+        still_running = store.get(run_id)
+        self.assertEqual(still_running["status"], "running", still_running)
+        self.assertIsNone(still_running["result"])
+        self.assertEqual(still_running["error"], "")
+        replay_activity = self.panel.chat_activities.read(
+            "activity-replay-disconnect-123"
+        )
+        self.assertNotIn(replay_activity["state"], {"error", "stopped"})
+
+    def test_completed_response_disconnect_preserves_terminal_outcome(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "The completed owner", "who": "claude"},
+        ]}})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        authority = self.panel.project_authority_status()
+        store = (
+            self.panel.swarm_runs
+            if authority.get("can_run")
+            else self.panel.swarm_communication_runs
+        )
+        request_id = "request-complete-disconnect-123"
+        activity_id = "activity-complete-disconnect-123"
+        delivery_attempted = threading.Event()
+        original_json = server.HarnessHandler._json
+
+        def disconnect_completed(handler, value, response_status=200):
+            if (
+                handler.path == "/api/swarm/say"
+                and isinstance(value, dict)
+                and value.get("request_id") == request_id
+            ):
+                delivery_attempted.set()
+                raise ConnectionError("the completed client disconnected")
+            return original_json(handler, value, response_status)
+
+        client_error = None
+        with mock.patch.object(
+            chat, "say", return_value={"said": []},
+        ), mock.patch.object(
+            server.HarnessHandler, "_json", disconnect_completed,
+        ):
+            try:
+                self.ask("/api/swarm/say", {
+                    "agent": agent_id,
+                    "text": "finish before response delivery",
+                    "mode": "chat",
+                    "activity": activity_id,
+                    "request_id": request_id,
+                })
+            except Exception as exc:  # the server deliberately closes this response
+                client_error = exc
+
+        self.assertTrue(delivery_attempted.is_set())
+        self.assertIsNotNone(client_error, "the disconnected client received a response")
+        completed = store.get(request_id)
+        self.assertEqual(completed["status"], "complete", completed)
+        self.assertEqual(completed["error"], "")
+        self.assertEqual(completed["result"]["request_id"], request_id)
+        terminal_activity = self.panel.chat_activities.read(activity_id)
+        self.assertEqual(terminal_activity["state"], "complete", terminal_activity)
+        self.assertEqual(terminal_activity["stage"], "Answer received")
+
+    def test_stop_watcher_start_failure_releases_every_chat_scope(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
+            {"name": "The retryable owner", "who": "claude"},
+        ]}})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        watcher_start_failed = threading.Event()
+        real_start = threading.Thread.start
+
+        def fail_exact_watcher(thread, *args, **kwargs):
+            if (
+                thread.name.startswith("nexus-chat-stop-")
+                and not watcher_start_failed.is_set()
+            ):
+                watcher_start_failed.set()
+                raise RuntimeError("simulated watcher start failure")
+            return real_start(thread, *args, **kwargs)
+
+        with mock.patch.object(
+            threading.Thread, "start", new=fail_exact_watcher,
+        ), mock.patch.object(chat, "say", return_value={"said": []}):
+            failed_status, failed = self.ask("/api/swarm/say", {
+                "agent": agent_id,
+                "text": "the watcher cannot start",
+                "mode": "chat",
+                "request_id": "request-watcher-start-failure-123",
+            })
+
+        self.assertTrue(watcher_start_failed.is_set())
+        self.assertEqual(failed_status, 500, failed)
+        self.assertFalse(self.panel.chat_cancellations.is_active(agent_id))
+
+        with mock.patch.object(chat, "say", return_value={"said": []}):
+            retry_status, retried = self.ask("/api/swarm/say", {
+                "agent": agent_id,
+                "text": "the next turn must be admitted",
+                "mode": "chat",
+                "request_id": "request-after-watcher-start-failure-123",
+            })
+        self.assertEqual(retry_status, 200, retried)
+
     def test_failed_chat_turn_is_saved_as_a_visible_nexus_outcome(self) -> None:
         self.ask("/api/swarm/save", {"board": {"agents": [
             {"name": "The reviewer", "who": "claude"},
@@ -4332,7 +4913,10 @@ class WhatThePanelIsTold(BoardTestCase):
 
         def slow_answer(*_args, **_kwargs):
             entered.set()
-            self.assertTrue(release.wait(5), "the activity probe did not release the provider")
+            self.assertTrue(
+                release.wait(self.HTTP_TIMEOUT_SECONDS),
+                "the activity probe did not release the provider",
+            )
             return {"said": []}
 
         def send() -> None:
@@ -4342,18 +4926,27 @@ class WhatThePanelIsTold(BoardTestCase):
             }))
 
         with mock.patch.object(chat, "say", side_effect=slow_answer):
-            thread = threading.Thread(target=send)
+            thread = threading.Thread(target=send, daemon=True)
             thread.start()
-            self.assertTrue(entered.wait(5), "the provider request did not start")
-            status, activity = self.ask(
-                "/api/swarm/activity?activity=activity-running-123"
-            )
-            self.assertEqual(status, 200)
-            self.assertEqual(activity["state"], "working")
-            self.assertEqual(activity["stage"], "Waiting for The reviewer")
-            release.set()
-            thread.join(5)
-        self.assertEqual(result[0][0], 200)
+            try:
+                self.assertTrue(
+                    entered.wait(self.HTTP_TIMEOUT_SECONDS),
+                    "the provider request did not start",
+                )
+                status, activity = self.ask(
+                    "/api/swarm/activity?activity=activity-running-123"
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(activity["state"], "working")
+                self.assertEqual(activity["stage"], "Waiting for The reviewer")
+            finally:
+                # A failed timing assertion must never strand the daemon HTTP
+                # worker or its SQLite journal in the temporary project.
+                release.set()
+                thread.join(self.HTTP_TIMEOUT_SECONDS)
+        self.assertFalse(thread.is_alive(), "the provider request did not finish")
+        self.assertTrue(result, "the provider request produced no HTTP result")
+        self.assertEqual(result[0][0], 200, result[0][1])
 
     def test_chat_acceptance_pins_project_config_and_store_until_finish(self) -> None:
         status, saved = self.ask("/api/swarm/save", {"board": {"agents": [
@@ -4979,6 +5572,91 @@ class WhatThePanelIsTold(BoardTestCase):
             store.get("request-watcher-failure-123")["status"], "stopped",
         )
 
+    def test_completed_request_keeps_immutable_token_for_a_late_stop_watcher(self) -> None:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [{"name": "Late stop poll", "who": "claude"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        agent_id = saved["board"]["agents"][0]["id"]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+        ]
+        authority = self.panel.project_authority_status()
+        store = (
+            self.panel.swarm_runs
+            if authority.get("can_run")
+            else self.panel.swarm_communication_runs
+        )
+        poll_entered = threading.Event()
+        poll_returned = threading.Event()
+        release_poll = threading.Event()
+        cancel_observed = threading.Event()
+        captured_tokens: list[cancellation.Cancellation] = []
+        poll_started_at: list[float] = []
+        real_begin = self.panel.chat_cancellations.begin
+        real_cancel = cancellation.Cancellation.cancel
+
+        def capture_token(chat_key: str, activity_id: str = ""):
+            token = real_begin(chat_key, activity_id)
+            captured_tokens.append(token)
+            return token
+
+        def blocked_stop_poll(_run_id: str) -> bool:
+            poll_started_at.append(time.monotonic())
+            poll_entered.set()
+            release_poll.wait(self.HTTP_TIMEOUT_SECONDS)
+            poll_returned.set()
+            return True
+
+        def observe_cancel(token: cancellation.Cancellation) -> bool:
+            cancelled = real_cancel(token)
+            if captured_tokens and token is captured_tokens[0]:
+                cancel_observed.set()
+            return cancelled
+
+        def answer_after_poll_starts(*_args, **_kwargs):
+            if not poll_entered.wait(self.HTTP_TIMEOUT_SECONDS):
+                raise RuntimeError("the durable stop watcher did not start")
+            return {"said": []}
+
+        with mock.patch.object(
+            store, "should_stop", side_effect=blocked_stop_poll,
+        ), mock.patch.object(
+            self.panel.chat_cancellations, "begin", side_effect=capture_token,
+        ), mock.patch.object(
+            cancellation.Cancellation, "cancel", new=observe_cancel,
+        ), mock.patch.object(
+            chat, "say", side_effect=answer_after_poll_starts,
+        ):
+            try:
+                send_status, sent = self.ask("/api/swarm/say", {
+                    "agent": agent_id,
+                    "text": "finish while the stop journal is slow",
+                    "mode": "chat",
+                    "request_id": "request-late-stop-poll-123",
+                })
+                self.assertEqual(send_status, 200, sent)
+                self.assertTrue(captured_tokens, "the request created no cancellation token")
+                self.assertFalse(
+                    poll_returned.is_set(),
+                    "the stop poll was not still blocked after bounded cleanup",
+                )
+                # Keep the journal read blocked beyond release_chat_ownership's
+                # 250 ms join without depending on scheduler timing.
+                wait_left = 0.4 - (time.monotonic() - poll_started_at[0])
+                if wait_left > 0:
+                    self.assertFalse(release_poll.wait(wait_left))
+                self.assertFalse(captured_tokens[0].cancelled)
+            finally:
+                release_poll.set()
+
+            self.assertTrue(
+                cancel_observed.wait(self.HTTP_TIMEOUT_SECONDS),
+                "the late watcher lost the request's original cancellation token",
+            )
+            self.assertTrue(poll_returned.is_set())
+            self.assertTrue(captured_tokens[0].cancelled)
+
     def test_stop_watcher_failure_after_provider_return_blocks_transcript_commit(self) -> None:
         status, saved = self.ask("/api/swarm/save", {"board": {
             "agents": [{"name": "Late watcher race", "who": "claude"}],
@@ -5286,54 +5964,57 @@ class WhatThePanelIsTold(BoardTestCase):
             }))
 
         with mock.patch.object(chat, "say", side_effect=slow_answer):
-            thread = threading.Thread(target=send)
+            thread = threading.Thread(target=send, daemon=True)
             thread.start()
-            self.assertTrue(
-                entered.wait(5), f"running chat did not reach its provider: {result}",
-            )
+            try:
+                self.assertTrue(
+                    entered.wait(self.HTTP_TIMEOUT_SECONDS),
+                    f"running chat did not reach its provider: {result}",
+                )
 
-            running_mutations = [
-                ("/api/swarm/chats/project", {
-                    "agent": lead_id, "chat": running_chat["id"], "project": "project-1",
-                }),
-                ("/api/swarm/chats/delete", {
-                    "agent": lead_id, "chat": running_chat["id"],
-                }),
-                ("/api/swarm/start-again", {
-                    "agent": lead_id, "chat": running_chat["id"],
-                }),
-            ]
-            for endpoint, body in running_mutations:
-                mutation_status, refused = self.ask(endpoint, body)
-                self.assertEqual(mutation_status, 400, (endpoint, refused))
-                self.assertIn("already working", refused["error"], endpoint)
+                running_mutations = [
+                    ("/api/swarm/chats/project", {
+                        "agent": lead_id, "chat": running_chat["id"], "project": "project-1",
+                    }),
+                    ("/api/swarm/chats/delete", {
+                        "agent": lead_id, "chat": running_chat["id"],
+                    }),
+                    ("/api/swarm/start-again", {
+                        "agent": lead_id, "chat": running_chat["id"],
+                    }),
+                ]
+                for endpoint, body in running_mutations:
+                    mutation_status, refused = self.ask(endpoint, body)
+                    self.assertEqual(mutation_status, 400, (endpoint, refused))
+                    self.assertIn("already working", refused["error"], endpoint)
 
-            sibling_status, sibling_project = self.ask("/api/swarm/chats/project", {
-                "agent": lead_id, "chat": sibling_chat["id"], "project": "project-1",
-            })
-            self.assertEqual(sibling_status, 200, sibling_project)
-            selected = next(
-                one for one in sibling_project["chats"] if one["id"] == sibling_chat["id"]
-            )
-            self.assertEqual(selected["project"], "project-1")
+                sibling_status, sibling_project = self.ask("/api/swarm/chats/project", {
+                    "agent": lead_id, "chat": sibling_chat["id"], "project": "project-1",
+                })
+                self.assertEqual(sibling_status, 200, sibling_project)
+                selected = next(
+                    one for one in sibling_project["chats"] if one["id"] == sibling_chat["id"]
+                )
+                self.assertEqual(selected["project"], "project-1")
 
-            reset_status, reset = self.ask("/api/swarm/start-again", {
-                "agent": lead_id, "chat": sibling_chat["id"],
-            })
-            self.assertEqual(reset_status, 200, reset)
-            archive_status, archived = self.ask("/api/swarm/chats/delete", {
-                "agent": lead_id, "chat": sibling_chat["id"],
-            })
-            self.assertEqual(archive_status, 200, archived)
-            sibling = next(
-                one for one in archived["chats"] if one["id"] == sibling_chat["id"]
-            )
-            self.assertTrue(sibling["archived_at"])
-
-            release.set()
-            thread.join(5)
+                reset_status, reset = self.ask("/api/swarm/start-again", {
+                    "agent": lead_id, "chat": sibling_chat["id"],
+                })
+                self.assertEqual(reset_status, 200, reset)
+                archive_status, archived = self.ask("/api/swarm/chats/delete", {
+                    "agent": lead_id, "chat": sibling_chat["id"],
+                })
+                self.assertEqual(archive_status, 200, archived)
+                sibling = next(
+                    one for one in archived["chats"] if one["id"] == sibling_chat["id"]
+                )
+                self.assertTrue(sibling["archived_at"])
+            finally:
+                release.set()
+                thread.join(self.HTTP_TIMEOUT_SECONDS)
 
         self.assertFalse(thread.is_alive(), "running chat did not finish")
+        self.assertTrue(result, "running chat produced no HTTP result")
         self.assertEqual(result[0][0], 200, result[0][1])
 
     def test_untrusted_collaboration_record_can_be_reset_without_losing_chat(self) -> None:

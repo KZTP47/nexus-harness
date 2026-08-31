@@ -326,27 +326,34 @@ def put_this_file_in_place(path: Path, written: str) -> None:
     # stores hash the exact UTF-8 bytes before this atomic move; on Windows the
     # implicit LF -> CRLF rewrite made a freshly written file fail its own
     # integrity check.  Preserve the caller's exact text bytes on every OS.
-    with beside.open("w", encoding="utf-8", newline="") as writing:
-        writing.write(written)
-        writing.flush()
-        os.fsync(writing.fileno())
-    # Six and a bit seconds all told. A reader really does hold the move off on
-    # Windows, and four checks running side by side hold it longer than one
-    # does, so the waiting is longer than it looks like it needs to be.
-    for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2):
+    try:
+        with beside.open("w", encoding="utf-8", newline="") as writing:
+            writing.write(written)
+            writing.flush()
+            os.fsync(writing.fileno())
+        # Six and a bit seconds all told. A reader really does hold the move off on
+        # Windows, and four checks running side by side hold it longer than one
+        # does, so the waiting is longer than it looks like it needs to be.
+        for wait in (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2):
+            try:
+                os.replace(beside, path)
+                return
+            except PermissionError:
+                time.sleep(wait)
         try:
             os.replace(beside, path)
-            return
-        except PermissionError:
-            time.sleep(wait)
-    try:
-        os.replace(beside, path)
-    except PermissionError as exc:
-        beside.unlink(missing_ok=True)
-        raise HarnessError(
-            f"{path.name} is held open by something else, so it could not be "
-            "written. Close whatever has it open and try again."
-        ) from exc
+        except PermissionError as exc:
+            raise HarnessError(
+                f"{path.name} is held open by something else, so it could not be "
+                "written. Close whatever has it open and try again."
+            ) from exc
+    finally:
+        # A failed write or replace must not leave a name that a later process
+        # can mistake for its own pending publication.
+        try:
+            beside.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_this_file_patiently(path: Path) -> str:

@@ -4,15 +4,27 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from .. import cancellation
-from ..execution import _BoundedCapture, _ProcessTree, _reap_process, _wait_for_terminated_process, _write_stdin
+from ..execution import (
+    _WINDOWS_CREATE_BREAKAWAY_FROM_JOB,
+    _WINDOWS_CREATE_SUSPENDED,
+    _BoundedCapture,
+    _ProcessTree,
+    _reap_process,
+    _settle_process_tree,
+    _start_windows_contained_process,
+    _write_stdin,
+)
 from ..models import CommandResult, HarnessError, ProviderRequest, ProviderResponse
 from ..redaction import CredentialRedactor, bounded_redacted_text
 from .base import Provider
@@ -37,6 +49,66 @@ _FALLBACK_SCHEMA: dict[str, Any] = {
     "required": ["text"],
     "properties": {"text": {"type": "string"}},
 }
+
+
+def _remove_private_workspace(
+    path: Path, *, timeout_seconds: float,
+) -> tuple[bool, OSError | None]:
+    """Remove one exact provider workspace with a bounded Windows retry."""
+
+    deadline = time.monotonic() + max(0.001, float(timeout_seconds))
+    last_error: OSError | None = None
+    while True:
+        try:
+            shutil.rmtree(path)
+            return True, None
+        except FileNotFoundError:
+            return True, None
+        except OSError as exc:
+            last_error = exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False, last_error
+        time.sleep(min(0.025, remaining))
+
+
+def _finish_private_workspace_later(path: Path) -> None:
+    _remove_private_workspace(path, timeout_seconds=30.0)
+
+
+@contextmanager
+def _private_workspace(prefix: str) -> Iterator[Path]:
+    """Create an isolated CLI cwd without masking an authoritative failure.
+
+    Windows reports a sharing violation while any process still owns a cwd.
+    A bounded retry absorbs ordinary kernel scheduling delay.  If cleanup is
+    still pending after a provider error, retain that original error, attach a
+    diagnostic note, and finish removing the already-private path in a bounded
+    daemon cleanup instead of replacing the useful timeout with ``rmdir``.
+    """
+
+    path = Path(tempfile.mkdtemp(prefix=prefix))
+    try:
+        yield path
+    except BaseException as primary:
+        removed, cleanup_error = _remove_private_workspace(path, timeout_seconds=2.0)
+        if not removed:
+            primary.add_note(
+                f"Codex CLI private workspace cleanup is still pending: {cleanup_error}"
+            )
+            threading.Thread(
+                target=_finish_private_workspace_later,
+                args=(path,),
+                name="nexus-codex-workspace-cleanup",
+                daemon=True,
+            ).start()
+        raise
+    else:
+        removed, cleanup_error = _remove_private_workspace(path, timeout_seconds=2.0)
+        if not removed:
+            raise HarnessError(
+                f"Codex CLI could not remove its private workspace: {cleanup_error}"
+            ) from cleanup_error
 
 
 def _codex_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -110,11 +182,12 @@ def _run_bounded(
     flags = (
         subprocess.CREATE_NEW_PROCESS_GROUP
         | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        | _WINDOWS_CREATE_SUSPENDED
         if os.name == "nt" else 0
     )
     started = time.monotonic()
-    try:
-        process = subprocess.Popen(
+    def start_process(creation_flags: int) -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
             argv,
             cwd=cwd,
             env=_minimal_codex_environment(also_in_the_environment),
@@ -122,17 +195,27 @@ def _run_bounded(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             shell=False,
-            creationflags=flags,
+            creationflags=creation_flags,
             start_new_session=os.name != "nt",
         )
-    except OSError as exc:
-        raise HarnessError(f"Codex CLI could not start: {exc}") from exc
-    try:
-        tree = _ProcessTree(process)
-    except Exception:
-        process.kill()
-        process.wait()
-        raise
+
+    if os.name == "nt":
+        process, tree = _start_windows_contained_process(
+            lambda: start_process(flags | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB),
+            lambda: start_process(flags),
+            label="Codex CLI",
+        )
+    else:
+        try:
+            process = start_process(flags)
+        except OSError as exc:
+            raise HarnessError(f"Codex CLI could not start: {exc}") from exc
+        try:
+            tree = _ProcessTree(process)
+        except Exception:
+            process.kill()
+            process.wait()
+            raise
     unregister_cancel = cancellation.register(tree.kill)
     capture = _BoundedCapture(max(1, max_output_bytes))
     readers = [
@@ -146,31 +229,20 @@ def _run_bounded(
         writer = threading.Thread(target=_write_stdin, args=(process.stdin, stdin_text.encode("utf-8")), daemon=True)
         writer.start()
     deadline_at = started + timeout_seconds
-    timed_out = False
-    try:
-        process.wait(timeout=max(0.001, deadline_at - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        timed_out = True
+    timed_out = not tree.wait_for_root_until(deadline_at)
     if not timed_out:
         for worker in (*readers, *((writer,) if writer is not None else ())):
-            remaining = deadline_at - time.monotonic()
-            if remaining <= 0:
+            if not tree.join_worker_until(worker, deadline_at):
                 timed_out = True
                 break
-            worker.join(remaining)
-            if worker.is_alive():
-                timed_out = True
-                break
-    if timed_out:
-        tree.kill()
-    else:
-        tree.kill_descendants_after_exit()
-    unregister_cancel()
-    tree.close()
+    workers = (*readers, *((writer,) if writer is not None else ()))
+    try:
+        settled = _settle_process_tree(tree, workers, terminate=timed_out)
+    finally:
+        unregister_cancel()
+        tree.close()
     cancellation.checkpoint()
-    if timed_out:
-        _wait_for_terminated_process(process)
-    if process.poll() is None:
+    if not settled and process.poll() is None:
         threading.Thread(target=_reap_process, args=(process,), daemon=True).start()
     stdout, stderr, truncated = capture.snapshot()
     return CommandResult(
@@ -396,8 +468,7 @@ def codex_cli_preflight(
     if auth_mode != _AUTH_MODE:
         raise HarnessError("Codex CLI auth_mode must be chatgpt")
     deadline_at = time.monotonic() + max(0.001, float(timeout_seconds))
-    with tempfile.TemporaryDirectory(prefix="our-harness-codex-preflight-") as temporary:
-        cwd = Path(temporary)
+    with _private_workspace("our-harness-codex-preflight-") as cwd:
         version = _run_bounded(
             [*command, "--version"], cwd=cwd, stdin_text=None,
             timeout_seconds=_remaining(deadline_at), max_output_bytes=max_output_bytes,
@@ -608,8 +679,7 @@ class CodexCLIProvider(Provider):
             )
             self._preflight_complete = True
         schema = _codex_output_schema(contract_schema)
-        with tempfile.TemporaryDirectory(prefix="our-harness-codex-") as temporary:
-            cwd = Path(temporary)
+        with _private_workspace("our-harness-codex-") as cwd:
             schema_path = cwd / "response.schema.json"
             result_path = cwd / "response.json"
             catalog_path = cwd / "models.catalog.json"

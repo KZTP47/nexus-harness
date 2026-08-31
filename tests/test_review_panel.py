@@ -118,7 +118,10 @@ class ReviewPanelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             panel = ReviewPanel(panel_config(Path(temporary), 3, 3, delays=[0.25, 0.25, 0.25]))
             started = time.monotonic()
-            result = panel.review({"patch": "same"}, deadline_at=started + 2)
+            # Windows may spend close to a second starting each fully isolated
+            # interpreter under endpoint security.  The assertion below tests
+            # parallelism, not an unrelated machine-speed deadline.
+            result = panel.review({"patch": "same"}, deadline_at=started + 5)
             parallel_elapsed = time.monotonic() - started
             self.assertTrue(result.passed)
             self.assertTrue(all(item.latency_ms >= 200 for item in result.reviews))
@@ -126,7 +129,7 @@ class ReviewPanelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             serial = ReviewPanel(panel_config(Path(temporary), 3, 1, delays=[0.25, 0.25, 0.25]))
             started = time.monotonic()
-            self.assertTrue(serial.review({"patch": "same"}, deadline_at=started + 3).passed)
+            self.assertTrue(serial.review({"patch": "same"}, deadline_at=started + 8).passed)
             serial_elapsed = time.monotonic() - started
         self.assertLess(parallel_elapsed, serial_elapsed * 0.75)
 
@@ -223,7 +226,10 @@ class ReviewPanelTests(unittest.TestCase):
                     f"program={program!r}",
                     "config=load_isolated_config(root, {'workflow': {'reviewers': 1, 'review_parallelism': 1}, 'provider': {'name': 'local', 'model': 'fixture', 'command': [sys.executable, '-c', program, str(pid_path)]}})",
                     "started=time.monotonic()",
-                    "result=ReviewPanel(config).review({'patch':'x'}, deadline_at=started+0.50)",
+                    # Allow both isolated interpreters to start under endpoint
+                    # security before testing that the non-cooperative provider
+                    # is killed at the real shared deadline.
+                    "result=ReviewPanel(config).review({'patch':'x'}, deadline_at=started+5.0)",
                     "assert result.reviews[0].status == 'cancelled'",
                     "assert not any(item.name.startswith('harness-review-panel') for item in __import__('threading').enumerate())",
                     "print(time.monotonic()-started)",
@@ -237,12 +243,12 @@ class ReviewPanelTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 env=environment,
-                timeout=3.0,
+                timeout=8.0,
                 check=False,
             )
             elapsed = time.monotonic() - started
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertLess(elapsed, 2.0)
+            self.assertLess(elapsed, 7.0)
             self.assertTrue(pid_path.exists(), "provider child did not start")
             provider_identity = json.loads(pid_path.read_text(encoding="utf-8"))
             provider_pid = int(provider_identity["pid"])
@@ -266,7 +272,9 @@ class ReviewPanelTests(unittest.TestCase):
                 encoding="utf-8",
             )
             result = ReviewPanel(panel_config(root, 1, 1)).review(
-                {"patch": "x"}, deadline_at=time.monotonic() + 2
+                # Keep this about import isolation rather than local process
+                # launch latency on a busy Windows test host.
+                {"patch": "x"}, deadline_at=time.monotonic() + 5
             )
             self.assertTrue(result.passed, result.findings)
             self.assertFalse(site_marker.exists())

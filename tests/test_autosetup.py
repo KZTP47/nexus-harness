@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,16 @@ class SetupTestCase(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         (self.root / ".harness").mkdir()
+        # Setup writes a user-scoped trust record. Keep every test process in
+        # its own disposable user-config root so parallel CI shards never
+        # mutate the desktop account or manufacture contention between tests.
+        isolated_user_config = self.root / "user-config"
+        environment = mock.patch.dict(os.environ, {
+            "APPDATA": str(isolated_user_config),
+            "XDG_CONFIG_HOME": str(isolated_user_config),
+        })
+        environment.start()
+        self.addCleanup(environment.stop)
         self.config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
 
     @property

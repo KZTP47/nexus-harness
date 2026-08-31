@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
+from contextlib import nullcontext
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from our_harness import cancellation
+from our_harness import cancellation, execution
 from our_harness.config import load_isolated_config
 from our_harness.doctor import run_doctor
 from our_harness.models import HarnessError, ProviderRequest, ResponseFormat
@@ -19,7 +23,7 @@ from our_harness.usage import PriceCatalog
 
 
 FAKE_CODEX = r'''
-import json, os, pathlib, sys, time
+import ctypes, json, os, pathlib, subprocess, sys, time
 
 args = sys.argv[1:]
 def option(name, default=""):
@@ -85,6 +89,39 @@ if record:
     }), encoding="utf-8")
 if mode == "timeout":
     time.sleep(5)
+if mode in {"timeout-tree", "fast-root-tree"}:
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        cwd=os.getcwd(),
+    )
+    child_in_job = ctypes.c_int()
+    checked_job = ctypes.windll.kernel32.IsProcessInJob(
+        int(child._handle), None, ctypes.byref(child_in_job)
+    )
+    pathlib.Path(str(record) + ".child.pid").write_text(json.dumps({
+        "pid": child.pid,
+        "in_job": bool(child_in_job.value) if checked_job else None,
+    }), encoding="utf-8")
+if mode == "timeout-tree":
+    time.sleep(30)
+if mode == "brokered-grandchild-tree":
+    intermediate_code = (
+        "import pathlib,subprocess,sys,time; "
+        "pathlib.Path(sys.argv[2]).write_text(str(__import__('os').getpid()),encoding='utf-8'); "
+        "trigger=pathlib.Path(sys.argv[3]); "
+        "list(iter(lambda:(time.sleep(0.005),trigger.exists())[1],True)); "
+        "child_code=\"import json,os,pathlib,sys,time;pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid()}));time.sleep(30)\"; "
+        "subprocess.Popen([sys.executable,'-c',child_code,sys.argv[4]],cwd=sys.argv[1])"
+    )
+    subprocess.Popen(
+        [
+            sys.executable, "-c", intermediate_code, os.getcwd(),
+            str(record) + ".broker.pid", str(record) + ".spawn-now",
+            str(record) + ".child.pid",
+        ],
+        cwd=os.getcwd(),
+    )
+    time.sleep(30)
 if mode == "nonzero":
     print("fixture failure", file=sys.stderr)
     raise SystemExit(17)
@@ -117,6 +154,24 @@ else:
 
 
 class CodexCLIProviderTests(unittest.TestCase):
+    def test_private_workspace_cleanup_never_masks_authoritative_provider_error(self) -> None:
+        workspace: Path | None = None
+        cleanup_error = PermissionError(32, "fixture cwd is still locked")
+        try:
+            with patch.object(
+                codex_cli, "_remove_private_workspace",
+                return_value=(False, cleanup_error),
+            ), patch.object(codex_cli, "_finish_private_workspace_later"):
+                with self.assertRaisesRegex(HarnessError, "authoritative timeout") as caught:
+                    with codex_cli._private_workspace("nexus-cleanup-mask-test-") as workspace:
+                        raise HarnessError("authoritative timeout")
+            self.assertTrue(
+                any("cleanup is still pending" in note for note in caught.exception.__notes__)
+            )
+        finally:
+            if workspace is not None:
+                shutil.rmtree(workspace, ignore_errors=True)
+
     def test_codex_native_schema_requires_optional_properties_without_mutating_contract(self) -> None:
         contract = {
             "type": "object",
@@ -368,6 +423,225 @@ class CodexCLIProviderTests(unittest.TestCase):
                 if record.exists():
                     cwd = json.loads(record.read_text(encoding="utf-8"))["cwd"]
                     self.assertFalse(Path(cwd).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows process containment is Windows-specific")
+    def test_timeout_reaps_contained_and_brokered_trees_before_workspace_cleanup(self) -> None:
+        class BrokerEscapedJob:
+            # Models Store/venv redirectors that broker the real executable
+            # outside a job even though assignment of the launcher succeeded.
+            last_handle = None
+
+            def __init__(self, _process):
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.CreateJobObjectW.argtypes = [
+                    ctypes.c_void_p, ctypes.c_wchar_p
+                ]
+                kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+                self._kernel32 = kernel32
+                self.handle = kernel32.CreateJobObjectW(None, None)
+                if not self.handle:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                BrokerEscapedJob.last_handle = self.handle
+
+            def terminate(self) -> bool:
+                return True
+
+            def wait_until_empty(self, _timeout_seconds: float) -> bool:
+                return True
+
+            def close(self) -> None:
+                if self.handle:
+                    self._kernel32.CloseHandle(ctypes.c_void_p(self.handle))
+                    self.handle = None
+
+        for mode in (
+            "timeout-tree",
+            "fast-root-tree",
+            "brokered-grandchild-tree",
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                _config, provider, record = self.make_provider(
+                    root, mode, output_limit=250_000
+                )
+                child_record = Path(str(record) + ".child.pid")
+                broker_record = Path(str(record) + ".broker.pid")
+                spawn_trigger = Path(str(record) + ".spawn-now")
+                inner_cwd: Path | None = None
+                drain_counts = [0, 0]
+                drain_lock = threading.Lock()
+                real_drain = codex_cli._BoundedCapture.drain
+                real_snapshot = execution._windows_process_snapshot
+                snapshot_state = {
+                    "broker_seen": 0,
+                    "spawned": False,
+                    "child_in_private_job": None,
+                }
+
+                def tracked_drain(capture, pipe, destination):
+                    with drain_lock:
+                        drain_counts[0] += 1
+                    try:
+                        return real_drain(capture, pipe, destination)
+                    finally:
+                        with drain_lock:
+                            drain_counts[1] += 1
+
+                def snapshot_then_spawn_final_child():
+                    snapshot = real_snapshot()
+                    if not broker_record.exists():
+                        return snapshot
+                    try:
+                        broker_pid = int(broker_record.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        return snapshot
+                    processes, _cutoff = snapshot
+                    if broker_pid not in processes:
+                        return snapshot
+                    snapshot_state["broker_seen"] += 1
+                    if snapshot_state["broker_seen"] != 2:
+                        return snapshot
+
+                    # The first scan has already retained this broker's process
+                    # handle.  Trigger its final child only after this second
+                    # snapshot was captured, then wait for the broker to exit.
+                    # Returning the now-stale snapshot forces cleanup to rescan
+                    # from the retained exited intermediate.
+                    broker_handle = execution._windows_open_process_handle(broker_pid)
+                    try:
+                        spawn_trigger.write_text("spawn", encoding="utf-8")
+                        child_deadline = time.monotonic() + 3.0
+                        while (
+                            not child_record.exists()
+                            and time.monotonic() < child_deadline
+                        ):
+                            time.sleep(0.005)
+                        self.assertTrue(
+                            child_record.exists(), "fixture final child did not start"
+                        )
+                        child_pid = int(json.loads(
+                            child_record.read_text(encoding="utf-8")
+                        )["pid"])
+                        child_handle = execution._windows_open_process_handle(
+                            child_pid
+                        )
+                        self.assertIsNotNone(
+                            child_handle, "fixture final child was not live"
+                        )
+                        try:
+                            in_job = ctypes.c_int()
+                            checker = ctypes.WinDLL(
+                                "kernel32", use_last_error=True
+                            ).IsProcessInJob
+                            checker.argtypes = [
+                                ctypes.c_void_p,
+                                ctypes.c_void_p,
+                                ctypes.POINTER(ctypes.c_int),
+                            ]
+                            checker.restype = ctypes.c_int
+                            checked = checker(
+                                ctypes.c_void_p(child_handle),
+                                ctypes.c_void_p(BrokerEscapedJob.last_handle),
+                                ctypes.byref(in_job),
+                            )
+                            self.assertTrue(checked)
+                            snapshot_state["child_in_private_job"] = bool(
+                                in_job.value
+                            )
+                        finally:
+                            execution._windows_close_process_handle(child_handle)
+                        if broker_handle is not None:
+                            while (
+                                execution._windows_process_handle_is_running(
+                                    broker_handle
+                                )
+                                and time.monotonic() < child_deadline
+                            ):
+                                time.sleep(0.005)
+                            self.assertFalse(
+                                execution._windows_process_handle_is_running(
+                                    broker_handle
+                                ),
+                                "fixture intermediate did not exit",
+                            )
+                        snapshot_state["spawned"] = True
+                    finally:
+                        if broker_handle is not None:
+                            execution._windows_close_process_handle(broker_handle)
+                    return snapshot
+
+                try:
+                    job_boundary = (
+                        patch.object(execution, "_WindowsJob", BrokerEscapedJob)
+                        if mode == "brokered-grandchild-tree" else nullcontext()
+                    )
+                    snapshot_boundary = (
+                        patch.object(
+                            execution,
+                            "_windows_process_snapshot",
+                            side_effect=snapshot_then_spawn_final_child,
+                        )
+                        if mode == "brokered-grandchild-tree" else nullcontext()
+                    )
+                    with job_boundary, snapshot_boundary, patch.object(
+                        codex_cli._BoundedCapture, "drain", tracked_drain
+                    ):
+                        with self.assertRaisesRegex(HarnessError, "timed out"):
+                            provider.complete(self.request(3.0))
+                    captured = json.loads(record.read_text(encoding="utf-8"))
+                    inner_cwd = Path(captured["cwd"])
+                    self.assertTrue(child_record.exists(), "fixture child was not started")
+                    child_identity = json.loads(
+                        child_record.read_text(encoding="utf-8")
+                    )
+                    if mode == "brokered-grandchild-tree":
+                        self.assertTrue(
+                            snapshot_state["spawned"],
+                            "fixture did not force the post-snapshot spawn race",
+                        )
+                        self.assertFalse(
+                            snapshot_state["child_in_private_job"],
+                            "fixture child unexpectedly remained in the private job",
+                        )
+                    self.assertFalse(
+                        inner_cwd.exists(),
+                        "a contained descendant kept the private cwd locked",
+                    )
+                    self.assertEqual(
+                        drain_counts[0], drain_counts[1],
+                        "Codex stdout/stderr pumps outlived the private workspace",
+                    )
+                finally:
+                    # This branch runs only if the regression returns.  It keeps a
+                    # failed test from leaving its deliberate 30-second fixture
+                    # child behind on a developer machine or CI runner.
+                    if inner_cwd is None and record.exists():
+                        try:
+                            inner_cwd = Path(
+                                json.loads(record.read_text(encoding="utf-8"))["cwd"]
+                            )
+                        except (OSError, ValueError, TypeError, KeyError):
+                            pass
+                    if (
+                        inner_cwd is not None and inner_cwd.exists()
+                        and child_record.exists()
+                    ):
+                        subprocess.run(
+                            [
+                                "taskkill", "/PID",
+                                str(json.loads(
+                                    child_record.read_text(encoding="utf-8")
+                                )["pid"]),
+                                "/T", "/F",
+                            ],
+                            stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=2,
+                            check=False,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                        shutil.rmtree(inner_cwd, ignore_errors=True)
 
     def test_missing_usage_remains_unreported(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

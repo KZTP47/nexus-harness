@@ -9,10 +9,13 @@ import math
 import os
 import re
 import secrets
+import threading
+import time
 import urllib.parse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .models import HarnessError
 from .safety import confined_path, put_this_file_in_place, read_this_file_patiently
@@ -255,6 +258,74 @@ def project_trust_store_path() -> Path:
     return user_config_path().parent / "trusted-projects.json"
 
 
+_PROJECT_TRUST_THREAD_LOCK = threading.RLock()
+# Four CI shards or desktop windows may arrive together, and one Windows
+# replace can legitimately spend about six seconds waiting for an indexer.
+# Keep the transaction bounded while allowing that full worst-case queue.
+_PROJECT_TRUST_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+@contextmanager
+def _project_trust_store_transaction(store_path: Path) -> Iterator[None]:
+    """Serialize the user-wide trust-store read/merge/publish transaction.
+
+    Separate Nexus processes can discover providers at the same time. The
+    target JSON is atomically published, but atomic replacement alone cannot
+    prevent two read-modify-write operations from losing each other's project
+    record. This byte lock is beside the user-owned store, never in a project.
+    """
+
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = store_path.with_suffix(".lock")
+    deadline = time.monotonic() + _PROJECT_TRUST_LOCK_TIMEOUT_SECONDS
+    with _PROJECT_TRUST_THREAD_LOCK, lock_path.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+            os.fsync(stream.fileno())
+        acquired = False
+        try:
+            while True:
+                try:
+                    stream.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if time.monotonic() >= deadline:
+                        raise HarnessError(
+                            "Another Nexus process is updating trusted project settings. "
+                            "Wait a moment and try again."
+                        ) from exc
+                    time.sleep(0.025)
+            yield
+        finally:
+            if acquired:
+                try:
+                    stream.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    # Closing the handle also releases the OS lock. Do not
+                    # hide an already committed trust record with an unlock
+                    # diagnostic from a handle being torn down concurrently.
+                    pass
+
+
 def _project_trust_key(root: Path) -> str:
     value = str(root.resolve())
     if os.name == "nt":
@@ -272,7 +343,7 @@ def is_project_local_config_trusted(root: Path, local_path: Path | None = None) 
         return False
     store_path = project_trust_store_path()
     try:
-        store = json.loads(store_path.read_text(encoding="utf-8"))
+        store = json.loads(read_this_file_patiently(store_path))
         record = store.get("projects", {}).get(_project_trust_key(root), {})
         metadata = path.stat()
         return (
@@ -280,7 +351,7 @@ def is_project_local_config_trusted(root: Path, local_path: Path | None = None) 
             and record.get("config_sha256") == _file_sha256(path)
             and record.get("config_size") == metadata.st_size
         )
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, HarnessError):
         return False
 
 
@@ -298,7 +369,7 @@ def is_project_shared_config_trusted(root: Path) -> bool:
     if not path.is_file():
         return False
     try:
-        store = json.loads(project_trust_store_path().read_text(encoding="utf-8"))
+        store = json.loads(read_this_file_patiently(project_trust_store_path()))
         record = store.get("projects", {}).get(_project_trust_key(root), {})
         metadata = path.stat()
         return (
@@ -306,7 +377,7 @@ def is_project_shared_config_trusted(root: Path) -> bool:
             and record.get("shared_sha256") == _file_sha256(path)
             and record.get("shared_size") == metadata.st_size
         )
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, HarnessError):
         return False
 
 
@@ -324,46 +395,73 @@ def trust_project_local_config(
     }
     if path not in allowed:
         raise ValueError(f"Refusing to trust a config outside this project's exact .harness files: {path}")
-    with path.open("rb") as handle:
-        before = os.fstat(handle.fileno())
-        contents = handle.read()
-        after = os.fstat(handle.fileno())
-    digest = hashlib.sha256(contents).hexdigest()
+
+    def stable_candidate() -> tuple[bytes, str, tuple[int, int, int, int]]:
+        with path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            contents = handle.read()
+            after = os.fstat(handle.fileno())
+        current = path.stat()
+        identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        identity_current = (
+            current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns,
+        )
+        if identity_before != identity_after or identity_after != identity_current:
+            raise ValueError(
+                "The settings file changed while trust was being recorded; nothing was trusted."
+            )
+        return contents, hashlib.sha256(contents).hexdigest(), identity_current
+
+    contents, digest, candidate_identity = stable_candidate()
     if expected_sha256 is not None:
         wanted = expected_sha256.strip().lower()
         if not re.fullmatch(r"[0-9a-f]{64}", wanted) or not secrets.compare_digest(digest, wanted):
             raise ValueError("The settings file changed after review; nothing was trusted.")
-    current = path.stat()
-    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-    identity_current = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
-    if identity_before != identity_after or identity_after != identity_current:
-        raise ValueError("The settings file changed while trust was being recorded; nothing was trusted.")
     store_path = project_trust_store_path()
-    try:
-        store = json.loads(store_path.read_text(encoding="utf-8")) if store_path.is_file() else {}
-    except (OSError, ValueError, TypeError):
-        store = {}
-    if not isinstance(store, dict):
-        store = {}
-    projects = store.get("projects")
-    if not isinstance(projects, dict):
-        projects = {}
-    kept = projects.get(_project_trust_key(resolved_root))
-    kept = dict(kept) if isinstance(kept, dict) else {}
-    shared = resolved_root / ".harness" / "config.json"
-    if path == shared.resolve():
-        kept["shared_sha256"] = digest
-        kept["shared_size"] = len(contents)
-    else:
-        kept["config_sha256"] = digest
-        kept["config_size"] = len(contents)
-    projects[_project_trust_key(resolved_root)] = kept
-    store = {"schema_version": 1, "projects": projects}
-    store_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = store_path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(store, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(temporary, store_path)
+    with _project_trust_store_transaction(store_path):
+        try:
+            store = (
+                json.loads(read_this_file_patiently(store_path))
+                if store_path.is_file() else {}
+            )
+        except FileNotFoundError:
+            store = {}
+        except (ValueError, TypeError):
+            store = {}
+        # The candidate was captured before waiting for the user-wide store.
+        # Another setup process may have changed this same project's config
+        # while we waited. Reopen and hash it at the commit boundary; trusting
+        # either the stale bytes or the other writer's unreviewed bytes would
+        # be an authority escalation.
+        locked_contents, locked_digest, locked_identity = stable_candidate()
+        if (
+            locked_contents != contents
+            or not secrets.compare_digest(locked_digest, digest)
+            or locked_identity != candidate_identity
+        ):
+            raise ValueError(
+                "The settings file changed while waiting to record trust; nothing was trusted."
+            )
+        if not isinstance(store, dict):
+            store = {}
+        projects = store.get("projects")
+        if not isinstance(projects, dict):
+            projects = {}
+        kept = projects.get(_project_trust_key(resolved_root))
+        kept = dict(kept) if isinstance(kept, dict) else {}
+        shared = resolved_root / ".harness" / "config.json"
+        if path == shared.resolve():
+            kept["shared_sha256"] = locked_digest
+            kept["shared_size"] = len(locked_contents)
+        else:
+            kept["config_sha256"] = locked_digest
+            kept["config_size"] = len(locked_contents)
+        projects[_project_trust_key(resolved_root)] = kept
+        store = {"schema_version": 1, "projects": projects}
+        put_this_file_in_place(
+            store_path, json.dumps(store, indent=2, sort_keys=True) + "\n"
+        )
     return store_path
 
 

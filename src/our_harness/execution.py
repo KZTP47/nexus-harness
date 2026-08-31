@@ -7,6 +7,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from . import cancellation
@@ -24,6 +25,11 @@ ALWAYS_DENIED = frozenset({
     "format-volume", "clear-disk", "initialize-disk",
     "restart-computer", "stop-computer", "shutdown", "reboot",
 })
+
+# WinBase.h CREATE_SUSPENDED.  ``subprocess`` does not export this creation
+# flag, but accepts the documented CreateProcess value in ``creationflags``.
+_WINDOWS_CREATE_SUSPENDED = 0x00000004
+_WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
 def _windows_process_cwd(working: Path) -> Path:
@@ -266,27 +272,45 @@ class CommandRunner:
         if os.name == "nt":
             # Without CREATE_NO_WINDOW every command run from the desktop app,
             # which has no console of its own, pops a black window on screen.
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            # Start suspended so the process cannot launch a child in the gap
+            # between CreateProcess and assignment to our containment job.
+            flags = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | subprocess.CREATE_NO_WINDOW
+                | _WINDOWS_CREATE_SUSPENDED
+            )
         reviewer_process_group = os.name != "nt" and os.environ.get("OUR_HARNESS_REVIEWER_PROCESS_GROUP") == "1"
         started = time.monotonic()
         deadline = started + timeout_seconds
-        process = subprocess.Popen(
-            actual,
-            cwd=process_cwd,
-            env=environment,
-            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            creationflags=flags,
-            start_new_session=os.name != "nt" and not reviewer_process_group,
-        )
-        try:
-            tree = _ProcessTree(process, reviewer_process_group=reviewer_process_group)
-        except Exception:
-            process.kill()
-            process.wait()
-            raise
+        def start_process(creation_flags: int) -> subprocess.Popen[bytes]:
+            return subprocess.Popen(
+                actual,
+                cwd=process_cwd,
+                env=environment,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                creationflags=creation_flags,
+                start_new_session=os.name != "nt" and not reviewer_process_group,
+            )
+
+        if os.name == "nt":
+            process, tree = _start_windows_contained_process(
+                lambda: start_process(flags | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB),
+                lambda: start_process(flags),
+                label="Command",
+            )
+        else:
+            process = start_process(flags)
+            try:
+                tree = _ProcessTree(
+                    process, reviewer_process_group=reviewer_process_group
+                )
+            except Exception:
+                process.kill()
+                process.wait()
+                raise
         unregister_cancel = cancellation.register(tree.kill)
         capture = _BoundedCapture(limit)
         readers = [
@@ -299,34 +323,20 @@ class CommandRunner:
         if stdin_text is not None:
             writer = threading.Thread(target=_write_stdin, args=(process.stdin, stdin_text.encode("utf-8")), daemon=True)
             writer.start()
-        timed_out = False
-        try:
-            process.wait(timeout=max(0.001, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            timed_out = True
+        timed_out = not tree.wait_for_root_until(deadline)
         if not timed_out:
             for worker in (*readers, *((writer,) if writer is not None else ())):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if not tree.join_worker_until(worker, deadline):
                     timed_out = True
                     break
-                worker.join(remaining)
-                if worker.is_alive():
-                    timed_out = True
-                    break
-        if timed_out:
-            tree.kill()
-        else:
-            # A command owns every descendant it starts. Closing the Windows
-            # job or killing the POSIX group prevents detached background work
-            # from surviving after a successful foreground command.
-            tree.kill_descendants_after_exit()
-        unregister_cancel()
-        tree.close()
+        workers = (*readers, *((writer,) if writer is not None else ()))
+        try:
+            settled = _settle_process_tree(tree, workers, terminate=timed_out)
+        finally:
+            unregister_cancel()
+            tree.close()
         cancellation.checkpoint()
-        if timed_out:
-            _wait_for_terminated_process(process)
-        if process.poll() is None:
+        if not settled and process.poll() is None:
             threading.Thread(target=_reap_process, args=(process,), daemon=True).start()
         duration = int((time.monotonic() - started) * 1000)
         stdout, stderr, output_truncated = capture.snapshot()
@@ -347,39 +357,400 @@ class _ProcessTree:
         self.process = process
         self.reviewer_process_group = reviewer_process_group
         self._closed = False
+        self._lock = threading.Lock()
+        self._termination_lock = threading.Lock()
+        self._windows_tree_lock = threading.Lock()
+        self._windows_tree_tokens: dict[int, int] = {}
+        self._windows_tree_parents: dict[int, int] = {}
+        self._windows_tree_handles: dict[int, int] = {}
+        self._windows_root_handle: int | None = None
         self._job = _WindowsJob(process) if os.name == "nt" else None
+        self._remember_windows_root()
+
+    @property
+    def windows_contained(self) -> bool:
+        return os.name != "nt" or bool(
+            self._job is not None and getattr(self._job, "handle", None)
+        )
+
+    def _remember_windows_root(self) -> None:
+        if os.name != "nt":
+            return
+        try:
+            handle = int(getattr(self.process, "_handle"))
+        except (AttributeError, TypeError, ValueError):
+            return
+        token = _windows_process_creation_token(handle)
+        if token is None:
+            return
+        with self._windows_tree_lock:
+            self._windows_root_handle = handle
+            self._windows_tree_tokens[self.process.pid] = token
+            self._windows_tree_parents[self.process.pid] = 0
+
+    def remember_windows_process_tree(self) -> None:
+        """Retain creation-time identities for brokered descendants.
+
+        Store/venv launchers can broker the real executable outside a Windows
+        job.  Polling while the request is active preserves each ancestry hop;
+        creation tokens later prevent a reused PID from becoming a kill target.
+        """
+
+        if os.name != "nt":
+            return
+        processes, snapshot_cutoff = _windows_process_snapshot()
+        if not processes:
+            return
+        with self._windows_tree_lock:
+            known_tokens = dict(self._windows_tree_tokens)
+            known_handles = dict(self._windows_tree_handles)
+            if self._windows_root_handle is not None:
+                known_handles[self.process.pid] = self._windows_root_handle
+        if not known_tokens:
+            return
+
+        descendants: set[int] = set()
+        changed = True
+        while changed:
+            changed = False
+            ancestry = set(known_tokens) | descendants
+            for pid, parent in processes.items():
+                if pid not in ancestry and parent in ancestry:
+                    descendants.add(pid)
+                    changed = True
+        if not descendants:
+            return
+
+        # Pin each candidate before trusting it.  The Toolhelp row can outlive
+        # the process that occupied its numeric PID.  A replacement opened
+        # after that snapshot necessarily has a creation time newer than the
+        # cutoff captured before CreateToolhelp32Snapshot and is rejected.
+        observed: dict[int, tuple[int, int]] = {}
+        for pid in descendants:
+            handle = _windows_open_process_handle(pid)
+            if handle is None:
+                continue
+            times = _windows_process_times(handle)
+            if times is None or times[0] > snapshot_cutoff:
+                _windows_close_process_handle(handle)
+                continue
+            observed[pid] = (handle, times[0])
+
+        # Validate one ancestry edge at a time against handles that pin the
+        # actual process identities.  If a remembered parent has exited,
+        # Windows may later reuse its PID; a real child must have been created
+        # no later than that parent's recorded exit time.  This ordering check
+        # prevents a child of a replacement process from joining our tree.
+        validated: set[int] = set()
+        changed = True
+        while changed:
+            changed = False
+            parents = set(known_tokens) | validated
+            for pid, (handle, token) in observed.items():
+                if pid in validated:
+                    continue
+                parent_pid = processes.get(pid, 0)
+                if parent_pid not in parents:
+                    continue
+                parent_handle = (
+                    observed[parent_pid][0]
+                    if parent_pid in validated
+                    else known_handles.get(parent_pid)
+                )
+                if parent_handle is None:
+                    continue
+                parent_times = _windows_process_times(parent_handle)
+                if parent_times is None or token < parent_times[0]:
+                    continue
+                parent_exit = _windows_process_exit_time(parent_handle)
+                if parent_exit is not None and token > parent_exit:
+                    continue
+                validated.add(pid)
+                changed = True
+
+        with self._windows_tree_lock:
+            for pid, (handle, token) in observed.items():
+                if pid not in validated:
+                    _windows_close_process_handle(handle)
+                    continue
+                existing = self._windows_tree_tokens.get(pid)
+                if existing is None:
+                    self._windows_tree_tokens[pid] = token
+                    self._windows_tree_parents[pid] = processes.get(pid, 0)
+                    self._windows_tree_handles[pid] = handle
+                else:
+                    # The first retained handle is the immutable identity for
+                    # this PID.  Never replace it from a later numeric scan.
+                    _windows_close_process_handle(handle)
+
+    def _terminate_remembered_windows_processes(self, deadline_at: float) -> bool:
+        if os.name != "nt":
+            return True
+        previous_signature: tuple[tuple[int, int], ...] | None = None
+        stable_empty_scans = 0
+        while time.monotonic() < deadline_at:
+            self.remember_windows_process_tree()
+            with self._windows_tree_lock:
+                tokens = dict(self._windows_tree_tokens)
+                parents = dict(self._windows_tree_parents)
+                handles = dict(self._windows_tree_handles)
+
+            def depth(pid: int) -> int:
+                seen: set[int] = set()
+                current = pid
+                value = 0
+                while current in parents and current not in seen:
+                    seen.add(current)
+                    current = parents[current]
+                    value += 1
+                return value
+
+            live = [
+                pid for pid, handle in handles.items()
+                if _windows_process_handle_is_running(handle)
+                and _windows_process_creation_token(handle) == tokens.get(pid)
+            ]
+            signature = tuple(sorted(tokens.items()))
+            if not live:
+                stable_empty_scans = (
+                    stable_empty_scans + 1
+                    if signature == previous_signature else 1
+                )
+                if stable_empty_scans >= 2:
+                    return True
+                previous_signature = signature
+                time.sleep(min(0.005, max(0.0, deadline_at - time.monotonic())))
+                continue
+
+            stable_empty_scans = 0
+            previous_signature = signature
+            for pid in sorted(live, key=depth, reverse=True):
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    return False
+                handle = handles[pid]
+                # The retained handle, not the numeric PID, is the destructive
+                # target.  Revalidate its creation token immediately before
+                # TerminateProcess as an additional fail-closed guard.
+                if _windows_process_creation_token(handle) != tokens[pid]:
+                    continue
+                _terminate_windows_process_handle(
+                    handle, timeout_seconds=min(0.1, remaining)
+                )
+            # A terminating launcher may create one last child after the prior
+            # snapshot.  Rescan from retained (even exited) intermediaries and
+            # require two stable empty observations before declaring quiescence.
+        return False
 
     def kill(self) -> None:
         if os.name == "nt":
-            if self._job is not None:
-                self._job.terminate()
+            # Normal execution is always assigned to our private job before
+            # resume.  If Windows nevertheless refuses job termination, use
+            # taskkill's bounded tree fallback while the root PID still names
+            # the family, then reap it below.
+            with self._termination_lock:
+                deadline = time.monotonic() + 1.0
+                self._terminate_remembered_windows_processes(deadline)
+                with self._lock:
+                    job = self._job
+                    assigned = bool(job is not None and getattr(job, "handle", None))
+                    terminated = job.terminate() if assigned else False
+                if not terminated:
+                    _terminate_windows_process_tree(
+                        self.process,
+                        timeout_seconds=max(0.05, deadline - time.monotonic()),
+                    )
             return
-        if self.reviewer_process_group:
-            # The command shares the killable reviewer group. A command timeout
-            # invalidates that reviewer, so terminate the complete isolation unit.
-            os.killpg(os.getpgrp(), signal.SIGKILL)
-            return
-        try:
-            os.killpg(self.process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        with self._termination_lock:
+            if self.reviewer_process_group:
+                # The command shares the killable reviewer group. A command timeout
+                # invalidates that reviewer, so terminate the complete isolation unit.
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+                return
+            # A reaped process no longer reserves its numeric PID/PGID.  Signalling
+            # that number can therefore hit an unrelated process group after PID
+            # reuse.  Normal command waits use waitid(WNOWAIT) below so the exited
+            # leader remains a zombie (and keeps the identity reserved) until this
+            # group signal has completed.  Holding the same lock used by the final
+            # reap closes the cancellation-vs-reap race around this check and signal.
+            if self.process.returncode is not None:
+                return
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def kill_descendants_after_exit(self) -> None:
-        if self.process.poll() is None:
-            return
         if self.reviewer_process_group:
             # The panel parent kills this group after collecting the worker's
             # atomic result, which removes any background descendants without
             # terminating the worker before it can report that result.
             return
+        # Do not call poll(): it reaps an exited leader and creates a PID-reuse
+        # window before killpg.  wait_for_root_until() deliberately observes a
+        # normal POSIX exit without reaping when the platform supports WNOWAIT.
+        # If another caller already reaped the process, kill() safely declines
+        # the now-unverifiable numeric process-group target.
         self.kill()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._job is not None:
-            self._job.close()
+        with self._termination_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
+                if self._job is not None:
+                    self._job.close()
+            with self._windows_tree_lock:
+                handles = list(self._windows_tree_handles.values())
+                self._windows_tree_handles.clear()
+            for handle in handles:
+                _windows_close_process_handle(handle)
+
+    def wait_until_terminated(self, timeout_seconds: float) -> bool:
+        """Wait boundedly for the root and every job-owned descendant.
+
+        The Windows job handle must stay open throughout this wait.  Waiting
+        only for ``Popen`` proves that the foreground process exited, not that
+        a child released inherited pipes or the command cwd.
+        """
+
+        deadline = time.monotonic() + max(0.001, float(timeout_seconds))
+        with self._termination_lock:
+            tracked_done = self._terminate_remembered_windows_processes(deadline)
+            root_done = _wait_for_terminated_process(
+                self.process, timeout_seconds=max(0.001, deadline - time.monotonic())
+            )
+            job_done = True
+            if os.name == "nt":
+                with self._lock:
+                    job = self._job
+                    assigned = bool(job is not None and getattr(job, "handle", None))
+                if assigned:
+                    job_done = job.wait_until_empty(
+                        max(0.001, deadline - time.monotonic())
+                    )
+                tracked_done = self._terminate_remembered_windows_processes(deadline)
+            return root_done and job_done and tracked_done
+
+    def wait_for_root_until(self, deadline_at: float) -> bool:
+        """Wait for the foreground process while observing brokered children."""
+
+        if os.name != "nt":
+            if not self.reviewer_process_group:
+                observed = _wait_for_posix_root_without_reaping(
+                    self.process, deadline_at
+                )
+                if observed is not None:
+                    return observed
+            try:
+                self.process.wait(timeout=max(0.001, deadline_at - time.monotonic()))
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+        while True:
+            self.remember_windows_process_tree()
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                return self.process.poll() is not None
+            try:
+                self.process.wait(timeout=min(0.01, remaining))
+                self.remember_windows_process_tree()
+                return True
+            except subprocess.TimeoutExpired:
+                continue
+
+    def join_worker_until(
+        self,
+        worker: threading.Thread,
+        deadline_at: float,
+        *,
+        terminate_observed: bool = False,
+    ) -> bool:
+        """Join one pipe pump while observing processes that retain its pipe."""
+
+        if os.name != "nt":
+            worker.join(max(0, deadline_at - time.monotonic()))
+            return not worker.is_alive()
+        while worker.is_alive():
+            self.remember_windows_process_tree()
+            if terminate_observed:
+                with self._termination_lock:
+                    self._terminate_remembered_windows_processes(deadline_at)
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                return False
+            worker.join(min(0.01, remaining))
+        self.remember_windows_process_tree()
+        return True
+
+
+def _close_process_pipes(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _discard_suspended_process(
+    process: subprocess.Popen[bytes], tree: _ProcessTree | None,
+) -> None:
+    """Reap a CREATE_SUSPENDED process before any of its code can run."""
+
+    try:
+        if tree is not None and tree.windows_contained:
+            tree.kill()
+            tree.wait_until_terminated(2.0)
+        else:
+            _wait_for_terminated_process(process, timeout_seconds=2.0)
+    finally:
+        if tree is not None:
+            tree.close()
+        _close_process_pipes(process)
+
+
+def _start_windows_contained_process(
+    start_breakaway: Callable[[], subprocess.Popen[bytes]],
+    start_nested: Callable[[], subprocess.Popen[bytes]],
+    *,
+    label: str,
+) -> tuple[subprocess.Popen[bytes], _ProcessTree]:
+    """Create outside an inherited job, assign privately, then resume.
+
+    Parent CI jobs can enable SILENT_BREAKAWAY, which can let descendants escape
+    a nested private job even though assigning the root appeared to succeed.
+    Proactively create the suspended root with CREATE_BREAKAWAY_FROM_JOB so our
+    job is its only owner.  If the parent explicitly denies breakaway, retry a
+    still-suspended nested launch and require private assignment there.  In
+    every path user code starts only after containment succeeds.
+    """
+
+    try:
+        process = start_breakaway()
+    except OSError as breakaway_error:
+        if getattr(breakaway_error, "winerror", None) != 5:
+            raise HarnessError(f"{label} could not start: {breakaway_error}") from breakaway_error
+        try:
+            process = start_nested()
+        except OSError as nested_error:
+            raise HarnessError(f"{label} could not start: {nested_error}") from nested_error
+    tree: _ProcessTree | None = None
+    try:
+        tree = _ProcessTree(process)
+    except Exception:
+        _discard_suspended_process(process, tree)
+        raise
+    if not tree.windows_contained:
+        _discard_suspended_process(process, tree)
+        raise HarnessError(
+            f"{label} cannot run safely because Windows refused its private process job"
+        )
+    if not _resume_windows_process(process):
+        _discard_suspended_process(process, tree)
+        raise HarnessError(f"{label} could not resume its contained Windows process")
+    return process, tree
 
 
 if os.name == "nt":
@@ -419,8 +790,52 @@ if os.name == "nt":
             ("PeakJobMemoryUsed", ctypes.c_size_t),
         ]
 
+    class _JobBasicAccountingInformation(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_longlong),
+            ("TotalKernelTime", ctypes.c_longlong),
+            ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+            ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+            ("TotalPageFaultCount", wintypes.DWORD),
+            ("TotalProcesses", wintypes.DWORD),
+            ("ActiveProcesses", wintypes.DWORD),
+            ("TotalTerminatedProcesses", wintypes.DWORD),
+        ]
+
+    class _ThreadEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+        ]
+
+    class _ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [
+            ("dwLowDateTime", wintypes.DWORD),
+            ("dwHighDateTime", wintypes.DWORD),
+        ]
+
     class _WindowsJob:
         _KILL_ON_JOB_CLOSE = 0x00002000
+        _BASIC_ACCOUNTING_INFORMATION = 1
         _EXTENDED_LIMIT_INFORMATION = 9
 
         def __init__(self, process: subprocess.Popen[bytes]):
@@ -439,6 +854,14 @@ if os.name == "nt":
             kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
             kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
             kernel32.TerminateJobObject.restype = wintypes.BOOL
+            kernel32.QueryInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+                ctypes.c_void_p,
+            ]
+            kernel32.QueryInformationJobObject.restype = wintypes.BOOL
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
             kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -459,29 +882,264 @@ if os.name == "nt":
             if not kernel32.AssignProcessToJobObject(self.handle, wintypes.HANDLE(int(process._handle))):
                 error = ctypes.WinError(ctypes.get_last_error())
                 self.close()
-                # A job is how one command and everything it starts get stopped
-                # together. Some machines will not allow it: a build server
-                # already puts every step inside a job of its own, and Windows
-                # refuses to put a process in a second one. Refusing to run the
-                # command at all was the wrong answer to that - it made every
-                # command on such a machine fail for a reason nothing to do
-                # with the command. So it runs without one, and stopping it
-                # stops the command itself rather than its whole tree.
+                # A nested build/CI job can refuse assignment.  The caller has
+                # deliberately not resumed this process yet: it may retry a
+                # suspended breakaway launch, or fail closed before user code
+                # gets a chance to start a descendant outside containment.
                 if getattr(error, "winerror", 0) == 5:
                     self.handle = None
                     return
                 raise HarnessError(f"Cannot assign command to a Windows process job: {error}")
 
-        def terminate(self) -> None:
-            if self.handle:
-                self._kernel32.TerminateJobObject(self.handle, 124)
+        def terminate(self) -> bool:
+            if not self.handle:
+                return False
+            return bool(self._kernel32.TerminateJobObject(self.handle, 124))
+
+        def wait_until_empty(self, timeout_seconds: float) -> bool:
+            """Wait until Windows reports no active process in this job."""
+
+            if not self.handle:
+                return False
+            deadline = time.monotonic() + max(0.001, float(timeout_seconds))
+            while True:
+                information = _JobBasicAccountingInformation()
+                queried = self._kernel32.QueryInformationJobObject(
+                    self.handle,
+                    self._BASIC_ACCOUNTING_INFORMATION,
+                    ctypes.byref(information),
+                    ctypes.sizeof(information),
+                    None,
+                )
+                if not queried:
+                    return False
+                if int(information.ActiveProcesses) == 0:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                # QueryInformationJobObject has no event for the general
+                # TerminateJobObject case.  A short bounded poll retains the
+                # job handle until the kernel releases all process references.
+                time.sleep(min(0.01, remaining))
 
         def close(self) -> None:
             if self.handle:
                 self._kernel32.CloseHandle(self.handle)
                 self.handle = None
+
+    def _resume_windows_process(process: subprocess.Popen[bytes]) -> bool:
+        """Resume every initial thread after the process is contained.
+
+        ``subprocess.Popen`` closes CreateProcess' primary-thread handle before
+        returning.  Enumerating the still-suspended process' thread is the
+        documented Win32 route left to resume it.  No user code can execute or
+        spawn a descendant before this function succeeds.
+        """
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+        kernel32.Thread32First.restype = wintypes.BOOL
+        kernel32.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ThreadEntry32)]
+        kernel32.Thread32Next.restype = wintypes.BOOL
+        kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenThread.restype = wintypes.HANDLE
+        kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+        kernel32.ResumeThread.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000004, 0)  # TH32CS_SNAPTHREAD
+        if snapshot == wintypes.HANDLE(-1).value:
+            return False
+        resumed = False
+        try:
+            entry = _ThreadEntry32()
+            entry.dwSize = ctypes.sizeof(entry)
+            more = bool(kernel32.Thread32First(snapshot, ctypes.byref(entry)))
+            while more:
+                if int(entry.th32OwnerProcessID) == int(process.pid):
+                    thread = kernel32.OpenThread(
+                        0x0002,  # THREAD_SUSPEND_RESUME
+                        False,
+                        entry.th32ThreadID,
+                    )
+                    if thread:
+                        try:
+                            if int(kernel32.ResumeThread(thread)) != 0xFFFFFFFF:
+                                resumed = True
+                        finally:
+                            kernel32.CloseHandle(thread)
+                entry.dwSize = ctypes.sizeof(entry)
+                more = bool(kernel32.Thread32Next(snapshot, ctypes.byref(entry)))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return resumed
+
+    def _windows_process_times(handle: int) -> tuple[int, int] | None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+            ctypes.POINTER(_FileTime),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        created = _FileTime()
+        exited = _FileTime()
+        kernel = _FileTime()
+        user = _FileTime()
+        if not kernel32.GetProcessTimes(
+            wintypes.HANDLE(handle),
+            ctypes.byref(created),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+        return (
+            (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime),
+            (int(exited.dwHighDateTime) << 32) | int(exited.dwLowDateTime),
+        )
+
+    def _windows_process_creation_token(handle: int) -> int | None:
+        times = _windows_process_times(handle)
+        return None if times is None else times[0]
+
+    def _windows_open_process_handle(pid: int) -> int | None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(
+            0x0001 | 0x00100000 | 0x1000,
+            # PROCESS_TERMINATE | SYNCHRONIZE |
+            # PROCESS_QUERY_LIMITED_INFORMATION
+            False,
+            int(pid),
+        )
+        return int(handle) if handle else None
+
+    def _windows_close_process_handle(handle: int) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+    def _windows_process_handle_is_running(handle: int) -> bool:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        return int(kernel32.WaitForSingleObject(wintypes.HANDLE(handle), 0)) == 0x102
+
+    def _windows_process_exit_time(handle: int) -> int | None:
+        """Return None while live; fail closed with zero for an invalid exit."""
+
+        if _windows_process_handle_is_running(handle):
+            return None
+        times = _windows_process_times(handle)
+        if times is None or times[1] <= 0:
+            return 0
+        return times[1]
+
+    def _windows_filetime_now() -> int:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        value = _FileTime()
+        try:
+            precise = kernel32.GetSystemTimePreciseAsFileTime
+        except AttributeError:
+            precise = kernel32.GetSystemTimeAsFileTime
+        precise.argtypes = [ctypes.POINTER(_FileTime)]
+        precise.restype = None
+        precise(ctypes.byref(value))
+        return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+    def _windows_process_snapshot() -> tuple[dict[int, int], int]:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # The cutoff precedes the Toolhelp capture.  If the snapshotted PID
+        # exits and is reused before OpenProcess, its replacement is newer than
+        # this value and therefore cannot be enrolled from the stale row.
+        snapshot_cutoff = _windows_filetime_now()
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)
+        ]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)
+        ]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot or snapshot == wintypes.HANDLE(-1).value:
+            return {}, snapshot_cutoff
+        processes: dict[int, int] = {}
+        try:
+            entry = _ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            more = bool(kernel32.Process32FirstW(snapshot, ctypes.byref(entry)))
+            while more:
+                processes[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                entry.dwSize = ctypes.sizeof(entry)
+                more = bool(kernel32.Process32NextW(snapshot, ctypes.byref(entry)))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        return processes, snapshot_cutoff
+
+    def _terminate_windows_process_handle(
+        handle: int, *, timeout_seconds: float,
+    ) -> bool:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        native = wintypes.HANDLE(handle)
+        if not kernel32.TerminateProcess(native, 124):
+            if int(kernel32.WaitForSingleObject(native, 0)) != 0:
+                return False
+        wait_ms = max(1, int(max(0.001, timeout_seconds) * 1000))
+        return int(kernel32.WaitForSingleObject(native, wait_ms)) == 0
+
 else:
     _WindowsJob = None  # type: ignore[assignment,misc]
+
+    def _resume_windows_process(_process: subprocess.Popen[bytes]) -> bool:
+        return True
+
+    def _windows_process_creation_token(_handle: int) -> int | None:
+        return None
+
+    def _windows_process_times(_handle: int) -> tuple[int, int] | None:
+        return None
+
+    def _windows_open_process_handle(_pid: int) -> int | None:
+        return None
+
+    def _windows_close_process_handle(_handle: int) -> None:
+        return None
+
+    def _windows_process_handle_is_running(_handle: int) -> bool:
+        return False
+
+    def _windows_process_exit_time(_handle: int) -> int | None:
+        return 0
+
+    def _windows_filetime_now() -> int:
+        return 0
+
+    def _windows_process_snapshot() -> tuple[dict[int, int], int]:
+        return {}, 0
+
+    def _terminate_windows_process_handle(
+        _handle: int, *, timeout_seconds: float,
+    ) -> bool:
+        return True
+
 
 
 class _BoundedCapture:
@@ -537,6 +1195,38 @@ def _write_stdin(pipe: object, payload: bytes) -> None:
             pass
 
 
+def _terminate_windows_process_tree(
+    process: subprocess.Popen[bytes], *, timeout_seconds: float,
+) -> bool:
+    """Use Windows' tree-aware fallback when a private job was unavailable."""
+
+    if os.name != "nt":
+        return False
+    # Run this while the root PID is still alive.  Killing just the root first
+    # can leave an already-started child outside any tree we can identify.
+    completed = False
+    if process.poll() is None:
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(0.05, float(timeout_seconds)),
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            completed = result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    return completed
+
+
 def _reap_process(process: subprocess.Popen[bytes]) -> None:
     try:
         process.wait()
@@ -544,15 +1234,91 @@ def _reap_process(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def _wait_for_terminated_process(process: subprocess.Popen[bytes]) -> None:
-    """Boundedly release a timed-out process' cwd and pipe handles before returning."""
+def _wait_for_terminated_process(
+    process: subprocess.Popen[bytes], *, timeout_seconds: float = 4.0,
+) -> bool:
+    """Boundedly kill and reap one process before its workspace is removed."""
+
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
     try:
-        process.wait(timeout=2)
-        return
+        process.wait(timeout=max(0.001, float(timeout_seconds)))
+        return process.poll() is not None
     except (OSError, subprocess.TimeoutExpired):
-        pass
-    try:
-        process.kill()
-        process.wait(timeout=2)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+        return process.poll() is not None
+
+
+def _wait_for_posix_root_without_reaping(
+    process: subprocess.Popen[bytes], deadline_at: float,
+) -> bool | None:
+    """Observe one POSIX child exit while retaining its PID/PGID identity.
+
+    ``None`` means this platform cannot provide a non-reaping wait and the
+    caller must use the ordinary Popen wait.  In that fallback, later process-
+    group cleanup intentionally skips killpg once Popen has reaped the leader.
+    """
+
+    waitid = getattr(os, "waitid", None)
+    p_pid = getattr(os, "P_PID", None)
+    wexited = getattr(os, "WEXITED", None)
+    wnohang = getattr(os, "WNOHANG", None)
+    wnowait = getattr(os, "WNOWAIT", None)
+    if (
+        not callable(waitid)
+        or p_pid is None
+        or wexited is None
+        or wnohang is None
+        or wnowait is None
+    ):
+        return None
+    flags = int(wexited) | int(wnohang) | int(wnowait)
+    while True:
+        # A Popen method used elsewhere may already have reaped the process.
+        # Report completion without pretending its numeric group is still safe.
+        if process.returncode is not None:
+            return True
+        try:
+            status = waitid(p_pid, process.pid, flags)
+        except (ChildProcessError, OSError):
+            return None
+        if status is not None:
+            return True
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.01, remaining))
+
+
+def _settle_process_tree(
+    tree: _ProcessTree,
+    workers: tuple[threading.Thread, ...] | list[threading.Thread],
+    *,
+    terminate: bool,
+    timeout_seconds: float = 5.0,
+) -> bool:
+    """Terminate a command tree and quiesce every stdio pump, boundedly.
+
+    Keeping the tree (and therefore its Windows job handle) open until after
+    the readers and writer finish is intentional.  A foreground process can
+    be reaped while a descendant still owns the cwd or inherited pipe handles.
+    """
+
+    deadline = time.monotonic() + max(0.001, float(timeout_seconds))
+    if terminate:
+        tree.kill()
+    else:
+        tree.kill_descendants_after_exit()
+    tree_done = tree.wait_until_terminated(
+        max(0.001, deadline - time.monotonic())
+    )
+    workers_done = True
+    for worker in workers:
+        if not tree.join_worker_until(
+            worker, deadline, terminate_observed=True
+        ):
+            workers_done = False
+            break
+    return tree_done and workers_done and tree.process.poll() is not None

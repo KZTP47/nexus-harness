@@ -1129,6 +1129,31 @@ class WritingAFileSomethingElseIsReading(unittest.TestCase):
             list(self.where.parent.iterdir()), [], "and it tidies up after itself"
         )
 
+    def test_a_transient_replace_collision_retries_the_unique_file_and_cleans_it(self) -> None:
+        real_replace = os.replace
+        attempts = 0
+        temporary_names: list[str] = []
+
+        def transient(source, destination):
+            nonlocal attempts
+            attempts += 1
+            temporary_names.append(Path(source).name)
+            if attempts < 3:
+                raise PermissionError("another process is publishing")
+            return real_replace(source, destination)
+
+        with mock.patch("our_harness.safety.os.replace", side_effect=transient):
+            safety.put_this_file_in_place(self.where, "eventually lands\n")
+
+        self.assertEqual(self.where.read_text(encoding="utf-8"), "eventually lands\n")
+        self.assertEqual(attempts, 3)
+        self.assertEqual(len(set(temporary_names)), 1, "retries moved the exact same file")
+        self.assertIn(f".{os.getpid()}-", temporary_names[0])
+        self.assertEqual(
+            list(self.where.parent.iterdir()), [self.where],
+            "successful retry left its unique temporary file behind",
+        )
+
 
 class AsDeepAsARunReallyGoes(TimerTestCase):
     """Nearly the right depth is worse than not trying.

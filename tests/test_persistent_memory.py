@@ -645,37 +645,90 @@ class PersistentMemoryHookTests(unittest.TestCase):
             "import os,sys,time; from pathlib import Path; "
             "from our_harness.persistent_memory import _checkout_deployment_lock; "
             "root=Path(sys.argv[1]); marker=Path(sys.argv[2]); label=sys.argv[3]; delay=float(sys.argv[4]); "
+            "identity=Path(sys.argv[5]); "
             "lock=_checkout_deployment_lock(root,5,purpose=label); lock.__enter__(); "
+            "identity.write_text(str(os.getpid()),encoding='utf-8'); "
             "marker.open('a',encoding='utf-8').write(label+':start\\n'); "
             "time.sleep(delay); marker.open('a',encoding='utf-8').write(label+':end\\n'); lock.__exit__(None,None,None)"
         )
+        started_processes: list[subprocess.Popen[bytes]] = []
+
+        def reap_started_processes() -> None:
+            for process in reversed(started_processes):
+                if process.poll() is not None:
+                    continue
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+
+        self.addCleanup(reap_started_processes)
+        first_identity = self.project / "deployment-owner-one.pid"
         first = subprocess.Popen(
-            [sys.executable, "-c", worker, str(self.project), str(marker), "one", "0.45"],
+            [
+                sys.executable,
+                "-c",
+                worker,
+                str(self.project),
+                str(marker),
+                "one",
+                "0.45",
+                str(first_identity),
+            ],
             env=environment,
         )
+        started_processes.append(first)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
             if marker.is_file() and "one:start" in marker.read_text(encoding="utf-8"):
                 break
             time.sleep(0.02)
         else:
-            first.kill()
             self.fail("first deployment-lock process did not acquire the lock")
         owner = json.loads((self.project / DEPLOYMENT_LOCK_OWNER).read_text(encoding="utf-8"))
         self.assertEqual(owner["state"], "owning")
-        self.assertEqual(owner["pid"], first.pid)
+        # A Windows Store-backed venv can expose a short-lived launcher as
+        # Popen.pid while a child interpreter executes the worker.  The PID
+        # published by that interpreter is the authoritative lock owner.
+        self.assertEqual(owner["pid"], int(first_identity.read_text(encoding="utf-8")))
         self.assertEqual(owner["project_root"], str(self.project.resolve()))
 
+        with self.assertRaisesRegex(HarnessError, "live OS lock was not broken"):
+            with _checkout_deployment_lock(self.project, 0.1, purpose="must-time-out"):
+                self.fail("a live deployment lock was stolen")
+        still_owned = json.loads(
+            (self.project / DEPLOYMENT_LOCK_OWNER).read_text(encoding="utf-8")
+        )
+        self.assertEqual(still_owned["pid"], owner["pid"])
+        self.assertEqual(still_owned["purpose"], "one")
+
+        second_identity = self.project / "deployment-owner-two.pid"
         second = subprocess.Popen(
-            [sys.executable, "-c", worker, str(self.project), str(marker), "two", "0.02"],
+            [
+                sys.executable,
+                "-c",
+                worker,
+                str(self.project),
+                str(marker),
+                "two",
+                "0.02",
+                str(second_identity),
+            ],
             env=environment,
         )
+        started_processes.append(second)
         self.assertEqual(first.wait(timeout=10), 0)
         self.assertEqual(second.wait(timeout=10), 0)
         self.assertEqual(
             marker.read_text(encoding="utf-8").splitlines(),
             ["one:start", "one:end", "two:start", "two:end"],
         )
+        released = json.loads(
+            (self.project / DEPLOYMENT_LOCK_OWNER).read_text(encoding="utf-8")
+        )
+        self.assertEqual(released["state"], "released")
+        self.assertEqual(released["pid"], int(second_identity.read_text(encoding="utf-8")))
 
         crashed = (
             "import os,sys; from pathlib import Path; "

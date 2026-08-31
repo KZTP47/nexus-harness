@@ -7169,6 +7169,13 @@ const swarmConversationTranscriptRefreshes = new Set();
 // saved chat ID is known, drafting/navigation are safe but any provider or
 // lifecycle action would run under the temporary legacy agent identity.
 const swarmConversationHydrating = new Set();
+// Metadata and transcript fetches are independent renderer-owned lanes.
+// Routine same-lane overlap is revision-guarded rather than aborted, so a
+// metadata read cannot strand transcript intent (or vice versa). Closing the
+// card or changing boards aborts every tracked request in both lanes.
+const swarmConversationListControllers = new Map();
+const swarmConversationTranscriptControllers = new Map();
+let swarmConversationBoardVersion = null;
 // Reset is a lifecycle mutation on one exact saved chat. It may continue in
 // Electron after the server transcript reset has returned, so keep a separate
 // exact-chat lease until both halves have finished.
@@ -7958,6 +7965,12 @@ function keptTranscriptFor(agentId) {
     ? held.said : [];
 }
 
+function keptChatNoticeFor(agentId) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  return held?.noticeFor === transcriptIdentityFor(agentId)
+    ? String(held.notice || "") : "";
+}
+
 function nextConversationListRevision(agentId) {
   const revision = (swarmConversationListRevisions.get(agentId) || 0) + 1;
   swarmConversationListRevisions.set(agentId, revision);
@@ -7975,6 +7988,51 @@ function nextSwarmChatRevision(agentId) {
   // the pair-chat key keeps revisions independent once it is selected again.
   swarmChatRevisions.set(agentId, revision);
   return revision;
+}
+
+function beginConversationRead(controllers, agentId) {
+  const controller = new AbortController();
+  let lane = controllers.get(agentId);
+  if (!lane) {
+    lane = new Set();
+    controllers.set(agentId, lane);
+  }
+  lane.add(controller);
+  return controller;
+}
+
+function finishConversationRead(controllers, agentId, controller) {
+  const lane = controllers.get(agentId);
+  if (!lane) return;
+  lane.delete(controller);
+  if (!lane.size) controllers.delete(agentId);
+}
+
+function cancelConversationReadLane(controllers, agentId) {
+  for (const controller of controllers.get(agentId) || []) controller.abort();
+  controllers.delete(agentId);
+}
+
+// Closing/removing a chat discards its read intent. A surviving chat on a new
+// board revision is different: its old transcript request is stale, but the
+// next metadata read must inherit that intent and fetch the durable answer.
+function cancelConversationReadsFor(agentId, preserveTranscriptIntent = false) {
+  const transcriptWasRequested = swarmConversationTranscriptRefreshes.has(agentId) || Boolean(
+    swarmConversationTranscriptControllers.get(agentId)?.size
+  );
+  cancelConversationReadLane(swarmConversationListControllers, agentId);
+  cancelConversationReadLane(swarmConversationTranscriptControllers, agentId);
+  if (preserveTranscriptIntent && transcriptWasRequested) {
+    swarmConversationTranscriptRefreshes.add(agentId);
+  } else {
+    swarmConversationTranscriptRefreshes.delete(agentId);
+  }
+  nextConversationListRevision(agentId);
+  nextSwarmChatRevision(agentId);
+}
+
+function conversationReadWasCancelled(error) {
+  return error?.name === "AbortError";
 }
 
 function aChatActivityPanel(extraClass = "") {
@@ -8445,6 +8503,19 @@ async function refreshSwarm(quietly) {
 // What was picked, or a chat that was open, may have been removed in another
 // window. Rather than a panel showing an agent that is not there, it falls away.
 function keepTheSwarmPick() {
+  const boardVersion = String(theSwarmBoard()?.version ?? "");
+  if (swarmConversationBoardVersion !== null
+      && boardVersion !== swarmConversationBoardVersion) {
+    for (const held of swarmChats) {
+      cancelConversationReadsFor(held.agent, Boolean(theSwarmAgent(held.agent)));
+    }
+  }
+  swarmConversationBoardVersion = boardVersion;
+  for (const held of swarmChats) {
+    if (theSwarmAgent(held.agent)) continue;
+    cancelConversationReadsFor(held.agent);
+    swarmConversationHydrating.delete(held.agent);
+  }
   swarmChats = swarmChats.filter((one) => theSwarmAgent(one.agent));
   for (const agentId of swarmAgentSettingDrafts.keys()) {
     if (!theSwarmAgent(agentId)) discardSwarmAgentSettings(agentId);
@@ -10011,6 +10082,8 @@ async function openTheChatFor(agentId) {
       minimised: false,
       said: [],
       saidFor: "",
+      notice: "",
+      noticeFor: "",
       conversations: [],
       conversation: "",
     });
@@ -10031,6 +10104,7 @@ async function openTheChatFor(agentId) {
 }
 
 function closeTheChatFor(agentId) {
+  cancelConversationReadsFor(agentId);
   swarmConversationHydrating.delete(agentId);
   swarmConversationTranscriptRefreshes.delete(agentId);
   swarmChats = swarmChats.filter((one) => one.agent !== agentId);
@@ -10123,7 +10197,7 @@ function connectedPairsFor(agentId) {
 
 function applyConversationList(agentId, said) {
   const held = swarmChats.find((one) => one.agent === agentId);
-  if (!held) return;
+  if (!held) return false;
   swarmConversationHydrating.delete(agentId);
   const before = held.conversation;
   rememberSwarmChatComposer(agentId);
@@ -10135,7 +10209,9 @@ function applyConversationList(agentId, said) {
   // Selection and transcript become one atomic piece of visible state. A
   // transcript is never reusable merely because it belongs to the same lead
   // agent; it must belong to this exact pair-chat id.
-  if (before !== held.conversation || held.saidFor !== transcriptIdentityFor(agentId)) {
+  const identityChanged = before !== held.conversation
+    || held.saidFor !== transcriptIdentityFor(agentId);
+  if (identityChanged) {
     held.said = [];
     held.saidFor = transcriptIdentityFor(agentId);
     nextSwarmChatRevision(agentId);
@@ -10151,35 +10227,43 @@ function applyConversationList(agentId, said) {
     setWhatCanBePressedInAChat(card);
   }
   if (theBigOne === agentId) renderTheBigChat();
+  return identityChanged;
 }
 
 async function loadConversationsFor(agentId, refresh = true) {
   const held = swarmChats.find((one) => one.agent === agentId);
-  if (!held) return;
+  if (!held) return false;
   if (refresh || swarmChatIsHydrating(agentId)) {
     swarmConversationTranscriptRefreshes.add(agentId);
   }
-  if (swarmConversationSwitching.has(agentId)) return;
+  if (swarmConversationSwitching.has(agentId)) return false;
+  const controller = beginConversationRead(swarmConversationListControllers, agentId);
   const revision = nextConversationListRevision(agentId);
   try {
     const said = await request(
-      `/api/swarm/chats?agent=${encodeURIComponent(agentId)}`
+      `/api/swarm/chats?agent=${encodeURIComponent(agentId)}`,
+      {signal: controller.signal},
     );
-    if (!swarmChats.includes(held)
-        || swarmConversationListRevisions.get(agentId) !== revision) return;
-    applyConversationList(agentId, said);
+    if (controller.signal.aborted || !swarmChats.includes(held)
+        || swarmConversationListRevisions.get(agentId) !== revision) return false;
+    const identityChanged = applyConversationList(agentId, said);
     // A metadata-only request may have superseded a full request while both
     // were in flight. The winning request inherits the pending transcript
     // intent instead of leaving a correctly selected chat visibly empty.
-    const refreshTranscript = swarmConversationTranscriptRefreshes.delete(agentId);
+    const refreshTranscript = swarmConversationTranscriptRefreshes.delete(agentId)
+      || identityChanged;
     if (refreshTranscript && swarmConversationListRevisions.get(agentId) === revision) {
       await refreshTheChatFor(agentId);
     }
+    return !controller.signal.aborted;
   } catch (error) {
-    if (swarmConversationListRevisions.get(agentId) !== revision) return;
+    if (conversationReadWasCancelled(error)) return false;
+    if (swarmConversationListRevisions.get(agentId) !== revision) return false;
     sayInTheChatFor(agentId, error.message);
     sayInBigChatConversationFor(agentId, error.message);
+    return false;
   } finally {
+    finishConversationRead(swarmConversationListControllers, agentId, controller);
     setWhatCanBePressedInSwarm();
   }
 }
@@ -10853,9 +10937,10 @@ function oneSwarmChatCard(held) {
     () => closeTheChatFor(held.agent), `close the chat with ${agent.name}`, "close"));
   card.append(bar);
 
-  card.append(make("p", "swarm-chat-said hint", agent.ready
+  const keptNotice = keptChatNoticeFor(held.agent);
+  card.append(make("p", "swarm-chat-said hint", keptNotice || (agent.ready
     ? (agent.trouble_last_time || "Nobody else reads this.")
-    : (agent.why_not || "This one is not set up yet.")));
+    : (agent.why_not || "This one is not set up yet."))));
   if (agent.how_to_fix_it) {
     card.append(make("p", "swarm-chat-repair hint", agent.how_to_fix_it));
   }
@@ -10980,6 +11065,10 @@ function oneSwarmChatCard(held) {
     (one, index) => attachmentChip(held.agent, one, index)));
   card.append(form);
   makeTheChatCardDraggable(card, grip, held);
+  // The first card render happens before its saved conversation identity is
+  // hydrated. Apply the same lifecycle locks immediately; waiting for the
+  // request's finally block leaves Start again briefly enabled under legacy ID.
+  setWhatCanBePressedInAChat(card);
   return card;
 }
 
@@ -11033,8 +11122,13 @@ function makeTheChatCardDraggable(card, grip, held) {
 }
 
 function sayInTheChatFor(agentId, words) {
+  const held = swarmChats.find((one) => one.agent === agentId);
+  if (held) {
+    held.notice = String(words || "");
+    held.noticeFor = transcriptIdentityFor(agentId);
+  }
   const card = theChatCardFor(agentId);
-  if (card) card.querySelector(".swarm-chat-said").textContent = words;
+  if (card) card.querySelector(".swarm-chat-said").textContent = String(words || "");
 }
 
 function bigChatShows(agentId, conversationId = undefined) {
@@ -11112,8 +11206,11 @@ function setWhatCanBePressedInAChat(card) {
   setSwarmProjectWorkControl(
     card.querySelector(".swarm-chat-work"), workDisabled, workTitle, card.dataset.agent,
   );
-  card.querySelector(".swarm-chat-again").disabled =
-    waiting || !agent || Boolean(bindingProblem);
+  const startAgain = card.querySelector(".swarm-chat-again");
+  startAgain.disabled = waiting || !agent || Boolean(bindingProblem);
+  startAgain.title = identityChanging
+    ? "Wait while Nexus opens the selected saved chat."
+    : bindingWords;
   renderWorkRecoveryButtons(card.dataset.agent);
 }
 
@@ -11159,6 +11256,7 @@ async function stopChatFor(agentId) {
 async function refreshTheChatFor(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
+  const controller = beginConversationRead(swarmConversationTranscriptControllers, agentId);
   const conversation = activeConversationFor(agentId);
   const conversationId = conversation?.id || "";
   const revisionKey = swarmChatKey(agentId);
@@ -11166,8 +11264,10 @@ async function refreshTheChatFor(agentId) {
   try {
     const said = await request(
       `/api/swarm/said?agent=${encodeURIComponent(agentId)}`
-      + (conversation ? `&chat=${encodeURIComponent(conversation.id)}` : ""));
-    if (activeConversationIdFor(agentId) !== conversationId
+      + (conversation ? `&chat=${encodeURIComponent(conversation.id)}` : ""),
+      {signal: controller.signal},
+    );
+    if (controller.signal.aborted || activeConversationIdFor(agentId) !== conversationId
         || swarmChatRevisions.get(agentId) !== revision
         || swarmChatRevisions.get(revisionKey) !== revision) return;
     if (said.limits && typeof said.limits === "object") {
@@ -11176,10 +11276,13 @@ async function refreshTheChatFor(agentId) {
     keepWhatWasSaidTo(agentId, said.said || [], conversationId);
     countWhatIsTypedTo(agentId);
   } catch (error) {
+    if (conversationReadWasCancelled(error)) return;
     if (activeConversationIdFor(agentId) !== conversationId
         || swarmChatRevisions.get(agentId) !== revision
         || swarmChatRevisions.get(revisionKey) !== revision) return;
     sayInTheChatFor(agentId, error.message);
+  } finally {
+    finishConversationRead(swarmConversationTranscriptControllers, agentId, controller);
   }
 }
 
@@ -12113,7 +12216,19 @@ async function sendWhatIsTypedTo(agentId) {
 async function startTheChatAgainFor(agentId) {
   const agent = theSwarmAgent(agentId);
   if (!agent) return;
-  if (swarmChatIsHydrating(agentId) || swarmConversationSwitching.has(agentId)) return;
+  if (swarmConversationSwitching.has(agentId)) {
+    sayInTheChatFor(agentId, "Finishing the selected saved-chat switch first. Start again was not sent.");
+    return;
+  }
+  if (swarmChatIsHydrating(agentId)) {
+    sayInTheChatFor(agentId, "Loading this chat's saved identity before starting it again...");
+    const ready = await loadConversationsFor(agentId);
+    if (!ready || swarmChatIsHydrating(agentId)
+        || swarmConversationSwitching.has(agentId)) {
+      sayInTheChatFor(agentId, "This chat's saved identity could not be loaded. Start again was not sent.");
+      return;
+    }
+  }
   const conversation = activeConversationFor(agentId);
   const chatId = conversation?.id || "";
   const runtimeKey = swarmChatRuntimeKeyFor(agentId, chatId);
@@ -14782,6 +14897,13 @@ function renderTheBigChat() {
   if (!list || !theBigOne) return;
   const agent = theSwarmAgent(theBigOne);
   const held = swarmChats.find((one) => one.agent === theBigOne);
+  // A board refresh can remove the selected agent while a transcript or
+  // activity callback is still queued. Close the now-ownerless modal instead
+  // of dereferencing stale UI identity and throwing from the render loop.
+  if (!agent || !held) {
+    minimiseTheBigChat(false);
+    return;
+  }
   const conversation = activeConversationFor(theBigOne);
   const renderIdentity = swarmChatKey(theBigOne);
   syncTheBigChatComposer();
