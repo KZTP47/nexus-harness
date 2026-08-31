@@ -176,9 +176,11 @@ authenticated transaction evidence. Cosmetic paraphrasing therefore cannot
 keep dead work alive, while real file/evidence progress resets the guard and
 permits the collaboration to continue.
 
-Inside the maximised view, each connected pair has its own list of saved chats.
-The transcript file name is generated from the stable pair and chat ID, so two
-pair workspaces never read each other's words.
+Inside the maximised view, every agent has a permanent direct-chat list and
+each connected pair has its own separate list of saved chats. Adding a green
+communication line adds the pair list without replacing the agent's direct
+list. The transcript file name is generated from the stable participant set
+and chat ID, so direct and pair workspaces never read each other's words.
 
 ## The live shared collaboration ledger
 

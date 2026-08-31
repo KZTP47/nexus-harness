@@ -96,6 +96,21 @@ test("every chat scenario proves dispatch, visible truth, recovery, and restart 
   assert.match(pairOpening, /New pair chat created/);
   assert.match(pairOpening, /#theBigChatBox"\)\.isEnabled\(\)/);
 
+  const directOpening = source.slice(
+    source.indexOf("async function assertOneDirectChatGroup"),
+    source.indexOf("async function openPairChat"),
+  );
+  assert.match(directOpening, /\+ New chat for this agent/);
+  assert.match(directOpening, /count === 1/);
+  assert.match(directOpening, /currentChatId !== previousChatId/);
+  assert.match(directOpening, /New direct chat created/);
+  assert.match(source, /await createDirectChat\(page\)/);
+  assert.ok(
+    source.lastIndexOf("await assertOneDirectChatGroup(page)")
+      > source.indexOf("the restarted board to hydrate"),
+    "the permanent lone-agent group is not rechecked after restart",
+  );
+
   const recovery = source.slice(
     source.indexOf("async function exercisePartialRecovery"),
     source.indexOf("function isLoopback"),

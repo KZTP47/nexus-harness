@@ -26,9 +26,11 @@ faces, and can create, switch, archive, or restore several durable chats for
 that pair. Archiving never removes its transcript, attachments, provider-thread
 identity, or shared-agent ledger; archived rows remain visible and reversible.
 A chat under GPT Codex ↔ Claude is not reused by GPT Codex ↔ Gemini, even when
-the same provider route appears in both pairs. A lone agent's direct-chat group
-can also hold several fresh, independently saved chats. Those one-agent chats
-remain one-agent conversations even if the agent later gains green-line peers:
+the same provider route appears in both pairs. Every agent also keeps a
+permanent direct-chat group of its own, alongside all connected-pair groups,
+and that group can hold several fresh, independently saved chats. Gaining or
+losing a green-line peer never removes the group or its history. Those
+one-agent chats remain one-agent conversations even after peers are connected:
 automatic routing stays direct, team/project-work actions stay unavailable,
 and connected non-members are not added to the provider context.
 

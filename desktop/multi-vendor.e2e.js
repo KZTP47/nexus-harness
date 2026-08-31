@@ -554,6 +554,38 @@ async function connectPair(page, one, other) {
   ));
 }
 
+async function assertOneDirectChatGroup(page) {
+  const directNew = page.getByRole(
+    "button", {name: "+ New chat for this agent", exact: true},
+  );
+  await waitUntil("one permanent lone-agent chat group to remain visible", async () => {
+    const count = await directNew.count();
+    return count === 1 ? true : `found ${count} lone-agent New controls`;
+  });
+  return directNew;
+}
+
+async function createDirectChat(page) {
+  const directNew = await assertOneDirectChatGroup(page);
+  await waitUntil("the lone-agent New control to become available", async () => (
+    await directNew.isEnabled() ? true : "the lone-agent New control is disabled"
+  ));
+  const activePick = page.locator(
+    "#theBigChatConversationList .the-big-chat-conversation-pick.active",
+  );
+  const previousChatId = String(await activePick.getAttribute("data-chat-id") || "");
+  await directNew.click();
+  await waitUntil("the new saved lone-agent chat identity to become active", async () => {
+    const currentChatId = String(await activePick.getAttribute("data-chat-id") || "");
+    const status = String(await page.locator("#theBigChatConversationSaid").textContent() || "");
+    return currentChatId && currentChatId !== previousChatId
+      && status.includes("New direct chat created")
+      ? true
+      : `old=${previousChatId || "none"} current=${currentChatId || "none"} status=${status}`;
+  });
+  await assertOneDirectChatGroup(page);
+}
+
 async function openPairChat(page, one, other, create = true) {
   if (!await page.locator("#theBigChat").isVisible()) {
     const card = agentCard(page, one);
@@ -799,6 +831,9 @@ async function main() {
     console.log("pass  the goal composer required and visibly completed all three provider contributions");
 
     await connectPair(page, "Fixture OpenAI", "Fixture Anthropic");
+    await openPairChat(page, "Fixture OpenAI", "Fixture Anthropic", false);
+    await createDirectChat(page);
+    console.log("pass  a connected agent keeps one permanent lone chat and can create another direct chat");
     await openPairChat(page, "Fixture OpenAI", "Fixture Anthropic", true);
     const complete = await runPairScenario(
       page, fixture.state, "complete", "complete", "2 of 2 agents answered", PAIR_PROVIDERS,
@@ -827,6 +862,7 @@ async function main() {
       return said && !said.includes("Loading") ? true : said;
     });
     await openPairChat(page, "Fixture OpenAI", "Fixture Anthropic", false);
+    await assertOneDirectChatGroup(page);
     const persisted = page.locator(
       '#theBigChatSaid .participant-outcome-card[data-outcome="partial"]',
     );

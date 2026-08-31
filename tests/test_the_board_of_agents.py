@@ -3328,6 +3328,8 @@ boardRevisionWhileTranscriptWaits()
                       self.script)
         self.assertNotIn('$("theBigChatSend").disabled = waiting || lone', enlarged)
         self.assertNotIn('$("theBigChatAttach").disabled = waiting || lone', enlarged)
+        self.assertIn("const hydrating = swarmChatIsHydrating(theBigOne)", enlarged)
+        self.assertIn("button.disabled = hydrating || switching", enlarged)
 
         creator = self.script[
             self.script.index("async function createConversationFor"):
@@ -3337,8 +3339,23 @@ boardRevisionWhileTranscriptWaits()
             self.script.index("function renderTheConversationSidebar"):
             self.script.index("function renderTheConversationProject")
         ]
+        pair_helpers = self.script[
+            self.script.index("function connectedPairsFor"):
+            self.script.index("function applyConversationList")
+        ]
+        loader = self.script[
+            self.script.index("async function loadConversationsFor"):
+            self.script.index("function finishConversationSwitch")
+        ]
         self.assertIn('peerId, scope = ""', creator)
         self.assertIn('scope === "single" ? "New direct chat created."', creator)
+        self.assertIn("function conversationPairsFor(agentId)", pair_helpers)
+        self.assertIn(
+            "return [...connectedPairsFor(agentId), [agentId]]", pair_helpers
+        )
+        self.assertIn(
+            "for (const pair of conversationPairsFor(agentId))", sidebar
+        )
         self.assertIn(
             "const singleAgentGroup = pair.length === 1 && pair[0] === agentId",
             sidebar,
@@ -3346,8 +3363,11 @@ boardRevisionWhileTranscriptWaits()
         self.assertIn('singleAgentGroup || connectedPairsFor(agentId).some', sidebar)
         self.assertIn('"+ New chat for this agent"', sidebar)
         self.assertIn('singleAgentGroup ? "single" : ""', sidebar)
+        self.assertIn('"No saved chats for this agent."', sidebar)
         self.assertIn('const currentPeer = peer?.id || ""', sidebar)
         self.assertNotIn('.flat().find((one) => one !== agentId)', sidebar)
+        self.assertIn("swarmConversationHydrating.delete(agentId)", loader)
+        self.assertIn("swarmConversationTranscriptRefreshes.delete(agentId)", loader)
 
     def test_completed_collaboration_turns_stream_into_both_chat_views(self) -> None:
         self.assertIn("Array.isArray(update.turns)", self.script)
@@ -6282,13 +6302,23 @@ class WhatThePanelIsTold(BoardTestCase):
         }})
         status, listed = self.ask("/api/swarm/chats?agent=agent-1")
         self.assertEqual(status, 200)
-        self.assertEqual(len(listed["chats"]), 1)
+        self.assertEqual(len([
+            one for one in listed["chats"] if len(one["pair"]) == 2
+        ]), 1)
+        self.assertEqual(len([
+            one for one in listed["chats"] if one["pair"] == ["agent-1"]
+        ]), 1)
         first = listed["active"]
         status, made = self.ask("/api/swarm/chats/create", {
             "agent": "agent-1", "peer": "agent-2",
         })
         self.assertEqual(status, 200)
-        self.assertEqual(len(made["chats"]), 2)
+        self.assertEqual(len([
+            one for one in made["chats"] if len(one["pair"]) == 2
+        ]), 2)
+        self.assertEqual(len([
+            one for one in made["chats"] if one["pair"] == ["agent-1"]
+        ]), 1)
         second = made["active"]
         self.assertNotEqual(first, second)
         status, selected = self.ask("/api/swarm/chats/project", {
@@ -6311,7 +6341,10 @@ class WhatThePanelIsTold(BoardTestCase):
         }})
         status, listed = self.ask("/api/swarm/chats?agent=agent-1")
         self.assertEqual(status, 200, listed)
-        pair_chat = listed["chats"][0]
+        pair_chat = next(one for one in listed["chats"] if len(one["pair"]) == 2)
+        first = next(
+            one for one in listed["chats"] if one["pair"] == ["agent-1"]
+        )
         chat.keep_exchange(
             self.panel.config, "claude", "keep the pair question",
             "keep the pair answer", filed_as=pair_chat["filed_as"],
@@ -6323,14 +6356,6 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(refused_status, 400, refused)
         self.assertIn("green communication line", refused["error"])
 
-        status, first_result = self.ask("/api/swarm/chats/create", {
-            "agent": "agent-1", "peer": "", "scope": "single",
-        })
-        self.assertEqual(status, 200, first_result)
-        first = next(
-            one for one in first_result["chats"]
-            if one["id"] == first_result["active"]
-        )
         status, second_result = self.ask("/api/swarm/chats/create", {
             "agent": "agent-1", "peer": "", "scope": "single",
         })
@@ -6341,6 +6366,8 @@ class WhatThePanelIsTold(BoardTestCase):
         )
         self.assertEqual(first["pair"], ["agent-1"])
         self.assertEqual(second["pair"], ["agent-1"])
+        self.assertEqual(first["name"], "Chat 1")
+        self.assertEqual(second["name"], "Chat 2")
         for identity_field in ("id", "filed_as", "web_conversation_key"):
             self.assertEqual(len({
                 pair_chat[identity_field], first[identity_field], second[identity_field],

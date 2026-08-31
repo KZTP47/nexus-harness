@@ -9768,15 +9768,16 @@ function setWhatCanBePressedInSwarm() {
       const targetBusy = Boolean(chatId) && swarmChatIsBusy(theBigOne, chatId);
       const targetResetting = Boolean(chatId) && swarmChatIsResetting(theBigOne, chatId);
       const switching = swarmConversationSwitching.has(theBigOne);
+      const hydrating = swarmChatIsHydrating(theBigOne);
       // Sidebar rows are navigation for independent saved chats. A turn in
       // the selected chat must not disable a sibling row or its New-chat
       // action; only destructive controls for the exact live chat are held.
       if (action === "pick") {
-        button.disabled = switching || button.dataset.archived === "true";
+        button.disabled = hydrating || switching || button.dataset.archived === "true";
       } else if (action === "archive") {
-        button.disabled = switching || targetBusy || targetResetting;
+        button.disabled = hydrating || switching || targetBusy || targetResetting;
       } else {
-        button.disabled = switching;
+        button.disabled = hydrating || switching;
       }
     }
     const stop = $("theBigChatStop");
@@ -10192,7 +10193,11 @@ function connectedPairsFor(agentId) {
       [line.one, line.other].sort().join("|") === pairKey([agentId, one.id])
     ))
   ));
-  return peers.length ? peers.map((peer) => [agentId, peer.id].sort()) : [[agentId]];
+  return peers.map((peer) => [agentId, peer.id].sort());
+}
+
+function conversationPairsFor(agentId) {
+  return [...connectedPairsFor(agentId), [agentId]];
 }
 
 function applyConversationList(agentId, said) {
@@ -10259,6 +10264,11 @@ async function loadConversationsFor(agentId, refresh = true) {
   } catch (error) {
     if (conversationReadWasCancelled(error)) return false;
     if (swarmConversationListRevisions.get(agentId) !== revision) return false;
+    // A failed first read must not leave this chat in a permanent loading
+    // state. The virtual direct group remains usable, and a later metadata
+    // read will request its transcript again when it has a saved identity.
+    swarmConversationHydrating.delete(agentId);
+    swarmConversationTranscriptRefreshes.delete(agentId);
     sayInTheChatFor(agentId, error.message);
     sayInBigChatConversationFor(agentId, error.message);
     return false;
@@ -14763,7 +14773,7 @@ function renderTheConversationSidebar(agentId) {
   const held = swarmChats.find((one) => one.agent === agentId);
   const conversations = held?.conversations || [];
   const groups = new Map();
-  for (const pair of connectedPairsFor(agentId)) groups.set(pairKey(pair), pair);
+  for (const pair of conversationPairsFor(agentId)) groups.set(pairKey(pair), pair);
   for (const one of conversations) groups.set(pairKey(one.pair || []), one.pair || []);
   list.replaceChildren();
   for (const pair of groups.values()) {
@@ -14781,7 +14791,10 @@ function renderTheConversationSidebar(agentId) {
     group.append(heading);
     const items = make("div", "the-big-chat-conversation-items");
     const chats = conversations.filter((one) => pairKey(one.pair || []) === pairKey(pair));
-    if (!chats.length) items.append(make("p", "hint", "No saved chats for this pair."));
+    if (!chats.length) items.append(make(
+      "p", "hint", singleAgentGroup
+        ? "No saved chats for this agent." : "No saved chats for this pair."
+    ));
     for (const conversation of chats) {
       const row = make("div", "the-big-chat-conversation-item");
       const archived = Boolean(conversation.archived_at);

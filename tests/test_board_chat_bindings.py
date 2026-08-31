@@ -492,9 +492,12 @@ class BoardChatBindingTests(unittest.TestCase):
 
     def test_legacy_path_binding_is_visible_and_upgrades_only_on_explicit_rebind(self) -> None:
         board = self.board("workspace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
-        conversation = swarm_chats.list_for_agent(
-            self.config, board, "agent-1"
-        )["chats"][0]
+        initial = swarm_chats.list_for_agent(self.config, board, "agent-1")
+        conversation = next(
+            one for one in initial["chats"] if len(one["pair"]) == 2
+        )
+        direct = next(one for one in initial["chats"] if len(one["pair"]) == 1)
+        self.assertEqual(direct["project"], "project-1")
         where = self.root / swarm_chats.WHERE_THEY_LIVE
         registry = json.loads(where.read_text(encoding="utf-8"))
         raw = next(one for one in registry["chats"] if one["id"] == conversation["id"])
@@ -518,7 +521,10 @@ class BoardChatBindingTests(unittest.TestCase):
             wraps=swarm_chats._filesystem_project_identity,
         ) as identity_probe:
             listed = swarm_chats.list_for_agent(self.config, board, "agent-1")
-        identity_probe.assert_not_called()
+        # The permanent singleton has one modern project binding. The legacy
+        # pair must not cause a second filesystem identity probe until the
+        # explicit rebind below.
+        identity_probe.assert_called_once_with(str(self.first))
         legacy = next(
             one for one in listed["chats"] if one["id"] == conversation["id"]
         )

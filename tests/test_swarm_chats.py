@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import multiprocessing
 import os
@@ -111,14 +112,204 @@ class PairScopedChatsTests(unittest.TestCase):
     def test_first_pair_chat_is_canonical_and_selects_a_shared_project(self) -> None:
         first = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
         reverse = swarm_chats.list_for_agent(self.config, self.board, "agent-2")
-        self.assertEqual(len(first["chats"]), 1)
-        self.assertEqual(first["chats"][0]["id"], reverse["chats"][0]["id"])
-        self.assertEqual(first["chats"][0]["pair"], ["agent-1", "agent-2"])
-        self.assertEqual(first["chats"][0]["project"], "project-1")
+        pair_chat = next(
+            one for one in first["chats"]
+            if one["pair"] == ["agent-1", "agent-2"]
+        )
+        reverse_pair = next(
+            one for one in reverse["chats"]
+            if one["pair"] == ["agent-1", "agent-2"]
+        )
+        direct = next(one for one in first["chats"] if one["pair"] == ["agent-1"])
+        reverse_direct = next(
+            one for one in reverse["chats"] if one["pair"] == ["agent-2"]
+        )
+        self.assertEqual(len(first["chats"]), 2)
+        self.assertEqual(len(reverse["chats"]), 2)
+        self.assertEqual(pair_chat["id"], reverse_pair["id"])
+        self.assertNotEqual(direct["id"], reverse_direct["id"])
+        self.assertEqual(first["active"], pair_chat["id"])
+        self.assertEqual(reverse["active"], reverse_pair["id"])
+        self.assertEqual(pair_chat["project"], "project-1")
         self.assertEqual(
-            [one["name"] for one in first["chats"][0]["pair_agents"]],
+            [one["name"] for one in pair_chat["pair_agents"]],
             ["Claude", "Codex"],
         )
+        repeated = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual([
+            one["id"] for one in repeated["chats"] if one["pair"] == ["agent-1"]
+        ], [direct["id"]])
+
+    def test_pair_stays_default_when_only_the_lone_agent_has_a_project(self) -> None:
+        board = copy.deepcopy(self.board)
+        board["works_on"] = [{"agent": "agent-1", "project": "project-1"}]
+
+        listed = swarm_chats.list_for_agent(self.config, board, "agent-1")
+        pair_chat = next(one for one in listed["chats"] if len(one["pair"]) == 2)
+        direct = next(one for one in listed["chats"] if len(one["pair"]) == 1)
+
+        self.assertEqual(pair_chat["project"], "")
+        self.assertEqual(direct["project"], "project-1")
+        self.assertEqual(listed["active"], pair_chat["id"])
+
+    def test_direct_seed_survives_connection_changes_and_restart(self) -> None:
+        disconnected = copy.deepcopy(self.board)
+        disconnected["talks_to"] = []
+        initial = swarm_chats.list_for_agent(self.config, disconnected, "agent-1")
+        direct = next(one for one in initial["chats"] if one["pair"] == ["agent-1"])
+        self.assertEqual(initial["active"], direct["id"])
+
+        connected = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        pair_chat = next(one for one in connected["chats"] if len(one["pair"]) == 2)
+        self.assertEqual(connected["active"], pair_chat["id"])
+        self.assertEqual([
+            one["id"] for one in connected["chats"] if one["pair"] == ["agent-1"]
+        ], [direct["id"]])
+
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        reopened.data["providers"] = copy.deepcopy(self.config.data["providers"])
+        after_restart = swarm_chats.list_for_agent(reopened, disconnected, "agent-1")
+        reconnected = swarm_chats.list_for_agent(reopened, self.board, "agent-1")
+        self.assertCountEqual(
+            [one["id"] for one in after_restart["chats"]],
+            [direct["id"], pair_chat["id"]],
+        )
+        self.assertCountEqual(
+            [one["id"] for one in reconnected["chats"]],
+            [direct["id"], pair_chat["id"]],
+        )
+
+    def test_stale_known_singleton_key_repairs_a_missing_initial_chat(self) -> None:
+        listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        direct = next(one for one in listed["chats"] if one["pair"] == ["agent-1"])
+        registry = swarm_chats._read(self.config)
+        singleton_key = swarm_chats._pair_scope_key(
+            swarm_chats._board_workspace_id(self.board), ["agent-1"]
+        )
+        self.assertIn(singleton_key, registry["known_pairs"])
+        registry["chats"] = [
+            one for one in registry["chats"] if one["id"] != direct["id"]
+        ]
+        swarm_chats._write(self.config, registry)
+
+        repaired = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        direct_chats = [
+            one for one in repaired["chats"] if one["pair"] == ["agent-1"]
+        ]
+        self.assertEqual(len(direct_chats), 1)
+        self.assertNotEqual(direct_chats[0]["id"], direct["id"])
+
+    def test_upgrade_reserves_a_singleton_slot_at_the_workspace_chat_cap(self) -> None:
+        agents = [
+            {
+                "id": f"agent-{number}", "name": f"Agent {number}",
+                "who": "claude", "ready": True,
+            }
+            for number in range(1, swarm.MOST_AGENTS + 1)
+        ]
+        board = {
+            "workspace_id": "workspace-cccccccccccccccccccccccccccccccc",
+            "agents": agents, "projects": [], "works_on": [],
+            "talks_to": [
+                {"one": one["id"], "other": other["id"]}
+                for one, other in itertools.combinations(agents, 2)
+            ],
+        }
+        registry = swarm_chats._empty()
+        pairs = list(itertools.combinations(
+            [one["id"] for one in agents], 2
+        ))[:swarm_chats.MOST_CHATS]
+        for pair in pairs:
+            swarm_chats._new_chat(
+                self.config, registry, board, sorted(pair)
+            )
+        self.assertEqual(len(registry["chats"]), swarm_chats.MOST_CHATS)
+        swarm_chats._write(self.config, registry)
+
+        upgraded = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )
+        direct = [
+            one for one in upgraded["chats"] if one["pair"] == ["agent-1"]
+        ]
+        self.assertEqual(len(direct), 1)
+        persisted = swarm_chats._read(self.config)
+        self.assertEqual(
+            len(persisted["chats"]), swarm_chats.MOST_CHATS + 1
+        )
+        repeated = swarm_chats.list_for_agent(
+            self.config, board, "agent-1"
+        )
+        self.assertEqual([
+            one["id"] for one in repeated["chats"]
+            if one["pair"] == ["agent-1"]
+        ], [direct[0]["id"]])
+        with self.assertRaisesRegex(Exception, "maximum number of chats"):
+            swarm_chats.create(
+                self.config, board, "agent-1", "", scope="single"
+            )
+
+    def test_full_migration_recovers_the_last_singleton_without_alias_lockout(self) -> None:
+        agents = [
+            {
+                "id": f"agent-{number}", "name": f"Agent {number}",
+                "filed_as": f"Stable agent {number}",
+                "who": "claude", "ready": True,
+            }
+            for number in range(1, swarm.MOST_AGENTS + 1)
+        ]
+        board = {
+            "agents": agents, "projects": [], "works_on": [], "talks_to": [],
+        }
+        registry = swarm_chats._empty()
+        pairs = list(itertools.combinations(
+            [one["id"] for one in agents], 2
+        ))[:swarm_chats.MOST_CHATS]
+        for pair in pairs:
+            swarm_chats._new_chat(
+                self.config, registry, board, sorted(pair)
+            )
+        for number in range(1, swarm.MOST_AGENTS):
+            swarm_chats._new_chat(
+                self.config, registry, board, [f"agent-{number}"],
+                required_singleton_seed=True,
+            )
+        self.assertEqual(
+            len(registry["chats"]),
+            swarm_chats.MOST_CHATS + swarm.MOST_AGENTS - 1,
+        )
+        with self.assertRaisesRegex(Exception, "maximum number of chats"):
+            swarm_chats._new_chat(
+                self.config, registry, board, ["agent-1"],
+                required_singleton_seed=True,
+            )
+        swarm_chats._write(self.config, registry)
+        last = agents[-1]
+        for filed_as in (last["filed_as"], last["name"]):
+            chat.keep_exchange(
+                self.config, "claude", f"question for {filed_as}",
+                f"answer for {filed_as}", filed_as=filed_as,
+            )
+
+        listed = swarm_chats.list_for_agent(
+            self.config, board, last["id"]
+        )
+        direct = [
+            one for one in listed["chats"] if one["pair"] == [last["id"]]
+        ]
+        self.assertEqual(len(direct), 1)
+        self.assertEqual(direct[0]["name"], "Recovered older chat")
+        self.assertEqual(
+            len(swarm_chats._read(self.config)["chats"]),
+            swarm_chats.MOST_CHATS + swarm.MOST_AGENTS,
+        )
+        repeated = swarm_chats.list_for_agent(
+            self.config, board, last["id"]
+        )
+        self.assertEqual([
+            one["id"] for one in repeated["chats"]
+            if one["pair"] == [last["id"]]
+        ], [direct[0]["id"]])
 
     def test_multiple_chats_keep_distinct_transcripts_and_active_projects(self) -> None:
         first = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
@@ -148,18 +339,11 @@ class PairScopedChatsTests(unittest.TestCase):
 
     def test_explicit_single_agent_chats_remain_distinct_with_a_connected_peer(self) -> None:
         listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
-        pair_chat = listed["chats"][0]
+        pair_chat = next(one for one in listed["chats"] if len(one["pair"]) == 2)
+        first_single = next(one for one in listed["chats"] if len(one["pair"]) == 1)
         chat.keep_exchange(
             self.config, "claude", "pair question", "pair answer",
             filed_as=pair_chat["filed_as"],
-        )
-
-        first_result = swarm_chats.create(
-            self.config, self.board, "agent-1", "", scope="single"
-        )
-        first_single = next(
-            one for one in first_result["chats"]
-            if one["id"] == first_result["active"]
         )
         self.assertEqual(first_single["pair"], ["agent-1"])
         self.assertEqual(first_single["name"], "Chat 1")
@@ -391,6 +575,9 @@ class PairScopedChatsTests(unittest.TestCase):
         recovered = next(
             one for one in listed["chats"] if one["pair"] == ["agent-1"]
         )
+        self.assertEqual(len([
+            one for one in listed["chats"] if one["pair"] == ["agent-1"]
+        ]), 1)
 
         self.assertTrue(conversation["filed_as"].startswith("pair-chat-"))
         self.assertEqual(chat.read_it(
@@ -409,6 +596,9 @@ class PairScopedChatsTests(unittest.TestCase):
         again = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
         self.assertEqual(len([
             one for one in again["chats"] if one["legacy_source"]
+        ]), 1)
+        self.assertEqual(len([
+            one for one in again["chats"] if one["pair"] == ["agent-1"]
         ]), 1)
         self.assertTrue(chat.where_it_is_kept(
             self.config, "claude", legacy

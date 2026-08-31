@@ -1135,9 +1135,19 @@ def _connected_pairs(board: dict[str, Any], agent_id: str) -> list[list[str]]:
     for other in agents:
         if other != agent_id and swarm_lab.may_they_talk(board, agent_id, other):
             pairs.append(_pair(agent_id, other))
-    # A single-agent chat remains usable on a board with no green line. As soon
-    # as a peer is connected, the real pair workspaces replace this fallback.
+    # This helper describes communication-edge eligibility. The lone-agent
+    # fallback keeps the historical no-peer create call working; saved-chat
+    # inventory adds the same singleton independently through
+    # ``_conversation_pairs`` so gaining a peer never removes the direct space.
     return pairs or [[agent_id]]
+
+
+def _conversation_pairs(board: dict[str, Any], agent_id: str) -> list[list[str]]:
+    """Return every chat space this agent owns, with the singleton exactly once."""
+
+    pairs = _connected_pairs(board, agent_id)
+    singleton = [agent_id]
+    return pairs if singleton in pairs else [*pairs, singleton]
 
 
 def _shared_projects(board: dict[str, Any], pair: list[str]) -> list[dict[str, Any]]:
@@ -1409,7 +1419,7 @@ def _recover_legacy_history(
 
 def _new_chat(
     config: LoadedConfig, registry: dict[str, Any], board: dict[str, Any],
-    pair: list[str],
+    pair: list[str], *, required_singleton_seed: bool = False,
 ) -> dict[str, Any]:
     workspace_id = _board_workspace_id(board)
     same = [
@@ -1424,7 +1434,17 @@ def _new_chat(
         raise swarm_lab.SwarmError(
             "This pair already has the maximum number of saved chats."
         )
-    if len(in_workspace) >= MOST_CHATS:
+    # Older supported registries may already be at the user-chat ceiling when
+    # permanent singleton spaces are introduced. Reserve one migration slot
+    # per possible board agent exclusively for a missing required singleton;
+    # ordinary New-chat actions retain the published workspace limit.
+    missing_required_singleton = (
+        required_singleton_seed and len(pair) == 1 and not same
+    )
+    workspace_limit = MOST_CHATS + (
+        swarm_lab.MOST_AGENTS if missing_required_singleton else 0
+    )
+    if len(in_workspace) >= workspace_limit:
         raise swarm_lab.SwarmError(
             "This saved board already has the maximum number of chats. "
             "Other saved boards and their chats are unaffected."
@@ -1498,7 +1518,8 @@ def _recover_direct_legacy_chats(
     Before pair chats existed, one stable board-agent name owned one transcript.
     Those files were deliberately left untouched by the pair migration, but no
     UI indexed them afterwards. Copy each one into a canonical single-agent
-    conversation and retain the source as immutable recovery evidence.
+    conversation when capacity permits and retain every untouched source as
+    immutable recovery evidence.
     """
 
     member = agents.get(agent_id) or {}
@@ -1519,7 +1540,29 @@ def _recover_direct_legacy_chats(
         turns = chat_lab.read_it(config, route, legacy_name)
         if not turns:
             continue
-        made = _new_chat(config, registry, board, [agent_id])
+        same = [
+            one for one in registry["chats"]
+            if one.get("workspace_id") == workspace_id
+            and one.get("pair") == [agent_id]
+        ]
+        in_workspace = [
+            one for one in registry["chats"]
+            if one.get("workspace_id") == workspace_id
+        ]
+        required_singleton_seed = not same
+        # Only the first conversation needed to restore a missing permanent
+        # singleton may use migration reserve. Additional legacy aliases are
+        # useful history, but at an existing user/per-pair ceiling they must
+        # defer without aborting the whole inventory transaction or leaving
+        # transcript side effects whose registry write never happens.
+        if not required_singleton_seed and (
+            len(same) >= MOST_PER_PAIR or len(in_workspace) >= MOST_CHATS
+        ):
+            continue
+        made = _new_chat(
+            config, registry, board, [agent_id],
+            required_singleton_seed=required_singleton_seed,
+        )
         made["name"] = "Recovered older chat"
         made["project"] = ""
         made["binding"] = _binding_for(config, board, [agent_id], "")
@@ -1654,7 +1697,7 @@ def _validated_conversation(
 def list_for_agent(
     config: LoadedConfig, board: dict[str, Any], agent_id: str
 ) -> dict[str, Any]:
-    """List chats containing this agent, creating one initial chat per new pair."""
+    """List chats, creating one initial chat per pair and per lone agent."""
 
     with _registry_transaction(config):
         registry = _read(config)
@@ -1666,23 +1709,48 @@ def list_for_agent(
             changed = True
         if _upgrade_exact_legacy_web_bindings(config, registry, board):
             changed = True
-        pairs = _connected_pairs(board, agent_id)
-        for pair in pairs:
-            key = _pair_scope_key(workspace_id, pair)
-            if key in registry["known_pairs"]:
-                continue
-            # Pair chats start in pair-owned storage. A pre-multi-chat file is
-            # intentionally left intact as legacy history: it has no reliable
-            # pair identity, so adopting it would relabel unknown speakers as
-            # members of whichever pair happened to be listed first.
-            made = _new_chat(config, registry, board, pair)
-            registry["known_pairs"].append(key)
-            changed = True
+        pairs = _conversation_pairs(board, agent_id)
 
+        def ensure_initial_chat(
+            pair: list[str], *, required_singleton_seed: bool = False,
+        ) -> bool:
+            key = _pair_scope_key(workspace_id, pair)
+            has_chat = any(
+                one.get("workspace_id") == workspace_id
+                and one.get("pair") == pair
+                for one in registry["chats"]
+            )
+            if has_chat:
+                if key not in registry["known_pairs"]:
+                    registry["known_pairs"].append(key)
+                    return True
+                return False
+            # Saved chats start in participant-owned storage. A pre-multi-chat
+            # file is intentionally left intact as legacy history: it has no
+            # reliable pair identity, so adopting it would relabel unknown
+            # speakers as members of whichever pair was listed first.
+            _new_chat(
+                config, registry, board, pair,
+                required_singleton_seed=required_singleton_seed,
+            )
+            if key not in registry["known_pairs"]:
+                registry["known_pairs"].append(key)
+            return True
+
+        # Preserve the historical pair-first ordering and capacity priority.
+        # Then recover a real older direct transcript before considering an
+        # empty singleton seed, so migration cannot manufacture a duplicate
+        # Chat 1 beside the recovered conversation.
+        for pair in (one for one in pairs if len(one) == 2):
+            if ensure_initial_chat(pair):
+                changed = True
         if _may_adopt_legacy(workspace_id) and _recover_direct_legacy_chats(
             config, registry, board, agent_id, agents
         ):
             changed = True
+        for pair in (one for one in pairs if len(one) == 1):
+            if ensure_initial_chat(pair, required_singleton_seed=True):
+                changed = True
 
         visible = [
             one for one in registry["chats"]
@@ -1721,17 +1789,32 @@ def list_for_agent(
         else:
             # A board can connect one agent to several peers. Board order is
             # not a useful default: the first pair may have no folder in
-            # common while a later pair is ready for project work. Until the
-            # user explicitly picks a pair, prefer a conversation that has a
-            # real shared project and therefore can do the work advertised by
-            # the chat controls.
-            preferred_chat = next((
+            # common while a later pair is ready for project work. The
+            # permanent direct space is additive and must not take over an
+            # existing connected-pair default merely because the lone agent
+            # has a project of its own.
+            available = [
                 one for one in visible
-                if not one.get("archived_at") and not one.get("legacy_source")
+                if not one.get("archived_at")
+            ]
+            preferred_chat = next((
+                one for one in available
+                if not one.get("legacy_source")
+                and len(one["pair"]) == 2
                 and _shared_projects(board, one["pair"])
-            ), next((
-                one for one in visible if not one.get("archived_at")
-            ), None))
+            ), None)
+            if preferred_chat is None:
+                preferred_chat = next((
+                    one for one in available if len(one["pair"]) == 2
+                ), None)
+            if preferred_chat is None:
+                preferred_chat = next((
+                    one for one in available
+                    if not one.get("legacy_source")
+                    and _shared_projects(board, one["pair"])
+                ), None)
+            if preferred_chat is None:
+                preferred_chat = next(iter(available), None)
             preferred = preferred_chat["id"] if preferred_chat else ""
         if active != preferred:
             active = preferred
@@ -1788,12 +1871,10 @@ def create(
         pair = [agent_id]
     else:
         pair = _pair(agent_id, peer_id)
-    # ``_connected_pairs`` intentionally returns the lone-agent fallback only
-    # while an agent has no green lines. It also drives automatic Chat 1
-    # creation, so adding singleton pairs there would silently create an extra
-    # direct chat for every connected agent. A user-requested ``single`` scope
-    # is the narrow, explicit exception: it preserves the exact one-agent
-    # identity even when this agent also has connected pair workspaces.
+    # ``_connected_pairs`` remains the communication-edge validator. Saved-chat
+    # inventory provisions a direct space separately, but that one-agent space
+    # never authorizes a named peer. Explicit ``single`` scope preserves that
+    # exact identity even when this agent also has connected pair workspaces.
     if pair not in allowed and not (
         requested_scope == "single" and pair == [agent_id]
     ):

@@ -325,6 +325,11 @@ async function main() {
       throw new Error(`full-screen reparenting lost the maximised draft: ${JSON.stringify(afterReparent)}`);
     }
     await page.fill("#theBigChatBox", "");
+    await page.waitForFunction(
+      (agentId) => !swarmChatIsHydrating(agentId)
+        && !swarmConversationListControllers.has(agentId),
+      which, {timeout: 20000}
+    );
     console.log(`pass  the maximised composer stays visible, clickable, focused, and cheap to refresh (${Math.round(composerCheck.elapsed)}ms/50)`);
 
     // Metadata and transcript arrive through separate HTTP reads. Exercise
@@ -344,12 +349,17 @@ async function main() {
       const agent = theSwarmAgent(agentId);
       const board = theSwarmBoard();
       const originalAgents = board.agents;
+      const originalTalks = board.talks_to;
+      const originallyRefreshing = swarmConversationTranscriptRefreshes.has(agentId);
       const syntheticPeer = {
         id: "synthetic-connected-peer", name: "Synthetic connected peer",
         who: "synthetic-peer", ready: false,
         why_not: "Synthetic provider is unavailable for this deterministic smoke.",
       };
       board.agents = [...(originalAgents || []), syntheticPeer];
+      board.talks_to = [...(originalTalks || []), {
+        one: agentId, other: syntheticPeer.id,
+      }];
       const conversation = (id, name) => ({
         id, name, pair: [agentId], pair_agents: [{id: agentId, name: agent.name}],
         projects: [], project: "", destination: {
@@ -361,13 +371,70 @@ async function main() {
       });
       const alpha = conversation("smoke-chat-alpha", "Alpha chat");
       const beta = conversation("smoke-chat-beta", "Beta chat");
+      const pairOnly = {
+        ...conversation("smoke-chat-pair-only", "Pair-only chat"),
+        pair: [agentId, syntheticPeer.id].sort(),
+        pair_agents: [
+          {id: agentId, name: agent.name},
+          {id: syntheticPeer.id, name: syntheticPeer.name},
+        ],
+      };
       try {
         nextConversationListRevision(agentId);
+        held.conversations = [pairOnly];
+        held.conversation = pairOnly.id;
+        swarmConversationHydrating.add(agentId);
+        renderTheConversationSidebar(agentId);
+        setWhatCanBePressedInSwarm();
+        const conversationGroups = () => [...document.querySelectorAll(
+          "#theBigChatConversationList .the-big-chat-pair"
+        )];
+        const directGroups = () => conversationGroups().filter((section) => (
+          [...section.querySelectorAll(".the-big-chat-pair-new")].some(
+            (button) => button.textContent === "+ New chat for this agent"
+          )
+        ));
+        const syntheticPairGroups = () => conversationGroups().filter((section) => (
+          section.textContent.includes(syntheticPeer.name)
+          && [...section.querySelectorAll(".the-big-chat-pair-new")].some(
+            (button) => button.textContent === "+ New chat for this pair"
+          )
+        ));
+        if (directGroups().length !== 1 || syntheticPairGroups().length !== 1) {
+          throw new Error("pair-only chat data did not render one permanent direct group");
+        }
+        if (!directGroups()[0].querySelector(".the-big-chat-pair-new").disabled) {
+          throw new Error("the permanent direct-chat control stayed enabled while hydrating");
+        }
+        const requestBeforeHydrationFailure = request;
+        try {
+          request = async (url, options) => {
+            if (url.startsWith("/api/swarm/chats?agent=")) {
+              throw new Error("Synthetic initial conversation-list failure");
+            }
+            return requestBeforeHydrationFailure(url, options);
+          };
+          const unexpectedlyLoaded = await loadConversationsFor(agentId, false);
+          if (unexpectedlyLoaded) {
+            throw new Error("a rejected conversation-list read reported success");
+          }
+        } finally {
+          request = requestBeforeHydrationFailure;
+        }
+        if (directGroups().length !== 1
+            || swarmChatIsHydrating(agentId)
+            || directGroups()[0].querySelector(".the-big-chat-pair-new").disabled) {
+          throw new Error("a failed first read permanently disabled the direct-chat group");
+        }
+
         held.conversations = [alpha, beta];
         held.conversation = alpha.id;
         held.saidFor = alpha.id;
         held.said = [{who: "them", text: "ALPHA TRANSCRIPT MARKER", at: ""}];
         renderTheBigChat();
+        if (directGroups().length !== 1) {
+          throw new Error("persisted direct chats duplicated their permanent sidebar group");
+        }
 
         const directNew = [...document.querySelectorAll(
           "#theBigChatConversationList .the-big-chat-pair-new"
@@ -700,6 +767,10 @@ async function main() {
       } finally {
         request = originalRequest;
         board.agents = originalAgents;
+        board.talks_to = originalTalks;
+        swarmConversationHydrating.delete(agentId);
+        if (originallyRefreshing) swarmConversationTranscriptRefreshes.add(agentId);
+        else swarmConversationTranscriptRefreshes.delete(agentId);
         held.conversations = original.conversations;
         held.conversation = original.conversation;
         held.said = original.said;
@@ -711,6 +782,7 @@ async function main() {
       }
     }, which);
     console.log("pass  selected chat, title, project, and transcript stay atomic under stale reads");
+    console.log("pass  every connected agent keeps one permanent lone-chat group");
     console.log("pass  lone-chat actions and in-transcript progress follow the selected chat type");
     console.log("pass  lone-chat New and repair controls preserve the exact one-agent scope");
     console.log("pass  direct/team labels, finite rounds, readiness repair, and durable complete/partial/zero outcomes work without live providers");
