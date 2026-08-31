@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {execFileSync} = require("node:child_process");
-const {_electron: electron, chromium} = require("playwright");
+const {_electron: electron, chromium} = require("playwright-core");
 
 function matchingChrome(profile) {
   const quoted = profile.replace(/'/g, "''");

@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import threading
 import time
 import urllib.request
@@ -352,7 +353,9 @@ def _archive_entries(raw: bytes) -> dict[str, bytes]:
     return entries
 
 
-def packaged_runtime_if_usable(root: Path) -> Path | None:
+def packaged_runtime_if_usable(
+    root: Path, *, expected_requirements_sha256: str | None = None,
+) -> Path | None:
     """Prefer a complete built runtime, but never mistake a partial build for one."""
 
     root = root.resolve()
@@ -371,9 +374,216 @@ def packaged_runtime_if_usable(root: Path) -> Path | None:
         not isinstance(manifest, dict)
         or manifest.get("python") != PYTHON_VERSION
         or manifest.get("python_sha256") != PYTHON_SHA256
+        or (
+            expected_requirements_sha256 is not None
+            and manifest.get("requirements_sha256") != expected_requirements_sha256
+        )
     ):
         return None
     return root
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _is_direct_link_or_reparse(path: Path) -> bool:
+    try:
+        return path.is_symlink() or _is_reparse(path)
+    except OSError:
+        return True
+
+
+def _source_runtime_contract(
+    module_file: Path,
+) -> tuple[Path, str | None] | None:
+    """Return a source desktop and its current dependency identity.
+
+    ``None`` means the module is not in a source layout.  A tuple whose digest
+    is ``None`` means it is a source layout but its lock cannot be trusted, so
+    callers must not silently fall through to an old prepared runtime.
+    """
+
+    try:
+        repository = module_file.parents[2]
+    except IndexError:
+        return None
+    desktop = repository / "desktop"
+    if not desktop.is_dir():
+        return None
+    lock = repository / "requirements-runtime.lock"
+    try:
+        if (
+            not lock.is_file()
+            or _is_direct_link_or_reparse(lock)
+        ):
+            return desktop, None
+        requirements_sha256 = _sha256(lock.read_bytes())
+    except OSError:
+        return desktop, None
+    return desktop, requirements_sha256
+
+
+def _selected_source_runtime(
+    desktop: Path, *, expected_requirements_sha256: str,
+) -> Path | None:
+    """Resolve one builder-owned selector without broadening its authority."""
+
+    selector = desktop / ".runtime-selection.json"
+    if _is_direct_link_or_reparse(selector):
+        return None
+    try:
+        payload = json.loads(selector.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+
+    relative = payload.get("runtime_path")
+    if not isinstance(relative, str) or Path(relative).is_absolute():
+        return None
+    normalized = relative.replace("\\", "/")
+    published_identity: str | None = None
+    if normalized == "runtime":
+        candidate = desktop / "runtime"
+    elif normalized.startswith(".runtime-published/"):
+        parts = normalized.split("/")
+        if len(parts) != 2 or not _is_sha256(parts[1]):
+            return None
+        published_identity = parts[1]
+        publication_root = desktop / ".runtime-published"
+        if _is_direct_link_or_reparse(publication_root):
+            return None
+        candidate = publication_root / published_identity
+    else:
+        return None
+
+    if _is_direct_link_or_reparse(candidate):
+        return None
+    try:
+        resolved_desktop = desktop.resolve(strict=True)
+        resolved_candidate = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    if normalized == "runtime":
+        if resolved_candidate.parent != resolved_desktop:
+            return None
+    else:
+        if (
+            resolved_candidate.parent.parent != resolved_desktop
+            or resolved_candidate.parent.name != ".runtime-published"
+        ):
+            return None
+
+    input_identity = payload.get("input_identity")
+    if (
+        not _is_sha256(payload.get("manifest_sha256"))
+        or not _is_sha256(payload.get("tree_sha256"))
+        or not _is_sha256(input_identity)
+        or (published_identity is not None and input_identity != published_identity)
+        or payload.get("python") != PYTHON_VERSION
+        or payload.get("python_sha256") != PYTHON_SHA256
+        or payload.get("requirements_sha256") != expected_requirements_sha256
+    ):
+        return None
+
+    manifest = candidate / "NEXUS_RUNTIME.json"
+    if _is_direct_link_or_reparse(manifest):
+        return None
+    try:
+        if _sha256(manifest.read_bytes()) != payload["manifest_sha256"]:
+            return None
+    except OSError:
+        return None
+    return packaged_runtime_if_usable(
+        candidate,
+        expected_requirements_sha256=expected_requirements_sha256,
+    )
+
+
+def discover_packaged_runtime(
+    *,
+    module_file: Path | str | None = None,
+    executable: Path | str | None = None,
+) -> Path | None:
+    """Find the immutable verification Python carried by Nexus.
+
+    A source checkout follows the runtime builder's selector, including an
+    immutable publication below ``desktop/.runtime-published``.  An installed
+    app keeps the harness below ``resources/harness`` and the runtime beside
+    that folder at ``resources/runtime``.  The packaged Python process itself
+    remains the strongest location signal.  Every candidate still has to pass
+    the pinned manifest and core-file checks above; an arbitrary system or
+    project Python is never accepted.
+
+    ``module_file`` and ``executable`` are injectable solely so the layout
+    contract can be proved without installing the app in a test process.
+    """
+
+    held_module = Path(module_file or __file__).resolve()
+    held_executable = Path(executable or sys.executable).resolve()
+    source_contract = _source_runtime_contract(held_module)
+    if source_contract is not None and source_contract[1] is None:
+        return None
+    expected_requirements = source_contract[1] if source_contract is not None else None
+
+    # Keep a process already running from Nexus's private runtime on that same
+    # runtime.  In a source checkout it must still match the current dependency
+    # lock, so an old canonical runtime cannot win merely because it launched
+    # the current process.
+    running = packaged_runtime_if_usable(
+        held_executable.parent,
+        expected_requirements_sha256=expected_requirements,
+    )
+    if running is not None:
+        return running
+
+    if source_contract is not None:
+        desktop, expected_requirements = source_contract
+        assert expected_requirements is not None
+        selector = desktop / ".runtime-selection.json"
+        try:
+            selector_present = _path_exists(selector)
+        except OSError:
+            return None
+        if selector_present:
+            # A present selector is authoritative.  Corruption, traversal, or
+            # an obsolete identity must never fall back to a different tree.
+            return _selected_source_runtime(
+                desktop,
+                expected_requirements_sha256=expected_requirements,
+            )
+        # Backward-compatible pre-selector source trees may use the canonical
+        # location, but only when its manifest matches today's dependency lock.
+        if _is_direct_link_or_reparse(desktop / "runtime"):
+            return None
+        return packaged_runtime_if_usable(
+            desktop / "runtime",
+            expected_requirements_sha256=expected_requirements,
+        )
+
+    candidates: list[Path] = []
+    try:
+        # Installed tree:
+        # <resources>/harness/src/our_harness/verification_python.py
+        candidates.append(held_module.parents[3] / "runtime")
+    except IndexError:
+        pass
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        usable = packaged_runtime_if_usable(resolved)
+        if usable is not None:
+            return usable
+    return None
 
 
 def _staged_runtime_matches(

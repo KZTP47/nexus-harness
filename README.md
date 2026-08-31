@@ -226,18 +226,18 @@ not signed in to GitHub yet, sign in once or download both assets from the
 Releases page in a signed-in browser. Anonymous one-click downloads require the
 repository—or a separate distribution repository—to be public.
 
-For a browser download of `0.2.0`, open PowerShell in the download folder and
+For a browser download of `0.2.1`, open PowerShell in the download folder and
 run:
 
 ```powershell
-$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.0-UNSIGNED.exe').Hash.ToLowerInvariant()
-$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.0-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.1-UNSIGNED.exe').Hash.ToLowerInvariant()
+$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.1-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
 $actual -eq $expected
 ```
 
 The last command must print `True` before you run the installer.
 
-The current 0.2.0 build is about 234 MiB to download and about 810 MiB unpacked.
+The current 0.2.1 build is about 234 MiB to download and about 810 MiB unpacked.
 Allow at least 2 GiB free while installing so the download, temporary unpacking,
 and installed app can coexist. It includes a private Python 3.11 runtime and locked
 dependencies. Nexus does not silently auto-update. **About

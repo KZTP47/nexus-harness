@@ -49,7 +49,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
-from . import PRODUCT_NAME
+from . import PRODUCT_NAME, __version__
 from .config import LoadedConfig
 from .models import HarnessError
 
@@ -417,7 +417,7 @@ class Conversation:
             return {
                 "protocolVersion": self.agreed_version,
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": WHAT_WE_ARE_CALLED, "version": "0.2.0"},
+                "serverInfo": {"name": WHAT_WE_ARE_CALLED, "version": __version__},
                 # The name is written down once, in our_harness.PRODUCT_NAME.
                 # Written out again here, a rename would leave this saying the
                 # old one to every editor that asks.

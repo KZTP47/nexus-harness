@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import multiprocessing
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -72,6 +73,15 @@ class PairScopedChatsTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         (self.root / ".harness").mkdir()
+        self.runtime_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.runtime_temporary.cleanup)
+        runtime_root = Path(self.runtime_temporary.name).resolve()
+        runtime_environment = mock.patch.dict(os.environ, {
+            "OUR_HARNESS_SWARM_RUN_DIR": str(runtime_root / "swarm-runtime"),
+            "OUR_HARNESS_PIPELINE_RUN_DIR": str(runtime_root / "pipeline-runtime"),
+        })
+        runtime_environment.start()
+        self.addCleanup(runtime_environment.stop)
         self.first = self.root / "first"
         self.second = self.root / "second"
         self.first.mkdir()
@@ -135,6 +145,111 @@ class PairScopedChatsTests(unittest.TestCase):
         self.assertEqual(chat.read_it(
             self.config, "claude", second_chat["filed_as"]
         )[-1].text, "second answer")
+
+    def test_explicit_single_agent_chats_remain_distinct_with_a_connected_peer(self) -> None:
+        listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        pair_chat = listed["chats"][0]
+        chat.keep_exchange(
+            self.config, "claude", "pair question", "pair answer",
+            filed_as=pair_chat["filed_as"],
+        )
+
+        first_result = swarm_chats.create(
+            self.config, self.board, "agent-1", "", scope="single"
+        )
+        first_single = next(
+            one for one in first_result["chats"]
+            if one["id"] == first_result["active"]
+        )
+        self.assertEqual(first_single["pair"], ["agent-1"])
+        self.assertEqual(first_single["name"], "Chat 1")
+        chat.keep_exchange(
+            self.config, "claude", "direct question", "direct answer",
+            filed_as=first_single["filed_as"],
+        )
+
+        second_result = swarm_chats.create(
+            self.config, self.board, "agent-1", "", scope="single"
+        )
+        second_single = next(
+            one for one in second_result["chats"]
+            if one["id"] == second_result["active"]
+        )
+        self.assertEqual(second_single["pair"], ["agent-1"])
+        self.assertEqual(second_single["name"], "Chat 2")
+        for identity_field in ("id", "filed_as", "web_conversation_key"):
+            self.assertEqual(len({
+                one[identity_field]
+                for one in (pair_chat, first_single, second_single)
+            }), 3, identity_field)
+        self.assertEqual(chat.read_it(
+            self.config, "claude", second_single["filed_as"]
+        ), [])
+
+        archived = swarm_chats.delete(
+            self.config, self.board, "agent-1", first_single["id"]
+        )
+        archived_single = next(
+            one for one in archived["chats"] if one["id"] == first_single["id"]
+        )
+        self.assertTrue(archived_single["archived_at"])
+        self.assertEqual(archived["active"], second_single["id"])
+        restored = swarm_chats.restore(
+            self.config, self.board, "agent-1", first_single["id"]
+        )
+        self.assertEqual(restored["active"], first_single["id"])
+
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        reopened.data["providers"] = copy.deepcopy(self.config.data["providers"])
+        persisted = swarm_chats.list_for_agent(reopened, self.board, "agent-1")
+        by_id = {one["id"]: one for one in persisted["chats"]}
+        self.assertEqual(persisted["active"], first_single["id"])
+        self.assertEqual(by_id[first_single["id"]]["pair"], ["agent-1"])
+        self.assertEqual(
+            by_id[first_single["id"]]["filed_as"], first_single["filed_as"]
+        )
+        self.assertEqual(
+            by_id[first_single["id"]]["web_conversation_key"],
+            first_single["web_conversation_key"],
+        )
+        self.assertEqual(chat.read_it(
+            reopened, "claude", first_single["filed_as"]
+        )[-1].text, "direct answer")
+        self.assertEqual(chat.read_it(
+            reopened, "claude", pair_chat["filed_as"]
+        )[-1].text, "pair answer")
+
+    def test_single_agent_scope_is_explicit_and_never_bypasses_peer_lines(self) -> None:
+        with self.assertRaisesRegex(Exception, "cannot also name a peer"):
+            swarm_chats.create(
+                self.config, self.board, "agent-1", "agent-2", scope="single"
+            )
+        with self.assertRaisesRegex(Exception, "supported saved-chat scope"):
+            swarm_chats.create(
+                self.config, self.board, "agent-1", "", scope="surprise"
+            )
+        board = copy.deepcopy(self.board)
+        board["agents"].append({
+            "id": "agent-3", "name": "Unconnected", "who": "codex", "ready": True,
+        })
+        with self.assertRaisesRegex(Exception, "green communication line"):
+            swarm_chats.create(
+                self.config, board, "agent-1", "agent-3"
+            )
+
+        disconnected = copy.deepcopy(self.board)
+        disconnected["talks_to"] = []
+        first = swarm_chats.list_for_agent(
+            self.config, disconnected, "agent-2"
+        )
+        made = swarm_chats.create(
+            self.config, disconnected, "agent-2", ""
+        )
+        self.assertEqual(len([
+            one for one in made["chats"] if one["pair"] == ["agent-2"]
+        ]), len([
+            one for one in first["chats"] if one["pair"] == ["agent-2"]
+        ]) + 1)
 
     def test_two_processes_cannot_overwrite_different_chat_project_updates(self) -> None:
         listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")

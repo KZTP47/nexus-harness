@@ -3329,6 +3329,26 @@ boardRevisionWhileTranscriptWaits()
         self.assertNotIn('$("theBigChatSend").disabled = waiting || lone', enlarged)
         self.assertNotIn('$("theBigChatAttach").disabled = waiting || lone', enlarged)
 
+        creator = self.script[
+            self.script.index("async function createConversationFor"):
+            self.script.index("async function activateConversationFor")
+        ]
+        sidebar = self.script[
+            self.script.index("function renderTheConversationSidebar"):
+            self.script.index("function renderTheConversationProject")
+        ]
+        self.assertIn('peerId, scope = ""', creator)
+        self.assertIn('scope === "single" ? "New direct chat created."', creator)
+        self.assertIn(
+            "const singleAgentGroup = pair.length === 1 && pair[0] === agentId",
+            sidebar,
+        )
+        self.assertIn('singleAgentGroup || connectedPairsFor(agentId).some', sidebar)
+        self.assertIn('"+ New chat for this agent"', sidebar)
+        self.assertIn('singleAgentGroup ? "single" : ""', sidebar)
+        self.assertIn('const currentPeer = peer?.id || ""', sidebar)
+        self.assertNotIn('.flat().find((one) => one !== agentId)', sidebar)
+
     def test_completed_collaboration_turns_stream_into_both_chat_views(self) -> None:
         self.assertIn("Array.isArray(update.turns)", self.script)
         self.assertIn("renderTurnsThatArrived(agentId, chatKey)", self.script)
@@ -6280,6 +6300,185 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual([one["name"] for one in active["pair_agents"]], [
             "The lead", "The peer",
         ])
+
+    def test_connected_agent_can_create_archive_restore_and_reopen_direct_chats(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        status, listed = self.ask("/api/swarm/chats?agent=agent-1")
+        self.assertEqual(status, 200, listed)
+        pair_chat = listed["chats"][0]
+        chat.keep_exchange(
+            self.panel.config, "claude", "keep the pair question",
+            "keep the pair answer", filed_as=pair_chat["filed_as"],
+        )
+
+        refused_status, refused = self.ask("/api/swarm/chats/create", {
+            "agent": "agent-1", "peer": "",
+        })
+        self.assertEqual(refused_status, 400, refused)
+        self.assertIn("green communication line", refused["error"])
+
+        status, first_result = self.ask("/api/swarm/chats/create", {
+            "agent": "agent-1", "peer": "", "scope": "single",
+        })
+        self.assertEqual(status, 200, first_result)
+        first = next(
+            one for one in first_result["chats"]
+            if one["id"] == first_result["active"]
+        )
+        status, second_result = self.ask("/api/swarm/chats/create", {
+            "agent": "agent-1", "peer": "", "scope": "single",
+        })
+        self.assertEqual(status, 200, second_result)
+        second = next(
+            one for one in second_result["chats"]
+            if one["id"] == second_result["active"]
+        )
+        self.assertEqual(first["pair"], ["agent-1"])
+        self.assertEqual(second["pair"], ["agent-1"])
+        for identity_field in ("id", "filed_as", "web_conversation_key"):
+            self.assertEqual(len({
+                pair_chat[identity_field], first[identity_field], second[identity_field],
+            }), 3, identity_field)
+
+        chat.keep_exchange(
+            self.panel.config, "claude", "keep the first direct question",
+            "keep the first direct answer", filed_as=first["filed_as"],
+        )
+        archive_status, archived = self.ask("/api/swarm/chats/delete", {
+            "agent": "agent-1", "chat": first["id"],
+        })
+        self.assertEqual(archive_status, 200, archived)
+        archived_first = next(
+            one for one in archived["chats"] if one["id"] == first["id"]
+        )
+        self.assertTrue(archived_first["archived_at"])
+        self.assertEqual(archived["active"], second["id"])
+        restore_status, restored = self.ask("/api/swarm/chats/restore", {
+            "agent": "agent-1", "chat": first["id"],
+        })
+        self.assertEqual(restore_status, 200, restored)
+        self.assertEqual(restored["active"], first["id"])
+
+        status, reopened = self.ask("/api/swarm/chats?agent=agent-1")
+        self.assertEqual(status, 200, reopened)
+        self.assertEqual(reopened["active"], first["id"])
+        self.assertCountEqual(
+            [one["id"] for one in reopened["chats"]],
+            [pair_chat["id"], first["id"], second["id"]],
+        )
+        transcript_status, transcript = self.ask(
+            f"/api/swarm/said?agent=agent-1&chat={first['id']}"
+        )
+        self.assertEqual(transcript_status, 200, transcript)
+        self.assertEqual(transcript["said"][-1]["text"], "keep the first direct answer")
+
+        reset_status, reset = self.ask("/api/swarm/start-again", {
+            "agent": "agent-1", "chat": first["id"],
+        })
+        self.assertEqual(reset_status, 200, reset)
+        self.assertEqual(reset["conversation"]["id"], first["id"])
+        self.assertEqual(reset["conversation"]["filed_as"], first["filed_as"])
+        direct_status, direct_after_reset = self.ask(
+            f"/api/swarm/said?agent=agent-1&chat={first['id']}"
+        )
+        self.assertEqual(direct_status, 200, direct_after_reset)
+        self.assertEqual(direct_after_reset["said"], [])
+        pair_status, pair_after_reset = self.ask(
+            f"/api/swarm/said?agent=agent-1&chat={pair_chat['id']}"
+        )
+        self.assertEqual(pair_status, 200, pair_after_reset)
+        self.assertEqual(pair_after_reset["said"][-1]["text"], "keep the pair answer")
+
+    def test_saved_single_agent_chat_cannot_expand_to_connected_nonmembers(self) -> None:
+        self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        status, made = self.ask("/api/swarm/chats/create", {
+            "agent": "agent-1", "peer": "", "scope": "single",
+        })
+        self.assertEqual(status, 200, made)
+        direct = next(one for one in made["chats"] if one["id"] == made["active"])
+        answer = {"said": [{"who": "them", "text": "lead only", "at": ""}]}
+
+        with (
+            mock.patch.object(chat, "say", return_value=answer) as talked,
+            mock.patch.object(swarm_work, "automatic_mode") as routed,
+            mock.patch.object(swarm_work, "relay") as relayed,
+            mock.patch.object(swarm_work, "collaborate") as collaborated,
+            mock.patch.object(swarm_work, "work_together") as worked,
+        ):
+            auto_status, auto = self.ask("/api/swarm/say", {
+                "agent": "agent-1", "chat": direct["id"],
+                "text": "Ask The peer to work together and create project files",
+                "mode": "auto", "allow_project_changes": True,
+                "request_id": "single-agent-auto-scope-123",
+            })
+            self.assertEqual(auto_status, 200, auto)
+            self.assertEqual(auto["routing"]["selected"], "chat")
+            self.assertIn("belongs to one agent", auto["routing"]["reason"])
+            routed.assert_not_called()
+            relayed.assert_not_called()
+            collaborated.assert_not_called()
+            worked.assert_not_called()
+            talked.assert_called_once()
+            self.assertEqual(
+                [one["id"] for one in talked.call_args.kwargs["recipients"]],
+                ["agent-1"],
+            )
+            context = talked.call_args.kwargs["context"]
+            self.assertIn("Connected agents Nexus may relay to: none", context)
+            self.assertNotIn("The peer", context)
+            self.assertNotIn("route codex", context)
+
+            def journal_counts() -> tuple[int, int, int, int]:
+                counts = []
+                for store in (
+                    self.panel.swarm_runs,
+                    self.panel.swarm_communication_runs,
+                ):
+                    with store._read() as database:
+                        counts.extend((
+                            int(database.execute(
+                                "SELECT COUNT(*) FROM runs"
+                            ).fetchone()[0]),
+                            int(database.execute(
+                                "SELECT COUNT(*) FROM events"
+                            ).fetchone()[0]),
+                        ))
+                return tuple(counts)
+
+            before_refusals = journal_counts()
+
+            for mode in ("relay", "collaborate", "work"):
+                with self.subTest(mode=mode):
+                    refused_status, refused = self.ask("/api/swarm/say", {
+                        "agent": "agent-1", "chat": direct["id"],
+                        "text": "Contact another agent and change project files",
+                        "mode": mode, "allow_project_changes": True,
+                        "request_id": f"single-agent-refused-{mode}-123",
+                    })
+                    self.assertEqual(refused_status, 400, refused)
+                    self.assertIn("belongs to one agent", refused["error"])
+                    self.assertEqual(journal_counts(), before_refusals)
+
+            self.assertEqual(talked.call_count, 1)
+            relayed.assert_not_called()
+            collaborated.assert_not_called()
+            worked.assert_not_called()
 
     def test_switching_pair_chats_does_not_probe_providers_again(self) -> None:
         self.ask("/api/swarm/save", {"board": {

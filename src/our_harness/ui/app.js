@@ -10281,19 +10281,20 @@ function finishConversationSwitch(agentId) {
   }
 }
 
-async function createConversationFor(agentId, peerId) {
+async function createConversationFor(agentId, peerId, scope = "") {
   if (swarmConversationSwitching.has(agentId) || swarmChatIsHydrating(agentId)) return;
   swarmConversationSwitching.add(agentId);
   nextConversationListRevision(agentId);
   setWhatCanBePressedInSwarm();
   try {
     const said = await request("/api/swarm/chats/create", {
-      method: "POST", body: JSON.stringify({agent: agentId, peer: peerId}),
+      method: "POST", body: JSON.stringify({agent: agentId, peer: peerId, scope}),
     });
     applyConversationList(agentId, said);
     keepWhatWasSaidTo(agentId, []);
     await refreshTheChatFor(agentId);
-    sayInBigChatConversationFor(agentId, "New pair chat created.");
+    sayInBigChatConversationFor(agentId,
+      scope === "single" ? "New direct chat created." : "New pair chat created.");
     if (bigChatShows(agentId)) $("theBigChatBox").focus();
   } catch (error) {
     sayInBigChatConversationFor(agentId, error.message);
@@ -14151,8 +14152,10 @@ async function connectThisAssistant(kind, button) {
       sayInSwarm(`${said.route} is connected. Its command line will verify the subscription on the first message.`);
     }
     await refreshSwarm(true);
+    return true;
   } catch (trouble) {
     sayInSwarm(String(trouble.message || trouble));
+    return false;
   } finally {
     button.disabled = false;
     button.textContent = was;
@@ -14767,6 +14770,7 @@ function renderTheConversationSidebar(agentId) {
     const agents = pair.map(theSwarmAgent).filter(Boolean);
     if (!agents.length) continue;
     const peer = agents.find((one) => one.id !== agentId);
+    const singleAgentGroup = pair.length === 1 && pair[0] === agentId;
     const group = make("section", "the-big-chat-pair");
     const heading = make("div", "the-big-chat-pair-head");
     const faces = make("span", "the-big-chat-pair-faces");
@@ -14835,23 +14839,29 @@ function renderTheConversationSidebar(agentId) {
         fresh.dataset.conversationAction = "create";
         fresh.disabled = swarmConversationSwitching.has(agentId)
           || swarmChatIsHydrating(agentId);
-        const currentPeer = peer?.id || (connectedPairsFor(agentId)
-          .flat().find((one) => one !== agentId) || "");
+        const currentPeer = peer?.id || "";
         fresh.addEventListener("click", () =>
-          createConversationFor(agentId, currentPeer));
+          createConversationFor(
+            agentId, currentPeer, singleAgentGroup ? "single" : ""
+          ));
         repair.append(fresh);
         row.append(repair);
       }
       items.append(row);
     }
     group.append(items);
-    if (connectedPairsFor(agentId).some((one) => pairKey(one) === pairKey(pair))) {
-      const add = make("button", "the-big-chat-pair-new", "+ New chat for this pair");
+    if (singleAgentGroup || connectedPairsFor(agentId).some(
+      (one) => pairKey(one) === pairKey(pair)
+    )) {
+      const add = make("button", "the-big-chat-pair-new", singleAgentGroup
+        ? "+ New chat for this agent" : "+ New chat for this pair");
       add.type = "button";
       add.dataset.conversationAction = "create";
       add.disabled = swarmConversationSwitching.has(agentId)
         || swarmChatIsHydrating(agentId);
-      add.addEventListener("click", () => createConversationFor(agentId, peer?.id || ""));
+      add.addEventListener("click", () => createConversationFor(
+        agentId, peer?.id || "", singleAgentGroup ? "single" : ""
+      ));
       group.append(add);
     }
     list.append(group);
@@ -15363,7 +15373,12 @@ async function repairGeminiRoute(agentId, route, button) {
 
 async function performAgentRepairAction(agentId, route, offered, button) {
   const actionId = String(offered?.id || offered || "");
-  if (actionId === "google-project") {
+  if (actionId === "connect-assistant") {
+    const connected = await connectThisAssistant(String(offered?.kind || ""), button);
+    if (connected && agentStillUsesRoute(agentId, route)) {
+      await loadAgentRepairPlan(agentId, route);
+    }
+  } else if (actionId === "google-project") {
     await repairGeminiRoute(agentId, route, button);
   } else if (actionId === "repair-claude") {
     await repairClaudeAccess(route, offered?.diagnosis_fingerprint || "", button);

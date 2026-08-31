@@ -27,6 +27,7 @@ what makes something feel like an app rather than a tab somebody left open.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import subprocess
@@ -46,6 +47,7 @@ LONGEST_WAIT_FOR_THE_PANEL = 90.0
 # browser that is already running is not a process of its own, and then closing
 # it tells this nothing and the panel is left running for ever.
 WHERE_THE_WINDOW_KEEPS_ITSELF = "window"
+WHERE_A_CONFLICT_WINDOW_KEEPS_ITSELF = "source-conflict-window"
 ALREADY_EXISTS = 183
 
 
@@ -84,21 +86,57 @@ def _remember_source_instance(root: Path, url: str) -> None:
     where.parent.mkdir(parents=True, exist_ok=True)
     where.write_text(json.dumps({
         "process_id": os.getpid(),
-        "project_root": str(root.resolve()),
+        "project_root": str(_canonical_source_checkout(root)),
         "url": url,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }, indent=2) + "\n", encoding="utf-8")
+
+
+def _canonical_source_checkout(root: Path | str) -> Path:
+    """The filesystem identity used when deciding whether two roots are one.
+
+    ``resolve`` folds ``.``/``..`` and Windows junction or symlink aliases when
+    they can be resolved.  It deliberately does not require the recorded path
+    to still exist: the mutex, not this diagnostic record, owns the process.
+    """
+
+    return Path(root).expanduser().resolve(strict=False)
+
+
+def _same_source_checkout(root: Path, recorded_root: str) -> bool:
+    """Whether an instance record names this exact source checkout.
+
+    ``samefile`` handles filesystem aliases.  Its fallback preserves Windows'
+    case-insensitive path semantics even if an old record names a path that can
+    no longer be stat-ed.  Other platforms keep their native case semantics.
+    """
+
+    try:
+        current = _canonical_source_checkout(root)
+        recorded = _canonical_source_checkout(recorded_root)
+        try:
+            return current.samefile(recorded)
+        except OSError:
+            return os.path.normcase(str(current)) == os.path.normcase(str(recorded))
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _existing_source_instance(root: Path) -> dict[str, object] | None:
     try:
         value = json.loads(_instance_file(root).read_text(encoding="utf-8"))
         url = str(value.get("url") or "")
+        project_root = str(value.get("project_root") or "").strip()
         parsed = urlparse(url)
-        if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
+        if (
+            parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and project_root
+            and Path(project_root).is_absolute()
+        ):
             return {
                 "url": url,
-                "project_root": str(value.get("project_root") or "Unknown source checkout"),
+                "project_root": project_root,
                 "process_id": value.get("process_id"),
             }
     except (OSError, ValueError, json.JSONDecodeError):
@@ -364,6 +402,72 @@ def show_what_went_wrong(browser: Path, exc: "TheAppWouldNotStart") -> None:
         return
 
 
+def _source_instance_conflict_message(
+        root: Path, owner: str | None, process_id: object = None) -> str:
+    """A complete console answer for a machine-wide source-window conflict."""
+
+    current = str(_canonical_source_checkout(root))
+    if owner:
+        owner_line = f"The open source checkout: {owner}"
+        process_line = f" (process {process_id})" if process_id else ""
+        opening = (
+            "Another Nexus Harness source window is already open from a "
+            f"different checkout{process_line}."
+        )
+    else:
+        owner_line = "The open source checkout: unknown (its identity record is missing or invalid)"
+        opening = "Another Nexus Harness source window owns the machine-wide window lock."
+    return "\n".join((
+        opening,
+        f"This checkout: {current}",
+        owner_line,
+        "Close the other Nexus Harness source window, then open this checkout again.",
+        "Nexus did not open or focus the other checkout.",
+    ))
+
+
+def a_page_about_source_instance_conflict(message: str) -> str:
+    """A local page for a conflict that happens before a panel can start."""
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Another Nexus Harness source window is open</title>
+<style>
+  body {{ margin: 0; padding: 40px; background: #0d1b24; color: #e8f1f5;
+         font: 16px/1.6 "Segoe UI", system-ui, sans-serif; }}
+  main {{ max-width: 52rem; margin: 0 auto; }}
+  h1 {{ font-size: 1.5rem; }}
+  pre {{ background: #06121a; border: 1px solid #1e3a49; border-radius: 10px;
+         padding: 14px 16px; overflow-x: auto; white-space: pre-wrap;
+         word-break: break-word; }}
+</style></head>
+<body><main>
+  <h1>Another Nexus Harness source window is open</h1>
+  <p>Source windows are kept separate so one checkout can never silently show
+  the code or saved state from another checkout.</p>
+  <pre>{html.escape(message)}</pre>
+  <p>You can close this message after closing the other source window.</p>
+</main></body></html>
+"""
+
+
+def show_source_instance_conflict(browser: Path, root: Path, message: str) -> None:
+    """Show a source-window ownership conflict without touching its owner."""
+
+    try:
+        base = where_the_window_keeps_itself(root).parent
+        where = base / "source-window-conflict.html"
+        base.mkdir(parents=True, exist_ok=True)
+        where.write_text(a_page_about_source_instance_conflict(message), encoding="utf-8")
+        open_it_in_a_window(
+            browser,
+            where.as_uri(),
+            base / WHERE_A_CONFLICT_WINDOW_KEEPS_ITSELF,
+        ).wait()
+    except (OSError, subprocess.SubprocessError):
+        return
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Open the Nexus Harness panel in a window of its own.")
@@ -380,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
     if already_open:
         _release_source_instance(ownership)
         existing = _existing_source_instance(ROOT)
-        if existing:
+        if existing and _same_source_checkout(ROOT, str(existing["project_root"])):
             url = str(existing["url"])
             owner = str(existing["project_root"])
             process_id = existing.get("process_id")
@@ -394,11 +498,14 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 webbrowser.open(url)
             return 0
-        print(
-            "Another Nexus source-mode process owns the machine-wide window lock, "
-            "but its identity record is missing or invalid. Close that Nexus window "
-            "(or end the stale process) before opening this checkout."
+        message = _source_instance_conflict_message(
+            ROOT,
+            str(existing["project_root"]) if existing else None,
+            existing.get("process_id") if existing else None,
         )
+        print(message)
+        if browser is not None:
+            show_source_instance_conflict(browser, ROOT, message)
         return 1
     try:
         panel, url = start_the_panel(ROOT, said.port)

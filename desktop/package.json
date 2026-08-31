@@ -1,6 +1,6 @@
 {
   "name": "our-harness-desktop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Desktop window for the Nexus Harness control panel",
   "main": "main.js",
   "private": true,

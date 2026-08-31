@@ -191,6 +191,30 @@ test("the private runtime lock includes exact Node, Playwright, and Chromium ide
     "desktop Playwright code must not float independently of the bundled runtime");
 });
 
+test("every source-tree UI smoke uses the dependency installed by a clean checkout", () => {
+  const smokeFiles = Object.entries(PACKAGE.scripts)
+    .filter(([name]) => name === "smoke" || name.startsWith("smoke:") || name.startsWith("e2e:"))
+    .map(([, command]) => /^node\s+([^\s]+\.js)(?:\s|$)/.exec(command))
+    .filter(Boolean)
+    .map((match) => match[1])
+    .filter((name) => /\b(?:_electron|chromium)\b/.test(
+      fs.readFileSync(path.join(__dirname, name), "utf8")
+    ));
+  assert.ok(smokeFiles.includes("built.smoke.js"));
+  assert.ok(smokeFiles.includes("smoke.js"));
+  assert.ok(smokeFiles.includes("multi-vendor.e2e.js"));
+  for (const name of smokeFiles) {
+    const source = fs.readFileSync(path.join(__dirname, name), "utf8");
+    assert.doesNotMatch(source, /require\(["']playwright["']\)/,
+      `${name} must not require an undeclared package`);
+    assert.match(source, /require\(["']playwright-core["']\)/,
+      `${name} must use the pinned clean-install dependency`);
+  }
+  const resolved = path.relative(__dirname, require.resolve("playwright-core"));
+  assert.ok(!resolved.startsWith("..") && resolved.includes(`node_modules${path.sep}playwright-core${path.sep}`),
+    `playwright-core resolved outside desktop/node_modules: ${resolved}`);
+});
+
 test("test and smoke files stay out of the installer", () => {
   for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js",
                       "automations.smoke.js"]) {

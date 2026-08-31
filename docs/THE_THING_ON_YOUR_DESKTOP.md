@@ -14,8 +14,8 @@ helper uses Windows PowerShell to:
 4. enforce the signature mode declared by that release; and
 5. start the per-user installer.
 
-The current `0.2.0` release is explicitly unsigned. Its installer must therefore
-be named `Nexus-Harness-Setup-0.2.0-UNSIGNED.exe`, match the published checksum,
+The current `0.2.1` release is explicitly unsigned. Its installer must therefore
+be named `Nexus-Harness-Setup-0.2.1-UNSIGNED.exe`, match the published checksum,
 and have Windows' `NotSigned` status. Windows may display an unknown-publisher
 warning. A future release that pins a publisher certificate will instead be
 required to have a valid signature from that exact publisher.
@@ -34,12 +34,12 @@ The repository is currently private. On a new computer, either:
 
 The helper reuses authentication but does not print or save the credential.
 
-If you download the two `0.2.0` assets in a browser, open PowerShell in the
+If you download the two `0.2.1` assets in a browser, open PowerShell in the
 download folder and run:
 
 ```powershell
-$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.0-UNSIGNED.exe').Hash.ToLowerInvariant()
-$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.0-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.1-UNSIGNED.exe').Hash.ToLowerInvariant()
+$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.1-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
 $actual -eq $expected
 ```
 
@@ -61,7 +61,7 @@ The helper stops safely and prints the exact reason. Common causes are:
   as broken.
 - **Windows warns about an unknown publisher.** That is expected only for a
   release whose filename and release metadata explicitly say `UNSIGNED`.
-- **There is not enough disk space.** The `0.2.0` installer is about 234 MiB and
+- **There is not enough disk space.** The `0.2.1` installer is about 234 MiB and
   the app about 810 MiB unpacked. Allow at least 2 GiB free during installation.
 
 Running `Install Nexus Harness.cmd` again is safe: it downloads and validates

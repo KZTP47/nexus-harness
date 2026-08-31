@@ -184,6 +184,197 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         (packaged / "python311.zip").unlink()
         self.assertIsNone(runtime.packaged_runtime_if_usable(packaged))
 
+    def _complete_packaged_runtime(
+        self, packaged: Path, *, requirements_sha256: str | None = None,
+    ) -> Path:
+        packaged.mkdir(parents=True)
+        for name in (
+            "python.exe", "python3.dll", "python311.dll", "python311.zip",
+            "python311._pth", "vcruntime140.dll", "vcruntime140_1.dll",
+        ):
+            (packaged / name).write_bytes(name.encode("ascii"))
+        manifest = {
+            "python": runtime.PYTHON_VERSION,
+            "python_sha256": runtime.PYTHON_SHA256,
+        }
+        if requirements_sha256 is not None:
+            manifest["requirements_sha256"] = requirements_sha256
+        (packaged / "NEXUS_RUNTIME.json").write_text(
+            json.dumps(manifest), encoding="utf-8",
+        )
+        return packaged
+
+    def _source_checkout(self) -> tuple[Path, Path, str]:
+        repository = self.root / "checkout"
+        module = repository / "src" / "our_harness" / "module.py"
+        module.parent.mkdir(parents=True)
+        (repository / "desktop").mkdir()
+        lock = repository / "requirements-runtime.lock"
+        lock.write_bytes(b"pinned-runtime-dependency==1.2.3\n")
+        return repository, module, hashlib.sha256(lock.read_bytes()).hexdigest()
+
+    def _write_runtime_selector(
+        self, repository: Path, packaged: Path, requirements_sha256: str,
+    ) -> None:
+        relative = packaged.relative_to(repository / "desktop").as_posix()
+        identity = (
+            packaged.name if relative.startswith(".runtime-published/") else "1" * 64
+        )
+        manifest = packaged / "NEXUS_RUNTIME.json"
+        (repository / "desktop" / ".runtime-selection.json").write_text(json.dumps({
+            "schema_version": 1,
+            "runtime_path": relative,
+            "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            "tree_sha256": "2" * 64,
+            "python": runtime.PYTHON_VERSION,
+            "python_sha256": runtime.PYTHON_SHA256,
+            "requirements_sha256": requirements_sha256,
+            "input_identity": identity,
+        }), encoding="utf-8")
+
+    def test_packaged_runtime_discovery_prefers_the_running_private_python(self) -> None:
+        _repository, module, requirements_sha256 = self._source_checkout()
+        packaged = self._complete_packaged_runtime(
+            self.root / "carried-runtime",
+            requirements_sha256=requirements_sha256,
+        )
+        self.assertEqual(
+            packaged,
+            runtime.discover_packaged_runtime(
+                module_file=module,
+                executable=packaged / "python.exe",
+            ),
+        )
+
+    def test_packaged_runtime_discovery_understands_installed_resource_layout(self) -> None:
+        resources = self.root / "installed" / "resources"
+        packaged = self._complete_packaged_runtime(resources / "runtime")
+        module = resources / "harness" / "src" / "our_harness" / "module.py"
+        module.parent.mkdir(parents=True)
+        unrelated_python = self.root / "system" / "python.exe"
+        unrelated_python.parent.mkdir()
+        self.assertEqual(
+            packaged,
+            runtime.discover_packaged_runtime(
+                module_file=module,
+                executable=unrelated_python,
+            ),
+        )
+
+    def test_packaged_runtime_discovery_understands_source_layout(self) -> None:
+        repository, module, requirements_sha256 = self._source_checkout()
+        packaged = self._complete_packaged_runtime(
+            repository / "desktop" / "runtime",
+            requirements_sha256=requirements_sha256,
+        )
+        unrelated_python = self.root / "system" / "python.exe"
+        unrelated_python.parent.mkdir(exist_ok=True)
+        self.assertEqual(
+            packaged,
+            runtime.discover_packaged_runtime(
+                module_file=module,
+                executable=unrelated_python,
+            ),
+        )
+
+    def test_source_discovery_honors_the_selected_immutable_publication(self) -> None:
+        repository, module, requirements_sha256 = self._source_checkout()
+        stale = self._complete_packaged_runtime(
+            repository / "desktop" / "runtime",
+            requirements_sha256="0" * 64,
+        )
+        identity = "a" * 64
+        selected = self._complete_packaged_runtime(
+            repository / "desktop" / ".runtime-published" / identity,
+            requirements_sha256=requirements_sha256,
+        )
+        self._write_runtime_selector(repository, selected, requirements_sha256)
+        unrelated_python = self.root / "system" / "python.exe"
+        unrelated_python.parent.mkdir(exist_ok=True)
+
+        self.assertEqual(
+            selected,
+            runtime.discover_packaged_runtime(
+                module_file=module, executable=unrelated_python,
+            ),
+        )
+        self.assertNotEqual(stale, selected)
+
+    def test_source_discovery_rejects_a_stale_canonical_runtime(self) -> None:
+        repository, module, _requirements_sha256 = self._source_checkout()
+        self._complete_packaged_runtime(
+            repository / "desktop" / "runtime",
+            requirements_sha256="0" * 64,
+        )
+        unrelated_python = self.root / "system" / "python.exe"
+        unrelated_python.parent.mkdir(exist_ok=True)
+
+        self.assertIsNone(runtime.discover_packaged_runtime(
+            module_file=module, executable=unrelated_python,
+        ))
+
+    def test_source_discovery_rejects_a_running_runtime_without_a_trusted_lock(self) -> None:
+        repository, module, _requirements_sha256 = self._source_checkout()
+        (repository / "requirements-runtime.lock").unlink()
+        running = self._complete_packaged_runtime(self.root / "running-runtime")
+
+        self.assertIsNone(runtime.discover_packaged_runtime(
+            module_file=module, executable=running / "python.exe",
+        ))
+
+    def test_source_discovery_fails_closed_on_a_traversal_selector(self) -> None:
+        repository, module, requirements_sha256 = self._source_checkout()
+        self._complete_packaged_runtime(
+            repository / "desktop" / "runtime",
+            requirements_sha256=requirements_sha256,
+        )
+        outside = self._complete_packaged_runtime(
+            repository / "outside", requirements_sha256=requirements_sha256,
+        )
+        manifest = outside / "NEXUS_RUNTIME.json"
+        (repository / "desktop" / ".runtime-selection.json").write_text(json.dumps({
+            "schema_version": 1,
+            "runtime_path": "../outside",
+            "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+            "tree_sha256": "2" * 64,
+            "python": runtime.PYTHON_VERSION,
+            "python_sha256": runtime.PYTHON_SHA256,
+            "requirements_sha256": requirements_sha256,
+            "input_identity": "1" * 64,
+        }), encoding="utf-8")
+        unrelated_python = self.root / "system" / "python.exe"
+        unrelated_python.parent.mkdir(exist_ok=True)
+
+        self.assertIsNone(runtime.discover_packaged_runtime(
+            module_file=module, executable=unrelated_python,
+        ))
+
+    def test_source_discovery_fails_closed_on_an_invalid_selector(self) -> None:
+        repository, module, requirements_sha256 = self._source_checkout()
+        self._complete_packaged_runtime(
+            repository / "desktop" / "runtime",
+            requirements_sha256=requirements_sha256,
+        )
+        (repository / "desktop" / ".runtime-selection.json").write_text(
+            "{not-json", encoding="utf-8",
+        )
+        unrelated_python = self.root / "system" / "python.exe"
+        unrelated_python.parent.mkdir(exist_ok=True)
+
+        self.assertIsNone(runtime.discover_packaged_runtime(
+            module_file=module, executable=unrelated_python,
+        ))
+
+    def test_packaged_runtime_discovery_rejects_a_mismatched_manifest(self) -> None:
+        packaged = self._complete_packaged_runtime(self.root / "carried-runtime")
+        (packaged / "NEXUS_RUNTIME.json").write_text(json.dumps({
+            "python": "0.0.0", "python_sha256": "wrong",
+        }), encoding="utf-8")
+        self.assertIsNone(runtime.discover_packaged_runtime(
+            module_file=self.root / "checkout" / "src" / "our_harness" / "module.py",
+            executable=packaged / "python.exe",
+        ))
+
     def test_verified_cache_hit_never_reaches_the_network(self) -> None:
         raw = embedded_archive()
         with self.release(raw):
@@ -440,7 +631,7 @@ class LightweightVerificationPythonTests(unittest.TestCase):
                     return_value={"passed": True},
                 ), \
                 mock.patch.object(
-                    swarm_work, "packaged_runtime_if_usable", return_value=None,
+                    swarm_work, "discover_packaged_runtime", return_value=None,
                 ), \
                 mock.patch.object(
                     swarm_work, "stage_source_runtime",
@@ -455,6 +646,44 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         self.assertTrue(result["containment_unavailable"])
         self.assertIn("Nexus did not run project code", result["stderr"])
         launch.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows packaged-runtime selection")
+    def test_installed_verification_uses_the_carried_runtime_without_a_download(self) -> None:
+        project = self.root / "selected-project"
+        project.mkdir()
+        config = LoadedConfig(dict(DEFAULT_CONFIG), project, [], {})
+        packaged = self._complete_packaged_runtime(self.root / "resources" / "runtime")
+        launched = {
+            "exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": False,
+            "output_truncated": False, "containment_profile": "windows-appcontainer-job-v1",
+        }
+        with mock.patch.object(swarm_work, "appcontainer_available", return_value=True), \
+                mock.patch.object(
+                    swarm_work, "_windows_containment_canary",
+                    return_value={"passed": True},
+                ), \
+                mock.patch.object(
+                    swarm_work, "discover_packaged_runtime", return_value=packaged,
+                ), \
+                mock.patch.object(
+                    swarm_work, "_stage_packaged_python_runtime",
+                ) as staged, \
+                mock.patch.object(
+                    swarm_work, "stage_source_runtime",
+                    side_effect=AssertionError("installed verification must stay offline"),
+                ), \
+                mock.patch.object(
+                    swarm_work, "run_appcontainer", return_value=launched,
+                ) as launch:
+            result = swarm_work._contained_snapshot_command(
+                config, self.snapshot, ["python", "-c", "print('ok')"],
+                timeout=10, denied_root=project,
+            )
+
+        self.assertEqual(0, result["exit_code"], result)
+        staged.assert_called_once()
+        launch.assert_called_once()
+        self.assertIn(packaged, launch.call_args.kwargs["read_execute_roots"])
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("node"), "Windows Node runtime probe")
     def test_snapshot_node_runtime_collision_is_scrubbed_and_external_runtime_runs(self) -> None:
@@ -494,7 +723,7 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         # the clean-runner dependency on mutable per-user state.
         runtime._verified_archive_bytes(self.cache)
         with mock.patch.object(
-            swarm_work, "packaged_runtime_if_usable", return_value=None,
+            swarm_work, "discover_packaged_runtime", return_value=None,
         ), mock.patch.object(
             runtime, "default_cache_root", return_value=self.cache,
         ), mock.patch.object(
@@ -516,7 +745,7 @@ class LightweightVerificationPythonTests(unittest.TestCase):
     def test_missing_pytest_reports_the_explicit_no_install_strategy(self) -> None:
         config = LoadedConfig(dict(DEFAULT_CONFIG), self.root, [], {})
         with mock.patch.object(
-            swarm_work, "packaged_runtime_if_usable", return_value=None,
+            swarm_work, "discover_packaged_runtime", return_value=None,
         ):
             result = swarm_work._contained_snapshot_command(
                 config, self.snapshot, ["pytest", "-q"],
@@ -547,7 +776,7 @@ class LightweightVerificationPythonTests(unittest.TestCase):
             "site.__file__+'|'+str(ctypes.windll.kernel32.GetCurrentProcessId()),encoding='utf-8')"
         )
         with mock.patch.object(
-            swarm_work, "packaged_runtime_if_usable", return_value=None,
+            swarm_work, "discover_packaged_runtime", return_value=None,
         ):
             result = swarm_work._contained_snapshot_command(
                 config, self.snapshot, ["python", "-c", source],

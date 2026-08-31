@@ -31,6 +31,7 @@ from our_harness.providers.subscription_cli import (
     RECIPES,
     SubscriptionCLIProvider,
     available,
+    responding_command,
 )
 
 
@@ -241,6 +242,59 @@ class FindingAToolThatIsNotOnThePathTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.folder)}), \
              mock.patch.object(subscription_cli.shutil, "which", lambda one: None):
             self.assertEqual(available("codex-cli"), str(where / "codex.exe"))
+
+    def test_it_finds_the_current_versioned_codex_desktop_location(self) -> None:
+        where = self.folder / "OpenAI" / "Codex" / "bin" / "b99306303521e97e"
+        where.mkdir(parents=True)
+        (where / "codex.exe").write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.folder)}), \
+             mock.patch.object(subscription_cli.shutil, "which", lambda one: None):
+            self.assertEqual(available("codex-cli"), str(where / "codex.exe"))
+
+    def test_a_stable_codex_route_follows_a_desktop_update_to_the_new_build(self) -> None:
+        first = self.folder / "OpenAI" / "Codex" / "bin" / "build-a" / "codex.exe"
+        first.parent.mkdir(parents=True)
+        first.write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.folder)}), \
+             mock.patch.object(subscription_cli.shutil, "which", lambda one: None):
+            self.assertEqual(available("codex-cli", ["codex"]), str(first))
+            first.unlink()
+            second = self.folder / "OpenAI" / "Codex" / "bin" / "build-b" / "codex.exe"
+            second.parent.mkdir(parents=True)
+            second.write_text("", encoding="utf-8")
+            self.assertEqual(available("codex-cli", ["codex"]), str(second))
+
+    def test_an_older_nexus_absolute_codex_route_migrates_after_update(self) -> None:
+        vanished = self.folder / "OpenAI" / "Codex" / "bin" / "build-a" / "codex.exe"
+        current = self.folder / "OpenAI" / "Codex" / "bin" / "build-b" / "codex.exe"
+        current.parent.mkdir(parents=True)
+        current.write_text("", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.folder)}), \
+             mock.patch.object(subscription_cli.shutil, "which", lambda one: None):
+            self.assertEqual(
+                available("codex-cli", [str(vanished)]),
+                str(current),
+            )
+
+    def test_an_arbitrary_missing_codex_command_remains_exact_authority(self) -> None:
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(self.folder)}), \
+             mock.patch.object(subscription_cli.shutil, "which", lambda one: None):
+            self.assertEqual(
+                available("codex-cli", [str(self.folder / "custom" / "codex.exe")]),
+                "",
+            )
+
+    def test_repair_discovery_requires_the_candidate_to_answer_its_version_probe(self) -> None:
+        answered = CommandResult(["codex", "--version"], ".", 0, "codex 1", "", 1)
+        refused = CommandResult(["codex", "--version"], ".", 1, "", "blocked", 1)
+        with mock.patch.object(
+            subscription_cli, "available", return_value="C:/tools/codex.exe",
+        ), mock.patch.object(subscription_cli, "_run_bounded", return_value=answered):
+            self.assertEqual(responding_command("codex-cli"), "C:/tools/codex.exe")
+        with mock.patch.object(
+            subscription_cli, "available", return_value="C:/tools/codex.exe",
+        ), mock.patch.object(subscription_cli, "_run_bounded", return_value=refused):
+            self.assertEqual(responding_command("codex-cli"), "")
 
     def test_a_copy_on_the_path_still_wins(self) -> None:
         """Somebody who put one there meant that one."""

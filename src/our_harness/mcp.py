@@ -16,6 +16,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import urlsplit
 
+from . import __version__
 from .config import LoadedConfig
 from .models import HarnessError
 
@@ -35,7 +36,7 @@ LATEST_LEGACY_PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_LEGACY_PROTOCOL_VERSIONS = frozenset(
     {LATEST_LEGACY_PROTOCOL_VERSION, "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07"}
 )
-_CLIENT_INFO = {"name": "our-harness", "version": "0.2.0"}
+_CLIENT_INFO = {"name": "our-harness", "version": __version__}
 
 
 class MCPRemoteError(HarnessError):

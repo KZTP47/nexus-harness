@@ -10,6 +10,86 @@ if (-not (Test-Path -LiteralPath $publisherFile -PathType Leaf)) {
 $expectedPublisher = (Get-Content -Raw -LiteralPath $publisherFile).Trim()
 $publisherConfigured = [bool]$expectedPublisher -and -not $expectedPublisher.StartsWith('UNCONFIGURED')
 
+function Invoke-OptionalNativeCommand {
+    param(
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [Parameter(Mandatory = $true)] [string] $Arguments,
+        [AllowNull()] [AllowEmptyString()] [string] $StandardInput = $null,
+        [hashtable] $EnvironmentOverrides = @{},
+        [ValidateRange(1000, 60000)] [int] $TimeoutMilliseconds = 15000
+    )
+
+    # PowerShell 5.1 can promote native stderr to a terminating error when the
+    # caller uses ErrorActionPreference=Stop. These probes are optional, so run
+    # them outside PowerShell's native-command pipeline and treat every failure
+    # (including start failure and timeout) as an ordinary nonzero result.
+    $process = $null
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $FilePath
+        # Arguments are installer-owned fixed literals, never downloaded data.
+        $startInfo.Arguments = $Arguments
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.RedirectStandardInput = $null -ne $StandardInput
+        foreach ($name in $EnvironmentOverrides.Keys) {
+            $startInfo.EnvironmentVariables[[string]$name] = [string]$EnvironmentOverrides[$name]
+        }
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            return [pscustomobject]@{ ExitCode = -1; StdOut = '' }
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if ($startInfo.RedirectStandardInput) {
+            $process.StandardInput.Write($StandardInput)
+            $process.StandardInput.Close()
+        }
+        $remaining = $TimeoutMilliseconds - [int]$timer.ElapsedMilliseconds
+        if ($remaining -le 0 -or -not $process.WaitForExit($remaining)) {
+            try { $process.Kill($true) } catch { try { $process.Kill() } catch {} }
+            try { $process.StandardOutput.Close() } catch {}
+            try { $process.StandardError.Close() } catch {}
+            return [pscustomobject]@{ ExitCode = -2; StdOut = '' }
+        }
+        # A child spawned by gh/git can inherit redirected handles after the
+        # direct process exits. Bound that drain by the same end-to-end deadline
+        # instead of blocking forever on Task.GetResult().
+        while ((-not $stdoutTask.IsCompleted -or -not $stderrTask.IsCompleted) -and
+               $timer.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+            [System.Threading.Thread]::Sleep(10)
+        }
+        if (-not $stdoutTask.IsCompleted -or -not $stderrTask.IsCompleted) {
+            try { $process.StandardOutput.Close() } catch {}
+            try { $process.StandardError.Close() } catch {}
+            return [pscustomobject]@{ ExitCode = -2; StdOut = '' }
+        }
+        $stdout = [string]$stdoutTask.GetAwaiter().GetResult()
+        # Drain stderr concurrently to prevent pipe deadlocks, but never surface
+        # optional credential diagnostics (which can contain sensitive details).
+        [void]$stderrTask.GetAwaiter().GetResult()
+        return [pscustomobject]@{ ExitCode = [int]$process.ExitCode; StdOut = $stdout }
+    } catch {
+        if ($null -ne $process) {
+            try {
+                if (-not $process.HasExited) {
+                    try { $process.Kill($true) } catch { $process.Kill() }
+                }
+            } catch {}
+        }
+        return [pscustomobject]@{ ExitCode = -1; StdOut = '' }
+    } finally {
+        if ($null -ne $process) {
+            try { $process.Dispose() } catch {}
+        }
+    }
+}
+
 function Get-GitHubHeaders {
     $headers = @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'Nexus-Harness-Installer' }
     $token = [string]$env:GH_TOKEN
@@ -17,9 +97,11 @@ function Get-GitHubHeaders {
     if (-not $token) {
         $gh = Get-Command gh.exe -ErrorAction SilentlyContinue
         if (-not $gh) { $gh = Get-Command gh -ErrorAction SilentlyContinue }
-        if ($gh) {
-            $token = [string](& $gh.Source auth token 2>$null)
-            if ($LASTEXITCODE -ne 0) { $token = '' }
+        if ($gh -and $gh.CommandType -eq 'Application' -and $gh.Source) {
+            $ghResult = Invoke-OptionalNativeCommand -FilePath $gh.Source -Arguments 'auth token'
+            if ($ghResult.ExitCode -eq 0) {
+                $token = ([string]$ghResult.StdOut).Trim()
+            }
         }
     }
     if (-not $token) {
@@ -27,22 +109,29 @@ function Get-GitHubHeaders {
         # Credential Manager login. Ask non-interactively; never print or save it.
         $git = Get-Command git.exe -ErrorAction SilentlyContinue
         if (-not $git) { $git = Get-Command git -ErrorAction SilentlyContinue }
-        if ($git) {
-            $oldInteractive = $env:GCM_INTERACTIVE
-            try {
-                $env:GCM_INTERACTIVE = 'Never'
-                $lines = "protocol=https`nhost=github.com`n`n" | & $git.Source credential fill 2>$null
-                if ($LASTEXITCODE -eq 0) {
-                    $password = @($lines | Where-Object { $_ -like 'password=*' } | Select-Object -First 1)
-                    if ($password.Count -eq 1) { $token = $password[0].Substring(9) }
-                }
-            } finally {
-                $env:GCM_INTERACTIVE = $oldInteractive
+        if ($git -and $git.CommandType -eq 'Application' -and $git.Source) {
+            $gitResult = Invoke-OptionalNativeCommand -FilePath $git.Source -Arguments 'credential fill' `
+                -StandardInput "protocol=https`nhost=github.com`n`n" `
+                -EnvironmentOverrides @{ GCM_INTERACTIVE = 'Never' }
+            if ($gitResult.ExitCode -eq 0) {
+                $lines = @(([string]$gitResult.StdOut) -split '\r?\n')
+                $password = @($lines | Where-Object { $_ -like 'password=*' } | Select-Object -First 1)
+                if ($password.Count -eq 1) { $token = $password[0].Substring(9) }
             }
         }
     }
     if ($token) { $headers.Authorization = "Bearer $token" }
     return $headers
+}
+
+function Get-InstallationFailureMessage(
+    [string] $Message, [hashtable] $Headers, [bool] $LatestReleaseMetadataDownloaded
+) {
+    if (-not $LatestReleaseMetadataDownloaded -and -not $Headers.Authorization -and
+        $Message -ceq 'GitHub returned HTTP 404 while downloading a release asset.') {
+        return 'No installable Nexus Harness release is visible to this installer. Either no stable release has been published yet, or the repository is private and this shell has no usable GitHub login. Check the Releases page in a signed-in browser. If no stable release is listed, publish one before retrying. If the repository is private, sign in with GitHub CLI or Git Credential Manager, or set GH_TOKEN for this process, then retry.'
+    }
+    return $Message
 }
 
 $githubHeaders = Get-GitHubHeaders
@@ -124,10 +213,12 @@ function Download-ReleaseAsset(
 
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('nexus-harness-install-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temporary | Out-Null
+$latestReleaseMetadataDownloaded = $false
 try {
     $releaseMetadata = Join-Path $temporary 'release-metadata.json'
     Download-ReleaseAsset "https://api.github.com/repos/$repository/releases/latest" `
         $releaseMetadata 2097152 $githubHeaders 'application/vnd.github+json'
+    $latestReleaseMetadataDownloaded = $true
     $release = Get-Content -Raw -LiteralPath $releaseMetadata | ConvertFrom-Json
     if ($release.draft -or $release.prerelease -or -not $release.tag_name) {
         throw 'There is no stable Nexus Harness release to install yet.'
@@ -180,10 +271,8 @@ try {
     if ($process.ExitCode -ne 0) { throw "The Windows installer stopped with code $($process.ExitCode)." }
     Write-Host "Nexus Harness $($release.tag_name) is installed."
 } catch {
-    $message = $_.Exception.Message
-    if (-not $githubHeaders.Authorization -and $message -match '404|Not Found') {
-        $message = 'This repository is private and no existing GitHub login was available. Sign in with GitHub CLI or Git Credential Manager, set GH_TOKEN for this process, or download the installer and checksum from the Releases page in your signed-in browser.'
-    }
+    $message = Get-InstallationFailureMessage ([string]$_.Exception.Message) `
+        $githubHeaders $latestReleaseMetadataDownloaded
     Write-Host "Installation stopped safely: $message" -ForegroundColor Red
     Write-Host 'Release page: https://github.com/KZTP47/nexus-harness/releases'
     exit 1

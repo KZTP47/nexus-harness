@@ -174,7 +174,7 @@ def _run_bounded(
     also_in_the_environment: dict[str, str] | None = None,
 ) -> CommandResult:
     if timeout_seconds <= 0:
-        raise HarnessError("Codex CLI wall-clock deadline expired")
+        raise HarnessError("Codex CLI timed out because its wall-clock deadline expired")
     # Provider calls are always headless.  CREATE_NEW_PROCESS_GROUP preserves
     # cancellation while CREATE_NO_WINDOW prevents a black console flashing in
     # front of the desktop app for every turn.  Interactive sign-in/repair
@@ -341,7 +341,7 @@ def _as_words(raw: bytes) -> str:
 def _remaining(deadline_at: float) -> float:
     remaining = deadline_at - time.monotonic()
     if remaining <= 0:
-        raise HarnessError("Codex CLI wall-clock deadline expired")
+        raise HarnessError("Codex CLI timed out because its wall-clock deadline expired")
     return remaining
 
 
@@ -641,7 +641,20 @@ class CodexCLIProvider(Provider):
         command = self.settings.get("command", [])
         if not isinstance(command, list) or not command or any(not isinstance(part, str) or not part for part in command):
             raise HarnessError("Codex CLI provider requires a non-empty provider command")
-        return list(command)
+        # Imported lazily because subscription_cli builds its Codex recipe from
+        # helpers in this module. At dispatch time both modules are complete.
+        # Resolving here lets the stable ``codex`` hint follow a desktop update
+        # from build A to build B while arbitrary configured commands remain
+        # exact authority inside subscription_cli.available().
+        from .subscription_cli import available
+
+        resolved = available("codex-cli", list(command))
+        if not resolved:
+            raise HarnessError(
+                "The configured Codex command is not available. Update Codex or "
+                "reconnect this route in Nexus Settings."
+            )
+        return [resolved, *command[1:]]
 
     @staticmethod
     def _reject_native_contract(request: ProviderRequest) -> None:

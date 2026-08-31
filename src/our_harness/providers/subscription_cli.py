@@ -360,6 +360,7 @@ CODEX_RECIPE = CliRecipe(
     command=("codex",),
     also_found_at=(
         "LOCALAPPDATA/Packages/OpenAI.Codex_*/LocalCache/Local/OpenAI/Codex/bin/codex.exe",
+        "LOCALAPPDATA/OpenAI/Codex/bin/*/codex.exe",
         "LOCALAPPDATA/Programs/codex/codex.exe",
         "HOME/.codex/bin/codex",
     ),
@@ -409,7 +410,12 @@ def available(kind: str, command: list[str] | None = None) -> str:
     # A configured route naming an exact command is authority, not a hint.
     # Looking for another desktop build after somebody named one makes a login
     # check inspect a different session from the one the agent will actually use.
-    if command is not None:
+    # The one exception is Nexus's stable Codex hint (and the bounded legacy
+    # desktop paths Nexus itself wrote before that hint existed). Codex Desktop
+    # replaces its versioned bin directory during an update, so treating that
+    # generated path as permanent strands an otherwise valid route on build B.
+    rediscoverable = _rediscoverable_codex_command(kind, parts)
+    if command is not None and not rediscoverable:
         return found or ""
     kept = _every_build_of(recipe.kept_under)
     if kept:
@@ -425,6 +431,62 @@ def available(kind: str, command: list[str] | None = None) -> str:
     # already have.
     somewhere = _where_else_it_might_be(recipe.also_found_at)
     return str(somewhere[0]) if somewhere else ""
+
+
+def _rediscoverable_codex_command(kind: str, parts: list[str]) -> bool:
+    """Whether one configured command is Nexus's portable Codex locator.
+
+    Arbitrary user commands remain exact authority. The path shapes below are
+    only the desktop-owned locations that older Nexus releases discovered and
+    persisted automatically; accepting them is a compatibility migration into
+    the stable ``codex`` hint, not a general missing-command fallback.
+    """
+
+    if kind != "codex-cli" or len(parts) != 1:
+        return False
+    raw = parts[0].strip()
+    if raw.casefold() in {"codex", "codex.exe", "codex.cmd"}:
+        return True
+    normalized = raw.replace("\\", "/").casefold()
+    return bool(
+        re.search(r"/openai/codex/bin/[^/]+/codex\.exe$", normalized)
+        or (
+            "/packages/openai.codex_" in normalized
+            and normalized.endswith(
+                "/localcache/local/openai/codex/bin/codex.exe"
+            )
+        )
+        or normalized.endswith("/programs/codex/codex.exe")
+    )
+
+
+def responding_command(
+    kind: str,
+    command: list[str] | tuple[str, ...] | None = None,
+    *,
+    timeout_seconds: float = 5.0,
+) -> str:
+    """Return an installed CLI only after its bounded version probe answers."""
+
+    configured = list(command) if command is not None else None
+    program = available(kind, configured)
+    if not program:
+        return ""
+    recipe = recipe_for(kind)
+    try:
+        result = _run_bounded(
+            [program, *(configured[1:] if configured is not None else ()),
+             *recipe.version_arguments],
+            cwd=Path.cwd(),
+            stdin_text=None,
+            timeout_seconds=max(1.0, min(float(timeout_seconds), 15.0)),
+            max_output_bytes=8_000,
+        )
+    except (HarnessError, OSError, ValueError):
+        return ""
+    if result.exit_code != 0 or result.timed_out or result.output_truncated:
+        return ""
+    return program
 
 
 def connection_status(

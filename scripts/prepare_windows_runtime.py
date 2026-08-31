@@ -553,6 +553,7 @@ for dist in importlib.metadata.distributions(path=[site]):
             missing.append(f"{dist.metadata['Name']} requires {raw}; found {found or 'nothing'}")
 if missing:
     raise SystemExit("\n".join(sorted(missing)))
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import StateGraph
 import pytest
 print(f"private runtime imports ok: {len(installed)} locked distributions")

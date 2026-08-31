@@ -21,7 +21,7 @@
 
 const path = require("node:path");
 const fs = require("node:fs");
-const { _electron: electron } = require("playwright");
+const { _electron: electron } = require("playwright-core");
 
 const TIMEOUT_MS = 120000;
 const OUTPUT = path.join(__dirname, "build-output");
@@ -369,6 +369,44 @@ async function main() {
         held.said = [{who: "them", text: "ALPHA TRANSCRIPT MARKER", at: ""}];
         renderTheBigChat();
 
+        const directNew = [...document.querySelectorAll(
+          "#theBigChatConversationList .the-big-chat-pair-new"
+        )].find((button) => button.textContent === "+ New chat for this agent");
+        if (!directNew) {
+          throw new Error("a saved lone-agent group has no New chat control");
+        }
+        const originalCreateConversationFor = createConversationFor;
+        const directCreationCalls = [];
+        try {
+          createConversationFor = async (...args) => { directCreationCalls.push(args); };
+          directNew.click();
+          await Promise.resolve();
+          alpha.binding_problem = {
+            message: "Synthetic direct-chat binding changed.",
+            action_label: "Start fresh with current setup",
+          };
+          renderTheBigChat();
+          const directRepair = document.querySelector(
+            "#theBigChatConversationList .the-big-chat-binding-repair button"
+          );
+          if (!directRepair) {
+            throw new Error("a saved lone-agent binding problem has no fresh-chat control");
+          }
+          directRepair.click();
+          await Promise.resolve();
+        } finally {
+          createConversationFor = originalCreateConversationFor;
+          delete alpha.binding_problem;
+          renderTheBigChat();
+        }
+        if (directCreationCalls.length !== 2 || directCreationCalls.some((args) => (
+          args[0] !== agentId || args[1] !== "" || args[2] !== "single"
+        ))) {
+          throw new Error(
+            `lone-agent create/repair changed conversation scope: ${JSON.stringify(directCreationCalls)}`
+          );
+        }
+
         setWhatCanBePressedInSwarm();
         const activity = document.getElementById("theBigChatActivity");
         if (activity.parentElement?.className !== "the-big-chat-transcript"
@@ -674,6 +712,7 @@ async function main() {
     }, which);
     console.log("pass  selected chat, title, project, and transcript stay atomic under stale reads");
     console.log("pass  lone-chat actions and in-transcript progress follow the selected chat type");
+    console.log("pass  lone-chat New and repair controls preserve the exact one-agent scope");
     console.log("pass  direct/team labels, finite rounds, readiness repair, and durable complete/partial/zero outcomes work without live providers");
     console.log("pass  damaged collaboration recovery resets only the exact record and sends no provider prompt");
     await page.click("#theBigChatSmall");

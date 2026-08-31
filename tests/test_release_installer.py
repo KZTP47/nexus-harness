@@ -5,6 +5,10 @@ import tempfile
 import unittest
 import json
 import os
+import re
+import shutil
+import subprocess
+import tomllib
 from pathlib import Path
 from unittest import mock
 
@@ -25,12 +29,52 @@ build_info = importlib.util.module_from_spec(BUILD_SPEC)
 BUILD_SPEC.loader.exec_module(build_info)
 
 
+def _powershell_hosts() -> list[str]:
+    hosts: list[str] = []
+    for name in ("powershell.exe", "pwsh.exe"):
+        resolved = shutil.which(name)
+        if resolved and resolved.casefold() not in {item.casefold() for item in hosts}:
+            hosts.append(resolved)
+    return hosts
+
+
+def _installer_header_function_source() -> str:
+    source = (ROOT / "scripts" / "install_nexus_harness.ps1").read_text(encoding="utf-8")
+    start = source.index("function Invoke-OptionalNativeCommand")
+    end = source.index("\n$githubHeaders = Get-GitHubHeaders", start)
+    return source[start:end]
+
+
 class ReleaseInstallerTests(unittest.TestCase):
+    def test_public_version_surfaces_cannot_drift(self):
+        expected = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))["version"]
+        root_package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+        root_lock = json.loads((ROOT / "package-lock.json").read_text(encoding="utf-8"))
+        desktop_lock = json.loads((ROOT / "desktop" / "package-lock.json").read_text(encoding="utf-8"))
+        with (ROOT / "pyproject.toml").open("rb") as handle:
+            python_project = tomllib.load(handle)
+        init_source = (ROOT / "src" / "our_harness" / "__init__.py").read_text(encoding="utf-8")
+        match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_source, re.MULTILINE)
+        self.assertIsNotNone(match)
+        self.assertEqual({
+            root_package["version"],
+            root_lock["version"],
+            root_lock["packages"][""]["version"],
+            desktop_lock["version"],
+            desktop_lock["packages"][""]["version"],
+            python_project["project"]["version"],
+            match.group(1),
+        }, {expected})
+        self.assertIn('_CLIENT_INFO = {"name": "our-harness", "version": __version__}',
+                      (ROOT / "src" / "our_harness" / "mcp.py").read_text(encoding="utf-8"))
+        self.assertIn('"serverInfo": {"name": WHAT_WE_ARE_CALLED, "version": __version__}',
+                      (ROOT / "src" / "our_harness" / "editor.py").read_text(encoding="utf-8"))
+
     def test_requires_exactly_one_installer_and_checksum(self):
         release = {
             "assets": [
-                {"name": "Nexus-Harness-Setup-0.2.0.exe"},
-                {"name": "Nexus-Harness-Setup-0.2.0.exe.sha256"},
+                {"name": "Nexus-Harness-Setup-0.2.1.exe"},
+                {"name": "Nexus-Harness-Setup-0.2.1.exe.sha256"},
             ]
         }
         executable, checksum = installer._assets(release)
@@ -42,9 +86,9 @@ class ReleaseInstallerTests(unittest.TestCase):
     def test_checksum_must_name_the_exact_installer(self):
         with tempfile.TemporaryDirectory() as folder:
             checksum = Path(folder) / "release.sha256"
-            checksum.write_text("a" * 64 + "  Nexus-Harness-Setup-0.2.0.exe\n", encoding="utf-8")
+            checksum.write_text("a" * 64 + "  Nexus-Harness-Setup-0.2.1.exe\n", encoding="utf-8")
             self.assertEqual(
-                installer._expected_digest(checksum, "Nexus-Harness-Setup-0.2.0.exe"),
+                installer._expected_digest(checksum, "Nexus-Harness-Setup-0.2.1.exe"),
                 "a" * 64,
             )
             with self.assertRaises(installer.InstallError):
@@ -86,7 +130,7 @@ class ReleaseInstallerTests(unittest.TestCase):
     def test_authenticated_asset_download_uses_the_release_asset_api(self):
         asset = {
             "url": "https://api.github.com/repos/KZTP47/nexus-harness/releases/assets/42",
-            "browser_download_url": "https://github.com/KZTP47/nexus-harness/releases/download/v0.2.0/x.exe",
+            "browser_download_url": "https://github.com/KZTP47/nexus-harness/releases/download/v0.2.1/x.exe",
         }
         self.assertEqual(
             installer._asset_download_url(asset, authenticated=True), asset["url"]
@@ -95,6 +139,112 @@ class ReleaseInstallerTests(unittest.TestCase):
             installer._asset_download_url(asset, authenticated=False),
             asset["browser_download_url"],
         )
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell credential probes are Windows-specific")
+    def test_failed_optional_powershell_credential_probes_stay_anonymous(self):
+        hosts = _powershell_hosts()
+        self.assertTrue(hosts, "Windows PowerShell is required for the installer contract")
+        native_failure = Path(os.environ["SystemRoot"]) / "System32" / "net.exe"
+        self.assertTrue(native_failure.is_file())
+        functions = _installer_header_function_source()
+        harness = """\
+$ErrorActionPreference = 'Stop'
+if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
+    $global:PSNativeCommandUseErrorActionPreference = $true
+}
+__INSTALLER_FUNCTIONS__
+$global:LASTEXITCODE = 73
+$headers = Get-GitHubHeaders
+[pscustomobject]@{
+    HasAuthorization = $headers.ContainsKey('Authorization')
+    ResolvedGh = [bool](Get-Command gh.exe -ErrorAction SilentlyContinue)
+    ResolvedGit = [bool](Get-Command git.exe -ErrorAction SilentlyContinue)
+    GcmInteractive = [string]$env:GCM_INTERACTIVE
+    LastExitCode = $global:LASTEXITCODE
+    ErrorActionPreference = [string]$ErrorActionPreference
+} | ConvertTo-Json -Compress
+""".replace("__INSTALLER_FUNCTIONS__", functions)
+
+        probes = (
+            ("gh.exe", ("auth", "token"), None),
+            ("git.exe", ("credential", "fill"), "protocol=https\nhost=github.com\n\n"),
+        )
+        for fake_name, arguments, standard_input in probes:
+            with self.subTest(probe=fake_name), tempfile.TemporaryDirectory() as folder:
+                folder_path = Path(folder)
+                fake = folder_path / fake_name
+                shutil.copy2(native_failure, fake)
+                fake_result = subprocess.run(
+                    [str(fake), *arguments], input=standard_input, text=True,
+                    capture_output=True, timeout=5, cwd=folder, errors="replace",
+                    env={**os.environ, "PATH": folder},
+                )
+                self.assertNotEqual(fake_result.returncode, 0)
+                self.assertTrue(fake_result.stderr.strip(), "the fake must exercise native stderr")
+                harness_path = folder_path / "probe.ps1"
+                harness_path.write_text(harness, encoding="utf-8")
+                environment = os.environ.copy()
+                environment["PATH"] = folder
+                environment["GCM_INTERACTIVE"] = "leave-parent-state-alone"
+                environment.pop("GH_TOKEN", None)
+                environment.pop("GITHUB_TOKEN", None)
+                for host in hosts:
+                    with self.subTest(probe=fake_name, host=Path(host).name):
+                        result = subprocess.run(
+                            [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                             "-File", str(harness_path)],
+                            text=True, capture_output=True, timeout=30, cwd=folder,
+                            errors="replace", env=environment,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        payload = json.loads(result.stdout.strip().splitlines()[-1])
+                        self.assertFalse(payload["HasAuthorization"])
+                        self.assertEqual(payload["ResolvedGh"], fake_name == "gh.exe")
+                        self.assertEqual(payload["ResolvedGit"], fake_name == "git.exe")
+                        self.assertEqual(payload["GcmInteractive"], "leave-parent-state-alone")
+                        self.assertEqual(payload["LastExitCode"], 73)
+                        self.assertEqual(payload["ErrorActionPreference"], "Stop")
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell installer messaging is Windows-specific")
+    def test_latest_release_404_does_not_claim_the_repository_is_private(self):
+        hosts = _powershell_hosts()
+        self.assertTrue(hosts, "Windows PowerShell is required for the installer contract")
+        functions = _installer_header_function_source()
+        harness = """\
+$ErrorActionPreference = 'Stop'
+__INSTALLER_FUNCTIONS__
+$anonymous = @{ Accept = 'application/vnd.github+json' }
+$authenticated = @{ Authorization = 'Bearer private-token' }
+[pscustomobject]@{
+    AnonymousLatest = Get-InstallationFailureMessage 'GitHub returned HTTP 404 while downloading a release asset.' $anonymous $false
+    LaterAsset = Get-InstallationFailureMessage 'GitHub returned HTTP 404 while downloading a release asset.' $anonymous $true
+    Authenticated = Get-InstallationFailureMessage 'GitHub returned HTTP 404 while downloading a release asset.' $authenticated $false
+    UnrelatedNotFound = Get-InstallationFailureMessage 'A local file was Not Found.' $anonymous $false
+    Http4040 = Get-InstallationFailureMessage 'GitHub returned HTTP 4040 while downloading a release asset.' $anonymous $false
+} | ConvertTo-Json -Compress
+""".replace("__INSTALLER_FUNCTIONS__", functions)
+        with tempfile.TemporaryDirectory() as folder:
+            harness_path = Path(folder) / "message.ps1"
+            harness_path.write_text(harness, encoding="utf-8")
+            for host in hosts:
+                with self.subTest(host=Path(host).name):
+                    result = subprocess.run(
+                        [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                         "-File", str(harness_path)],
+                        text=True, capture_output=True, timeout=15, errors="replace",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout.strip().splitlines()[-1])
+                    message = payload["AnonymousLatest"]
+                    self.assertIn("No installable Nexus Harness release is visible", message)
+                    self.assertIn("no stable release has been published", message)
+                    self.assertIn("repository is private", message)
+                    self.assertIn("sign in with GitHub CLI", message)
+                    self.assertNotIn("This repository is private", message)
+                    self.assertEqual(payload["LaterAsset"], "GitHub returned HTTP 404 while downloading a release asset.")
+                    self.assertEqual(payload["Authenticated"], "GitHub returned HTTP 404 while downloading a release asset.")
+                    self.assertEqual(payload["UnrelatedNotFound"], "A local file was Not Found.")
+                    self.assertEqual(payload["Http4040"], "GitHub returned HTTP 4040 while downloading a release asset.")
 
     def test_windows_signature_must_be_valid_before_execution(self):
         valid = mock.Mock(returncode=0, stdout=json.dumps({

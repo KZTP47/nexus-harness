@@ -2803,6 +2803,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     said = swarm_chats.create(
                         self.server.config, standing["board"], agent_id,
                         str(body.get("peer") or ""),
+                        scope=str(body.get("scope") or ""),
                     )
                 elif self.path == "/api/swarm/chats/activate":
                     said = swarm_chats.activate(
@@ -3265,6 +3266,37 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             str(conversation.get("web_conversation_key") or filed_as)
                             if conversation else filed_as
                         )
+                        saved_participant_ids = [
+                            str(member_id) for member_id in conversation.get("pair", [])
+                            if str(member_id)
+                        ] if conversation else []
+                        single_agent_conversation = (
+                            bool(conversation)
+                            and saved_participant_ids == [agent_id]
+                        )
+                        if single_agent_conversation:
+                            if requested_mode == "auto":
+                                # An empty peer means "all connected peers" to
+                                # the older board workflow helpers. A saved
+                                # singleton means the opposite: this exact
+                                # transcript belongs only to its one agent.
+                                # Constrain auto before it can expand the
+                                # participant set from the surrounding board.
+                                mode = "chat"
+                                routing = {
+                                    "requested": "auto",
+                                    "selected": "chat",
+                                    "reason": (
+                                        "This saved chat belongs to one agent, "
+                                        "so Nexus kept the request direct."
+                                    ),
+                                }
+                            elif requested_mode != "chat":
+                                raise swarm_lab.SwarmError(
+                                    "This saved chat belongs to one agent. Use its "
+                                    "direct Ask button; connected-agent collaboration "
+                                    "and project work are unavailable in this chat."
+                                )
                         if (
                             requested_mode == "work"
                             and not goal_queue_id
@@ -3538,7 +3570,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             objective_text,
                             filed_as=filed_as,
                             context=swarm_work.board_context(
-                                board_payload, agent_id, peer_id, project_id
+                                board_payload, agent_id, peer_id, project_id,
+                                participant_ids=(
+                                    saved_participant_ids if conversation else None
+                                ),
                             ),
                             attachments=body.get("attachments"),
                             speaker=one.to_dict() if conversation else None,

@@ -16,6 +16,8 @@ from typing import Any
 from . import chat
 from .config import LoadedConfig
 from .providers.connection import connection_status
+from .providers.subscription_cli import recipe_for, responding_command
+from .seats import ROUTE_NAMES
 
 
 DIAGNOSIS_SCHEMA_VERSION = 1
@@ -92,6 +94,40 @@ INSPECT_PROVIDER_TURN = _action(
 )
 
 _WEB_PROVIDER_IDS = ("chatgpt", "claude", "gemini", "copilot")
+
+
+def _connect_missing_route_action(route: str) -> tuple[str, dict[str, Any] | None]:
+    """Offer a real one-click repair when the named built-in CLI is present.
+
+    Stable board routes such as ``claude`` and ``codex`` can survive while a
+    fresh checkout quite correctly lacks the machine-local route definition.
+    Settings search cannot recreate an absent dictionary key. A bounded local
+    version probe (never a model request) keeps stale updater debris from being
+    called installed, then surfaces the existing route writer directly.
+    """
+
+    kind = next((
+        candidate for candidate, route_name in ROUTE_NAMES.items()
+        if route_name == str(route or "")
+    ), "")
+    if not kind:
+        return "", None
+    try:
+        found = responding_command(kind)
+    except (OSError, ValueError):
+        found = ""
+    if not found:
+        return kind, None
+    label = recipe_for(kind).label
+    return kind, {
+        **_action(
+            "connect-assistant", f"Connect {label}",
+            f"Writes a local {label} route for this project using the installed command. "
+            "Nexus will still require review if an existing local settings file is untrusted.",
+            primary=True,
+        ),
+        "kind": kind,
+    }
 
 
 def _web_chat_reconnect_action(route: str) -> dict[str, Any]:
@@ -363,10 +399,11 @@ def repair_plan(
 
     named = str(route or "").strip()
     if not _route_exists(config, named):
+        connectable_kind, connect_action = _connect_missing_route_action(named)
         status = {
             "route": named,
-            "kind": "unknown",
-            "installed": False,
+            "kind": connectable_kind or "unknown",
+            "installed": connect_action is not None,
             "authentication": "unknown",
             "state": "route-missing",
             "can_login": False,
@@ -378,16 +415,25 @@ def repair_plan(
             ),
         }
         diagnosis = _status_diagnosis(status)
+        if connect_action is not None:
+            steps = [
+                f"Reconnect the installed {recipe_for(connectable_kind).label} command line to this project.",
+                "Review the local settings file if Nexus asks, then press Check again.",
+            ]
+            actions = [connect_action, CHOOSE_ROUTE, CHECK]
+        else:
+            steps = [
+                "Choose another configured assistant for this agent, or recreate the missing route.",
+                "Press Check again after the agent points to an existing route.",
+            ]
+            actions = [CHOOSE_ROUTE, SETTINGS, CHECK]
         return _finish_plan(status, {
             "state": "route-missing",
             "tone": "blocked",
             "title": "This agent's provider route no longer exists",
             "summary": str(status["note"]),
-            "steps": [
-                "Choose another configured assistant for this agent, or recreate the missing route.",
-                "Press Check again after the agent points to an existing route.",
-            ],
-            "actions": [CHOOSE_ROUTE, SETTINGS, CHECK],
+            "steps": steps,
+            "actions": actions,
             "diagnosis_costs_model_request": False,
         }, diagnosis)
 

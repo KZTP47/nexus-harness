@@ -94,6 +94,36 @@ class RepairPlanTests(unittest.TestCase):
             ["choose-route", "settings", "check"],
         )
 
+    def test_missing_stable_route_can_reconnect_an_installed_assistant(self) -> None:
+        with mock.patch.object(
+            provider_repair, "responding_command", return_value="C:/tools/claude.exe",
+        ), mock.patch.object(provider_repair, "connection_status") as checked:
+            found = provider_repair.repair_plan(self.config, "claude")
+
+        checked.assert_not_called()
+        self.assertTrue(found["installed"])
+        self.assertEqual(found["kind"], "claude-cli")
+        self.assertEqual(
+            [one["id"] for one in found["repair"]["actions"]],
+            ["connect-assistant", "choose-route", "check"],
+        )
+        connect = found["repair"]["actions"][0]
+        self.assertEqual(connect["kind"], "claude-cli")
+        self.assertEqual(connect["route"], "claude")
+        self.assertNotIn("settings", [one["id"] for one in found["repair"]["actions"]])
+
+    def test_missing_stable_route_does_not_call_a_dead_file_installed(self) -> None:
+        with mock.patch.object(
+            provider_repair, "responding_command", return_value="",
+        ):
+            found = provider_repair.repair_plan(self.config, "claude")
+
+        self.assertFalse(found["installed"])
+        self.assertNotIn(
+            "connect-assistant",
+            [one["id"] for one in found["repair"]["actions"]],
+        )
+
     def test_saved_failures_are_typed_and_only_auth_can_offer_login(self) -> None:
         cases = {
             "auth": "Authentication required: not signed in.",
@@ -395,6 +425,8 @@ class RepairPanelContractTests(unittest.TestCase):
         self.assertIn('request("/api/team/test-route"', script)
         self.assertIn('request("/api/team/stop-route-test"', script)
         self.assertIn('request("/api/team/set-google-project"', script)
+        self.assertIn('actionId === "connect-assistant"', script)
+        self.assertIn("connectThisAssistant(String(offered?.kind", script)
 
 
 if __name__ == "__main__":

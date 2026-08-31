@@ -46,7 +46,7 @@ release job or accepted by the public-release bootstrap.
 ## Download size and updates
 
 The private CPython runtime and locked dependencies deliberately make the
-Windows installer substantial: the measured 0.2.0 development installer is
+Windows installer substantial: the measured 0.2.1 development installer is
 about 234 MiB and the unpacked application is about 810 MiB. Release notes must
 state the final measured sizes; users should allow at least 2 GiB while
 installing for the download, temporary unpacking, and installed app. Nexus does not silently

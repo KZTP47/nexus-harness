@@ -12,6 +12,35 @@ const READY_MARKER = "harness-ui-ready ";
 const START_TIMEOUT_MS = 45000;
 const LOG_LINES = 200;
 
+function privateRuntimeMissingError() {
+  return new Error(
+    "This installed Nexus package is incomplete: resources/runtime/python.exe is missing or was removed before it could start. "
+    + "Reinstall the same checksummed release. If the private runtime disappears again, ask your IT or security "
+    + "administrator to allow Nexus Harness and its bundled resources/runtime/python.exe. "
+    + "Do not install a separate system Python; that will not repair this package."
+  );
+}
+
+function projectFolderIsUnavailable(projectPath) {
+  try {
+    const details = fs.statSync(projectPath);
+    if (!details.isDirectory()) return true;
+    fs.accessSync(projectPath, fs.constants.R_OK | fs.constants.X_OK);
+    return false;
+  } catch (error) {
+    return true;
+  }
+}
+
+function projectFolderUnavailableError(projectPath, code) {
+  return new Error(
+    `The selected project folder is no longer available at ${projectPath} (${code || "unavailable"}). `
+    + "Reopen Nexus Harness and choose an existing folder you can access. If it is on a network, removable, "
+    + "or managed drive, reconnect it or ask your IT administrator to restore access. "
+    + "The bundled runtime is still present; installing another Python will not help."
+  );
+}
+
 // The first command that answers is the one we use. A user can name their own
 // with HARNESS_PYTHON when they keep Python somewhere unusual.
 function pythonCandidates(environment = process.env, resources = "", bundledRequired = false) {
@@ -190,10 +219,7 @@ class HarnessServer {
   // them.
   async start(projectPath, options = {}) {
     if (!this.candidates.length && this.bundledRequired) {
-      throw new Error(
-        "This installed Nexus package is incomplete: resources/runtime/python.exe is missing. "
-        + "Reinstall the same checksummed release; do not install a separate system Python."
-      );
+      throw privateRuntimeMissingError();
     }
     const missing = [];
     let realProblem = null;
@@ -201,7 +227,14 @@ class HarnessServer {
       try {
         return await this.startOnce(command, leadingArguments, projectPath, options);
       } catch (error) {
-        if (error.commandIsMissing) missing.push(command);
+        if (error.commandIsMissing) {
+          // A packaged candidate existed when the app inspected its resources,
+          // but antivirus or an updater can remove it before spawn. Never turn
+          // that race into source-mode advice about installing another Python.
+          if (this.bundledRequired) throw privateRuntimeMissingError();
+          missing.push(command);
+        }
+        else if (error.commandAccessDenied && this.bundledRequired) throw error;
         else if (!realProblem) realProblem = error;
       }
     }
@@ -261,8 +294,33 @@ class HarnessServer {
       // A command that is not on this machine is not a failure worth showing:
       // it only means try the next one. Anything else is the real answer.
       const notHere = (error) => {
-        const problem = new Error(`Could not start ${command}: ${error.message}`);
-        problem.commandIsMissing = error.code === "ENOENT" || error.code === "EACCES";
+        const code = String(error?.code || "").toUpperCase();
+        const denied = code === "EACCES" || code === "EPERM"
+          || Number(error?.winerror) === 5
+          || /(?:access is denied|permission denied)/i.test(String(error?.message || ""));
+        // Windows uses the same spawn errors for a missing executable and a
+        // missing/inaccessible cwd. If the private runtime is still present,
+        // attribute the failure to the selected project instead of telling the
+        // user to repair a runtime that is not actually missing.
+        const projectUnavailable = this.bundledRequired
+          && fs.existsSync(command)
+          && projectFolderIsUnavailable(projectPath);
+        const problem = projectUnavailable
+          ? projectFolderUnavailableError(projectPath, code)
+          : new Error(denied && this.bundledRequired
+            ? `Windows refused access while starting the installed Nexus private runtime at ${command} `
+              + `for the selected project folder at ${projectPath} (${code || "access denied"}). `
+              + "Security policy or antivirus may have blocked or quarantined the runtime, or policy may deny "
+              + "the project folder as a child-process working directory. Confirm that the project folder is "
+              + "still accessible. If it is, reinstall the same checksummed release, then ask your IT or security "
+              + "administrator to allow Nexus Harness and its bundled resources/runtime/python.exe. "
+              + "Installing another Python will not fix this."
+            : denied
+              ? `The operating system refused permission to start ${command} (${code || "access denied"}). `
+                + "Check file permissions, application-control policy, and antivirus before trying again."
+              : `Could not start ${command}: ${error.message}`);
+        problem.commandIsMissing = code === "ENOENT" && !projectUnavailable;
+        problem.commandAccessDenied = denied;
         return problem;
       };
       let child;

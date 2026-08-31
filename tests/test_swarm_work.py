@@ -175,6 +175,32 @@ class SwarmWorkTests(unittest.TestCase):
         self.assertIn("Codex (route codex)", context)
         self.assertIn("No relay has happened", context)
 
+    def test_saved_chat_participants_bound_which_connected_agents_context_names(self) -> None:
+        board = copy.deepcopy(self.board)
+        board["agents"].append({
+            "id": "agent-3", "name": "Reviewer", "who": "claude",
+            "job": "second review", "ready": True,
+        })
+        board["talks_to"].append({"one": "agent-1", "other": "agent-3"})
+
+        direct = swarm_work.board_context(
+            board, "agent-1", participant_ids=["agent-1"]
+        )
+        self.assertIn("Connected agents Nexus may relay to: none", direct)
+        self.assertNotIn("Codex (route codex)", direct)
+        self.assertNotIn("Reviewer (route claude)", direct)
+
+        exact_pair = swarm_work.board_context(
+            board, "agent-1", "agent-2",
+            participant_ids=["agent-1", "agent-2"],
+        )
+        self.assertIn("Codex (route codex)", exact_pair)
+        self.assertNotIn("Reviewer (route claude)", exact_pair)
+
+        board_wide = swarm_work.board_context(board, "agent-1")
+        self.assertIn("Codex (route codex)", board_wide)
+        self.assertIn("Reviewer (route claude)", board_wide)
+
     def test_publicly_rehashed_collaboration_rewrite_fails_keyed_authorship(self) -> None:
         ledger = CollaborationLedger(
             self.config, "claude", "keyed-ledger", session_id="keyed-session"

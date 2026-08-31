@@ -34,7 +34,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 
 from .config import LoadedConfig, is_project_local_config_trusted, trust_project_local_config
@@ -470,7 +470,10 @@ def _do_ollama(job: Job, config: LoadedConfig, plan: Plan) -> None:
 def _do_signed_in_tool(job: Job, config: LoadedConfig, plan: Plan) -> None:
     looking = Step(f"Look for the {plan.command} command")
     job.steps.append(looking)
-    where = available(plan.kind, [plan.command])
+    # A built-in plan's bare command is a discovery hint, not user-configured
+    # authority. Passing it as an explicit route made ``available`` skip the
+    # desktop-app locations where Codex is normally installed.
+    where = available(plan.kind)
     if not where:
         looking.state = CANNOT
         looking.detail = f"The {plan.command} command is not on this machine."
@@ -522,7 +525,34 @@ def _do_signed_in_tool(job: Job, config: LoadedConfig, plan: Plan) -> None:
             if status == "signed in"
             else "The sign-in check answered; personal account details were discarded."
         )
-    _finish(job, config, plan)
+    route_plan = plan
+    if plan.kind == "codex-cli":
+        choosing = Step("Read the installed Codex model catalog")
+        job.steps.append(choosing)
+        model = _codex_model(where)
+        if not model:
+            choosing.state = CANNOT
+            choosing.detail = "Codex did not provide a usable bundled model name."
+            job.left_for_you.append(
+                "Update Codex, run 'codex debug models --bundled' yourself, then press Connect again."
+            )
+            job.said = "Codex is installed and signed in, but its model catalog could not be verified."
+            return
+        choosing.state = DONE
+        choosing.detail = "Selected a model reported by this installed Codex build."
+        # Persist the stable built-in hint rather than a disposable desktop
+        # build directory. Dispatch resolves it to the current exact executable
+        # and fingerprints that executable/version before use.
+        route_plan = replace(plan, model=model)
+    _finish(job, config, route_plan)
+
+
+def _codex_model(where: str) -> str:
+    """Ask the established seat workflow for a model this Codex really has."""
+
+    from .seats import _a_model_codex_really_has
+
+    return _a_model_codex_really_has(where)
 
 
 def _do_hosted(job: Job, config: LoadedConfig, plan: Plan) -> None:

@@ -245,6 +245,97 @@ test("a command that is not on this machine moves on to the next one", async () 
   assert.deepStrictEqual(tried, ["py", "python"]);
 });
 
+test("source mode continues after a denied launcher and can use a later Python", async (t) => {
+  for (const code of ["EACCES", "EPERM"]) {
+    await t.test(code, async () => {
+      const tried = [];
+      const server = new HarnessServer({
+        candidates: [["blocked-python", []], ["working-python", []]],
+        timeoutMs: 2000,
+        spawn: (command) => {
+          tried.push(command);
+          return fakeChild((child) => {
+            if (command === "blocked-python") {
+              const error = new Error(`spawn ${code}`);
+              error.code = code;
+              child.emit("error", error);
+              return;
+            }
+            child.stdout.emit("data", `harness-ui-ready {"url":"http://127.0.0.1:8765"}\n`);
+          });
+        },
+      });
+      assert.strictEqual(await server.start("demo-project"), "http://127.0.0.1:8765");
+      assert.deepStrictEqual(tried, ["blocked-python", "working-python"]);
+      server.stop();
+    });
+  }
+});
+
+test("source mode preserves a denied-launcher error when every candidate fails", async () => {
+  const tried = [];
+  const server = new HarnessServer({
+    candidates: [["blocked-python", []], ["missing-python", []]],
+    timeoutMs: 2000,
+    spawn: (command) => {
+      tried.push(command);
+      return fakeChild((child) => {
+        const error = new Error(command === "blocked-python" ? "spawn EACCES" : "spawn ENOENT");
+        error.code = command === "blocked-python" ? "EACCES" : "ENOENT";
+        child.emit("error", error);
+      });
+    },
+  });
+  await assert.rejects(
+    () => server.start("demo-project"),
+    (error) => {
+      assert.match(error.message, /operating system refused permission.*blocked-python.*EACCES/i);
+      assert.doesNotMatch(error.message, /Windows refused permission/i);
+      assert.doesNotMatch(error.message, /No Python was found/i);
+      return true;
+    }
+  );
+  assert.deepStrictEqual(tried, ["blocked-python", "missing-python"]);
+});
+
+test("installed-runtime access denials are visible and never fall back to another Python", async (t) => {
+  for (const code of ["EACCES", "EPERM"]) {
+    await t.test(code, async () => {
+      const bundled = path.join("installed", "resources", "runtime", "python.exe");
+      const tried = [];
+      const server = new HarnessServer({
+        candidates: [[bundled, []], ["python", []]],
+        bundledRequired: true,
+        timeoutMs: 2000,
+        spawn: (command) => {
+          tried.push(command);
+          return fakeChild((child) => {
+            if (command === bundled) {
+              const error = new Error(`spawn ${code}`);
+              error.code = code;
+              child.emit("error", error);
+              return;
+            }
+            child.stdout.emit("data", `harness-ui-ready {"url":"http://127.0.0.1:8765"}\n`);
+          });
+        },
+      });
+      await assert.rejects(
+        () => server.start("demo-project"),
+        (error) => {
+          assert.match(error.message, /installed Nexus private runtime/);
+          assert.match(error.message, new RegExp(code));
+          assert.match(error.message, /Security policy or antivirus/);
+          assert.match(error.message, /resources\/runtime\/python\.exe/);
+          assert.doesNotMatch(error.message, /No Python was found/);
+          return true;
+        }
+      );
+      assert.deepStrictEqual(tried, [bundled], "an access denial must not try a fallback interpreter");
+    });
+  }
+});
+
 test("no Python at all is said plainly, naming what was tried", async () => {
   const server = new HarnessServer({
     candidates: [["py", ["-3"]], ["python", []], ["python3", []]],
@@ -400,6 +491,121 @@ test("an incomplete packaged app does not silently fall back to system Python", 
     () => server.start("demo-project"),
     /package is incomplete.*runtime\/python\.exe.*do not install a separate system Python/i,
   );
+});
+
+test("a packaged runtime removed after discovery gets package recovery advice", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-runtime-removed-"));
+  try {
+    const runtime = path.join(folder, "runtime", "python.exe");
+    fs.mkdirSync(path.dirname(runtime), { recursive: true });
+    fs.writeFileSync(runtime, "stand-in");
+    const candidates = [[runtime, []]];
+    fs.rmSync(runtime);
+    const tried = [];
+    const server = new HarnessServer({
+      candidates,
+      bundledRequired: true,
+      timeoutMs: 2000,
+      spawn: (command) => {
+        tried.push(command);
+        return fakeChild((child) => {
+          const error = new Error("spawn ENOENT");
+          error.code = "ENOENT";
+          child.emit("error", error);
+        });
+      },
+    });
+    await assert.rejects(
+      () => server.start("demo-project"),
+      (error) => {
+        assert.match(error.message, /installed Nexus package is incomplete/i);
+        assert.match(error.message, /resources\/runtime\/python\.exe/);
+        assert.match(error.message, /same checksummed release/i);
+        assert.match(error.message, /IT or security administrator/i);
+        assert.doesNotMatch(error.message, /Install Python|HARNESS_PYTHON/i);
+        return true;
+      }
+    );
+    assert.deepStrictEqual(tried, [runtime]);
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
+});
+
+test("a packaged spawn failure with a present runtime identifies an unavailable project", async (t) => {
+  for (const code of ["ENOENT", "EACCES", "EPERM"]) {
+    await t.test(code, async () => {
+      const folder = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-project-unavailable-"));
+      try {
+        const runtime = path.join(folder, "runtime", "python.exe");
+        const missingProject = path.join(folder, "project-that-moved");
+        fs.mkdirSync(path.dirname(runtime), { recursive: true });
+        fs.writeFileSync(runtime, "stand-in");
+        const server = new HarnessServer({
+          candidates: [[runtime, []]],
+          bundledRequired: true,
+          timeoutMs: 2000,
+          spawn: () => fakeChild((child) => {
+            const error = new Error(`spawn ${code}`);
+            error.code = code;
+            child.emit("error", error);
+          }),
+        });
+        await assert.rejects(
+          () => server.start(missingProject),
+          (error) => {
+            assert.match(error.message, /selected project folder is no longer available/i);
+            assert.match(error.message, /choose an existing folder you can access/i);
+            assert.match(error.message, /network, removable, or managed drive/i);
+            assert.doesNotMatch(error.message, /package is incomplete|Install Python|HARNESS_PYTHON/i);
+            return true;
+          }
+        );
+        assert.strictEqual(fs.existsSync(runtime), true, "the fixture must prove the runtime still exists");
+      } finally {
+        fs.rmSync(folder, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("a packaged denial names both policy targets when an existing project passes the access probe", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-ambiguous-denial-"));
+  try {
+    const runtime = path.join(folder, "runtime", "python.exe");
+    const project = path.join(folder, "managed project");
+    fs.mkdirSync(path.dirname(runtime), { recursive: true });
+    fs.mkdirSync(project);
+    fs.writeFileSync(runtime, "stand-in");
+    const tried = [];
+    const server = new HarnessServer({
+      candidates: [[runtime, []], ["fallback-python", []]],
+      bundledRequired: true,
+      timeoutMs: 2000,
+      spawn: (command) => {
+        tried.push(command);
+        return fakeChild((child) => {
+          const error = new Error("spawn EACCES");
+          error.code = "EACCES";
+          child.emit("error", error);
+        });
+      },
+    });
+    await assert.rejects(
+      () => server.start(project),
+      (error) => {
+        assert.match(error.message, /installed Nexus private runtime/i);
+        assert.match(error.message, /selected project folder/i);
+        assert.match(error.message, /runtime.*blocked or quarantined.*policy may deny.*project folder/i);
+        assert.match(error.message, /IT or security administrator/i);
+        assert.doesNotMatch(error.message, /Install Python|HARNESS_PYTHON/i);
+        return true;
+      }
+    );
+    assert.deepStrictEqual(tried, [runtime], "a bundled denial must remain terminal");
+  } finally {
+    fs.rmSync(folder, { recursive: true, force: true });
+  }
 });
 
 test("a packaged app uses its private supported Python before machine Python", () => {

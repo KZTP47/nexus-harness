@@ -17,7 +17,7 @@
 const path = require("node:path");
 const fs = require("node:fs");
 const os = require("node:os");
-const { _electron: electron } = require("playwright");
+const { _electron: electron } = require("playwright-core");
 
 const TIMEOUT_MS = 120000;
 const OUTPUT = path.join(__dirname, "build-output");

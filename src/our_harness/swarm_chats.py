@@ -1773,11 +1773,30 @@ def resolve(
 
 
 def create(
-    config: LoadedConfig, board: dict[str, Any], agent_id: str, peer_id: str
+    config: LoadedConfig, board: dict[str, Any], agent_id: str, peer_id: str,
+    *, scope: str = "",
 ) -> dict[str, Any]:
-    pair = _pair(agent_id, peer_id)
     allowed = _connected_pairs(board, agent_id)
-    if pair not in allowed:
+    requested_scope = str(scope or "").strip()
+    if requested_scope not in ("", "single"):
+        raise swarm_lab.SwarmError("Choose a supported saved-chat scope.")
+    if requested_scope == "single":
+        if peer_id:
+            raise swarm_lab.SwarmError(
+                "A single-agent chat cannot also name a peer."
+            )
+        pair = [agent_id]
+    else:
+        pair = _pair(agent_id, peer_id)
+    # ``_connected_pairs`` intentionally returns the lone-agent fallback only
+    # while an agent has no green lines. It also drives automatic Chat 1
+    # creation, so adding singleton pairs there would silently create an extra
+    # direct chat for every connected agent. A user-requested ``single`` scope
+    # is the narrow, explicit exception: it preserves the exact one-agent
+    # identity even when this agent also has connected pair workspaces.
+    if pair not in allowed and not (
+        requested_scope == "single" and pair == [agent_id]
+    ):
         raise swarm_lab.SwarmError("These two agents need a green communication line first.")
     with _registry_transaction(config):
         registry = _read(config)

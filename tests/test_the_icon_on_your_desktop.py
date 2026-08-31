@@ -25,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import draw_the_icon  # noqa: E402
+import open_the_app  # noqa: E402
 import put_it_on_your_desktop as installer  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -826,6 +827,146 @@ class MakingTheShortcutWithoutPowerShellTests(unittest.TestCase):
         # never asked at all.
         self.assertEqual(asked, [], "PowerShell was asked when it did not need to be")
         self.assertEqual(installer._desktop_out_of_the_registry(), held)
+
+
+class SourceWindowCheckoutOwnershipTests(unittest.TestCase):
+    """One source checkout must never silently open another one's panel."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name)
+        self.current = self.base / "current checkout"
+        self.other = self.base / "other checkout"
+        self.current.mkdir()
+        self.other.mkdir()
+        self.browser = Path(r"C:\Program Files\Browser\browser.exe")
+        self.owner_url = "http://127.0.0.1:49321/"
+
+    @staticmethod
+    def a_finished_window():
+        window = mock.Mock()
+        window.wait.return_value = 0
+        return window
+
+    def ownership_patches(self, existing, *, browser=True):
+        """The already-owned branch with every process mutation observable."""
+
+        return (
+            mock.patch.object(open_the_app, "ROOT", self.current),
+            mock.patch.object(
+                open_the_app, "a_browser_that_can_do_windows",
+                return_value=self.browser if browser else None,
+            ),
+            mock.patch.object(open_the_app, "_claim_source_instance", return_value=(71, True)),
+            mock.patch.object(open_the_app, "_release_source_instance"),
+            mock.patch.object(open_the_app, "_existing_source_instance", return_value=existing),
+            mock.patch.object(
+                open_the_app, "start_the_panel",
+                side_effect=AssertionError("a second panel must not start while the mutex is owned"),
+            ),
+            mock.patch.object(open_the_app, "_stop_it"),
+        )
+
+    def test_the_same_canonical_checkout_may_focus_its_existing_window(self) -> None:
+        alias_part = self.current / "folder" / ".."
+        (self.current / "folder").mkdir()
+        existing = {
+            "url": self.owner_url,
+            "project_root": str(alias_part),
+            "process_id": 801,
+        }
+        opened = mock.Mock(return_value=self.a_finished_window())
+        patches = self.ownership_patches(existing)
+        with patches[0], patches[1], patches[2], patches[3] as released, \
+             patches[4], patches[5], patches[6] as stopped, \
+             mock.patch.object(open_the_app, "open_it_in_a_window", opened):
+            result = open_the_app.main([])
+
+        self.assertEqual(result, 0)
+        released.assert_called_once_with(71)
+        opened.assert_called_once()
+        self.assertEqual(opened.call_args.args[1], self.owner_url)
+        stopped.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows path identity semantics")
+    def test_windows_case_and_dot_aliases_are_the_same_checkout(self) -> None:
+        part = self.current / "folder"
+        part.mkdir()
+        alias = str(part / "..").swapcase()
+        self.assertTrue(open_the_app._same_source_checkout(self.current, alias))
+
+    def test_a_different_checkout_gets_a_local_visible_error_not_the_owner_url(self) -> None:
+        existing = {
+            "url": self.owner_url,
+            "project_root": str(self.other.resolve()),
+            "process_id": 802,
+        }
+        profile = self.base / "profiles" / "window"
+        opened = mock.Mock(return_value=self.a_finished_window())
+        patches = self.ownership_patches(existing)
+        with patches[0], patches[1], patches[2], patches[3] as released, \
+             patches[4], patches[5], patches[6] as stopped, \
+             mock.patch.object(open_the_app, "where_the_window_keeps_itself", return_value=profile), \
+             mock.patch.object(open_the_app, "open_it_in_a_window", opened):
+            result = open_the_app.main([])
+
+        self.assertEqual(result, 1)
+        released.assert_called_once_with(71)
+        stopped.assert_not_called()
+        opened.assert_called_once()
+        shown_url = opened.call_args.args[1]
+        self.assertTrue(shown_url.startswith("file:"), shown_url)
+        self.assertNotEqual(shown_url, self.owner_url)
+        page = profile.parent / "source-window-conflict.html"
+        said = page.read_text(encoding="utf-8")
+        self.assertIn(str(self.current.resolve()), said)
+        self.assertIn(str(self.other.resolve()), said)
+        self.assertIn("Close the other Nexus Harness source window", said)
+
+    def test_without_app_mode_a_different_checkout_fails_clearly_and_opens_nothing(self) -> None:
+        existing = {
+            "url": self.owner_url,
+            "project_root": str(self.other.resolve()),
+            "process_id": 803,
+        }
+        patches = self.ownership_patches(existing, browser=False)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], \
+             mock.patch.object(open_the_app.webbrowser, "open") as browser_open, \
+             mock.patch("builtins.print") as printed:
+            result = open_the_app.main(["--in-a-tab"])
+
+        self.assertEqual(result, 1)
+        browser_open.assert_not_called()
+        said = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn(str(self.current.resolve()), said)
+        self.assertIn(str(self.other.resolve()), said)
+        self.assertIn("Close the other Nexus Harness source window", said)
+
+    def test_missing_or_invalid_identity_fails_closed_without_focusing_a_url(self) -> None:
+        patches = self.ownership_patches(None)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], \
+             mock.patch.object(open_the_app, "show_source_instance_conflict") as shown, \
+             mock.patch.object(open_the_app, "open_it_in_a_window") as opened:
+            result = open_the_app.main([])
+
+        self.assertEqual(result, 1)
+        opened.assert_not_called()
+        shown.assert_called_once()
+        self.assertIn("identity record is missing or invalid", shown.call_args.args[2])
+
+    def test_an_identity_record_without_its_checkout_is_not_trusted(self) -> None:
+        local = self.base / "local-app-data"
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": str(local)}):
+            record = open_the_app._instance_file(self.current)
+            record.parent.mkdir(parents=True)
+            record.write_text(
+                '{"process_id": 804, "url": "http://127.0.0.1:49321/"}',
+                encoding="utf-8",
+            )
+            self.assertIsNone(open_the_app._existing_source_instance(self.current))
 
 
 class TheRealBrowserFinderTests(unittest.TestCase):

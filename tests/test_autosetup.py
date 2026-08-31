@@ -153,6 +153,37 @@ class ASignedInToolTests(SetupTestCase):
         self.assertIn("sign in", " ".join(job.left_for_you).lower())
         self.assertFalse(self.local.exists())
 
+    def test_built_in_setup_uses_full_desktop_discovery_not_an_exact_bare_hint(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        def found(kind, command=None):
+            calls.append((kind, command))
+            return "C:/OpenAI/Codex/bin/build/codex.exe"
+
+        with mock.patch.object(autosetup, "available", found), \
+                mock.patch.object(autosetup, "_run", lambda parts, seconds: (0, "1.2.3")), \
+                mock.patch.object(autosetup, "_codex_model", return_value="gpt-current"):
+            job = autosetup.do_it(self.config, "codex-cli")
+
+        self.assertTrue(job.worked, job.said)
+        self.assertEqual(calls, [("codex-cli", None)])
+        self.assertEqual(
+            self.written()["providers"]["codex"]["command"],
+            ["codex"],
+        )
+        self.assertEqual(self.written()["providers"]["codex"]["model"], "gpt-current")
+
+    def test_codex_setup_does_not_claim_connected_without_a_real_model_catalog(self) -> None:
+        with mock.patch.object(
+                autosetup, "available", return_value="C:/OpenAI/Codex/bin/build/codex.exe"), \
+                mock.patch.object(autosetup, "_run", return_value=(0, "1.2.3")), \
+                mock.patch.object(autosetup, "_codex_model", return_value=""):
+            job = autosetup.do_it(self.config, "codex-cli")
+
+        self.assertFalse(job.worked)
+        self.assertIn("model catalog", job.said.lower())
+        self.assertFalse(self.local.exists(), "an unverified model must not create a route")
+
 
 class AHostedServiceTests(SetupTestCase):
     def test_a_key_that_is_set_is_enough(self) -> None:

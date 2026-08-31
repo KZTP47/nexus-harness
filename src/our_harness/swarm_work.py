@@ -51,7 +51,7 @@ from .windows_containment import (
 )
 from .verification_python import (
     VerificationPythonUnavailable,
-    packaged_runtime_if_usable,
+    discover_packaged_runtime,
     snapshot_dependency_paths,
     stage_source_runtime,
 )
@@ -934,8 +934,15 @@ def _participants(
 def board_context(
     board: dict[str, Any], agent_id: str,
     peer_id: str = "", project_id: str = "",
+    *, participant_ids: list[str] | None = None,
 ) -> str:
-    """Truthful board identity for every normal chat provider."""
+    """Truthful board identity for every normal chat provider.
+
+    ``peer_id`` predates durable saved-chat membership: an empty value means
+    every ready peer on a green line. ``participant_ids`` is the stronger
+    conversation boundary. When supplied, surrounding board connections are
+    never disclosed as members of this exact chat.
+    """
 
     lead = _agent(board, agent_id)
     project_ids = {
@@ -946,7 +953,17 @@ def board_context(
         one for one in board.get("projects", [])
         if isinstance(one, dict) and str(one.get("id")) in project_ids
     ]
-    peers = [one for one in _participants(board, lead, peer_id) if one is not lead]
+    if participant_ids is None:
+        participants = _participants(board, lead, peer_id)
+    else:
+        allowed = {str(one) for one in participant_ids if str(one)}
+        if str(lead.get("id") or "") not in allowed:
+            raise SwarmError("This saved chat does not include the selected agent.")
+        participants = [lead] if len(allowed) == 1 else [
+            one for one in _participants(board, lead, peer_id)
+            if str(one.get("id") or "") in allowed
+        ]
+    peers = [one for one in participants if one is not lead]
     active = next(
         (one for one in projects if str(one.get("id")) == project_id), None
     )
@@ -4687,8 +4704,7 @@ def _contained_snapshot_command_with_engine(
         runtime_root = python_guard.parent / "runtime"
         contained_read_roots: tuple[Path, ...] = (python_guard.parent,)
         if name in {"python", "python3", "py"}:
-            candidate = Path(__file__).resolve().parents[2] / "desktop" / "runtime"
-            bundled = packaged_runtime_if_usable(candidate)
+            bundled = discover_packaged_runtime(module_file=Path(__file__))
             project_root = (denied_root or config.project_root).resolve()
             if bundled is not None:
                 bundled_root = bundled.resolve()

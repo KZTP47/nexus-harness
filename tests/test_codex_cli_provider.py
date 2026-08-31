@@ -154,6 +154,18 @@ else:
 
 
 class CodexCLIProviderTests(unittest.TestCase):
+    def test_stable_codex_hint_resolves_the_current_desktop_build_at_dispatch(self) -> None:
+        provider = object.__new__(codex_cli.CodexCLIProvider)
+        provider.settings = {"command": ["codex"]}
+        with patch(
+            "our_harness.providers.subscription_cli.available",
+            return_value="C:/OpenAI/Codex/bin/build-b/codex.exe",
+        ):
+            self.assertEqual(
+                provider._command(),
+                ["C:/OpenAI/Codex/bin/build-b/codex.exe"],
+            )
+
     def test_private_workspace_cleanup_never_masks_authoritative_provider_error(self) -> None:
         workspace: Path | None = None
         cleanup_error = PermissionError(32, "fixture cwd is still locked")
