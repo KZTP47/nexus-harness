@@ -110,6 +110,8 @@ opened through Nexus. A project box is a real local folder. The lines between
 them are not decoration: they say which agent works on which project and which
 two agents are allowed to exchange messages.
 
+![The AI Agent Swarm orchestrator board](docs/images/agent-swarms.png)
+
 On this board you can:
 
 - add agents and project folders, move them freely, tidy the layout, zoom, or
