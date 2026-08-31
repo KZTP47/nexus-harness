@@ -47,6 +47,45 @@ def _checked_bounded_command(
     return result
 
 
+def _owned_entry_disappeared(
+    root: Path,
+    entry: Path,
+    error: BaseException,
+    root_identity: tuple[int, int],
+) -> bool:
+    """Confirm a raced-away disposable child instead of masking cleanup errors.
+
+    Chromium can finish deleting transient profile files after ``scandir`` has
+    returned their names.  Treat that specific ENOENT race as successful only
+    for a lexical child of the owned tree and only when a fresh no-follow stat
+    confirms that there is no object left at the name.  Any other error, a
+    missing or replaced root, or a name that still resolves remains a
+    fail-closed cleanup failure.
+    """
+
+    if not isinstance(error, FileNotFoundError) or entry == root:
+        return False
+    try:
+        entry.relative_to(root)
+    except ValueError:
+        return False
+    try:
+        os.stat(entry, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            root_metadata = os.stat(root, follow_symlinks=False)
+        except OSError:
+            return False
+        root_attributes = getattr(root_metadata, "st_file_attributes", 0)
+        return bool(
+            stat.S_ISDIR(root_metadata.st_mode)
+            and (root_metadata.st_dev, root_metadata.st_ino) == root_identity
+            and not root_attributes
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+    return False
+
+
 def _remove_snapshot_reparse_entries(snapshot: Path) -> list[str]:
     """Unlink unsafe aliases lexically without ever walking their targets.
 
@@ -58,6 +97,7 @@ def _remove_snapshot_reparse_entries(snapshot: Path) -> list[str]:
 
     root = Path(os.path.abspath(snapshot))
     root_metadata = root.stat(follow_symlinks=False)
+    root_identity = (root_metadata.st_dev, root_metadata.st_ino)
     if (
         root.is_symlink()
         or getattr(root_metadata, "st_file_attributes", 0)
@@ -72,8 +112,26 @@ def _remove_snapshot_reparse_entries(snapshot: Path) -> list[str]:
         if time.monotonic() > deadline or visited > _REPARSE_SCAN_MAX_ENTRIES:
             raise TimeoutError("Timed out sanitizing disposable snapshot reparse entries")
         folder = pending.pop()
-        with os.scandir(folder) as entries:
-            for entry in entries:
+        try:
+            entries = os.scandir(folder)
+        except OSError as error:
+            if _owned_entry_disappeared(
+                root, folder, error, root_identity,
+            ):
+                continue
+            raise
+        with entries:
+            while True:
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    break
+                except OSError as error:
+                    if _owned_entry_disappeared(
+                        root, folder, error, root_identity,
+                    ):
+                        break
+                    raise
                 visited += 1
                 if (
                     time.monotonic() > deadline
@@ -86,7 +144,14 @@ def _remove_snapshot_reparse_entries(snapshot: Path) -> list[str]:
                 # CPython's Windows DirEntry.stat() currently reports
                 # st_nlink=0 even for a real hard link.  A direct no-follow
                 # stat on the lexical entry preserves the actual link count.
-                metadata = os.stat(lexical, follow_symlinks=False)
+                try:
+                    metadata = os.stat(lexical, follow_symlinks=False)
+                except OSError as error:
+                    if _owned_entry_disappeared(
+                        root, lexical, error, root_identity,
+                    ):
+                        continue
+                    raise
                 attributes = getattr(metadata, "st_file_attributes", 0)
                 reparse = bool(
                     attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -97,14 +162,21 @@ def _remove_snapshot_reparse_entries(snapshot: Path) -> list[str]:
                 )
                 if reparse or external_file_alias:
                     relative = os.path.relpath(lexical, root).replace("\\", "/")
-                    if (
-                        reparse
-                        and attributes
-                        & getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
-                    ):
-                        os.rmdir(lexical)
-                    else:
-                        os.unlink(lexical)
+                    try:
+                        if (
+                            reparse
+                            and attributes
+                            & getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+                        ):
+                            os.rmdir(lexical)
+                        else:
+                            os.unlink(lexical)
+                    except OSError as error:
+                        if _owned_entry_disappeared(
+                            root, lexical, error, root_identity,
+                        ):
+                            continue
+                        raise
                     removed.append(relative)
                 elif stat.S_ISDIR(metadata.st_mode):
                     pending.append(lexical)

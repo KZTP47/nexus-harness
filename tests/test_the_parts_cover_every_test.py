@@ -75,6 +75,17 @@ class SplittingTheTestsTests(unittest.TestCase):
         self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/8", workflow)
         self.assertIn("part: [1, 2, 3, 4, 5, 6, 7, 8]", workflow)
 
+    def test_the_source_panel_lane_installs_declared_runtime_dependencies(self) -> None:
+        # PYTHONPATH makes Nexus's own modules importable, but it does not
+        # install LangGraph or make child commands independent of that one CI
+        # environment variable. The panel lane is meant to model a supported
+        # source installation, so require that installation before it starts.
+        workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
+        panel = workflow[workflow.index("  panel:\n"):workflow.index("  project-checks:\n")]
+        install = panel.index("python -m pip install -e .")
+        start = panel.index("Start the panel and run this part of the checks")
+        self.assertLess(install, start)
+
 
 if __name__ == "__main__":
     unittest.main()

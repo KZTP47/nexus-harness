@@ -26,6 +26,7 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from typing import Any, Callable, Iterator, Sequence
@@ -171,14 +172,63 @@ class ProjectExecutionReservation:
 def _default_base_dir() -> Path:
     override = os.environ.get("OUR_HARNESS_PROJECT_EXECUTION_DIR", "").strip()
     if override:
-        return Path(override).expanduser().resolve()
+        # Preserve this exact final component until _prepare_base_dir has had
+        # a chance to reject a caller-supplied link or reparse point.
+        return Path(override).expanduser()
     if os.name == "nt":
         local = os.environ.get("LOCALAPPDATA", "").strip()
         base = Path(local) if local else Path.home() / "AppData" / "Local"
-        return (base / "OurHarness" / "project-execution").resolve()
+        return base / "OurHarness" / "project-execution"
     state = os.environ.get("XDG_STATE_HOME", "").strip()
     base = Path(state) if state else Path.home() / ".local" / "state"
-    return (base / "our-harness" / "project-execution").resolve()
+    return base / "our-harness" / "project-execution"
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    try:
+        attributes = int(getattr(path.lstat(), "st_file_attributes", 0))
+    except (FileNotFoundError, OSError):
+        return False
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _prepare_base_dir(value: str | os.PathLike[str]) -> Path:
+    """Create and return one canonical identity for the user runtime.
+
+    The spelling supplied by an environment variable or caller is not a
+    durable identity.  In particular, Windows may hand the same profile to
+    different processes as both ``RUNNER~1`` and ``runneradmin``.  Resolve
+    before creation so existing ancestor aliases converge, then resolve the
+    completed directory again so every coordinator publishes paths beneath
+    the same physical directory spelling.
+    """
+
+    requested = Path(value).expanduser()
+    if _is_link_or_reparse(requested):
+        raise ProjectExecutionIntegrityError(
+            "The project-execution runtime directory must not be a link or reparse point."
+        )
+    try:
+        selected = requested.resolve(strict=False)
+        selected.mkdir(parents=True, exist_ok=True)
+        # Check the caller's exact final component again after publication so
+        # a concurrent redirect cannot become the durable SQLite owner.
+        if _is_link_or_reparse(requested):
+            raise ProjectExecutionIntegrityError(
+                "The project-execution runtime directory must not be a link or reparse point."
+            )
+        canonical = selected.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProjectExecutionIntegrityError(
+            "The project-execution runtime directory could not be prepared."
+        ) from exc
+    if _is_link_or_reparse(canonical) or not canonical.is_dir():
+        raise ProjectExecutionIntegrityError(
+            "The project-execution runtime directory is not a regular directory."
+        )
+    return canonical
 
 
 def _current_user_scope() -> str:
@@ -399,11 +449,10 @@ class ProjectExecutionCoordinator:
         owner_alive: Callable[[int, str], bool] | None = None,
         user_scope: str | None = None,
     ) -> None:
-        self.base_dir = (
-            Path(base_dir).expanduser().resolve()
-            if base_dir is not None
-            else _default_base_dir()
-        )
+        requested_base_dir = Path(
+            base_dir if base_dir is not None else _default_base_dir()
+        ).expanduser()
+        self.base_dir = requested_base_dir.resolve(strict=False)
         self._default_ttl_ms = self._validate_ttl(provisional_ttl_ms)
         self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self._owner_alive = owner_alive or _owner_is_alive
@@ -411,11 +460,7 @@ class ProjectExecutionCoordinator:
         if not _TOKEN.fullmatch(self.user_scope):
             raise ProjectExecutionError("The user scope must be a 64-character lowercase SHA-256 value.")
 
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        if self.base_dir.is_symlink() or not self.base_dir.is_dir():
-            raise ProjectExecutionIntegrityError(
-                "The project-execution runtime directory is not a regular directory."
-            )
+        self.base_dir = _prepare_base_dir(requested_base_dir)
         try:
             self.base_dir.chmod(0o700)
         except OSError:

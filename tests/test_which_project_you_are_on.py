@@ -477,6 +477,9 @@ class MovingToAnotherOne(ProjectTestCase):
             with self.subTest(path=path):
                 entered = threading.Event()
                 release = threading.Event()
+                response_started = threading.Event()
+                release_response = threading.Event()
+                self.addCleanup(release_response.set)
 
                 def blocked(config: LoadedConfig, *_args) -> object:
                     provider_roots.append(config.project_root)
@@ -486,7 +489,17 @@ class MovingToAnotherOne(ProjectTestCase):
                     return returned
 
                 answer: list[tuple[int, dict]] = []
-                with mock.patch.object(chat, provider_method, side_effect=blocked):
+                original_json = server.HarnessHandler._json
+
+                def block_response(handler, value, status=200):
+                    if handler.path == path:
+                        response_started.set()
+                        if not release_response.wait(5):
+                            raise RuntimeError("test did not release provider response")
+                    return original_json(handler, value, status)
+
+                with mock.patch.object(chat, provider_method, side_effect=blocked), \
+                        mock.patch.object(server.HarnessHandler, "_json", block_response):
                     request = threading.Thread(
                         target=lambda: answer.append(self.ask(path, body)), daemon=True
                     )
@@ -498,13 +511,24 @@ class MovingToAnotherOne(ProjectTestCase):
                     self.assertEqual(self.panel.config.project_root, self.first)
 
                     release.set()
+                    self.assertTrue(response_started.wait(5))
+
+                    # The provider turn has finished and its immutable answer
+                    # has been captured. Slow response I/O must not extend the
+                    # old project's authority lifetime.
+                    self.panel.move_to(str(self.second))
+                    self.assertEqual(self.panel.config.project_root, self.second)
+
+                    release_response.set()
                     request.join(5)
 
                 self.assertFalse(request.is_alive())
                 self.assertEqual(answer[0][0], 200, answer)
 
+                if path != cases[-1][1]:
+                    self.panel.move_to(str(self.first))
+
         self.assertEqual(provider_roots, [self.first, self.first])
-        self.panel.move_to(str(self.second))
         self.assertEqual(self.panel.config.project_root, self.second)
 
     def test_talk_remains_available_when_project_execution_is_paused(self) -> None:

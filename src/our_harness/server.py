@@ -4367,11 +4367,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     with self.server.project_admission_lock:
                         config = self.server.config
                         with cancellation.use(cancel_token):
-                            self._json(chat_lab.say(
+                            answer = chat_lab.say(
                                 config, who, str(body.get("text") or ""),
-                            ))
+                            )
                 finally:
                     self.server.chat_cancellations.finish(chat_key, cancel_token)
+                # Provider completion is the project boundary.  Socket writes
+                # can outlive the request observed by the client, especially
+                # on a loaded runner, but they no longer read project state.
+                # Do not make unrelated project moves wait for response I/O.
+                self._json(answer)
             elif self.path == "/api/chat/ask-everyone":
                 # Every one of them, at the same time. Six one after another is
                 # six waits.
@@ -4381,13 +4386,12 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     with self.server.project_admission_lock:
                         config = self.server.config
                         with cancellation.use(cancel_token):
-                            self._json({
-                                "answers": chat_lab.ask_everyone(
-                                    config, str(body.get("text") or "")
-                                )
-                            })
+                            answers = chat_lab.ask_everyone(
+                                config, str(body.get("text") or "")
+                            )
                 finally:
                     self.server.chat_cancellations.finish(chat_key, cancel_token)
+                self._json({"answers": answers})
             elif self.path == "/api/chat/stop":
                 who = str(body.get("who") or "")
                 chat_key = "talk:everyone" if body.get("everyone") is True else f"talk:{who}"

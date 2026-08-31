@@ -21,6 +21,9 @@ from our_harness.models import HarnessError
 from our_harness.providers import base as provider_base
 
 
+THREAD_COORDINATION_TIMEOUT_SECONDS = 30.0
+
+
 def action(kind: str = "complete", **updates):
     value = {
         "action": kind,
@@ -1749,65 +1752,91 @@ class LongHorizonTests(unittest.TestCase):
             })
             return runtime.store.get(goal["goal_id"])
 
+        def control_while_verifying(goal, control, payload=None):
+            entered = threading.Event()
+            release = threading.Event()
+            controlled = threading.Event()
+            results = {}
+            failures = []
+
+            def delayed_verification(*_args, **_kwargs):
+                entered.set()
+                if not release.wait(THREAD_COORDINATION_TIMEOUT_SECONDS * 2):
+                    raise TimeoutError("the verification race was not released during bounded cleanup")
+                return {"status": "passed", "basis": "stale checks"}
+
+            def verify():
+                try:
+                    results["verification"] = runtime._verify_node({"goal_id": goal["goal_id"]})
+                except BaseException as exc:
+                    failures.append(("verification", exc))
+
+            def apply_control():
+                try:
+                    results["control"] = runtime.control(goal["goal_id"], control, payload)
+                except BaseException as exc:
+                    failures.append(("control", exc))
+                finally:
+                    controlled.set()
+
+            verifier = threading.Thread(target=verify, name=f"verify-race-{control}", daemon=True)
+            controller = threading.Thread(target=apply_control, name=f"control-race-{control}", daemon=True)
+            with mock.patch.object(
+                long_horizon.swarm_work, "_run_selected_project_verification",
+                side_effect=delayed_verification,
+            ):
+                verifier.start()
+                try:
+                    self.assertTrue(
+                        entered.wait(THREAD_COORDINATION_TIMEOUT_SECONDS),
+                        "verification did not reach the controlled race boundary",
+                    )
+                    controller.start()
+                    self.assertTrue(
+                        controlled.wait(THREAD_COORDINATION_TIMEOUT_SECONDS),
+                        f"{control} control did not finish before the bounded test timeout",
+                    )
+                finally:
+                    # Always release and join both sides so an assertion cannot strand a
+                    # test thread or let its late mutation leak into the next race.
+                    release.set()
+                    if controller.ident is not None:
+                        controller.join(THREAD_COORDINATION_TIMEOUT_SECONDS)
+                    verifier.join(THREAD_COORDINATION_TIMEOUT_SECONDS)
+
+            self.assertFalse(controller.is_alive(), f"{control} control thread did not stop")
+            self.assertFalse(verifier.is_alive(), "verification thread did not stop after release")
+            if failures:
+                phase, failure = failures[0]
+                raise AssertionError(f"{phase} thread failed during the verification race") from failure
+            return results
+
         first = ready_for_verification(self.board, "project", "verify-steer-race")
-        entered = threading.Event()
-        release = threading.Event()
-        def delayed_verification(*_args, **_kwargs):
-            entered.set()
-            self.assertTrue(release.wait(5))
-            return {"status": "passed", "basis": "stale checks"}
-        result = {}
         with mock.patch.object(
-            long_horizon.swarm_work, "_run_selected_project_verification", side_effect=delayed_verification,
-        ), mock.patch.object(
             runtime, "start_background", side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
         ):
-            verifier = threading.Thread(
-                target=lambda: result.update({"steer": runtime._verify_node({"goal_id": first["goal_id"]})}),
+            steer_race = control_while_verifying(
+                first, "steer", {"text": "Also satisfy the new constraint"},
             )
-            verifier.start()
-            self.assertTrue(entered.wait(5))
-            runtime.control(first["goal_id"], "steer", {"text": "Also satisfy the new constraint"})
-            release.set()
-            verifier.join(5)
         steered = runtime.store.get(first["goal_id"])
         self.assertNotEqual(steered["status"], "complete")
         self.assertEqual(steered["verification"]["status"], "superseded")
+        self.assertEqual(steer_race["verification"], {"route": "schedule"})
 
         runtime.store.control(first["goal_id"], "cancel")
         second = ready_for_verification(self.board, "project", "verify-cancel-race")
-        entered.clear()
-        release.clear()
-        with mock.patch.object(
-            long_horizon.swarm_work, "_run_selected_project_verification", side_effect=delayed_verification,
-        ):
-            verifier = threading.Thread(
-                target=lambda: result.update({"cancel": runtime._verify_node({"goal_id": second["goal_id"]})}),
-            )
-            verifier.start()
-            self.assertTrue(entered.wait(5))
-            runtime.control(second["goal_id"], "cancel")
-            release.set()
-            verifier.join(5)
-        self.assertEqual(runtime.store.get(second["goal_id"])["status"], "cancelled")
+        cancel_race = control_while_verifying(second, "cancel")
+        cancelled = runtime.store.get(second["goal_id"])
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["verification"]["status"], "not_run")
+        self.assertEqual(cancel_race["verification"], {"route": "end"})
 
         third = ready_for_verification(self.board, "project", "verify-pause-race")
-        entered.clear()
-        release.clear()
-        with mock.patch.object(
-            long_horizon.swarm_work, "_run_selected_project_verification", side_effect=delayed_verification,
-        ):
-            verifier = threading.Thread(
-                target=lambda: result.update({"pause": runtime._verify_node({"goal_id": third["goal_id"]})}),
-            )
-            verifier.start()
-            self.assertTrue(entered.wait(5))
-            runtime.control(third["goal_id"], "pause")
-            release.set()
-            verifier.join(5)
+        pause_race = control_while_verifying(third, "pause")
         paused = runtime.store.get(third["goal_id"])
         self.assertEqual(paused["status"], "paused")
         self.assertEqual(paused["verification"]["status"], "superseded")
+        self.assertEqual(pause_race["verification"], {"route": "end"})
 
     def test_pause_and_cancel_serialize_at_file_transaction_boundary(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)

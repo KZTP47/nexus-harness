@@ -413,6 +413,133 @@ class RunnerTests(unittest.TestCase):
         finished = subprocess.run([node, "--check", str(path)], capture_output=True, text=True)
         self.assertEqual(finished.returncode, 0, finished.stderr)
 
+    def _browser_report_with_load_failures(
+        self,
+        failures: list[str | None],
+        *,
+        failed_url: str = "http://127.0.0.1:8765/styles.css",
+        method: str = "GET",
+        resource_type: str = "stylesheet",
+    ) -> dict:
+        """Run the generated worker against a deterministic Playwright stand-in."""
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is not on this machine")
+        module = self.root / "node_modules" / "playwright"
+        module.mkdir(parents=True, exist_ok=True)
+        (module / "index.js").write_text(
+            f"""
+const failures = {json.dumps(failures)};
+const failedUrl = {json.dumps(failed_url)};
+const failedMethod = {json.dumps(method)};
+const failedType = {json.dumps(resource_type)};
+const handlers = {{}};
+let loads = 0;
+const page = {{
+  addInitScript: async () => {{}},
+  on: (name, handler) => {{ handlers[name] = handler; }},
+  goto: async () => {{
+    const errorText = failures[loads++];
+    if (errorText) {{
+      const request = {{
+        url: () => failedUrl,
+        failure: () => ({{errorText}}),
+        method: () => failedMethod,
+        resourceType: () => failedType,
+      }};
+      handlers.requestfailed(request);
+      handlers.console({{
+        type: () => 'error',
+        location: () => ({{url: failedUrl}}),
+        text: () => 'Failed to load resource: ' + errorText,
+      }});
+    }}
+    return {{status: () => 200}};
+  }},
+  waitForTimeout: async () => {{}},
+  evaluate: async (body) => String(body).includes('document.body') ? 'ready' : false,
+}};
+module.exports = {{chromium: {{launch: async () => ({{
+  newContext: async () => ({{newPage: async () => page}}),
+  close: async () => {{}},
+}})}}}};
+""",
+            encoding="utf-8",
+        )
+        plan = {
+            "url": "http://127.0.0.1:8765/",
+            "routes": ["/"],
+            "viewport": {"width": 800, "height": 600},
+            "steps": [],
+            "clickAll": False,
+            "checkAccessibility": False,
+            "timeoutMs": 1_000,
+            "settleMs": 0,
+            "measure": False,
+            "crawl": None,
+            "screenshot": None,
+        }
+        script = self.root / "browser-load-retry.js"
+        script.write_text(qa.browser_script(plan), encoding="utf-8")
+        finished = subprocess.run(
+            [node, str(script)], cwd=self.root, capture_output=True, text=True, timeout=20
+        )
+        self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
+        marker = "<<<QA_REPORT>>>"
+        self.assertIn(marker, finished.stdout)
+        return json.loads(finished.stdout.split(marker, 1)[1])
+
+    def test_initial_same_origin_socket_buffer_failure_gets_one_clean_navigation_retry(self) -> None:
+        report = self._browser_report_with_load_failures(["net::ERR_NO_BUFFER_SPACE", None])
+
+        self.assertEqual(report["consoleErrors"], [])
+        self.assertEqual(report["requestFailures"], [])
+        self.assertEqual(report["routes"], [{"route": "/", "status": 200}])
+        self.assertEqual(len(report["navigationRetries"]), 1)
+        retried = report["navigationRetries"][0]
+        self.assertIs(retried["recovered"], True)
+        self.assertEqual(retried["after"], [{
+            "url": "http://127.0.0.1:8765/styles.css",
+            "text": "net::ERR_NO_BUFFER_SPACE",
+        }])
+
+    def test_persistent_socket_buffer_failure_survives_the_one_retry_and_fails(self) -> None:
+        report = self._browser_report_with_load_failures([
+            "net::ERR_NO_BUFFER_SPACE", "net::ERR_NO_BUFFER_SPACE",
+        ])
+
+        self.assertEqual(len(report["requestFailures"]), 1)
+        self.assertEqual(len(report["consoleErrors"]), 1)
+        self.assertIs(report["navigationRetries"][0]["recovered"], False)
+        case = self.suite([{
+            "id": "browser", "kind": "browser", "url": "http://127.0.0.1:8765/",
+            "expect": {"max_console_errors": 0, "max_failed_requests": 0},
+        }]).cases[0]
+        reasons, _summary, _full = qa.QaRunner(self.config)._browser_reasons(case, report)
+        self.assertTrue(any("failed network request" in reason for reason in reasons))
+
+    def test_initial_navigation_retry_does_not_cover_other_errors_or_origins(self) -> None:
+        examples = (
+            ({"failures": ["net::ERR_CONNECTION_REFUSED"]}, "another transport error"),
+            ({
+                "failures": ["net::ERR_NO_BUFFER_SPACE"],
+                "failed_url": "https://example.invalid/styles.css",
+            }, "another origin"),
+            ({
+                "failures": ["net::ERR_NO_BUFFER_SPACE"], "method": "POST",
+            }, "a request that might have changed state"),
+            ({
+                "failures": ["net::ERR_NO_BUFFER_SPACE"], "resource_type": "image",
+            }, "a non-critical page resource"),
+        )
+        for arguments, why in examples:
+            with self.subTest(why=why):
+                report = self._browser_report_with_load_failures(**arguments)
+                self.assertEqual(report["navigationRetries"], [])
+                self.assertEqual(len(report["requestFailures"]), 1)
+                self.assertEqual(len(report["consoleErrors"]), 1)
+
     def test_every_step_action_reaches_its_own_branch(self) -> None:
         """The script must handle each action the parser accepts, or a valid
         suite would fail at run time with 'unknown step'."""

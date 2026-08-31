@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from our_harness.project_execution import (
     CONTRACT_FINGERPRINT,
@@ -86,8 +87,10 @@ class ProjectExecutionCoordinatorTests(unittest.TestCase):
         project = self.project("one")
         reservation = self.reserve("schema-request", [project])
 
-        self.assertEqual(self.coordinator.path, self.runtime / DATABASE_NAME)
-        self.assertEqual(self.coordinator.key_path, self.runtime / INTEGRITY_KEY_NAME)
+        canonical_runtime = self.runtime.resolve()
+        self.assertEqual(self.coordinator.base_dir, canonical_runtime)
+        self.assertEqual(self.coordinator.path, canonical_runtime / DATABASE_NAME)
+        self.assertEqual(self.coordinator.key_path, canonical_runtime / INTEGRITY_KEY_NAME)
         self.assertTrue(self.coordinator.path.is_file())
         self.assertEqual(self.coordinator.key_path.stat().st_size, 32)
         self.assertFalse((project / DATABASE_NAME).exists())
@@ -103,6 +106,48 @@ class ProjectExecutionCoordinatorTests(unittest.TestCase):
         self.assertEqual(metadata[1], CONTRACT_FINGERPRINT)
         self.assertRegex(metadata[2], r"^[0-9a-f]{64}$")
         self.assertRegex(metadata[3], r"^[0-9a-f]{64}$")
+
+    def test_runtime_aliases_share_one_store_but_siblings_do_not(self) -> None:
+        parent = self.root / "runtime identity"
+        detour = parent / "detour"
+        detour.mkdir(parents=True)
+        canonical_runtime = parent / "shared"
+        aliased_runtime = detour / ".." / "shared"
+        through_alias = ProjectExecutionCoordinator(base_dir=aliased_runtime)
+        through_canonical = ProjectExecutionCoordinator(base_dir=canonical_runtime)
+        self.assertEqual(through_alias.base_dir, canonical_runtime.resolve())
+        self.assertEqual(through_canonical.base_dir, canonical_runtime.resolve())
+
+        project = self.project("runtime-alias")
+        claim = through_alias.reserve(
+            request_id="runtime-alias",
+            intent={"engine": "test", "work": "alias"},
+            roots=[project],
+            provisional_owner_id="alias-owner",
+        )
+        replay = through_canonical.by_request("runtime-alias")
+        self.assertIsNotNone(replay)
+        assert replay is not None
+        self.assertEqual(replay.reservation_id, claim.reservation_id)
+
+        sibling = ProjectExecutionCoordinator(base_dir=parent / "different")
+        self.assertIsNone(sibling.by_request("runtime-alias"))
+
+    def test_runtime_base_symlink_is_rejected_without_writing_its_target(self) -> None:
+        target = self.root / "runtime-link-target"
+        target.mkdir()
+        link = self.root / "runtime-link"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as exc:
+            self.skipTest(f"this host cannot create a directory symlink: {exc}")
+
+        with self.assertRaisesRegex(
+            ProjectExecutionIntegrityError, "link or reparse point"
+        ):
+            ProjectExecutionCoordinator(base_dir=link)
+        self.assertFalse((target / DATABASE_NAME).exists())
+        self.assertFalse((target / INTEGRITY_KEY_NAME).exists())
 
     def test_multi_root_reservation_is_atomic_for_exact_and_nested_overlap(self) -> None:
         first = self.project("first")
@@ -506,6 +551,69 @@ class ProjectExecutionCoordinatorTests(unittest.TestCase):
         extended = Path("\\\\?\\" + str(root))
         with self.assertRaises(ProjectExecutionConflict):
             self.reserve("extended-alias", [extended])
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows 8.3 path aliases")
+    def test_windows_short_and_long_runtime_aliases_share_one_store(self) -> None:
+        import ctypes
+        import os
+
+        long_parent = self.root.resolve()
+        buffer = ctypes.create_unicode_buffer(32_768)
+        copied = ctypes.windll.kernel32.GetShortPathNameW(
+            str(long_parent), buffer, len(buffer)
+        )
+        if copied == 0 or copied >= len(buffer):
+            self.skipTest("this Windows volume does not expose an 8.3 alias")
+        short_parent = Path(buffer.value)
+        self.assertTrue(long_parent.samefile(short_parent))
+        if os.path.normcase(str(short_parent)) == os.path.normcase(str(long_parent)):
+            self.skipTest("this Windows volume does not expose a distinct 8.3 alias")
+
+        short_runtime = short_parent / "short-long-shared-runtime"
+        long_runtime = long_parent / "short-long-shared-runtime"
+        through_short = ProjectExecutionCoordinator(base_dir=short_runtime)
+        through_long = ProjectExecutionCoordinator(base_dir=long_runtime)
+        self.assertEqual(through_short.base_dir, through_long.base_dir)
+        self.assertEqual(through_short.path, through_long.path)
+
+        project = self.project("windows-runtime-alias")
+        claim = through_short.reserve(
+            request_id="windows-runtime-alias",
+            intent={"engine": "test", "work": "windows-alias"},
+            roots=[project],
+            provisional_owner_id="windows-alias-owner",
+        )
+        replay = through_long.by_request("windows-runtime-alias")
+        self.assertIsNotNone(replay)
+        assert replay is not None
+        self.assertEqual(replay.reservation_id, claim.reservation_id)
+
+    @unittest.skipUnless(__import__("os").name == "nt", "Windows junctions")
+    def test_windows_runtime_junction_is_rejected_without_writing_its_target(self) -> None:
+        import subprocess
+
+        target = self.root / "runtime-junction-target"
+        target.mkdir()
+        junction = self.root / "runtime-junction"
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0 or not junction.is_dir():
+            self.skipTest("this Windows host cannot create a directory junction")
+        try:
+            with mock.patch.dict(
+                "os.environ", {"OUR_HARNESS_PROJECT_EXECUTION_DIR": str(junction)}
+            ):
+                with self.assertRaisesRegex(
+                    ProjectExecutionIntegrityError, "link or reparse point"
+                ):
+                    ProjectExecutionCoordinator()
+            self.assertFalse((target / DATABASE_NAME).exists())
+            self.assertFalse((target / INTEGRITY_KEY_NAME).exists())
+        finally:
+            junction.rmdir()
 
     def test_persisted_claim_remains_releasable_after_root_disappears(self) -> None:
         root = self.project("disappearing")

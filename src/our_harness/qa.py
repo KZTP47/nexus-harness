@@ -3815,6 +3815,7 @@ class QaRunner:
                 "console_errors": len(report.get("consoleErrors") or []),
                 "page_errors": len(report.get("pageErrors") or []),
                 "failed_requests": len(report.get("requestFailures") or []),
+                "navigation_retries": report.get("navigationRetries") or [],
                 "accessibility_problems": len(report.get("accessibility") or []),
                 "steps": report.get("steps"),
             },
@@ -4170,11 +4171,77 @@ async function runStep(page, step) {
   throw new Error('unknown step: ' + step.do);
 }
 
+// Chromium reports this when Windows could not allocate a socket buffer. The
+// request never reached the panel, so one fresh navigation is useful evidence
+// rather than a rerun of somebody's workflow. Keep the rule deliberately
+// narrow: only the exact client-side condition, only a same-origin GET for a
+// page resource, and only before the case's first user step.
+const INITIAL_NAVIGATION_TRANSIENT = 'net::ERR_NO_BUFFER_SPACE';
+const INITIAL_NAVIGATION_RESOURCE_TYPES = new Set(['document', 'stylesheet', 'script']);
+
+function isRetryableInitialNavigationFailure(item, target) {
+  if (!item || item.text !== INITIAL_NAVIGATION_TRANSIENT || item.method !== 'GET') return false;
+  if (!INITIAL_NAVIGATION_RESOURCE_TYPES.has(item.resourceType)) return false;
+  try { return new URL(item.url).origin === new URL(target).origin; }
+  catch (_) { return false; }
+}
+
+function forgetRetriedTransportNoise(report, requestStart, consoleStart, failures) {
+  report.requestFailures.splice(requestStart, failures.length);
+  const retried = new Set(failures.map(item => item.url + '\n' + item.text));
+  const keep = report.consoleErrors.slice(consoleStart).filter(item => {
+    for (const key of retried) {
+      const [url, text] = key.split('\n', 2);
+      if (item.text.includes(url) && item.text.includes(text)) return false;
+    }
+    return true;
+  });
+  report.consoleErrors.splice(consoleStart, report.consoleErrors.length - consoleStart, ...keep);
+}
+
+async function openInitialRoute(page, target, route, plan, report) {
+  let answer;
+  let navigationError;
+  const requestStart = report.requestFailures.length;
+  const consoleStart = report.consoleErrors.length;
+  try {
+    answer = await page.goto(target, { waitUntil: 'load', timeout: plan.timeoutMs });
+  } catch (error) {
+    navigationError = error;
+  }
+  // `load` waits for styles and scripts, but yielding once also lets the
+  // requestfailed/console listeners record the failure before it is judged.
+  await page.waitForTimeout(0);
+  const failures = report.requestFailures.slice(requestStart);
+  if (!failures.length || !failures.every(item => isRetryableInitialNavigationFailure(item, target))) {
+    if (navigationError) throw navigationError;
+    return answer;
+  }
+
+  const retry = {
+    route,
+    after: failures.map(item => ({ url: item.url, text: item.text })),
+    recovered: false,
+  };
+  report.navigationRetries.push(retry);
+  // Do not count the discarded navigation twice. Only the matching Chromium
+  // transport message is removed; an unrelated console or page error from the
+  // first load remains visible and still fails the check.
+  forgetRetriedTransportNoise(report, requestStart, consoleStart, failures);
+  await page.waitForTimeout(200);
+  answer = await page.goto(target, { waitUntil: 'load', timeout: plan.timeoutMs });
+  await page.waitForTimeout(0);
+  retry.recovered = !report.requestFailures.slice(requestStart).some(
+    item => isRetryableInitialNavigationFailure(item, target)
+  );
+  return answer;
+}
+
 (async () => {
   const report = {
     routes: [], consoleErrors: [], pageErrors: [], requestFailures: [], accessibility: [],
     clicks: [], steps: [], text: '', fatal: '', screenshot: '', speed: [],
-    pages: [], morePages: 0, refused: [],
+    pages: [], morePages: 0, refused: [], navigationRetries: [],
   };
   let current = '/';
   let browser;
@@ -4232,7 +4299,11 @@ async function runStep(page, step) {
     page.on('requestfailed', (request) => {
       const failure = request.failure() || {};
       report.requestFailures.push({
-        route: current, url: request.url().slice(0, 300), text: failure.errorText || 'request failed',
+        route: current,
+        url: request.url().slice(0, 300),
+        text: failure.errorText || 'request failed',
+        method: request.method(),
+        resourceType: request.resourceType(),
       });
     });
     if (plan.crawl) {
@@ -4310,7 +4381,7 @@ async function runStep(page, step) {
     for (const route of plan.routes) {
       current = route;
       const target = new URL(route, plan.url).toString();
-      const answer = await page.goto(target, { waitUntil: 'load', timeout: plan.timeoutMs });
+      const answer = await openInitialRoute(page, target, route, plan, report);
       report.routes.push({ route, status: answer ? answer.status() : 0 });
       await page.waitForTimeout(plan.settleMs);
       report.text += '\n' + await page.evaluate(() => (document.body ? document.body.innerText : ''));

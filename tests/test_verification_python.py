@@ -622,6 +622,81 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         ).stdout
         self.assertEqual(before_acl, after_acl)
 
+    def test_snapshot_cleanup_accepts_an_enumerated_file_that_really_disappeared(self) -> None:
+        transient = self.snapshot / "browser-profile-wal"
+        transient.write_bytes(b"pending browser profile cleanup")
+        stable = self.snapshot / "stable.txt"
+        stable.write_text("ordinary snapshot content", encoding="utf-8")
+        real_stat = os.stat
+        raced = False
+
+        def disappearing_stat(path, *args, **kwargs):
+            nonlocal raced
+            if Path(path) == transient and not raced:
+                raced = True
+                transient.unlink()
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(
+            windows_containment.os, "stat", side_effect=disappearing_stat,
+        ):
+            removed = windows_containment._remove_snapshot_reparse_entries(
+                self.snapshot
+            )
+
+        self.assertTrue(raced)
+        self.assertEqual([], removed)
+        self.assertFalse(transient.exists())
+        self.assertEqual("ordinary snapshot content", stable.read_text(encoding="utf-8"))
+
+    def test_snapshot_cleanup_accepts_an_unsafe_alias_deleted_during_unlink(self) -> None:
+        external = self.guard / "engine-owned.txt"
+        external.write_bytes(b"engine-owned")
+        alias = self.snapshot / "raced-engine-alias.txt"
+        os.link(external, alias)
+        real_unlink = os.unlink
+        raced = False
+
+        def disappearing_unlink(path, *args, **kwargs):
+            nonlocal raced
+            if Path(path) == alias and not raced:
+                raced = True
+                real_unlink(path, *args, **kwargs)
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            windows_containment.os, "unlink", side_effect=disappearing_unlink,
+        ):
+            removed = windows_containment._remove_snapshot_reparse_entries(
+                self.snapshot
+            )
+
+        self.assertTrue(raced)
+        self.assertEqual([], removed)
+        self.assertFalse(alias.exists())
+        self.assertEqual(b"engine-owned", external.read_bytes())
+
+    def test_snapshot_cleanup_fails_closed_when_missing_alias_is_still_present(self) -> None:
+        external = self.guard / "engine-owned.txt"
+        external.write_bytes(b"engine-owned")
+        alias = self.snapshot / "leftover-engine-alias.txt"
+        os.link(external, alias)
+        real_unlink = os.unlink
+
+        def false_missing(path, *args, **kwargs):
+            if Path(path) == alias:
+                raise FileNotFoundError(2, "simulated missing entry", str(path))
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            windows_containment.os, "unlink", side_effect=false_missing,
+        ):
+            with self.assertRaises(FileNotFoundError):
+                windows_containment._remove_snapshot_reparse_entries(self.snapshot)
+
+        self.assertTrue(alias.exists())
+        self.assertEqual(b"engine-owned", external.read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()
