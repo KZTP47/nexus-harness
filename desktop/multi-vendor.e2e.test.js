@@ -126,6 +126,8 @@ test("every chat scenario proves dispatch, visible truth, recovery, and restart 
   assert.match(source, /await app\.close\(\)/);
   assert.match(source, /survive a full restart/);
   assert.match(source, /Repair Fixture Anthropic[\s\S]*Ask all agents again/);
+  assert.match(source, /maxRetries: 12/);
+  assert.match(source, /retryDelay: 250/);
 });
 
 test("unpacked and installed acceptance lanes are release gates", () => {

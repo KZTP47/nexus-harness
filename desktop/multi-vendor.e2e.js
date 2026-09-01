@@ -912,7 +912,15 @@ async function main() {
   } finally {
     if (app) await app.close().catch(() => {});
     await new Promise((resolve) => fixture.server.close(resolve));
-    if (passed) fs.rmSync(root, {recursive: true, force: true});
+    if (passed) fs.rmSync(root, {
+      recursive: true,
+      force: true,
+      // Windows can briefly retain a cwd/file handle after Electron and its
+      // server have exited. Keep a successful release acceptance from turning
+      // red solely because that temporary directory needs another moment.
+      maxRetries: 12,
+      retryDelay: 250,
+    });
   }
 }
 
