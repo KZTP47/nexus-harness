@@ -1330,6 +1330,18 @@ body.workspace-is-fullscreen { overflow: hidden; }
 .work-recovery-actions { margin-top: 1px; }
 .swarm-chat-work-recovery { max-height: 42vh; overflow-y: auto; overscroll-behavior: contain; }
 .the-big-chat-work-recovery { margin-bottom: 8px; }
+.direct-long-goal-recovery-board {
+  display: grid; gap: 7px; margin: 8px 0 14px; padding: 10px 12px;
+  border: 1px solid var(--yellow, #ffd166); border-radius: 10px;
+  background: color-mix(in srgb, var(--yellow, #ffd166) 9%, var(--panel, #0f2430));
+}
+.direct-long-goal-recovery-board[hidden] { display: none !important; }
+.direct-long-goal-recovery-board h4,
+.direct-long-goal-recovery-board p { margin: 0; }
+.direct-long-goal-recovery-board ul { display: grid; gap: 8px; margin: 0; padding-left: 20px; }
+.direct-long-goal-recovery-row { overflow-wrap: anywhere; }
+.direct-long-goal-recovery-row > .button-row { margin-top: 5px; }
+.direct-long-goal-recovery-identity { font-size: .78rem; }
 .agent-question-card {
   display: grid; gap: 8px; margin-top: 9px; padding: 11px 12px;
   border: 1px solid color-mix(in srgb, var(--cyan, #52d5ea) 62%, transparent);

@@ -236,15 +236,377 @@ $authenticated = @{ Authorization = 'Bearer private-token' }
                     self.assertEqual(result.returncode, 0, result.stderr)
                     payload = json.loads(result.stdout.strip().splitlines()[-1])
                     message = payload["AnonymousLatest"]
-                    self.assertIn("No installable Nexus Harness release is visible", message)
-                    self.assertIn("no stable release has been published", message)
-                    self.assertIn("repository is private", message)
-                    self.assertIn("sign in with GitHub CLI", message)
+                    self.assertIn("No installable Nexus Harness release is available", message)
+                    self.assertIn("latest stable release", message)
+                    self.assertIn("No Windows installer ran", message)
+                    self.assertIn("no desktop shortcut could be created", message)
                     self.assertNotIn("This repository is private", message)
                     self.assertEqual(payload["LaterAsset"], "GitHub returned HTTP 404 while downloading a release asset.")
-                    self.assertEqual(payload["Authenticated"], "GitHub returned HTTP 404 while downloading a release asset.")
+                    self.assertEqual(payload["Authenticated"], message)
                     self.assertEqual(payload["UnrelatedNotFound"], "A local file was Not Found.")
                     self.assertEqual(payload["Http4040"], "GitHub returned HTTP 4040 while downloading a release asset.")
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell release binding is Windows-specific")
+    def test_powershell_stable_release_binds_tag_installer_and_checksum_versions(self):
+        hosts = _powershell_hosts()
+        self.assertTrue(hosts, "Windows PowerShell is required for the installer contract")
+        functions = _installer_header_function_source()
+        harness = r'''
+$ErrorActionPreference = 'Stop'
+__INSTALLER_FUNCTIONS__
+function Test-Release([string] $Tag, [string] $Installer, [string] $Checksum) {
+    $release = [pscustomobject]@{
+        draft = $false
+        prerelease = $false
+        tag_name = $Tag
+        assets = @(
+            [pscustomobject]@{ name = $Installer; url = 'https://api.github.com/installer' },
+            [pscustomobject]@{ name = $Checksum; url = 'https://api.github.com/checksum' }
+        )
+    }
+    try {
+        $bound = Get-NexusStableReleaseAssets $release
+        return [pscustomobject]@{
+            Accepted = $true
+            Version = $bound.Version
+            Installer = $bound.Installer.name
+            Checksum = $bound.Checksum.name
+            Message = ''
+        }
+    } catch {
+        return [pscustomobject]@{
+            Accepted = $false
+            Version = ''
+            Installer = ''
+            Checksum = ''
+            Message = [string]$_.Exception.Message
+        }
+    }
+}
+[pscustomobject]@{
+    Exact = Test-Release 'v0.2.1' 'Nexus-Harness-Setup-0.2.1-UNSIGNED.exe' 'Nexus-Harness-Setup-0.2.1-UNSIGNED.exe.sha256'
+    WrongInstaller = Test-Release 'v0.2.2' 'Nexus-Harness-Setup-0.2.1.exe' 'Nexus-Harness-Setup-0.2.1.exe.sha256'
+    WrongChecksum = Test-Release 'v0.2.1' 'Nexus-Harness-Setup-0.2.1.exe' 'Nexus-Harness-Setup-0.2.0.exe.sha256'
+    LooseTag = Test-Release 'release-0.2.1' 'Nexus-Harness-Setup-0.2.1.exe' 'Nexus-Harness-Setup-0.2.1.exe.sha256'
+} | ConvertTo-Json -Depth 5 -Compress
+'''.replace("__INSTALLER_FUNCTIONS__", functions)
+        with tempfile.TemporaryDirectory() as folder:
+            harness_path = Path(folder) / "release-binding.ps1"
+            harness_path.write_text(harness, encoding="utf-8-sig")
+            for host in hosts:
+                with self.subTest(host=Path(host).name):
+                    result = subprocess.run(
+                        [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                         "-File", str(harness_path)],
+                        text=True, capture_output=True, timeout=20, errors="replace",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout.strip().splitlines()[-1])
+                    self.assertTrue(payload["Exact"]["Accepted"])
+                    self.assertEqual(payload["Exact"]["Version"], "0.2.1")
+                    self.assertEqual(payload["Exact"]["Installer"],
+                                     "Nexus-Harness-Setup-0.2.1-UNSIGNED.exe")
+                    self.assertFalse(payload["WrongInstaller"]["Accepted"])
+                    self.assertIn("does not match installer", payload["WrongInstaller"]["Message"])
+                    self.assertFalse(payload["WrongChecksum"]["Accepted"])
+                    self.assertIn("does not name the exact", payload["WrongChecksum"]["Message"])
+                    self.assertFalse(payload["LooseTag"]["Accepted"])
+                    self.assertIn("not an exact Nexus Harness version", payload["LooseTag"]["Message"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows install metadata is Windows-specific")
+    def test_powershell_installed_application_uses_exact_redirected_registry_location(self):
+        hosts = _powershell_hosts()
+        self.assertTrue(hosts, "Windows PowerShell is required for the installer contract")
+        functions = _installer_header_function_source()
+        harness = r'''
+$ErrorActionPreference = 'Stop'
+__INSTALLER_FUNCTIONS__
+$installLocation = Join-Path ([IO.Path]::GetFullPath($args[0])) "Policy-redirected User Programs\Nexus Harness"
+New-Item -ItemType Directory -Force -Path $installLocation | Out-Null
+$application = Join-Path $installLocation 'Nexus Harness.exe'
+$uninstaller = Join-Path $installLocation 'Uninstall Nexus Harness.exe'
+[IO.File]::WriteAllBytes($application, [byte[]](77, 90))
+[IO.File]::WriteAllBytes($uninstaller, [byte[]](77, 90))
+$installMetadata = [pscustomobject]@{
+    InstallLocation = $installLocation
+    KeepShortcuts = 'true'
+    ShortcutName = 'Nexus Harness'
+}
+$uninstallMetadata = [pscustomobject]@{
+    DisplayName = 'Nexus Harness'
+    DisplayVersion = '0.2.1'
+    Publisher = 'Nexus Harness'
+    UninstallString = '"{0}" /currentuser' -f $uninstaller
+    QuietUninstallString = '"{0}" /currentuser /S' -f $uninstaller
+}
+$accepted = Assert-NexusInstalledApplicationMetadata '0.2.1' $installMetadata $uninstallMetadata
+$wrongVersionRejected = $false
+try {
+    $wrongVersion = $uninstallMetadata.PSObject.Copy()
+    $wrongVersion.DisplayVersion = '0.2.0'
+    [void](Assert-NexusInstalledApplicationMetadata '0.2.1' $installMetadata $wrongVersion)
+} catch { $wrongVersionRejected = $_.Exception.Message -like '*product and version*' }
+$allUsersRejected = $false
+try {
+    $allUsers = $uninstallMetadata.PSObject.Copy()
+    $allUsers.UninstallString = '"{0}" /allusers' -f $uninstaller
+    [void](Assert-NexusInstalledApplicationMetadata '0.2.1' $installMetadata $allUsers)
+} catch { $allUsersRejected = $_.Exception.Message -like '*current-user mode*' }
+[pscustomobject]@{
+    Accepted = $accepted
+    Expected = $application
+    WrongVersionRejected = $wrongVersionRejected
+    AllUsersRejected = $allUsersRejected
+} | ConvertTo-Json -Compress
+'''.replace("__INSTALLER_FUNCTIONS__", functions)
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "installed-metadata.ps1"
+            script.write_text(harness, encoding="utf-8-sig")
+            for host in hosts:
+                with self.subTest(host=Path(host).name):
+                    result = subprocess.run(
+                        [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                         "-File", str(script), folder],
+                        text=True, capture_output=True, timeout=30, errors="replace",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout.strip().splitlines()[-1])
+                    self.assertEqual(Path(payload["Accepted"]), Path(payload["Expected"]))
+                    self.assertIn("Policy-redirected User Programs", payload["Accepted"])
+                    self.assertTrue(payload["WrongVersionRejected"])
+                    self.assertTrue(payload["AllUsersRejected"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows shortcut verification is Windows-specific")
+    def test_powershell_shortcut_verifier_handles_redirected_desktops_idempotently(self):
+        hosts = _powershell_hosts()
+        self.assertTrue(hosts, "Windows PowerShell is required for the installer contract")
+        functions = _installer_header_function_source()
+        harness = r'''
+$ErrorActionPreference = 'Stop'
+__INSTALLER_FUNCTIONS__
+$root = [IO.Path]::GetFullPath($args[0])
+$installedFolder = Join-Path $root 'installed application'
+$desktop = Join-Path $root "Karo's redirected OneDrive desktop"
+$commonDesktop = Join-Path $root 'redirected Public Desktop'
+New-Item -ItemType Directory -Force -Path $installedFolder, $desktop, $commonDesktop | Out-Null
+$installed = Join-Path $installedFolder 'Nexus Harness.exe'
+[IO.File]::WriteAllBytes($installed, [byte[]](77, 90))
+$shortcutPath = Join-Path $desktop 'Nexus Harness.lnk'
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $installed
+$shortcut.IconLocation = "$installed,0"
+$shortcut.Save()
+[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+$before = [Convert]::ToBase64String([IO.File]::ReadAllBytes($shortcutPath))
+$first = Assert-NexusDesktopShortcut $installed $desktop $commonDesktop
+$second = Assert-NexusDesktopShortcut $installed $desktop $commonDesktop
+$driveRoot = Get-NexusCanonicalPath ([IO.Path]::GetPathRoot($root)) 'The drive root'
+$after = [Convert]::ToBase64String([IO.File]::ReadAllBytes($shortcutPath))
+[pscustomobject]@{
+    ShortcutPath = $second.ShortcutPath
+    TargetPath = $second.TargetPath
+    IconPath = $second.IconPath
+    Arguments = $second.Arguments
+    LinkCount = @(
+        Get-ChildItem -LiteralPath $desktop, $commonDesktop -Filter 'Nexus Harness*.lnk' -File -Force
+    ).Count
+    Unchanged = $before -ceq $after
+    SameResult = $first.ShortcutPath -ceq $second.ShortcutPath
+    DriveRoot = $driveRoot
+} | ConvertTo-Json -Compress
+'''.replace("__INSTALLER_FUNCTIONS__", functions)
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "shortcut-positive.ps1"
+            script.write_text(harness, encoding="utf-8-sig")
+            for host in hosts:
+                with self.subTest(host=Path(host).name):
+                    result = subprocess.run(
+                        [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                         "-File", str(script), folder],
+                        text=True, capture_output=True, timeout=30, errors="replace",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    payload = json.loads(result.stdout.strip().splitlines()[-1])
+                    self.assertEqual(Path(payload["ShortcutPath"]).parent,
+                                     Path(folder) / "Karo's redirected OneDrive desktop")
+                    self.assertEqual(Path(payload["TargetPath"]).name, "Nexus Harness.exe")
+                    self.assertEqual(Path(payload["IconPath"]).name, "Nexus Harness.exe")
+                    self.assertEqual(payload["Arguments"], "")
+                    self.assertEqual(payload["LinkCount"], 1)
+                    self.assertTrue(payload["Unchanged"])
+                    self.assertTrue(payload["SameResult"])
+                    self.assertTrue(
+                        payload["DriveRoot"].endswith(("\\", "/")),
+                        payload["DriveRoot"],
+                    )
+
+    @unittest.skipUnless(os.name == "nt", "Windows shortcut verification is Windows-specific")
+    def test_powershell_shortcut_verifier_rejects_missing_or_unowned_links(self):
+        hosts = _powershell_hosts()
+        self.assertTrue(hosts, "Windows PowerShell is required for the installer contract")
+        functions = _installer_header_function_source()
+        harness = r'''
+$ErrorActionPreference = 'Stop'
+__INSTALLER_FUNCTIONS__
+$root = [IO.Path]::GetFullPath($args[0])
+$case = [string]$args[1]
+$installedFolder = Join-Path $root 'installed application'
+$desktop = Join-Path $root 'redirected desktop with spaces'
+$commonDesktop = Join-Path $root 'public desktop with spaces'
+New-Item -ItemType Directory -Force -Path $installedFolder, $desktop, $commonDesktop | Out-Null
+$installed = Join-Path $installedFolder 'Nexus Harness.exe'
+$outside = Join-Path $root 'outside.exe'
+$missingIcon = Join-Path $installedFolder 'missing.ico'
+[IO.File]::WriteAllBytes($installed, [byte[]](77, 90))
+[IO.File]::WriteAllBytes($outside, [byte[]](77, 90))
+if ($case -notin @('missing', 'public-only')) {
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut((Join-Path $desktop 'Nexus Harness.lnk'))
+    $shortcut.TargetPath = if ($case -eq 'wrong-target') { $outside } else { $installed }
+    if ($case -eq 'wrong-arguments') { $shortcut.Arguments = '--project "C:\wrong project"' }
+    $shortcut.IconLocation = if ($case -eq 'outside-icon') {
+        "$outside,0"
+    } elseif ($case -eq 'missing-icon') {
+        "$missingIcon,0"
+    } elseif ($case -eq 'wrong-index') {
+        "$installed,1"
+    } else {
+        "$installed,0"
+    }
+    $shortcut.Save()
+    [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+    [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+}
+if ($case -in @(
+    'duplicate', 'hidden-duplicate', 'public-duplicate',
+    'hidden-public-duplicate', 'public-only'
+)) {
+    $shell = New-Object -ComObject WScript.Shell
+    $duplicateFolder = if ($case -in @(
+        'public-duplicate', 'hidden-public-duplicate', 'public-only'
+    )) { $commonDesktop } else { $desktop }
+    $duplicateName = if ($case -eq 'public-only') { 'Nexus Harness.lnk' } else { 'Nexus Harness old.lnk' }
+    $duplicatePath = Join-Path $duplicateFolder $duplicateName
+    $duplicate = $shell.CreateShortcut($duplicatePath)
+    $duplicate.TargetPath = $installed
+    $duplicate.IconLocation = "$installed,0"
+    $duplicate.Save()
+    [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($duplicate)
+    [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+    if ($case -in @('hidden-duplicate', 'hidden-public-duplicate')) {
+        [IO.File]::SetAttributes($duplicatePath, [IO.FileAttributes]::Hidden)
+    }
+}
+$result = $null
+try {
+    [void](Assert-NexusDesktopShortcut $installed $desktop $commonDesktop)
+    $result = [pscustomobject]@{ Rejected = $false; Message = '' }
+} catch {
+    $result = [pscustomobject]@{ Rejected = $true; Message = [string]$_.Exception.Message }
+}
+$result | ConvertTo-Json -Compress
+'''.replace("__INSTALLER_FUNCTIONS__", functions)
+        expected = {
+            "missing": "did not create exactly one visible desktop shortcut",
+            "wrong-target": "instead of the installed application",
+            "outside-icon": "does not use the installed application",
+            "missing-icon": "desktop shortcut icon source does not exist",
+            "wrong-index": "does not use the installed application",
+            "wrong-arguments": "contains unexpected launch arguments",
+            "duplicate": "did not create exactly one visible desktop shortcut",
+            "hidden-duplicate": "did not create exactly one visible desktop shortcut",
+            "public-duplicate": "did not create exactly one visible desktop shortcut",
+            "hidden-public-duplicate": "did not create exactly one visible desktop shortcut",
+            "public-only": "did not create exactly one visible desktop shortcut",
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "shortcut-negative.ps1"
+            script.write_text(harness, encoding="utf-8-sig")
+            for host in hosts:
+                for case, phrase in expected.items():
+                    case_root = Path(folder) / Path(host).stem / case
+                    case_root.mkdir(parents=True)
+                    with self.subTest(host=Path(host).name, case=case):
+                        result = subprocess.run(
+                            [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                             "-File", str(script), str(case_root), case],
+                            text=True, capture_output=True, timeout=30, errors="replace",
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        payload = json.loads(result.stdout.strip().splitlines()[-1])
+                        self.assertTrue(payload["Rejected"])
+                        self.assertIn(phrase, payload["Message"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive-root verification is Windows-specific")
+    def test_powershell_shortcut_verifier_accepts_a_real_drive_root_desktop(self):
+        hosts = _powershell_hosts()
+        self.assertTrue(hosts, "Windows PowerShell is required for the installer contract")
+        subst = shutil.which("subst.exe")
+        if not subst:
+            self.skipTest("Windows subst.exe is unavailable")
+        drive = next(
+            (
+                f"{letter}:" for letter in reversed("PQRSTUVWXYZ")
+                if not Path(f"{letter}:\\").exists()
+            ),
+            "",
+        )
+        if not drive:
+            self.skipTest("No unused drive letter is available for the root-path contract")
+        functions = _installer_header_function_source()
+        harness = r'''
+$ErrorActionPreference = 'Stop'
+__INSTALLER_FUNCTIONS__
+$desktop = [IO.Path]::GetPathRoot([IO.Path]::GetFullPath([string]$args[0]))
+$installedFolder = Join-Path $desktop 'installed application'
+New-Item -ItemType Directory -Force -Path $installedFolder | Out-Null
+$installed = Join-Path $installedFolder 'Nexus Harness.exe'
+[IO.File]::WriteAllBytes($installed, [byte[]](77, 90))
+$shortcutPath = Join-Path $desktop 'Nexus Harness.lnk'
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($shortcutPath)
+$shortcut.TargetPath = $installed
+$shortcut.IconLocation = "$installed,0"
+$shortcut.Save()
+[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+$verified = Assert-NexusDesktopShortcut $installed $desktop $desktop
+[pscustomobject]@{
+    Desktop = $desktop
+    ShortcutPath = $verified.ShortcutPath
+    TargetPath = $verified.TargetPath
+    IconPath = $verified.IconPath
+    IconIndex = $verified.IconIndex
+} | ConvertTo-Json -Compress
+'''.replace("__INSTALLER_FUNCTIONS__", functions)
+        with tempfile.TemporaryDirectory() as folder:
+            mapped = subprocess.run(
+                [subst, drive, folder], text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(mapped.returncode, 0, mapped.stderr)
+            try:
+                script = Path(folder) / "shortcut-drive-root.ps1"
+                script.write_text(harness, encoding="utf-8-sig")
+                for host in hosts:
+                    with self.subTest(host=Path(host).name, drive=drive):
+                        result = subprocess.run(
+                            [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                             "-File", str(script), f"{drive}\\"],
+                            text=True, capture_output=True, timeout=30, errors="replace",
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        payload = json.loads(result.stdout.strip().splitlines()[-1])
+                        self.assertEqual(payload["Desktop"].casefold(), f"{drive}\\".casefold())
+                        self.assertEqual(Path(payload["ShortcutPath"]).parent, Path(f"{drive}\\"))
+                        self.assertEqual(payload["TargetPath"], payload["IconPath"])
+                        self.assertEqual(payload["IconIndex"], 0)
+            finally:
+                unmapped = subprocess.run(
+                    [subst, drive, "/D"], text=True, capture_output=True, timeout=10,
+                )
+                self.assertEqual(unmapped.returncode, 0, unmapped.stderr)
 
     def test_windows_signature_must_be_valid_before_execution(self):
         valid = mock.Mock(returncode=0, stdout=json.dumps({
@@ -294,6 +656,7 @@ $authenticated = @{ Authorization = 'Bearer private-token' }
         panel = (ROOT / "src" / "our_harness" / "ui" / "app.js").read_text(encoding="utf-8")
         desktop = (ROOT / "desktop" / "main.js").read_text(encoding="utf-8")
         package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))
+        nsis_include = (ROOT / "desktop" / "installer.nsh").read_text(encoding="utf-8")
         powershell_installer = (ROOT / "scripts" / "install_nexus_harness.ps1").read_text(encoding="utf-8")
         top_level = (ROOT / "Install Nexus Harness.cmd").read_text(encoding="utf-8")
         self.assertIn("runs-on: windows-latest", workflow)
@@ -317,6 +680,16 @@ $authenticated = @{ Authorization = 'Bearer private-token' }
         self.assertIn("harness:diagnostics", desktop)
         self.assertIn("NEXUS_BUILD_COMMIT", desktop)
         self.assertEqual(package["build"]["win"]["target"], "nsis")
+        self.assertEqual(package["build"]["nsis"]["createDesktopShortcut"], "always")
+        self.assertEqual(package["build"]["nsis"]["uninstallDisplayName"],
+                         "Nexus Harness")
+        self.assertEqual(package["build"]["nsis"]["guid"],
+                         "e52322ab-f15e-5dc0-963b-7588e3739e89")
+        self.assertEqual(package["build"]["nsis"]["include"], "installer.nsh")
+        self.assertFalse(package["build"]["nsis"]["allowElevation"])
+        self.assertIn("customInstallMode", nsis_include)
+        self.assertIn("$isForceCurrentInstall \"1\"", nsis_include)
+        self.assertIn("${isForAllUsers}", nsis_include)
         self.assertTrue((ROOT / "requirements-runtime.lock").is_file())
         browser_lock = json.loads((ROOT / "runtime-playwright.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(browser_lock["schema_version"], 1)
@@ -329,6 +702,30 @@ $authenticated = @{ Authorization = 'Bearer private-token' }
         self.assertIn("credential fill", powershell_installer)
         self.assertIn("GH_TOKEN", powershell_installer)
         self.assertIn("$installers[0].url", powershell_installer)
+        self.assertIn("Assert-NexusDesktopShortcut", powershell_installer)
+        self.assertIn("Get-NexusStableReleaseAssets", powershell_installer)
+        self.assertIn("DesktopDirectory", powershell_installer)
+        self.assertIn("CommonDesktopDirectory", powershell_installer)
+        self.assertIn("RegistryView]::Registry64", powershell_installer)
+        self.assertIn("e52322ab-f15e-5dc0-963b-7588e3739e89", powershell_installer)
+        self.assertIn("-ArgumentList '/currentuser'", powershell_installer)
+        self.assertIn("Desktop shortcut verified", powershell_installer)
+        self.assertIn("$shortcut.Arguments", powershell_installer)
+        self.assertIn("-File -Force", powershell_installer)
+        self.assertIn("Remove-Item -LiteralPath $shortcut -Force", workflow)
+        self.assertIn("CommonDesktopDirectory", workflow)
+        self.assertIn("RegistryView]::Registry64", workflow)
+        self.assertIn("@('/S', '/currentuser')", workflow)
+        self.assertIn("The recreated desktop shortcut did not launch", workflow)
+        self.assertIn("A prior package smoke left the installed app running", workflow)
+        self.assertIn("Stop-InstalledProcessTrees", workflow)
+        self.assertIn("did not stop", workflow)
+        self.assertIn("Prove the stable release is anonymously installable", workflow)
+        self.assertIn("releases/latest", workflow)
+        self.assertIn("cmp --silent", workflow)
+        self.assertIn("sha256sum", workflow)
+        self.assertNotRegex(workflow, r"(?m)^\s*--head(?:\s|\\)$")
+        self.assertIn("npm run smoke:long-horizon", workflow)
         self.assertTrue((ROOT / "release" / "windows-authenticode-publisher.txt").is_file())
         self.assertTrue((ROOT / "THIRD_PARTY_NOTICES.md").is_file())
         notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")

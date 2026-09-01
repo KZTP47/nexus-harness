@@ -38,6 +38,64 @@ MIN_REPETITIONS = 1
 MAX_REPETITIONS = 10
 MAX_DIAGNOSTIC_CHARS = 12_000
 
+_EVALUATOR_BOOTSTRAP = """\
+import importlib.util
+import pathlib
+import runpy
+import sys
+import sysconfig
+
+script = pathlib.Path(sys.argv[1]).resolve()
+workspace = pathlib.Path(sys.argv[2]).resolve()
+base = pathlib.Path(sys.base_prefix).resolve()
+major, minor = sys.version_info[:2]
+stdlib = pathlib.Path(sysconfig.get_path("stdlib")).resolve()
+platstdlib = pathlib.Path(sysconfig.get_path("platstdlib")).resolve()
+candidates = [
+    base / f"python{major}{minor}.zip",
+    base / "DLLs",
+    stdlib,
+    platstdlib,
+    base,
+]
+# On POSIX builds, native standard-library modules such as ``math`` and
+# ``_ssl`` live below DESTSHARED (normally ``lib-dynload``), not directly in
+# either stdlib directory.  Keep that interpreter-owned directory while still
+# excluding site-packages, the current checkout, and every ambient harness
+# path.  Windows already reaches the same modules through the adjacent DLLs
+# directory above.
+dest_shared = sysconfig.get_config_var("DESTSHARED")
+if dest_shared:
+    native_stdlib = pathlib.Path(dest_shared).resolve()
+    trusted_roots = (base, stdlib, platstdlib)
+    if any(native_stdlib == root or root in native_stdlib.parents for root in trusted_roots):
+        candidates.insert(-1, native_stdlib)
+allowed = []
+for candidate in candidates:
+    if candidate.exists() and candidate not in allowed:
+        allowed.append(candidate)
+sys.path[:] = [str(candidate) for candidate in allowed]
+if importlib.util.find_spec("our_harness") is not None:
+    raise SystemExit("benchmark evaluator isolation retained the harness package")
+sys.path.insert(0, str(workspace))
+sys.argv[:] = [str(script), str(workspace)]
+sys.dont_write_bytecode = True
+runpy.run_path(str(script), run_name="__main__")
+"""
+
+
+def _evaluator_command(script: str | Path, workspace: str | Path) -> list[str]:
+    return [
+        sys.executable,
+        "-I",
+        "-S",
+        "-B",
+        "-c",
+        _EVALUATOR_BOOTSTRAP,
+        os.fspath(script),
+        os.fspath(workspace),
+    ]
+
 
 def _canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -579,13 +637,9 @@ def _agentic_attempt(
         # Run the visible evaluator after every candidate so its exact failure
         # reaches the repair loop. The hidden evaluator remains outside the
         # workflow and is never placed in model context or retained diagnostics.
-        workflow_command = [
-            sys.executable,
-            "-I",
-            "-S",
-            ".harness/benchmark_public_evaluator.py",
-            ".",
-        ]
+        workflow_command = _evaluator_command(
+            ".harness/benchmark_public_evaluator.py", "."
+        )
         workflow = {
             "name": "planner-coder-reviewer", "max_iterations": 3,
             "max_elapsed_seconds": AGENTIC_TASK_TIMEOUT_SECONDS, "repeat_failure_limit": 2,
@@ -692,13 +746,13 @@ def _agentic_attempt(
         )
         public = _command_result(
             public_config,
-            [sys.executable, "-I", "-S", str(public_path), str(public_workspace)],
+            _evaluator_command(public_path, public_workspace),
             cwd="safe-cwd",
         )
         public_post_tree, public_post_unsafe = _graded_tree(public_workspace)
         hidden_result = _command_result(
             hidden_config,
-            [sys.executable, "-I", "-S", str(hidden_path), str(hidden_workspace)],
+            _evaluator_command(hidden_path, hidden_workspace),
             cwd="safe-cwd",
         )
         hidden_post_tree, hidden_post_unsafe = _graded_tree(hidden_workspace)

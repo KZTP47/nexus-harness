@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import re
 import secrets
@@ -14,6 +15,7 @@ import time
 import urllib.parse
 import uuid
 import webbrowser
+from contextlib import contextmanager
 from dataclasses import asdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,9 +60,18 @@ from .doctor import run_doctor
 from .graphs import migrate_graph, resolve_graph_execution_policy, resolve_workflow_policy, simulate_graph, validate_graph
 from .memory import MemoryStore
 from .models import HarnessError, ProviderOutcomeUnknown
+from .runtime_integrity import atomic_text, compare as compare_runtime_mac, mac
 
 if TYPE_CHECKING:
     from . import long_horizon
+
+
+DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION = 1
+DIRECT_LONG_HORIZON_ADMISSION_MAX_BYTES = 12_000_000
+DIRECT_LONG_HORIZON_ADMISSION_MAX_PENDING = 20
+DIRECT_LONG_HORIZON_ADMISSION_MAX_TOMBSTONES = 2048
+DIRECT_LONG_HORIZON_ADMISSION_BINDING_SCHEMA_VERSION = 1
+DIRECT_LONG_HORIZON_RECEIPT_SCHEMA_VERSION = 1
 
 
 def _long_horizon_module():
@@ -686,6 +697,1218 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 held.recover_all()
                 self._long_horizon = held
             return held
+
+    @staticmethod
+    def _long_horizon_chat(
+        config: LoadedConfig, board: dict[str, Any], goal: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Resolve a goal's immutable origin chat without redirecting history."""
+
+        chat_id = str(goal.get("conversation_id") or "")
+        if not chat_id:
+            return None
+        candidates = list(dict.fromkeys([
+            str(goal.get("lead_agent_id") or ""),
+            *[
+                str(one or "") for one in (goal.get("requested_agent_ids") or [])
+                if str(one or "")
+            ],
+            *[
+                str(one.get("id") or "") for one in (goal.get("agents") or [])
+                if isinstance(one, dict) and str(one.get("id") or "")
+            ],
+        ]))
+        for agent_id in candidates:
+            if not agent_id:
+                continue
+            try:
+                return swarm_chats.resolve(
+                    config, board, agent_id, chat_id, allow_binding_drift=True,
+                )
+            except HarnessError:
+                continue
+        # Legacy and board-wide goals intentionally have no resolvable saved
+        # pair chat. Their Mission-control history remains authoritative.
+        return None
+
+    def project_long_horizon_chat_statuses(
+        self, goals: list[dict[str, Any]],
+    ) -> None:
+        """Idempotently copy canonical goal transitions into origin chats."""
+
+        chat_goals = [
+            goal for goal in goals
+            if isinstance(goal, dict) and str(goal.get("conversation_id") or "")
+        ]
+        if not chat_goals:
+            return
+        with self.swarm_lock:
+            standing = self.swarm_standing()
+            board = standing["board"]
+            for goal in chat_goals:
+                chat_id = str(goal.get("conversation_id") or "")
+                try:
+                    with self.swarm_communication_runs.conversation_turn(
+                        f"long-goal-projection-{uuid.uuid4().hex}", chat_id,
+                        timeout=0.0,
+                    ):
+                        conversation = self._long_horizon_chat(
+                            self.config, board, goal,
+                        )
+                        if conversation is None:
+                            continue
+                        chat_lab.keep_long_horizon_status(
+                            self.config,
+                            str(conversation.get("transcript_route") or ""),
+                            goal,
+                            filed_as=str(conversation.get("filed_as") or ""),
+                            chat_id=chat_id,
+                            project_id=str(
+                                (goal.get("project") or {}).get("id") or ""
+                            ),
+                            lead_id=str(goal.get("lead_agent_id") or ""),
+                        )
+                except HarnessError as exc:
+                    # A normal chat turn owns this exact transcript briefly.
+                    # Its next goal poll will reconcile the status; unrelated
+                    # registry/integrity errors remain visible to the caller.
+                    if "already working on another request" in str(exc):
+                        continue
+                    raise
+
+    @staticmethod
+    def _canonical_direct_long_horizon_payload(
+        supplied: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Freeze the one exact bounded payload saved and later admitted."""
+
+        request_id = str(supplied.get("request_id") or "").strip()
+        if not request_id or len(request_id) > 160:
+            raise HarnessError("A stable request ID is required for direct project work")
+        has_objectives = "objectives" in supplied
+        has_text = supplied.get("text") is not None
+        if has_objectives and not isinstance(supplied.get("objectives"), list):
+            raise HarnessError(
+                "Direct project objectives must be a JSON list of goal text."
+            )
+        objectives = (
+            [str(one) for one in supplied.get("objectives", [])]
+            if has_objectives else [str(supplied.get("text")) if has_text else ""]
+        )
+        prompt_text = "\n\n".join(objectives)
+        if has_text and has_objectives \
+                and str(supplied.get("text")) != prompt_text:
+            raise HarnessError(
+                "Direct project text and objectives disagree. Send one or send both "
+                "with text exactly equal to the objectives joined by a blank line."
+            )
+        raw_attachments = supplied.get("attachments")
+        if raw_attachments is None:
+            raw_attachments = []
+        if not isinstance(raw_attachments, list) or len(raw_attachments) > 6 \
+                or any(not isinstance(one, dict) for one in raw_attachments):
+            raise HarnessError("Direct project work accepts at most 6 attachment records")
+        raw_criteria = supplied.get("success_criteria")
+        if raw_criteria is not None and not isinstance(raw_criteria, list):
+            raise HarnessError("Direct project success criteria must be a JSON list")
+        raw_policy = supplied.get("policy")
+        if raw_policy is not None and not isinstance(raw_policy, dict):
+            raise HarnessError("Direct project policy must be a JSON object")
+        payload = {
+            "schema_version": DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION,
+            "request_id": request_id,
+            "project_id": str(supplied.get("project_id") or ""),
+            "lead_id": str(supplied.get("lead_id") or ""),
+            "chat_id": str(supplied.get("chat_id") or ""),
+            "text": prompt_text,
+            "objectives": objectives,
+            "success_criteria": (
+                [str(one) for one in raw_criteria]
+                if isinstance(raw_criteria, list) else None
+            ),
+            "policy": dict(raw_policy) if isinstance(raw_policy, dict) else None,
+            "attachments": [dict(one) for one in raw_attachments],
+        }
+        try:
+            frozen = json.loads(json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ))
+        except (TypeError, ValueError) as exc:
+            raise HarnessError(
+                "Direct project admission inputs must be JSON-compatible"
+            ) from exc
+        encoded = json.dumps(
+            frozen, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > DIRECT_LONG_HORIZON_ADMISSION_MAX_BYTES:
+            raise HarnessError(
+                "The exact direct project admission payload is too large to save safely"
+            )
+        return frozen
+
+    def _direct_long_horizon_context(
+        self, standing: dict[str, Any], payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        project_id = str(payload.get("project_id") or "")
+        project_root = self._board_project_path(standing["board"], project_id)
+        lead_id = str(payload.get("lead_id") or "")
+        chat_id = str(payload.get("chat_id") or "")
+        if not chat_id:
+            raise HarnessError(
+                "Direct project work requires an exact saved chat identity. Use "
+                "board-goal work for an explicitly project-wide agent pool."
+            )
+        conversation = swarm_chats.resolve(
+            self.config, standing["board"], lead_id, chat_id,
+        )
+        if str(conversation.get("project") or "") != project_id:
+            raise HarnessError(
+                "The selected chat and long-horizon target project no longer match."
+            )
+        participant_ids = [
+            str(one.get("id") or "")
+            for one in conversation.get("pair_agents", [])
+            if isinstance(one, dict) and str(one.get("id") or "")
+        ]
+        return {
+            "project_id": project_id,
+            "project_root": project_root,
+            "lead_id": lead_id,
+            "chat_id": chat_id,
+            "conversation": conversation,
+            "participant_ids": participant_ids,
+            "transcript_route": str(conversation.get("transcript_route") or ""),
+            "filed_as": str(conversation.get("filed_as") or ""),
+        }
+
+    @contextmanager
+    def _direct_admission_turn(
+        self, request_id: str, chat_id: str, *, timeout: float = 30.0,
+    ):
+        """Serialize one direct request identity and its exact chat cross-process."""
+
+        request = str(request_id or "").strip()
+        chat = str(chat_id or "").strip()
+        request_key = hashlib.sha256(request.encode("utf-8")).hexdigest()
+        request_owner = "long-goal-request-" + request_key
+        chat_owner = "long-goal-chat-" + hashlib.sha256(
+            f"{chat}\0{request}".encode("utf-8")
+        ).hexdigest()
+        with self.swarm_communication_runs.conversation_turn(
+            request_owner, "direct-long-horizon-request:" + request_key,
+            timeout=timeout,
+        ):
+            with self.swarm_communication_runs.conversation_turn(
+                chat_owner, chat, timeout=timeout,
+            ):
+                yield
+
+    def _preflight_direct_long_horizon(
+        self, standing: dict[str, Any], payload: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Compute the exact goal binding without constructing a scheduler runtime."""
+
+        store = _long_horizon_module().GoalStore(
+            self.config, migrate_execution_metadata=False,
+        )
+        return store.preflight_runtime_admission(
+            standing["board"], context["project_id"],
+            list(payload["objectives"]), str(payload["request_id"]),
+            lead_id=context["lead_id"],
+            success_criteria=payload.get("success_criteria"),
+            policy=payload.get("policy"), attachments=payload.get("attachments"),
+            participant_ids=context["participant_ids"],
+            conversation_id=context["chat_id"],
+        )
+
+    def _direct_admission_folder(self) -> tuple[Path, str]:
+        store = self.swarm_communication_runs
+        authority = str(store.chat_scope)
+        parent = (store.root / "direct-long-horizon-admissions").resolve()
+        folder = (parent / authority).resolve()
+        if parent not in folder.parents:
+            raise HarnessError("Direct project admission storage escaped its authority")
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder, authority
+
+    def _direct_admission_path(self, request_id: str) -> Path:
+        folder, _authority = self._direct_admission_folder()
+        return folder / (
+            hashlib.sha256(str(request_id).encode("utf-8")).hexdigest() + ".json"
+        )
+
+    @staticmethod
+    def _direct_admission_unsigned(record: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in record.items() if key != "integrity_mac"}
+
+    @staticmethod
+    def _direct_admission_binding_digest(record: dict[str, Any]) -> str:
+        binding = record.get("admission_binding")
+        if binding in (None, {}):
+            return ""
+        if not isinstance(binding, dict) or binding.get(
+            "schema_version"
+        ) != DIRECT_LONG_HORIZON_ADMISSION_BINDING_SCHEMA_VERSION:
+            raise HarnessError(
+                "A saved direct project admission has an unsupported goal binding"
+            )
+        digest = str(binding.get("admission_digest") or "").lower()
+        if len(digest) != 64 or any(one not in "0123456789abcdef" for one in digest):
+            raise HarnessError(
+                "A saved direct project admission has an invalid goal binding"
+            )
+        return digest
+
+    def _direct_admission_receipt(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Return a causal receipt only from an authenticated backend record."""
+
+        unsigned = self._direct_admission_unsigned(record)
+        if not compare_runtime_mac(
+            "direct-long-horizon-admission-v1", unsigned,
+            record.get("integrity_mac"),
+        ):
+            raise HarnessError(
+                "A direct project admission receipt failed integrity verification"
+            )
+        state = str(record.get("state") or "pending")
+        if state == "pending":
+            payload = self._canonical_direct_long_horizon_payload(
+                record.get("payload") if isinstance(record.get("payload"), dict) else {},
+            )
+            canonical = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            if not hmac.compare_digest(
+                hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                str(record.get("payload_sha256") or ""),
+            ):
+                raise HarnessError("A direct project admission receipt payload changed")
+            request_id = str(payload.get("request_id") or "")
+            chat_id = str(payload.get("chat_id") or "")
+            project_id = str(payload.get("project_id") or "")
+            lead_id = str(payload.get("lead_id") or "")
+            intent_sha256 = chat_lab.long_horizon_intent_sha256(
+                chat_id, project_id, lead_id, str(payload.get("text") or ""),
+                payload.get("attachments"),
+            )
+        elif state in {"discarded", "reconciled"}:
+            request_id = str(record.get("request_id") or "")
+            chat_id = str(record.get("chat_id") or "")
+            project_id = str(record.get("project_id") or "")
+            lead_id = str(record.get("lead_id") or "")
+            intent_sha256 = str(record.get("intent_sha256") or "").lower()
+        else:
+            raise HarnessError("A direct project admission receipt has an unsupported state")
+        if not all((request_id, chat_id, project_id, lead_id)):
+            raise HarnessError("A direct project admission receipt is incomplete")
+        if str(record.get("request_id") or "") != request_id:
+            raise HarnessError("A direct project admission receipt changed request identity")
+        contract = record.get("execution_contract") \
+            if isinstance(record.get("execution_contract"), dict) else {}
+        if any(
+            str(contract.get(key) or "") != expected
+            for key, expected in (
+                ("project_id", project_id), ("chat_id", chat_id), ("lead_id", lead_id),
+            )
+        ):
+            raise HarnessError(
+                "A direct project admission receipt disagrees with its execution contract"
+            )
+        if len(intent_sha256) != 64 or any(
+            one not in "0123456789abcdef" for one in intent_sha256
+        ):
+            raise HarnessError("A direct project admission receipt has an invalid intent digest")
+        return {
+            "schema_version": DIRECT_LONG_HORIZON_RECEIPT_SCHEMA_VERSION,
+            "request_id": request_id,
+            "chat_id": chat_id,
+            "project_id": project_id,
+            "lead_id": lead_id,
+            "intent_sha256": intent_sha256,
+        }
+
+    @staticmethod
+    def _direct_discard_response(
+        receipt: dict[str, Any], *, discarded: bool, reconciled: bool,
+        safe_to_delete: bool, transcript_noted: bool = False,
+        goal: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        for value in (discarded, reconciled, safe_to_delete, transcript_noted):
+            if type(value) is not bool:
+                raise HarnessError("Direct project discard receipt flags must be booleans")
+        response = {
+            **receipt,
+            "discarded": discarded,
+            "reconciled": reconciled,
+            "safe_to_delete": safe_to_delete,
+            "transcript_noted": transcript_noted,
+        }
+        if goal is not None:
+            response["goal"] = goal
+        return response
+
+    @staticmethod
+    def _goal_for_direct_receipt(
+        goal: dict[str, Any], receipt: dict[str, Any], *,
+        admission_digest: str = "", transcript_proven: bool = False,
+    ) -> dict[str, Any]:
+        """Require the returned canonical goal to name the receipt's exact cause."""
+
+        if not isinstance(goal, dict):
+            raise HarnessError("Direct project admission returned no canonical goal")
+        canonical = dict(goal)
+        if str(canonical.get("request_id") or "") != str(receipt["request_id"]):
+            raise HarnessError("The admitted goal has a different request identity")
+        if str(canonical.get("conversation_id") or "") != str(receipt["chat_id"]):
+            raise HarnessError("The admitted goal has a different saved chat identity")
+        if str(canonical.get("lead_agent_id") or "") != str(receipt["lead_id"]):
+            raise HarnessError("The admitted goal has a different lead-agent identity")
+        project = canonical.get("project") if isinstance(canonical.get("project"), dict) else {}
+        stored_project_id = str(project.get("id") or "")
+        if stored_project_id != str(receipt["project_id"]):
+            if stored_project_id:
+                raise HarnessError("The admitted goal has a different project identity")
+            stored_digest = str(canonical.get("admission_digest") or "").lower()
+            digest_proven = bool(admission_digest) and hmac.compare_digest(
+                str(admission_digest).lower(), stored_digest,
+            )
+            if canonical.get("request_tombstone") is not True \
+                    or not (digest_proven or transcript_proven):
+                raise HarnessError("The admitted goal has a different project identity")
+            # Older compact request tombstones did not retain the project id.
+            # Exact full-digest or transcript proof safely restores it only in
+            # this response; no persistent history is rewritten.
+            canonical["project"] = {"id": str(receipt["project_id"])}
+        return canonical
+
+    def _read_direct_admission_path(self, path: Path) -> dict[str, Any]:
+        if path.is_symlink() or not path.is_file():
+            raise HarnessError("A saved direct project admission is not a regular file")
+        if path.stat().st_size > DIRECT_LONG_HORIZON_ADMISSION_MAX_BYTES + 16_384:
+            raise HarnessError("A saved direct project admission is oversized")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HarnessError("A saved direct project admission is unreadable") from exc
+        if not isinstance(record, dict) \
+                or record.get("schema_version") != DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION:
+            raise HarnessError("A saved direct project admission has an unsupported schema")
+        unsigned = self._direct_admission_unsigned(record)
+        if not compare_runtime_mac(
+            "direct-long-horizon-admission-v1", unsigned,
+            record.get("integrity_mac"),
+        ):
+            raise HarnessError("A saved direct project admission failed integrity verification")
+        self._direct_admission_binding_digest(record)
+        state = str(record.get("state") or "pending")
+        if state in {"discarded", "reconciled"}:
+            if not str(record.get("request_id") or "") \
+                    or not str(record.get("chat_id") or "") \
+                    or not str(record.get("payload_sha256") or ""):
+                raise HarnessError("A retired direct project request is incomplete")
+            record["state"] = state
+            return record
+        if state != "pending":
+            raise HarnessError("A saved direct project admission has an unsupported state")
+        payload = self._canonical_direct_long_horizon_payload(
+            record.get("payload") if isinstance(record.get("payload"), dict) else {},
+        )
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        if hashlib.sha256(canonical.encode("utf-8")).hexdigest() \
+                != str(record.get("payload_sha256") or ""):
+            raise HarnessError("A saved direct project admission payload changed")
+        record["payload"] = payload
+        record["state"] = "pending"
+        return record
+
+    def _save_direct_admission(
+        self, payload: dict[str, Any], context: dict[str, Any],
+        admission_digest: str,
+    ) -> dict[str, Any]:
+        from .safety import ProjectTransactionLock
+
+        path = self._direct_admission_path(str(payload["request_id"]))
+        folder, authority = self._direct_admission_folder()
+        contract = {
+            "schema_version": DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION,
+            "kind": "direct_long_horizon_admission",
+            "chat_scope": authority,
+            "project_id": str(context["project_id"]),
+            "chat_id": str(context["chat_id"]),
+            "lead_id": str(context["lead_id"]),
+            "project_root_fingerprint_sha256": hashlib.sha256(
+                os.path.normcase(str(Path(context["project_root"]).resolve())).encode("utf-8")
+            ).hexdigest(),
+        }
+        contract["fingerprint_sha256"] = hashlib.sha256(json.dumps(
+            contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        canonical = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        payload_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        bound_digest = str(admission_digest or "").lower()
+        if len(bound_digest) != 64 or any(
+            one not in "0123456789abcdef" for one in bound_digest
+        ):
+            raise HarnessError(
+                "Direct project admission requires an exact goal admission binding"
+            )
+        admission_binding = {
+            "schema_version": DIRECT_LONG_HORIZON_ADMISSION_BINDING_SCHEMA_VERSION,
+            "admission_digest": bound_digest,
+        }
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            if path.exists():
+                existing = self._read_direct_admission_path(path)
+                if str(existing.get("state") or "pending") != "pending":
+                    raise HarnessError(
+                        "That direct project request identity was explicitly retired. "
+                        "Start new work with a new request identity."
+                    )
+                if str(existing.get("payload_sha256") or "") != payload_sha256 \
+                        or existing.get("execution_contract") != contract:
+                    raise HarnessError(
+                        "That direct project request identity is already bound to a "
+                        "different exact payload or execution contract."
+                    )
+                existing_digest = self._direct_admission_binding_digest(existing)
+                if existing_digest and not hmac.compare_digest(
+                    existing_digest, bound_digest,
+                ):
+                    raise HarnessError(
+                        "That saved direct project request is bound to a different "
+                        "full goal admission contract."
+                    )
+                if not existing_digest:
+                    now = int(time.time() * 1000)
+                    upgraded_unsigned = {
+                        **self._direct_admission_unsigned(existing),
+                        "admission_binding": admission_binding,
+                        "updated_ms": now,
+                    }
+                    existing = {
+                        **upgraded_unsigned,
+                        "integrity_mac": mac(
+                            "direct-long-horizon-admission-v1", upgraded_unsigned,
+                        ),
+                    }
+                    atomic_text(path, json.dumps(
+                        existing, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n")
+                return existing
+            records = [one for one in folder.iterdir() if one.suffix == ".json"]
+            pending: list[Path] = []
+            tombstones = 0
+            for held_path in records:
+                held = self._read_direct_admission_path(held_path)
+                if str(held.get("state") or "pending") != "pending":
+                    tombstones += 1
+                    continue
+                pending.append(held_path)
+                held_payload = held.get("payload") \
+                    if isinstance(held.get("payload"), dict) else {}
+                if str(held_payload.get("chat_id") or "") == str(payload["chat_id"]):
+                    raise HarnessError(
+                        "This exact chat already has a saved direct project request. "
+                        "Reconcile it before starting another one."
+                    )
+            if tombstones + len(pending) + 1 > DIRECT_LONG_HORIZON_ADMISSION_MAX_TOMBSTONES:
+                raise HarnessError(
+                    "The bounded retired-request guard cannot reserve safe replay "
+                    "tombstones for another direct project request."
+                )
+            if len(pending) >= DIRECT_LONG_HORIZON_ADMISSION_MAX_PENDING:
+                raise HarnessError(
+                    "Reconcile an earlier saved direct project request before starting "
+                    "another one."
+                )
+            now = int(time.time() * 1000)
+            unsigned = {
+                "schema_version": DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION,
+                "state": "pending",
+                "request_id": str(payload["request_id"]),
+                "payload": payload,
+                "payload_sha256": payload_sha256,
+                "admission_binding": admission_binding,
+                "execution_contract": contract,
+                "created_ms": now,
+                "updated_ms": now,
+            }
+            record = {
+                **unsigned,
+                "integrity_mac": mac("direct-long-horizon-admission-v1", unsigned),
+            }
+            atomic_text(path, json.dumps(
+                record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ) + "\n")
+            return record
+
+    def _load_direct_admission(
+        self, request_id: str, chat_id: str = "",
+    ) -> dict[str, Any]:
+        from .safety import ProjectTransactionLock
+
+        request = str(request_id or "").strip()
+        if not request or len(request) > 160:
+            raise HarnessError("Choose an exact saved direct project request")
+        path = self._direct_admission_path(request)
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            if not path.exists():
+                raise HarnessError(
+                    "That saved direct project admission no longer needs recovery. "
+                    "Refresh Mission control and the chat transcript."
+                )
+            record = self._read_direct_admission_path(path)
+            if str(record.get("state") or "pending") != "pending":
+                raise HarnessError(
+                    "That direct project request identity was explicitly retired. "
+                    "Start new work with a new request identity."
+                )
+        if str(record.get("request_id") or "") != request:
+            raise HarnessError("The saved direct project request identity does not match")
+        payload = record["payload"]
+        if chat_id and str(payload.get("chat_id") or "") != str(chat_id):
+            raise HarnessError("That saved direct project request belongs to another chat")
+        return record
+
+    def _remove_direct_admission(self, request_id: str, payload_sha256: str) -> None:
+        from .safety import ProjectTransactionLock
+
+        path = self._direct_admission_path(request_id)
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            if not path.exists():
+                return
+            record = self._read_direct_admission_path(path)
+            if str(record.get("payload_sha256") or "") != str(payload_sha256):
+                raise HarnessError(
+                    "The saved direct project admission changed before reconciliation"
+                )
+            path.unlink()
+
+    def _retire_direct_admission(
+        self, record: dict[str, Any], state: str, *, goal_id: str = "",
+    ) -> None:
+        """Replace exact payload bytes with an authenticated replay tombstone."""
+
+        from .safety import ProjectTransactionLock
+
+        if state not in {"discarded", "reconciled"}:
+            raise HarnessError("Choose a supported direct admission retirement state")
+        request_id = str(record.get("request_id") or "")
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        payload_sha256 = str(record.get("payload_sha256") or "")
+        admission_digest = self._direct_admission_binding_digest(record)
+        path = self._direct_admission_path(request_id)
+        folder, _authority = self._direct_admission_folder()
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            current = self._read_direct_admission_path(path)
+            current_state = str(current.get("state") or "pending")
+            if current_state in {"discarded", "reconciled"}:
+                return
+            if str(current.get("payload_sha256") or "") != payload_sha256:
+                raise HarnessError(
+                    "The saved direct project admission changed before retirement"
+                )
+            current_digest = self._direct_admission_binding_digest(current)
+            if current_digest != admission_digest:
+                raise HarnessError(
+                    "The saved direct project admission binding changed before retirement"
+                )
+            tombstones = sum(
+                1 for candidate in folder.iterdir()
+                if candidate.suffix == ".json"
+                and str(self._read_direct_admission_path(candidate).get("state") or "pending")
+                in {"discarded", "reconciled"}
+            )
+            if tombstones >= DIRECT_LONG_HORIZON_ADMISSION_MAX_TOMBSTONES:
+                raise HarnessError(
+                    "The bounded retired-request guard is full. The exact pending "
+                    "request was left recoverable instead of deleting replay protection."
+                )
+            now = int(time.time() * 1000)
+            unsigned = {
+                "schema_version": DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION,
+                "state": state,
+                "request_id": request_id,
+                "chat_id": str(payload.get("chat_id") or ""),
+                "project_id": str(payload.get("project_id") or ""),
+                "lead_id": str(payload.get("lead_id") or ""),
+                "payload_sha256": payload_sha256,
+                "intent_sha256": chat_lab.long_horizon_intent_sha256(
+                    str(payload.get("chat_id") or ""),
+                    str(payload.get("project_id") or ""),
+                    str(payload.get("lead_id") or ""),
+                    str(payload.get("text") or ""), payload.get("attachments"),
+                ),
+                "execution_contract": dict(record.get("execution_contract") or {}),
+                "created_ms": int(record.get("created_ms") or now),
+                "retired_ms": now,
+                "goal_id": str(goal_id or ""),
+            }
+            if admission_digest:
+                unsigned["admission_binding"] = {
+                    "schema_version": DIRECT_LONG_HORIZON_ADMISSION_BINDING_SCHEMA_VERSION,
+                    "admission_digest": admission_digest,
+                }
+            retired = {
+                **unsigned,
+                "integrity_mac": mac("direct-long-horizon-admission-v1", unsigned),
+            }
+            atomic_text(path, json.dumps(
+                retired, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ) + "\n")
+
+    def _retire_missing_direct_admission(
+        self, *, request_id: str, chat_id: str, project_id: str,
+        lead_id: str, intent_sha256: str, state: str = "discarded",
+        goal_id: str = "",
+    ) -> None:
+        """Fence a desktop-outbox request after absence of both journal and goal."""
+
+        from .safety import ProjectTransactionLock
+
+        if state not in {"discarded", "reconciled"}:
+            raise HarnessError("Choose a supported direct admission retirement state")
+        digest = str(intent_sha256 or "").lower()
+        if len(digest) != 64 or any(one not in "0123456789abcdef" for one in digest):
+            raise HarnessError(
+                "The exact desktop outbox digest is required before a local-only "
+                "goal request can be discarded."
+            )
+        path = self._direct_admission_path(request_id)
+        folder, authority = self._direct_admission_folder()
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            if path.exists():
+                existing = self._read_direct_admission_path(path)
+                if str(existing.get("state") or "pending") in {"discarded", "reconciled"}:
+                    return
+                raise HarnessError(
+                    "A backend admission appeared before local-only discard completed"
+                )
+            tombstones = sum(
+                1 for candidate in folder.iterdir()
+                if candidate.suffix == ".json"
+                and str(self._read_direct_admission_path(candidate).get("state") or "pending")
+                in {"discarded", "reconciled"}
+            )
+            if tombstones >= DIRECT_LONG_HORIZON_ADMISSION_MAX_TOMBSTONES:
+                raise HarnessError(
+                    "The bounded retired-request guard is full. The desktop outbox "
+                    "was kept instead of deleting replay protection."
+                )
+            now = int(time.time() * 1000)
+            contract = {
+                "schema_version": DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION,
+                "kind": "desktop_direct_long_horizon_outbox",
+                "chat_scope": authority,
+                "project_id": str(project_id or ""),
+                "chat_id": str(chat_id or ""),
+                "lead_id": str(lead_id or ""),
+            }
+            contract["fingerprint_sha256"] = hashlib.sha256(json.dumps(
+                contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            unsigned = {
+                "schema_version": DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION,
+                "state": state,
+                "request_id": request_id,
+                "chat_id": chat_id,
+                "project_id": str(project_id or ""),
+                "lead_id": str(lead_id or ""),
+                "payload_sha256": digest,
+                "intent_sha256": digest,
+                "execution_contract": contract,
+                "created_ms": now,
+                "retired_ms": now,
+                "goal_id": str(goal_id or ""),
+            }
+            retired = {
+                **unsigned,
+                "integrity_mac": mac("direct-long-horizon-admission-v1", unsigned),
+            }
+            atomic_text(path, json.dumps(
+                retired, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ) + "\n")
+
+    def _verify_direct_goal_intent_binding(
+        self, goal: dict[str, Any], request_id: str, intent_sha256: str,
+    ) -> dict[str, Any]:
+        """Prove an existing goal came from the exact desktop outbox payload."""
+
+        expected = str(intent_sha256 or "").lower()
+        if len(expected) != 64 or any(one not in "0123456789abcdef" for one in expected):
+            raise HarnessError(
+                "The exact desktop outbox digest is required to reconcile an existing goal"
+            )
+        standing = self.swarm_standing()
+        conversation = self._long_horizon_chat(
+            self.config, standing["board"], goal,
+        )
+        if conversation is None:
+            raise HarnessError(
+                "The existing goal's exact saved chat binding could not be verified"
+            )
+        found = [
+            one for one in chat_lab.read_it(
+                self.config, str(conversation.get("transcript_route") or ""),
+                str(conversation.get("filed_as") or ""),
+            )
+            if isinstance(getattr(one, "correlation", None), dict)
+            and str(one.correlation.get("kind") or "") == "long_horizon_prompt"
+            and str(one.correlation.get("request_id") or "") == request_id
+            and str(one.correlation.get("chat_id") or "")
+            == str(goal.get("conversation_id") or "")
+        ]
+        if not found or any(
+            str(one.correlation.get("intent_sha256") or "") != expected
+            for one in found
+        ):
+            raise HarnessError(
+                "The existing goal is bound to a different exact saved prompt digest"
+            )
+        identities = {
+            (
+                str(one.correlation.get("request_id") or ""),
+                str(one.correlation.get("chat_id") or ""),
+                str(one.correlation.get("project_id") or ""),
+                str(one.correlation.get("lead_id") or ""),
+                str(one.correlation.get("intent_sha256") or "").lower(),
+            )
+            for one in found
+        }
+        if len(identities) != 1:
+            raise HarnessError(
+                "The existing goal has conflicting saved prompt receipt identities"
+            )
+        saved_request, saved_chat, saved_project, saved_lead, saved_intent = \
+            next(iter(identities))
+        if not all((saved_request, saved_chat, saved_project, saved_lead)):
+            raise HarnessError("The existing goal's saved prompt receipt is incomplete")
+        return {
+            "schema_version": DIRECT_LONG_HORIZON_RECEIPT_SCHEMA_VERSION,
+            "request_id": saved_request,
+            "chat_id": saved_chat,
+            "project_id": saved_project,
+            "lead_id": saved_lead,
+            "intent_sha256": saved_intent,
+        }
+
+    def _note_discarded_direct_admission(
+        self, record: dict[str, Any], request_id: str,
+    ) -> bool:
+        payload = record.get("payload") \
+            if isinstance(record.get("payload"), dict) else {}
+        try:
+            standing = self.swarm_standing()
+            context = self._direct_long_horizon_context(standing, payload)
+            intent_sha256 = chat_lab.long_horizon_intent_sha256(
+                context["chat_id"], context["project_id"], context["lead_id"],
+                str(payload["text"]), payload.get("attachments"),
+            )
+            chat_lab.keep_long_horizon_error(
+                self.config, context["transcript_route"],
+                "This saved project goal request was explicitly discarded before "
+                "goal admission. This discard did not start provider work.",
+                filed_as=context["filed_as"], request_id=request_id,
+                chat_id=context["chat_id"], project_id=context["project_id"],
+                lead_id=context["lead_id"], intent_sha256=intent_sha256,
+            )
+            return True
+        except HarnessError:
+            # The board/chat may have been removed while the authenticated
+            # journal remained. Discard never invents a replacement identity.
+            return False
+
+    def discard_direct_admission(
+        self, supplied: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Discard one exact unadmitted journal, never an already-created goal.
+
+        The request id is a provider-dispatch idempotency key.  A renderer can
+        lose the response after ``start`` has durably created a goal, so a
+        discard must first prove that this authority has no goal for that key.
+        If it does, only an exact full binding may reconcile and return that
+        canonical goal. A provably different pending journal is retired as an
+        unadmitted attempt without changing or claiming the older goal.
+        """
+
+        request_id = str(supplied.get("request_id") or "").strip()
+        exact_chat_id = str(supplied.get("chat_id") or "").strip()
+        if not request_id or len(request_id) > 160 or not exact_chat_id:
+            raise HarnessError("Choose one exact saved direct project request and chat")
+        payload_sha256 = str(supplied.get("payload_sha256") or "").strip()
+        outbox_intent_sha256 = str(supplied.get("intent_sha256") or "").strip()
+        project_id = str(supplied.get("project_id") or "")
+        lead_id = str(supplied.get("lead_id") or "")
+        with self.project_admission_lock, self.swarm_lock:
+            with self._direct_admission_turn(
+                request_id, exact_chat_id, timeout=30.0,
+            ):
+                path = self._direct_admission_path(request_id)
+                record: dict[str, Any] | None = None
+                held_record: dict[str, Any] | None = None
+                terminal_state = ""
+                if path.exists():
+                    # Integrity failures are not absence. Fail closed so a
+                    # corrupt exact journal cannot be bypassed by deleting a
+                    # similarly named desktop record.
+                    held = self._read_direct_admission_path(path)
+                    held_record = held
+                    terminal_state = str(held.get("state") or "pending")
+                    held_chat_id = str(
+                        (held.get("payload") or {}).get("chat_id")
+                        if isinstance(held.get("payload"), dict)
+                        else held.get("chat_id") or ""
+                    )
+                    if held_chat_id != exact_chat_id:
+                        raise HarnessError(
+                            "That saved direct project request belongs to another chat"
+                        )
+                    if terminal_state in {"discarded", "reconciled"} \
+                            and outbox_intent_sha256 \
+                            and str(held.get("intent_sha256") or "") \
+                            != outbox_intent_sha256:
+                        raise HarnessError(
+                            "That retired request identity is bound to a different "
+                            "exact desktop outbox digest"
+                        )
+                    if terminal_state == "pending":
+                        record = held
+                        payload = held["payload"]
+                        if str(payload.get("chat_id") or "") != exact_chat_id:
+                            raise HarnessError(
+                                "That saved direct project request belongs to another chat"
+                            )
+                        if payload_sha256 and payload_sha256 != str(
+                            held.get("payload_sha256") or ""
+                        ):
+                            raise HarnessError(
+                                "The saved direct project admission changed before it "
+                                "could be discarded"
+                            )
+                    elif terminal_state not in {"discarded", "reconciled"}:
+                        raise HarnessError(
+                            "The saved direct project request has an unsupported state"
+                        )
+
+                existing = self.long_horizon.store.get_by_request(request_id)
+                if existing is not None:
+                    expected_intent = outbox_intent_sha256
+                    receipt: dict[str, Any]
+                    binding_digest = ""
+                    transcript_proven = False
+                    if record is not None:
+                        receipt = self._direct_admission_receipt(record)
+                        record_payload = record["payload"]
+                        recorded_intent = chat_lab.long_horizon_intent_sha256(
+                            str(record_payload.get("chat_id") or ""),
+                            str(record_payload.get("project_id") or ""),
+                            str(record_payload.get("lead_id") or ""),
+                            str(record_payload.get("text") or ""),
+                            record_payload.get("attachments"),
+                        )
+                        if expected_intent and expected_intent != recorded_intent:
+                            raise HarnessError(
+                                "The desktop outbox and backend journal contain different "
+                                "exact prompt digests"
+                            )
+                        expected_intent = recorded_intent
+
+                        journal_digest = self._direct_admission_binding_digest(record)
+                        goal_digest = str(existing.get("admission_digest") or "").lower()
+                        if not journal_digest:
+                            raise HarnessError(
+                                "The saved direct project request predates full goal "
+                                "binding and cannot be safely reconciled or discarded."
+                            )
+                        if len(goal_digest) != 64 or any(
+                            one not in "0123456789abcdef" for one in goal_digest
+                        ):
+                            raise HarnessError(
+                                "The existing goal has no verifiable full admission binding."
+                            )
+                        if not hmac.compare_digest(journal_digest, goal_digest):
+                            transcript_noted = self._note_discarded_direct_admission(
+                                record, request_id,
+                            )
+                            self._retire_direct_admission(record, "discarded")
+                            return self._direct_discard_response(
+                                receipt, discarded=True, reconciled=False,
+                                safe_to_delete=True,
+                                transcript_noted=transcript_noted,
+                            )
+                        if str(existing.get("conversation_id") or "") != exact_chat_id:
+                            raise HarnessError(
+                                "The exact full admission binding disagrees with the "
+                                "existing goal's saved chat identity."
+                            )
+                        binding_digest = journal_digest
+                    else:
+                        terminal_digest = self._direct_admission_binding_digest(
+                            held_record or {},
+                        )
+                        goal_digest = str(existing.get("admission_digest") or "").lower()
+                        if terminal_digest:
+                            if len(goal_digest) != 64:
+                                raise HarnessError(
+                                    "The existing goal has no verifiable full admission binding."
+                                )
+                            if not hmac.compare_digest(terminal_digest, goal_digest):
+                                if terminal_state == "discarded":
+                                    return self._direct_discard_response(
+                                        self._direct_admission_receipt(held_record or {}),
+                                        discarded=True, reconciled=False,
+                                        safe_to_delete=True,
+                                    )
+                                raise HarnessError(
+                                    "The retired direct request and existing goal have "
+                                    "different full admission bindings."
+                                )
+                            receipt = self._direct_admission_receipt(held_record or {})
+                            binding_digest = terminal_digest
+                        else:
+                            # A local-only desktop record carries no full backend
+                            # payload. Keep the narrow legacy recovery path: the
+                            # exact prompt digest must be proven by the canonical
+                            # saved transcript before the old goal can be claimed.
+                            receipt = self._verify_direct_goal_intent_binding(
+                                existing, request_id, expected_intent,
+                            )
+                            transcript_proven = True
+                        if str(existing.get("conversation_id") or "") != exact_chat_id:
+                            raise HarnessError(
+                                "That request identity already belongs to a goal from another chat"
+                            )
+                    public_goal = self.long_horizon.store.public(existing)
+                    public_goal = self._goal_for_direct_receipt(
+                        public_goal, receipt, admission_digest=binding_digest,
+                        transcript_proven=transcript_proven,
+                    )
+                    if record is not None:
+                        self._retire_direct_admission(
+                            record, "reconciled",
+                            goal_id=str(existing.get("goal_id") or ""),
+                        )
+                    if record is None and not terminal_state:
+                        self._retire_missing_direct_admission(
+                            request_id=str(receipt["request_id"]),
+                            chat_id=str(receipt["chat_id"]),
+                            project_id=str(receipt["project_id"]),
+                            lead_id=str(receipt["lead_id"]),
+                            intent_sha256=str(receipt["intent_sha256"]),
+                            state="reconciled",
+                            goal_id=str(existing.get("goal_id") or ""),
+                        )
+                    return self._direct_discard_response(
+                        receipt, discarded=False, reconciled=True,
+                        safe_to_delete=False, goal=public_goal,
+                    )
+
+                if terminal_state in {"discarded", "reconciled"}:
+                    return self._direct_discard_response(
+                        self._direct_admission_receipt(held_record or {}),
+                        discarded=terminal_state == "discarded",
+                        reconciled=False, safe_to_delete=True,
+                    )
+
+                if record is None:
+                    standing = self.swarm_standing()
+                    context = self._direct_long_horizon_context(standing, {
+                        "project_id": project_id, "lead_id": lead_id,
+                        "chat_id": exact_chat_id,
+                    })
+                    self._retire_missing_direct_admission(
+                        request_id=request_id, chat_id=exact_chat_id,
+                        project_id=context["project_id"], lead_id=context["lead_id"],
+                        intent_sha256=outbox_intent_sha256,
+                    )
+                    retired = self._read_direct_admission_path(path)
+                    return self._direct_discard_response(
+                        self._direct_admission_receipt(retired),
+                        discarded=True, reconciled=False, safe_to_delete=True,
+                    )
+
+                receipt = self._direct_admission_receipt(record)
+                transcript_noted = self._note_discarded_direct_admission(
+                    record, request_id,
+                )
+                self._retire_direct_admission(record, "discarded")
+        return self._direct_discard_response(
+            receipt, discarded=True, reconciled=False, safe_to_delete=True,
+            transcript_noted=transcript_noted,
+        )
+
+    def _public_direct_admission(self, record: dict[str, Any]) -> dict[str, Any]:
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        text = str(payload.get("text") or "")
+        safe_preview = CredentialRedactor(self.config).text(text)[:500]
+        return {
+            "schema_version": DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION,
+            "request_id": str(record.get("request_id") or ""),
+            "chat_id": str(payload.get("chat_id") or ""),
+            "project_id": str(payload.get("project_id") or ""),
+            "lead_id": str(payload.get("lead_id") or ""),
+            "intent_sha256": chat_lab.long_horizon_intent_sha256(
+                str(payload.get("chat_id") or ""),
+                str(payload.get("project_id") or ""),
+                str(payload.get("lead_id") or ""), text,
+                payload.get("attachments"),
+            ),
+            "text_preview": safe_preview,
+            "text_characters": len(text),
+            "attachment_count": len(payload.get("attachments") or []),
+            "payload_sha256": str(record.get("payload_sha256") or ""),
+            "created_ms": int(record.get("created_ms") or 0),
+            "execution_contract": dict(record.get("execution_contract") or {}),
+        }
+
+    def direct_admission_inventory(self) -> list[dict[str, Any]]:
+        from .safety import ProjectTransactionLock
+
+        folder, _authority = self._direct_admission_folder()
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            records = [
+                self._read_direct_admission_path(path)
+                for path in folder.iterdir() if path.suffix == ".json"
+            ]
+        records = [
+            one for one in records
+            if str(one.get("state") or "pending") == "pending"
+        ]
+        records.sort(key=lambda one: int(one.get("created_ms") or 0))
+        return [self._public_direct_admission(one) for one in records]
+
+    def prepare_direct_long_horizon(
+        self, supplied: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = self._canonical_direct_long_horizon_payload(supplied)
+        with self.project_admission_lock, self.swarm_lock:
+            standing = self.swarm_standing()
+            context = self._direct_long_horizon_context(standing, payload)
+            intent_sha256 = chat_lab.long_horizon_intent_sha256(
+                context["chat_id"], context["project_id"], context["lead_id"],
+                str(payload["text"]), payload.get("attachments"),
+            )
+            with self._direct_admission_turn(
+                str(payload["request_id"]), context["chat_id"], timeout=30.0,
+            ):
+                preflight = self._preflight_direct_long_horizon(
+                    standing, payload, context,
+                )
+                record = self._save_direct_admission(
+                    payload, context, str(preflight["admission_digest"]),
+                )
+                chat_lab.keep_long_horizon_prompt(
+                    self.config, context["transcript_route"], str(payload["text"]),
+                    filed_as=context["filed_as"], request_id=str(payload["request_id"]),
+                    chat_id=context["chat_id"], project_id=context["project_id"],
+                    lead_id=context["lead_id"], intent_sha256=intent_sha256,
+                    attachments=payload.get("attachments"),
+                )
+        return self._public_direct_admission(record)
+
+    def admit_direct_long_horizon(
+        self, supplied: dict[str, Any], *, from_pending: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if from_pending:
+            initial = self._load_direct_admission(
+                str(supplied.get("request_id") or ""),
+                str(supplied.get("chat_id") or ""),
+            )
+            payload = initial["payload"]
+        else:
+            payload = self._canonical_direct_long_horizon_payload(supplied)
+        with self.project_admission_lock, self.swarm_lock:
+            standing = self.swarm_standing()
+            context = self._direct_long_horizon_context(standing, payload)
+            with self._direct_admission_turn(
+                str(payload["request_id"]), context["chat_id"], timeout=30.0,
+            ):
+                if from_pending:
+                    # Re-read only after the cross-process request+chat leases. A
+                    # concurrent explicit discard may have replaced the
+                    # payload with a replay tombstone; never recreate it from
+                    # the stale pre-lease copy.
+                    record = self._load_direct_admission(
+                        str(payload["request_id"]), str(payload["chat_id"]),
+                    )
+                    payload = record["payload"]
+                    standing = self.swarm_standing()
+                    context = self._direct_long_horizon_context(standing, payload)
+                intent_sha256 = chat_lab.long_horizon_intent_sha256(
+                    context["chat_id"], context["project_id"], context["lead_id"],
+                    str(payload["text"]), payload.get("attachments"),
+                )
+                preflight = self._preflight_direct_long_horizon(
+                    standing, payload, context,
+                )
+                record = self._save_direct_admission(
+                    payload, context, str(preflight["admission_digest"]),
+                )
+                chat_lab.keep_long_horizon_prompt(
+                    self.config, context["transcript_route"], str(payload["text"]),
+                    filed_as=context["filed_as"], request_id=str(payload["request_id"]),
+                    chat_id=context["chat_id"], project_id=context["project_id"],
+                    lead_id=context["lead_id"], intent_sha256=intent_sha256,
+                    attachments=payload.get("attachments"),
+                )
+                try:
+                    self.long_horizon.store.validate_create(
+                        standing["board"], context["project_id"],
+                        list(payload["objectives"]), str(payload["request_id"]),
+                        success_criteria=payload.get("success_criteria"),
+                        policy=payload.get("policy"),
+                        participant_ids=context["participant_ids"],
+                    )
+                    admitted_authority = self.require_project_execution_authority(
+                        context["project_root"]
+                    )
+                    goal = self.long_horizon.start(
+                        standing["board"], context["project_id"],
+                        list(payload["objectives"]), str(payload["request_id"]),
+                        lead_id=context["lead_id"],
+                        success_criteria=payload.get("success_criteria"),
+                        policy=payload.get("policy"),
+                        attachments=payload.get("attachments"),
+                        participant_ids=context["participant_ids"],
+                        conversation_id=context["chat_id"],
+                        expected_project_authority_id=str(
+                            admitted_authority.get("project_authority_id") or ""
+                        ),
+                    )
+                except Exception as exc:
+                    try:
+                        chat_lab.keep_long_horizon_error(
+                            self.config, context["transcript_route"], str(exc),
+                            filed_as=context["filed_as"],
+                            request_id=str(payload["request_id"]),
+                            chat_id=context["chat_id"],
+                            project_id=context["project_id"],
+                            lead_id=context["lead_id"], intent_sha256=intent_sha256,
+                        )
+                    except Exception:
+                        pass
+                    raise
+                receipt = self._direct_admission_receipt(record)
+                goal = self._goal_for_direct_receipt(
+                    goal, receipt,
+                    admission_digest=self._direct_admission_binding_digest(record),
+                )
+                chat_lab.keep_long_horizon_status(
+                    self.config, context["transcript_route"], goal,
+                    filed_as=context["filed_as"], chat_id=context["chat_id"],
+                    project_id=context["project_id"], lead_id=context["lead_id"],
+                    intent_sha256=intent_sha256,
+                )
+                self._remove_direct_admission(
+                    str(payload["request_id"]), str(record["payload_sha256"]),
+                )
+        return goal, receipt
 
     @staticmethod
     def _project_paths_overlap(one: Path, other: Path) -> bool:
@@ -1615,13 +2838,22 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json(self.server.swarm_runs.recoverable_work())
             elif parsed.path == "/api/long-horizon/goals":
                 self._require_token()
-                self._json({"goals": self.server.long_horizon.store.list(100)})
+                goals = self.server.long_horizon.store.list(100)
+                self.server.project_long_horizon_chat_statuses(goals)
+                self._json({"goals": goals})
+            elif parsed.path == "/api/long-horizon/pending-admissions":
+                self._require_token()
+                self._json({
+                    "pending": self.server.direct_admission_inventory(),
+                })
             elif parsed.path == "/api/long-horizon/goal":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
                 goal_id = str(query.get("id", [""])[0])
                 store = self.server.long_horizon.store
-                self._json({"goal": store.public(store.get(goal_id))})
+                goal = store.public(store.get(goal_id))
+                self.server.project_long_horizon_chat_statuses([goal])
+                self._json({"goal": goal})
             elif parsed.path == "/api/long-horizon/events":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -1998,6 +3230,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             if conversation else one.who,
                             filed_as,
                         )
+                        if held.phase != "long_horizon_checkpoint"
                     ],
                     "most_letters": chat_lab.MOST_LETTERS,
                     "limits": chat_lab.effective_limits(
@@ -2959,18 +4192,6 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             and any(isinstance(task, str) and task.strip()
                                     for task in one.get("tasks", []))
                         ]
-                        selected_roots = [
-                            Path(str(project.get("path") or "")).resolve(strict=True)
-                            for project in selected
-                        ]
-                        for position, root in enumerate(selected_roots):
-                            if any(
-                                root == other or root in other.parents or other in root.parents
-                                for other in selected_roots[position + 1:]
-                            ):
-                                raise HarnessError(
-                                    "Board goals cannot run concurrently in nested or overlapping project folders"
-                                )
                         for project in selected:
                             self.server.long_horizon.store.validate_create(
                                 standing["board"], str(project.get("id") or ""),
@@ -2986,65 +4207,27 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             standing["board"], request_id
                         )
                 self._json({"goals": goals, "engine": "long_horizon"}, HTTPStatus.ACCEPTED)
+            elif self.path == "/api/long-horizon/prepare-admission":
+                prepared = dict(body)
+                prepared["request_id"] = str(
+                    body.get("request_id") or uuid.uuid4().hex
+                )
+                pending = self.server.prepare_direct_long_horizon(prepared)
+                self._json({"pending": pending})
+            elif self.path == "/api/long-horizon/discard-admission":
+                discarded = self.server.discard_direct_admission(body)
+                self._json(discarded)
             elif self.path == "/api/long-horizon/start":
-                request_id = str(body.get("request_id") or uuid.uuid4().hex)
-                with self.server.project_admission_lock, self.server.swarm_lock:
-                    standing = self.server.swarm_standing()
-                    project_id = str(body.get("project_id") or "")
-                    project_root = self.server._board_project_path(
-                        standing["board"], project_id
-                    )
-                    lead_id = str(body.get("lead_id") or "")
-                    chat_id = str(body.get("chat_id") or "")
-                    if not chat_id:
-                        raise HarnessError(
-                            "Direct project work requires an exact saved chat identity. "
-                            "Use board-goal work for an explicitly project-wide agent pool."
-                        )
-                    conversation = swarm_chats.resolve(
-                        self.server.config, standing["board"], lead_id, chat_id
-                    )
-                    if str(conversation.get("project") or "") != project_id:
-                        raise HarnessError(
-                            "The selected chat and long-horizon target project no longer match."
-                        )
-                    participant_ids = [
-                        str(one.get("id") or "")
-                        for one in conversation.get("pair_agents", [])
-                        if isinstance(one, dict) and str(one.get("id") or "")
-                    ]
-                    objectives = (
-                        [str(one) for one in body.get("objectives", [])]
-                        if isinstance(body.get("objectives"), list)
-                        else [str(body.get("text") or "")]
-                    )
-                    success_criteria = (
-                        [str(one) for one in body.get("success_criteria", [])]
-                        if isinstance(body.get("success_criteria"), list) else None
-                    )
-                    policy = body.get("policy") if isinstance(body.get("policy"), dict) else None
-                    self.server.long_horizon.store.validate_create(
-                        standing["board"], project_id, objectives, request_id,
-                        success_criteria=success_criteria, policy=policy,
-                        participant_ids=participant_ids,
-                    )
-                    admitted_authority = self.server.require_project_execution_authority(
-                        project_root
-                    )
-                    goal = self.server.long_horizon.start(
-                        standing["board"], project_id,
-                        objectives,
-                        request_id, lead_id=lead_id,
-                        success_criteria=success_criteria,
-                        policy=policy,
-                        attachments=body.get("attachments"),
-                        participant_ids=participant_ids,
-                        conversation_id=chat_id,
-                        expected_project_authority_id=str(
-                            admitted_authority.get("project_authority_id") or ""
-                        ),
-                    )
-                self._json({"goal": goal, "engine": "long_horizon"}, HTTPStatus.ACCEPTED)
+                prepared = dict(body)
+                prepared["request_id"] = str(
+                    body.get("request_id") or uuid.uuid4().hex
+                )
+                goal, receipt = self.server.admit_direct_long_horizon(
+                    prepared, from_pending=body.get("from_pending") is True,
+                )
+                self._json({
+                    **receipt, "goal": goal, "engine": "long_horizon",
+                }, HTTPStatus.ACCEPTED)
             elif self.path == "/api/long-horizon/control":
                 goal_id = str(body.get("goal_id") or "")
                 action = str(body.get("action") or "")

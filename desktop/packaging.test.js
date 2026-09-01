@@ -202,6 +202,7 @@ test("every source-tree UI smoke uses the dependency installed by a clean checko
     ));
   assert.ok(smokeFiles.includes("built.smoke.js"));
   assert.ok(smokeFiles.includes("smoke.js"));
+  assert.ok(smokeFiles.includes("long-horizon.smoke.js"));
   assert.ok(smokeFiles.includes("multi-vendor.e2e.js"));
   for (const name of smokeFiles) {
     const source = fs.readFileSync(path.join(__dirname, name), "utf8");
@@ -217,7 +218,7 @@ test("every source-tree UI smoke uses the dependency installed by a clean checko
 
 test("test and smoke files stay out of the installer", () => {
   for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js",
-                      "automations.smoke.js"]) {
+                      "automations.smoke.js", "long-horizon.smoke.js"]) {
     assert.ok(!shipped(name), `${name} should not be shipped`);
   }
 });
@@ -257,6 +258,7 @@ test("the release is a versioned per-user NSIS installer", () => {
   assert.match(PACKAGE.build.win.artifactName, /UNSIGNED-DEV/,
     "an unsigned local build must not look like a signed public release");
   assert.strictEqual(PACKAGE.build.nsis.perMachine, false);
-  assert.strictEqual(PACKAGE.build.nsis.createDesktopShortcut, true);
+  assert.strictEqual(PACKAGE.build.nsis.createDesktopShortcut, "always",
+    "every normal reinstall must restore a missing desktop shortcut");
   assert.strictEqual(PACKAGE.build.nsis.createStartMenuShortcut, true);
 });

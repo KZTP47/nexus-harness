@@ -63,3 +63,14 @@ new tag; do not replace assets beneath an existing version.
 
 Do not push a tag until the local test suite and the mandatory persistent
 memory post-work deployment gate pass.
+
+The GitHub account must also be able to allocate both Windows and Ubuntu Actions
+runners. A source tag is not a release. After publication, the workflow polls
+GitHub's latest-release API without credentials, requires the exact tag,
+installer, and checksum, anonymously downloads both assets, compares their
+bytes with the verified build artifacts, and verifies the published SHA-256.
+The real-package Windows job installs the package, validates the desktop
+shortcut, removes it, reinstalls to prove it is recreated exactly once, and
+launches the app through that shortcut before publication may proceed. The
+operator should still inspect the completed release page before distributing
+its link.

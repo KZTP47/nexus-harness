@@ -18,6 +18,15 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   repairVersionMismatch: () => ipcRenderer.invoke("harness:repairVersionMismatch"),
   showHelp: () => ipcRenderer.invoke("harness:help"),
   diagnostics: () => ipcRenderer.invoke("harness:diagnostics"),
+  saveDirectGoalOutbox: (record) => ipcRenderer.invoke(
+    "harness:saveDirectGoalOutbox", record),
+  listDirectGoalOutbox: () => ipcRenderer.invoke("harness:listDirectGoalOutbox"),
+  readDirectGoalOutbox: (chatId, requestId, payloadSha256) => ipcRenderer.invoke(
+    "harness:readDirectGoalOutbox", String(chatId || ""),
+    String(requestId || ""), String(payloadSha256 || "")),
+  deleteDirectGoalOutbox: (chatId, requestId, payloadSha256) => ipcRenderer.invoke(
+    "harness:deleteDirectGoalOutbox", String(chatId || ""),
+    String(requestId || ""), String(payloadSha256 || "")),
   reviewTrust: () => ipcRenderer.invoke("harness:reviewTrust"),
   trustProject: () => ipcRenderer.invoke("harness:trustProject"),
   showProjectFile: (relativePath) => ipcRenderer.invoke(

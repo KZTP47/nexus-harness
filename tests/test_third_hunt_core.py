@@ -170,11 +170,41 @@ class DeniedCommandShapeTests(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(HarnessError):
                 self.runner()._check(argv)
 
+    def test_powershell_named_switches_are_not_mistaken_for_short_force(self) -> None:
+        for argv in (
+            ["powershell.exe", "-NoProfile", "-File", "script.ps1"],
+            ["pwsh", "-NoProfile", "-InputFormat", "Text", "-File", "script.ps1"],
+            [r"C:\Program Files\PowerShell\7\pwsh.exe", "-NoProfile", "-File", "script.ps1"],
+        ):
+            with self.subTest(argv=argv):
+                self.runner()._check(argv)
+
+    def test_destructive_git_clean_bundles_cannot_hide_force_or_directory(self) -> None:
+        for switch in ("-xfd", "-xdf", "-nfd"):
+            with self.subTest(switch=switch), self.assertRaises(HarnessError):
+                self.runner()._check(["git", "clean", switch])
+
+    def test_powershell_command_payload_returns_to_short_bundle_parsing(self) -> None:
+        for argv in (
+            ["powershell.exe", "-NoProfile", "-Command", "git clean -xfd"],
+            ["pwsh", "-NoProfile", "-c", "git clean -xdf"],
+            ["powershell.exe", "-NoProfile", "git clean -nfd"],
+        ):
+            with self.subTest(argv=argv), self.assertRaises(HarnessError):
+                self.runner()._check(argv)
+
+    def test_force_and_short_bundles_still_match_the_denied_switch(self) -> None:
+        for switch in ("-Force", "-f", "-fd"):
+            with self.subTest(switch=switch), self.assertRaises(HarnessError):
+                self.runner()._check(["git", "push", switch, "origin", "main"])
+
     def test_ordinary_work_is_not_refused(self) -> None:
         for argv in (
             ["git", "status"],
             ["git", "log", "--oneline"],
             ["git", "clean", "-n"],
+            ["git", "clean", "-nd"],
+            ["git", "clean", "-nxd"],
             ["git", "commit", "-m", "reset the counter"],
             ["npm", "run", "build"],
             ["python", "-m", "pytest", "-q"],

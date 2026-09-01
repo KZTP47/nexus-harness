@@ -49,6 +49,72 @@ def with_nothing_set_up() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name != "PYTHONPATH"}
 
 
+def ordinary_python_for_plain_download() -> list[str] | None:
+    """Find a Python whose default import path does not already contain Nexus."""
+
+    if os.name == "nt":
+        candidates = [
+            [sys.executable],
+            ["py", f"-{sys.version_info.major}.{sys.version_info.minor}"],
+            ["py", "-3"],
+            ["python"],
+            ["python3"],
+        ]
+    else:
+        candidates = [
+            [sys.executable],
+            [f"python{sys.version_info.major}.{sys.version_info.minor}"],
+            ["python3"],
+            ["python"],
+        ]
+    probe = (
+        "import importlib.util,json,sys; "
+        "spec=importlib.util.find_spec('our_harness'); "
+        "print(json.dumps({'executable':sys.executable,"
+        "'version':list(sys.version_info[:2]),"
+        "'found':spec is not None,"
+        "'origin':None if spec is None else spec.origin}))"
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            completed = subprocess.run(
+                [*candidate, "-c", probe],
+                capture_output=True,
+                text=True,
+                env=with_nothing_set_up(),
+                cwd=str(ROOT),
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if completed.returncode != 0:
+            continue
+        try:
+            payload = json.loads(completed.stdout.splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        executable = payload.get("executable")
+        version = payload.get("version")
+        if (
+            not isinstance(executable, str)
+            or not executable
+            or not isinstance(version, list)
+            or len(version) != 2
+            or any(isinstance(part, bool) or not isinstance(part, int) for part in version)
+        ):
+            continue
+        identity = os.path.normcase(os.path.abspath(executable))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if tuple(version) >= (3, 11) and payload.get("found") is False:
+            return candidate
+    return None
+
+
 class TheLauncherIsReallyThere(unittest.TestCase):
     def test_it_is_where_the_answer_says_it_is(self) -> None:
         self.assertTrue(a_launcher().is_file(), str(a_launcher()))
@@ -85,10 +151,11 @@ class TheLauncherIsReallyThere(unittest.TestCase):
         """If this ever passes, the harness is installed on this machine and
         the rest of these tests are proving nothing. Better to be told."""
 
-        if is_it_installed():
-            self.skipTest("the harness is installed here, so there is nothing to prove")
+        ordinary_python = ordinary_python_for_plain_download()
+        if ordinary_python is None:
+            self.skipTest("no ordinary Python without Nexus on its import path is available")
         finished = subprocess.run(
-            [sys.executable, "-m", "our_harness", "--version"],
+            [*ordinary_python, "-m", "our_harness", "--version"],
             capture_output=True, text=True, env=with_nothing_set_up(),
             cwd=str(ROOT), timeout=120,
         )

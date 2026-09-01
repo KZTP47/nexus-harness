@@ -14,17 +14,20 @@ helper uses Windows PowerShell to:
 4. enforce the signature mode declared by that release; and
 5. start the per-user installer.
 
-The current `0.2.1` release is explicitly unsigned. Its installer must therefore
-be named `Nexus-Harness-Setup-0.2.1-UNSIGNED.exe`, match the published checksum,
+A published `0.2.1` release without a configured publisher must be explicitly
+named `Nexus-Harness-Setup-0.2.1-UNSIGNED.exe`, match its published checksum,
 and have Windows' `NotSigned` status. Windows may display an unknown-publisher
 warning. A future release that pins a publisher certificate will instead be
-required to have a valid signature from that exact publisher.
+required to have a valid signature from that exact publisher. A version in the
+source tree is not installable until its stable GitHub release actually exists.
 
 After installation, open **Nexus Harness** from the desktop or Start menu. The
 installed app carries its own Python runtime and dependencies, so the cloned
 repository can be moved or removed without breaking that shortcut.
 
-The repository is currently private. On a new computer, either:
+The repository is currently public, so a published public release needs no
+GitHub login. If a private fork or a future visibility change is involved,
+either:
 
 - sign in with GitHub CLI (`gh auth login`);
 - have Git Credential Manager already signed in;
@@ -50,22 +53,30 @@ The last command must print `True` before you run the installer.
 The helper stops safely and prints the exact reason. Common causes are:
 
 - **No stable release exists.** Open the repository's
-  [Releases page](https://github.com/KZTP47/nexus-harness/releases/latest) and
+  [Releases page](https://github.com/KZTP47/nexus-harness/releases) and
   confirm a release is published rather than only a source tag.
-- **GitHub says the repository or release was not found.** Authenticate the
-  helper with GitHub CLI, Git Credential Manager, or a process-scoped
-  `GH_TOKEN`, then run it again. Signing in only inside a browser does not
-  authenticate the helper; in that case download both assets in the browser.
+- **GitHub says the repository or release was not found.** For this public
+  repository, first check the Releases page: authentication cannot create a
+  release that has not been published. For a private fork with a confirmed
+  release, authenticate the helper with GitHub CLI, Git Credential Manager, or
+  a process-scoped `GH_TOKEN`, then run it again. Signing in only inside a
+  browser does not authenticate the helper; in that case download both assets
+  in the browser.
 - **The checksum or signature mode does not match.** Do not run the downloaded
   file. Download both assets again; if the mismatch remains, report the release
   as broken.
 - **Windows warns about an unknown publisher.** That is expected only for a
   release whose filename and release metadata explicitly say `UNSIGNED`.
-- **There is not enough disk space.** The `0.2.1` installer is about 234 MiB and
-  the app about 810 MiB unpacked. Allow at least 2 GiB free during installation.
+- **There is not enough disk space.** The measured `0.2.1` development installer
+  is about 234 MiB and the app about 810 MiB unpacked. Confirm a published
+  release's exact sizes in its notes and allow at least 2 GiB free during
+  installation.
 
 Running `Install Nexus Harness.cmd` again is safe: it downloads and validates
-the current stable installer again before starting it.
+the current stable installer again before starting it. A normal reinstall also
+restores a missing **Nexus Harness** desktop shortcut and verifies that exactly
+one such link exists, targets the installed app, and uses that same executable
+as its icon before reporting success.
 
 ## Source-development shortcut
 

@@ -4,10 +4,12 @@ import copy
 import base64
 from contextlib import closing
 import json
+import multiprocessing
 import re
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -22,6 +24,124 @@ from our_harness.providers import base as provider_base
 
 
 THREAD_COORDINATION_TIMEOUT_SECONDS = 30.0
+
+
+def _cross_process_goal_admission(
+    state_path: str, authority_path: str, project_path: str, request_id: str,
+    ready: object, begin: object, results: object,
+) -> None:
+    """Spawn-safe admission worker used to prove the SQLite owner boundary."""
+
+    try:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "codex": {
+                "kind": "openai", "model": "gpt-test",
+                "endpoint": "http://127.0.0.1/openai", "api_key_env": "TEST_OPENAI_KEY",
+            },
+        }
+        authority = Path(authority_path)
+        project = Path(project_path)
+        config = LoadedConfig(data, authority, [], {})
+        board = {
+            "agents": [{"id": "lead", "name": "Lead", "who": "codex", "ready": True}],
+            "projects": [{
+                "id": "project", "name": "Project", "path": str(project),
+                "is_there": True, "tasks": [],
+            }],
+            "works_on": [{"agent": "lead", "project": "project"}],
+        }
+        long_horizon._base = lambda: Path(state_path)
+        store = long_horizon.GoalStore(config)
+        ready.put(request_id)
+        if not begin.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+            raise RuntimeError("cross-process admission barrier timed out")
+        goal = store.create(
+            board, "project", ["Exact work " + request_id], request_id,
+            conversation_id="chat-" + request_id,
+        )
+        results.put({
+            "ok": True, "request_id": request_id,
+            "goal_id": goal["goal_id"], "status": goal["status"],
+            "queue": goal["project_queue"],
+        })
+    except Exception as exc:  # pragma: no cover - returned to parent for assertion
+        results.put({"ok": False, "error": repr(exc)})
+
+
+def _cross_process_runtime_replay(
+    state_path: str, authority_path: str, project_path: str,
+    ready: object, begin: object, release: object, dispatch_count: object,
+    results: object,
+) -> None:
+    """Spawn-safe runtime replay worker for the durable scheduler CAS."""
+
+    runtime = None
+    try:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "codex": {
+                "kind": "openai", "model": "gpt-test",
+                "endpoint": "http://127.0.0.1/openai", "api_key_env": "TEST_OPENAI_KEY",
+            },
+        }
+        authority = Path(authority_path)
+        project = Path(project_path)
+        config = LoadedConfig(data, authority, [], {})
+        board = {
+            "agents": [{"id": "lead", "name": "Lead", "who": "codex", "ready": True}],
+            "projects": [{
+                "id": "project", "name": "Project", "path": str(project),
+                "is_there": True, "tasks": [],
+            }],
+            "works_on": [{"agent": "lead", "project": "project"}],
+        }
+        long_horizon._base = lambda: Path(state_path)
+        runtime = long_horizon.LongHorizonRuntime(config)
+
+        def provider(*_args, **kwargs):
+            before = kwargs.get("before_provider_dispatch")
+            after = kwargs.get("after_provider_response")
+            if before:
+                before("initial")
+            with dispatch_count.get_lock():
+                dispatch_count.value += 1
+            if not release.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+                raise RuntimeError("provider release barrier timed out")
+            if after:
+                after("initial")
+            return {"text": json.dumps(action(criteria_evidence=[{
+                "criterion": "Original objective is satisfied",
+                "evidence_refs": ["verified-no-change"],
+            }]))}
+
+        ready.put("ready")
+        if not begin.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+            raise RuntimeError("runtime replay barrier timed out")
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=provider), \
+                mock.patch.object(
+                    long_horizon.swarm_work, "_run_selected_project_verification",
+                    return_value={"status": "passed", "basis": "cross-process scheduler"},
+                ):
+            goal = runtime.start(
+                board, "project", ["Dispatch this exact request once"],
+                "same-runtime-request", conversation_id="same-chat",
+            )
+            deadline = time.monotonic() + THREAD_COORDINATION_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                current = runtime.store.get(goal["goal_id"])
+                if current["status"] in {"complete", "failed", "cancelled", "paused"}:
+                    break
+                time.sleep(0.02)
+            results.put({
+                "ok": True, "goal_id": goal["goal_id"],
+                "status": runtime.store.get(goal["goal_id"])["status"],
+            })
+    except Exception as exc:  # pragma: no cover - returned to parent for assertion
+        results.put({"ok": False, "error": repr(exc)})
+    finally:
+        if runtime is not None:
+            runtime.close()
 
 
 def action(kind: str = "complete", **updates):
@@ -87,6 +207,45 @@ class LongHorizonTests(unittest.TestCase):
 
     def store(self):
         return long_horizon.GoalStore(self.config)
+
+    def assert_one_compact_rollover_tombstone(self, store):
+        with closing(sqlite3.connect(store.database)) as db:
+            db.row_factory = sqlite3.Row
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goals "
+                "WHERE status IN ('complete','cancelled')"
+            ).fetchone()[0], long_horizon.MAX_GOALS)
+            rows = db.execute(
+                "SELECT * FROM long_goal_request_tombstones"
+            ).fetchall()
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            raw = str(row["tombstone_json"])
+            tombstone = json.loads(raw)
+            self.assertEqual(set(tombstone), {
+                "request_tombstone_schema_version", "request_tombstone",
+                "goal_id", "request_id", "client_request_id", "authority_key",
+                "status", "retired_ms", "admission_digest", "project", "conversation_id",
+                "requested_agent_ids", "lead_agent_id", "parent_goal_id",
+            })
+            self.assertEqual(
+                tombstone["request_tombstone_schema_version"],
+                long_horizon.REQUEST_TOMBSTONE_SCHEMA_VERSION,
+            )
+            self.assertTrue(tombstone["request_tombstone"])
+            self.assertLess(len(raw.encode("utf-8")), 2_048)
+            self.assertRegex(str(row["tombstone_sha256"]), r"^[0-9a-f]{64}$")
+            self.assertRegex(str(row["integrity_mac"]), r"^[0-9a-f]{64}$")
+            self.assertEqual(int(row["retired_ms"]), tombstone["retired_ms"])
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goals WHERE goal_id=?",
+                (tombstone["goal_id"],),
+            ).fetchone()[0], 0)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goal_events WHERE goal_id=?",
+                (tombstone["goal_id"],),
+            ).fetchone()[0], 0)
+        return tombstone
 
     def stage_review(self, store, goal, task, proposed):
         store.record_dispatch(goal["goal_id"], task, "review-proposal")
@@ -741,12 +900,6 @@ class LongHorizonTests(unittest.TestCase):
             review_goal = store.create(
                 board, "project", ["Propose risky work"], "effective-review",
             )
-            failover_goal = store.create(
-                board, "project", ["Recover from a known failure"], "effective-failover",
-            )
-            manual_goal = store.create(
-                board, "project", ["Request a manual review"], "effective-manual-review",
-            )
 
         claimed = store.claim_ready(review_goal["goal_id"], "review-worker")[0]
         self.stage_review(store, review_goal, claimed, action("request_review", risk="high"))
@@ -768,12 +921,22 @@ class LongHorizonTests(unittest.TestCase):
             store.control(review_goal["goal_id"], "reassign", {
                 "task_id": review["id"], "agent_id": "alias",
             })
+        store.control(review_goal["goal_id"], "cancel")
 
+        with mock.patch.object(long_horizon.chat_lab, "_route_failure_context", side_effect=context):
+            manual_goal = store.create(
+                board, "project", ["Request a manual review"], "effective-manual-review",
+            )
         with self.assertRaisesRegex(HarnessError, "different effective provider identity"):
             store.control(manual_goal["goal_id"], "request_review", {
                 "task_id": manual_goal["tasks"][0]["id"], "agent_id": "alias",
             })
+        store.control(manual_goal["goal_id"], "cancel")
 
+        with mock.patch.object(long_horizon.chat_lab, "_route_failure_context", side_effect=context):
+            failover_goal = store.create(
+                board, "project", ["Recover from a known failure"], "effective-failover",
+            )
         first = store.claim_ready(failover_goal["goal_id"], "failure-worker")[0]
         store.record_dispatch(failover_goal["goal_id"], first, "known-failure")
         store.fail_task(
@@ -1436,7 +1599,7 @@ class LongHorizonTests(unittest.TestCase):
             store.create(self.board, "project", ["one"], "too-many-criteria",
                          success_criteria=[f"criterion {n}" for n in range(long_horizon.MAX_CRITERIA + 1)])
 
-    def test_nested_project_roots_are_rejected_before_parallel_start(self):
+    def test_nested_project_roots_are_persisted_and_serialized(self):
         nested = self.project / "nested"
         nested.mkdir()
         board = copy.deepcopy(self.board)
@@ -1449,8 +1612,16 @@ class LongHorizonTests(unittest.TestCase):
         ]
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
-        with self.assertRaisesRegex(HarnessError, "nested or overlapping"):
-            runtime.start_board(board, "nested")
+        with mock.patch.object(
+            runtime, "start_background",
+            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+        ) as start:
+            goals = runtime.start_board(board, "nested")
+        self.assertEqual([one["status"] for one in goals], ["queued", "waiting_for_project"])
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(
+            goals[1]["project_queue"]["blocked_by_goal_id"], goals[0]["goal_id"],
+        )
 
     def test_board_prevalidates_every_project_before_creating_or_starting_any_goal(self):
         second = self.base / "second-project"
@@ -1487,37 +1658,1137 @@ class LongHorizonTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, "different .*objective"):
                 runtime.start_board(board, "stable-board-request")
 
-    def test_overlap_is_rejected_before_persisting_a_ghost_goal(self):
+    def test_overlap_is_persisted_as_waiter_without_dispatch(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
-        with mock.patch.object(runtime, "start_background", side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id)):
-            runtime.start(self.board, "project", ["First"], "first-live")
-            with self.assertRaisesRegex(HarnessError, "already owns"):
-                runtime.start(self.board, "project", ["Second"], "second-rejected")
-        self.assertEqual(len(runtime.store.list(100)), 1)
-        self.assertIsNone(runtime.store.get_by_request("second-rejected"))
+        with mock.patch.object(
+            runtime, "start_background",
+            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+        ) as start:
+            owner = runtime.start(
+                self.board, "project", ["First"], "first-live",
+                conversation_id="chat-first",
+            )
+            waiter = runtime.start(
+                self.board, "project", ["Second exact objective"], "second-waiting",
+                conversation_id="chat-second",
+            )
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(waiter["status"], "waiting_for_project")
+        self.assertEqual(waiter["conversation_id"], "chat-second")
+        self.assertEqual(waiter["objective"], "Second exact objective")
+        self.assertEqual(waiter["project_queue"]["state"], "waiting")
+        self.assertEqual(waiter["project_queue"]["blocked_by_goal_id"], owner["goal_id"])
+        self.assertEqual(waiter["execution_contract"]["schema_version"], 1)
+        self.assertEqual(waiter["execution_contract"]["mode"], "exclusive_project")
+        self.assertRegex(waiter["execution_contract"]["fingerprint_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(runtime.store.claim_ready(waiter["goal_id"], "must-not-run"), [])
+        self.assertEqual(len(runtime.store.list(100)), 2)
 
-    def test_continuations_reject_overlap_without_claiming_a_second_owner(self):
+    def test_waiting_goal_controls_cannot_bypass_project_owner(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
         old = runtime.store.create(self.board, "project", ["Paused old goal"], "old-paused")
         runtime.store.control(old["goal_id"], "pause")
-        active = runtime.store.create(self.board, "project", ["Active new goal"], "new-active")
+        waiting = runtime.store.create(self.board, "project", ["Waiting new goal"], "new-waiting")
         controls = [
-            ("resume", {}), ("retry", {"task_id": old["tasks"][0]["id"]}),
+            ("resume", {}), ("retry", {"task_id": waiting["tasks"][0]["id"]}),
             ("steer", {"text": "New direction"}),
-            ("message", {"text": "Continue", "task_id": old["tasks"][0]["id"]}),
-            ("reassign", {"task_id": old["tasks"][0]["id"], "agent_id": "reviewer"}),
-            ("request_review", {"task_id": old["tasks"][0]["id"], "agent_id": "reviewer"}),
+            ("message", {"text": "Continue", "task_id": waiting["tasks"][0]["id"]}),
+            ("reassign", {"task_id": waiting["tasks"][0]["id"], "agent_id": "reviewer"}),
+            ("request_review", {"task_id": waiting["tasks"][0]["id"], "agent_id": "reviewer"}),
         ]
         for control, payload in controls:
-            with self.subTest(control=control), self.assertRaisesRegex(HarnessError, "already owns"):
-                runtime.control(old["goal_id"], control, payload)
+            with self.subTest(control=control), self.assertRaisesRegex(HarnessError, "waiting for"):
+                runtime.control(waiting["goal_id"], control, payload)
             self.assertEqual(runtime.store.get(old["goal_id"])["status"], "paused")
-        active_goals = runtime.store.active_overlapping_project(self.project)
+            self.assertEqual(
+                runtime.store.get(waiting["goal_id"])["status"], "waiting_for_project",
+            )
+        owners = runtime.store.active_overlapping_project(self.project)
+        self.assertEqual([one["goal_id"] for one in owners], [old["goal_id"]])
+
+    def test_cancel_promotes_oldest_waiter_once_and_rebases_the_next(self):
+        store = self.store()
+        owner = store.create(self.board, "project", ["Owner"], "owner")
+        time.sleep(0.002)
+        first = store.create(self.board, "project", ["First waiter"], "first-waiter")
+        time.sleep(0.002)
+        second = store.create(self.board, "project", ["Second waiter"], "second-waiter")
+
+        released = store.control(owner["goal_id"], "cancel")
+
+        self.assertEqual(released["status"], "cancelled")
+        self.assertEqual(released["project_queue"]["state"], "released")
+        self.assertEqual(released["promoted_goal_ids"], [first["goal_id"]])
+        promoted = store.get(first["goal_id"])
+        still_waiting = store.get(second["goal_id"])
+        self.assertEqual(promoted["status"], "queued")
+        self.assertEqual(promoted["project_queue"]["state"], "owner")
+        self.assertGreater(promoted["project_queue"]["promoted_ms"], 0)
+        self.assertEqual(still_waiting["status"], "waiting_for_project")
         self.assertEqual(
-            {one["goal_id"] for one in active_goals}, {active["goal_id"], old["goal_id"]}
+            still_waiting["project_queue"]["blocked_by_goal_id"], first["goal_id"],
         )
+        event_types = [
+            one["type"] for one in store.events(first["goal_id"])["events"]
+        ]
+        self.assertEqual(event_types.count("goal_project_promoted"), 1)
+
+        second_release = store.control(first["goal_id"], "cancel")
+        self.assertEqual(second_release["promoted_goal_ids"], [second["goal_id"]])
+        self.assertEqual(store.get(second["goal_id"])["status"], "queued")
+
+    def test_complete_releases_project_and_promotes_waiter(self):
+        store = self.store()
+        owner = store.create(self.board, "project", ["Owner"], "complete-owner")
+        waiter = store.create(self.board, "project", ["Waiter"], "complete-waiter")
+
+        def ready_to_complete(document, _db):
+            for task in document["tasks"]:
+                task["state"] = "complete"
+                task["criteria_evidence"] = [{
+                    "criterion": "Original objective is satisfied",
+                    "evidence_refs": ["snapshot:" + "a" * 64],
+                }]
+            document["artifacts"] = [{
+                "kind": "verified_no_change", "tree_merkle": "a" * 64,
+            }]
+
+        store._mutate(owner["goal_id"], ready_to_complete)
+        current = store.get(owner["goal_id"])
+        completed = store.complete_verification(
+            owner["goal_id"], {"status": "passed", "basis": "unit"},
+            expected_revision=current["revision"], expected_objective_epoch=1,
+        )
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(completed["project_queue"]["state"], "released")
+        self.assertEqual(completed["promoted_goal_ids"], [waiter["goal_id"]])
+        self.assertEqual(store.get(waiter["goal_id"])["status"], "queued")
+
+    def test_runtime_starts_same_authority_goal_after_atomic_promotion(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        owner = runtime.store.create(self.board, "project", ["Owner"], "runtime-owner")
+        waiter = runtime.store.create(self.board, "project", ["Waiter"], "runtime-waiter")
+        with mock.patch.object(
+            runtime, "start_background",
+            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+        ) as start:
+            released = runtime.control(owner["goal_id"], "cancel")
+        self.assertEqual(released["promoted_goal_ids"], [waiter["goal_id"]])
+        start.assert_called_once_with(waiter["goal_id"])
+
+    def test_failed_goal_retains_ownership_until_cancel_or_resume(self):
+        store = self.store()
+        owner = store.create(self.board, "project", ["Owner"], "failed-owner")
+
+        def fail_resumably(document, db):
+            document["status"] = "failed"
+            document["note"] = "Injected resumable failure"
+            store._event(db, document, "goal_failed", payload={"resumable": True})
+
+        store._mutate(owner["goal_id"], fail_resumably)
+        failed = store.get(owner["goal_id"])
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["project_queue"]["state"], "owner")
+        waiter = store.create(self.board, "project", ["Wait"], "after-failed")
+        self.assertEqual(waiter["status"], "waiting_for_project")
+        self.assertEqual(
+            waiter["project_queue"]["blocked_by_goal_id"], owner["goal_id"],
+        )
+
+        resumed = store.control(owner["goal_id"], "resume")
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["project_queue"]["state"], "owner")
+        cancelled = store.control(owner["goal_id"], "cancel")
+        self.assertEqual(cancelled["promoted_goal_ids"], [waiter["goal_id"]])
+
+    def test_cancel_directly_from_failed_releases_and_promotes(self):
+        store = self.store()
+        failed = store.create(self.board, "project", ["Failed owner"], "failed-cancel")
+
+        def fail(document, _db):
+            document["status"] = "failed"
+            document["note"] = "Injected resumable failure"
+            document["tasks"][0]["state"] = "failed"
+
+        store._mutate(failed["goal_id"], fail)
+        waiter = store.create(self.board, "project", ["Waiting"], "failed-cancel-waiter")
+
+        cancelled = store.control(failed["goal_id"], "cancel")
+
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["project_queue"]["state"], "released")
+        self.assertEqual(cancelled["promoted_goal_ids"], [waiter["goal_id"]])
+        self.assertEqual(store.get(waiter["goal_id"])["status"], "queued")
+
+    def test_legacy_failed_overlap_migrates_released_without_resend_and_resume_waits(self):
+        store = self.store()
+        pairs = []
+        for suffix, owner_status in (("paused", "paused"), ("running", "running")):
+            target = self.base / f"legacy-target-{suffix}"
+            staging = self.base / f"legacy-staging-{suffix}"
+            target.mkdir()
+            staging.mkdir()
+            board = copy.deepcopy(self.board)
+            board["projects"][0].update({
+                "id": f"target-{suffix}", "path": str(target), "name": "Target",
+            })
+            board["works_on"] = [{
+                "agent": one["agent"], "project": f"target-{suffix}",
+            } for one in self.board["works_on"]]
+            old = store.create(
+                board, f"target-{suffix}", ["Legacy failed evidence"],
+                f"legacy-failed-{suffix}",
+            )
+
+            def make_legacy_failed(document, _db):
+                document["status"] = "failed"
+                document["note"] = "Legacy failure evidence remains inspectable"
+                document["tasks"][0]["state"] = "failed"
+                document["tasks"][0]["evidence"] = ["legacy-evidence"]
+                document.pop("project_queue", None)
+
+            store._mutate(old["goal_id"], make_legacy_failed)
+            staging_board = copy.deepcopy(board)
+            staging_board["projects"][0]["path"] = str(staging)
+            newer = store.create(
+                staging_board, f"target-{suffix}", ["New owner"],
+                f"new-owner-{suffix}",
+            )
+
+            def move_new_owner(document, _db):
+                authority_id = long_horizon.project_identity(target)
+                document["status"] = owner_status
+                document["project"]["path"] = str(target)
+                document["project_authority_id"] = authority_id
+                document["execution_contract"] = long_horizon._exclusive_project_contract(
+                    target, authority_id,
+                )
+                document["project_queue"] = store._queue_record("owner", document["created_ms"])
+
+            store._mutate(newer["goal_id"], move_new_owner)
+            pairs.append((old, newer, owner_status))
+
+        with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+            reopened = long_horizon.GoalStore(self.config)
+        ask.assert_not_called()
+        for old, newer, owner_status in pairs:
+            migrated = reopened.get(old["goal_id"])
+            self.assertEqual(migrated["status"], "failed")
+            self.assertEqual(migrated["project_queue"]["state"], "released")
+            self.assertEqual(migrated["tasks"][0]["evidence"], ["legacy-evidence"])
+            self.assertEqual(reopened.get(newer["goal_id"])["status"], owner_status)
+            resumed = reopened.control(old["goal_id"], "resume")
+            self.assertEqual(resumed["status"], "waiting_for_project")
+            self.assertEqual(
+                resumed["project_queue"]["blocked_by_goal_id"], newer["goal_id"],
+            )
+
+    def test_runtime_resume_reacquires_released_legacy_failed_goal(self):
+        store = self.store()
+        goal = store.create(self.board, "project", ["Legacy failed"], "runtime-legacy-resume")
+
+        def make_legacy_failed(document, _db):
+            document["status"] = "failed"
+            document["tasks"][0]["state"] = "failed"
+            document.pop("project_queue", None)
+
+        store._mutate(goal["goal_id"], make_legacy_failed)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        self.assertEqual(runtime.store.get(goal["goal_id"])["project_queue"]["state"], "released")
+        with mock.patch.object(
+            runtime, "start_background",
+            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+        ) as start:
+            resumed = runtime.control(goal["goal_id"], "resume")
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["project_queue"]["state"], "owner")
+        start.assert_called_once_with(goal["goal_id"])
+
+    def test_effectful_legacy_failed_migration_retains_project_owner(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Unresolved legacy reply"], "effectful-legacy-failed",
+        )
+        task = store.claim_ready(goal["goal_id"], "legacy-effect-worker")[0]
+        store.record_dispatch(goal["goal_id"], task, "legacy-effect")
+
+        def fail_without_queue(document, _db):
+            document["status"] = "failed"
+            document["tasks"][0]["state"] = "failed"
+            document.pop("project_queue", None)
+
+        store._mutate(goal["goal_id"], fail_without_queue)
+        reopened = long_horizon.GoalStore(self.config)
+        migrated = reopened.get(goal["goal_id"])
+        self.assertEqual(migrated["status"], "failed")
+        self.assertEqual(migrated["project_queue"]["state"], "owner")
+        waiter = reopened.create(
+            self.board, "project", ["Must wait"], "effectful-legacy-waiter",
+        )
+        self.assertEqual(waiter["status"], "waiting_for_project")
+        self.assertEqual(
+            waiter["project_queue"]["blocked_by_goal_id"], goal["goal_id"],
+        )
+
+    def test_effectful_legacy_failed_overlap_fails_closed_during_migration(self):
+        store = self.store()
+        old = store.create(
+            self.board, "project", ["Unresolved old effect"], "effectful-overlap-old",
+        )
+        task = store.claim_ready(old["goal_id"], "effectful-overlap-worker")[0]
+        store.record_dispatch(old["goal_id"], task, "effectful-overlap")
+
+        def fail_without_queue(document, _db):
+            document["status"] = "failed"
+            document["tasks"][0]["state"] = "failed"
+            document.pop("project_queue", None)
+
+        store._mutate(old["goal_id"], fail_without_queue)
+        staging = self.base / "effectful-overlap-staging"
+        staging.mkdir()
+        staging_board = copy.deepcopy(self.board)
+        staging_board["projects"][0]["path"] = str(staging)
+        newer = store.create(
+            staging_board, "project", ["New active owner"], "effectful-overlap-new",
+        )
+
+        def overlap_new_owner(document, _db):
+            authority_id = long_horizon.project_identity(self.project)
+            document["status"] = "paused"
+            document["project"]["path"] = str(self.project)
+            document["project_authority_id"] = authority_id
+            document["execution_contract"] = long_horizon._exclusive_project_contract(
+                self.project, authority_id,
+            )
+            document["project_queue"] = store._queue_record(
+                "owner", document["created_ms"],
+            )
+
+        store._mutate(newer["goal_id"], overlap_new_owner)
+        with self.assertRaisesRegex(HarnessError, "ownership conflicts"):
+            long_horizon.GoalStore(self.config)
+
+    def test_waiting_for_user_goal_retains_project_ownership(self):
+        store = self.store()
+        owner = store.create(self.board, "project", ["Need user"], "user-owner")
+
+        def wait_for_user(document, db):
+            document["status"] = "waiting_for_user"
+            document["note"] = "Waiting for an exact user decision"
+            store._event(db, document, "goal_waiting", payload={"reason": "test"})
+
+        store._mutate(owner["goal_id"], wait_for_user)
+        waiter = store.create(self.board, "project", ["Later"], "after-user-wait")
+        self.assertEqual(waiter["status"], "waiting_for_project")
+        self.assertEqual(waiter["project_queue"]["blocked_by_goal_id"], owner["goal_id"])
+        self.assertEqual(
+            [one["goal_id"] for one in store.active_overlapping_project(self.project)],
+            [owner["goal_id"]],
+        )
+
+    def test_unrelated_roots_have_independent_durable_owners(self):
+        other_root = self.base / "different project β"
+        other_root.mkdir()
+        board = copy.deepcopy(self.board)
+        board["projects"].append({
+            "id": "other", "name": "Other", "path": str(other_root),
+            "is_there": True, "tasks": [],
+        })
+        board["works_on"].append({"agent": "lead", "project": "other"})
+        store = self.store()
+        first = store.create(board, "project", ["First"], "different-root-first")
+        second = store.create(board, "other", ["Second"], "different-root-second")
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(second["status"], "queued")
+        self.assertEqual(first["project_queue"]["state"], "owner")
+        self.assertEqual(second["project_queue"]["state"], "owner")
+
+    def test_cross_authority_store_waits_and_observes_promotion(self):
+        first_store = self.store()
+        owner = first_store.create(self.board, "project", ["First"], "authority-first")
+        other_authority = self.base / "other-config-authority"
+        other_authority.mkdir()
+        other_config = LoadedConfig(copy.deepcopy(self.config.data), other_authority, [], {})
+        other_store = long_horizon.GoalStore(other_config)
+        waiter = other_store.create(
+            self.board, "project", ["Second"], "authority-second",
+            conversation_id="other-chat",
+        )
+        self.assertEqual(waiter["status"], "waiting_for_project")
+        self.assertEqual(waiter["project_queue"]["blocked_by_goal_id"], owner["goal_id"])
+
+        first_store.control(owner["goal_id"], "cancel")
+
+        promoted = other_store.get(waiter["goal_id"])
+        self.assertEqual(promoted["status"], "queued")
+        self.assertEqual(promoted["project_queue"]["state"], "owner")
+
+    def test_cancel_drains_provider_before_cross_authority_waiter_dispatches(self):
+        other_authority = self.base / "live-waiter-authority"
+        other_authority.mkdir()
+        other_config = LoadedConfig(copy.deepcopy(self.config.data), other_authority, [], {})
+        owner_runtime = long_horizon.LongHorizonRuntime(self.config)
+        waiter_runtime = long_horizon.LongHorizonRuntime(other_config)
+        self.addCleanup(owner_runtime.close)
+        self.addCleanup(waiter_runtime.close)
+        provider_entered = threading.Event()
+        release_provider = threading.Event()
+        dispatches: list[str] = []
+        dispatch_lock = threading.Lock()
+
+        def provider(*_args, **kwargs):
+            before = kwargs.get("before_provider_dispatch")
+            after = kwargs.get("after_provider_response")
+            if before:
+                before("initial")
+            with dispatch_lock:
+                dispatches.append(str(kwargs.get("conversation_key") or ""))
+                number = len(dispatches)
+            if number == 1:
+                provider_entered.set()
+                if not release_provider.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+                    raise RuntimeError("blocking provider test timed out")
+            if after:
+                after("initial")
+            return {"text": json.dumps(action(criteria_evidence=[{
+                "criterion": "Original objective is satisfied",
+                "evidence_refs": ["verified-no-change"],
+            }]))}
+
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=provider), \
+                mock.patch.object(
+                    long_horizon.swarm_work, "_run_selected_project_verification",
+                    return_value={"status": "passed", "basis": "drain ordering"},
+                ):
+            owner = owner_runtime.start(
+                self.board, "project", ["Blocking owner"], "blocking-owner",
+            )
+            self.assertTrue(provider_entered.wait(THREAD_COORDINATION_TIMEOUT_SECONDS))
+            waiter = waiter_runtime.start(
+                self.board, "project", ["Foreign waiter"], "foreign-live-waiter",
+            )
+            self.assertEqual(waiter["status"], "waiting_for_project")
+
+            draining = owner_runtime.control(owner["goal_id"], "cancel")
+            self.assertEqual(draining["status"], "cancelling")
+            self.assertEqual(draining["project_queue"]["state"], "owner")
+            self.assertEqual(
+                waiter_runtime.store.get(waiter["goal_id"])["status"],
+                "waiting_for_project",
+            )
+            time.sleep(0.15)
+            with dispatch_lock:
+                self.assertEqual(len(dispatches), 1)
+
+            release_provider.set()
+            deadline = time.monotonic() + THREAD_COORDINATION_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                owner_state = owner_runtime.store.get(owner["goal_id"])["status"]
+                waiter_state = waiter_runtime.store.get(waiter["goal_id"])["status"]
+                with dispatch_lock:
+                    count = len(dispatches)
+                if owner_state == "cancelled" and count >= 2 \
+                        and waiter_state in {"running", "complete"}:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(owner_runtime.store.get(owner["goal_id"])["status"], "cancelled")
+            with dispatch_lock:
+                self.assertEqual(len(dispatches), 2)
+            self.assertNotEqual(
+                waiter_runtime.store.get(waiter["goal_id"])["status"],
+                "waiting_for_project",
+            )
+
+    def test_cancelling_goal_rejects_other_controls_and_new_context_tools(self):
+        store = self.store()
+        goal = store.create(self.board, "project", ["Drain safely"], "cancel-control-fence")
+        scheduler_id = "runtime-scheduler"
+        self.assertTrue(store.claim_scheduler(goal["goal_id"], scheduler_id))
+        task = store.claim_ready(goal["goal_id"], scheduler_id)[0]
+        draining = store.control(goal["goal_id"], "cancel")
+        self.assertEqual(draining["status"], "cancelling")
+        with self.assertRaisesRegex(HarnessError, "draining cancellation"):
+            store.control(goal["goal_id"], "pause")
+        with self.assertRaisesRegex(HarnessError, "changed or paused|draining cancellation"):
+            store.reserve_context_tool(goal["goal_id"], task, {
+                "call_id": "late-tool", "name": "read_file", "arguments": {"path": "x"},
+            })
+        with self.assertRaisesRegex(HarnessError, "draining cancellation"):
+            store.prepare_transaction(
+                goal["goal_id"], task, "late-transaction", [{
+                    "path": "late.txt", "content": "late", "delete": False,
+                }],
+            )
+        with self.assertRaisesRegex(HarnessError, "draining cancellation"):
+            store.stage_review_if_needed(goal["goal_id"], task, action(risk="high"))
+        with self.assertRaisesRegex(HarnessError, "draining"):
+            store.apply_action(goal["goal_id"], task, action())
+        with self.assertRaisesRegex(HarnessError, "terminal goal"):
+            store.resolve_interrupts(goal["goal_id"], {
+                "expected_revision": draining["revision"], "pending_ids": [], "answers": {},
+            })
+        self.assertTrue(store.record_action(goal["goal_id"], task, action()))
+        failed_apply = store.fail_pending_apply(goal["goal_id"], "late apply error")
+        self.assertEqual(failed_apply["status"], "cancelling")
+        finalized = store.control(goal["goal_id"], "cancel", {
+            "drain_complete": True, "scheduler_id": scheduler_id,
+        })
+        self.assertEqual(finalized["status"], "cancelled")
+
+    def test_cancelling_allows_receipt_of_already_applied_transaction(self):
+        other_root = self.base / "applied-during-drain"
+        other_root.mkdir()
+        board = copy.deepcopy(self.board)
+        board["projects"][0].update({"id": "applied-drain", "path": str(other_root)})
+        board["works_on"] = [{"agent": "lead", "project": "applied-drain"}]
+        store = self.store()
+        goal = store.create(
+            board, "applied-drain", ["Receipt applied boundary"], "applied-drain",
+        )
+        scheduler_id = "applied-drain-scheduler"
+        self.assertTrue(store.claim_scheduler(goal["goal_id"], scheduler_id))
+        task = store.claim_ready(goal["goal_id"], scheduler_id)[0]
+        transaction_id = "applied-drain-transaction"
+        store.prepare_transaction(goal["goal_id"], task, transaction_id, [{
+            "path": "done.txt", "content": "done", "delete": False,
+        }])
+        self.assertEqual(store.control(goal["goal_id"], "cancel")["status"], "cancelling")
+        store.record_transaction_applied(goal["goal_id"], task, {
+            "kind": "file_transaction", "transaction_id": transaction_id,
+            "changes": [], "patch": "", "patch_sha256": "0" * 64,
+        })
+        current = store.get(goal["goal_id"])
+        self.assertEqual(current["status"], "cancelling")
+        self.assertEqual(current["tasks"][0]["pending_transaction"]["state"], "applied")
+
+    def test_cancel_replay_is_a_true_no_write_for_terminal_and_draining_goals(self):
+        store = self.store()
+        terminal = store.create(self.board, "project", ["Cancel once"], "cancel-once")
+        first = store.control(terminal["goal_id"], "cancel")
+        replay = store.control(terminal["goal_id"], "cancel")
+        self.assertEqual(replay["revision"], first["revision"])
+        self.assertEqual(replay["event_seq"], first["event_seq"])
+
+        draining = store.create(self.board, "project", ["Drain once"], "drain-once")
+        scheduler_id = "drain-once-scheduler"
+        self.assertTrue(store.claim_scheduler(draining["goal_id"], scheduler_id))
+        store.claim_ready(draining["goal_id"], scheduler_id)
+        requested = store.control(draining["goal_id"], "cancel")
+        repeated = store.control(draining["goal_id"], "cancel")
+        self.assertEqual(repeated["revision"], requested["revision"])
+        self.assertEqual(repeated["event_seq"], requested["event_seq"])
+        store.control(draining["goal_id"], "cancel", {
+            "drain_complete": True, "scheduler_id": scheduler_id,
+        })
+
+    def test_list_never_hides_old_active_owner_behind_newest_hundred_rows(self):
+        store = self.store()
+        oldest = store.create(
+            self.board, "project", ["Old blocking owner"], "old-visible-owner",
+        )
+        for index in range(105):
+            root = self.base / f"visible-active-{index:03d}"
+            root.mkdir()
+            store.clone_to_project(
+                oldest, f"visible-{index}", f"Visible {index}", root,
+                f"visible-active-request-{index}",
+            )
+
+        listed = store.list(limit=20)
+
+        self.assertIn(oldest["goal_id"], {one["goal_id"] for one in listed})
+        self.assertGreaterEqual(len(listed), 106)
+
+    def test_foreign_runtime_cancel_between_final_read_and_release_is_finalized(self):
+        owner_runtime = long_horizon.LongHorizonRuntime(self.config)
+        cancelling_runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(owner_runtime.close)
+        self.addCleanup(cancelling_runtime.close)
+        owner = owner_runtime.store.create(
+            self.board, "project", ["Owner boundary"], "foreign-finalizer-owner",
+        )
+        waiter = owner_runtime.store.create(
+            self.board, "project", ["Wait next"], "foreign-finalizer-waiter",
+        )
+        release_entered = threading.Event()
+        allow_release = threading.Event()
+        original_release = owner_runtime.store.release_scheduler
+
+        def graph_pause(*_args, **_kwargs):
+            owner_runtime.store.control(owner["goal_id"], "pause")
+
+        def blocked_release(goal_id, scheduler_id):
+            release_entered.set()
+            if not allow_release.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+                raise RuntimeError("scheduler release barrier timed out")
+            return original_release(goal_id, scheduler_id)
+
+        with mock.patch.object(owner_runtime.graph, "invoke", side_effect=graph_pause), \
+                mock.patch.object(
+                    owner_runtime.store, "release_scheduler", side_effect=blocked_release,
+                ), mock.patch.object(owner_runtime, "_start_promoted_goals"):
+            runner = threading.Thread(
+                target=owner_runtime.run, args=(owner["goal_id"],), daemon=True,
+            )
+            runner.start()
+            self.assertTrue(release_entered.wait(THREAD_COORDINATION_TIMEOUT_SECONDS))
+            requested = cancelling_runtime.control(owner["goal_id"], "cancel")
+            self.assertEqual(requested["status"], "cancelling")
+            self.assertEqual(
+                cancelling_runtime.store.get(waiter["goal_id"])["status"],
+                "waiting_for_project",
+            )
+            allow_release.set()
+            runner.join(THREAD_COORDINATION_TIMEOUT_SECONDS)
+            self.assertFalse(runner.is_alive())
+
+        self.assertEqual(owner_runtime.store.get(owner["goal_id"])["status"], "cancelled")
+        self.assertEqual(owner_runtime.store.get(waiter["goal_id"])["status"], "queued")
+
+    def test_restart_preserves_waiter_and_never_resends_promoted_checkpoint(self):
+        store = self.store()
+        owner = store.create(self.board, "project", ["Owner"], "restart-owner")
+        waiter = store.create(self.board, "project", ["Waiter"], "restart-waiter")
+        owner_task = store.claim_ready(owner["goal_id"], "owner-worker")[0]
+        store.record_dispatch(owner["goal_id"], owner_task, "owner-dispatch")
+
+        def make_owner_dead(document, _db):
+            document["worker"] = {
+                "pid": 99999999, "token": "dead", "worker_id": "dead",
+                "kind": "runtime", "schema_version": 1, "acquired_ms": 1,
+            }
+
+        store._mutate(owner["goal_id"], make_owner_dead)
+        with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+            runtime = long_horizon.LongHorizonRuntime(self.config)
+            runtime.recover_all()
+            self.assertEqual(runtime.store.get(owner["goal_id"])["status"], "paused")
+            self.assertEqual(
+                runtime.store.get(waiter["goal_id"])["status"], "waiting_for_project",
+            )
+            ask.assert_not_called()
+            runtime.close()
+            runtime.store.control(owner["goal_id"], "cancel")
+            self.assertEqual(runtime.store.get(waiter["goal_id"])["status"], "queued")
+            waiter_task = runtime.store.claim_ready(
+                waiter["goal_id"], "promoted-worker",
+            )[0]
+            runtime.store.record_dispatch(
+                waiter["goal_id"], waiter_task, "promoted-dispatch",
+            )
+            runtime.store._mutate(waiter["goal_id"], make_owner_dead)
+            restarted = long_horizon.LongHorizonRuntime(self.config)
+            self.addCleanup(restarted.close)
+            restarted.recover_all()
+            self.assertEqual(restarted.store.get(waiter["goal_id"])["status"], "paused")
+            ask.assert_not_called()
+
+    def test_exact_large_objective_is_preserved_and_oversize_is_rejected(self):
+        store = self.store()
+        exact = "Leading whitespace stays\n" + ("x" * 20_500) + "\nExact tail"
+        goal = store.create(
+            self.board, "project", [exact], "large-exact",
+            conversation_id="large-chat",
+        )
+        self.assertEqual(goal["objective"], exact)
+        self.assertEqual(goal["original_objective"], exact)
+        self.assertEqual(goal["tasks"][0]["description"], exact)
+        replayed = store.create(
+            self.board, "project", [exact], "large-exact",
+            conversation_id="large-chat",
+        )
+        self.assertEqual(replayed["goal_id"], goal["goal_id"])
+        self.assertTrue(replayed["reused"])
+
+        with self.assertRaisesRegex(HarnessError, "too large"):
+            store.create(
+                self.board, "project",
+                ["z" * (long_horizon.MAX_OBJECTIVE_CHARACTERS + 1)],
+                "oversize-explicit",
+            )
+        self.assertIsNone(store.get_by_request("oversize-explicit"))
+
+    def test_authenticated_schema_v2_goal_adds_execution_contract_without_resend(self):
+        store = self.store()
+        goal = store.create(self.board, "project", ["Legacy exact work"], "legacy-contract")
+
+        def remove_additive_metadata(document, _db):
+            document.pop("execution_contract", None)
+            document.pop("project_queue", None)
+
+        store._mutate(goal["goal_id"], remove_additive_metadata)
+        with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+            reopened = long_horizon.GoalStore(self.config)
+        migrated = reopened.get(goal["goal_id"])
+        self.assertEqual(migrated["schema_version"], long_horizon.SCHEMA_VERSION)
+        self.assertEqual(migrated["execution_contract"]["schema_version"], 1)
+        self.assertEqual(migrated["project_queue"]["state"], "owner")
+        self.assertIn(
+            "execution_contract_migrated",
+            [one["type"] for one in reopened.events(goal["goal_id"])["events"]],
+        )
+        ask.assert_not_called()
+
+    def test_runtime_admission_digest_binds_text_beyond_former_twenty_k_limit(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        prefix = "p" * 20_100
+        exact = prefix + " original tail"
+        with mock.patch.object(
+            runtime, "start_background",
+            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+        ):
+            created = runtime.start(
+                self.board, "project", [exact], "digest-large",
+                conversation_id="digest-chat",
+            )
+            replayed = runtime.start(
+                self.board, "project", [exact], "digest-large",
+                conversation_id="digest-chat",
+            )
+            with self.assertRaisesRegex(HarnessError, "different .*objective"):
+                runtime.start(
+                    self.board, "project", [prefix + " changed tail"], "digest-large",
+                    conversation_id="digest-chat",
+                )
+        self.assertEqual(created["objective"], exact)
+        self.assertEqual(replayed["goal_id"], created["goal_id"])
+
+    def test_max_goals_plus_one_create_replay_is_permanent_and_tamper_evident(self):
+        store = self.store()
+        intentions = {}
+        for index in range(long_horizon.MAX_GOALS + 1):
+            request_id = f"retired-create-{index}"
+            objective = f"Preserve exact retired create intent {index}"
+            conversation_id = f"retired-create-chat-{index}"
+            goal = store.create(
+                self.board, "project", [objective], request_id,
+                conversation_id=conversation_id,
+            )
+            intentions[request_id] = (objective, conversation_id, goal["goal_id"])
+            store.control(goal["goal_id"], "cancel")
+
+        tombstone = self.assert_one_compact_rollover_tombstone(store)
+        request_id = tombstone["client_request_id"]
+        objective, conversation_id, goal_id = intentions[request_id]
+        reopened = long_horizon.GoalStore(self.config)
+        with mock.patch.object(
+            reopened, "get", side_effect=AssertionError("pruned replay called get()"),
+        ) as get:
+            fetched = reopened.get_by_request(request_id)
+            replayed = reopened.create(
+                self.board, "project", [objective], request_id,
+                conversation_id=conversation_id,
+            )
+            with self.assertRaisesRegex(HarnessError, "retired .*different work"):
+                reopened.create(
+                    self.board, "project", [objective + " changed"], request_id,
+                    conversation_id=conversation_id,
+                )
+        get.assert_not_called()
+        self.assertEqual(fetched["goal_id"], goal_id)
+        self.assertEqual(replayed["goal_id"], goal_id)
+        self.assertTrue(fetched["request_tombstone"])
+        self.assertTrue(fetched["reused"])
+        self.assertTrue(replayed["reused"])
+
+        with closing(sqlite3.connect(reopened.database)) as db:
+            db.execute(
+                "UPDATE long_goal_request_tombstones SET tombstone_json=? "
+                "WHERE request_id=?",
+                (json.dumps({"request_tombstone": True}), tombstone["request_id"]),
+            )
+            db.commit()
+        with self.assertRaisesRegex(HarnessError, "integrity verification"):
+            reopened.get_by_request(request_id)
+
+    def test_max_goals_plus_one_runtime_replay_never_dispatches_or_loads_goal(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        intentions = {}
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), \
+                mock.patch.object(runtime, "start_background"):
+            for index in range(long_horizon.MAX_GOALS + 1):
+                request_id = f"retired-runtime-{index}"
+                objective = f"Preserve exact retired runtime intent {index}"
+                conversation_id = f"retired-runtime-chat-{index}"
+                goal = runtime.start(
+                    self.board, "project", [objective], request_id,
+                    conversation_id=conversation_id,
+                )
+                intentions[request_id] = (objective, conversation_id, goal["goal_id"])
+                runtime.store.control(goal["goal_id"], "cancel")
+        tombstone = self.assert_one_compact_rollover_tombstone(runtime.store)
+        runtime.close()
+
+        request_id = tombstone["client_request_id"]
+        objective, conversation_id, goal_id = intentions[request_id]
+        restarted = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(restarted.close)
+        with mock.patch.object(
+            restarted.store, "get",
+            side_effect=AssertionError("pruned runtime replay called get()"),
+        ) as get, mock.patch.object(
+            restarted, "_enable_auto_start_watcher",
+            side_effect=AssertionError("retired replay enabled auto-start"),
+        ) as watcher, mock.patch.object(
+            restarted, "_require_no_external_owner",
+            side_effect=AssertionError("retired replay reconciled project ownership"),
+        ) as ownership, mock.patch.object(
+            restarted.store, "reconcile_project_queue",
+            side_effect=AssertionError("retired replay reconciled the queue"),
+        ) as reconcile, mock.patch.object(
+            restarted, "start_background",
+            side_effect=AssertionError("retired replay started background work"),
+        ) as background, mock.patch.object(
+            long_horizon.chat_lab, "ask_once",
+            side_effect=AssertionError("retired replay dispatched a provider"),
+        ) as provider:
+            replayed = restarted.start(
+                self.board, "project", [objective], request_id,
+                conversation_id=conversation_id,
+            )
+            with self.assertRaisesRegex(HarnessError, "already bound to a different"):
+                restarted.start(
+                    self.board, "project", [objective + " changed"], request_id,
+                    conversation_id=conversation_id,
+                )
+        self.assertEqual(replayed["goal_id"], goal_id)
+        self.assertTrue(replayed["request_tombstone"])
+        self.assertTrue(replayed["reused"])
+        for held in (get, watcher, ownership, reconcile, background, provider):
+            held.assert_not_called()
+
+    def test_runtime_preflight_binds_every_direct_intent_field_live_and_after_rollover(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        request_id = "preflight-full-binding"
+        objectives = ["Preserve the first boundary", "Preserve the second boundary"]
+        text_equivalent_single_objective = "\n\n".join(objectives)
+        criteria = ["Return evidence from the exact saved contract"]
+        policy = {"max_tasks": 4, "max_parallel": 2, "review_risk": "high"}
+        attachments = [{
+            "name": "binding.txt", "type": "text/plain", "size": 5,
+            "data": "data:text/plain;base64,aGVsbG8=",
+        }]
+        participants = ["lead", "reviewer"]
+        exact_chat = "shared-prefix-" + ("c" * 146) + ("a" * 96)
+        conflicting_chat = "shared-prefix-" + ("c" * 146) + ("b" * 96)
+        self.assertEqual(len(exact_chat), 256)
+        self.assertEqual(exact_chat[:160], conflicting_chat[:160])
+        exact = {
+            "lead_id": "lead", "success_criteria": criteria,
+            "policy": policy, "attachments": attachments,
+            "participant_ids": participants, "conversation_id": exact_chat,
+        }
+        request_prefix = "r" * long_horizon.MAX_REQUEST_ID_CHARACTERS
+        inspected_boundary = runtime.preflight_start(
+            self.board, "project", ["Preserve the exact request boundary"],
+            request_prefix, conversation_id="request-boundary-chat",
+        )
+        self.assertIsNone(inspected_boundary["goal"])
+        with mock.patch.object(
+            runtime.store, "get_by_request",
+            side_effect=AssertionError("oversized request identity reached goal lookup"),
+        ) as request_lookup, mock.patch.object(
+            runtime, "_enable_auto_start_watcher",
+            side_effect=AssertionError("oversized request identity enabled the watcher"),
+        ) as request_watcher:
+            with self.assertRaisesRegex(HarnessError, "at most 160 characters"):
+                runtime.start(
+                    self.board, "project", ["Reject a request prefix alias"],
+                    request_prefix + "x", conversation_id="request-boundary-chat",
+                )
+        request_lookup.assert_not_called()
+        request_watcher.assert_not_called()
+        with mock.patch.object(
+            runtime.store, "get_by_request",
+            side_effect=AssertionError("oversized chat identity reached goal lookup"),
+        ) as lookup, mock.patch.object(
+            runtime, "_enable_auto_start_watcher",
+            side_effect=AssertionError("oversized chat identity enabled the watcher"),
+        ) as watcher:
+            with self.assertRaisesRegex(HarnessError, "at most 256 characters"):
+                runtime.start(
+                    self.board, "project", objectives, "preflight-oversized-chat",
+                    **{**exact, "conversation_id": "x" * 257},
+                )
+        lookup.assert_not_called()
+        watcher.assert_not_called()
+        inspected = runtime.preflight_start(
+            self.board, "project", objectives, request_id, **exact,
+        )
+        goal = runtime.store.create(
+            self.board, "project", objectives, request_id,
+            admission_digest=inspected["admission_digest"],
+            expected_project_authority_id=inspected["project_authority_id"],
+            **{key: value for key, value in exact.items() if key != "attachments"},
+        )
+
+        changed = [
+            (objectives, {**exact, "conversation_id": conflicting_chat}),
+            (["Changed first boundary", objectives[1]], exact),
+            (objectives, {**exact, "success_criteria": ["Different evidence"]}),
+            (objectives, {**exact, "policy": {**policy, "max_parallel": 1}}),
+            ([text_equivalent_single_objective], exact),
+            (objectives, {**exact, "attachments": [{**attachments[0], "data": (
+                "data:text/plain;base64,d29ybGQ="
+            )}]}),
+        ]
+
+        def assert_preflight_contract(runtime_under_test, expected_goal):
+            with mock.patch.object(
+                runtime_under_test.store, "get",
+                side_effect=AssertionError("preflight loaded a goal by id"),
+            ) as get, mock.patch.object(
+                runtime_under_test, "_enable_auto_start_watcher",
+                side_effect=AssertionError("preflight enabled the watcher"),
+            ) as watcher, mock.patch.object(
+                runtime_under_test, "_require_no_external_owner",
+                side_effect=AssertionError("preflight claimed project ownership"),
+            ) as ownership, mock.patch.object(
+                runtime_under_test.store, "reconcile_project_queue",
+                side_effect=AssertionError("preflight reconciled the project queue"),
+            ) as reconcile, mock.patch.object(
+                runtime_under_test, "start_background",
+                side_effect=AssertionError("preflight started background work"),
+            ) as background, mock.patch.object(
+                long_horizon.chat_lab, "ask_once",
+                side_effect=AssertionError("preflight dispatched a provider"),
+            ) as provider:
+                replay = runtime_under_test.preflight_start(
+                    self.board, "project", objectives, request_id, **exact,
+                )
+                self.assertEqual(replay["goal"]["goal_id"], expected_goal["goal_id"])
+                self.assertEqual(
+                    replay["admission_digest"], expected_goal["admission_digest"],
+                )
+                for changed_objectives, changed_fields in changed:
+                    with self.assertRaisesRegex(HarnessError, "already bound to a different"):
+                        runtime_under_test.preflight_start(
+                            self.board, "project", changed_objectives,
+                            request_id, **changed_fields,
+                        )
+            for held in (get, watcher, ownership, reconcile, background, provider):
+                held.assert_not_called()
+
+        assert_preflight_contract(runtime, goal)
+        runtime.store.control(goal["goal_id"], "cancel")
+        for index in range(long_horizon.MAX_GOALS):
+            filler = runtime.store.create(
+                self.board, "project", [f"Preflight rollover filler {index}"],
+                f"preflight-rollover-{index}",
+            )
+            runtime.store.control(filler["goal_id"], "cancel")
+        tombstone = runtime.store.get_by_request(request_id)
+        self.assertIsNotNone(tombstone)
+        self.assertTrue(tombstone["request_tombstone"])
+        runtime.close()
+
+        restarted = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(restarted.close)
+        assert_preflight_contract(restarted, tombstone)
+
+    def test_max_goals_plus_one_fork_replay_is_permanent_and_parent_bound(self):
+        store = self.store()
+        clock = iter(range(10_000, 1_000_000))
+        with mock.patch.object(long_horizon, "_now", side_effect=lambda: next(clock)):
+            source = store.create(
+                self.board, "project", ["Fork this exact checkpoint"], "fork-source",
+            )
+            fork_root = self.base / "fork-root"
+            fork_root.mkdir()
+            forked = store.clone_to_project(
+                store.get(source["goal_id"]), "project-fork", "Project fork",
+                fork_root, "retired-fork",
+            )
+            other_source = store.create(
+                self.board, "project", ["A different fork checkpoint"],
+                "other-fork-source",
+            )
+            with self.assertRaisesRegex(
+                HarnessError, "fork request identity already belongs to another goal",
+            ):
+                store.clone_to_project(
+                    store.get(other_source["goal_id"]), "project-fork", "Project fork",
+                    fork_root, "retired-fork",
+                )
+            store.control(forked["goal_id"], "cancel")
+            for index in range(long_horizon.MAX_GOALS):
+                filler = store.create(
+                    self.board, "project", [f"Fork rollover filler {index}"],
+                    f"fork-filler-{index}",
+                )
+                store.control(filler["goal_id"], "cancel")
+
+        tombstone = self.assert_one_compact_rollover_tombstone(store)
+        self.assertEqual(tombstone["client_request_id"], "retired-fork")
+        self.assertEqual(tombstone["parent_goal_id"], source["goal_id"])
+        restarted = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(restarted.close)
+        with mock.patch.object(
+            restarted.store, "get", side_effect=AssertionError("pruned fork called get()"),
+        ) as get, mock.patch.object(
+            long_horizon.subprocess, "run",
+            side_effect=AssertionError("pruned fork touched Git"),
+        ) as git:
+            replayed = restarted.fork(source["goal_id"], "retired-fork")
+            with self.assertRaisesRegex(HarnessError, "already belongs to another goal"):
+                restarted.fork("different-parent-goal", "retired-fork")
+        self.assertEqual(replayed["goal_id"], forked["goal_id"])
+        self.assertTrue(replayed["request_tombstone"])
+        self.assertTrue(replayed["reused"])
+        get.assert_not_called()
+        git.assert_not_called()
+
+    def test_max_goals_plus_one_tombstone_failure_rolls_back_terminal_prune(self):
+        store = self.store()
+        for index in range(long_horizon.MAX_GOALS):
+            goal = store.create(
+                self.board, "project", [f"Atomic rollover {index}"],
+                f"atomic-rollover-{index}",
+            )
+            store.control(goal["goal_id"], "cancel")
+        overflow = store.create(
+            self.board, "project", ["Atomic rollover overflow"], "atomic-overflow",
+        )
+        with mock.patch.object(
+            store, "_remember_request_tombstone",
+            side_effect=HarnessError("synthetic tombstone write failure"),
+        ), self.assertRaisesRegex(HarnessError, "synthetic tombstone write failure"):
+            store.control(overflow["goal_id"], "cancel")
+
+        self.assertEqual(store.get(overflow["goal_id"])["status"], "queued")
+        with closing(sqlite3.connect(store.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goals "
+                "WHERE status IN ('complete','cancelled')"
+            ).fetchone()[0], long_horizon.MAX_GOALS)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goal_request_tombstones"
+            ).fetchone()[0], 0)
+
+    def test_cross_process_same_project_admission_has_one_owner_and_one_waiter(self):
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        begin = context.Event()
+        results = context.Queue()
+        other_authority = self.base / "cross-process-authority"
+        other_authority.mkdir()
+        state_path = self.base / "state"
+        processes = [
+            context.Process(
+                target=_cross_process_goal_admission,
+                args=(
+                    str(state_path), str(authority), str(self.project), request_id,
+                    ready, begin, results,
+                ),
+            )
+            for authority, request_id in (
+                (self.authority, "process-a"), (other_authority, "process-b"),
+            )
+        ]
+        for process in processes:
+            process.start()
+        self.addCleanup(lambda: [
+            process.terminate() for process in processes if process.is_alive()
+        ])
+        self.assertEqual(
+            {ready.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS) for _ in processes},
+            {"process-a", "process-b"},
+        )
+        begin.set()
+        outcomes = [
+            results.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS) for _ in processes
+        ]
+        for process in processes:
+            process.join(THREAD_COORDINATION_TIMEOUT_SECONDS)
+            self.assertEqual(process.exitcode, 0)
+        self.assertTrue(all(one["ok"] for one in outcomes), outcomes)
+        self.assertCountEqual(
+            [one["status"] for one in outcomes], ["queued", "waiting_for_project"],
+        )
+        owner = next(one for one in outcomes if one["status"] == "queued")
+        waiter = next(one for one in outcomes if one["status"] == "waiting_for_project")
+        self.assertEqual(waiter["queue"]["blocked_by_goal_id"], owner["goal_id"])
+
+        configs = {
+            "process-a": self.config,
+            "process-b": LoadedConfig(
+                copy.deepcopy(self.config.data), other_authority, [], {},
+            ),
+        }
+        cross_board = {
+            "agents": [{"id": "lead", "name": "Lead", "who": "codex", "ready": True}],
+            "projects": [{
+                "id": "project", "name": "Project", "path": str(self.project),
+                "is_there": True, "tasks": [],
+            }],
+            "works_on": [{"agent": "lead", "project": "project"}],
+        }
+        owner_store = long_horizon.GoalStore(configs[owner["request_id"]])
+        waiter_store = long_horizon.GoalStore(configs[waiter["request_id"]])
+        released = owner_store.control(owner["goal_id"], "cancel")
+        self.assertEqual(released["promoted_goal_ids"], [waiter["goal_id"]])
+        promoted = waiter_store.get(waiter["goal_id"])
+        self.assertEqual(promoted["status"], "queued")
+        replayed = waiter_store.create(
+            cross_board, "project", ["Exact work " + waiter["request_id"]],
+            waiter["request_id"], conversation_id="chat-" + waiter["request_id"],
+        )
+        self.assertEqual(replayed["goal_id"], waiter["goal_id"])
+        self.assertTrue(replayed["reused"])
+
+    def test_cross_process_same_request_replay_has_one_provider_dispatch(self):
+        context = multiprocessing.get_context("spawn")
+        ready = context.Queue()
+        begin = context.Event()
+        release = context.Event()
+        dispatch_count = context.Value("i", 0)
+        results = context.Queue()
+        state_path = self.base / "runtime-replay-state"
+        processes = [
+            context.Process(
+                target=_cross_process_runtime_replay,
+                args=(
+                    str(state_path), str(self.authority), str(self.project),
+                    ready, begin, release, dispatch_count, results,
+                ),
+            )
+            for _ in range(2)
+        ]
+        for process in processes:
+            process.start()
+        self.addCleanup(lambda: [
+            process.terminate() for process in processes if process.is_alive()
+        ])
+        for _ in processes:
+            self.assertEqual(
+                ready.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS), "ready",
+            )
+        begin.set()
+        deadline = time.monotonic() + THREAD_COORDINATION_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and dispatch_count.value < 1:
+            time.sleep(0.02)
+        self.assertEqual(dispatch_count.value, 1)
+        time.sleep(0.35)
+        self.assertEqual(
+            dispatch_count.value, 1,
+            "two runtime processes dispatched the idempotent goal concurrently",
+        )
+        release.set()
+        outcomes = [
+            results.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS) for _ in processes
+        ]
+        for process in processes:
+            process.join(THREAD_COORDINATION_TIMEOUT_SECONDS)
+            self.assertEqual(process.exitcode, 0)
+        self.assertTrue(all(one.get("ok") for one in outcomes), outcomes)
+        self.assertEqual(len({one["goal_id"] for one in outcomes}), 1)
+        self.assertEqual(dispatch_count.value, 1)
+        self.assertTrue(all(one["status"] == "complete" for one in outcomes), outcomes)
 
     def test_shared_server_ownership_fences_legacy_and_long_horizon_both_directions(self):
         panel = harness_server.HarnessHTTPServer(("127.0.0.1", 0), self.config)
@@ -1710,14 +2981,24 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(stored["input_attachments"], kept)
         self.assertEqual(stored["input_provider_attachments"][0]["path"], str(attachment_file))
 
-    def test_restart_turns_orphaned_queued_boundaries_into_resumable_pause(self):
+    def test_restart_auto_starts_only_pristine_queued_boundary(self):
         store = self.store()
         created = store.create(self.board, "project", ["Created before worker start"], "queued-create-crash")
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
-        recovered = runtime.recover_all()
+        with mock.patch.object(
+            runtime, "start_background",
+            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+        ):
+            recovered = runtime.recover_all()
+            runtime._auto_start_enabled = False
         self.assertEqual(len(recovered), 1)
-        self.assertEqual(runtime.store.get(created["goal_id"])["status"], "paused")
+        self.assertEqual(runtime.store.get(created["goal_id"])["status"], "queued")
+
+        def consume_test_auto_start(document, _db):
+            document["project_queue"]["auto_start_pending"] = False
+
+        runtime.store._mutate(created["goal_id"], consume_test_auto_start)
 
         other_root = self.base / "after-apply"
         other_root.mkdir()
@@ -1734,8 +3015,66 @@ class LongHorizonTests(unittest.TestCase):
             document["worker"] = {"pid": 99999999, "token": "dead", "worker_id": "dead"}
         runtime.store._mutate(after_apply["goal_id"], dead_worker)
         second = runtime.recover_all()
-        self.assertEqual(len(second), 1)
+        self.assertEqual(len(second), 2)
+        self.assertEqual(runtime.store.get(created["goal_id"])["status"], "paused")
         self.assertEqual(runtime.store.get(after_apply["goal_id"])["status"], "paused")
+
+    def test_auto_start_watcher_pages_past_missing_roots_to_valid_goal(self):
+        store = self.store()
+        goals = []
+        for index in range(18):
+            root = self.base / f"watcher-root-{index:02d}"
+            root.mkdir()
+            board = copy.deepcopy(self.board)
+            board["projects"][0].update({
+                "id": f"watcher-{index}", "path": str(root),
+            })
+            board["works_on"] = [{
+                "agent": "lead", "project": f"watcher-{index}",
+            }]
+            goals.append(store.create(
+                board, f"watcher-{index}", [f"Goal {index}"], f"watcher-goal-{index}",
+            ))
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        attempts: list[str] = []
+        valid_goal_id = goals[-1]["goal_id"]
+
+        def attempt(goal_id, answers=None):
+            attempts.append(goal_id)
+            if goal_id != valid_goal_id:
+                raise FileNotFoundError("removed test project")
+            return runtime.store.get(goal_id)
+
+        with mock.patch.object(runtime, "start_background", side_effect=attempt):
+            runtime._enable_auto_start_watcher()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and valid_goal_id not in attempts:
+                time.sleep(0.02)
+            runtime.close()
+        self.assertIn(valid_goal_id, attempts)
+        self.assertGreaterEqual(len(set(attempts)), 18)
+
+    def test_recovery_keeps_pristine_goal_visible_when_provider_setup_changed(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Keep checkpoint visible"], "recovery-provider-drift",
+        )
+
+        def drift_provider(document, _db):
+            document["agents"][0]["route_binding"][
+                "route_fingerprint_sha256"
+            ] = "0" * 64
+
+        store._mutate(goal["goal_id"], drift_provider)
+        with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+            runtime = long_horizon.LongHorizonRuntime(self.config)
+            recovered = runtime.recover_all()
+            runtime.close()
+        self.assertTrue(recovered)
+        current = store.get(goal["goal_id"])
+        self.assertEqual(current["status"], "queued")
+        self.assertTrue(store.provider_setup_status(current)["changed"])
+        ask.assert_not_called()
 
     def test_verification_result_is_superseded_by_steer_and_cannot_revive_cancel(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
@@ -2028,7 +3367,11 @@ class LongHorizonTests(unittest.TestCase):
         self.assertIn('"pending_apply"', script)
         self.assertIn("expected_revision: longGoal.revision", script)
         self.assertIn("hasPendingDecision", script)
-        self.assertIn('const immutable = !longGoal || ["complete", "cancelled"]', script)
+        self.assertIn("const immutable = !longGoal", script)
+        self.assertIn(
+            '["complete", "cancelled", "cancelling"].includes(longGoal.status)',
+            script,
+        )
 
     def test_mission_control_protects_goal_history_after_provider_setup_changes(self):
         root = Path(__file__).parents[1] / "src/our_harness/ui"
@@ -2337,6 +3680,7 @@ class LongHorizonTests(unittest.TestCase):
                 else:
                     self.assertEqual(returned["action"], "complete")
                     self.assertEqual(ask.call_count, 1 if mode == "fenced" else 2)
+                runtime.store.control(goal["goal_id"], "cancel")
 
     def test_attachment_failures_leave_no_partial_request_directory(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
@@ -2427,6 +3771,62 @@ class LongHorizonTests(unittest.TestCase):
             "transaction_rolled_back_for_cancellation",
             [one["type"] for one in store.events(goal["goal_id"])["events"]],
         )
+
+    def test_released_legacy_failed_cancel_cannot_rollback_newer_owner_files(self):
+        target = self.project / "legacy-cancel.txt"
+        target.write_text("before\n", encoding="utf-8")
+        store = self.store()
+        legacy = store.create(
+            self.board, "project", ["Legacy prepared work"], "legacy-prepared-cancel",
+        )
+        task = store.claim_ready(legacy["goal_id"], "legacy-worker")[0]
+        proposed = action(changes=[{
+            "path": "legacy-cancel.txt", "content": "legacy-after\n", "delete": False,
+            "reason": "legacy prepared effect",
+        }])
+        proposed["_nexus_baselines"] = {
+            "legacy-cancel.txt": long_horizon._path_baseline_marker(
+                self.project, "legacy-cancel.txt",
+            )
+        }
+        store.record_dispatch(legacy["goal_id"], task, "legacy-prepared")
+        store.record_action(legacy["goal_id"], task, proposed)
+        transaction_id = long_horizon.FileTransaction.new_transaction_id()
+        store.prepare_transaction(
+            legacy["goal_id"], task, transaction_id, proposed["changes"],
+        )
+        plans = long_horizon.swarm_work._validated_changes(
+            self.project, proposed["changes"],
+        )
+        long_horizon.FileTransaction(self.project).prepare(
+            plans, transaction_id=transaction_id,
+        )
+        target.write_text("new-owner-output\n", encoding="utf-8")
+
+        def legacy_failed_without_queue(document, _db):
+            document["status"] = "failed"
+            # Simulate a row migrated by the earlier additive contract, before
+            # effectful failed checkpoints were retained as owners.
+            document["project_queue"] = store._queue_record(
+                "released", document["created_ms"],
+            )
+
+        store._mutate(legacy["goal_id"], legacy_failed_without_queue)
+        migrated = long_horizon.GoalStore(self.config)
+        self.assertEqual(
+            migrated.get(legacy["goal_id"])["project_queue"]["state"], "released",
+        )
+        owner = migrated.create(
+            self.board, "project", ["Protect current output"], "new-owner-protects-file",
+        )
+
+        with self.assertRaisesRegex(HarnessError, "must wait"):
+            migrated.control(legacy["goal_id"], "cancel")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "new-owner-output\n")
+        self.assertEqual(migrated.get(owner["goal_id"])["project_queue"]["state"], "owner")
+        held = migrated.get(legacy["goal_id"])["tasks"][0]
+        self.assertEqual(held["pending_transaction"]["transaction_id"], transaction_id)
 
     def test_cancel_accepts_only_a_proven_db_before_filesystem_boundary(self):
         store = self.store()
@@ -2706,6 +4106,7 @@ class LongHorizonTests(unittest.TestCase):
                         "task": task, "action": proposed,
                     }]})
                 self.assertFalse((self.project / f"{kind}.txt").exists())
+                runtime.store.control(goal["goal_id"], "cancel")
 
     def test_review_task_is_read_only_even_when_it_returns_a_delete(self):
         target = self.project / "must-stay.txt"

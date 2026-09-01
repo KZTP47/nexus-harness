@@ -60,7 +60,17 @@ def body_of(name: str) -> str:
     start = re.search(rf"^(?:async )?function {re.escape(name)}\s*\(", text, re.MULTILINE)
     if not start:
         return ""
-    opened = text.find("{", start.end())
+    # Find the brace after the complete parameter list. A default object such
+    # as ``options = {}`` is part of the signature, not the function body.
+    parameter_depth = 1
+    index = start.end()
+    while index < len(text) and parameter_depth:
+        if text[index] == "(":
+            parameter_depth += 1
+        elif text[index] == ")":
+            parameter_depth -= 1
+        index += 1
+    opened = text.find("{", index)
     if opened < 0:
         return ""
     depth = 0

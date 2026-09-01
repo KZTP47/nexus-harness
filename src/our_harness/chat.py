@@ -317,6 +317,10 @@ class Said:
     phase: str = ""
     questions: list[dict[str, Any]] = field(default_factory=list)
     participant_outcome: dict[str, Any] = field(default_factory=dict)
+    # Optional engine-owned identity for turns which are reconciled across
+    # retries and process restarts. Older transcript turns have no such field,
+    # so this is deliberately additive and omitted from their JSON projection.
+    correlation: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         value = {
@@ -340,6 +344,8 @@ class Said:
             value["participant_outcome"] = collaboration_outcomes.frozen(
                 self.participant_outcome
             )
+        if self.correlation:
+            value["correlation"] = dict(self.correlation)
         return value
 
 
@@ -1218,6 +1224,74 @@ def read_it(config: LoadedConfig, route: str, filed_as: str = "") -> list[Said]:
         return kept
 
 
+DIRECT_LONG_HORIZON_REQUEST_ID_CHARACTERS = 160
+DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS = 256
+DIRECT_LONG_HORIZON_PROJECT_ID_CHARACTERS = 512
+DIRECT_LONG_HORIZON_LEAD_ID_CHARACTERS = 256
+DIRECT_LONG_HORIZON_GOAL_ID_CHARACTERS = 160
+
+
+_CORRELATION_TEXT_LIMITS = {
+    "event_id": 64,
+    "kind": 80,
+    "request_id": DIRECT_LONG_HORIZON_REQUEST_ID_CHARACTERS,
+    "chat_id": DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS,
+    "project_id": DIRECT_LONG_HORIZON_PROJECT_ID_CHARACTERS,
+    "lead_id": DIRECT_LONG_HORIZON_LEAD_ID_CHARACTERS,
+    "intent_sha256": 64,
+    "goal_id": DIRECT_LONG_HORIZON_GOAL_ID_CHARACTERS,
+    "goal_status": 80,
+}
+
+
+def _said_correlation(value: object, turn_number: int = 0) -> dict[str, Any]:
+    """Validate additive engine correlation without changing legacy turns."""
+
+    if value in (None, {}):
+        return {}
+    label = f" turn {turn_number}" if turn_number else ""
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise ChatError(
+            f"Saved conversation{label} has malformed correlation metadata. "
+            "Nexus did not silently drop it."
+        )
+    kept: dict[str, Any] = {"schema_version": 1}
+    for key, limit in _CORRELATION_TEXT_LIMITS.items():
+        raw = value.get(key)
+        if raw in (None, ""):
+            continue
+        text = str(raw)
+        if len(text) > limit:
+            raise ChatError(
+                f"Saved conversation{label} has oversized correlation metadata. "
+                "Nexus did not silently clip it."
+            )
+        kept[key] = text
+    event_id = str(kept.get("event_id") or "")
+    intent = str(kept.get("intent_sha256") or "")
+    if event_id and not re.fullmatch(r"[0-9a-f]{64}", event_id):
+        raise ChatError(
+            f"Saved conversation{label} has an invalid correlated event identity."
+        )
+    if intent and not re.fullmatch(r"[0-9a-f]{64}", intent):
+        raise ChatError(
+            f"Saved conversation{label} has an invalid intent fingerprint."
+        )
+    if value.get("goal_revision") is not None:
+        try:
+            revision = int(value.get("goal_revision"))
+        except (TypeError, ValueError) as exc:
+            raise ChatError(
+                f"Saved conversation{label} has an invalid goal revision."
+            ) from exc
+        if revision < 0 or revision > 9_007_199_254_740_991:
+            raise ChatError(
+                f"Saved conversation{label} has an out-of-range goal revision."
+            )
+        kept["goal_revision"] = revision
+    return kept
+
+
 def _said_from_dicts(held: object) -> list[Said]:
     if not isinstance(held, list):
         raise ChatError(
@@ -1273,6 +1347,7 @@ def _said_from_dicts(held: object) -> list[Said]:
             phase=str(one.get("phase") or "")[:80],
             questions=user_questions.frozen(one.get("questions")),
             participant_outcome=participant_outcome,
+            correlation=_said_correlation(one.get("correlation"), index + 1),
         ))
     return kept
 
@@ -1448,6 +1523,165 @@ def _append_transcript_event(
     _write_transcript_anchor(path, [*records, event])
 
 
+def _correlated_event_id(turn: Said) -> str:
+    correlation = turn.correlation if isinstance(turn.correlation, dict) else {}
+    return str(correlation.get("event_id") or "")
+
+
+def _correlated_semantics(turn: Said) -> dict[str, Any]:
+    value = turn.to_dict()
+    # Wall-clock display metadata is not part of an idempotent engine event.
+    # A retry after restart necessarily constructs it at another instant.
+    value.pop("at", None)
+    value.pop("milliseconds", None)
+    return value
+
+
+def _goal_revision_projection(turn: Said) -> tuple[tuple[str, int], str] | None:
+    correlation = turn.correlation if isinstance(turn.correlation, dict) else {}
+    if correlation.get("kind") not in {
+        "long_horizon_status", "long_horizon_status_checkpoint",
+    }:
+        return None
+    if not correlation.get("goal_id") or "goal_revision" not in correlation:
+        return None
+    return (
+        (str(correlation["goal_id"]), int(correlation["goal_revision"])),
+        str(correlation.get("goal_status") or ""),
+    )
+
+
+def _long_horizon_request_binding(
+    turn: Said,
+) -> tuple[str, tuple[str, str, str, str]] | None:
+    correlation = turn.correlation if isinstance(turn.correlation, dict) else {}
+    if correlation.get("kind") != "long_horizon_prompt":
+        return None
+    request_id = str(correlation.get("request_id") or "")
+    if not request_id:
+        return None
+    return request_id, tuple(
+        str(correlation.get(key) or "")
+        for key in ("chat_id", "project_id", "lead_id", "intent_sha256")
+    )
+
+
+def _deduplicate_correlated_delta(
+    existing: list[Said], delta: list[Said],
+) -> list[Said]:
+    """Make a correlation ID exactly-once inside the file transaction.
+
+    The caller's in-process conversation lock cannot exclude another Nexus
+    process. ``_keep_it`` performs its fresh read under the cross-process
+    project lock, so this is the final authority which closes the retry race.
+    """
+
+    seen: dict[str, dict[str, Any]] = {}
+    prompt_bindings: dict[
+        str, tuple[tuple[str, str, str, str], dict[str, Any]]
+    ] = {}
+    projected: dict[str, tuple[int, str]] = {}
+    for turn in existing:
+        event_id = _correlated_event_id(turn)
+        semantics = _correlated_semantics(turn)
+        if event_id:
+            before = seen.get(event_id)
+            if before is not None and before != semantics:
+                raise ChatError(
+                    "A saved correlated transcript event identity has conflicting "
+                    "content. Nexus preserved the evidence and stopped."
+                )
+            seen[event_id] = semantics
+        binding = _long_horizon_request_binding(turn)
+        if binding is not None:
+            request_id, identity = binding
+            before_binding = prompt_bindings.get(request_id)
+            if before_binding is not None and before_binding != (identity, semantics):
+                raise ChatError(
+                    "A durable project request identity has conflicting transcript "
+                    "bindings. Nexus preserved the evidence and stopped."
+                )
+            prompt_bindings[request_id] = (identity, semantics)
+        projection = _goal_revision_projection(turn)
+        if projection is not None:
+            (goal_id, revision), status = projection
+            before_projection = projected.get(goal_id)
+            if before_projection is not None:
+                before_revision, before_status = before_projection
+                if revision < before_revision:
+                    raise ChatError(
+                        "A saved durable goal projection regresses its revision. "
+                        "Nexus preserved the evidence and stopped."
+                    )
+                if revision == before_revision and status != before_status:
+                    raise ChatError(
+                        "A saved durable goal revision has conflicting statuses. "
+                        "Nexus preserved the evidence and stopped."
+                    )
+                if before_status in {"complete", "cancelled"} \
+                        and status != before_status:
+                    raise ChatError(
+                        "A saved terminal durable goal status regresses. Nexus "
+                        "preserved the evidence and stopped."
+                    )
+            if before_projection is None or revision > before_projection[0]:
+                projected[goal_id] = (revision, status)
+    kept: list[Said] = []
+    for turn in delta:
+        event_id = _correlated_event_id(turn)
+        semantics = _correlated_semantics(turn)
+        if event_id:
+            before = seen.get(event_id)
+            if before is not None:
+                if before != semantics:
+                    raise ChatError(
+                        "A correlated transcript event identity was reused for different "
+                        "content. Nexus preserved the existing turn and stopped."
+                    )
+                continue
+        binding = _long_horizon_request_binding(turn)
+        if binding is not None:
+            request_id, identity = binding
+            before_binding = prompt_bindings.get(request_id)
+            if before_binding is not None:
+                if before_binding != (identity, semantics):
+                    raise ChatError(
+                        "That durable project request identity is already bound to a "
+                        "different chat, project, lead, or exact intent."
+                    )
+                continue
+            prompt_bindings[request_id] = (identity, semantics)
+        projection = _goal_revision_projection(turn)
+        if projection is not None:
+            (goal_id, revision), status = projection
+            before_projection = projected.get(goal_id)
+            if before_projection is not None:
+                before_revision, before_status = before_projection
+                if revision < before_revision:
+                    # A stale poll is a normal race. Its event is intentionally
+                    # ignored inside the final cross-process transaction.
+                    continue
+                if revision == before_revision:
+                    if before_status != status:
+                        raise ChatError(
+                            "The same durable goal revision was presented with two "
+                            "different statuses. Nexus preserved the existing transcript "
+                            "projection and stopped."
+                        )
+                    continue
+                if before_status in {"complete", "cancelled"} \
+                        and before_status != status:
+                    raise ChatError(
+                        "A terminal durable goal status cannot regress to a different "
+                        "state. Nexus preserved the verified transcript projection."
+                    )
+            projected[goal_id] = (revision, status)
+        if event_id:
+            seen[event_id] = semantics
+        kept.append(turn)
+    return kept
+
+
 def _keep_it(
     config: LoadedConfig, route: str, turns: list[Said], filed_as: str = "",
     *, replace_projection: bool = False,
@@ -1463,16 +1697,20 @@ def _keep_it(
         existing_dicts = [one.to_dict() for one in existing]
         requested = [one.to_dict() for one in turns]
         if requested[:len(existing_dicts)] == existing_dicts:
-            delta = turns[len(existing_dicts):]
+            delta = _deduplicate_correlated_delta(
+                existing, turns[len(existing_dicts):],
+            )
             if delta:
                 _append_transcript_event(event_path, records, "append", delta)
+            turns = [*existing, *delta]
+            requested = [one.to_dict() for one in turns]
         elif requested != existing_dicts and not replace_projection:
             common = 0
             for before, after in zip(existing_dicts, requested):
                 if before != after:
                     break
                 common += 1
-            delta = turns[common:]
+            delta = _deduplicate_correlated_delta(existing, turns[common:])
             if delta:
                 _append_transcript_event(event_path, records, "append", delta)
             turns = [*existing, *delta]
@@ -1990,7 +2228,7 @@ def _ask_and_keep(
         if one.phase not in {
             "agent_reply", "lead_draft", "agent_plan", "lead_plan",
             "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution",
-            "agent_verification", "participant_outcome",
+            "agent_verification", "participant_outcome", "long_horizon_checkpoint",
         }
     ]
     messages = _project_chat_history(
@@ -2266,6 +2504,414 @@ def keep_exchange(
         "route": str(route or "").strip(),
         "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
         "answer": turns[-1].to_dict(),
+    }
+
+
+def long_horizon_intent_sha256(
+    chat_id: str, project_id: str, lead_id: str, text: str,
+    attachments: object = None,
+) -> str:
+    """Fingerprint the exact direct-goal intent without persisting its payload."""
+
+    canonical = json.dumps({
+        "schema_version": 1,
+        "chat_id": str(chat_id or ""),
+        "project_id": str(project_id or ""),
+        "lead_id": str(lead_id or ""),
+        "text": _check_what_was_typed(text),
+        "attachments": attachments if attachments is not None else [],
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _long_horizon_event_id(kind: str, *parts: object) -> str:
+    canonical = json.dumps(
+        ["nexus-long-horizon-chat-v1", kind, *[str(one or "") for one in parts]],
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _exact_long_horizon_identity(value: object, field: str) -> str:
+    """Return one accepted direct-goal identity without clipping its binding."""
+
+    limits = {
+        "request ID": DIRECT_LONG_HORIZON_REQUEST_ID_CHARACTERS,
+        "chat ID": DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS,
+        "project ID": DIRECT_LONG_HORIZON_PROJECT_ID_CHARACTERS,
+        "lead agent ID": DIRECT_LONG_HORIZON_LEAD_ID_CHARACTERS,
+        "goal ID": DIRECT_LONG_HORIZON_GOAL_ID_CHARACTERS,
+    }
+    maximum = limits[field]
+    exact = str(value or "")
+    if not exact or len(exact) > maximum:
+        raise ChatError(
+            f"The durable project {field} must contain 1 to {maximum} characters. "
+            "Nexus did not save or truncate it."
+        )
+    return exact
+
+
+def _long_horizon_public_attachments(
+    redactor: CredentialRedactor, supplied: object,
+) -> list[dict[str, Any]]:
+    """Keep display metadata, never the submitted attachment bytes, in chat."""
+
+    if not isinstance(supplied, list):
+        return []
+    kept: list[dict[str, Any]] = []
+    for raw in supplied[:MOST_ATTACHMENTS]:
+        if not isinstance(raw, dict):
+            continue
+        name = redactor.text(Path(str(raw.get("name") or "attachment")).name)[:180]
+        mime = str(raw.get("type") or "application/octet-stream")[:160]
+        try:
+            size = max(0, int(raw.get("size") or 0))
+        except (TypeError, ValueError):
+            size = 0
+        kept.append({
+            "name": name or "attachment",
+            "type": mime,
+            "size": size,
+            "image": mime.startswith("image/"),
+        })
+    return kept
+
+
+def _long_horizon_prompt_binding(
+    turns: list[Said], request_id: str,
+) -> dict[str, Any] | None:
+    found = [
+        turn.correlation for turn in turns
+        if turn.correlation.get("kind") == "long_horizon_prompt"
+        and turn.correlation.get("request_id") == request_id
+    ]
+    if not found:
+        return None
+    first = found[0]
+    keys = ("chat_id", "project_id", "lead_id", "intent_sha256")
+    if any(any(one.get(key) != first.get(key) for key in keys) for one in found[1:]):
+        raise ChatError(
+            "A durable project request identity has conflicting transcript bindings. "
+            "Nexus preserved the evidence and stopped."
+        )
+    return first
+
+
+def _require_long_horizon_binding(
+    turns: list[Said], request_id: str, chat_id: str, project_id: str,
+    lead_id: str, intent_sha256: str,
+) -> None:
+    held = _long_horizon_prompt_binding(turns, request_id)
+    if held is None:
+        return
+    expected = {
+        "chat_id": str(chat_id or ""),
+        "project_id": str(project_id or ""),
+        "lead_id": str(lead_id or ""),
+        "intent_sha256": str(intent_sha256 or ""),
+    }
+    if any(held.get(key) != value for key, value in expected.items()):
+        raise ChatError(
+            "That durable project request identity is already bound to a different "
+            "chat, project, lead, or exact intent."
+        )
+
+
+def keep_long_horizon_prompt(
+    config: LoadedConfig, route: str, text: str, *, filed_as: str,
+    request_id: str, chat_id: str, project_id: str, lead_id: str,
+    intent_sha256: str, attachments: object = None,
+) -> dict[str, Any]:
+    """Commit one direct Work Together prompt before goal admission.
+
+    The correlation makes a renderer retry, HTTP retry, or process restart an
+    exact replay rather than a second visible user message.
+    """
+
+    request = _exact_long_horizon_identity(
+        str(request_id or "").strip(), "request ID",
+    )
+    exact_chat_id = _exact_long_horizon_identity(chat_id, "chat ID")
+    exact_project_id = _exact_long_horizon_identity(project_id, "project ID")
+    exact_lead_id = _exact_long_horizon_identity(lead_id, "lead agent ID")
+    intent = str(intent_sha256 or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", intent):
+        raise ChatError("The durable project request has no valid intent fingerprint")
+    redactor = CredentialRedactor(config)
+    safe_text = redactor.text(_check_what_was_typed(text))
+    correlation = {
+        "schema_version": 1,
+        "event_id": _long_horizon_event_id(
+            "prompt", request, exact_chat_id, exact_project_id, exact_lead_id, intent,
+        ),
+        "kind": "long_horizon_prompt",
+        "request_id": request,
+        "chat_id": exact_chat_id,
+        "project_id": exact_project_id,
+        "lead_id": exact_lead_id,
+        "intent_sha256": intent,
+    }
+    turn = Said(
+        "you", safe_text, _now(),
+        attachments=_long_horizon_public_attachments(redactor, attachments),
+        speaker_name="You", phase="long_horizon_prompt", correlation=correlation,
+    )
+    with _the_lock_for(_filed_under(filed_as or route)):
+        turns = read_it(config, route, filed_as)
+        _require_long_horizon_binding(
+            turns, request, exact_chat_id, exact_project_id, exact_lead_id, intent,
+        )
+        _keep_it(config, route, [*turns, turn], filed_as)
+        saved = read_it(config, route, filed_as)
+    return {
+        "route": str(route or "").strip(),
+        "said": [one.to_dict() for one in saved[-MOST_KEPT:]],
+    }
+
+
+def keep_long_horizon_error(
+    config: LoadedConfig, route: str, error: str, *, filed_as: str,
+    request_id: str, chat_id: str, project_id: str, lead_id: str,
+    intent_sha256: str,
+) -> dict[str, Any]:
+    """Persist a failed admission without duplicating its accepted prompt."""
+
+    request = _exact_long_horizon_identity(
+        str(request_id or "").strip(), "request ID",
+    )
+    exact_chat_id = _exact_long_horizon_identity(chat_id, "chat ID")
+    exact_project_id = _exact_long_horizon_identity(project_id, "project ID")
+    exact_lead_id = _exact_long_horizon_identity(lead_id, "lead agent ID")
+    exact_intent = str(intent_sha256 or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", exact_intent):
+        raise ChatError("The durable project request has no valid intent fingerprint")
+    redactor = CredentialRedactor(config)
+    safe_error = bounded_redacted_text(
+        redactor, error or "Nexus could not admit this project goal", 65_536,
+    ).strip()
+    reason = safe_error if safe_error.endswith((".", "!", "?")) else safe_error + "."
+    text = (
+        "Nexus did not start this durable project goal. Your request remains saved "
+        "in this chat and was not automatically resent.\n\n"
+        f"Reason: {reason}"
+    )
+    error_sha256 = hashlib.sha256(safe_error.encode("utf-8")).hexdigest()
+    correlation = {
+        "schema_version": 1,
+        "event_id": _long_horizon_event_id(
+            "error", request, exact_chat_id, exact_project_id,
+            exact_intent, error_sha256,
+        ),
+        "kind": "long_horizon_error",
+        "request_id": request,
+        "chat_id": exact_chat_id,
+        "project_id": exact_project_id,
+        "lead_id": exact_lead_id,
+        "intent_sha256": exact_intent,
+        "goal_status": "admission_failed",
+    }
+    turn = Said(
+        "them", _checked_answer(text, "Nexus"), _now(),
+        model="nexus/long-horizon-admission-v1", speaker_id="nexus",
+        speaker_name="Nexus", recipient_name="You", phase="nexus_error",
+        correlation=correlation,
+    )
+    with _the_lock_for(_filed_under(filed_as or route)):
+        turns = read_it(config, route, filed_as)
+        _require_long_horizon_binding(
+            turns, request, exact_chat_id, exact_project_id,
+            exact_lead_id, exact_intent,
+        )
+        _keep_it(config, route, [*turns, turn], filed_as)
+        saved = read_it(config, route, filed_as)
+    return {
+        "route": str(route or "").strip(),
+        "said": [one.to_dict() for one in saved[-MOST_KEPT:]],
+        "answer": next(
+            one.to_dict() for one in reversed(saved)
+            if one.correlation.get("event_id") == correlation["event_id"]
+        ),
+    }
+
+
+def _long_horizon_status_text(goal: dict[str, Any]) -> str:
+    goal_id = str(goal.get("goal_id") or "")
+    short_id = goal_id[:8] or "unknown"
+    status = str(goal.get("status") or "unknown")
+    if status == "waiting_for_project":
+        queue = goal.get("project_queue") if isinstance(goal.get("project_queue"), dict) else {}
+        blocker = str(queue.get("blocked_by_goal_id") or "")[:8]
+        blocked = f" Goal {blocker} currently owns the project." if blocker else ""
+        return (
+            f"Durable goal {short_id} is waiting for this project.{blocked} Nexus will "
+            "start it automatically after the project is released. Open it in Mission "
+            "control for its exact queue state."
+        )
+    if status == "queued":
+        return f"Durable goal {short_id} was accepted and is queued in Mission control."
+    if status == "running":
+        return f"Durable goal {short_id} is running. Mission control shows its current task and evidence."
+    if status == "paused":
+        return f"Durable goal {short_id} is paused. It has not been reported as complete."
+    if status == "waiting_for_user":
+        return f"Durable goal {short_id} is waiting for your input in Mission control."
+    if status == "failed":
+        return f"Durable goal {short_id} failed. Mission control has the recorded reason and evidence."
+    if status == "cancelling":
+        return (
+            f"Durable goal {short_id} is cancelling. Nexus is draining its active "
+            "work and has not released the project yet. It is not complete."
+        )
+    if status == "cancelled":
+        return f"Durable goal {short_id} was cancelled. It was not reported as complete."
+    if status == "complete":
+        return f"Durable goal {short_id} is verified complete. Mission control has its authenticated evidence."
+    return f"Durable goal {short_id} has status “{status}”. Open Mission control for its exact state."
+
+
+def keep_long_horizon_status(
+    config: LoadedConfig, route: str, goal: dict[str, Any], *, filed_as: str,
+    chat_id: str = "", project_id: str = "", lead_id: str = "",
+    intent_sha256: str = "",
+) -> dict[str, Any]:
+    """Append one truthful canonical goal-state transition to its origin chat."""
+
+    goal_id = _exact_long_horizon_identity(goal.get("goal_id"), "goal ID")
+    request_id = _exact_long_horizon_identity(
+        goal.get("request_id"), "request ID",
+    )
+    conversation_id = _exact_long_horizon_identity(
+        chat_id or goal.get("conversation_id"), "chat ID",
+    )
+    project = goal.get("project") if isinstance(goal.get("project"), dict) else {}
+    selected_project = _exact_long_horizon_identity(
+        project_id or project.get("id"), "project ID",
+    )
+    selected_lead = _exact_long_horizon_identity(
+        lead_id or goal.get("lead_agent_id"), "lead agent ID",
+    )
+    status = str(goal.get("status") or "unknown")[:80]
+    raw_revision = goal.get("revision")
+    has_revision = raw_revision is not None
+    try:
+        revision = int(raw_revision) if has_revision else 0
+    except (TypeError, ValueError) as exc:
+        raise ChatError("The durable project status has an invalid revision") from exc
+    if revision < 0 or revision > 9_007_199_254_740_991:
+        raise ChatError("The durable project status revision is out of range")
+    with _the_lock_for(_filed_under(filed_as or route)):
+        turns = read_it(config, route, filed_as)
+        prompt = _long_horizon_prompt_binding(turns, request_id)
+        bound_intent = str(
+            intent_sha256 or (prompt or {}).get("intent_sha256") or ""
+        )
+        if bound_intent and not re.fullmatch(r"[0-9a-f]{64}", bound_intent):
+            raise ChatError(
+                "The durable project status has an invalid exact intent fingerprint. "
+                "Nexus did not save or truncate it."
+            )
+        status_turns = [
+            turn for turn in turns
+            if turn.correlation.get("kind") == "long_horizon_status"
+            and turn.correlation.get("goal_id") == goal_id
+        ]
+        projections = [
+            turn for turn in turns
+            if turn.correlation.get("kind") in {
+                "long_horizon_status", "long_horizon_status_checkpoint",
+            }
+            and turn.correlation.get("goal_id") == goal_id
+        ]
+        latest_status_turn = status_turns[-1] if status_turns else None
+
+        def unchanged() -> dict[str, Any]:
+            answer = latest_status_turn.to_dict() if latest_status_turn else {}
+            return {
+                "route": str(route or "").strip(),
+                "said": [one.to_dict() for one in turns[-MOST_KEPT:]],
+                "answer": answer,
+            }
+
+        if has_revision and projections:
+            highest_revision = max(
+                int(one.correlation.get("goal_revision") or 0)
+                for one in projections
+            )
+            at_highest = [
+                one for one in projections
+                if int(one.correlation.get("goal_revision") or 0) == highest_revision
+            ]
+            highest_statuses = {
+                str(one.correlation.get("goal_status") or "") for one in at_highest
+            }
+            if len(highest_statuses) > 1:
+                raise ChatError(
+                    "The saved goal projection has conflicting statuses at one revision. "
+                    "Nexus preserved it and stopped."
+                )
+            highest_status = next(iter(highest_statuses), "")
+            if revision < highest_revision:
+                return unchanged()
+            if revision == highest_revision:
+                if highest_status and highest_status != status:
+                    raise ChatError(
+                        "The same durable goal revision was presented with two different "
+                        "statuses. Nexus preserved the newer transcript projection and stopped."
+                    )
+                return unchanged()
+        if latest_status_turn and latest_status_turn.correlation.get("goal_status") in {
+            "complete", "cancelled",
+        } and latest_status_turn.correlation.get("goal_status") != status:
+            raise ChatError(
+                "A terminal durable goal status cannot regress to a different state. "
+                "Nexus preserved the verified transcript projection."
+            )
+
+        same_status = bool(
+            latest_status_turn
+            and latest_status_turn.correlation.get("goal_status") == status
+        )
+        if same_status and not has_revision:
+            return unchanged()
+        kind = "long_horizon_status_checkpoint" if same_status else "long_horizon_status"
+        transition = len(status_turns) + 1
+        correlation = {
+            "schema_version": 1,
+            "event_id": _long_horizon_event_id(
+                kind, goal_id, revision if has_revision else transition, status,
+            ),
+            "kind": kind,
+            "request_id": request_id,
+            "chat_id": conversation_id,
+            "project_id": selected_project,
+            "lead_id": selected_lead,
+            "goal_id": goal_id,
+            "goal_status": status,
+        }
+        if has_revision:
+            correlation["goal_revision"] = revision
+        if bound_intent:
+            correlation["intent_sha256"] = bound_intent
+        turn = Said(
+            "them", _long_horizon_status_text(goal), _now(),
+            model="nexus/long-horizon-status-v1", speaker_id="nexus",
+            speaker_name="Nexus", recipient_name="You",
+            phase=(
+                "long_horizon_checkpoint" if same_status else "long_horizon_status"
+            ),
+            correlation=correlation,
+        )
+        _keep_it(config, route, [*turns, turn], filed_as)
+        saved = read_it(config, route, filed_as)
+    return {
+        "route": str(route or "").strip(),
+        "said": [one.to_dict() for one in saved[-MOST_KEPT:]],
+        "answer": next((
+            one.to_dict() for one in reversed(saved)
+            if one.correlation.get("kind") == "long_horizon_status"
+            and one.correlation.get("goal_id") == goal_id
+        ), {}),
     }
 
 

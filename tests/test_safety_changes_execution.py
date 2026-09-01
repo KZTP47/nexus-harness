@@ -12,7 +12,9 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from our_harness import execution
 from our_harness.changes import FileTransaction, file_sha256
 from our_harness.checkpoints import CheckpointManager
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
@@ -24,6 +26,44 @@ from our_harness.safety import (
     confined_walk_files,
     validate_portable_relative_path,
 )
+
+
+class CommandPolicyArgumentParsingTests(unittest.TestCase):
+    def test_git_clean_bundles_expose_every_short_switch_to_policy(self) -> None:
+        for switch in ("-xfd", "-xdf", "-nfd"):
+            with self.subTest(switch=switch):
+                argv = ["git", "clean", switch]
+                self.assertTrue(execution._matches_rule("clean -fd", argv))
+                self.assertTrue(execution._matches_rule("--force", argv))
+
+    def test_safe_git_clean_bundles_do_not_invent_force(self) -> None:
+        for switch in ("-n", "-nd", "-nxd"):
+            with self.subTest(switch=switch):
+                argv = ["git", "clean", switch]
+                self.assertFalse(execution._matches_rule("clean -fd", argv))
+                self.assertFalse(execution._matches_rule("--force", argv))
+
+    def test_powershell_named_parameters_end_at_the_payload_boundary(self) -> None:
+        launcher = [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "-NoProfile", "-InputFormat", "Text", "-File", "script.ps1",
+        ]
+        self.assertFalse(execution._matches_rule("--force", launcher))
+        self.assertTrue(execution._matches_rule(
+            "--force", ["not-powershell", "-NoProfile"],
+        ))
+        self.assertFalse(execution._matches_rule(
+            "--force",
+            ["powershell.exe", "-ExecutionPolicy:Bypass", "-File", "script.ps1"],
+        ))
+        self.assertTrue(execution._matches_rule(
+            "clean -fd",
+            ["powershell.exe", "-NoProfile", "-Command", "git clean -nfd"],
+        ))
+        self.assertTrue(execution._matches_rule(
+            "clean -fd",
+            ["powershell.exe", "-NoProfile", "git clean -xfd"],
+        ))
 
 
 class ProjectTransactionLockTests(unittest.TestCase):
@@ -284,6 +324,98 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(result.cwd, ".")
             with self.assertRaisesRegex(HarnessError, "denied"):
                 runner.run(["git", "reset", "--hard"])
+
+    def test_embedded_python_restores_cwd_imports_and_user_argv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "local_probe.py").write_text("VALUE = 'cwd-visible'\n", encoding="utf-8")
+            runner = CommandRunner(self._config(root))
+            command = [
+                sys.executable,
+                "-c",
+                "from __future__ import annotations\n"
+                "import local_probe, sys\n"
+                "print(local_probe.VALUE, sys.argv)",
+                "one",
+                "two",
+            ]
+            result = runner.run(command)
+            self.assertTrue(result.passed, result.stderr)
+            self.assertIn("cwd-visible ['-c', 'one', 'two']", result.stdout)
+            self.assertEqual(result.argv, command)
+
+    def test_embedded_python_restores_module_and_script_import_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "local_probe.py").write_text("VALUE = 'cwd-visible'\n", encoding="utf-8")
+            (root / "runnable_probe.py").write_text(
+                "import local_probe, sys\n"
+                "print('module', local_probe.VALUE, sys.argv[1:])\n",
+                encoding="utf-8",
+            )
+            (root / "probe_script.py").write_text(
+                "from pathlib import Path\n"
+                "import local_probe, sys\n"
+                "print('script', local_probe.VALUE, Path(sys.argv[0]).name, sys.argv[1:])\n",
+                encoding="utf-8",
+            )
+            runner = CommandRunner(self._config(root))
+            module = runner.run([sys.executable, "-m", "runnable_probe", "one"])
+            script = runner.run([sys.executable, "probe_script.py", "two"])
+            self.assertTrue(module.passed, module.stderr)
+            self.assertEqual(module.stdout.strip(), "module cwd-visible ['one']")
+            self.assertTrue(script.passed, script.stderr)
+            self.assertEqual(script.stdout.strip(), "script cwd-visible probe_script.py ['two']")
+
+    def test_explicit_python_safe_path_modes_are_never_rewritten(self) -> None:
+        working = Path.cwd()
+        environment = {"PATH": os.environ.get("PATH", "")}
+        for command in (
+            [sys.executable, "-I", "-c", "print('isolated')"],
+            [sys.executable, "-P", "-m", "module"],
+        ):
+            with self.subTest(command=command), mock.patch.object(
+                execution, "_is_embedded_python", return_value=True,
+            ):
+                self.assertEqual(
+                    execution._embedded_python_cwd_argv(command, working, environment),
+                    command,
+                )
+        with mock.patch.object(execution, "_is_embedded_python", return_value=True):
+            command = [sys.executable, "-c", "print('safe')"]
+            self.assertEqual(
+                execution._embedded_python_cwd_argv(
+                    command, working, {**environment, "PYTHONSAFEPATH": "1"},
+                ),
+                command,
+            )
+
+    def test_explicit_python_safe_path_still_hides_project_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "private_probe.py").write_text("VISIBLE = True\n", encoding="utf-8")
+            runner = CommandRunner(self._config(root))
+            for flag in ("-I", "-P"):
+                with self.subTest(flag=flag):
+                    result = runner.run([
+                        sys.executable, flag, "-c", "import private_probe",
+                    ])
+                    self.assertFalse(result.passed)
+                    self.assertIn("No module named 'private_probe'", result.stderr)
+            safe_environment = runner.run(
+                [sys.executable, "-c", "import private_probe"],
+                environment_overrides={"PYTHONSAFEPATH": "1"},
+            )
+            self.assertFalse(safe_environment.passed)
+            self.assertIn("No module named 'private_probe'", safe_environment.stderr)
+
+    def test_non_python_commands_are_not_rewritten_by_cwd_compatibility(self) -> None:
+        command = ["node", "-e", "console.log('ok')"]
+        with mock.patch.object(execution, "_resolved_executable", return_value=Path("node.exe")):
+            self.assertEqual(
+                execution._embedded_python_cwd_argv(command, Path.cwd(), {}),
+                command,
+            )
 
     @unittest.skipUnless(os.name == "nt", "Windows 8.3 path aliases")
     def test_short_root_alias_and_long_resolved_root_are_the_same_cwd(self) -> None:

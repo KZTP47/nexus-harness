@@ -45,6 +45,7 @@ from . import swarm_work
 
 SCHEMA_VERSION = 2
 EVENT_SCHEMA_VERSION = 1
+REQUEST_TOMBSTONE_SCHEMA_VERSION = 1
 AGENT_BINDING_SCHEMA_VERSION = 3
 MAX_GOALS = 40
 MAX_TASKS = 200
@@ -56,8 +57,21 @@ MAX_NO_PROGRESS = 4
 MAX_CRITERIA = 32
 MAX_OBJECTIVE_CHARACTERS = 240_000
 MAX_PENDING_ACTION_BYTES = 8_000_000
+MAX_REQUEST_ID_CHARACTERS = 160
+MAX_CONVERSATION_ID_CHARACTERS = (
+    chat_lab.DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS
+)
 TERMINAL_GOALS = {"complete", "cancelled", "failed"}
-ACTIVE_GOALS = {"queued", "running", "paused", "waiting_for_user"}
+RELEASED_GOALS = {"complete", "cancelled"}
+PROJECT_OWNER_GOALS = {
+    "queued", "running", "paused", "waiting_for_user", "failed", "cancelling",
+}
+ACTIVE_GOALS = PROJECT_OWNER_GOALS | {"waiting_for_project"}
+EXECUTION_CONTRACT_SCHEMA_VERSION = 1
+PROJECT_QUEUE_SCHEMA_VERSION = 1
+CANCELLATION_SCHEMA_VERSION = 1
+SCHEDULER_LEASE_SCHEMA_VERSION = 1
+_NO_MUTATION = object()
 TASK_STATES = {
     "ready", "running", "pending_apply", "waiting", "waiting_review", "blocked", "failed",
     "complete", "cancelled",
@@ -157,6 +171,38 @@ def _short(value: object, limit: int) -> str:
     return str(value or "").strip()[:limit]
 
 
+def _exact_request_id(value: object, *, what: str = "request") -> str:
+    """Validate an idempotency identity without creating prefix aliases."""
+
+    raw = str(value or "")
+    exact = raw.strip()
+    if not exact:
+        raise HarnessError(f"A stable {what} ID is required")
+    if exact != raw:
+        raise HarnessError(
+            f"A long-horizon {what} ID may not contain surrounding whitespace. "
+            "Nexus did not normalize it."
+        )
+    if len(exact) > MAX_REQUEST_ID_CHARACTERS:
+        raise HarnessError(
+            f"A long-horizon {what} ID may contain at most "
+            f"{MAX_REQUEST_ID_CHARACTERS} characters. Nexus did not truncate it."
+        )
+    return exact
+
+
+def _exact_conversation_id(value: object) -> str:
+    """Keep an accepted chat identity exact instead of creating prefix aliases."""
+
+    exact = str(value or "")
+    if len(exact) > MAX_CONVERSATION_ID_CHARACTERS:
+        raise HarnessError(
+            "A long-horizon chat identity may contain at most "
+            f"{MAX_CONVERSATION_ID_CHARACTERS} characters. Nexus did not truncate it."
+        )
+    return exact
+
+
 def _stable_id(prefix: str, *values: object) -> str:
     material = "\0".join(str(one) for one in values)
     return prefix + "-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
@@ -200,6 +246,38 @@ def _project_key(path: Path) -> str:
     return hashlib.sha256(os.path.normcase(str(path.resolve())).encode("utf-8")).hexdigest()
 
 
+def _exclusive_project_contract(project_path: Path, project_authority_id: str) -> dict[str, Any]:
+    basis = {
+        "schema_version": EXECUTION_CONTRACT_SCHEMA_VERSION,
+        "mode": "exclusive_project",
+        "project_authority_id": str(project_authority_id),
+        "root_fingerprint_sha256": _project_key(project_path),
+    }
+    return {
+        **basis,
+        "fingerprint_sha256": hashlib.sha256(
+            _canonical(basis).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _redacted_objectives(
+    redactor: CredentialRedactor, objectives: list[str],
+) -> list[str]:
+    """Return every accepted objective without silently clipping user text."""
+
+    accepted: list[str] = []
+    for raw in objectives:
+        text = redactor.text(str(raw or ""))
+        if text.strip():
+            accepted.append(text)
+    if len("\n\n".join(accepted)) > MAX_OBJECTIVE_CHARACTERS:
+        raise HarnessError(
+            "The combined goal text is too large for one bounded long-horizon goal"
+        )
+    return accepted
+
+
 def _goal_admission_digest(
     redactor: CredentialRedactor, *, project_id: str, project_path: Path,
     project_authority_id: str, conversation_id: str, participant_ids: list[str],
@@ -213,13 +291,14 @@ def _goal_admission_digest(
         "project_id": str(project_id),
         "project_path": str(project_path.resolve()),
         "project_authority_id": str(project_authority_id),
-        "conversation_id": _short(conversation_id, 160),
+        "conversation_id": _exact_conversation_id(conversation_id),
         "participant_ids": list(dict.fromkeys(str(one) for one in participant_ids if str(one))),
         "lead_id": str(lead_id),
         "agent_bindings": copy.deepcopy(agent_bindings or []),
-        "objectives": [
-            _short(redactor.text(one), 20_000) for one in objectives if _short(one, 20_000)
-        ],
+        "execution_contract": _exclusive_project_contract(
+            project_path, project_authority_id,
+        ),
+        "objectives": _redacted_objectives(redactor, objectives),
         "success_criteria": [
             _short(redactor.text(one), 1_000)
             for one in (success_criteria or []) if _short(one, 1_000)
@@ -361,7 +440,9 @@ def _validate_action_semantics(action: dict[str, Any], task: dict[str, Any]) -> 
 class GoalStore:
     """Authenticated snapshots plus a strictly ordered typed event journal."""
 
-    def __init__(self, config: LoadedConfig) -> None:
+    def __init__(
+        self, config: LoadedConfig, *, migrate_execution_metadata: bool = True,
+    ) -> None:
         self.config = config
         self.redactor = CredentialRedactor(config)
         self.authority_key = _project_key(config.project_root)
@@ -399,9 +480,20 @@ class GoalStore:
                   PRIMARY KEY(goal_id, seq),
                   FOREIGN KEY(goal_id) REFERENCES long_goals(goal_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS long_goal_request_tombstones(
+                  request_id TEXT PRIMARY KEY,
+                  tombstone_json TEXT NOT NULL,
+                  tombstone_sha256 TEXT NOT NULL,
+                  integrity_mac TEXT NOT NULL,
+                  retired_ms INTEGER NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS long_goals_updated
                   ON long_goals(updated_ms DESC);
+                CREATE INDEX IF NOT EXISTS long_goals_status_created
+                  ON long_goals(status,created_ms,goal_id);
             """)
+        if migrate_execution_metadata:
+            self._migrate_execution_metadata()
 
     @contextmanager
     def _connect(self):
@@ -415,7 +507,7 @@ class GoalStore:
         finally:
             db.close()
 
-    def _decode(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+    def _decode_shared(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
         raw = str(row["document_json"])
@@ -438,9 +530,472 @@ class GoalStore:
             raise HarnessError("Long-horizon goal state has an unsupported schema")
         if str(document.get("goal_id")) != str(row["goal_id"]):
             raise HarnessError("Long-horizon goal identity does not match its record")
+        return document
+
+    def _decode(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        document = self._decode_shared(row)
+        if document is None:
+            return None
         if str(document.get("authority_key") or "") != self.authority_key:
             raise HarnessError("That long-horizon goal belongs to a different Nexus project authority")
         return document
+
+    def _decode_request_tombstone(
+        self, row: sqlite3.Row | None,
+    ) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        raw = str(row["tombstone_json"])
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        material = [
+            str(row["request_id"]), raw, digest, int(row["retired_ms"]),
+        ]
+        if digest != str(row["tombstone_sha256"]) or not hmac.compare_digest(
+            str(row["integrity_mac"]),
+            mac("long-horizon-request-tombstone-v1", material),
+        ):
+            quarantine_marker(
+                "long-horizon-request-tombstones", self.database,
+                "Request tombstone integrity failed",
+            )
+            raise HarnessError(
+                "Long-horizon request replay protection failed integrity verification"
+            )
+        try:
+            document = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HarnessError(
+                "Long-horizon request replay protection is unreadable"
+            ) from exc
+        if not isinstance(document, dict) \
+                or document.get("request_tombstone_schema_version") \
+                != REQUEST_TOMBSTONE_SCHEMA_VERSION \
+                or document.get("request_tombstone") is not True:
+            raise HarnessError(
+                "Long-horizon request replay protection has an unsupported schema"
+            )
+        if str(document.get("request_id") or "") != str(row["request_id"]):
+            raise HarnessError(
+                "Long-horizon request replay identity does not match its record"
+            )
+        if str(document.get("authority_key") or "") != self.authority_key:
+            raise HarnessError(
+                "That long-horizon request belongs to a different Nexus project authority"
+            )
+        if str(document.get("status") or "") not in RELEASED_GOALS:
+            raise HarnessError(
+                "Long-horizon request replay protection has a non-terminal state"
+            )
+        return document
+
+    @staticmethod
+    def _request_tombstone_document(
+        document: dict[str, Any], retired_ms: int,
+    ) -> dict[str, Any]:
+        """Keep identity/binding evidence after detailed terminal history is pruned."""
+
+        stored_request_id = str(document.get("request_id") or "")
+        client_request_id = str(document.get("client_request_id") or "")
+        if not client_request_id and ":" in stored_request_id:
+            client_request_id = stored_request_id.split(":", 1)[1]
+        return {
+            "request_tombstone_schema_version": REQUEST_TOMBSTONE_SCHEMA_VERSION,
+            "request_tombstone": True,
+            "goal_id": str(document.get("goal_id") or ""),
+            "request_id": stored_request_id,
+            "client_request_id": client_request_id,
+            "authority_key": str(document.get("authority_key") or ""),
+            "status": str(document.get("status") or ""),
+            "retired_ms": retired_ms,
+            "admission_digest": str(document.get("admission_digest") or ""),
+            "project": {
+                "id": str(
+                    document.get("project", {}).get("id")
+                    if isinstance(document.get("project"), dict) else ""
+                ),
+            },
+            "conversation_id": str(document.get("conversation_id") or ""),
+            "requested_agent_ids": [
+                str(one) for one in document.get("requested_agent_ids", [])
+                if str(one)
+            ],
+            "lead_agent_id": str(document.get("lead_agent_id") or ""),
+            "parent_goal_id": str(document.get("parent_goal_id") or ""),
+        }
+
+    def _remember_request_tombstone(
+        self, db: sqlite3.Connection, document: dict[str, Any],
+    ) -> dict[str, Any]:
+        if str(document.get("status") or "") not in RELEASED_GOALS:
+            raise HarnessError(
+                "Only released long-horizon goals can become replay tombstones"
+            )
+        request_id = str(document.get("request_id") or "")
+        existing = self._decode_request_tombstone(db.execute(
+            "SELECT * FROM long_goal_request_tombstones WHERE request_id=?",
+            (request_id,),
+        ).fetchone())
+        if existing is not None:
+            if str(existing.get("goal_id") or "") != str(document.get("goal_id") or "") \
+                    or not hmac.compare_digest(
+                        str(existing.get("admission_digest") or ""),
+                        str(document.get("admission_digest") or ""),
+                    ):
+                raise HarnessError(
+                    "A retired long-horizon request identity conflicts with its "
+                    "authenticated replay tombstone"
+                )
+            return existing
+        retired_ms = _now()
+        tombstone = self._request_tombstone_document(document, retired_ms)
+        raw = _canonical(tombstone)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        material = [request_id, raw, digest, retired_ms]
+        db.execute(
+            "INSERT INTO long_goal_request_tombstones(request_id,tombstone_json,"
+            "tombstone_sha256,integrity_mac,retired_ms) VALUES(?,?,?,?,?)",
+            (
+                request_id, raw, digest,
+                mac("long-horizon-request-tombstone-v1", material), retired_ms,
+            ),
+        )
+        return tombstone
+
+    def _prune_released_goals(self, db: sqlite3.Connection) -> None:
+        """Retire request identities before bounded terminal details disappear."""
+
+        old = db.execute(
+            "SELECT * FROM long_goals WHERE status IN ('complete','cancelled') "
+            "AND request_id LIKE ? "
+            "ORDER BY updated_ms DESC,created_ms DESC,rowid DESC",
+            (self.authority_key + ":%",),
+        ).fetchall()
+        for row in old[MAX_GOALS:]:
+            released = self._decode(row)
+            if released is None:
+                raise HarnessError(
+                    "A terminal goal disappeared before replay protection was saved"
+                )
+            self._remember_request_tombstone(db, released)
+            if db.execute(
+                "DELETE FROM long_goals WHERE goal_id=?",
+                (str(row["goal_id"]),),
+            ).rowcount != 1:
+                raise HarnessError(
+                    "A terminal goal changed while replay protection was being saved"
+                )
+
+    @staticmethod
+    def _project_queue_state(document: dict[str, Any]) -> str:
+        queue = document.get("project_queue")
+        if isinstance(queue, dict) and queue.get("schema_version") == PROJECT_QUEUE_SCHEMA_VERSION:
+            return str(queue.get("state") or "")
+        if document.get("status") == "waiting_for_project":
+            return "waiting"
+        if document.get("status") in RELEASED_GOALS:
+            return "released"
+        return "owner"
+
+    @classmethod
+    def _is_project_owner(cls, document: dict[str, Any]) -> bool:
+        return document.get("status") in PROJECT_OWNER_GOALS \
+            and cls._project_queue_state(document) == "owner"
+
+    @classmethod
+    def _is_project_waiter(cls, document: dict[str, Any]) -> bool:
+        return document.get("status") == "waiting_for_project" \
+            and cls._project_queue_state(document) == "waiting"
+
+    @staticmethod
+    def _project_paths_overlap(left: Path, right: Path) -> bool:
+        left = left.resolve()
+        right = right.resolve()
+        return left == right or left in right.parents or right in left.parents
+
+    @classmethod
+    def _goals_overlap(cls, left: dict[str, Any], right: dict[str, Any]) -> bool:
+        left_authority = str(left.get("project_authority_id") or "")
+        right_authority = str(right.get("project_authority_id") or "")
+        if left_authority and right_authority and hmac.compare_digest(
+            left_authority, right_authority,
+        ):
+            return True
+        return cls._project_paths_overlap(
+            Path(str(left.get("project", {}).get("path") or "")),
+            Path(str(right.get("project", {}).get("path") or "")),
+        )
+
+    @classmethod
+    def _goal_overlaps_target(
+        cls, document: dict[str, Any], project_path: Path, project_authority_id: str,
+    ) -> bool:
+        held_authority = str(document.get("project_authority_id") or "")
+        if held_authority and project_authority_id and hmac.compare_digest(
+            held_authority, project_authority_id,
+        ):
+            return True
+        return cls._project_paths_overlap(
+            Path(str(document.get("project", {}).get("path") or "")), project_path,
+        )
+
+    @staticmethod
+    def _pristine_for_queue_migration(document: dict[str, Any]) -> bool:
+        if document.get("artifacts"):
+            return False
+        for task in document.get("tasks", []):
+            if not isinstance(task, dict):
+                return False
+            if task.get("state") not in {"ready", "waiting"}:
+                return False
+            if task.get("pending_action") or task.get("pending_transaction"):
+                return False
+            if str(task.get("provider_effect_state") or "never_dispatched") \
+                    not in {"", "never_dispatched"}:
+                return False
+        return True
+
+    def _execution_contract_for(self, document: dict[str, Any]) -> dict[str, Any]:
+        return _exclusive_project_contract(
+            Path(str(document.get("project", {}).get("path") or "")),
+            str(document.get("project_authority_id") or ""),
+        )
+
+    def _validate_execution_metadata(self, document: dict[str, Any]) -> None:
+        contract = document.get("execution_contract")
+        expected = self._execution_contract_for(document)
+        if not isinstance(contract, dict) or contract.get(
+            "schema_version"
+        ) != EXECUTION_CONTRACT_SCHEMA_VERSION or contract.get("mode") != "exclusive_project" \
+                or not hmac.compare_digest(
+                    str(contract.get("project_authority_id") or ""),
+                    str(expected["project_authority_id"]),
+                ) or not hmac.compare_digest(
+                    str(contract.get("root_fingerprint_sha256") or ""),
+                    str(expected["root_fingerprint_sha256"]),
+                ) or not hmac.compare_digest(
+                    str(contract.get("fingerprint_sha256") or ""),
+                    str(expected["fingerprint_sha256"]),
+                ):
+            raise HarnessError("Long-horizon execution ownership metadata is invalid")
+        queue = document.get("project_queue")
+        if not isinstance(queue, dict) or queue.get(
+            "schema_version"
+        ) != PROJECT_QUEUE_SCHEMA_VERSION or queue.get("state") not in {
+            "owner", "waiting", "released",
+        }:
+            raise HarnessError("Long-horizon project queue metadata is invalid")
+        state = str(queue["state"])
+        status = str(document.get("status") or "")
+        if (status == "waiting_for_project") != (state == "waiting"):
+            raise HarnessError("Long-horizon project queue status does not match its claim")
+        if status in RELEASED_GOALS and state != "released":
+            raise HarnessError("A completed long-horizon goal still claims its project")
+        if status in PROJECT_OWNER_GOALS - {"failed"} and state != "owner":
+            raise HarnessError("An executable long-horizon goal does not own its project")
+        if status == "failed" and state not in {"owner", "released"}:
+            raise HarnessError("A failed long-horizon goal has invalid project ownership")
+        cancellation = document.get("cancellation")
+        if not isinstance(cancellation, dict) or cancellation.get(
+            "schema_version"
+        ) != CANCELLATION_SCHEMA_VERSION or cancellation.get("state") not in {
+            "none", "draining", "settled",
+        }:
+            raise HarnessError("Long-horizon cancellation metadata is invalid")
+        if status == "cancelling" and cancellation.get("state") != "draining":
+            raise HarnessError("A cancelling goal has no durable drain request")
+
+    @staticmethod
+    def _queue_record(
+        state: str, now: int, *, blocked_by_goal_id: str = "",
+        queued_ms: int = 0, promoted_ms: int = 0,
+        auto_start_pending: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": PROJECT_QUEUE_SCHEMA_VERSION,
+            "state": state,
+            "blocked_by_goal_id": str(blocked_by_goal_id),
+            "queued_ms": int(queued_ms),
+            "promoted_ms": int(promoted_ms),
+            "released_ms": int(now if state == "released" else 0),
+            "auto_start_pending": bool(auto_start_pending and state == "owner"),
+        }
+
+    def _shared_documents(
+        self, db: sqlite3.Connection, statuses: set[str],
+    ) -> list[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in statuses)
+        rows = db.execute(
+            f"SELECT * FROM long_goals WHERE status IN ({placeholders}) "
+            "ORDER BY created_ms,goal_id",
+            tuple(sorted(statuses)),
+        ).fetchall()
+        return [self._decode_shared(row) for row in rows if row is not None]
+
+    def _shared_project_owners(
+        self, db: sqlite3.Connection, project_path: Path, project_authority_id: str,
+        *, except_goal_id: str = "",
+    ) -> list[dict[str, Any]]:
+        return [
+            goal for goal in self._shared_documents(db, PROJECT_OWNER_GOALS)
+            if goal["goal_id"] != except_goal_id and self._is_project_owner(goal)
+            and self._goal_overlaps_target(goal, project_path, project_authority_id)
+        ]
+
+    def _promote_eligible_waiters(
+        self, db: sqlite3.Connection, *, auto_start_pending: bool = True,
+    ) -> list[str]:
+        documents = self._shared_documents(db, ACTIVE_GOALS)
+        owners = [one for one in documents if self._is_project_owner(one)]
+        waiters = [one for one in documents if self._is_project_waiter(one)]
+        promoted: list[str] = []
+        for waiter in waiters:
+            blockers = [one for one in owners if self._goals_overlap(waiter, one)]
+            blockers.sort(key=lambda one: (int(one.get("created_ms") or 0), one["goal_id"]))
+            queue = waiter["project_queue"]
+            if blockers:
+                blocker_id = str(blockers[0]["goal_id"])
+                if str(queue.get("blocked_by_goal_id") or "") != blocker_id:
+                    queue["blocked_by_goal_id"] = blocker_id
+                    waiter["note"] = (
+                        "Waiting for long-horizon goal " + blocker_id[:8]
+                        + " to release this project."
+                    )
+                    self._event(db, waiter, "goal_project_wait_rebased", payload={
+                        "blocked_by_goal_id": blocker_id,
+                    })
+                    waiter["revision"] = int(waiter["revision"]) + 1
+                    self._write(db, waiter)
+                continue
+            now = _now()
+            waiter["status"] = "queued"
+            waiter["project_queue"] = self._queue_record(
+                "owner", now,
+                queued_ms=int(queue.get("queued_ms") or waiter.get("created_ms") or now),
+                promoted_ms=now,
+                auto_start_pending=auto_start_pending,
+            )
+            waiter["note"] = "The prior project owner finished; this goal is ready to continue."
+            self._event(db, waiter, "goal_project_promoted", payload={
+                "execution_contract_fingerprint": waiter["execution_contract"]["fingerprint_sha256"],
+            })
+            waiter["revision"] = int(waiter["revision"]) + 1
+            self._write(db, waiter)
+            owners.append(waiter)
+            promoted.append(str(waiter["goal_id"]))
+        return promoted
+
+    def _migrate_execution_metadata(self) -> None:
+        """Add the v1 project claim contract to authenticated schema-v2 rows."""
+
+        with self.lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                rows = db.execute(
+                    "SELECT * FROM long_goals ORDER BY created_ms,goal_id"
+                ).fetchall()
+                owners: list[dict[str, Any]] = []
+                for row in rows:
+                    document = self._decode_shared(row)
+                    if document is None:
+                        continue
+                    changed = False
+                    if not isinstance(document.get("execution_contract"), dict):
+                        document["execution_contract"] = self._execution_contract_for(document)
+                        changed = True
+                    queue = document.get("project_queue")
+                    if not isinstance(queue, dict):
+                        now = int(document.get("created_ms") or _now())
+                        if document.get("status") in RELEASED_GOALS:
+                            queue = self._queue_record("released", now)
+                        elif document.get("status") == "failed":
+                            # A legacy failed row with an unresolved provider
+                            # or file boundary remains the exclusive owner. It
+                            # is unsafe to let newer work build on a partial
+                            # effect and attempt a delayed rollback afterward.
+                            queue = self._queue_record(
+                                "owner" if any(
+                                    _task_has_unsettled_effect(task)
+                                    for task in document.get("tasks", [])
+                                ) else "released",
+                                now,
+                            )
+                        elif document.get("status") == "waiting_for_project":
+                            queue = self._queue_record("waiting", now, queued_ms=now)
+                        else:
+                            blockers = [
+                                owner for owner in owners if self._goals_overlap(document, owner)
+                            ]
+                            if blockers:
+                                if not self._pristine_for_queue_migration(document):
+                                    raise HarnessError(
+                                        "Conflicting legacy long-horizon goals have project effects; "
+                                        "reconcile them before Nexus can migrate project ownership."
+                                    )
+                                document["status"] = "waiting_for_project"
+                                queue = self._queue_record(
+                                    "waiting", now,
+                                    blocked_by_goal_id=str(blockers[0]["goal_id"]),
+                                    queued_ms=now,
+                                )
+                                document["note"] = (
+                                    "Waiting for long-horizon goal "
+                                    + str(blockers[0]["goal_id"])[:8]
+                                    + " to release this project."
+                                )
+                            else:
+                                queue = self._queue_record("owner", now)
+                        document["project_queue"] = queue
+                        changed = True
+                    elif "auto_start_pending" not in queue:
+                        # Never infer automatic dispatch for an existing row.  A
+                        # legacy checkpoint may already have crossed a provider
+                        # boundary even when its top-level status is queued.
+                        queue["auto_start_pending"] = False
+                        changed = True
+                    if not isinstance(document.get("cancellation"), dict):
+                        document["cancellation"] = {
+                            "schema_version": CANCELLATION_SCHEMA_VERSION,
+                            "state": "none",
+                            "requested_ms": 0,
+                            "settled_ms": 0,
+                        }
+                        changed = True
+                    worker = document.get("worker")
+                    if not isinstance(worker, dict):
+                        worker = {}
+                        document["worker"] = worker
+                    if worker.get("schema_version") != SCHEDULER_LEASE_SCHEMA_VERSION:
+                        worker.update({
+                            "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                            "pid": int(worker.get("pid") or 0),
+                            "token": str(worker.get("token") or ""),
+                            "worker_id": str(worker.get("worker_id") or ""),
+                            "acquired_ms": int(worker.get("acquired_ms") or 0),
+                        })
+                        changed = True
+                    self._validate_execution_metadata(document)
+                    if self._is_project_owner(document):
+                        blockers = [
+                            owner for owner in owners if self._goals_overlap(document, owner)
+                        ]
+                        if blockers:
+                            raise HarnessError(
+                                "Authenticated long-horizon project ownership conflicts; "
+                                "Nexus stopped before dispatching more work."
+                            )
+                        owners.append(document)
+                    if changed:
+                        self._event(db, document, "execution_contract_migrated", payload={
+                            "execution_contract": document["execution_contract"],
+                            "project_queue_state": document["project_queue"]["state"],
+                        })
+                        document["revision"] = int(document["revision"]) + 1
+                        self._write(db, document)
+                self._promote_eligible_waiters(db, auto_start_pending=False)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
 
     def _write(self, db: sqlite3.Connection, document: dict[str, Any]) -> None:
         document["updated_ms"] = _now()
@@ -521,11 +1076,36 @@ class GoalStore:
                 document = self._decode(row)
                 if document is None:
                     raise HarnessError("That long-horizon goal does not exist")
+                was_owner = self._is_project_owner(document)
                 result = change(document, db)
+                if result is _NO_MUTATION:
+                    db.rollback()
+                    returned = copy.deepcopy(document)
+                    returned["_promoted_goal_ids"] = []
+                    return returned, None
+                released = was_owner and document.get("status") in RELEASED_GOALS
+                if document.get("status") in RELEASED_GOALS \
+                        and self._project_queue_state(document) != "released":
+                    queued_ms = int((document.get("project_queue") or {}).get("queued_ms") or 0)
+                    promoted_ms = int((document.get("project_queue") or {}).get("promoted_ms") or 0)
+                    document["project_queue"] = self._queue_record(
+                        "released", _now(), queued_ms=queued_ms, promoted_ms=promoted_ms,
+                    )
+                    self._event(db, document, "goal_project_released", payload={
+                        "terminal_status": document["status"],
+                        "execution_contract_fingerprint": document[
+                            "execution_contract"
+                        ]["fingerprint_sha256"],
+                    })
                 document["revision"] = int(document["revision"]) + 1
                 self._write(db, document)
+                if document.get("status") in RELEASED_GOALS:
+                    self._prune_released_goals(db)
+                promoted = self._promote_eligible_waiters(db) if released else []
                 db.commit()
-                return copy.deepcopy(document), result
+                returned = copy.deepcopy(document)
+                returned["_promoted_goal_ids"] = promoted
+                return returned, result
             except Exception:
                 db.rollback()
                 raise
@@ -696,8 +1276,7 @@ class GoalStore:
         require_all_participants: bool | None = None,
     ) -> None:
         """Run every non-persistent admission check used by goal creation."""
-        if not _short(request_id, 160):
-            raise HarnessError("A stable request ID is required")
+        _exact_request_id(request_id)
         project = next((
             one for one in board.get("projects", []) if isinstance(one, dict)
             and str(one.get("id") or "") == project_id
@@ -710,10 +1289,7 @@ class GoalStore:
         admitted_agents = self._agents_for_project(board, project_id, participant_ids)
         if not admitted_agents:
             raise HarnessError("Assign at least one ready agent to this project")
-        clean_objectives = [
-            _short(self.redactor.text(one), 20_000)
-            for one in objectives if _short(one, 20_000)
-        ]
+        clean_objectives = _redacted_objectives(self.redactor, objectives)
         if not clean_objectives:
             raise HarnessError("Write at least one concrete project goal")
         requested_max_tasks = min(
@@ -729,7 +1305,7 @@ class GoalStore:
                 "The initial objectives and required chat-participant contributions "
                 "exceed the explicit task budget"
             )
-        if len("\n\n".join(clean_objectives)) + len(_short(attachment_text, 200_000)) \
+        if len("\n\n".join(clean_objectives)) + len(str(attachment_text or "")) \
                 > MAX_OBJECTIVE_CHARACTERS:
             raise HarnessError("The goal plus extracted attachment text is too large for one bounded goal")
         raw_criteria = list(success_criteria or [])
@@ -741,6 +1317,130 @@ class GoalStore:
         if len(criteria) + 3 > MAX_CRITERIA:
             raise HarnessError(f"Use at most {MAX_CRITERIA - 3} custom success criteria")
 
+    def inspect_runtime_admission(
+        self, board: dict[str, Any], project_id: str, objectives: list[str],
+        request_id: str, *, lead_id: str = "",
+        success_criteria: list[str] | None = None,
+        policy: dict[str, Any] | None = None, attachments: object = None,
+        participant_ids: list[str] | None = None, conversation_id: str = "",
+        expected_project_authority_id: str = "",
+        require_all_participants: bool | None = None,
+    ) -> dict[str, Any]:
+        """Inspect one exact runtime admission without changing scheduler state."""
+
+        exact_conversation_id = _exact_conversation_id(conversation_id)
+        require_all = bool(participant_ids) if require_all_participants is None \
+            else bool(require_all_participants)
+        project = next((
+            one for one in board.get("projects", []) if isinstance(one, dict)
+            and str(one.get("id") or "") == project_id
+        ), None)
+        if project is None or project.get("is_there") is not True:
+            raise HarnessError("Choose an available project for the long-horizon goal")
+        root = Path(str(project.get("path") or "")).resolve(strict=True)
+        self.validate_create(
+            board, project_id, objectives, request_id,
+            success_criteria=success_criteria, policy=policy,
+            participant_ids=participant_ids,
+            require_all_participants=require_all,
+        )
+        agents = self._agents_for_project(board, project_id, participant_ids)
+        if lead_id and not any(one["id"] == lead_id for one in agents):
+            raise HarnessError(
+                "The selected lead is not one of this chat's ready project agents"
+            )
+        lead = next((one for one in agents if one["id"] == lead_id), agents[0])
+        exact_participants = [one["id"] for one in agents] if participant_ids else []
+        actual_authority_id = project_identity(root)
+        if expected_project_authority_id and not hmac.compare_digest(
+            expected_project_authority_id, actual_authority_id,
+        ):
+            raise HarnessError(
+                "The selected project's execution authority changed during goal admission."
+            )
+        admission_digest = _goal_admission_digest(
+            self.redactor,
+            project_id=project_id,
+            project_path=root,
+            project_authority_id=actual_authority_id,
+            conversation_id=exact_conversation_id,
+            participant_ids=exact_participants,
+            lead_id=lead["id"],
+            objectives=objectives,
+            success_criteria=success_criteria,
+            policy={
+                **(policy or {}),
+                **({"participant_requirement": "adaptive"}
+                   if participant_ids and not require_all else {}),
+            },
+            attachments=attachments,
+            agent_bindings=[one.get("route_binding") for one in agents],
+        )
+        goal = self.get_by_request(request_id)
+        conflict = ""
+        request_retired = bool(
+            goal is not None and goal.get("request_tombstone") is True
+        )
+        if goal is not None and not request_retired:
+            same_root = Path(
+                str(goal.get("project", {}).get("path") or "")
+            ).resolve() == root
+            if (
+                str(goal.get("project", {}).get("id") or "") != project_id
+                or not same_root
+                or str(goal.get("conversation_id") or "")
+                != exact_conversation_id
+                or list(goal.get("requested_agent_ids") or []) != exact_participants
+                or str(goal.get("lead_agent_id") or "") != lead["id"]
+                or bool(goal.get(
+                    "require_all_participants",
+                    bool(goal.get("requested_agent_ids")),
+                )) != require_all
+            ):
+                conflict = (
+                    "That long-horizon request identity is already bound to a different "
+                    "project, chat, participant set, or lead agent."
+                )
+        if goal is not None and not conflict:
+            stored_digest = str(goal.get("admission_digest") or "")
+            if not stored_digest:
+                conflict = (
+                    "That saved request predates intent-bound retries and cannot be "
+                    "resumed by replay. Inspect it in Mission control, then use a new "
+                    "request for changed work."
+                )
+            elif not hmac.compare_digest(stored_digest, admission_digest):
+                conflict = (
+                    "That long-horizon request identity is already bound to a different "
+                    "project, chat, participant set, objective, policy, or attachment set."
+                )
+        return {
+            "project": project,
+            "root": root,
+            "agents": agents,
+            "lead": lead,
+            "participant_ids": exact_participants,
+            "require_all_participants": require_all,
+            "project_authority_id": actual_authority_id,
+            "admission_digest": admission_digest,
+            "goal": goal,
+            "request_retired": request_retired,
+            "conflict": conflict,
+        }
+
+    def preflight_runtime_admission(
+        self, board: dict[str, Any], project_id: str, objectives: list[str],
+        request_id: str, **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Require an exact existing binding, or prove that the identity is unused."""
+
+        inspected = self.inspect_runtime_admission(
+            board, project_id, objectives, request_id, **kwargs,
+        )
+        if inspected["conflict"]:
+            raise HarnessError(str(inspected["conflict"]))
+        return inspected
+
     def create(
         self, board: dict[str, Any], project_id: str, objectives: list[str],
         request_id: str, *, lead_id: str = "", success_criteria: list[str] | None = None,
@@ -749,6 +1449,7 @@ class GoalStore:
         admission_digest: str = "", expected_project_authority_id: str = "",
         require_all_participants: bool | None = None,
     ) -> dict[str, Any]:
+        exact_conversation_id = _exact_conversation_id(conversation_id)
         require_all = bool(participant_ids) if require_all_participants is None \
             else bool(require_all_participants)
         self.validate_create(
@@ -758,9 +1459,7 @@ class GoalStore:
             participant_ids=participant_ids,
             require_all_participants=require_all,
         )
-        client_request_id = _short(request_id, 160)
-        if not client_request_id:
-            raise HarnessError("A stable request ID is required")
+        client_request_id = _exact_request_id(request_id)
         request_id = f"{self.authority_key}:{client_request_id}"
         projects = [one for one in board.get("projects", []) if isinstance(one, dict)]
         project = next((one for one in projects if str(one.get("id") or "") == project_id), None)
@@ -782,10 +1481,7 @@ class GoalStore:
             raise HarnessError(
                 "The selected project's execution authority changed during goal admission."
             )
-        clean_objectives = [
-            _short(self.redactor.text(one), 20_000)
-            for one in objectives if _short(one, 20_000)
-        ]
+        clean_objectives = _redacted_objectives(self.redactor, objectives)
         if not clean_objectives:
             raise HarnessError("Write at least one concrete project goal")
         requested_max_tasks = min(
@@ -799,8 +1495,6 @@ class GoalStore:
                 "The initial objectives and required chat-participant contributions "
                 "exceed the explicit task budget"
             )
-        if sum(len(one) for one in clean_objectives) > MAX_OBJECTIVE_CHARACTERS:
-            raise HarnessError("The combined goal text is too large for one bounded long-horizon goal")
         now = _now()
         goal_id = uuid.uuid4().hex
         tasks: list[dict[str, Any]] = []
@@ -893,7 +1587,7 @@ class GoalStore:
                     "pending_transaction": {},
                 })
         objective = "\n\n".join(clean_objectives)
-        attachment_text = _short((input_bundle or {}).get("attachment_text"), 200_000)
+        attachment_text = str((input_bundle or {}).get("attachment_text") or "")
         if attachment_text:
             objective += "\n\nUSER-SUPPLIED ATTACHMENT TEXT\n" + attachment_text
         if len(objective) > MAX_OBJECTIVE_CHARACTERS:
@@ -928,16 +1622,18 @@ class GoalStore:
             "review_risk": _short((policy or {}).get("review_risk") or "high", 20),
             "legacy_available": True,
         }
+        execution_contract = _exclusive_project_contract(root, target_authority_id)
         bound_admission_digest = _short(admission_digest, 128) or hashlib.sha256(
             _canonical({
                 "project_id": project_id,
                 "project_path": str(root),
                 "project_authority_id": target_authority_id,
-                "conversation_id": _short(conversation_id, 160),
+                "conversation_id": exact_conversation_id,
                 "participant_ids": [one["id"] for one in agents] if participant_ids else [],
                 "require_all_participants": require_all,
                 "lead_id": lead["id"],
                 "agent_bindings": [one.get("route_binding") for one in agents],
+                "execution_contract": execution_contract,
                 "objectives": clean_objectives,
                 "success_criteria": criteria,
                 "policy": runtime_policy,
@@ -963,8 +1659,12 @@ class GoalStore:
             "project_key": _project_key(root),
             "project": {"id": project_id, "name": _short(project.get("name") or root.name, 300), "path": str(root)},
             "project_authority_id": target_authority_id,
+            "execution_contract": execution_contract,
+            "project_queue": self._queue_record(
+                "owner", now, auto_start_pending=True,
+            ),
             "admission_digest": bound_admission_digest,
-            "conversation_id": _short(conversation_id, 160),
+            "conversation_id": exact_conversation_id,
             "requested_agent_ids": [one["id"] for one in agents] if participant_ids else [],
             "require_all_participants": require_all,
             "objective": objective,
@@ -985,14 +1685,18 @@ class GoalStore:
                        "max_context_tool_calls": runtime_policy["max_context_tool_calls"],
                        "tasks_created": len(tasks), "max_tasks": runtime_policy["max_tasks"]},
             "policy": runtime_policy,
-            "worker": {"pid": 0, "token": "", "worker_id": ""},
+            "worker": {
+                "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                "pid": 0, "token": "", "worker_id": "", "acquired_ms": 0,
+            },
+            "cancellation": {
+                "schema_version": CANCELLATION_SCHEMA_VERSION,
+                "state": "none", "requested_ms": 0, "settled_ms": 0,
+            },
             "note": "Ready to begin useful project work.",
             "parent_goal_id": "",
             "fork_checkpoint": 0,
         }
-        raw = _canonical(document)
-        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-        material = [goal_id, request_id, document["project_key"], "queued", 1, raw, digest, now, now]
         with self.lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -1006,32 +1710,80 @@ class GoalStore:
                         raise HarnessError(
                             "That long-horizon request identity is already bound to different work."
                         )
-                    db.rollback()
+                    self._promote_eligible_waiters(db)
+                    existing_document = self._decode(db.execute(
+                        "SELECT * FROM long_goals WHERE request_id=?", (request_id,)
+                    ).fetchone())
+                    db.commit()
                     return self.public(existing_document, reused=True)
+                retired = self._decode_request_tombstone(db.execute(
+                    "SELECT * FROM long_goal_request_tombstones WHERE request_id=?",
+                    (request_id,),
+                ).fetchone())
+                if retired is not None:
+                    if not str(retired.get("admission_digest") or "") \
+                            or not hmac.compare_digest(
+                                str(retired.get("admission_digest") or ""),
+                                bound_admission_digest,
+                            ):
+                        raise HarnessError(
+                            "That retired long-horizon request identity is already "
+                            "bound to different work."
+                        )
+                    db.commit()
+                    return self.public(retired, reused=True)
+                # Reconcile an eligible older waiter before admitting newer
+                # work.  The write transaction makes owner selection atomic
+                # across Nexus processes and configuration authorities.
+                self._promote_eligible_waiters(db)
+                blockers = self._shared_project_owners(
+                    db, root, target_authority_id,
+                )
+                blockers.sort(key=lambda one: (
+                    int(one.get("created_ms") or 0), str(one["goal_id"]),
+                ))
+                if blockers:
+                    blocker_id = str(blockers[0]["goal_id"])
+                    document["status"] = "waiting_for_project"
+                    document["project_queue"] = self._queue_record(
+                        "waiting", now, blocked_by_goal_id=blocker_id, queued_ms=now,
+                    )
+                    document["note"] = (
+                        "Waiting for long-horizon goal " + blocker_id[:8]
+                        + " to release this project."
+                    )
+                raw = _canonical(document)
+                digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+                material = [
+                    goal_id, request_id, document["project_key"], document["status"],
+                    1, raw, digest, now, now,
+                ]
                 db.execute(
                     "INSERT INTO long_goals(goal_id,request_id,project_key,status,revision,document_json,"
                     "document_sha256,integrity_mac,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (goal_id, request_id, document["project_key"], "queued", 1, raw, digest,
+                    (goal_id, request_id, document["project_key"], document["status"], 1, raw, digest,
                      mac("long-horizon-goal-v1", material), now, now),
                 )
                 self._event(db, document, "goal_created", agent_id=lead["id"], payload={
                     "objective": objective, "success_criteria": criteria,
                     "task_ids": [one["id"] for one in tasks], "policy": runtime_policy,
+                    "execution_contract": execution_contract,
+                    "project_queue_state": document["project_queue"]["state"],
                 })
+                if document["status"] == "waiting_for_project":
+                    self._event(db, document, "goal_waiting_for_project", payload={
+                        "blocked_by_goal_id": document["project_queue"]["blocked_by_goal_id"],
+                        "execution_contract_fingerprint": execution_contract["fingerprint_sha256"],
+                    })
                 if public_inputs:
                     self._event(db, document, "input_attached", agent_id=lead["id"], payload={
                         "files": public_inputs,
                     })
                 document["revision"] = 2
                 self._write(db, document)
-                # Retain a bounded terminal history; active goals are never pruned.
-                old = db.execute(
-                    "SELECT goal_id FROM long_goals WHERE status IN ('complete','cancelled','failed') "
-                    "AND request_id LIKE ? ORDER BY updated_ms DESC",
-                    (self.authority_key + ":%",),
-                ).fetchall()
-                for row in old[MAX_GOALS:]:
-                    db.execute("DELETE FROM long_goals WHERE goal_id=?", (str(row["goal_id"]),))
+                # Repair any legacy overage during admission too. New terminal
+                # transitions prune in their own transaction at MAX_GOALS + 1.
+                self._prune_released_goals(db)
                 db.commit()
             except Exception:
                 db.rollback()
@@ -1046,56 +1798,219 @@ class GoalStore:
         return document
 
     def get_by_request(self, request_id: str) -> dict[str, Any] | None:
-        stored = f"{self.authority_key}:{_short(request_id, 160)}"
+        stored = f"{self.authority_key}:{_exact_request_id(request_id)}"
         with self.lock, self._connect() as db:
             document = self._decode(db.execute(
                 "SELECT * FROM long_goals WHERE request_id=?", (stored,)
             ).fetchone())
+            if document is None:
+                document = self._decode_request_tombstone(db.execute(
+                    "SELECT * FROM long_goal_request_tombstones WHERE request_id=?",
+                    (stored,),
+                ).fetchone())
         return self.public(document, reused=True) if document else None
 
     def list(self, limit: int = 20) -> list[dict[str, Any]]:
         with self.lock, self._connect() as db:
-            rows = db.execute(
-                "SELECT * FROM long_goals WHERE request_id LIKE ? ORDER BY updated_ms DESC LIMIT ?",
-                (self.authority_key + ":%", max(1, min(100, limit))),
+            active_rows = db.execute(
+                "SELECT * FROM long_goals WHERE request_id LIKE ? AND status IN "
+                "('queued','running','paused','waiting_for_user','waiting_for_project',"
+                "'failed','cancelling') ORDER BY updated_ms DESC",
+                (self.authority_key + ":%",),
             ).fetchall()
-            return [self.public(self._decode(row)) for row in rows]
+            active_documents = [self._decode(row) for row in active_rows]
+            active = [
+                document for document in active_documents
+                if document is not None and (
+                    self._is_project_owner(document) or self._is_project_waiter(document)
+                )
+            ]
+            history_limit = max(1, min(100, int(limit)))
+            # Failed owners are included above but share a SQL status with
+            # released legacy history. Fetch enough candidates to skip every
+            # active failed row without letting it crowd terminal history out.
+            history_rows = db.execute(
+                "SELECT * FROM long_goals WHERE request_id LIKE ? AND status IN "
+                "('complete','cancelled','failed') ORDER BY updated_ms DESC LIMIT ?",
+                (self.authority_key + ":%", history_limit + len(active)),
+            ).fetchall()
+            history_documents = [self._decode(row) for row in history_rows]
+            history = [
+                document for document in history_documents
+                if document is not None and not self._is_project_owner(document)
+                and not self._is_project_waiter(document)
+            ][:history_limit]
+            by_id = {
+                str(document["goal_id"]): document for document in [*active, *history]
+            }
+            ordered = sorted(
+                by_id.values(), key=lambda one: (
+                    int(one.get("updated_ms") or 0), str(one["goal_id"]),
+                ), reverse=True,
+            )
+            return [self.public(document) for document in ordered]
 
     def active_for_project(self, project_key: str, *, except_goal_id: str = "") -> list[dict[str, Any]]:
         with self.lock, self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM long_goals WHERE project_key=? AND status IN ('queued','running','paused','waiting_for_user') "
+                "SELECT * FROM long_goals WHERE project_key=? "
+                "AND status IN ('queued','running','paused','waiting_for_user','failed','cancelling') "
                 "AND goal_id<>? AND request_id LIKE ? ORDER BY updated_ms DESC",
                 (project_key, except_goal_id, self.authority_key + ":%"),
             ).fetchall()
-            return [self.public(self._decode(row)) for row in rows]
+            return [
+                self.public(document) for row in rows
+                if (document := self._decode(row)) is not None
+                and self._is_project_owner(document)
+            ]
 
     def active_authority_goals(self) -> list[dict[str, Any]]:
         """Return every active goal for this authority without a UI page limit."""
         with self.lock, self._connect() as db:
             rows = db.execute(
-                "SELECT * FROM long_goals WHERE status IN ('queued','running','paused','waiting_for_user') "
+                "SELECT * FROM long_goals WHERE "
+                "status IN ('queued','running','paused','waiting_for_user','waiting_for_project','failed','cancelling') "
                 "AND request_id LIKE ? ORDER BY updated_ms DESC",
                 (self.authority_key + ":%",),
             ).fetchall()
-            return [self.public(self._decode(row)) for row in rows]
+            documents = [self._decode(row) for row in rows]
+            return [
+                self.public(document) for document in documents
+                if document is not None and (
+                    self._is_project_owner(document) or self._is_project_waiter(document)
+                )
+            ]
+
+    def auto_startable_authority_goals(self, limit: int = 8) -> list[dict[str, Any]]:
+        """Return pristine durable starts owned by this configuration authority."""
+
+        with self.lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM long_goals WHERE status='queued' AND request_id LIKE ? "
+                "ORDER BY created_ms,goal_id LIMIT ?",
+                (self.authority_key + ":%", MAX_GOALS),
+            ).fetchall()
+            documents = [self._decode(row) for row in rows]
+        return [
+            self.public(document) for document in documents
+            if document is not None and self._is_project_owner(document)
+            and (document.get("project_queue") or {}).get("auto_start_pending") is True
+            and self._pristine_for_queue_migration(document)
+            and not str((document.get("worker") or {}).get("worker_id") or "")
+        ][:max(1, min(MAX_GOALS, int(limit) if limit else MAX_GOALS))]
+
+    def auto_startable_authority_page(
+        self, after_created_ms: int, after_goal_id: str, *, limit: int = 16,
+    ) -> tuple[list[dict[str, Any]], tuple[int, str]]:
+        """Scan one fair bounded page so old blocked starts cannot starve newer ones."""
+
+        page_size = max(1, min(64, int(limit)))
+        with self.lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM long_goals WHERE status='queued' AND request_id LIKE ? "
+                "AND (created_ms>? OR (created_ms=? AND goal_id>?)) "
+                "ORDER BY created_ms,goal_id LIMIT ?",
+                (
+                    self.authority_key + ":%", int(after_created_ms),
+                    int(after_created_ms), str(after_goal_id), page_size,
+                ),
+            ).fetchall()
+            if not rows and (after_created_ms or after_goal_id):
+                rows = db.execute(
+                    "SELECT * FROM long_goals WHERE status='queued' AND request_id LIKE ? "
+                    "ORDER BY created_ms,goal_id LIMIT ?",
+                    (self.authority_key + ":%", page_size),
+                ).fetchall()
+            documents = [self._decode(row) for row in rows]
+        cursor = (
+            (int(rows[-1]["created_ms"]), str(rows[-1]["goal_id"]))
+            if rows else (0, "")
+        )
+        return ([
+            self.public(document) for document in documents
+            if document is not None and self._is_project_owner(document)
+            and (document.get("project_queue") or {}).get("auto_start_pending") is True
+            and self._pristine_for_queue_migration(document)
+            and not str((document.get("worker") or {}).get("worker_id") or "")
+        ], cursor)
 
     def active_overlapping_project(self, project_path: Path, *, except_goal_id: str = "") -> list[dict[str, Any]]:
         wanted = project_path.resolve()
-        return [
-            goal for goal in self.active_authority_goals()
-            if goal["goal_id"] != except_goal_id
-            and (
-                Path(goal["project"]["path"]).resolve() == wanted
-                or Path(goal["project"]["path"]).resolve() in wanted.parents
-                or wanted in Path(goal["project"]["path"]).resolve().parents
+        try:
+            wanted_authority = project_identity(wanted)
+        except Exception:
+            wanted_authority = ""
+        with self.lock, self._connect() as db:
+            owners = self._shared_project_owners(
+                db, wanted, wanted_authority, except_goal_id=except_goal_id,
             )
+        return [self.public(goal) for goal in owners]
+
+    def reconcile_project_queue(self) -> list[dict[str, Any]]:
+        """Promote every globally eligible waiter without dispatching provider work."""
+
+        with self.lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                promoted_ids = self._promote_eligible_waiters(db)
+                rows = [
+                    db.execute("SELECT * FROM long_goals WHERE goal_id=?", (goal_id,)).fetchone()
+                    for goal_id in promoted_ids
+                ]
+                promoted = [
+                    self._decode_shared(row) for row in rows if row is not None
+                ]
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+        return [
+            self.public(goal) for goal in promoted
+            if str(goal.get("authority_key") or "") == self.authority_key
+        ]
+
+    def owned_queued_goals(self) -> list[dict[str, Any]]:
+        with self.lock, self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM long_goals WHERE status='queued' AND request_id LIKE ? "
+                "ORDER BY created_ms,goal_id",
+                (self.authority_key + ":%",),
+            ).fetchall()
+            documents = [self._decode(row) for row in rows]
+        return [
+            self.public(document) for document in documents
+            if document is not None and self._is_project_owner(document)
         ]
 
     def public(self, document: dict[str, Any] | None, *, reused: bool = False) -> dict[str, Any]:
         if document is None:
             return {}
         value = copy.deepcopy(document)
+        if value.get("request_tombstone") is True:
+            value["request_id"] = value.get(
+                "client_request_id", value.get("request_id", "")
+            )
+            value["reused"] = reused
+            value["promoted_goal_ids"] = []
+            value["progress"] = {"complete": 0, "total": 0}
+            value["pending_interrupts"] = []
+            value["note"] = (
+                "This terminal goal's detailed history was pruned, but its exact "
+                "request identity remains permanently retired to prevent replay."
+            )
+            value["provider_setup_changed"] = False
+            value["provider_setup_status"] = {
+                "changed": False,
+                "code": "terminal_request_retired",
+                "message": (
+                    "Detailed terminal history was pruned; the exact request remains "
+                    "retired and cannot dispatch again."
+                ),
+                "agents": [],
+                "recovery_action": "",
+            }
+            return value
+        value["promoted_goal_ids"] = list(value.pop("_promoted_goal_ids", []))
         value.pop("input_provider_attachments", None)
         value["request_id"] = value.get("client_request_id", value.get("request_id", ""))
         value["reused"] = reused
@@ -1122,13 +2037,12 @@ class GoalStore:
             raise HarnessError("That long-horizon goal belongs to a different Nexus project authority")
         if any(one.get("state") == "pending" for one in source.get("interrupts", [])):
             raise HarnessError("Answer or cancel the pending decision before forking this goal")
-        client_request_id = _short(request_id, 160)
-        if not client_request_id:
-            raise HarnessError("A stable fork request ID is required")
+        client_request_id = _exact_request_id(request_id, what="fork request")
         stored_request_id = f"{self.authority_key}:{client_request_id}"
         now = _now()
         document = copy.deepcopy(source)
         old_goal_id = str(source["goal_id"])
+        target_authority_id = project_identity(project_path)
         document.update({
             "goal_id": uuid.uuid4().hex,
             "request_id": stored_request_id,
@@ -1139,8 +2053,19 @@ class GoalStore:
             "event_floor_previous_sha256": "", "created_ms": now, "updated_ms": now,
             "project_key": _project_key(project_path),
             "project": {"id": project_id, "name": project_name, "path": str(project_path)},
-            "project_authority_id": project_identity(project_path),
-            "worker": {"pid": 0, "token": "", "worker_id": ""},
+            "project_authority_id": target_authority_id,
+            "execution_contract": _exclusive_project_contract(
+                project_path, target_authority_id,
+            ),
+            "project_queue": self._queue_record("owner", now),
+            "worker": {
+                "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                "pid": 0, "token": "", "worker_id": "", "acquired_ms": 0,
+            },
+            "cancellation": {
+                "schema_version": CANCELLATION_SCHEMA_VERSION,
+                "state": "none", "requested_ms": 0, "settled_ms": 0,
+            },
             "parent_goal_id": old_goal_id,
             "fork_checkpoint": int(source.get("event_seq") or 0),
             "note": "Forked from the saved task/evidence checkpoint into an isolated Git worktree. Resume when ready.",
@@ -1164,8 +2089,27 @@ class GoalStore:
             try:
                 existing = db.execute("SELECT * FROM long_goals WHERE request_id=?", (stored_request_id,)).fetchone()
                 if existing is not None:
+                    existing_document = self._decode(existing)
+                    if existing_document is None or str(
+                        existing_document.get("parent_goal_id") or ""
+                    ) != old_goal_id:
+                        raise HarnessError(
+                            "That fork request identity already belongs to another goal"
+                        )
                     db.rollback()
-                    return self.public(self._decode(existing), reused=True)
+                    return self.public(existing_document, reused=True)
+                retired = self._decode_request_tombstone(db.execute(
+                    "SELECT * FROM long_goal_request_tombstones WHERE request_id=?",
+                    (stored_request_id,),
+                ).fetchone())
+                if retired is not None:
+                    if str(retired.get("parent_goal_id") or "") != old_goal_id:
+                        raise HarnessError(
+                            "That retired fork request identity already belongs to "
+                            "another goal"
+                        )
+                    db.commit()
+                    return self.public(retired, reused=True)
                 db.execute(
                     "INSERT INTO long_goals(goal_id,request_id,project_key,status,revision,document_json,"
                     "document_sha256,integrity_mac,created_ms,updated_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -1274,10 +2218,139 @@ class GoalStore:
                 return False
         return True
 
+    @staticmethod
+    def _scheduler_record(worker_id: str, *, kind: str = "runtime") -> dict[str, Any]:
+        return {
+            "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+            "pid": os.getpid(),
+            "token": _process_token(os.getpid()),
+            "worker_id": str(worker_id),
+            "kind": str(kind),
+            "acquired_ms": _now(),
+        }
+
+    @staticmethod
+    def _scheduler_live(document: dict[str, Any]) -> bool:
+        worker = document.get("worker") or {}
+        return bool(str(worker.get("worker_id") or "")) and _owner_is_alive(
+            int(worker.get("pid") or 0), str(worker.get("token") or ""),
+        )
+
+    def claim_scheduler(self, goal_id: str, worker_id: str) -> bool:
+        """Atomically acquire the one durable graph-dispatch lease for a goal."""
+
+        worker_id = str(worker_id)
+        if not worker_id:
+            raise HarnessError("A stable scheduler identity is required")
+        with self.lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                row = db.execute(
+                    "SELECT * FROM long_goals WHERE goal_id=?", (goal_id,),
+                ).fetchone()
+                document = self._decode(row)
+                if document is None:
+                    raise HarnessError("That long-horizon goal does not exist")
+                if document.get("status") != "queued" or not self._is_project_owner(document):
+                    db.rollback()
+                    return False
+                held = document.get("worker") or {}
+                same = (
+                    str(held.get("worker_id") or "") == worker_id
+                    and int(held.get("pid") or 0) == os.getpid()
+                    and hmac.compare_digest(
+                        str(held.get("token") or ""), _process_token(os.getpid()),
+                    )
+                )
+                if same and self._scheduler_live(document):
+                    db.commit()
+                    return True
+                if str(held.get("worker_id") or "") and not (
+                    held.get("kind") == "claim"
+                    and not any(one.get("state") == "running" for one in document["tasks"])
+                ):
+                    # A dead lease is recovered separately so a process cannot
+                    # skip provider-effect reconciliation while taking over.
+                    db.rollback()
+                    return False
+                document["worker"] = self._scheduler_record(worker_id)
+                self._event(db, document, "goal_scheduler_claimed", payload={
+                    "worker_id": worker_id,
+                })
+                document["revision"] = int(document["revision"]) + 1
+                self._write(db, document)
+                db.commit()
+                return True
+            except Exception:
+                db.rollback()
+                raise
+
+    def release_scheduler(self, goal_id: str, worker_id: str) -> bool:
+        """CAS-clear a scheduler lease without disturbing a newer runtime."""
+
+        with self.lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                document = self._decode(db.execute(
+                    "SELECT * FROM long_goals WHERE goal_id=?", (goal_id,),
+                ).fetchone())
+                if document is None:
+                    raise HarnessError("That long-horizon goal does not exist")
+                held = document.get("worker") or {}
+                same = (
+                    str(held.get("worker_id") or "") == str(worker_id)
+                    and int(held.get("pid") or 0) == os.getpid()
+                    and hmac.compare_digest(
+                        str(held.get("token") or ""), _process_token(os.getpid()),
+                    )
+                )
+                if not same:
+                    db.rollback()
+                    return False
+                document["worker"] = {
+                    "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                    "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
+                    "acquired_ms": 0,
+                }
+                self._event(db, document, "goal_scheduler_released", payload={
+                    "worker_id": str(worker_id),
+                })
+                document["revision"] = int(document["revision"]) + 1
+                self._write(db, document)
+                db.commit()
+                return True
+            except Exception:
+                db.rollback()
+                raise
+
     def claim_ready(self, goal_id: str, worker_id: str) -> list[dict[str, Any]]:
         def change(document: dict[str, Any], db: sqlite3.Connection):
-            if document["status"] in TERMINAL_GOALS or document["status"] in {"paused", "waiting_for_user"}:
+            if document["status"] in TERMINAL_GOALS or document["status"] in {
+                "paused", "waiting_for_user", "waiting_for_project", "cancelling",
+            }:
                 return []
+            held = document.get("worker") or {}
+            live = self._scheduler_live(document)
+            exact = live and (
+                int(held.get("pid") or 0) == os.getpid()
+                and hmac.compare_digest(
+                    str(held.get("token") or ""), _process_token(os.getpid()),
+                )
+                and str(held.get("worker_id") or "") == str(worker_id)
+            )
+            if live and not exact:
+                # Low-level claim leases used by store tests may hand off only
+                # after their prior task is no longer running. Runtime leases
+                # cover the entire graph invocation and are never replaceable.
+                if held.get("kind") != "claim" or any(
+                    one.get("state") == "running" for one in document["tasks"]
+                ):
+                    return []
+                live = False
+            if not live:
+                if str(held.get("worker_id") or "") and held.get("kind") == "runtime":
+                    return []
+                document["worker"] = self._scheduler_record(worker_id, kind="claim")
             self._refresh_waiting(document)
             if document["budget"]["provider_calls"] >= document["budget"]["max_provider_calls"]:
                 document["status"] = "paused"
@@ -1315,7 +2388,6 @@ class GoalStore:
                             agent_id=task["assigned_agent_id"], payload={"lease_id": task["lease_id"]})
             if chosen:
                 document["status"] = "running"
-                document["worker"] = {"pid": os.getpid(), "token": _process_token(os.getpid()), "worker_id": worker_id}
                 document["note"] = f"{len(chosen)} useful task(s) are running."
             return copy.deepcopy(chosen)
         return self._mutate(goal_id, change)[1]
@@ -1327,13 +2399,21 @@ class GoalStore:
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current["lease_id"] != task["lease_id"] or current["state"] != "running":
                 raise HarnessError("That task lease is stale; Nexus did not dispatch it")
-            if document["status"] in {"paused", "waiting_for_user", "cancelled"} \
+            if document["status"] in {
+                "paused", "waiting_for_user", "cancelled", "cancelling",
+            } \
                     or int(current.get("claim_objective_epoch") or 0) \
                     != int(document.get("objective_epoch") or 1):
                 raise HarnessError("The goal changed or paused before this provider continuation")
             if document["budget"]["provider_calls"] >= document["budget"]["max_provider_calls"]:
                 raise HarnessError("The explicit provider-call budget was reached before dispatch")
             document["budget"]["provider_calls"] += 1
+            queue = document.get("project_queue") or {}
+            if queue.get("auto_start_pending") is True:
+                queue["auto_start_pending"] = False
+                self._event(db, document, "goal_auto_start_consumed", payload={
+                    "task_id": current["id"],
+                })
             current["provider_effect_state"] = "dispatched"
             current["provider_effect_id"] = _stable_id(
                 "effect", goal_id, current["id"], current["attempts"],
@@ -1387,7 +2467,9 @@ class GoalStore:
                 "outcome_unknown": False, "reconciliation_required": True,
                 "provider_effect_state": "reply_received_reconciliation_required",
             })
-            if document["status"] not in {"cancelled", "waiting_for_user"}:
+            if document["status"] not in {
+                "cancelled", "waiting_for_user", "cancelling",
+            }:
                 document["status"] = "paused"
             document["note"] = current["last_error"]
             self._event(
@@ -1405,7 +2487,9 @@ class GoalStore:
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current.get("lease_id") != task.get("lease_id") or current["state"] != "running":
                 raise HarnessError("That task lease is stale; Nexus did not run its context tool")
-            if document["status"] in {"paused", "waiting_for_user", "cancelled"} \
+            if document["status"] in {
+                "paused", "waiting_for_user", "cancelled", "cancelling",
+            } \
                     or int(current.get("claim_objective_epoch") or 0) \
                     != int(document.get("objective_epoch") or 1):
                 raise HarnessError("The goal changed or paused before this context tool could run")
@@ -1438,6 +2522,8 @@ class GoalStore:
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current.get("lease_id") != task.get("lease_id") or current["state"] != "running":
                 raise HarnessError("The context-tool request belongs to a stale task lease")
+            if document.get("status") == "cancelling":
+                raise HarnessError("The goal is draining cancellation before context tools run")
             if int(current.get("claim_objective_epoch") or 0) != int(document.get("objective_epoch") or 1):
                 raise HarnessError("The context-tool request was superseded by user steering")
             calls = copy.deepcopy(action.get("tool_calls") or [])
@@ -1536,8 +2622,9 @@ class GoalStore:
                                 "current_objective_epoch": document.get("objective_epoch", 1),
                                 "effect_id": current.get("provider_effect_id", ""),
                             }, run_id=goal_id)
-                document["status"] = "queued"
-                document["note"] = "A stale provider result was discarded after user steering."
+                if document.get("status") != "cancelling":
+                    document["status"] = "queued"
+                    document["note"] = "A stale provider result was discarded after user steering."
                 return False
             if current["lease_id"] != task["lease_id"] or current["state"] != "running":
                 raise HarnessError("A late agent result cannot overwrite the task's current owner")
@@ -1621,6 +2708,13 @@ class GoalStore:
                 "at_ms": _now(), "outcome_unknown": bool(uncertain),
             })
             del history[:-12]
+            if document.get("status") == "cancelling":
+                self._event(
+                    db, document, "task_drained_for_cancellation",
+                    task_id=current["id"], agent_id=current["assigned_agent_id"],
+                    payload={"error": current["last_error"], "uncertain": bool(uncertain)},
+                )
+                return
             replacement = None
             if allow_failover and not uncertain and not current.get("required_contributor_id"):
                 # Route aliases are not independent failover. Once a provider
@@ -1658,7 +2752,7 @@ class GoalStore:
                 # A provider failover may prepare a different ready owner, but
                 # it must never override a user Pause or waiting-for-user
                 # boundary. Resume will admit the prepared task later.
-                if document["status"] not in {"paused", "waiting_for_user"}:
+                if document["status"] not in {"paused", "waiting_for_user", "cancelling"}:
                     document["status"] = "queued"
                 document["note"] = (
                     f"{previous_agent} failed with a known provider outcome; Nexus reassigned "
@@ -1714,6 +2808,8 @@ class GoalStore:
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current.get("lease_id") != task.get("lease_id") or current["state"] != "running":
                 raise HarnessError("The requested-file continuation belongs to a stale task lease")
+            if document.get("status") == "cancelling":
+                raise HarnessError("The goal is draining cancellation before more file context")
             if int(current.get("claim_objective_epoch") or 0) != int(document.get("objective_epoch") or 1):
                 raise HarnessError("The requested-file continuation was superseded by user steering")
             step = {
@@ -1741,6 +2837,8 @@ class GoalStore:
     ) -> None:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
+            if document.get("status") == "cancelling":
+                raise HarnessError("The goal is draining cancellation before file preparation")
             if current.get("lease_id") != task.get("lease_id") or current["state"] not in {"running", "pending_apply"}:
                 raise HarnessError("The task lease changed before its file transaction was prepared")
             current["pending_transaction"] = {
@@ -1786,6 +2884,8 @@ class GoalStore:
         interrupt_ids: list[str] = []
 
         def change(document: dict[str, Any], db: sqlite3.Connection):
+            if document.get("status") == "cancelling":
+                raise HarnessError("The goal is draining cancellation before risk review")
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current.get("lease_id") != task.get("lease_id") \
                     or current["state"] not in {"running", "pending_apply"}:
@@ -1932,8 +3032,10 @@ class GoalStore:
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current["lease_id"] != task["lease_id"] or current["state"] not in {"running", "pending_apply"}:
                 raise HarnessError("A stale task action cannot change long-horizon state")
-            if document["status"] == "cancelled":
-                raise HarnessError("The goal was cancelled before this result could be applied")
+            if document["status"] in {"cancelled", "cancelling"}:
+                raise HarnessError(
+                    "The goal was cancelled or is draining before this result could be applied"
+                )
             _validate_action_semantics(action, current)
             current["pending_action"] = {}
             current["summary"] = _short(action.get("summary"), 8_000)
@@ -2173,7 +3275,7 @@ class GoalStore:
             current.update({"lease_id": "", "owner_pid": 0, "owner_token": "", "updated_ms": _now()})
             current["pending_transaction"] = {}
             self._refresh_waiting(document)
-            if document["status"] not in {"waiting_for_user", "paused"}:
+            if document["status"] not in {"waiting_for_user", "paused", "cancelling"}:
                 document["status"] = "queued"
                 document["note"] = current["summary"] or "The scheduler is choosing the next useful task."
             return interrupt_ids
@@ -2283,7 +3385,7 @@ class GoalStore:
             str(one) for one in envelope.get("pending_ids", []) if str(one)
         } if isinstance(envelope.get("pending_ids"), list) else set()
         def change(document: dict[str, Any], db: sqlite3.Connection):
-            if document["status"] in TERMINAL_GOALS:
+            if document["status"] in TERMINAL_GOALS | {"cancelling"}:
                 raise HarnessError("A terminal goal is immutable; its old decision cards cannot be answered")
             risk_rejected = False
             pending = [one for one in document["interrupts"] if one["state"] == "pending"]
@@ -2354,7 +3456,9 @@ class GoalStore:
 
     def pause_deadlock(self, goal_id: str, reason: str) -> None:
         def change(document: dict[str, Any], db: sqlite3.Connection):
-            if document["status"] in TERMINAL_GOALS | {"paused", "waiting_for_user"}:
+            if document["status"] in TERMINAL_GOALS | {
+                "paused", "waiting_for_user", "cancelling",
+            }:
                 return
             document["status"] = "paused"
             document["note"] = _short(reason, 4_000)
@@ -2368,6 +3472,14 @@ class GoalStore:
         cancellation_error: list[str] = []
 
         def change(document: dict[str, Any], db: sqlite3.Connection):
+            if document["status"] == "waiting_for_project" and action != "cancel":
+                raise HarnessError(
+                    "This goal is waiting for the current project owner and cannot dispatch or change yet"
+                )
+            if document["status"] == "cancelling" and action != "cancel":
+                raise HarnessError(
+                    "This goal is draining cancellation and cannot accept other controls"
+                )
             def publish_recovered_applied(task: dict[str, Any], reason: str) -> bool:
                 pending = task.get("pending_transaction") or {}
                 artifact = pending.get("artifact") if pending.get("state") == "applied" else None
@@ -2512,6 +3624,8 @@ class GoalStore:
                     raise HarnessError("Answer the pending question before resuming")
                 if document["status"] not in {"paused", "failed"}:
                     raise HarnessError("Only a paused or failed goal can resume")
+                released_failed = document["status"] == "failed" \
+                    and self._project_queue_state(document) == "released"
                 if any(
                     one["state"] in {"blocked", "failed"} and _task_has_unsettled_effect(one)
                     for one in document["tasks"]
@@ -2523,22 +3637,133 @@ class GoalStore:
                     if task["state"] in {"blocked", "failed"} and task.get("outcome_unknown") is not True:
                         task["state"] = "ready"
                         task["last_error"] = ""
+                if released_failed:
+                    blockers = self._shared_project_owners(
+                        db,
+                        Path(str(document["project"]["path"])),
+                        str(document.get("project_authority_id") or ""),
+                        except_goal_id=str(document["goal_id"]),
+                    )
+                    blockers.sort(key=lambda one: (
+                        int(one.get("created_ms") or 0), str(one["goal_id"]),
+                    ))
+                    now = _now()
+                    if blockers:
+                        blocker_id = str(blockers[0]["goal_id"])
+                        document["status"] = "waiting_for_project"
+                        document["project_queue"] = self._queue_record(
+                            "waiting", now,
+                            blocked_by_goal_id=blocker_id, queued_ms=now,
+                        )
+                        document["note"] = (
+                            "Resume is waiting for long-horizon goal "
+                            + blocker_id[:8] + " to release this project."
+                        )
+                        self._event(db, document, "goal_resume_waiting_for_project", payload={
+                            "blocked_by_goal_id": blocker_id,
+                            "automatic_dispatch": False,
+                        })
+                        return
+                    document["project_queue"] = self._queue_record(
+                        "owner", now, auto_start_pending=True,
+                    )
+                    self._event(db, document, "goal_project_claimed_for_resume", payload={
+                        "automatic_dispatch": False,
+                        "execution_contract_fingerprint": document[
+                            "execution_contract"
+                        ]["fingerprint_sha256"],
+                    })
                 document["status"] = "queued"
                 document["note"] = "Resumed from the saved state."
                 self._event(db, document, "goal_resumed", payload={"budgets_preserved": True})
             elif action == "cancel":
-                if document["status"] in TERMINAL_GOALS:
+                if document["status"] in {"complete", "cancelled"}:
+                    return _NO_MUTATION
+                released_failed = document["status"] == "failed" \
+                    and self._project_queue_state(document) == "released"
+                if released_failed and any(
+                    _task_has_unsettled_effect(task) for task in document["tasks"]
+                ):
+                    blockers = self._shared_project_owners(
+                        db,
+                        Path(str(document["project"]["path"])),
+                        str(document.get("project_authority_id") or ""),
+                        except_goal_id=str(document["goal_id"]),
+                    )
+                    if blockers:
+                        blockers.sort(key=lambda one: (
+                            int(one.get("created_ms") or 0), str(one["goal_id"]),
+                        ))
+                        raise HarnessError(
+                            "Cancellation must wait for long-horizon goal "
+                            + str(blockers[0]["goal_id"])[:8]
+                            + " to release this project before reconciling saved file effects"
+                        )
+                    now = _now()
+                    document["project_queue"] = self._queue_record("owner", now)
+                    released_failed = False
+                    self._event(db, document, "goal_project_claimed_for_cancellation", payload={
+                        "automatic_dispatch": False,
+                        "execution_contract_fingerprint": document[
+                            "execution_contract"
+                        ]["fingerprint_sha256"],
+                    })
+                worker = document.get("worker") or {}
+                worker_live = self._scheduler_live(document) \
+                    and worker.get("kind") == "runtime"
+                drain_complete = payload.get("drain_complete") is True
+                exact_drainer = worker_live and (
+                    int(worker.get("pid") or 0) == os.getpid()
+                    and hmac.compare_digest(
+                        str(worker.get("token") or ""), _process_token(os.getpid()),
+                    )
+                    and str(worker.get("worker_id") or "")
+                    == str(payload.get("scheduler_id") or "")
+                )
+                if drain_complete and worker_live and not exact_drainer:
+                    raise HarnessError(
+                        "Only the durable scheduler lease holder can finish cancellation draining"
+                    )
+                if worker_live and not drain_complete:
+                    cancellation = document.get("cancellation") or {}
+                    if document.get("status") == "cancelling" \
+                            and cancellation.get("state") == "draining":
+                        return _NO_MUTATION
+                    requested_ms = _now()
+                    document["cancellation"] = {
+                        "schema_version": CANCELLATION_SCHEMA_VERSION,
+                        "state": "draining",
+                        "requested_ms": requested_ms,
+                        "settled_ms": 0,
+                    }
+                    document["status"] = "cancelling"
+                    document["note"] = (
+                        "Cancellation requested; Nexus is waiting for the in-flight "
+                        "provider boundary to drain before releasing the project."
+                    )
+                    self._event(db, document, "goal_cancellation_requested", payload={
+                        "worker_id": str(worker.get("worker_id") or ""),
+                        "release_deferred": True,
+                    })
                     return
                 try:
                     for task in document["tasks"]:
                         settle_for_cancellation(task)
                 except HarnessError as exc:
                     detail = _short(exc, 2_000)
-                    document["status"] = "paused"
+                    document["status"] = "failed" if released_failed else "paused"
                     document["note"] = (
-                        "Cancellation paused because a file effect could not be reconciled safely: "
+                        (
+                            "Cancellation could not finish because a file effect could not be reconciled safely: "
+                            if released_failed else
+                            "Cancellation paused because a file effect could not be reconciled safely: "
+                        )
                         + detail
                     )
+                    document["cancellation"] = {
+                        "schema_version": CANCELLATION_SCHEMA_VERSION,
+                        "state": "none", "requested_ms": 0, "settled_ms": 0,
+                    }
                     for held in document["tasks"]:
                         if held.get("pending_transaction") and held["state"] in {
                             "running", "pending_apply", "failed",
@@ -2557,6 +3782,19 @@ class GoalStore:
                         "Cancellation could not settle every provider or file effect"
                     )
                 document["status"] = "cancelled"
+                requested_ms = int((document.get("cancellation") or {}).get(
+                    "requested_ms"
+                ) or _now())
+                document["cancellation"] = {
+                    "schema_version": CANCELLATION_SCHEMA_VERSION,
+                    "state": "settled", "requested_ms": requested_ms,
+                    "settled_ms": _now(),
+                }
+                document["worker"] = {
+                    "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                    "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
+                    "acquired_ms": 0,
+                }
                 for task in document["tasks"]:
                     if task["state"] not in {"complete", "cancelled"}:
                         task["state"] = "cancelled"
@@ -2871,7 +4109,7 @@ class GoalStore:
         expected_revision: int | None = None, expected_objective_epoch: int | None = None,
     ) -> dict[str, Any]:
         def change(document: dict[str, Any], db: sqlite3.Connection):
-            if document["status"] in TERMINAL_GOALS:
+            if document["status"] in TERMINAL_GOALS | {"cancelling"}:
                 return
             if (expected_revision is not None and int(document["revision"]) != int(expected_revision)) \
                     or (expected_objective_epoch is not None and int(document.get("objective_epoch") or 1)
@@ -2881,7 +4119,7 @@ class GoalStore:
                     "reason": "The goal changed while verification was running; this result was not used.",
                     "commands": [],
                 }
-                if document["status"] not in {"paused", "waiting_for_user"}:
+                if document["status"] not in {"paused", "waiting_for_user", "cancelling"}:
                     document["status"] = (
                         "running" if any(one["state"] == "running" for one in document["tasks"])
                         else "queued"
@@ -2975,6 +4213,8 @@ class GoalStore:
     def recover_dead(self, goal_id: str) -> dict[str, Any]:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             worker = document.get("worker", {})
+            was_cancelling = document.get("status") == "cancelling" \
+                and (document.get("cancellation") or {}).get("state") == "draining"
             has_running_lease = any(one["state"] == "running" for one in document["tasks"])
             if not has_running_lease or _owner_is_alive(
                 int(worker.get("pid") or 0), str(worker.get("token") or "")
@@ -3056,9 +4296,24 @@ class GoalStore:
                             "Nexus restarted before the provider effect began; retry is safe."
                         )
                         task.update({"lease_id": "", "owner_pid": 0, "owner_token": ""})
-            document["status"] = "paused"
-            document["note"] = "Recovered exact goal state after restart; uncertain effects were not resent."
-            self._event(db, document, "goal_recovered", payload={"automatic_retry": False})
+            document["worker"] = {
+                "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
+                "acquired_ms": 0,
+            }
+            if was_cancelling:
+                document["status"] = "cancelling"
+                document["note"] = (
+                    "Recovered the cancelled scheduler after restart; Nexus will settle "
+                    "the drained boundary without resending provider work."
+                )
+                self._event(db, document, "goal_cancellation_drain_recovered", payload={
+                    "automatic_retry": False,
+                })
+            else:
+                document["status"] = "paused"
+                document["note"] = "Recovered exact goal state after restart; uncertain effects were not resent."
+                self._event(db, document, "goal_recovered", payload={"automatic_retry": False})
         return self.public(self._mutate(goal_id, change)[0])
 
     def recover_orphaned_queue(self, goal_id: str) -> dict[str, Any]:
@@ -3071,12 +4326,30 @@ class GoalStore:
                 return
             if any(one["state"] == "running" for one in document["tasks"]):
                 raise HarnessError("A queued goal with an active lease must use provider-effect recovery")
+            if (document.get("project_queue") or {}).get("auto_start_pending") is True \
+                    and self._pristine_for_queue_migration(document):
+                document["worker"] = {
+                    "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                    "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
+                    "acquired_ms": 0,
+                }
+                document["note"] = (
+                    "Recovered a pristine committed start before any provider dispatch."
+                )
+                self._event(db, document, "goal_pristine_auto_start_recovered", payload={
+                    "automatic_retry": True, "provider_dispatched": False,
+                })
+                return
             document["status"] = "paused"
             document["note"] = (
                 "Recovered a committed scheduling boundary after restart. Resume to continue; "
                 "Nexus did not repeat a provider or file effect."
             )
-            document["worker"] = {"pid": 0, "token": "", "worker_id": ""}
+            document["worker"] = {
+                "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+                "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
+                "acquired_ms": 0,
+            }
             self._event(db, document, "goal_recovered", payload={
                 "automatic_retry": False, "boundary": "queued_between_nodes",
             })
@@ -3094,8 +4367,12 @@ class GoalStore:
                                 agent_id=task["assigned_agent_id"], payload={"phase": "apply", "error": task["last_error"]})
                     changed = True
             if changed:
-                document["status"] = "paused"
-                document["note"] = "A structured result could not be safely applied: " + _short(error, 2_000)
+                if document.get("status") != "cancelling":
+                    document["status"] = "paused"
+                    document["note"] = (
+                        "A structured result could not be safely applied: "
+                        + _short(error, 2_000)
+                    )
         return self.public(self._mutate(goal_id, change)[0])
 
 
@@ -3114,7 +4391,19 @@ class LongHorizonRuntime:
         self.graph = self._build_graph()
         self.lock = threading.RLock()
         self.workers: dict[str, threading.Thread] = {}
+        self.scheduler_ids: dict[str, str] = {}
+        self._auto_start_attempted: dict[str, float] = {}
+        self._auto_start_cursor: tuple[int, str] = (0, "")
         self.external_project_conflicts = external_project_conflicts
+        self._auto_start_enabled = False
+        self._watcher_stop = threading.Event()
+        self._watcher_wake = threading.Event()
+        self._watcher = threading.Thread(
+            target=self._auto_start_watch,
+            name="nexus-long-horizon-auto-start",
+            daemon=True,
+        )
+        self._watcher.start()
 
     def _require_no_external_owner(self, root: Path) -> None:
         conflicts = self.external_project_conflicts(root) if self.external_project_conflicts else []
@@ -3150,10 +4439,57 @@ class LongHorizonRuntime:
         return actual
 
     def close(self) -> None:
+        self._watcher_stop.set()
+        self._watcher_wake.set()
+        if self._watcher.is_alive() and threading.current_thread() is not self._watcher:
+            self._watcher.join(timeout=2.0)
+        deadline = time.monotonic() + 5.0
+        with self.lock:
+            workers = list(self.workers.values())
+        for worker in workers:
+            if worker is threading.current_thread() or not worker.is_alive():
+                continue
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self.lock:
+            workers_alive = any(one.is_alive() for one in self.workers.values())
+        if workers_alive:
+            # A provider may be legitimately blocked outside our process. Do
+            # not close LangGraph's SQLite handle from underneath its thread.
+            return
         try:
             self._checkpoint_context.__exit__(None, None, None)
         except Exception:
             pass
+
+    def _enable_auto_start_watcher(self) -> None:
+        if not self._auto_start_enabled:
+            self._auto_start_enabled = True
+            self._watcher_wake.set()
+
+    def _auto_start_watch(self) -> None:
+        while not self._watcher_stop.is_set():
+            self._watcher_wake.wait(timeout=0.25)
+            self._watcher_wake.clear()
+            if self._watcher_stop.is_set() or not self._auto_start_enabled:
+                continue
+            try:
+                goals, cursor = self.store.auto_startable_authority_page(
+                    *self._auto_start_cursor,
+                )
+                self._auto_start_cursor = cursor
+            except Exception:
+                continue
+            for goal in goals:
+                if self._watcher_stop.is_set():
+                    break
+                try:
+                    with self.lock:
+                        recent = self._auto_start_attempted.get(str(goal["goal_id"]), 0.0)
+                    if time.monotonic() - recent < 60.0:
+                        continue
+                    self.start_background(str(goal["goal_id"]))
+                except Exception:
+                    continue
 
     def _build_graph(self):
         graph = StateGraph(GoalGraphState)
@@ -3178,12 +4514,18 @@ class LongHorizonRuntime:
 
     def _schedule_node(self, state: GoalGraphState) -> GoalGraphState:
         goal = self.store.get(state["goal_id"])
-        if goal["status"] in TERMINAL_GOALS or goal["status"] in {"paused", "waiting_for_user"}:
+        if goal["status"] in TERMINAL_GOALS or goal["status"] in {
+            "paused", "waiting_for_user", "waiting_for_project", "cancelling",
+        }:
             return {"task_ids": [], "route": "end"}
         pending = [one["id"] for one in goal["tasks"] if one["state"] == "pending_apply" and one.get("pending_action")]
         if pending:
             return {"task_ids": pending, "actions": [], "route": "apply"}
-        tasks = self.store.claim_ready(goal["goal_id"], uuid.uuid4().hex)
+        with self.lock:
+            scheduler_id = self.scheduler_ids.get(goal["goal_id"], "")
+        tasks = self.store.claim_ready(
+            goal["goal_id"], scheduler_id or uuid.uuid4().hex,
+        )
         if tasks:
             return {"task_ids": [one["id"] for one in tasks], "route": "act"}
         goal = self.store.get(goal["goal_id"])
@@ -3375,7 +4717,9 @@ class LongHorizonRuntime:
                         != int(current_goal.get("objective_epoch") or 1) \
                         or current_task.get("lease_id") != task.get("lease_id"):
                     return "superseded"
-                if current_goal["status"] in {"paused", "waiting_for_user"}:
+                if current_goal["status"] in {
+                    "paused", "waiting_for_user", "cancelling",
+                }:
                     self.store.defer_context_continuation(goal_id, task)
                     return "deferred"
                 return "continue"
@@ -3610,7 +4954,9 @@ class LongHorizonRuntime:
                     != int(current_goal.get("objective_epoch") or 1):
                 continue
             _validate_action_semantics(action, current_task)
-            if current_goal["status"] in {"paused", "waiting_for_user"}:
+            if current_goal["status"] in {
+                "paused", "waiting_for_user", "cancelling",
+            }:
                 # Parallel provider replies are acknowledged before this apply
                 # loop. Once any one action opens a human decision boundary,
                 # later actions must remain durable pending work; mutating files
@@ -3687,7 +5033,11 @@ class LongHorizonRuntime:
         goal = self.store.get(goal_id)
         if goal["status"] == "waiting_for_user" and interrupts:
             return {"interrupt_ids": interrupts, "route": "human"}
-        return {"route": "end" if goal["status"] in TERMINAL_GOALS | {"paused"} else "schedule"}
+        return {
+            "route": "end" if goal["status"] in TERMINAL_GOALS | {
+                "paused", "cancelling",
+            } else "schedule",
+        }
 
     def _human_node(self, state: GoalGraphState) -> GoalGraphState:
         goal = self.store.get(state["goal_id"])
@@ -3716,24 +5066,74 @@ class LongHorizonRuntime:
             expected_revision=int(goal["revision"]),
             expected_objective_epoch=int(goal.get("objective_epoch") or 1),
         )
-        return {"route": "end" if updated["status"] in TERMINAL_GOALS | {"paused"} else "schedule"}
+        self._start_promoted_goals(updated.get("promoted_goal_ids", []))
+        return {
+            "route": "end" if updated["status"] in TERMINAL_GOALS | {
+                "paused", "cancelling",
+            } else "schedule",
+        }
 
-    def run(self, goal_id: str, answers: dict[str, Any] | None = None) -> dict[str, Any]:
+    def run(
+        self, goal_id: str, answers: dict[str, Any] | None = None,
+        *, _scheduler_id: str = "",
+    ) -> dict[str, Any]:
+        scheduler_id = str(_scheduler_id or uuid.uuid4().hex)
+        if not _scheduler_id and not self.store.claim_scheduler(goal_id, scheduler_id):
+            return self.store.public(self.store.get(goal_id), reused=True)
+        with self.lock:
+            self.scheduler_ids[goal_id] = scheduler_id
         config = {"configurable": {"thread_id": goal_id}, "recursion_limit": 10_000}
-        if answers is not None:
-            self.graph.invoke(Command(resume=answers), config=config)
-        else:
-            self.graph.invoke({"goal_id": goal_id}, config=config)
+        promoted: list[str] = []
+        try:
+            if answers is not None:
+                self.graph.invoke(Command(resume=answers), config=config)
+            else:
+                self.graph.invoke({"goal_id": goal_id}, config=config)
+        finally:
+            with self.lock:
+                try:
+                    current = self.store.get(goal_id)
+                    if current.get("status") == "cancelling" \
+                            and (current.get("cancellation") or {}).get("state") == "draining":
+                        finalized = self.store.control(goal_id, "cancel", {
+                            "drain_complete": True,
+                            "scheduler_id": scheduler_id,
+                        })
+                        promoted = list(finalized.get("promoted_goal_ids", []))
+                finally:
+                    self.store.release_scheduler(goal_id, scheduler_id)
+                    if self.scheduler_ids.get(goal_id) == scheduler_id:
+                        self.scheduler_ids.pop(goal_id, None)
+                # A different Nexus process does not share this runtime lock.
+                # If its Cancel committed between our first read and the lease
+                # CAS-clear, finish the now-drained request from a fresh durable
+                # snapshot. A later Cancel sees no live lease and settles in its
+                # own transaction, so neither interleaving can strand ownership.
+                after_release = self.store.get(goal_id)
+                if after_release.get("status") == "cancelling" \
+                        and not self.store._scheduler_live(after_release):
+                    finalized = self.store.control(goal_id, "cancel", {
+                        "drain_complete": True,
+                    })
+                    promoted.extend(finalized.get("promoted_goal_ids", []))
+            self._start_promoted_goals(promoted)
         return self.store.public(self.store.get(goal_id))
 
     def start_background(self, goal_id: str, answers: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._enable_auto_start_watcher()
         with self.lock:
+            self._auto_start_attempted[goal_id] = time.monotonic()
             existing = self.workers.get(goal_id)
             if existing is not None and existing.is_alive():
                 return self.store.public(self.store.get(goal_id), reused=True)
             goal = self.store.get(goal_id)
             self._require_goal_authority(goal)
             self._require_agent_setup(goal)
+            if goal["status"] == "waiting_for_project":
+                return self.store.public(goal)
+            if not self.store._is_project_owner(goal):
+                raise HarnessError("This long-horizon goal does not own its target project")
+            self._require_no_external_owner(Path(goal["project"]["path"]))
             competing = self.store.active_overlapping_project(
                 Path(goal["project"]["path"]), except_goal_id=goal_id
             )
@@ -3741,16 +5141,24 @@ class LongHorizonRuntime:
                 raise HarnessError(
                     "Another long-horizon goal already owns this project. Cancel or finish it, or create an isolated fork."
                 )
+            scheduler_id = uuid.uuid4().hex
+            if not self.store.claim_scheduler(goal_id, scheduler_id):
+                return self.store.public(self.store.get(goal_id), reused=True)
+            self.scheduler_ids[goal_id] = scheduler_id
             def work() -> None:
                 try:
-                    self.run(goal_id, answers)
+                    self.run(goal_id, answers, _scheduler_id=scheduler_id)
                 except Exception as exc:
                     try:
                         goal = self.store.get(goal_id)
-                        if goal["status"] not in TERMINAL_GOALS | {"waiting_for_user", "paused"}:
+                        if goal["status"] not in TERMINAL_GOALS | {
+                            "waiting_for_user", "waiting_for_project", "paused", "cancelling",
+                        }:
                             self.store.fail_pending_apply(goal_id, str(exc))
                             goal = self.store.get(goal_id)
-                            if goal["status"] not in TERMINAL_GOALS | {"waiting_for_user", "paused"}:
+                            if goal["status"] not in TERMINAL_GOALS | {
+                                "waiting_for_user", "waiting_for_project", "paused", "cancelling",
+                            }:
                                 self.store.control(goal_id, "pause")
                     except Exception:
                         pass
@@ -3759,13 +5167,25 @@ class LongHorizonRuntime:
                         self.workers.pop(goal_id, None)
             thread = threading.Thread(target=work, name=f"nexus-goal-{goal_id[:8]}", daemon=True)
             self.workers[goal_id] = thread
-            thread.start()
+            try:
+                thread.start()
+            except Exception:
+                self.workers.pop(goal_id, None)
+                self.scheduler_ids.pop(goal_id, None)
+                self.store.release_scheduler(goal_id, scheduler_id)
+                raise
         return self.store.public(self.store.get(goal_id))
 
     def _require_available_project(self, goal_id: str) -> dict[str, Any]:
         goal = self.store.get(goal_id)
         self._require_goal_authority(goal)
         self._require_agent_setup(goal)
+        if goal["status"] == "waiting_for_project":
+            raise HarnessError(
+                "This goal is waiting for the current project owner and cannot continue yet"
+            )
+        if not self.store._is_project_owner(goal):
+            raise HarnessError("This long-horizon goal does not own its target project")
         self._require_no_external_owner(Path(goal["project"]["path"]))
         competing = self.store.active_overlapping_project(
             Path(goal["project"]["path"]), except_goal_id=goal_id,
@@ -3781,12 +5201,45 @@ class LongHorizonRuntime:
     ) -> dict[str, Any]:
         activates = {"resume", "retry", "reassign", "steer", "message", "request_review"}
         with self.lock:
+            current = self.store.get(goal_id)
+            released_failed_cancel_with_effects = action == "cancel" \
+                and current.get("status") == "failed" \
+                and self.store._project_queue_state(current) == "released" \
+                and any(_task_has_unsettled_effect(one) for one in current["tasks"])
+            if released_failed_cancel_with_effects:
+                self._require_goal_authority(current)
+                self._require_agent_setup(current)
+                self._require_no_external_owner(Path(current["project"]["path"]))
             if action in activates:
-                self._require_available_project(goal_id)
+                released_failed_resume = action == "resume" \
+                    and current.get("status") == "failed" \
+                    and self.store._project_queue_state(current) == "released"
+                if released_failed_resume:
+                    self._require_goal_authority(current)
+                    self._require_agent_setup(current)
+                    self._require_no_external_owner(Path(current["project"]["path"]))
+                else:
+                    self._require_available_project(goal_id)
             goal = self.store.control(goal_id, action, payload)
             if action in activates and goal["status"] == "queued":
                 self.start_background(goal_id)
+            self._start_promoted_goals(goal.get("promoted_goal_ids", []))
             return goal
+
+    def _start_promoted_goals(self, goal_ids: object) -> None:
+        if not isinstance(goal_ids, list):
+            return
+        for goal_id in list(dict.fromkeys(str(one) for one in goal_ids if str(one))):
+            try:
+                goal = self.store.get(goal_id)
+                if goal["status"] == "queued" and self.store._is_project_owner(goal):
+                    self.start_background(goal_id)
+            except HarnessError:
+                # Promotion is already durable.  A changed provider setup or a
+                # newly arrived legacy owner must not roll back terminal work
+                # or cause an automatic resend; recovery exposes the queued
+                # checkpoint for explicit continuation.
+                continue
 
     def start_board(self, board: dict[str, Any], request_id: str) -> list[dict[str, Any]]:
         with self.lock:
@@ -3797,20 +5250,12 @@ class LongHorizonRuntime:
                 and any(isinstance(one, str) and one.strip() for one in project.get("tasks", []))
             ]
             roots = [Path(str(project.get("path") or "")).resolve(strict=True) for project in selected_projects]
-            for position, root in enumerate(roots):
-                if any(root == other or root in other.parents or other in root.parents
-                       for other in roots[position + 1:]):
-                    raise HarnessError("Board goals cannot run concurrently in nested or overlapping project folders")
             specs = []
             for project, root in zip(selected_projects, roots):
                 objectives = [str(one) for one in project.get("tasks", []) if isinstance(one, str) and one.strip()]
                 per_request = _stable_id("board", request_id, project.get("id"))
                 existing = self.store.get_by_request(per_request)
                 self._require_no_external_owner(root)
-                if existing is None and self.store.active_overlapping_project(root):
-                    raise HarnessError(
-                        "Another long-horizon goal already owns this project. Cancel or finish it, or create an isolated fork."
-                    )
                 if existing is None:
                     self.store.validate_create(
                         board, str(project.get("id") or ""), objectives, per_request,
@@ -3830,13 +5275,63 @@ class LongHorizonRuntime:
             return goals
 
     def recover_all(self) -> list[dict[str, Any]]:
-        recovered: list[dict[str, Any]] = []
+        self._enable_auto_start_watcher()
+        recovered: list[dict[str, Any]] = list(self.store.reconcile_project_queue())
         for goal in self.store.active_authority_goals():
-            if any(one["state"] == "running" for one in goal["tasks"]):
+            if goal["status"] == "waiting_for_project":
+                continue
+            if goal["status"] == "cancelling":
+                if self.store._scheduler_live(goal):
+                    continue
+                if any(one["state"] == "running" for one in goal["tasks"]):
+                    recovered.append(self.store.recover_dead(goal["goal_id"]))
+                current = self.store.get(goal["goal_id"])
+                if current.get("status") == "cancelling" \
+                        and not self.store._scheduler_live(current):
+                    finalized = self.store.control(goal["goal_id"], "cancel", {
+                        "drain_complete": True,
+                    })
+                    recovered.append(finalized)
+                    self._start_promoted_goals(finalized.get("promoted_goal_ids", []))
+            elif any(one["state"] == "running" for one in goal["tasks"]):
                 recovered.append(self.store.recover_dead(goal["goal_id"]))
             elif goal["status"] == "queued":
-                recovered.append(self.store.recover_orphaned_queue(goal["goal_id"]))
+                queued = self.store.recover_orphaned_queue(goal["goal_id"])
+                recovered.append(queued)
+                if queued.get("status") == "queued" \
+                        and (queued.get("project_queue") or {}).get(
+                            "auto_start_pending"
+                        ) is True:
+                    try:
+                        self.start_background(goal["goal_id"])
+                    except Exception:
+                        # Recovery is an availability path. A removed project,
+                        # provider drift, or external owner must leave the
+                        # durable checkpoint inspectable instead of preventing
+                        # the runtime from loading other goals.
+                        continue
         return recovered
+
+    def preflight_start(
+        self, board: dict[str, Any], project_id: str, objectives: list[str],
+        request_id: str, *, lead_id: str = "",
+        success_criteria: list[str] | None = None,
+        policy: dict[str, Any] | None = None, attachments: object = None,
+        participant_ids: list[str] | None = None, conversation_id: str = "",
+        expected_project_authority_id: str = "",
+        require_all_participants: bool | None = None,
+    ) -> dict[str, Any]:
+        """Validate and bind an admission without scheduling or dispatching it."""
+
+        with self.lock:
+            return self.store.preflight_runtime_admission(
+                board, project_id, objectives, request_id, lead_id=lead_id,
+                success_criteria=success_criteria, policy=policy,
+                attachments=attachments, participant_ids=participant_ids,
+                conversation_id=conversation_id,
+                expected_project_authority_id=expected_project_authority_id,
+                require_all_participants=require_all_participants,
+            )
 
     def start(
         self, board: dict[str, Any], project_id: str, objectives: list[str],
@@ -3847,88 +5342,35 @@ class LongHorizonRuntime:
         require_all_participants: bool | None = None,
     ) -> dict[str, Any]:
         with self.lock:
-            require_all = bool(participant_ids) if require_all_participants is None \
-                else bool(require_all_participants)
-            project = next((
-                one for one in board.get("projects", []) if isinstance(one, dict)
-                and str(one.get("id") or "") == project_id
-            ), None)
-            if project is None or project.get("is_there") is not True:
-                raise HarnessError("Choose an available project for the long-horizon goal")
-            root = Path(str(project.get("path") or "")).resolve(strict=True)
-            self.store.validate_create(
-                board, project_id, objectives, request_id,
+            inspected = self.store.preflight_runtime_admission(
+                board, project_id, objectives, request_id, lead_id=lead_id,
                 success_criteria=success_criteria, policy=policy,
-                participant_ids=participant_ids,
-                require_all_participants=require_all,
-            )
-            agents = self.store._agents_for_project(board, project_id, participant_ids)
-            if lead_id and not any(one["id"] == lead_id for one in agents):
-                raise HarnessError("The selected lead is not one of this chat's ready project agents")
-            lead = next((one for one in agents if one["id"] == lead_id), agents[0])
-            exact_participants = [one["id"] for one in agents] if participant_ids else []
-            goal = self.store.get_by_request(request_id)
-            if goal is not None:
-                same_root = Path(str(goal.get("project", {}).get("path") or "")).resolve() == root
-                if (
-                    str(goal.get("project", {}).get("id") or "") != project_id
-                    or not same_root
-                    or str(goal.get("conversation_id") or "") != _short(conversation_id, 160)
-                    or list(goal.get("requested_agent_ids") or []) != exact_participants
-                    or str(goal.get("lead_agent_id") or "") != lead["id"]
-                    or bool(goal.get(
-                        "require_all_participants",
-                        bool(goal.get("requested_agent_ids")),
-                    )) != require_all
-                ):
-                    raise HarnessError(
-                        "That long-horizon request identity is already bound to a different "
-                        "project, chat, participant set, or lead agent."
-                    )
-            actual_authority_id = project_identity(root)
-            if expected_project_authority_id and not hmac.compare_digest(
-                expected_project_authority_id, actual_authority_id
-            ):
-                raise HarnessError(
-                    "The selected project's execution authority changed during goal admission."
-                )
-            admission_digest = _goal_admission_digest(
-                self.redactor,
-                project_id=project_id,
-                project_path=root,
-                project_authority_id=actual_authority_id,
+                attachments=attachments, participant_ids=participant_ids,
                 conversation_id=conversation_id,
-                participant_ids=exact_participants,
-                lead_id=lead["id"],
-                objectives=objectives,
-                success_criteria=success_criteria,
-                policy={
-                    **(policy or {}),
-                    **({"participant_requirement": "adaptive"}
-                       if participant_ids and not require_all else {}),
-                },
-                attachments=attachments,
-                agent_bindings=[one.get("route_binding") for one in agents],
+                expected_project_authority_id=expected_project_authority_id,
+                require_all_participants=require_all_participants,
             )
+            require_all = bool(inspected["require_all_participants"])
+            root = Path(inspected["root"])
+            agents = list(inspected["agents"])
+            lead = dict(inspected["lead"])
+            goal = inspected["goal"]
+            request_retired = bool(inspected["request_retired"])
+            actual_authority_id = str(inspected["project_authority_id"])
+            admission_digest = str(inspected["admission_digest"])
             if goal is not None:
-                stored_digest = str(goal.get("admission_digest") or "")
-                if not stored_digest:
-                    raise HarnessError(
-                        "That saved request predates intent-bound retries and cannot be resumed by replay. "
-                        "Inspect it in Mission control, then use a new request for changed work."
-                    )
-                if not hmac.compare_digest(stored_digest, admission_digest):
-                    raise HarnessError(
-                        "That long-horizon request identity is already bound to a different project, "
-                        "chat, participant set, objective, policy, or attachment set."
-                    )
+                if request_retired:
+                    # Replay protection is already the terminal result. Do not
+                    # start the watcher, reconcile ownership, call get(), stage
+                    # attachments, or reach any provider/background dispatch.
+                    return self.store.public(goal, reused=True)
+                self._enable_auto_start_watcher()
                 self._require_no_external_owner(root)
+                self.store.reconcile_project_queue()
+                goal = self.store.get_by_request(request_id)
             else:
+                self._enable_auto_start_watcher()
                 self._require_no_external_owner(root)
-                if self.store.active_overlapping_project(root):
-                    raise HarnessError(
-                        "Another long-horizon goal already owns this project. Cancel or finish it, or create an isolated fork."
-                    )
                 input_bundle = None
                 if attachments:
                     agents = self.store._agents_for_project(
@@ -3939,7 +5381,7 @@ class LongHorizonRuntime:
                     lead = next((one for one in agents if one["id"] == lead_id), agents[0])
                     attachment_root = (
                         self.store.root / "long-horizon-inputs" / self.store.authority_key
-                        / hashlib.sha256(_short(request_id, 160).encode("utf-8")).hexdigest()
+                        / hashlib.sha256(_exact_request_id(request_id).encode("utf-8")).hexdigest()
                     ).resolve()
                     expected_parent = (self.store.root / "long-horizon-inputs" / self.store.authority_key).resolve()
                     if expected_parent not in attachment_root.parents:
@@ -3986,6 +5428,11 @@ class LongHorizonRuntime:
                         admission_digest=admission_digest,
                         expected_project_authority_id=actual_authority_id,
                     )
+            if goal.get("request_tombstone") is True:
+                # Detailed terminal history is intentionally bounded, but a
+                # retired request identity is a permanent idempotency result.
+                # Never ask the scheduler for a pruned goal or dispatch it.
+                return self.store.public(goal, reused=True)
             if goal["status"] == "queued":
                 self.start_background(goal["goal_id"])
             return self.store.public(

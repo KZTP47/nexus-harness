@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import multiprocessing
 import pathlib
 import os
 import subprocess
@@ -44,6 +45,75 @@ class Answering:
     def complete(self, request):
         self.asked.append(request)
         return Back(self.text)
+
+
+def _racing_long_prompt_worker(
+    root: str, filed_as: str, text: str, barrier, result_queue,
+) -> None:
+    """Spawn-safe worker which pauses after its stale read, before final append."""
+
+    config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(root), [], {})
+    intent = chat.long_horizon_intent_sha256(
+        "chat-race", "project-race", "lead", text, [],
+    )
+    original_keep = chat._keep_it
+
+    def keep_at_barrier(*args, **kwargs):
+        barrier.wait(timeout=20)
+        return original_keep(*args, **kwargs)
+
+    chat._keep_it = keep_at_barrier
+    try:
+        chat.keep_long_horizon_prompt(
+            config, "claude", text, filed_as=filed_as,
+            request_id="request-race", chat_id="chat-race",
+            project_id="project-race", lead_id="lead",
+            intent_sha256=intent,
+        )
+        result_queue.put(("ok", text))
+    except Exception as exc:  # pragma: no cover - asserted in the parent process
+        result_queue.put(("error", str(exc)))
+    finally:
+        chat._keep_it = original_keep
+
+
+def _racing_long_status_worker(
+    root: str, filed_as: str, revision: int, wait_for_newer: bool,
+    barrier, newer_written, result_queue,
+) -> None:
+    """Force both revisions to calculate from the same pre-lock transcript."""
+
+    config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), Path(root), [], {})
+    original_keep = chat._keep_it
+
+    def keep_at_barrier(*args, **kwargs):
+        barrier.wait(timeout=20)
+        if wait_for_newer and not newer_written.wait(timeout=20):
+            raise RuntimeError("newer revision did not reach the transcript")
+        try:
+            return original_keep(*args, **kwargs)
+        finally:
+            if not wait_for_newer:
+                newer_written.set()
+
+    chat._keep_it = keep_at_barrier
+    try:
+        chat.keep_long_horizon_status(
+            config, "claude", {
+                "goal_id": "goal-race-1234567890",
+                "request_id": "goal-race-request",
+                "conversation_id": "chat-race",
+                "project": {"id": "project-race"},
+                "lead_agent_id": "lead",
+                "status": "complete" if revision == 10 else "running",
+                "revision": revision,
+            }, filed_as=filed_as,
+        )
+        result_queue.put(("ok", revision))
+    except Exception as exc:  # pragma: no cover - asserted in the parent process
+        result_queue.put(("error", f"{revision}: {exc}"))
+    finally:
+        chat._keep_it = original_keep
 
 
 class TalkingTestCase(unittest.TestCase):
@@ -583,6 +653,369 @@ class WhatItRefuses(TalkingTestCase):
         turns = chat.read_it(self.config, "")
         self.assertEqual(turns[0].text, goal)
         self.assertIn("provider unavailable", turns[-1].text)
+
+    def test_direct_long_goal_transcript_is_idempotent_and_survives_restart(self) -> None:
+        prompt = "Implement the exact fix\nBearer sk-secret-value-1234567890"
+        request_id = "direct-goal-request-1"
+        chat_id = "chat-two"
+        project_id = "project-arbitrary"
+        filed_as = "pair-chat-direct-goal"
+        intent = chat.long_horizon_intent_sha256(
+            chat_id, project_id, "lead", prompt, [],
+        )
+
+        for _attempt in range(2):
+            chat.keep_long_horizon_prompt(
+                self.config, "claude", prompt, filed_as=filed_as,
+                request_id=request_id, chat_id=chat_id,
+                project_id=project_id, lead_id="lead",
+                intent_sha256=intent,
+            )
+        waiting = {
+            "goal_id": "goal-waiting-1234567890",
+            "request_id": request_id,
+            "conversation_id": chat_id,
+            "project": {"id": project_id},
+            "lead_agent_id": "lead",
+            "status": "waiting_for_project",
+            "project_queue": {"blocked_by_goal_id": "owner-1234567890"},
+        }
+        for _poll in range(2):
+            chat.keep_long_horizon_status(
+                self.config, "claude", waiting, filed_as=filed_as,
+            )
+
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        turns = chat.read_it(reopened, "claude", filed_as)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].text, "Implement the exact fix\nBearer [REDACTED]")
+        self.assertEqual(turns[0].phase, "long_horizon_prompt")
+        self.assertEqual(turns[0].correlation["request_id"], request_id)
+        self.assertEqual(turns[0].correlation["intent_sha256"], intent)
+        self.assertEqual(turns[1].correlation["goal_id"], waiting["goal_id"])
+        self.assertEqual(turns[1].correlation["goal_status"], "waiting_for_project")
+        self.assertIn("waiting for this project", turns[1].text)
+        self.assertNotIn("verified complete", turns[1].text)
+
+        queued = {**waiting, "status": "queued", "project_queue": {"state": "owner"}}
+        chat.keep_long_horizon_status(reopened, "claude", queued, filed_as=filed_as)
+        chat.keep_long_horizon_status(reopened, "claude", queued, filed_as=filed_as)
+        complete = {**queued, "status": "complete"}
+        chat.keep_long_horizon_status(reopened, "claude", complete, filed_as=filed_as)
+        statuses = [
+            one.correlation.get("goal_status") for one in chat.read_it(
+                reopened, "claude", filed_as,
+            ) if one.correlation.get("kind") == "long_horizon_status"
+        ]
+        self.assertEqual(statuses, ["waiting_for_project", "queued", "complete"])
+        self.assertIn("verified complete", chat.read_it(reopened, "claude", filed_as)[-1].text)
+
+    def test_direct_long_goal_identity_boundaries_survive_restart_without_clipping(self) -> None:
+        prompt = "Keep every accepted identity character"
+        request_id = "r" * chat.DIRECT_LONG_HORIZON_REQUEST_ID_CHARACTERS
+        chat_id = "c" * chat.DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS
+        project_id = "p" * chat.DIRECT_LONG_HORIZON_PROJECT_ID_CHARACTERS
+        lead_id = "l" * chat.DIRECT_LONG_HORIZON_LEAD_ID_CHARACTERS
+        filed_as = "pair-chat-direct-identity-boundary"
+        intent = chat.long_horizon_intent_sha256(
+            chat_id, project_id, lead_id, prompt, [],
+        )
+        supplied = {
+            "filed_as": filed_as,
+            "request_id": request_id,
+            "chat_id": chat_id,
+            "project_id": project_id,
+            "lead_id": lead_id,
+            "intent_sha256": intent,
+        }
+
+        chat.keep_long_horizon_prompt(
+            self.config, "claude", prompt, **supplied,
+        )
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        chat.keep_long_horizon_prompt(reopened, "claude", prompt, **supplied)
+
+        turns = chat.read_it(reopened, "claude", filed_as)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].correlation["request_id"], request_id)
+        self.assertEqual(turns[0].correlation["chat_id"], chat_id)
+        self.assertEqual(turns[0].correlation["project_id"], project_id)
+        self.assertEqual(turns[0].correlation["lead_id"], lead_id)
+
+    def test_direct_long_goal_one_over_identity_is_rejected_before_transcript_write(self) -> None:
+        accepted = {
+            "chat_id": "c" * chat.DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS,
+            "project_id": "p" * chat.DIRECT_LONG_HORIZON_PROJECT_ID_CHARACTERS,
+            "lead_id": "l" * chat.DIRECT_LONG_HORIZON_LEAD_ID_CHARACTERS,
+        }
+        limits = {
+            "chat_id": chat.DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS,
+            "project_id": chat.DIRECT_LONG_HORIZON_PROJECT_ID_CHARACTERS,
+            "lead_id": chat.DIRECT_LONG_HORIZON_LEAD_ID_CHARACTERS,
+        }
+        for field, maximum in limits.items():
+            with self.subTest(field=field):
+                identity = {**accepted, field: field[0] * (maximum + 1)}
+                filed_as = f"pair-chat-direct-one-over-{field}"
+                intent = chat.long_horizon_intent_sha256(
+                    identity["chat_id"], identity["project_id"],
+                    identity["lead_id"], "Do not clip this request", [],
+                )
+                transcript = chat.where_it_is_kept(self.config, "codex", filed_as)
+                events = transcript.with_suffix(".events.jsonl")
+
+                with self.assertRaisesRegex(chat.ChatError, "did not save or truncate"):
+                    chat.keep_long_horizon_prompt(
+                        self.config, "codex", "Do not clip this request",
+                        filed_as=filed_as, request_id=f"request-{field}",
+                        intent_sha256=intent, **identity,
+                    )
+
+                self.assertFalse(transcript.exists())
+                self.assertFalse(events.exists())
+
+    def test_long_goal_status_keeps_the_exact_goal_id_boundary_after_restart(self) -> None:
+        filed_as = "pair-chat-status-goal-id-boundary"
+        goal_id = "g" * chat.DIRECT_LONG_HORIZON_GOAL_ID_CHARACTERS
+        goal = {
+            "goal_id": goal_id,
+            "request_id": "status-boundary-request",
+            "conversation_id": "status-boundary-chat",
+            "project": {"id": "status-boundary-project"},
+            "lead_agent_id": "status-boundary-lead",
+            "status": "queued",
+            "revision": 1,
+        }
+        supplied = {
+            "filed_as": filed_as,
+            "intent_sha256": "a" * 64,
+        }
+
+        chat.keep_long_horizon_status(self.config, "claude", goal, **supplied)
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        chat.keep_long_horizon_status(reopened, "claude", goal, **supplied)
+
+        turns = chat.read_it(reopened, "claude", filed_as)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].correlation["goal_id"], goal_id)
+        self.assertEqual(turns[0].correlation["intent_sha256"], "a" * 64)
+
+    def test_long_goal_status_rejects_clippable_identity_before_transcript_write(self) -> None:
+        base = {
+            "goal_id": "goal-exact-status",
+            "request_id": "status-invalid-request",
+            "conversation_id": "status-invalid-chat",
+            "project": {"id": "status-invalid-project"},
+            "lead_agent_id": "status-invalid-lead",
+            "status": "queued",
+            "revision": 1,
+        }
+        invalid = {
+            "goal-one-over": (
+                {**base, "goal_id": "g" * (
+                    chat.DIRECT_LONG_HORIZON_GOAL_ID_CHARACTERS + 1
+                )},
+                "a" * 64,
+            ),
+            "intent-one-over": (base, "a" * 65),
+            "intent-uppercase": (base, "A" * 64),
+        }
+        for name, (goal, intent) in invalid.items():
+            with self.subTest(name=name):
+                filed_as = f"pair-chat-status-invalid-{name}"
+                transcript = chat.where_it_is_kept(self.config, "claude", filed_as)
+                events = transcript.with_suffix(".events.jsonl")
+
+                with self.assertRaisesRegex(
+                    chat.ChatError, "did not save or truncate",
+                ):
+                    chat.keep_long_horizon_status(
+                        self.config, "claude", goal,
+                        filed_as=filed_as, intent_sha256=intent,
+                    )
+
+                self.assertFalse(transcript.exists())
+                self.assertFalse(events.exists())
+
+    def test_direct_long_goal_error_does_not_duplicate_prompt_or_rebind_request(self) -> None:
+        request_id = "direct-goal-error-1"
+        filed_as = "pair-chat-direct-error"
+        prompt = "Change only this project"
+        intent = chat.long_horizon_intent_sha256(
+            "chat-two", "project-one", "lead", prompt, [],
+        )
+        chat.keep_long_horizon_prompt(
+            self.config, "codex", prompt, filed_as=filed_as,
+            request_id=request_id, chat_id="chat-two", project_id="project-one",
+            lead_id="lead", intent_sha256=intent,
+        )
+        for _attempt in range(2):
+            chat.keep_long_horizon_error(
+                self.config, "codex", "Another goal owns this project",
+                filed_as=filed_as, request_id=request_id, chat_id="chat-two",
+                project_id="project-one", lead_id="lead",
+                intent_sha256=intent,
+            )
+        turns = chat.read_it(self.config, "codex", filed_as)
+        self.assertEqual(
+            [one.correlation.get("kind") for one in turns],
+            ["long_horizon_prompt", "long_horizon_error"],
+        )
+        self.assertIn("remains saved", turns[-1].text)
+
+        changed = "A different intent"
+        changed_intent = chat.long_horizon_intent_sha256(
+            "chat-two", "project-one", "lead", changed, [],
+        )
+        with self.assertRaisesRegex(chat.ChatError, "already bound"):
+            chat.keep_long_horizon_prompt(
+                self.config, "codex", changed, filed_as=filed_as,
+                request_id=request_id, chat_id="chat-two", project_id="project-one",
+                lead_id="lead", intent_sha256=changed_intent,
+            )
+
+    def test_goal_projection_revision_rejects_stale_or_conflicting_regression(self) -> None:
+        filed_as = "pair-chat-goal-revision"
+        base = {
+            "goal_id": "goal-revision-1234567890",
+            "request_id": "goal-revision-request",
+            "conversation_id": "chat-two",
+            "project": {"id": "project-one"},
+            "lead_agent_id": "lead",
+        }
+        queued = {**base, "status": "queued", "revision": 1}
+        complete = {**base, "status": "complete", "revision": 10}
+        stale_running = {**base, "status": "running", "revision": 9}
+        chat.keep_long_horizon_status(
+            self.config, "claude", queued, filed_as=filed_as,
+        )
+        chat.keep_long_horizon_status(
+            self.config, "claude", complete, filed_as=filed_as,
+        )
+        chat.keep_long_horizon_status(
+            self.config, "claude", stale_running, filed_as=filed_as,
+        )
+        turns = chat.read_it(self.config, "claude", filed_as)
+        self.assertEqual(
+            [one.correlation.get("goal_status") for one in turns],
+            ["queued", "complete"],
+        )
+        self.assertEqual(turns[-1].correlation["goal_revision"], 10)
+        self.assertIn("verified complete", turns[-1].text)
+
+        with self.assertRaisesRegex(chat.ChatError, "same durable goal revision"):
+            chat.keep_long_horizon_status(
+                self.config, "claude",
+                {**base, "status": "running", "revision": 10},
+                filed_as=filed_as,
+            )
+
+    def test_failed_goal_projection_can_resume_to_queued_at_a_new_revision(self) -> None:
+        filed_as = "pair-chat-goal-resume"
+        base = {
+            "goal_id": "goal-resume-1234567890",
+            "request_id": "goal-resume-request",
+            "conversation_id": "chat-two",
+            "project": {"id": "project-one"},
+            "lead_agent_id": "lead",
+        }
+        chat.keep_long_horizon_status(
+            self.config, "claude",
+            {**base, "status": "failed", "revision": 4},
+            filed_as=filed_as,
+        )
+        chat.keep_long_horizon_status(
+            self.config, "claude",
+            {**base, "status": "queued", "revision": 5},
+            filed_as=filed_as,
+        )
+        turns = chat.read_it(self.config, "claude", filed_as)
+        self.assertEqual(
+            [one.correlation.get("goal_status") for one in turns],
+            ["failed", "queued"],
+        )
+        self.assertNotIn("verified complete", turns[-1].text)
+
+    def test_cancelling_projection_is_truthful_until_cancelled(self) -> None:
+        filed_as = "pair-chat-goal-cancelling"
+        base = {
+            "goal_id": "goal-cancelling-1234567890",
+            "request_id": "goal-cancelling-request",
+            "conversation_id": "chat-two",
+            "project": {"id": "project-one"},
+            "lead_agent_id": "lead",
+        }
+        for revision, status in ((6, "running"), (7, "cancelling"), (8, "cancelled")):
+            chat.keep_long_horizon_status(
+                self.config, "claude",
+                {**base, "status": status, "revision": revision},
+                filed_as=filed_as,
+            )
+        turns = chat.read_it(self.config, "claude", filed_as)
+        self.assertEqual(
+            [one.correlation.get("goal_status") for one in turns],
+            ["running", "cancelling", "cancelled"],
+        )
+        self.assertIn("draining its active work", turns[1].text)
+        self.assertIn("has not released the project", turns[1].text)
+        self.assertNotIn("verified complete", turns[1].text)
+        self.assertIn("was cancelled", turns[2].text)
+
+    def test_spawned_conflicting_request_prompts_fail_at_final_transcript_lock(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(2)
+        results = context.Queue()
+        filed_as = "pair-chat-cross-process-request"
+        workers = [
+            context.Process(
+                target=_racing_long_prompt_worker,
+                args=(str(self.root), filed_as, text, barrier, results),
+            )
+            for text in ("First exact intent", "Conflicting exact intent")
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(30)
+            self.assertFalse(worker.is_alive(), "cross-process prompt race hung")
+            self.assertEqual(worker.exitcode, 0)
+        outcomes = [results.get(timeout=5) for _worker in workers]
+        self.assertEqual(sorted(one[0] for one in outcomes), ["error", "ok"])
+        self.assertIn("already bound", next(one[1] for one in outcomes if one[0] == "error"))
+        turns = chat.read_it(self.config, "claude", filed_as)
+        self.assertEqual(len(turns), 1)
+        self.assertIn(turns[0].text, {"First exact intent", "Conflicting exact intent"})
+        self.assertEqual(turns[0].phase, "long_horizon_prompt")
+
+    def test_spawned_revision_ten_wins_after_both_polls_read_revision_zero(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(2)
+        newer_written = context.Event()
+        results = context.Queue()
+        filed_as = "pair-chat-cross-process-revision"
+        workers = [
+            context.Process(
+                target=_racing_long_status_worker,
+                args=(
+                    str(self.root), filed_as, revision, revision == 9,
+                    barrier, newer_written, results,
+                ),
+            )
+            for revision in (10, 9)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(30)
+            self.assertFalse(worker.is_alive(), "cross-process revision race hung")
+            self.assertEqual(worker.exitcode, 0)
+        outcomes = [results.get(timeout=5) for _worker in workers]
+        self.assertEqual(sorted(one[0] for one in outcomes), ["ok", "ok"])
+        turns = chat.read_it(self.config, "claude", filed_as)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].correlation["goal_revision"], 10)
+        self.assertEqual(turns[0].correlation["goal_status"], "complete")
+        self.assertIn("verified complete", turns[0].text)
 
     def test_failed_team_turn_keeps_every_contribution_and_bounded_redacted_cause(self) -> None:
         secret = "secret-value-that-must-never-survive"

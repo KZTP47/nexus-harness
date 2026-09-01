@@ -235,7 +235,16 @@ class StagedCodingWorkspaceTests(unittest.TestCase):
             )
             check = VerificationAction(
                 "unit",
-                (sys.executable, "-m", "unittest", "discover", "-s", "tests"),
+                (
+                    sys.executable,
+                    "-c",
+                    "import sys, unittest; "
+                    "sys.path.insert(0, '.'); "
+                    "unittest.main(module=None)",
+                    "discover",
+                    "-s",
+                    "tests",
+                ),
             )
             with StagedCodingWorkspace(
                 config_for(root),

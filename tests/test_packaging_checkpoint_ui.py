@@ -89,7 +89,10 @@ class PackagingTests(unittest.TestCase):
             )
             before_path = os.environ.get("PATH")
             generated = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                [
+                    "powershell", "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-Command", command,
+                ],
                 capture_output=True,
                 text=True,
                 check=False,

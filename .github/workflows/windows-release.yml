@@ -106,15 +106,221 @@ jobs:
         run: |
           $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
           if ($installers.Count -ne 1) { throw "Expected one installer, found $($installers.Count)." }
-          $installed = Join-Path $env:LOCALAPPDATA 'Programs/our-harness-desktop/Nexus Harness.exe'
-          $process = Start-Process -FilePath $installers[0].FullName -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
+          $expectedVersion = (Get-Content -Raw -LiteralPath desktop/package.json | ConvertFrom-Json).version
+          $applicationGuid = 'e52322ab-f15e-5dc0-963b-7588e3739e89'
+          $installed = $null
+
+          function Get-CanonicalPath([string] $Path, [string] $What) {
+            if (-not $Path -or -not [IO.Path]::IsPathRooted($Path)) { throw "$What is not an absolute path: $Path" }
+            $full = [IO.Path]::GetFullPath($Path)
+            $root = [IO.Path]::GetPathRoot($full)
+            if ([StringComparer]::OrdinalIgnoreCase.Equals($full, $root)) { return $root }
+            return $full.TrimEnd(
+              [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar
+            )
+          }
+
+          function Get-InstalledApplication {
+            $installSubkey = "Software\$applicationGuid"
+            $uninstallSubkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$applicationGuid"
+            $baseKey = $null
+            $installKey = $null
+            $uninstallKey = $null
+            try {
+              $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                [Microsoft.Win32.RegistryHive]::CurrentUser,
+                [Microsoft.Win32.RegistryView]::Registry64
+              )
+              $installKey = $baseKey.OpenSubKey($installSubkey, $false)
+              $uninstallKey = $baseKey.OpenSubKey($uninstallSubkey, $false)
+              if ($null -eq $installKey -or $null -eq $uninstallKey) {
+                throw 'The exact current-user Nexus Harness registry metadata is missing.'
+              }
+              $locationValue = [string]$installKey.GetValue('InstallLocation')
+              $keepShortcuts = [string]$installKey.GetValue('KeepShortcuts')
+              $shortcutName = [string]$installKey.GetValue('ShortcutName')
+              $displayName = [string]$uninstallKey.GetValue('DisplayName')
+              $displayVersion = [string]$uninstallKey.GetValue('DisplayVersion')
+              $publisher = [string]$uninstallKey.GetValue('Publisher')
+              $uninstallString = [string]$uninstallKey.GetValue('UninstallString')
+              $quietUninstallString = [string]$uninstallKey.GetValue('QuietUninstallString')
+            } finally {
+              if ($null -ne $uninstallKey) { $uninstallKey.Dispose() }
+              if ($null -ne $installKey) { $installKey.Dispose() }
+              if ($null -ne $baseKey) { $baseKey.Dispose() }
+            }
+            if ($keepShortcuts -cne 'true' -or $shortcutName -cne 'Nexus Harness' -or
+                $displayName -cne 'Nexus Harness' -or $publisher -cne 'Nexus Harness' -or
+                $displayVersion -cne $expectedVersion) {
+              throw 'The exact current-user Nexus Harness product/version metadata is invalid.'
+            }
+            $location = Get-CanonicalPath $locationValue 'The installed application location'
+            if (-not (Test-Path -LiteralPath $location -PathType Container)) {
+              throw "The installed application location does not exist: $location"
+            }
+            $application = Get-CanonicalPath (Join-Path $location 'Nexus Harness.exe') 'The installed application'
+            $uninstaller = Get-CanonicalPath (Join-Path $location 'Uninstall Nexus Harness.exe') 'The installed uninstaller'
+            if (-not (Test-Path -LiteralPath $application -PathType Leaf) -or
+                -not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+              throw "The exact installed application or uninstaller is missing below $location."
+            }
+            $uninstallMatch = [Regex]::Match($uninstallString, '\A"(?<path>.+)" /currentuser\z')
+            $quietMatch = [Regex]::Match($quietUninstallString, '\A"(?<path>.+)" /currentuser /S\z')
+            if (-not $uninstallMatch.Success -or -not $quietMatch.Success) {
+              throw 'The installed package metadata is not bound to current-user mode.'
+            }
+            $registeredUninstaller = Get-CanonicalPath $uninstallMatch.Groups['path'].Value 'The registered uninstaller'
+            $registeredQuietUninstaller = Get-CanonicalPath $quietMatch.Groups['path'].Value 'The registered quiet uninstaller'
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($registeredUninstaller, $uninstaller) -or
+                -not [StringComparer]::OrdinalIgnoreCase.Equals($registeredQuietUninstaller, $uninstaller)) {
+              throw 'The installed package metadata points outside its exact install location.'
+            }
+            return $application
+          }
+
+          function Get-DesktopFolders {
+            $candidates = @(
+              [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory),
+              [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)
+            )
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $folders = @()
+            foreach ($candidate in $candidates) {
+              $folder = Get-CanonicalPath $candidate 'A Windows desktop known folder'
+              if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
+                throw "Windows did not provide an existing desktop known folder: $folder"
+              }
+              if ($seen.Add($folder)) { $folders += $folder }
+            }
+            if ($folders.Count -eq 0) { throw 'Windows did not provide any desktop known folders.' }
+            return $folders
+          }
+
+          $desktopFolders = @(Get-DesktopFolders)
+          $desktop = $desktopFolders[0]
+          $shortcut = Join-Path $desktop 'Nexus Harness.lnk'
+
+          function Assert-InstalledShortcut {
+            $installedPath = Get-CanonicalPath $installed 'The installed application'
+            $seenLinks = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $links = @()
+            foreach ($folder in $desktopFolders) {
+              foreach ($candidate in @(Get-ChildItem -LiteralPath $folder -Filter 'Nexus Harness*.lnk' -File -Force)) {
+                $candidatePath = Get-CanonicalPath $candidate.FullName 'A Nexus Harness desktop shortcut'
+                if ($seenLinks.Add($candidatePath)) { $links += $candidatePath }
+              }
+            }
+            if ($links.Count -ne 1 -or
+                -not [StringComparer]::OrdinalIgnoreCase.Equals($links[0], $shortcut)) {
+              throw "Expected exactly $shortcut and no duplicate visible Nexus Harness links; found $($links -join ', ')."
+            }
+            $shell = New-Object -ComObject WScript.Shell
+            $link = $null
+            try {
+              $link = $shell.CreateShortcut($shortcut)
+              $target = Get-CanonicalPath ([string]$link.TargetPath) 'The shortcut target'
+              $arguments = [string]$link.Arguments
+              $iconLocation = ([string]$link.IconLocation).Trim()
+              $iconIndex = 0
+              if ($iconLocation -match '^(.*),\s*(-?\d+)$') {
+                $iconLocation = $Matches[1].Trim()
+                $iconIndex = [int]$Matches[2]
+              }
+              $icon = Get-CanonicalPath $iconLocation.Trim('"') 'The shortcut icon source'
+            } finally {
+              if ($null -ne $link -and [Runtime.InteropServices.Marshal]::IsComObject($link)) {
+                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)
+              }
+              if ([Runtime.InteropServices.Marshal]::IsComObject($shell)) {
+                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+              }
+            }
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($target, $installedPath)) {
+              throw "Shortcut target '$target' does not match '$installedPath'."
+            }
+            if ($arguments -cne '') {
+              throw "Shortcut contains unexpected launch arguments: '$arguments'."
+            }
+            if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) {
+              throw "Shortcut icon source does not exist: $icon"
+            }
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($icon, $installedPath) -or
+                $iconIndex -ne 0) {
+              throw "Shortcut icon '$icon,$iconIndex' does not use the installed application exactly."
+            }
+            return [pscustomobject]@{
+              ShortcutPath = $shortcut; TargetPath = $target; Arguments = $arguments
+              IconPath = $icon; IconIndex = $iconIndex
+            }
+          }
+
+          function Get-InstalledProcesses {
+            return @(Get-CimInstance Win32_Process | Where-Object {
+              $_.ExecutablePath -and [StringComparer]::OrdinalIgnoreCase.Equals(
+                [IO.Path]::GetFullPath($_.ExecutablePath), [IO.Path]::GetFullPath($installed)
+              )
+            })
+          }
+
+          function Stop-InstalledProcessTrees {
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            do {
+              $remaining = @(Get-InstalledProcesses)
+              if ($remaining.Count -eq 0) { return }
+              foreach ($process in $remaining) {
+                try {
+                  [void](Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" `
+                    -ArgumentList @('/PID', [string]$process.ProcessId, '/T', '/F') `
+                    -Wait -PassThru -WindowStyle Hidden)
+                } catch {
+                  # The bounded exact-path readback below remains authoritative.
+                }
+              }
+              if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 250 }
+            } while ([DateTime]::UtcNow -lt $deadline)
+            $remaining = @(Get-InstalledProcesses)
+            if ($remaining.Count -ne 0) {
+              throw "The shortcut-launched installed process tree did not stop: $($remaining.ProcessId -join ', ')."
+            }
+          }
+
+          $process = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
           if ($process.ExitCode -ne 0) { throw "Installer stopped with code $($process.ExitCode)." }
-          if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) { throw "Installer did not create $installed." }
+          $installed = Get-InstalledApplication
+          [void](Assert-InstalledShortcut)
           Push-Location desktop
           try {
             npm run smoke:built -- "$installed"
             npm run e2e:multi-vendor -- "$installed"
+            npm run smoke:long-horizon -- "$installed"
           } finally { Pop-Location }
+
+          Remove-Item -LiteralPath $shortcut -Force
+          if (Test-Path -LiteralPath $shortcut) { throw "Could not remove $shortcut for the reinstall check." }
+          $reinstall = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
+          if ($reinstall.ExitCode -ne 0) { throw "Reinstall stopped with code $($reinstall.ExitCode)." }
+          $reinstalled = Get-InstalledApplication
+          if (-not [StringComparer]::OrdinalIgnoreCase.Equals($reinstalled, $installed)) {
+            throw "Reinstall moved the exact current-user application from '$installed' to '$reinstalled'."
+          }
+          $verifiedShortcut = Assert-InstalledShortcut
+
+          $alreadyRunning = @(Get-InstalledProcesses)
+          if ($alreadyRunning.Count -ne 0) {
+            throw "A prior package smoke left the installed app running: $($alreadyRunning.ProcessId -join ', ')."
+          }
+          $launched = @()
+          try {
+            [void](Start-Process -FilePath $verifiedShortcut.ShortcutPath -PassThru)
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              $launched = @(Get-InstalledProcesses)
+              if ($launched.Count -eq 0) { Start-Sleep -Milliseconds 250 }
+            } while ($launched.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($launched.Count -eq 0) { throw "The recreated desktop shortcut did not launch the installed app." }
+          } finally {
+            Stop-InstalledProcessTrees
+          }
 
       - name: Verify the installer Authenticode signature
         if: env.NEXUS_SIGNED_BUILD == '1'
@@ -197,6 +403,27 @@ jobs:
             echo "Expected exactly the installer and checksum, found ${#assets[@]}." >&2
             exit 1
           fi
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "The release tag is not an exact Nexus Harness version: $tag" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          mapfile -t release_installers < <(printf '%s\n' "${assets[@]}" | grep -E '\.exe$')
+          if [[ ${#release_installers[@]} -ne 1 ]]; then
+            echo "Expected exactly one release installer before publication." >&2
+            exit 1
+          fi
+          release_installer="${release_installers[0]}"
+          release_installer_name="$(basename "$release_installer")"
+          if [[ "$release_installer_name" != "Nexus-Harness-Setup-${version}.exe" \
+              && "$release_installer_name" != "Nexus-Harness-Setup-${version}-UNSIGNED.exe" ]]; then
+            echo "Release tag $tag does not match installer $release_installer_name." >&2
+            exit 1
+          fi
+          if [[ ! -f "${release_installer}.sha256" ]]; then
+            echo "The exact checksum for $release_installer_name is missing before publication." >&2
+            exit 1
+          fi
           metadata="release/release-metadata.json"
           if [[ ! -f "$metadata" ]]; then
             echo "Release size metadata is missing." >&2
@@ -210,3 +437,89 @@ jobs:
           fi
           notes="$notes Measured download size: ${installer_mib} MiB; unpacked application: ${unpacked_mib} MiB. Allow at least 2 GiB free while installing."
           gh release create "$tag" "${assets[@]}" --verify-tag --generate-notes --notes "$notes" --title "Nexus Harness $tag"
+
+      - name: Prove the stable release is anonymously installable
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
+          latest="${RUNNER_TEMP}/nexus-latest-release.json"
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error --location \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                --user-agent 'nexus-harness-release-readback' \
+                "$api" --output "$latest" \
+                && jq -e --arg tag "$tag" '.tag_name == $tag' "$latest" >/dev/null; then
+              break
+            fi
+            if [[ $attempt -eq 12 ]]; then
+              echo "The public latest-release API did not expose $tag after publication." >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          mapfile -t names < <(jq -er '.assets[].name' "$latest")
+          if [[ ${#names[@]} -ne 2 ]]; then
+            echo "Expected exactly the public installer and checksum assets, found: ${names[*]}" >&2
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "The stable tag is not an exact Nexus Harness version: $tag" >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          mapfile -t installers < <(printf '%s\n' "${names[@]}" | grep -E '^Nexus-Harness-Setup-.*\.exe$')
+          if [[ ${#installers[@]} -ne 1 ]]; then
+            echo "Expected one public installer asset, found: ${names[*]}" >&2
+            exit 1
+          fi
+          installer="${installers[0]}"
+          if [[ "$installer" != "Nexus-Harness-Setup-${version}.exe" \
+              && "$installer" != "Nexus-Harness-Setup-${version}-UNSIGNED.exe" ]]; then
+            echo "Stable tag $tag does not match public installer $installer." >&2
+            exit 1
+          fi
+          checksum="${installer}.sha256"
+          if [[ ! " ${names[*]} " =~ " ${checksum} " ]]; then
+            echo "The public release does not expose ${checksum}." >&2
+            exit 1
+          fi
+          public_assets="${RUNNER_TEMP}/nexus-public-release"
+          mkdir -p "$public_assets"
+          for name in "$installer" "$checksum"; do
+            url="$(jq -er --arg name "$name" '.assets[] | select(.name == $name) | .browser_download_url' "$latest")"
+            curl --fail --silent --show-error --location \
+              --user-agent 'nexus-harness-release-readback' \
+              "$url" --output "${public_assets}/${name}"
+            if [[ ! -s "${public_assets}/${name}" ]]; then
+              echo "The anonymously downloaded public asset is empty: $name" >&2
+              exit 1
+            fi
+            if ! cmp --silent "release/${name}" "${public_assets}/${name}"; then
+              echo "The public release bytes differ from the verified build artifact: $name" >&2
+              exit 1
+            fi
+          done
+          mapfile -t checksum_lines < "${public_assets}/${checksum}"
+          if [[ ${#checksum_lines[@]} -ne 1 ]]; then
+            echo "The public checksum must contain exactly one installer record." >&2
+            exit 1
+          fi
+          checksum_line="${checksum_lines[0]%$'\r'}"
+          if [[ ! "$checksum_line" =~ ^([0-9a-fA-F]{64})[[:space:]]+(\*)?(.+)$ ]]; then
+            echo "The public checksum has an unsupported format." >&2
+            exit 1
+          fi
+          expected_hash="${BASH_REMATCH[1],,}"
+          checksum_name="${BASH_REMATCH[3]}"
+          if [[ "$checksum_name" != "$installer" ]]; then
+            echo "The public checksum names '$checksum_name' instead of '$installer'." >&2
+            exit 1
+          fi
+          actual_hash="$(sha256sum "${public_assets}/${installer}" | awk '{print $1}')"
+          if [[ "$actual_hash" != "$expected_hash" ]]; then
+            echo "The anonymously downloaded public installer does not match its checksum." >&2
+            exit 1
+          fi

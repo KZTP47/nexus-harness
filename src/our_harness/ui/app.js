@@ -764,7 +764,10 @@ function fitGraph() { if (!graph.nodes.length) return; const xs = graph.nodes.ma
 function exportGraph() { const blob = new Blob([JSON.stringify(graph, null, 2) + "\n"], {type: "application/json"}); const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = "harness-graph.json"; link.click(); URL.revokeObjectURL(link.href); announce("Graph JSON exported."); }
 async function importGraph(file) { try { const candidate = migrateGraph(JSON.parse(await file.text())); const result = await validate(candidate); if (!result.valid) throw new Error("Imported graph failed validation. The current graph was not changed."); pushHistory(); graph = result.graph || candidate; selected = null; focusedNodeId = graph.nodes[0]?.id || ""; render(); fitGraph(); announce("Graph imported."); } catch (error) { showError(error.message); } finally { $("importInput").value = ""; } }
 
-function switchView(name) {
+let userViewSelectionRevision = 0;
+
+function switchView(name, options = {}) {
+  if (options.userInitiated) userViewSelectionRevision += 1;
   document.querySelectorAll("[data-view]").forEach((button) => {
     button.setAttribute("aria-pressed", String(button.dataset.view === name));
   });
@@ -792,7 +795,9 @@ function switchView(name) {
   if (name === "team") refreshTeam(teamOpen);
   if (name === "lookup") refreshLookup();
   if (name === "talk") refreshTalk();
-  if (name === "swarm") refreshSwarm();
+  if (name === "swarm") {
+    refreshSwarm(undefined, {recoveryOnly: Boolean(options.recoveryOnly)});
+  }
 }
 
 /* ---- Start here: one plain-language answer to "is this ready?" ---- */
@@ -4888,10 +4893,20 @@ function applyCheckEvent(event) {
 
 function bindEvents() {
   applyMoreOptionsPreference();
+  // Startup performs several local reads. Any real pointer or keyboard action
+  // means the person has begun using the current workspace, so a late recovery
+  // result may announce itself but must not move them to another view.
+  const markUserInteraction = (event) => {
+    if (event.isTrusted) userViewSelectionRevision += 1;
+  };
+  document.addEventListener("pointerdown", markUserInteraction, {capture: true});
+  document.addEventListener("keydown", markUserInteraction, {capture: true});
   applyAgentRunPanelPreference();
   $("agentRunPanel").addEventListener("toggle", rememberAgentRunPanelPreference);
   document.querySelectorAll("[data-node-type]").forEach((button) => { button.addEventListener("click", () => addNode(button.dataset.nodeType, 360, 300, button)); button.addEventListener("dragstart", (event) => event.dataTransfer.setData("application/x-harness-node", button.dataset.nodeType)); });
-  document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => switchView(button.dataset.view)));
+  document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener(
+    "click", () => switchView(button.dataset.view, {userInitiated: true}),
+  ));
   $("canvas").addEventListener("dragover", (event) => { if (event.dataTransfer.types.includes("application/x-harness-node")) event.preventDefault(); });
   $("canvas").addEventListener("drop", (event) => { event.preventDefault(); const type = event.dataTransfer.getData("application/x-harness-node"); const rect = $("canvas").getBoundingClientRect(); addNode(type, (event.clientX - rect.left - pan.x) / zoom, (event.clientY - rect.top - pan.y) / zoom); });
   $("canvas").addEventListener("pointerdown", (event) => { if (event.target !== $("canvas") && event.target !== $("viewport") && event.target !== $("nodeLayer")) return; panDrag = {startX: event.clientX, startY: event.clientY, x: pan.x, y: pan.y}; $("canvas").classList.add("panning"); clearSelection(); });
@@ -6898,6 +6913,7 @@ function renderLookupAnswer(said) {
 
 async function boot() {
   bindEvents();
+  const untouchedViewRevision = userViewSelectionRevision;
   try {
     await loadNexusAppIcon();
     const value = await request("/api/bootstrap");
@@ -6930,7 +6946,26 @@ async function boot() {
     restoreAuthorityRepairSuccess();
     await refreshTeamNotes();
     await refreshWorkflows();
+    // Event polling must not wait behind a slow loopback read or Electron IPC
+    // while the two recovery journals are inventoried below.
     pollEvents();
+    // A goal request is written to two durable journals before the composer is
+    // cleared. If admission was interrupted, make that recovery the first
+    // visible workspace after restart. Merely inventorying it is read-only:
+    // provider work still requires the explicit reconcile button below.
+    const directGoalRecoveryState = await refreshDirectLongGoalRecoveries();
+    if (directGoalRecoveryState.hasPending) {
+      if (userViewSelectionRevision === untouchedViewRevision) {
+        // Recovery-only hydration draws the saved board and chats but never
+        // resumes an unrelated board run or advances its durable goal queue.
+        switchView("swarm", {recoveryOnly: true});
+      }
+      announce(
+        "A saved project goal needs your attention. Open its exact chat or reconcile the saved request.",
+      );
+    } else if (directGoalRecoveryState.inventoryError) {
+      showError(directGoalRecoveryState.inventoryError);
+    }
   } catch (error) {
     showError(error.message);
   }
@@ -7015,6 +7050,19 @@ const SWARM_RECOVERABLE_WORK_STATUSES = new Set([
 ]);
 const swarmWorkRecoveries = loadSwarmWorkRecoveries();
 let swarmWorkRecoveryRefreshRevision = 0;
+// The authenticated backend journal is the admission authority. The desktop
+// main process owns a bounded, atomic pre-network outbox in app userData so a
+// random loopback port or renderer restart cannot strand the exact payload.
+// Attachment bytes never enter localStorage, and replay always needs an
+// explicit recovery press.
+const directLongGoalRecoveries = new Map(); // exact chat id -> public pending metadata
+const directLongGoalRecoveryBusy = new Set();
+// Exact pre-network payload text is loaded only after the user presses Open
+// exact saved chat. Keep that bounded read in renderer memory (never
+// localStorage), and retain attachment metadata rather than base64 bytes.
+const directLongGoalRecoveryPayloadViews = new Map();
+let directLongGoalRecoveryRefreshRevision = 0;
+let directLongGoalRecoveryError = "";
 // A long provider request remains one HTTP call, but its truthful Nexus stages
 // arrive through a second, lightweight activity feed.  This map lets both the
 // movable and maximised views show the same live state.
@@ -7765,8 +7813,1007 @@ function workRecoveryTitle(status) {
         : "Applied changes are not verified yet";
 }
 
+async function saveDirectLongGoalOutbox(record) {
+  if (!window.harnessDesktop?.saveDirectGoalOutbox) {
+    throw new Error(
+      "This Nexus desktop build cannot durably stage an exact goal request before sending it.",
+    );
+  }
+  return window.harnessDesktop.saveDirectGoalOutbox(record);
+}
+
+function exactDirectLongGoalOutboxInventoryValue(listed) {
+  if (!Array.isArray(listed)) {
+    throw new Error(
+      "The desktop recovery journal did not return its exact recovery-record list.",
+    );
+  }
+  return listed;
+}
+
+async function readDirectLongGoalOutbox() {
+  if (!window.harnessDesktop?.listDirectGoalOutbox) return [];
+  const listed = await window.harnessDesktop.listDirectGoalOutbox();
+  // The desktop contract is an array. A fulfilled malformed IPC value is not
+  // evidence that the durable outbox is empty: treating `{}` or `null` as []
+  // would make an already-visible recovery disappear on the next full merge.
+  return exactDirectLongGoalOutboxInventoryValue(listed);
+}
+
+async function loadDirectLongGoalOutboxPayload(recovery) {
+  if (!window.harnessDesktop?.readDirectGoalOutbox) {
+    throw new Error("The exact local goal request cannot be read by this desktop build.");
+  }
+  return window.harnessDesktop.readDirectGoalOutbox(
+    recovery.chat_id, recovery.request_id, recovery.outbox_payload_sha256 || recovery.payload_sha256,
+  );
+}
+
+function directLongGoalRecoveryPayloadViewKey(recovery) {
+  const digest = String(
+    recovery?.outbox_payload_sha256 || recovery?.intent || recovery?.intent_sha256
+      || recovery?.payload_sha256 || "",
+  );
+  return JSON.stringify([
+    String(recovery?.chat_id || ""), String(recovery?.request_id || ""), digest,
+  ]);
+}
+
+function directLongGoalRecoveryPayloadView(recovery) {
+  return directLongGoalRecoveryPayloadViews.get(
+    directLongGoalRecoveryPayloadViewKey(recovery),
+  ) || null;
+}
+
+function rememberDirectLongGoalRecoveryPayloadView(recovery, payload) {
+  const attachments = Object.freeze((Array.isArray(payload?.attachments)
+    ? payload.attachments : []).map((one) => Object.freeze({
+      name: String(one?.name || "Saved attachment"),
+      type: String(one?.type || "application/octet-stream"),
+      size: Number(one?.size || 0),
+    })));
+  const visible = Object.freeze({
+    text: String(payload?.text || ""), attachments,
+  });
+  directLongGoalRecoveryPayloadViews.set(
+    directLongGoalRecoveryPayloadViewKey(recovery), visible,
+  );
+  return visible;
+}
+
+async function verifiedDirectLongGoalOutboxPayload(recovery) {
+  const saved = await loadDirectLongGoalOutboxPayload(recovery);
+  const payload = saved?.payload;
+  const expectedDigest = String(
+    recovery?.outbox_payload_sha256 || recovery?.intent || recovery?.payload_sha256 || "",
+  );
+  if (!saved || typeof saved !== "object" || Array.isArray(saved)
+      || saved.schema_version !== 1 || !payload || typeof payload !== "object"
+      || Array.isArray(payload)
+      || String(saved.chat_id || "") !== String(recovery?.chat_id || "")
+      || String(saved.request_id || "") !== String(recovery?.request_id || "")
+      || String(saved.payload_sha256 || "") !== expectedDigest
+      || String(saved.intent || "") !== expectedDigest
+      || String(payload.chat_id || "") !== String(recovery?.chat_id || "")
+      || typeof payload.project_id !== "string" || !payload.project_id
+      || typeof payload.lead_id !== "string" || !payload.lead_id
+      || String(payload.project_id) !== String(recovery?.project_id || "")
+      || String(payload.lead_id) !== String(recovery?.lead_id || "")
+      || typeof payload.text !== "string" || !payload.text.trim()
+      || !Array.isArray(payload.attachments)) {
+    throw new Error(
+      "The exact local goal-request payload changed or returned an unsupported shape.",
+    );
+  }
+  const computed = await directLongGoalIntent(
+    {project: payload.project_id, id: payload.chat_id},
+    payload.lead_id, payload.text, payload.attachments,
+  );
+  if (computed !== expectedDigest) {
+    throw new Error(
+      "The exact local goal-request payload no longer matches its saved digest.",
+    );
+  }
+  return saved;
+}
+
+async function removeDirectLongGoalOutbox(chatId, requestId, payloadSha256 = "") {
+  if (!window.harnessDesktop?.deleteDirectGoalOutbox) {
+    throw new Error(
+      "This Nexus desktop build cannot confirm deletion of the exact saved goal request.",
+    );
+  }
+  const removed = await window.harnessDesktop.deleteDirectGoalOutbox(
+    chatId, requestId, payloadSha256,
+  );
+  const acknowledgementKeys = removed && typeof removed === "object"
+    && !Array.isArray(removed) ? Object.keys(removed).sort() : [];
+  const exactAcknowledgement = acknowledgementKeys.length === 2
+    && acknowledgementKeys[0] === "deleted"
+    && acknowledgementKeys[1] === "reason";
+  if (exactAcknowledgement
+      && removed.deleted === true && removed.reason === "deleted") {
+    return removed;
+  }
+  if (exactAcknowledgement
+      && removed.deleted === false && removed.reason === "missing") {
+    return removed;
+  }
+  if (exactAcknowledgement
+      && removed.deleted === false && removed.reason === "mismatch") {
+    throw new Error(
+      "The durable desktop outbox changed before deletion. Its replacement was kept.",
+    );
+  }
+  throw new Error(
+    "The desktop did not return an exact deletion acknowledgement. The saved goal request was kept visible.",
+  );
+}
+
+function clearDirectLongGoalRequestMarker(
+  agentId, chatId, requestId, intentSha256,
+) {
+  if (!agentId) return false;
+  const key = `nexus.long-horizon.direct-request.${swarmChatKeyFor(agentId, chatId)}`;
+  let marker = null;
+  try { marker = JSON.parse(localStorage.getItem(key) || "null"); }
+  catch (_) { return false; }
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)
+      || marker.schema_version !== 2
+      || typeof marker.id !== "string" || marker.id !== String(requestId || "")
+      || typeof marker.intent !== "string"
+      || marker.intent !== String(intentSha256 || "")) {
+    return false;
+  }
+  localStorage.removeItem(key);
+  return true;
+}
+
+function directLongGoalRecoveryFor(agentId) {
+  const recovery = directLongGoalRecoveries.get(activeConversationIdFor(agentId)) || null;
+  return recovery && String(recovery.lead_id || "") === String(agentId || "")
+    ? recovery : null;
+}
+
+const DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION = 1;
+const DIRECT_LONG_GOAL_RECEIPT_ID_LIMITS = Object.freeze({
+  request_id: 160, chat_id: 256, project_id: 512, lead_id: 256,
+});
+
+function verifiedDirectLongGoalReceiptIdentity(receipt, expected, label) {
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) {
+    throw new Error(`${label} did not return an exact receipt object.`);
+  }
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) {
+    throw new Error(`Nexus has no exact identity for ${label.toLowerCase()}.`);
+  }
+  const identity = {};
+  for (const [field, maximum] of Object.entries(DIRECT_LONG_GOAL_RECEIPT_ID_LIMITS)) {
+    const exact = expected[field];
+    if (typeof exact !== "string" || !exact || [...exact].length > maximum) {
+      throw new Error(
+        `Nexus has no bounded exact ${field.replaceAll("_", " ")} for ${label.toLowerCase()}.`,
+      );
+    }
+    if (typeof receipt[field] !== "string" || receipt[field] !== exact) {
+      throw new Error(
+        `${label} is bound to a different exact ${field.replaceAll("_", " ")}.`,
+      );
+    }
+    identity[field] = exact;
+  }
+  const intent = expected.intent_sha256;
+  if (typeof intent !== "string" || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(intent)) {
+    throw new Error(`Nexus has no exact intent digest for ${label.toLowerCase()}.`);
+  }
+  if (typeof receipt.intent_sha256 !== "string" || receipt.intent_sha256 !== intent) {
+    throw new Error(`${label} is bound to a different exact intent digest.`);
+  }
+  return {...identity, intent_sha256: intent};
+}
+
+function verifiedDirectLongGoalReceiptGoal(goal, expected, label) {
+  if (!goal || typeof goal !== "object" || Array.isArray(goal)
+      || !Number.isSafeInteger(goal.schema_version) || goal.schema_version < 1
+      || typeof goal.goal_id !== "string" || !goal.goal_id
+      || typeof goal.request_id !== "string" || goal.request_id !== expected.request_id
+      || typeof goal.conversation_id !== "string"
+      || goal.conversation_id !== expected.chat_id
+      || !goal.project || typeof goal.project !== "object" || Array.isArray(goal.project)
+      || typeof goal.project.id !== "string" || goal.project.id !== expected.project_id
+      || typeof goal.lead_agent_id !== "string" || goal.lead_agent_id !== expected.lead_id) {
+    throw new Error(`${label} did not return the matching canonical durable goal.`);
+  }
+  return goal;
+}
+
+function verifiedDirectLongGoalStartReceipt(receipt, expected) {
+  const identity = verifiedDirectLongGoalReceiptIdentity(
+    receipt, expected, "The durable goal start",
+  );
+  if (receipt.schema_version !== DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION
+      || receipt.engine !== "long_horizon") {
+    throw new Error("The durable goal start returned an unsupported receipt version or engine.");
+  }
+  verifiedDirectLongGoalReceiptGoal(receipt.goal, identity, "The durable goal start");
+  return receipt;
+}
+
+function verifiedDirectLongGoalDiscardReceipt(receipt, expected) {
+  const identity = verifiedDirectLongGoalReceiptIdentity(
+    receipt, expected, "The saved goal discard",
+  );
+  if (receipt.schema_version !== DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION
+      || typeof receipt.discarded !== "boolean"
+      || typeof receipt.reconciled !== "boolean"
+      || typeof receipt.safe_to_delete !== "boolean") {
+    throw new Error("The saved goal discard returned an unsupported or ambiguous receipt.");
+  }
+  if (receipt.reconciled) {
+    if (receipt.discarded || receipt.safe_to_delete) {
+      throw new Error("The saved goal discard returned conflicting reconciliation flags.");
+    }
+    verifiedDirectLongGoalReceiptGoal(
+      receipt.goal, identity, "The saved goal reconciliation",
+    );
+  } else {
+    if (!receipt.discarded || !receipt.safe_to_delete
+        || (receipt.goal !== undefined && receipt.goal !== null)) {
+      throw new Error("The backend did not prove that this exact saved request is safe to delete.");
+    }
+  }
+  return receipt;
+}
+
+function appendDirectLongGoalExactPayload(parent, recovery, {open = true} = {}) {
+  const payload = directLongGoalRecoveryPayloadView(recovery);
+  if (!payload) return false;
+  const exact = make("details", "direct-long-goal-exact-payload");
+  exact.open = open;
+  exact.append(make("summary", "", "Exact saved request"));
+  exact.append(make("pre", "direct-long-goal-exact-text", payload.text));
+  if (payload.attachments.length) {
+    const files = make("ul", "direct-long-goal-exact-attachments");
+    for (const attachment of payload.attachments) {
+      files.append(make(
+        "li", "",
+        `${attachment.name} · ${Number(attachment.size || 0).toLocaleString()} bytes`,
+      ));
+    }
+    exact.append(files);
+  }
+  parent.append(exact);
+  return true;
+}
+
+function fillDirectLongGoalRecoveryPanel(panel, agentId, recovery) {
+  panel.hidden = false;
+  panel.replaceChildren();
+  panel.dataset.status = "pending_admission";
+  panel.append(make("h4", "work-recovery-title", "Saved project goal needs reconciliation"));
+  panel.append(make(
+    "p", "work-recovery-status",
+    recovery.outbox_conflict || recovery.outbox_digest_mismatch
+      ? "The desktop outbox and backend journal disagree. Nexus has failed closed: it will not resend or delete either exact record."
+      : "Nexus saved the exact bounded request and its attachment bytes before clearing the composer. "
+        + "It has not automatically resent anything after the interrupted admission.",
+  ));
+  const exactPromptShown = appendDirectLongGoalExactPayload(panel, recovery);
+  if (!exactPromptShown && recovery.text_preview) {
+    panel.append(make("p", "hint", `Request: ${recovery.text_preview}`));
+  }
+  const attachmentWords = recovery.attachment_count
+    ? ` · ${recovery.attachment_count} saved attachment${recovery.attachment_count === 1 ? "" : "s"}`
+    : "";
+  panel.append(make(
+    "p", "hint",
+    `${Number(recovery.text_characters || 0).toLocaleString()} saved characters${attachmentWords}.`,
+  ));
+  const row = make("div", "button-row work-recovery-actions");
+  const recover = make("button", "primary direct-long-goal-recover", "Reconcile saved goal request");
+  recover.type = "button";
+  recover.addEventListener("click", () => recoverDirectLongGoalAdmission(agentId));
+  row.append(recover);
+  const discard = make("button", "danger direct-long-goal-discard", "Discard saved request");
+  discard.type = "button";
+  discard.addEventListener("click", () => discardDirectLongGoalAdmission(agentId));
+  row.append(discard);
+  panel.append(row);
+}
+
+async function openDirectLongGoalRecovery(recovery) {
+  let exact = recovery;
+  if (exact?.desktop_outbox) {
+    const saved = await verifiedDirectLongGoalOutboxPayload(exact);
+    rememberDirectLongGoalRecoveryPayloadView(exact, saved.payload);
+    // Keep the revealed attachment bytes confined to this verified read. The
+    // chat-selection path needs only immutable routing identity; neither the
+    // compact nor maximized composer should ever receive a resubmittable copy.
+    exact = {
+      ...exact,
+      project_id: String(saved.payload.project_id || ""),
+      lead_id: String(saved.payload.lead_id || ""),
+      chat_id: String(saved.payload.chat_id || ""),
+    };
+    // The exact payload is deliberately not inventoried on startup. Once the
+    // person explicitly opens it, show the exact text before either Reconcile
+    // or Discard can be chosen.
+    renderDirectLongGoalBoardRecoveryNotice();
+  }
+  const agentId = String(exact?.lead_id || "");
+  const chatId = String(exact?.chat_id || "");
+  if (!agentId || !chatId || !theSwarmAgent(agentId)) {
+    throw new Error("The saved goal request no longer has its exact agent and chat on this board.");
+  }
+  if (!swarmChats.some((one) => one.agent === agentId)) {
+    await openTheChatFor(agentId);
+  } else {
+    await loadConversationsFor(agentId, false);
+  }
+  const held = swarmChats.find((one) => one.agent === agentId);
+  const conversation = (held?.conversations || []).find((one) => one.id === chatId);
+  if (!conversation) throw new Error("The exact saved chat could not be found on this board.");
+  if (String(conversation.project || "") !== String(exact.project_id || "")) {
+    throw new Error(
+      "The exact saved chat is no longer bound to its saved project. The request remains journalled and was not resent.",
+    );
+  }
+  if (conversation.archived_at) await restoreConversationFor(agentId, chatId);
+  else if (held.conversation !== chatId) await activateConversationFor(agentId, chatId);
+  if (activeConversationIdFor(agentId) !== chatId) {
+    throw new Error(
+      "Nexus could not activate the exact saved chat. The recovery remains on the board and was not resent.",
+    );
+  }
+  renderWorkRecovery(agentId);
+  const card = theChatCardFor(agentId);
+  card?.scrollIntoView?.({block: "nearest"});
+  card?.querySelector?.(".direct-long-goal-recover")?.focus?.({preventScroll: true});
+}
+
+function renderDirectLongGoalBoardRecoveryNotice() {
+  const panel = $("directLongGoalRecoveryBoard");
+  const list = $("directLongGoalRecoveryBoardList");
+  if (!panel || !list) return;
+  const recoveries = [...directLongGoalRecoveries.values()].flatMap(
+    (one) => one.outbox_conflict ? [one, one.outbox_conflict] : [one],
+  );
+  panel.hidden = !recoveries.length && !directLongGoalRecoveryError;
+  list.replaceChildren();
+  if (directLongGoalRecoveryError) {
+    list.append(make("li", "direct-long-goal-recovery-error", directLongGoalRecoveryError));
+  }
+  for (const [recoveryIndex, recovery] of recoveries.entries()) {
+    const row = make("li", "direct-long-goal-recovery-row");
+    const identity = String(recovery.request_id || "").slice(0, 12);
+    row.append(make(
+      "span", "direct-long-goal-recovery-identity",
+      `${Number(recovery.text_characters || 0).toLocaleString()} characters · `
+        + `${Number(recovery.attachment_count || 0)} attachments · request ${identity}`,
+    ));
+    appendDirectLongGoalExactPayload(row, recovery, {open: false});
+    const actions = make("span", "button-row");
+    const open = make("button", "direct-long-goal-open", "Open exact saved chat");
+    open.type = "button";
+    open.disabled = !swarmBoardHydrated;
+    let loading = null;
+    if (open.disabled) {
+      loading = make(
+        "span", "hint direct-long-goal-loading",
+        "Loading the saved agent board before this exact chat can open.",
+      );
+      loading.id = `direct-long-goal-loading-${recoveryIndex}`;
+      open.setAttribute("aria-describedby", loading.id);
+    }
+    open.title = open.disabled
+      ? "Wait while Nexus loads the saved agent board; this request remains safely journalled"
+      : "Open the exact saved chat without resending its request";
+    open.addEventListener("click", async () => {
+      try { await openDirectLongGoalRecovery(recovery); }
+      catch (error) { showError(String(error.message || error)); }
+    });
+    actions.append(open);
+    const discard = make("button", "danger direct-long-goal-board-discard", "Discard exact request");
+    discard.type = "button";
+    discard.addEventListener("click", () => discardDirectLongGoalAdmission(
+      String(recovery.lead_id || ""), recovery,
+    ));
+    actions.append(discard);
+    if (loading) row.append(loading);
+    row.append(actions);
+    list.append(row);
+  }
+}
+
+function directLongGoalRecoveryInventoryState() {
+  return {
+    hasPending: directLongGoalRecoveries.size > 0,
+    inventoryError: String(directLongGoalRecoveryError || ""),
+  };
+}
+
+function directLongGoalLocalRecoveryMetadata(pending) {
+  return {
+    ...pending,
+    lead_id: String(pending?.lead_id || pending?.payload?.lead_id || ""),
+    project_id: String(pending?.project_id || pending?.payload?.project_id || ""),
+    text_characters: Number(pending?.text_characters || 0),
+    attachment_count: Number(pending?.attachment_count || 0),
+    // Desktop metadata is intentionally not used as a display preview; only
+    // the backend's credential-redacted preview may be rendered.
+    text_preview: "",
+    desktop_outbox: true,
+    server_pending: false,
+    outbox_payload_sha256: String(pending?.payload_sha256 || ""),
+  };
+}
+
+const DIRECT_LONG_GOAL_RECOVERY_SHA256 = /^[a-f0-9]{64}$/;
+
+function exactDirectLongGoalRecoveryText(pending, field, journal, index, maximum = 4096) {
+  const value = pending?.[field];
+  if (typeof value !== "string" || !value || value !== value.trim()
+      || [...value].length > maximum) {
+    throw new Error(
+      `${journal} record ${index + 1} has no exact ${field.replaceAll("_", " ")}.`,
+    );
+  }
+  return value;
+}
+
+function exactDirectLongGoalRecoveryCount(
+  pending, field, journal, index, maximum = Number.MAX_SAFE_INTEGER,
+) {
+  const value = pending?.[field];
+  if (!Number.isSafeInteger(value) || value < 0 || value > maximum) {
+    throw new Error(
+      `${journal} record ${index + 1} has an invalid ${field.replaceAll("_", " ")}.`,
+    );
+  }
+  return value;
+}
+
+function verifiedDirectLongGoalRecoveryRows(value, journal) {
+  if (!Array.isArray(value)) {
+    throw new Error(`${journal} did not return an exact recovery-record list.`);
+  }
+  const chatIds = new Set();
+  const requestIds = new Set();
+  const digestFields = journal === "The backend recovery journal"
+    ? ["intent_sha256", "payload_sha256"] : ["intent", "payload_sha256"];
+  for (const [index, pending] of value.entries()) {
+    if (!pending || typeof pending !== "object" || Array.isArray(pending)
+        || pending.schema_version !== 1) {
+      throw new Error(`${journal} record ${index + 1} has an unsupported shape or version.`);
+    }
+    const chatId = exactDirectLongGoalRecoveryText(
+      pending, "chat_id", journal, index, 512,
+    );
+    const requestId = exactDirectLongGoalRecoveryText(
+      pending, "request_id", journal, index, 160,
+    );
+    const projectId = exactDirectLongGoalRecoveryText(
+      pending, "project_id", journal, index, 512,
+    );
+    const leadId = exactDirectLongGoalRecoveryText(
+      pending, "lead_id", journal, index, 256,
+    );
+    if (chatIds.has(chatId) || requestIds.has(requestId)) {
+      throw new Error(`${journal} returned a duplicate chat or request identity.`);
+    }
+    chatIds.add(chatId);
+    requestIds.add(requestId);
+    for (const field of digestFields) {
+      if (typeof pending[field] !== "string"
+          || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(pending[field])) {
+        throw new Error(`${journal} record ${index + 1} has no exact ${field} digest.`);
+      }
+    }
+    if (journal !== "The backend recovery journal"
+        && pending.intent !== pending.payload_sha256) {
+      throw new Error(`${journal} record ${index + 1} contains conflicting exact digests.`);
+    }
+    if (typeof pending.text_preview !== "string"
+        || [...pending.text_preview].length > 500) {
+      throw new Error(`${journal} record ${index + 1} has an invalid bounded text preview.`);
+    }
+    exactDirectLongGoalRecoveryCount(
+      pending, "text_characters", journal, index, 12_000_000,
+    );
+    exactDirectLongGoalRecoveryCount(
+      pending, "attachment_count", journal, index, 6,
+    );
+    if (journal === "The backend recovery journal") {
+      exactDirectLongGoalRecoveryCount(
+        pending, "created_ms", journal, index,
+      );
+      const contract = pending.execution_contract;
+      if (!contract || typeof contract !== "object" || Array.isArray(contract)
+          || contract.schema_version !== 1
+          || contract.kind !== "direct_long_horizon_admission"
+          || String(contract.project_id || "") !== projectId
+          || String(contract.chat_id || "") !== chatId
+          || String(contract.lead_id || "") !== leadId
+          || typeof contract.chat_scope !== "string" || !contract.chat_scope
+          || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
+            String(contract.project_root_fingerprint_sha256 || ""),
+          )
+          || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
+            String(contract.fingerprint_sha256 || ""),
+          )) {
+        throw new Error(
+          `${journal} record ${index + 1} has an incomplete execution contract.`,
+        );
+      }
+    } else {
+      if (!DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
+        String(pending.project_fingerprint || ""),
+      )) {
+        throw new Error(
+          `${journal} record ${index + 1} has no exact project fingerprint.`,
+        );
+      }
+      exactDirectLongGoalRecoveryCount(
+        pending, "attachment_bytes", journal, index, 8_000_000,
+      );
+      for (const field of ["created_at", "updated_at"]) {
+        if (typeof pending[field] !== "string"
+            || !Number.isFinite(Date.parse(pending[field]))) {
+          throw new Error(
+            `${journal} record ${index + 1} has an invalid ${field.replaceAll("_", " ")}.`,
+          );
+        }
+      }
+    }
+  }
+  return value;
+}
+
+function verifiedDirectLongGoalRemoteInventory(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !Object.hasOwn(value, "pending")) {
+    throw new Error("The backend recovery journal did not return its exact inventory envelope.");
+  }
+  return verifiedDirectLongGoalRecoveryRows(
+    value.pending, "The backend recovery journal",
+  );
+}
+
+function verifyDirectLongGoalCrossAuthorityRequests(rows) {
+  const requests = new Map();
+  for (const pending of rows) {
+    const requestId = String(pending?.request_id || "");
+    const chatId = String(pending?.chat_id || "");
+    if (!requestId || !chatId) continue;
+    const heldChat = requests.get(requestId);
+    if (heldChat && heldChat !== chatId) {
+      throw new Error(
+        "The recovery journals bound one request identity to different exact chats.",
+      );
+    }
+    requests.set(requestId, chatId);
+  }
+}
+
+function sameDirectLongGoalCrossAuthorityBinding(one, other) {
+  return ["project_id", "lead_id"].every(
+    (field) => String(one?.[field] || "") === String(other?.[field] || ""),
+  );
+}
+
+function mergeDirectLongGoalRecoveryInventories(remote, local, replace = false) {
+  // Build the whole candidate inventory off to the side. A malformed but
+  // fulfilled IPC/HTTP value must not clear or partially rewrite recovery
+  // records which were already visible and safely frozen.
+  const remoteRows = verifiedDirectLongGoalRecoveryRows(
+    remote, "The backend recovery journal",
+  );
+  const localRows = verifiedDirectLongGoalRecoveryRows(
+    local, "The desktop recovery journal",
+  );
+  verifyDirectLongGoalCrossAuthorityRequests([...remoteRows, ...localRows]);
+  const merged = new Map(replace ? [] : directLongGoalRecoveries);
+  for (const pending of remoteRows) {
+    const chatId = String(pending?.chat_id || "");
+    if (!chatId) continue;
+    const remoteMetadata = {...pending, server_pending: true, desktop_outbox: false};
+    const existing = merged.get(chatId);
+    if (!existing || !existing.desktop_outbox) {
+      merged.set(chatId, {...existing, ...remoteMetadata});
+    } else if (String(existing.request_id) === String(pending.request_id)
+        && sameDirectLongGoalCrossAuthorityBinding(existing, pending)) {
+      const digestMismatch = Boolean(
+        pending.intent_sha256 && existing.outbox_payload_sha256
+        && pending.intent_sha256 !== existing.outbox_payload_sha256
+      );
+      merged.set(chatId, {
+        ...existing, ...remoteMetadata, desktop_outbox: true,
+        outbox_payload_sha256: existing.outbox_payload_sha256,
+        outbox_digest_mismatch: digestMismatch,
+      });
+    } else {
+      merged.set(chatId, {
+        ...remoteMetadata, outbox_conflict: Object.freeze({...existing}),
+      });
+    }
+  }
+  for (const pending of localRows) {
+    const chatId = String(pending?.chat_id || "");
+    if (!chatId) continue;
+    const existing = merged.get(chatId);
+    const localMetadata = directLongGoalLocalRecoveryMetadata(pending);
+    if (!existing) {
+      merged.set(chatId, localMetadata);
+    } else if (String(existing.request_id) === String(pending.request_id)
+        && sameDirectLongGoalCrossAuthorityBinding(existing, pending)) {
+      const digestMismatch = Boolean(
+        existing.intent_sha256 && localMetadata.outbox_payload_sha256
+        && existing.intent_sha256 !== localMetadata.outbox_payload_sha256
+      );
+      merged.set(chatId, {
+        ...localMetadata, ...existing, desktop_outbox: true,
+        outbox_payload_sha256: localMetadata.outbox_payload_sha256,
+        outbox_digest_mismatch: digestMismatch,
+      });
+    } else {
+      merged.set(chatId, {
+        ...existing, outbox_conflict: Object.freeze(localMetadata),
+      });
+    }
+  }
+  verifyDirectLongGoalCrossAuthorityRequests(
+    [...merged.values()].flatMap(
+      (pending) => pending.outbox_conflict
+        ? [pending, pending.outbox_conflict] : [pending],
+    ),
+  );
+  const committed = new Map();
+  for (const [chatId, pending] of merged) {
+    committed.set(chatId, Object.freeze({...pending}));
+  }
+  directLongGoalRecoveries.clear();
+  for (const [chatId, pending] of committed) {
+    directLongGoalRecoveries.set(chatId, pending);
+  }
+  const visiblePayloads = new Set();
+  for (const pending of directLongGoalRecoveries.values()) {
+    for (const one of pending.outbox_conflict
+      ? [pending, pending.outbox_conflict] : [pending]) {
+      if (one.desktop_outbox) {
+        visiblePayloads.add(directLongGoalRecoveryPayloadViewKey(one));
+      }
+    }
+  }
+  for (const key of directLongGoalRecoveryPayloadViews.keys()) {
+    if (!visiblePayloads.has(key)) directLongGoalRecoveryPayloadViews.delete(key);
+  }
+}
+
+function sameDirectLongGoalRecoveryIdentity(recovery, chatId, requestId, digest = "") {
+  if (!recovery || String(recovery.chat_id || "") !== String(chatId || "")
+      || String(recovery.request_id || "") !== String(requestId || "")) return false;
+  if (!digest) return true;
+  return [
+    recovery.outbox_payload_sha256, recovery.intent, recovery.intent_sha256,
+    recovery.payload_sha256,
+  ].some((one) => String(one || "") === String(digest));
+}
+
+function forgetDirectLongGoalRecovery(chatId, requestId, digest = "") {
+  // Any refresh which sampled the two journals before successful admission is
+  // now stale. Supersede it before changing the visible exact identity so its
+  // delayed response cannot resurrect a phantom Reconcile card.
+  directLongGoalRecoveryRefreshRevision += 1;
+  const current = directLongGoalRecoveries.get(String(chatId || ""));
+  if (sameDirectLongGoalRecoveryIdentity(current, chatId, requestId, digest)) {
+    if (current.outbox_conflict) {
+      directLongGoalRecoveries.set(
+        String(chatId), Object.freeze({...current.outbox_conflict}),
+      );
+    } else {
+      directLongGoalRecoveries.delete(String(chatId));
+    }
+  } else if (sameDirectLongGoalRecoveryIdentity(
+    current?.outbox_conflict, chatId, requestId, digest,
+  )) {
+    const kept = {...current};
+    delete kept.outbox_conflict;
+    directLongGoalRecoveries.set(String(chatId), Object.freeze(kept));
+  }
+  for (const key of directLongGoalRecoveryPayloadViews.keys()) {
+    let identity;
+    try { identity = JSON.parse(key); } catch (_) { identity = []; }
+    if (String(identity[0] || "") === String(chatId || "")
+        && String(identity[1] || "") === String(requestId || "")) {
+      directLongGoalRecoveryPayloadViews.delete(key);
+    }
+  }
+  renderDirectLongGoalBoardRecoveryNotice();
+  for (const held of swarmChats) renderWorkRecovery(held.agent);
+  setWhatCanBePressedInSwarm();
+}
+
+async function boundedDirectLongGoalRecoveryRead(reader, journalName) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(reader),
+      new Promise((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error(
+          `${journalName} did not answer within 8 seconds`,
+        )), 8000);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) window.clearTimeout(timer);
+  }
+}
+
+async function refreshDirectLongGoalRecoveries() {
+  const mine = ++directLongGoalRecoveryRefreshRevision;
+  const [remoteResult, localResult] = await Promise.allSettled([
+    boundedDirectLongGoalRecoveryRead(
+      () => request("/api/long-horizon/pending-admissions"), "The backend recovery journal",
+    ),
+    boundedDirectLongGoalRecoveryRead(
+      () => readDirectLongGoalOutbox(), "The desktop recovery journal",
+    ),
+  ]);
+  if (mine !== directLongGoalRecoveryRefreshRevision) {
+    return directLongGoalRecoveryInventoryState();
+  }
+  let remote = [];
+  let local = [];
+  let remoteProblem = remoteResult.status === "rejected" ? remoteResult.reason : null;
+  let localProblem = localResult.status === "rejected" ? localResult.reason : null;
+  if (!remoteProblem) {
+    try { remote = verifiedDirectLongGoalRemoteInventory(remoteResult.value); }
+    catch (error) { remoteProblem = error; }
+  }
+  if (!localProblem) {
+    try {
+      local = verifiedDirectLongGoalRecoveryRows(
+        localResult.value, "The desktop recovery journal",
+      );
+    } catch (error) { localProblem = error; }
+  }
+  if (remoteProblem && localProblem) {
+    directLongGoalRecoveryError = "Nexus could not verify either saved goal-request journal. Existing recovery records were kept; no request was assumed absent or resent.";
+    renderDirectLongGoalBoardRecoveryNotice();
+    return directLongGoalRecoveryInventoryState();
+  }
+  if (remoteProblem || localProblem) {
+    // A partial inventory is not proof that the other authority deleted its
+    // exact record. Preserve what was already displayed; a later complete
+    // read will perform the authoritative merge/removal.
+    directLongGoalRecoveryError = localProblem
+      ? "The durable desktop goal-request outbox could not be verified. Existing recovery records were kept; repair or restart Nexus before discarding anything."
+      : "The backend goal-request journal could not be verified. Existing recovery records were kept; Nexus will retry without resending anything.";
+    try {
+      // A successful authority is evidence that a record exists even though
+      // the failed authority is not evidence that anything was deleted. Merge
+      // additions only, preserving every previously displayed exact identity.
+      mergeDirectLongGoalRecoveryInventories(
+        remoteProblem ? [] : remote,
+        localProblem ? [] : local,
+        false,
+      );
+    } catch (_) {
+      directLongGoalRecoveryError =
+        "Nexus could not safely combine the available recovery journal with the records already shown. Everything was kept and no request was resent.";
+    }
+    renderDirectLongGoalBoardRecoveryNotice();
+    for (const held of swarmChats) renderWorkRecovery(held.agent);
+    setWhatCanBePressedInSwarm();
+    return directLongGoalRecoveryInventoryState();
+  }
+  try {
+    directLongGoalRecoveryError = "";
+    mergeDirectLongGoalRecoveryInventories(remote, local, true);
+    renderDirectLongGoalBoardRecoveryNotice();
+    for (const held of swarmChats) renderWorkRecovery(held.agent);
+    setWhatCanBePressedInSwarm();
+  } catch (_) {
+    // A recovery inventory read is not authority to discard a previously
+    // displayed record. Refresh remains explicit and never resends a request.
+    // Surface the failed verification as attention rather than silently
+    // returning to Start and making a durable request appear to have vanished.
+    directLongGoalRecoveryError =
+      "Nexus could not safely interpret the saved goal-request journals. Existing records were kept and no request was resent.";
+    renderDirectLongGoalBoardRecoveryNotice();
+  }
+  return directLongGoalRecoveryInventoryState();
+}
+
+async function recoverDirectLongGoalAdmission(agentId) {
+  const recovery = directLongGoalRecoveryFor(agentId);
+  if (!recovery || directLongGoalRecoveryBusy.has(recovery.request_id)) return;
+  directLongGoalRecoveryBusy.add(recovery.request_id);
+  renderWorkRecovery(agentId);
+  try {
+    if (recovery.outbox_conflict || recovery.outbox_digest_mismatch) {
+      throw new Error(
+        "The desktop outbox and backend journal do not describe the same exact request. "
+        + "Nexus refused to resend or delete either record.",
+      );
+    }
+    let backendIntentSha256 = String(recovery.intent_sha256 || "");
+    if (recovery.desktop_outbox) {
+      const saved = await verifiedDirectLongGoalOutboxPayload(recovery);
+      const exactPayload = saved?.payload;
+      if (!exactPayload || saved.request_id !== recovery.request_id
+          || saved.chat_id !== recovery.chat_id) {
+        throw new Error("The exact local goal-request outbox identity changed.");
+      }
+      const prepared = await request("/api/long-horizon/prepare-admission", {
+        method: "POST", body: JSON.stringify({
+          ...exactPayload, request_id: recovery.request_id,
+        }),
+      });
+      const preparedPending = verifiedDirectLongGoalRecoveryRows(
+        [prepared?.pending], "The backend recovery journal",
+      )[0];
+      for (const [field, expected] of Object.entries({
+        request_id: recovery.request_id,
+        chat_id: recovery.chat_id,
+        project_id: recovery.project_id,
+        lead_id: recovery.lead_id,
+      })) {
+        if (String(preparedPending[field] || "") !== String(expected || "")) {
+          throw new Error(
+            `The backend prepare replay changed the exact ${field.replaceAll("_", " ")}.`,
+          );
+        }
+      }
+      if (recovery.server_pending
+          && String(preparedPending.payload_sha256 || "")
+          !== String(recovery.payload_sha256 || "")) {
+        throw new Error(
+          "The backend prepare replay found a different full goal payload. Nexus did not start or delete it.",
+        );
+      }
+      backendIntentSha256 = String(preparedPending.intent_sha256 || "");
+    }
+    if (recovery.desktop_outbox
+        && String(recovery.outbox_payload_sha256 || recovery.payload_sha256) !== backendIntentSha256) {
+      throw new Error(
+        "The backend saved a different exact goal-request digest. Nexus did not start or delete it.",
+      );
+    }
+    const started = verifiedDirectLongGoalStartReceipt(
+      await request("/api/long-horizon/start", {
+        method: "POST", body: JSON.stringify({
+          request_id: recovery.request_id,
+          chat_id: recovery.chat_id,
+          from_pending: true,
+        }),
+      }),
+      {
+        request_id: recovery.request_id,
+        chat_id: recovery.chat_id,
+        project_id: recovery.project_id,
+        lead_id: recovery.lead_id,
+        intent_sha256: backendIntentSha256,
+      },
+    );
+    await removeDirectLongGoalOutbox(
+      recovery.chat_id, recovery.request_id,
+      recovery.outbox_payload_sha256 || recovery.payload_sha256,
+    );
+    forgetDirectLongGoalRecovery(
+      recovery.chat_id, recovery.request_id,
+      recovery.outbox_payload_sha256 || recovery.intent_sha256
+        || recovery.payload_sha256,
+    );
+    clearDirectLongGoalRequestMarker(
+      agentId, recovery.chat_id, recovery.request_id,
+      recovery.outbox_payload_sha256 || recovery.intent_sha256
+        || recovery.payload_sha256,
+    );
+    selectLongGoalSnapshot(started.goal);
+    if (activeConversationIdFor(agentId) === recovery.chat_id) {
+      await refreshTheChatFor(agentId);
+    }
+    await refreshLongGoals(true);
+    const words = longHorizonAdmissionWords(longGoal);
+    sayInTheChatFor(agentId, words.detail);
+  } catch (error) {
+    // A lost response may follow goal creation or provider dispatch. Read-only
+    // refreshes are safe; never automatically repeat the admission POST.
+    try {
+      await Promise.all([
+        refreshDirectLongGoalRecoveries(), refreshLongGoals(true),
+      ]);
+      if (activeConversationIdFor(agentId) === recovery.chat_id) {
+        await refreshTheChatFor(agentId);
+      }
+    } catch (_) { /* Preserve the original admission outcome. */ }
+    showError(error.message || String(error));
+  } finally {
+    directLongGoalRecoveryBusy.delete(recovery.request_id);
+    renderWorkRecovery(agentId);
+  }
+}
+
+async function discardDirectLongGoalAdmission(agentId, exactRecovery = null) {
+  const recovery = exactRecovery || directLongGoalRecoveryFor(agentId);
+  if (!recovery || directLongGoalRecoveryBusy.has(recovery.request_id)) return;
+  if (!window.confirm(
+    "Discard this exact saved goal request? Nexus first proves that no goal exists for its request identity. The saved chat transcript is kept, and this action starts no provider work.",
+  )) return;
+  directLongGoalRecoveryBusy.add(recovery.request_id);
+  if (agentId) renderWorkRecovery(agentId);
+  try {
+    const exactIntent = recovery.outbox_payload_sha256
+      || recovery.intent_sha256 || "";
+    const exactLead = recovery.lead_id || agentId || "";
+    const outcome = verifiedDirectLongGoalDiscardReceipt(
+      await request("/api/long-horizon/discard-admission", {
+        method: "POST", body: JSON.stringify({
+          request_id: recovery.request_id,
+          chat_id: recovery.chat_id,
+          project_id: recovery.project_id || "",
+          lead_id: exactLead,
+          payload_sha256: recovery.server_pending ? recovery.payload_sha256 : "",
+          intent_sha256: exactIntent,
+        }),
+      }),
+      {
+        request_id: recovery.request_id,
+        chat_id: recovery.chat_id,
+        project_id: recovery.project_id || "",
+        lead_id: exactLead,
+        intent_sha256: exactIntent,
+      },
+    );
+    const sameDesktopRecord = recovery.desktop_outbox
+      && !recovery.outbox_conflict && !recovery.outbox_digest_mismatch;
+    let desktopOutboxRemoved = false;
+    if (!recovery.server_pending || sameDesktopRecord) {
+      const removed = await removeDirectLongGoalOutbox(
+        recovery.chat_id, recovery.request_id,
+        recovery.outbox_payload_sha256 || recovery.payload_sha256,
+      );
+      desktopOutboxRemoved = removed.deleted === true || removed.reason === "missing";
+    }
+    const retainedDesktopOutbox = (
+      (recovery.desktop_outbox && !desktopOutboxRemoved)
+      || recovery.outbox_conflict?.desktop_outbox === true
+    );
+    if (agentId && !retainedDesktopOutbox) {
+      clearDirectLongGoalRequestMarker(
+        agentId, recovery.chat_id, recovery.request_id, exactIntent,
+      );
+    }
+    if (outcome.reconciled && outcome.goal) {
+      selectLongGoalSnapshot(outcome.goal);
+      if (agentId) sayInTheChatFor(agentId,
+        "A goal already existed for that exact request, so Nexus reconciled it instead of discarding it.");
+    } else {
+      if (agentId) sayInTheChatFor(agentId,
+        "The exact unadmitted goal request was discarded. No provider work was started by this action.");
+    }
+    await Promise.all([
+      refreshDirectLongGoalRecoveries(), refreshLongGoals(true),
+    ]);
+    if (agentId && activeConversationIdFor(agentId) === recovery.chat_id) {
+      await refreshTheChatFor(agentId);
+    }
+  } catch (error) {
+    showError(String(error.message || error));
+  } finally {
+    directLongGoalRecoveryBusy.delete(recovery.request_id);
+    if (agentId) renderWorkRecovery(agentId);
+  }
+}
+
 function fillWorkRecoveryPanel(panel, agentId) {
   if (!panel) return;
+  const directRecovery = directLongGoalRecoveryFor(agentId);
+  if (directRecovery) {
+    fillDirectLongGoalRecoveryPanel(panel, agentId, directRecovery);
+    return;
+  }
   const recovery = workRecoveryFor(agentId);
   panel.hidden = !recovery;
   panel.replaceChildren();
@@ -7848,6 +8895,36 @@ function fillWorkRecoveryPanel(panel, agentId) {
 }
 
 function renderWorkRecoveryButtons(agentId) {
+  const directRecovery = directLongGoalRecoveryFor(agentId);
+  if (directRecovery) {
+    const busy = swarmChatIsBusy(agentId)
+      || directLongGoalRecoveryBusy.has(directRecovery.request_id);
+    const card = theChatCardFor(agentId);
+    const recoverButtons = [card?.querySelector(".direct-long-goal-recover")];
+    const discardButtons = [card?.querySelector(".direct-long-goal-discard")];
+    if (theBigOne === agentId) {
+      recoverButtons.push(
+      $("theBigChatWorkRecovery")?.querySelector(".direct-long-goal-recover"),
+      );
+      discardButtons.push(
+      $("theBigChatWorkRecovery")?.querySelector(".direct-long-goal-discard"),
+      );
+    }
+    for (const button of recoverButtons.filter(Boolean)) {
+      button.disabled = busy || directRecovery.outbox_conflict
+        || directRecovery.outbox_digest_mismatch;
+      button.title = button.disabled
+        ? "Wait for this exact chat operation to finish"
+        : "Reconcile this exact saved request without changing or automatically resending it";
+    }
+    for (const button of discardButtons.filter(Boolean)) {
+      button.disabled = busy;
+      button.title = busy
+        ? "Wait for this exact chat operation to finish"
+        : "Prove no goal exists, then discard only this exact pending record";
+    }
+    return;
+  }
   const recovery = workRecoveryFor(agentId);
   const unavailable = swarmChatIsBusy(agentId) || swarmConversationSwitching.has(agentId)
     || !theSwarmAgent(agentId)?.ready;
@@ -8058,6 +9135,8 @@ function aChatActivityPanel(extraClass = "") {
 
 function activityWords(activity) {
   const seconds = Math.max(0, Math.floor((Date.now() - activity.startedAt) / 1000));
+  if (activity.settled && activity.state === "attention") return `Needs attention after ${seconds}s`;
+  if (activity.terminalState === "admitted") return `Accepted in ${seconds}s`;
   if (activity.state === "complete") return `Completed in ${seconds}s`;
   if (activity.state === "error") return `Stopped after ${seconds}s`;
   return seconds ? `Working for ${seconds}s` : "Working now";
@@ -8148,7 +9227,8 @@ function beginSwarmChatActivity(agentId, mode, agent, words = "", attachments = 
     stage: first[0], detail: first[1], startedAt: Date.now(),
     elapsedTimer: 0, pollTimer: 0, finishTimer: 0, remoteTurns: [],
     localTurns: words ? [{
-      who: "you", speaker_name: "You", text: words, phase: "user_prompt",
+      who: "you", speaker_name: "You", text: words,
+      phase: mode === "work" ? "long_horizon_prompt" : "user_prompt",
       attachments: attachments.map((one) => ({
         name: one.name, type: one.type, image: String(one.type || "").startsWith("image/"),
       })),
@@ -8278,6 +9358,71 @@ function finishSwarmChatActivity(
   // request or strands the composer below a permanent progress panel.
   scheduleSwarmChatActivityCollapse(agentId, activity,
     succeeded && !degraded ? 1600 : 4200);
+}
+
+function longHorizonAdmissionWords(goal) {
+  const goalId = String(goal?.goal_id || "").slice(0, 8) || "unknown";
+  const status = String(goal?.status || "unknown");
+  if (status === "waiting_for_project") {
+    return {
+      stage: "Goal waiting for project",
+      detail: `Durable goal ${goalId} was accepted and will start after the current project owner releases it.`,
+    };
+  }
+  if (status === "queued") {
+    return {stage: "Goal accepted and queued", detail: `Durable goal ${goalId} is queued in Mission control.`};
+  }
+  if (status === "running") {
+    return {stage: "Goal accepted and running", detail: `Durable goal ${goalId} is running in Mission control.`};
+  }
+  if (status === "paused") {
+    return {stage: "Goal accepted but paused", detail: `Durable goal ${goalId} is paused and is not complete.`};
+  }
+  if (status === "waiting_for_user") {
+    return {stage: "Goal needs your input", detail: `Durable goal ${goalId} is waiting for you in Mission control.`};
+  }
+  if (status === "complete") {
+    return {stage: "Goal verified complete", detail: `Durable goal ${goalId} already has verified completion evidence.`};
+  }
+  if (status === "failed") {
+    return {stage: "Goal failed", detail: `Durable goal ${goalId} failed; Mission control has the recorded reason.`};
+  }
+  if (status === "cancelling") {
+    return {
+      stage: "Goal cancellation in progress",
+      detail: `Durable goal ${goalId} is draining active work and has not released the project yet.`,
+    };
+  }
+  if (status === "cancelled") {
+    return {stage: "Goal cancelled", detail: `Durable goal ${goalId} was cancelled and is not complete.`};
+  }
+  return {stage: "Goal status received", detail: `Durable goal ${goalId} has status “${status}” in Mission control.`};
+}
+
+function finishLongHorizonAdmissionActivity(agentId, goal, expectedActivity) {
+  const activity = expectedActivity || swarmChatActivityFor(agentId);
+  if (!activity || (expectedActivity && activity !== expectedActivity)
+      || !swarmActivityCanSettle(activity)) return;
+  const words = longHorizonAdmissionWords(goal);
+  const status = String(goal?.status || "unknown");
+  activity.settled = true;
+  activity.settledBy = "response";
+  activity.terminalState = "admitted";
+  activity.state = ["waiting_for_project", "paused", "waiting_for_user", "failed", "cancelling", "cancelled"]
+    .includes(status) ? "attention" : "complete";
+  activity.stage = words.stage;
+  activity.detail = `${words.detail} The submitted prompt and canonical goal status are saved in this chat.`;
+  activity.localTurns = [];
+  activity.remoteTurns = [];
+  window.clearInterval(activity.elapsedTimer);
+  window.clearTimeout(activity.pollTimer);
+  if (selectedChatIs(activity)) {
+    renderSwarmChatActivity(agentId, activity.chatKey);
+    renderTurnsThatArrived(agentId, activity.chatKey);
+  }
+  if (theBigOne === agentId) renderTheBigChat();
+  scheduleSwarmChatActivityCollapse(agentId, activity,
+    status === "queued" || status === "running" ? 2400 : 4200);
 }
 
 function markSwarmChatActivityStopping(agentId, activity = swarmChatActivityFor(agentId)) {
@@ -8431,7 +9576,7 @@ function aSwarmButton(className, which, words, whenPressed, about, does) {
 // it holds would sit there showing a board that is not on the disk any more.
 let howManyChangesLanded = 0;
 
-async function refreshSwarm(quietly) {
+async function refreshSwarm(quietly, {recoveryOnly = false} = {}) {
   const mine = ++swarmNewestRefresh;
   const changesThen = howManyChangesLanded;
   try {
@@ -8458,37 +9603,50 @@ async function refreshSwarm(quietly) {
     renderTheKeptBoards();
     renderTheChatTray();
     if (theBigOne) renderTheBigChat();
+    // The recovery notice may have been drawn before this first local board
+    // read completed. Enable its exact-chat action immediately; a second
+    // journal read is useful reconciliation, never the hydration authority.
+    renderDirectLongGoalBoardRecoveryNotice();
     // Route/profile and project-path changes are authority changes for an
     // existing chat even when its short agent ids stayed the same. Re-read the
     // small registry snapshots so the protection card and one-click fresh-chat
     // action appear immediately after a repair, external edit, or board open.
     void Promise.all(swarmChats.map(
       (held) => loadConversationsFor(held.agent, false)
-    ));
-    // The signed run journal can contain substantial history and its first
-    // open performs integrity verification. Draw the saved board immediately;
-    // recovery cards hydrate independently a moment later.
-    void refreshDurableSwarmWorkRecoveries();
-    // The goal cursor is server-owned. Rehydrate it independently so closing
-    // or reloading this renderer cannot restart at goal one or strand a queued
-    // successor after the preceding goal verified.
-    void refreshBoardGoalQueue(false);
-    void refreshLongGoals(true);
-    // What the agents passed to each other, so the list down the side holds
-    // those conversations too rather than only the ones you have had. It is
-    // small, and without it the list is half a list until somebody opens the
-    // fold at the bottom of the board.
-    await refreshWhatTheySaidToEachOther();
-    const doing = await readSwarmBoardRun(swarmBoardRunId, swarmBoardCursor);
-    swarmBoardCursor = Number((doing || {}).next_cursor ?? (doing || {}).cursor ?? swarmBoardCursor);
-    if (doing && !doing.going) {
-      swarmBoardRequestId = "";
-      localStorage.removeItem("nexus.swarm.board-request");
+    )).then(() => refreshDirectLongGoalRecoveries()).catch(() => {
+      // Each read owns its normal visible error path. Recovery hydration stays
+      // read-only and will retry on the next board refresh.
+    });
+    if (!recoveryOnly) {
+      // The signed run journal can contain substantial history and its first
+      // open performs integrity verification. Draw the saved board immediately;
+      // recovery cards hydrate independently a moment later.
+      void refreshDurableSwarmWorkRecoveries();
+      // The goal cursor is server-owned. Rehydrate it independently so closing
+      // or reloading this renderer cannot restart at goal one or strand a queued
+      // successor after the preceding goal verified. Recovery-only startup
+      // deliberately skips these continuation paths: opening a saved chat is
+      // never authority to dispatch unrelated provider work.
+      void refreshBoardGoalQueue(false);
+      void refreshLongGoals(true);
+      // What the agents passed to each other, so the list down the side holds
+      // those conversations too rather than only the ones you have had. It is
+      // small, and without it the list is half a list until somebody opens the
+      // fold at the bottom of the board.
+      await refreshWhatTheySaidToEachOther();
+      const doing = await readSwarmBoardRun(swarmBoardRunId, swarmBoardCursor);
+      swarmBoardCursor = Number(
+        (doing || {}).next_cursor ?? (doing || {}).cursor ?? swarmBoardCursor,
+      );
+      if (doing && !doing.going) {
+        swarmBoardRequestId = "";
+        localStorage.removeItem("nexus.swarm.board-request");
+      }
+      renderWhatTheyAreDoing(doing);
+      if (doing && doing.going) watchWhatTheyAreDoing();
     }
-    renderWhatTheyAreDoing(doing);
-    if (doing && doing.going) watchWhatTheyAreDoing();
     if (!quietly) sayInSwarm(whatTheBoardSays());
-    if (said.provider_status_stale && mine === swarmNewestRefresh) {
+    if (!recoveryOnly && said.provider_status_stale && mine === swarmNewestRefresh) {
       // Do not await this: the durable board is already interactive. This
       // second pass only decorates it with newly discovered provider status.
       void refreshSwarm(true);
@@ -9694,9 +10852,13 @@ function setWhatCanBePressedInSwarm() {
     boardGoalPause || held
     || (swarmGoalWorkRunning ? "Goal work is starting." : ""));
   $("swarmCancelGoals").disabled = !longGoal
-    || ["complete", "cancelled", "failed"].includes(longGoal.status);
-  const longProjectWorkActive = longGoals.some(
-    (goal) => ["queued", "running", "paused", "waiting_for_user"].includes(goal.status));
+    || ["complete", "cancelled"].includes(longGoal.status);
+  const longProjectWorkActive = longGoals.some((goal) => (
+    ["waiting_for_project", "queued", "running", "paused", "waiting_for_user"]
+      .includes(goal.status)
+    || (goal.status === "cancelling" && goal.project_queue?.state !== "released")
+    || (goal.status === "failed" && goal.project_queue?.state === "owner")
+  ));
   $("swarmLegacyGoals").disabled = Boolean(
     held || boardGoalPause || swarmGoing || swarmGoalWorkRunning
     || ["queued", "running"].includes(swarmGoalQueue?.status)
@@ -11357,6 +12519,7 @@ function appendChatText(container, text) {
 
 const chatPhaseNames = {
   user_prompt: "Sent to the team",
+  long_horizon_prompt: "Saved project goal request",
   agent_reply: "Connected-agent reply",
   lead_draft: "Lead agent's first reply",
   agent_plan: "Connected-agent plan",
@@ -11369,9 +12532,36 @@ const chatPhaseNames = {
   final_answer: "Final answer",
   nexus_error: "Nexus failure",
   participant_outcome: "Team response status",
+  long_horizon_status: "Project goal status",
 };
 
 function chatPhaseName(phase) { return chatPhaseNames[phase] || ""; }
+
+function normalizedLongHorizonCorrelation(one) {
+  const raw = one?.correlation;
+  if (!raw || typeof raw !== "object" || Number(raw.schema_version) !== 1
+      || String(raw.kind || "") !== "long_horizon_status"
+      || !String(raw.goal_id || "")) return null;
+  return {
+    goalId: String(raw.goal_id),
+    status: String(raw.goal_status || "unknown"),
+  };
+}
+
+function appendLongHorizonGoalLink(container, correlation) {
+  if (!correlation?.goalId) return;
+  const open = make("button", "compact long-horizon-chat-link",
+    correlation.status === "complete" ? "Open verified goal" : "Open goal in Mission control");
+  open.type = "button";
+  open.dataset.goalId = correlation.goalId;
+  open.dataset.goalStatus = correlation.status;
+  open.addEventListener("click", async () => {
+    localStorage.setItem(LONG_GOAL_SELECTED_KEY, correlation.goalId);
+    await refreshLongGoals(true);
+    $("missionControl")?.scrollIntoView({behavior: "smooth", block: "start"});
+  });
+  container.append(open);
+}
 
 const PARTICIPANT_OUTCOME_STATUSES = new Set([
   "answered", "failed", "outcome_unknown",
@@ -11637,6 +12827,7 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
       appendChatText(text, one.text);
     }
     row.append(text);
+    appendLongHorizonGoalLink(row, normalizedLongHorizonCorrelation(one));
     if (one.structured_state_unavailable) {
       row.append(make("p", "hint chat-turn-protocol-warning",
         "Reply kept exactly as delivered; completion and progress could not be verified."));
@@ -11785,14 +12976,25 @@ function projectWorkPauseForMessage(mode, words, agentId = theBigOne) {
     ? swarmProjectWorkPauseMessage(agentId) : "";
 }
 
+function directLongGoalCanonicalValue(value) {
+  if (Array.isArray(value)) return value.map(directLongGoalCanonicalValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map(
+      (key) => [key, directLongGoalCanonicalValue(value[key])],
+    ));
+  }
+  return value;
+}
+
 async function directLongGoalIntent(conversation, agentId, text, attachments) {
-  const canonical = JSON.stringify({
+  const canonical = JSON.stringify(directLongGoalCanonicalValue({
+    schema_version: 1,
     project_id: String(conversation?.project || ""),
     chat_id: String(conversation?.id || ""),
     lead_id: String(agentId || ""),
     text: String(text || ""),
     attachments: attachments || [],
-  });
+  }));
   if (globalThis.crypto?.subtle && globalThis.TextEncoder) {
     const digest = await globalThis.crypto.subtle.digest(
       "SHA-256", new TextEncoder().encode(canonical),
@@ -11800,14 +13002,9 @@ async function directLongGoalIntent(conversation, agentId, text, attachments) {
     return [...new Uint8Array(digest)]
       .map((one) => one.toString(16).padStart(2, "0")).join("");
   }
-  // Deterministic compatibility fallback for older embedded renderers. The
-  // server still verifies the full SHA-256 admission digest before reuse.
-  let value = 2166136261;
-  for (let index = 0; index < canonical.length; index += 1) {
-    value ^= canonical.charCodeAt(index);
-    value = Math.imul(value, 16777619);
-  }
-  return `fnv-${(value >>> 0).toString(16)}-${canonical.length}`;
+  throw new Error(
+    "This renderer cannot compute the required SHA-256 goal-request identity. Restart or update Nexus before starting project work.",
+  );
 }
 
 function confirmProjectWork(agent, words, mode) {
@@ -11815,6 +13012,16 @@ function confirmProjectWork(agent, words, mode) {
   if (!needsConfirmation) return {allowed: true, confirmed: false};
   if (workRecoveryFor(agent?.id)) {
     const message = "Resume the saved project-work run before starting another file task in this chat.";
+    sayInTheChatFor(agent?.id, message);
+    if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
+    renderWorkRecovery(agent?.id);
+    return {allowed: false, confirmed: false};
+  }
+  if (directLongGoalRecoveryFor(agent?.id)) {
+    const message = (
+      "Reconcile the exact saved project-goal request in this chat before starting another one. "
+      + "Nexus will not resend it automatically."
+    );
     sayInTheChatFor(agent?.id, message);
     if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
     renderWorkRecovery(agent?.id);
@@ -12103,13 +13310,16 @@ async function sendWhatIsTypedTo(agentId) {
   setWhatCanBePressedInSwarm();
   const attachmentKey = requestChatKey;
   const attachments = swarmChatAttachments.get(attachmentKey) || [];
+  const durableDirectAdmission = mode === "work" && !goalQueueItem;
   // A sent prompt is already represented as the activity's local transcript
-  // turn. Free this exact draft now so a newly selected sibling can be typed
-  // into while the answer is pending; delayed completion never clears a DOM
-  // composer that may now belong to another chat.
-  box.value = "";
-  swarmChatComposerDrafts.delete(requestChatKey);
-  rememberSwarmChatComposer(agentId);
+  // turn. Direct goal work keeps its draft until the backend confirms that the
+  // exact payload (including attachment bytes) is durable. Other chat modes
+  // retain their established immediate-clear behaviour.
+  if (!durableDirectAdmission) {
+    box.value = "";
+    swarmChatComposerDrafts.delete(requestChatKey);
+    rememberSwarmChatComposer(agentId);
+  }
   const activity = beginSwarmChatActivity(agentId, mode, agent, words, attachments);
   sayInTheChatFor(agentId, mode === "auto" ? "Deciding whether connected agents should help..."
     : mode === "chat" ? `Asking ${agent.name}...`
@@ -12130,27 +13340,83 @@ async function sendWhatIsTypedTo(agentId) {
         : (globalThis.crypto?.randomUUID
           ? globalThis.crypto.randomUUID()
           : `long-goal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const exactPayload = {
+        project_id: conversation.project,
+        lead_id: agentId,
+        chat_id: conversation.id,
+        text: words,
+        attachments,
+      };
+      const outbox = await saveDirectLongGoalOutbox({
+        schema_version: 1,
+        chat_id: conversation.id,
+        request_id: directRequestId,
+        intent: directIntent,
+        payload: exactPayload,
+      });
+      if (String(outbox?.payload_sha256 || "") !== directIntent) {
+        throw new Error("The durable desktop outbox saved a different exact request digest.");
+      }
       localStorage.setItem(directRequestKey, JSON.stringify({
-        id: directRequestId, intent: directIntent,
+        schema_version: 2, id: directRequestId, intent: directIntent,
       }));
-      const started = await request("/api/long-horizon/start", {
+      const prepared = await request("/api/long-horizon/prepare-admission", {
         method: "POST", body: JSON.stringify({
-          project_id: conversation.project,
-          lead_id: agentId,
-          chat_id: conversation.id,
-          text: words,
-          attachments,
-          request_id: directRequestId,
+          ...exactPayload, request_id: directRequestId,
         }),
       });
-      localStorage.removeItem(directRequestKey);
+      if (String(prepared.pending?.intent_sha256 || "") !== outbox.payload_sha256) {
+        throw new Error(
+          "The backend admission journal saved a different exact request digest. Nexus did not start it.",
+        );
+      }
+      localStorage.setItem(directRequestKey, JSON.stringify({
+        schema_version: 2, id: directRequestId, intent: directIntent,
+        prepared: true, payload_sha256: prepared.pending?.payload_sha256 || "",
+      }));
+      const heldDraft = swarmChatComposerDrafts.get(requestChatKey);
+      if (!heldDraft || heldDraft.value === words) {
+        swarmChatComposerDrafts.delete(requestChatKey);
+      }
+      if (swarmChatKey(agentId) === requestChatKey && box.value === words) {
+        box.value = "";
+        rememberSwarmChatComposer(agentId);
+      }
+      const started = verifiedDirectLongGoalStartReceipt(
+        await request("/api/long-horizon/start", {
+          method: "POST", body: JSON.stringify({
+            request_id: directRequestId,
+            chat_id: conversation.id,
+            from_pending: true,
+          }),
+        }),
+        {
+          request_id: directRequestId,
+          chat_id: conversation.id,
+          project_id: conversation.project,
+          lead_id: agentId,
+          intent_sha256: directIntent,
+        },
+      );
+      await removeDirectLongGoalOutbox(
+        conversation.id, directRequestId, outbox.payload_sha256,
+      );
+      forgetDirectLongGoalRecovery(
+        conversation.id, directRequestId, outbox.payload_sha256,
+      );
+      clearDirectLongGoalRequestMarker(
+        agentId, conversation.id, directRequestId, directIntent,
+      );
       if (!swarmActivityCanReconcileSuccess(activity)) return started;
-      finishSwarmChatActivity(agentId, true, "", activity);
+      selectLongGoalSnapshot(started.goal);
+      if (swarmChatKey(agentId) === requestChatKey) {
+        await refreshTheChatFor(agentId);
+      }
+      finishLongHorizonAdmissionActivity(agentId, longGoal, activity);
       clearSwarmActivityAttachments(activity);
-      longGoal = started.goal;
-      localStorage.setItem(LONG_GOAL_SELECTED_KEY, longGoal.goal_id);
+      const admission = longHorizonAdmissionWords(longGoal);
       sayInRuntimeChat(runtimeKey,
-        `Started durable goal ${longGoal.goal_id.slice(0, 8)}. Follow its concrete tasks, evidence, and questions in Mission control.`);
+        admission.detail);
       await refreshLongGoals(true);
       return started;
     }
@@ -12209,7 +13475,8 @@ async function sendWhatIsTypedTo(agentId) {
     // terminal server run when the original HTTP response is lost.
     if (!swarmActivityCanSettle(activity)) return null;
     restoreSwarmChatDraft(requestChatKey, words);
-    if (swarmChatKey(agentId) === requestChatKey) void refreshTheChatFor(agentId);
+    if (swarmChatKey(agentId) === requestChatKey) await refreshTheChatFor(agentId);
+    if (durableDirectAdmission) await refreshDirectLongGoalRecoveries();
     if (!stoppedChatError(error)) showError(error.message);
     sayInRuntimeChat(runtimeKey, error.message);
     finishSwarmChatActivity(agentId, false, String(error.message || error), activity);
@@ -12413,12 +13680,30 @@ let longGoal = null;
 let longGoalEvents = [];
 let longGoalCursor = 0;
 let longGoalWatching = 0;
+let longGoalLoadRevision = 0;
 let selectedMissionTaskId = "";
 let longGoalEventNotice = "";
 let swarmWatching = 0;       // the timer that keeps asking how it is going
 let swarmBoardRunId = localStorage.getItem("nexus.swarm.board-run") || "";
 let swarmBoardRequestId = localStorage.getItem("nexus.swarm.board-request") || "";
 let swarmBoardCursor = 0;
+
+function beginLongGoalLoad() {
+  // A previous goal's timer or slow response must never restore that goal
+  // after the user admits or selects a newer one. Invalidate both before the
+  // next network boundary; the load path checks this revision after every
+  // awaited read.
+  window.clearTimeout(longGoalWatching);
+  longGoalWatching = 0;
+  longGoalLoadRevision += 1;
+  return longGoalLoadRevision;
+}
+
+function selectLongGoalSnapshot(goal) {
+  beginLongGoalLoad();
+  longGoal = goal;
+  if (goal?.goal_id) localStorage.setItem(LONG_GOAL_SELECTED_KEY, goal.goal_id);
+}
 
 async function readSwarmBoardRun(runId, after = 0) {
   let identity = String(runId || "");
@@ -12677,8 +13962,11 @@ async function workOnEveryBoardGoalLegacy() {
 }
 
 function missionSelectedGoalId() {
-  return String($("missionGoalSelect")?.value
-    || localStorage.getItem(LONG_GOAL_SELECTED_KEY) || "");
+  // Admission and the select's own change handler persist the new identity
+  // before any awaited refresh. The rendered select may still show the prior
+  // goal during that gap, so renderer state is only a fallback.
+  return String(localStorage.getItem(LONG_GOAL_SELECTED_KEY)
+    || $("missionGoalSelect")?.value || "");
 }
 
 function missionStatusWords(goal) {
@@ -12704,7 +13992,7 @@ function focusCurrentBoardGoalSetup() {
   start.scrollIntoView({behavior: "smooth", block: "center"});
   start.focus({preventScroll: true});
   const protectedOldGoal = longGoal
-    && !["complete", "cancelled", "failed"].includes(longGoal.status);
+    && !["complete", "cancelled"].includes(longGoal.status);
   $("swarmGoalWorkSaid").textContent = protectedOldGoal
     ? "Review the current board routes. The old goal remains protected; cancel it in Mission control when ready, then press Work until the goals are achieved to create a new goal."
     : "Review the current board routes, then press Work until the goals are achieved to create a new goal with a fresh history binding.";
@@ -12713,20 +14001,32 @@ function focusCurrentBoardGoalSetup() {
 async function prepareNewGoalWithCurrentProviderSetup() {
   if (!missionProviderSetupChanged()) return;
   const protectedGoal = longGoal;
-  const needsCancellation = !["complete", "cancelled", "failed"].includes(
+  const needsCancellation = !["complete", "cancelled"].includes(
     protectedGoal.status
   );
   if (needsCancellation && !window.confirm(
     "Cancel this protected old goal? Its tasks, events, artifacts, and evidence remain available for inspection. Nothing is rebound. After cancellation Nexus will focus the current board’s normal Start control so you can create a separate goal."
   )) return;
   try {
+    let cancellationStatus = String(protectedGoal.status || "");
     if (needsCancellation) {
-      await request("/api/long-horizon/control", {
+      const cancelled = await request("/api/long-horizon/control", {
         method: "POST", body: JSON.stringify({
           goal_id: protectedGoal.goal_id, action: "cancel", payload: {},
         }),
       });
+      cancellationStatus = String(cancelled.goal?.status || cancellationStatus);
       await refreshLongGoals(true);
+      const refreshed = longGoals.find(
+        (goal) => goal.goal_id === protectedGoal.goal_id,
+      ) || (longGoal?.goal_id === protectedGoal.goal_id ? longGoal : null);
+      cancellationStatus = String(refreshed?.status || cancellationStatus);
+      if (cancellationStatus !== "cancelled") {
+        $("swarmGoalWorkSaid").textContent = cancellationStatus === "cancelling"
+          ? "Cancellation is draining active work. Nexus has not released the project yet. The saved request and composer recovery state were retained; refresh and wait for cancelled before starting a new goal."
+          : `The old goal is ${cancellationStatus || "not yet cancelled"}. Nexus retained the saved request and composer recovery state and did not prepare a new goal.`;
+        return;
+      }
     }
     // A new provider binding requires a new request identity. Never let an
     // interrupted earlier Start attempt turn this explicit migration into an
@@ -12784,19 +14084,25 @@ function renderMissionControl() {
   if (longGoal && document.activeElement !== $("missionCriteria")) {
     $("missionCriteria").value = (longGoal.success_criteria || []).join("\n");
   }
-  const terminal = !longGoal || ["complete", "cancelled", "failed"].includes(longGoal.status);
-  const immutable = !longGoal || ["complete", "cancelled"].includes(longGoal.status);
+  const terminal = !longGoal
+    || ["complete", "cancelled", "failed", "cancelling"].includes(longGoal.status);
+  const immutable = !longGoal
+    || ["complete", "cancelled", "cancelling"].includes(longGoal.status);
   const hasPendingDecision = Boolean(longGoal?.pending_interrupts?.length);
   $("missionPause").disabled = !longGoal || terminal || longGoal.status === "paused";
   $("missionResume").disabled = !longGoal || providerSetupChanged || hasPendingDecision
     || !["paused", "failed"].includes(longGoal.status);
-  $("missionCancel").disabled = !longGoal || terminal;
-  $("missionFork").disabled = !longGoal || providerSetupChanged || hasPendingDecision;
+  // A failed goal still owns the exclusive project lease until cancellation.
+  // Keep cancellation available so failure/provider drift cannot strand it.
+  $("missionCancel").disabled = !longGoal
+    || ["complete", "cancelled"].includes(longGoal.status);
+  $("missionFork").disabled = immutable || providerSetupChanged || hasPendingDecision;
   $("missionCriteria").disabled = immutable || hasPendingDecision;
   $("missionCriteriaSave").disabled = immutable || hasPendingDecision;
   $("missionSteer").disabled = immutable || providerSetupChanged || hasPendingDecision;
   $("missionSteerSend").disabled = immutable || providerSetupChanged || hasPendingDecision;
   $("missionMessageAgent").disabled = immutable || providerSetupChanged || hasPendingDecision;
+  $("missionProviderSetupPrepare").disabled = !longGoal || longGoal.status === "cancelling";
 
   const tasks = $("missionTasks");
   tasks.replaceChildren();
@@ -12973,37 +14279,97 @@ function renderMissionEvents() {
   }
 }
 
-async function loadLongGoal(goalId, resetEvents = false) {
-  if (!goalId) { longGoal = null; longGoalEvents = []; longGoalCursor = 0; renderMissionControl(); return; }
-  if (resetEvents || longGoal?.goal_id !== goalId) { longGoalEvents = []; longGoalCursor = 0; }
+async function refreshLongGoalOriginChats(goals) {
+  const chatIds = new Set((Array.isArray(goals) ? goals : [goals])
+    .map((goal) => String(goal?.conversation_id || "")).filter(Boolean));
+  if (!chatIds.size) return;
+  const agents = [...new Set(swarmChats
+    .filter((held) => chatIds.has(String(activeConversationFor(held.agent)?.id || "")))
+    .map((held) => held.agent))];
+  await Promise.all(agents.map((agentId) => refreshTheChatFor(agentId)));
+}
+
+function longGoalNeedsWatching(goal) {
+  return ["waiting_for_project", "queued", "running", "cancelling"]
+    .includes(String(goal?.status || ""));
+}
+
+function anyLongGoalNeedsWatching() {
+  return longGoalNeedsWatching(longGoal) || longGoals.some(longGoalNeedsWatching);
+}
+
+async function loadLongGoal(goalId, resetEvents = false, inheritedRevision = 0) {
+  const loadRevision = inheritedRevision || beginLongGoalLoad();
+  const isCurrent = () => loadRevision === longGoalLoadRevision;
+  if (!goalId) {
+    if (!isCurrent()) return;
+    longGoal = null;
+    longGoalEvents = [];
+    longGoalCursor = 0;
+    longGoalEventNotice = "";
+    renderMissionControl();
+    return;
+  }
+  const resetsHistory = resetEvents || longGoal?.goal_id !== goalId;
+  let nextEvents = resetsHistory ? [] : [...longGoalEvents];
+  let nextCursor = resetsHistory ? 0 : longGoalCursor;
+  let nextNotice = resetsHistory ? "" : longGoalEventNotice;
   const goalAnswer = await request(`/api/long-horizon/goal?id=${encodeURIComponent(goalId)}`);
-  longGoal = goalAnswer.goal;
+  if (!isCurrent()) return;
+  const nextGoal = goalAnswer.goal;
+  await refreshLongGoalOriginChats(nextGoal);
+  if (!isCurrent()) return;
   for (let page = 0; page < 20; page += 1) {
     const eventAnswer = await request(
-      `/api/long-horizon/events?id=${encodeURIComponent(goalId)}&after=${longGoalCursor}`);
+      `/api/long-horizon/events?id=${encodeURIComponent(goalId)}&after=${nextCursor}`);
+    if (!isCurrent()) return;
     if (eventAnswer.truncated) {
-      longGoalEventNotice = `Older event deltas were compacted; this view starts at event ${eventAnswer.oldest_available}. The authenticated goal snapshot remains current.`;
+      nextNotice = `Older event deltas were compacted; this view starts at event ${eventAnswer.oldest_available}. The authenticated goal snapshot remains current.`;
     }
-    longGoalEvents.push(...(eventAnswer.events || []).filter(
-      (event) => !longGoalEvents.some((held) => held.event_id === event.event_id)));
-    const next = Number(eventAnswer.next || longGoalCursor);
-    if (!eventAnswer.has_more || next === longGoalCursor) { longGoalCursor = next; break; }
-    longGoalCursor = next;
+    nextEvents.push(...(eventAnswer.events || []).filter(
+      (event) => !nextEvents.some((held) => held.event_id === event.event_id)));
+    const next = Number(eventAnswer.next || nextCursor);
+    if (!eventAnswer.has_more || next === nextCursor) { nextCursor = next; break; }
+    nextCursor = next;
   }
+  if (!isCurrent()) return;
+  longGoal = nextGoal;
+  longGoalEvents = nextEvents;
+  longGoalCursor = nextCursor;
+  longGoalEventNotice = nextNotice;
   localStorage.setItem(LONG_GOAL_SELECTED_KEY, goalId);
   renderMissionControl();
-  if (["queued", "running"].includes(longGoal.status)) watchLongGoal();
+  if (anyLongGoalNeedsWatching()) watchLongGoal();
 }
 
 async function refreshLongGoals(loadSelected = true) {
+  const loadRevision = beginLongGoalLoad();
+  const isCurrent = () => loadRevision === longGoalLoadRevision;
   try {
-    longGoals = (await request("/api/long-horizon/goals")).goals || [];
+    const nextGoals = (await request("/api/long-horizon/goals")).goals || [];
+    if (!isCurrent()) return;
+    await refreshLongGoalOriginChats(nextGoals);
+    if (!isCurrent()) return;
+    longGoals = nextGoals;
     const wanted = missionSelectedGoalId();
     const selected = longGoals.find((goal) => goal.goal_id === wanted) || longGoals[0] || null;
-    if (loadSelected && selected) await loadLongGoal(selected.goal_id, longGoal?.goal_id !== selected.goal_id);
-    else { longGoal = selected; renderMissionControl(); }
+    if (loadSelected && selected) {
+      await loadLongGoal(
+        selected.goal_id, longGoal?.goal_id !== selected.goal_id, loadRevision,
+      );
+    } else if (isCurrent()) {
+      longGoal = selected;
+      renderMissionControl();
+    }
   } catch (error) {
-    $("missionProgress").textContent = String(error.message || error);
+    if (!isCurrent()) return;
+    const words = String(error.message || error);
+    $("missionProgress").textContent = words;
+    if (anyLongGoalNeedsWatching()) {
+      longGoalEventNotice = `Live refresh was interrupted: ${words} Nexus will reconnect automatically.`;
+      renderMissionControl();
+      watchLongGoal();
+    }
   }
 }
 
@@ -13011,15 +14377,10 @@ function watchLongGoal() {
   if (longGoalWatching) return;
   longGoalWatching = window.setTimeout(async () => {
     longGoalWatching = 0;
-    try {
-      if (longGoal?.goal_id) await loadLongGoal(longGoal.goal_id);
-    } catch (error) {
-      longGoalEventNotice = `Live refresh was interrupted: ${String(error.message || error)} Nexus will reconnect automatically.`;
-      renderMissionControl();
-      if (longGoal?.goal_id && ["queued", "running"].includes(longGoal.status)) {
-        watchLongGoal();
-      }
-    }
+    // Poll the full durable set, not only the selected detail. The list read
+    // projects lifecycle transitions into every origin chat, so concurrent
+    // goals remain truthful when the user later reopens an inactive chat.
+    await refreshLongGoals(true);
   }, 1200);
 }
 
@@ -14995,6 +16356,7 @@ function renderTheBigChat() {
       nexus: isNexusChatTurn(one),
       structuredStateUnavailable: Boolean(one.structured_state_unavailable),
       participantOutcome: normalizedParticipantOutcome(one),
+      longHorizonCorrelation: normalizedLongHorizonCorrelation(one),
       originalPrompt: latestUserPrompt,
     });
   }
@@ -15051,6 +16413,7 @@ function renderTheBigChat() {
       } else {
         appendChatText(what, one.text);
       }
+      appendLongHorizonGoalLink(what, one.longHorizonCorrelation);
       if (one.structuredStateUnavailable) {
         what.append(make("p", "hint chat-turn-protocol-warning",
           "Reply kept exactly as delivered; completion and progress could not be verified."));
@@ -15591,12 +16954,15 @@ async function sendFromTheBigChat(mode = "chat") {
   buttons.forEach((button) => { button.disabled = true; });
   const attachmentKey = recoveryKey;
   const attachments = swarmChatAttachments.get(attachmentKey) || [];
+  const durableDirectAdmission = mode === "work";
   // The sent text becomes a transcript turn immediately. Clear only that
-  // exact draft now; never clear the box when the delayed answer returns,
-  // because the user may already be composing the next message by then.
-  box.value = "";
-  theBigChatComposerDrafts.delete(attachmentKey);
-  rememberTheBigChatComposer();
+  // exact draft after direct goal payload persistence; ordinary chat retains
+  // immediate clearing so a user can compose its next turn while it runs.
+  if (!durableDirectAdmission) {
+    box.value = "";
+    theBigChatComposerDrafts.delete(attachmentKey);
+    rememberTheBigChatComposer();
+  }
   const activity = beginSwarmChatActivity(agentId, mode, agent, said, attachments);
   $("theBigChatSaidBack").textContent = mode === "auto"
     ? "Deciding whether connected agents should help..."
@@ -15618,24 +16984,85 @@ async function sendFromTheBigChat(mode = "chat") {
         : (globalThis.crypto?.randomUUID
           ? globalThis.crypto.randomUUID()
           : `long-goal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const exactPayload = {
+        project_id: conversation.project,
+        lead_id: agentId,
+        text: said,
+        chat_id: conversation.id,
+        attachments,
+      };
+      const outbox = await saveDirectLongGoalOutbox({
+        schema_version: 1,
+        chat_id: conversation.id,
+        request_id: directRequestId,
+        intent: directIntent,
+        payload: exactPayload,
+      });
+      if (String(outbox?.payload_sha256 || "") !== directIntent) {
+        throw new Error("The durable desktop outbox saved a different exact request digest.");
+      }
       localStorage.setItem(directRequestKey, JSON.stringify({
-        id: directRequestId, intent: directIntent,
+        schema_version: 2, id: directRequestId, intent: directIntent,
       }));
-      const started = await request("/api/long-horizon/start", {
+      const prepared = await request("/api/long-horizon/prepare-admission", {
         method: "POST", body: JSON.stringify({
-          project_id: conversation.project, lead_id: agentId, text: said,
-          chat_id: conversation.id, attachments, request_id: directRequestId,
+          ...exactPayload, request_id: directRequestId,
         }),
       });
-      localStorage.removeItem(directRequestKey);
+      if (String(prepared.pending?.intent_sha256 || "") !== outbox.payload_sha256) {
+        throw new Error(
+          "The backend admission journal saved a different exact request digest. Nexus did not start it.",
+        );
+      }
+      localStorage.setItem(directRequestKey, JSON.stringify({
+        schema_version: 2, id: directRequestId, intent: directIntent,
+        prepared: true, payload_sha256: prepared.pending?.payload_sha256 || "",
+      }));
+      const heldDraft = theBigChatComposerDrafts.get(attachmentKey);
+      if (!heldDraft || heldDraft.value === said) {
+        theBigChatComposerDrafts.delete(attachmentKey);
+      }
+      if (theBigOne === agentId && swarmChatKey(agentId) === recoveryKey
+          && box.value === said) {
+        box.value = "";
+        rememberTheBigChatComposer();
+      }
+      const started = verifiedDirectLongGoalStartReceipt(
+        await request("/api/long-horizon/start", {
+          method: "POST", body: JSON.stringify({
+            request_id: directRequestId,
+            chat_id: conversation.id,
+            from_pending: true,
+          }),
+        }),
+        {
+          request_id: directRequestId,
+          chat_id: conversation.id,
+          project_id: conversation.project,
+          lead_id: agentId,
+          intent_sha256: directIntent,
+        },
+      );
+      await removeDirectLongGoalOutbox(
+        conversation.id, directRequestId, outbox.payload_sha256,
+      );
+      forgetDirectLongGoalRecovery(
+        conversation.id, directRequestId, outbox.payload_sha256,
+      );
+      clearDirectLongGoalRequestMarker(
+        agentId, conversation.id, directRequestId, directIntent,
+      );
       if (!swarmActivityCanReconcileSuccess(activity)) return;
-      finishSwarmChatActivity(agentId, true, "", activity);
+      selectLongGoalSnapshot(started.goal);
+      if (theBigOne === agentId && swarmChatKey(agentId) === recoveryKey) {
+        await refreshTheChatFor(agentId);
+      }
+      finishLongHorizonAdmissionActivity(agentId, longGoal, activity);
       clearSwarmActivityAttachments(activity);
-      longGoal = started.goal;
-      localStorage.setItem(LONG_GOAL_SELECTED_KEY, longGoal.goal_id);
+      const admission = longHorizonAdmissionWords(longGoal);
       sayInRuntimeChat(
         runtimeKey,
-        `Started durable goal ${longGoal.goal_id.slice(0, 8)}. Mission control shows its exact work, evidence, and questions.`,
+        admission.detail,
       );
       await refreshLongGoals(true);
       return;
@@ -15674,7 +17101,8 @@ async function sendFromTheBigChat(mode = "chat") {
       box.setSelectionRange(typed.length, typed.length);
       rememberTheBigChatComposer();
     }
-    if (swarmChatKey(agentId) === recoveryKey) void refreshTheChatFor(agentId);
+    if (swarmChatKey(agentId) === recoveryKey) await refreshTheChatFor(agentId);
+    if (durableDirectAdmission) await refreshDirectLongGoalRecoveries();
     const words = String(trouble.message || trouble);
     sayInRuntimeChat(runtimeKey, words);
     if (!stoppedChatError(trouble)) showError(words);

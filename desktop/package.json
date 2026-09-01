@@ -17,6 +17,7 @@
     "smoke:built": "node built.smoke.js",
     "smoke:asking": "node asking.smoke.js",
     "smoke:board": "node board.smoke.js",
+    "smoke:long-horizon": "node long-horizon.smoke.js",
     "e2e:multi-vendor": "node multi-vendor.e2e.js",
     "smoke:automations": "node automations.smoke.js",
     "smoke:web-chat": "node web-chat.smoke.js",
@@ -31,6 +32,7 @@
     "productName": "Nexus Harness",
     "files": [
       "main.js",
+      "direct-goal-outbox.js",
       "settings-store.js",
       "server.js",
       "guards.js",
@@ -47,6 +49,7 @@
       "!packaged.smoke.js",
       "!built.smoke.js",
       "!asking.smoke.js",
+      "!long-horizon.smoke.js",
       "!multi-vendor.e2e.js",
       "!web-chat.smoke.js"
     ],
@@ -85,14 +88,18 @@
       }
     ],
     "nsis": {
+      "guid": "e52322ab-f15e-5dc0-963b-7588e3739e89",
+      "include": "installer.nsh",
       "installerIcon": "nexus-harness.ico",
       "uninstallerIcon": "nexus-harness.ico",
       "installerHeaderIcon": "nexus-harness.ico",
-      "createDesktopShortcut": true,
+      "createDesktopShortcut": "always",
       "createStartMenuShortcut": true,
       "shortcutName": "Nexus Harness",
+      "uninstallDisplayName": "Nexus Harness",
       "oneClick": false,
       "perMachine": false,
+      "allowElevation": false,
       "allowToChangeInstallationDirectory": false,
       "deleteAppDataOnUninstall": false
     }

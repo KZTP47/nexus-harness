@@ -201,33 +201,34 @@ are still documented below, but these two workspaces are the main product.
 
 ## Start here, on Windows
 
-The easiest route is the checksummed, versioned installer on the
-**[GitHub Releases page](https://github.com/KZTP47/nexus-harness/releases/latest)**.
-Download `Nexus-Harness-Setup-<version>-UNSIGNED.exe` and the `.sha256` file
-beside it, compare the SHA-256, and run it. This first packaged release is not
-Authenticode-signed, so Windows may show an unknown-publisher warning; the
-filename and release notes say that plainly. It installs for your Windows
-account, creates Start menu and desktop
-shortcuts, and needs neither administrator access nor a separate Python.
+When a stable build is published, the easiest route is its checksummed,
+versioned installer on the
+**[GitHub Releases page](https://github.com/KZTP47/nexus-harness/releases)**.
+Download the release's exactly named `Nexus-Harness-Setup-<version>.exe` (or
+its explicitly marked `-UNSIGNED.exe` variant) and the `.sha256` file beside
+it, compare the SHA-256, and run it. An explicitly unsigned release may
+show Windows' unknown-publisher warning; its filename and release notes say so
+plainly. The installer runs for your Windows account, creates Start menu and
+desktop shortcuts, and needs neither administrator access nor a separate
+Python. If that page has no stable release, there is nothing for the bootstrap
+to install yet and it stops before creating a shortcut.
 
 Already cloned the source? **Double-click `Install Nexus Harness.cmd`**. It
 downloads that same stable release, verifies both the published SHA-256 and
 the release's declared signature mode, and starts the Windows installer. With
-the current explicitly unsigned release it requires both the `-UNSIGNED.exe`
+an explicitly unsigned release it requires both the `-UNSIGNED.exe`
 name and Windows' `NotSigned` status; it will not mistake an arbitrary signed
 file for the release. It uses Windows' own PowerShell downloader, so a clean
 machine does not need Python. It does not disguise a browser shortcut as the
 desktop app.
 
-This repository is currently private. The helper reuses an existing `gh auth`
-or non-interactive Git Credential Manager login (or a process-scoped
-`GH_TOKEN`) without printing or storing the credential. If the new computer is
-not signed in to GitHub yet, sign in once or download both assets from the
-Releases page in a signed-in browser. Anonymous one-click downloads require the
-repository—or a separate distribution repository—to be public.
+This repository is public, so a published public release can be downloaded
+anonymously. For a private fork or a future visibility change, the helper can
+reuse an existing `gh auth` or non-interactive Git Credential Manager login (or
+a process-scoped `GH_TOKEN`) without printing or storing the credential.
 
-For a browser download of `0.2.1`, open PowerShell in the download folder and
-run:
+For a browser download of a published `0.2.1`, open PowerShell in the download
+folder and run:
 
 ```powershell
 $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.1-UNSIGNED.exe').Hash.ToLowerInvariant()
@@ -237,7 +238,8 @@ $actual -eq $expected
 
 The last command must print `True` before you run the installer.
 
-The current 0.2.1 build is about 234 MiB to download and about 810 MiB unpacked.
+The measured 0.2.1 development build is about 234 MiB to download and about
+810 MiB unpacked; confirm the final sizes in the release notes.
 Allow at least 2 GiB free while installing so the download, temporary unpacking,
 and installed app can coexist. It includes a private Python 3.11 runtime and locked
 dependencies. Nexus does not silently auto-update. **About
@@ -299,8 +301,8 @@ cd nexus-harness
 The helper downloads the latest stable NSIS installer from GitHub Releases,
 requires exactly one installer and matching checksum asset, verifies both the
 checksum and the release's declared signature mode, and only then starts it.
-The current release is explicitly unsigned; Windows may display its normal
-unknown-publisher warning. A future signed release must match the exact pinned
+An explicitly unsigned release may display Windows' normal unknown-publisher
+warning. A future signed release must match the exact pinned
 publisher. The app is
 installed below your own account and can be removed from Windows Installed
 apps or with the repository uninstaller.
@@ -309,11 +311,10 @@ It is at the top of the project with a name that says what it does, because the
 one thing somebody who has just downloaded this cannot be expected to know is
 which command to type first.
 
-For the current private repository, the helper uses an existing GitHub CLI or
-Git Credential Manager login, or `GH_TOKEN` scoped to that process. It never
-writes or echoes that credential. Without an existing login, use the Releases
-page in a signed-in browser; a private GitHub release cannot be downloaded
-anonymously.
+The public repository needs no GitHub login for a published public release. For
+a private fork, the helper can use an existing GitHub CLI or Git Credential
+Manager login, or `GH_TOKEN` scoped to that process. It never writes or echoes
+that credential.
 
 If you are developing Nexus itself and deliberately want to run this checkout
 instead of the release:

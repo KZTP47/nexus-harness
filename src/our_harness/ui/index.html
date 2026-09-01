@@ -938,6 +938,12 @@
           title="Use the older paired plan-review-execute workflow">Use legacy paired workflow</button>
       </div>
       <p id="swarmGoalWorkSaid" class="hint operational-status" role="status" aria-live="polite"></p>
+      <section id="directLongGoalRecoveryBoard" class="direct-long-goal-recovery-board"
+        aria-labelledby="directLongGoalRecoveryBoardTitle" hidden>
+        <h4 id="directLongGoalRecoveryBoardTitle">Saved goal requests needing reconciliation</h4>
+        <p class="hint">Nexus will not automatically resend these exact requests after an interrupted admission.</p>
+        <ul id="directLongGoalRecoveryBoardList"></ul>
+      </section>
 
       <h3 id="swarmSetGoingTitle">Get advice only</h3>
       <p class="hint">This optional mode asks every agent for an independent opinion,

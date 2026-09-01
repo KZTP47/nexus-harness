@@ -2347,7 +2347,7 @@ class MovingAroundTheBoard(unittest.TestCase):
         self.assertLess(fast_read, draw)
         self.assertLess(draw, background_probe)
         self.assertIn("const firstHydration = !swarmBoardHydrated;", refresh)
-        self.assertIn("if (said.provider_status_stale", refresh)
+        self.assertIn("if (!recoveryOnly && said.provider_status_stale", refresh)
 
     def test_connection_diagnosis_sends_the_exact_route_and_keeps_the_plan_visible(self) -> None:
         check = self.script[
@@ -2758,6 +2758,374 @@ boardRevisionWhileTranscriptWaits()
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "retried")
+
+    def test_provider_setup_recovery_waits_for_live_cancellation_to_finish(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is needed for the live cancellation renderer contract")
+        helper = self.script[
+            self.script.index("async function prepareNewGoalWithCurrentProviderSetup"):
+            self.script.index("function renderMissionControl")
+        ]
+        probe = f"""
+const LONG_GOAL_REQUEST_KEY = "request-key";
+const LONG_GOAL_COMPOSER_KEY = "composer-key";
+const view = {{swarmGoalWorkSaid: {{textContent: ""}}}};
+const $ = id => view[id];
+const removed = [];
+const localStorage = {{removeItem: key => removed.push(key)}};
+const window = {{confirm: () => true}};
+let focused = 0;
+let responseStatus = "cancelling";
+let refreshedStatus = "cancelling";
+let longGoal = {{goal_id: "goal-one", status: "failed"}};
+let longGoals = [longGoal];
+function missionProviderSetupChanged() {{ return true; }}
+function focusCurrentBoardGoalSetup() {{ focused += 1; }}
+function showError(error) {{ throw new Error(String(error)); }}
+async function request(path, options) {{
+  if (path !== "/api/long-horizon/control") throw new Error("wrong endpoint");
+  const sent = JSON.parse(options.body);
+  if (sent.action !== "cancel" || sent.goal_id !== "goal-one") {{
+    throw new Error("wrong cancellation identity");
+  }}
+  return {{goal: {{goal_id: "goal-one", status: responseStatus}}}};
+}}
+async function refreshLongGoals() {{
+  longGoal = {{goal_id: "goal-one", status: refreshedStatus}};
+  longGoals = [longGoal];
+}}
+{helper}
+async function run() {{
+  await prepareNewGoalWithCurrentProviderSetup();
+  if (removed.length || focused) throw new Error("draining cancellation cleared recovery state");
+  if (!view.swarmGoalWorkSaid.textContent.includes("draining active work")
+      || !view.swarmGoalWorkSaid.textContent.includes("were retained")) {{
+    throw new Error("draining cancellation was not explained truthfully");
+  }}
+  responseStatus = "cancelled";
+  refreshedStatus = "cancelled";
+  longGoal = {{goal_id: "goal-one", status: "failed"}};
+  longGoals = [longGoal];
+  await prepareNewGoalWithCurrentProviderSetup();
+  if (removed.join(",") !== "request-key,composer-key" || focused !== 1) {{
+    throw new Error("completed cancellation did not release new-goal setup");
+  }}
+  if (!view.swarmGoalWorkSaid.textContent.includes("was cancelled")) {{
+    throw new Error("completed cancellation wording is missing");
+  }}
+}}
+run().then(() => process.stdout.write("drained"))
+  .catch(error => {{ console.error(error); process.exit(1); }});
+"""
+        completed = subprocess.run(
+            [node, "-e", probe], capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "drained")
+
+    def test_new_goal_selection_fences_a_stale_goal_watcher_response(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is needed for the long-goal selection race contract")
+        helpers = self.script[
+            self.script.index("function beginLongGoalLoad"):
+            self.script.index("async function readSwarmBoardRun")
+        ]
+        loaders = self.script[
+            self.script.index("async function refreshLongGoalOriginChats"):
+            self.script.index("function savedLongGoalComposer")
+        ]
+        selection = self.script[
+            self.script.index("function missionSelectedGoalId"):
+            self.script.index("function missionStatusWords")
+        ]
+        probe = """
+const LONG_GOAL_SELECTED_KEY = "selected-goal";
+const saved = new Map([[LONG_GOAL_SELECTED_KEY, "goal-a"]]);
+const localStorage = {
+  getItem: key => saved.get(key) || "",
+  setItem: (key, value) => saved.set(key, String(value)),
+};
+let nextTimer = 0;
+const timers = new Map();
+const window = {
+  clearTimeout: id => timers.delete(id),
+  setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id; },
+};
+let longGoals = [];
+let longGoal = null;
+let longGoalEvents = [];
+let longGoalCursor = 0;
+let longGoalWatching = 0;
+let longGoalLoadRevision = 0;
+let longGoalEventNotice = "";
+const missionProgress = {textContent: ""};
+const staleMissionSelect = {value: "goal-a"};
+const $ = id => id === "missionProgress" ? missionProgress
+  : id === "missionGoalSelect" ? staleMissionSelect : null;
+let rendered = 0;
+function renderMissionControl() { rendered += 1; }
+const goalA = {goal_id: "goal-a", status: "running", conversation_id: "chat-a"};
+const goalB = {goal_id: "goal-b", status: "waiting_for_project", conversation_id: "chat-b"};
+const goalBComplete = {goal_id: "goal-b", status: "complete", conversation_id: "chat-b"};
+const goalCComplete = {goal_id: "goal-c", status: "complete", conversation_id: "chat-c"};
+const swarmChats = [{agent: "agent-b"}, {agent: "agent-c"}];
+function activeConversationFor(agentId) {
+  if (agentId === "agent-b") return {id: "chat-b"};
+  if (agentId === "agent-c") return {id: "chat-c"};
+  return null;
+}
+const refreshedChats = [];
+async function refreshTheChatFor(agentId) { refreshedChats.push(agentId); }
+function deferred() {
+  let resolve;
+  const promise = new Promise(done => { resolve = done; });
+  return {promise, resolve};
+}
+const staleGoal = deferred();
+let listCalls = 0;
+let goalBDetailCalls = 0;
+async function request(path) {
+  if (path === "/api/long-horizon/goal?id=goal-a") return staleGoal.promise;
+  if (path === "/api/long-horizon/goals") {
+    listCalls += 1;
+    return listCalls === 1
+      ? {goals: [goalB]} : {goals: [goalBComplete, goalCComplete]};
+  }
+  if (path === "/api/long-horizon/goal?id=goal-b") {
+    goalBDetailCalls += 1;
+    return {goal: goalBDetailCalls === 1 ? goalB : goalBComplete};
+  }
+  if (path === "/api/long-horizon/events?id=goal-b&after=0") {
+    return {events: [{event_id: "event-b"}], next: 1, has_more: false};
+  }
+  if (path === "/api/long-horizon/events?id=goal-b&after=1") {
+    return {events: [], next: 1, has_more: false};
+  }
+  throw new Error(`unexpected request ${path}`);
+}
+""" + selection + "\n" + helpers + "\n" + loaders + """
+async function run() {
+  longGoal = goalA;
+  longGoals = [goalA];
+  const stale = loadLongGoal("goal-a", true);
+  await Promise.resolve();
+
+  // This is the direct-admission boundary: Goal B becomes the user's selected
+  // goal before its chat refresh awaits. Goal A's old poll resolves in that gap.
+  selectLongGoalSnapshot(goalB);
+  staleGoal.resolve({goal: goalA});
+  await stale;
+  if (longGoal !== goalB || localStorage.getItem(LONG_GOAL_SELECTED_KEY) !== "goal-b") {
+    throw new Error("the stale Goal A poll replaced newly admitted Goal B");
+  }
+
+  await refreshLongGoals(true);
+  if (longGoal !== goalB || longGoals.length !== 1 || longGoals[0] !== goalB) {
+    throw new Error("Goal B did not remain the canonical selected snapshot");
+  }
+  if (longGoalEvents.length !== 1 || longGoalEvents[0].event_id !== "event-b") {
+    throw new Error("Goal B did not receive its own event cursor");
+  }
+  if (!refreshedChats.includes("agent-b") || timers.size !== 1 || !longGoalWatching) {
+    throw new Error("Goal B did not keep its origin chat and lifecycle watcher live");
+  }
+  if (rendered !== 1 || missionProgress.textContent) {
+    throw new Error("the latest goal did not render cleanly");
+  }
+
+  const [timerId, pollAllGoals] = [...timers.entries()][0];
+  timers.delete(timerId);
+  await pollAllGoals();
+  if (listCalls !== 2 || longGoal !== goalBComplete
+      || longGoals.length !== 2 || longGoals.some(goal => goal.status !== "complete")) {
+    throw new Error("the lifecycle watcher did not refresh the full durable goal set");
+  }
+  if (refreshedChats.filter(agent => agent === "agent-b").length !== 4
+      || refreshedChats.filter(agent => agent === "agent-c").length !== 1) {
+    throw new Error("the lifecycle watcher did not refresh every origin chat");
+  }
+  if (timers.size !== 0 || longGoalWatching !== 0 || rendered !== 2) {
+    throw new Error("the lifecycle watcher stayed live after every goal became terminal");
+  }
+}
+run().then(() => process.stdout.write("fenced"))
+  .catch(error => { console.error(error); process.exit(1); });
+"""
+        completed = subprocess.run(
+            [node, "-e", probe], capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "fenced")
+
+    def test_new_goal_selection_fences_a_stale_goal_list_response(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is needed for the long-goal list race contract")
+        helpers = self.script[
+            self.script.index("function beginLongGoalLoad"):
+            self.script.index("async function readSwarmBoardRun")
+        ]
+        loaders = self.script[
+            self.script.index("async function refreshLongGoalOriginChats"):
+            self.script.index("function savedLongGoalComposer")
+        ]
+        selection = self.script[
+            self.script.index("function missionSelectedGoalId"):
+            self.script.index("function missionStatusWords")
+        ]
+        probe = """
+const LONG_GOAL_SELECTED_KEY = "selected-goal";
+const saved = new Map([[LONG_GOAL_SELECTED_KEY, "goal-a"]]);
+const localStorage = {
+  getItem: key => saved.get(key) || "",
+  setItem: (key, value) => saved.set(key, String(value)),
+};
+let nextTimer = 0;
+const timers = new Map();
+const window = {
+  clearTimeout: id => timers.delete(id),
+  setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id; },
+};
+let longGoals = [];
+let longGoal = null;
+let longGoalEvents = [];
+let longGoalCursor = 0;
+let longGoalWatching = 0;
+let longGoalLoadRevision = 0;
+let longGoalEventNotice = "";
+const missionProgress = {textContent: ""};
+const staleMissionSelect = {value: "goal-a"};
+const $ = id => id === "missionProgress" ? missionProgress
+  : id === "missionGoalSelect" ? staleMissionSelect : null;
+let rendered = 0;
+function renderMissionControl() { rendered += 1; }
+const goalA = {goal_id: "goal-a", status: "running", conversation_id: "chat-a"};
+const goalB = {goal_id: "goal-b", status: "running", conversation_id: "chat-b"};
+const swarmChats = [{agent: "agent-a"}, {agent: "agent-b"}];
+function activeConversationFor(agentId) {
+  if (agentId === "agent-a") return {id: "chat-a"};
+  if (agentId === "agent-b") return {id: "chat-b"};
+  return null;
+}
+const refreshedChats = [];
+async function refreshTheChatFor(agentId) { refreshedChats.push(agentId); }
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return {promise, resolve, reject};
+}
+const staleList = deferred();
+const staleFailure = deferred();
+let listCalls = 0;
+let staleDetailCalls = 0;
+async function request(path) {
+  if (path === "/api/long-horizon/goals") {
+    listCalls += 1;
+    if (listCalls === 1) return staleList.promise;
+    if (listCalls === 3) return staleFailure.promise;
+    return {goals: [goalB]};
+  }
+  if (path === "/api/long-horizon/goal?id=goal-a") {
+    staleDetailCalls += 1;
+    return {goal: goalA};
+  }
+  if (path === "/api/long-horizon/goal?id=goal-b") return {goal: goalB};
+  if (path === "/api/long-horizon/events?id=goal-b&after=0") {
+    return {events: [{event_id: "event-b"}], next: 1, has_more: false};
+  }
+  if (path === "/api/long-horizon/events?id=goal-b&after=1") {
+    return {events: [], next: 1, has_more: false};
+  }
+  throw new Error(`unexpected request ${path}`);
+}
+""" + selection + "\n" + helpers + "\n" + loaders + """
+async function run() {
+  longGoal = goalA;
+  longGoals = [goalA];
+  const stale = refreshLongGoals(true);
+  await Promise.resolve();
+
+  selectLongGoalSnapshot(goalB);
+  await refreshLongGoals(true);
+  staleList.resolve({goals: [goalA]});
+  await stale;
+
+  if (longGoal !== goalB || longGoals.length !== 1 || longGoals[0] !== goalB) {
+    throw new Error("the stale goal list replaced newly selected Goal B");
+  }
+  if (localStorage.getItem(LONG_GOAL_SELECTED_KEY) !== "goal-b"
+      || longGoalEvents.length !== 1 || longGoalEvents[0].event_id !== "event-b") {
+    throw new Error("the stale goal list replaced Goal B selection or events");
+  }
+  if (staleDetailCalls !== 0 || refreshedChats.includes("agent-a")) {
+    throw new Error("the stale Goal A list triggered detail or origin-chat work");
+  }
+  if (refreshedChats.filter(agent => agent === "agent-b").length !== 2
+      || timers.size !== 1 || !longGoalWatching) {
+    throw new Error("Goal B did not retain its exact chat refresh and watcher");
+  }
+  if (rendered !== 1 || missionProgress.textContent) {
+    throw new Error("a stale list rendered or reported over the latest goal");
+  }
+
+  // A rejected stale poll is equally unable to paint an error over Goal B or
+  // replace its reconnect timer after a newer refresh succeeds.
+  const staleError = refreshLongGoals(true);
+  await Promise.resolve();
+  selectLongGoalSnapshot(goalB);
+  await refreshLongGoals(true);
+  staleFailure.reject(new Error("stale Goal A network failure"));
+  await staleError;
+  if (longGoal !== goalB || longGoals[0] !== goalB
+      || localStorage.getItem(LONG_GOAL_SELECTED_KEY) !== "goal-b") {
+    throw new Error("a stale rejected list replaced Goal B");
+  }
+  if (missionProgress.textContent || refreshedChats.includes("agent-a")
+      || refreshedChats.filter(agent => agent === "agent-b").length !== 4
+      || timers.size !== 1 || !longGoalWatching || rendered !== 2) {
+    throw new Error("a stale rejected list disturbed Goal B UI or polling: " + JSON.stringify({
+      missionProgress: missionProgress.textContent,
+      refreshedChats, timers: timers.size, longGoalWatching, rendered,
+    }));
+  }
+}
+run().then(() => process.stdout.write("latest-list"))
+  .catch(error => { console.error(error); process.exit(1); });
+"""
+        completed = subprocess.run(
+            [node, "-e", probe], capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "latest-list")
+
+    def test_desktop_outbox_compare_delete_mismatch_stays_visible(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is needed for the desktop outbox renderer contract")
+        helper = self.script[
+            self.script.index("async function saveDirectLongGoalOutbox"):
+            self.script.index("function directLongGoalRecoveryFor")
+        ]
+        probe = f"""
+const window = {{harnessDesktop: {{
+  deleteDirectGoalOutbox: async () => ({{deleted: false, reason: "mismatch"}}),
+}}}};
+{helper}
+removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
+  .then(() => {{ throw new Error("mismatch was silently discarded"); }})
+  .catch(error => {{
+    if (!String(error.message || error).includes("changed before deletion")) throw error;
+    process.stdout.write("kept");
+  }});
+"""
+        completed = subprocess.run(
+            [node, "-e", probe], capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "kept")
 
     def test_busy_controls_and_activity_are_scoped_to_the_exact_saved_chat(self) -> None:
         controls = self.script[
@@ -3688,6 +4056,95 @@ class WhatThePanelIsTold(BoardTestCase):
             # noise that hides a real one.
             with exc:
                 return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def saved_project_pair_with_two_chats(self) -> tuple[str, str, dict, dict]:
+        status, saved = self.ask("/api/swarm/save", {"board": {
+            "agents": [
+                {"name": "The lead", "who": "claude"},
+                {"name": "The peer", "who": "codex"},
+            ],
+            "projects": [{"name": "Shared", "path": str(self.where)}],
+            "works_on": [
+                {"agent": "agent-1", "project": "project-1"},
+                {"agent": "agent-2", "project": "project-1"},
+            ],
+            "talks_to": [{"one": "agent-1", "other": "agent-2"}],
+        }})
+        self.assertEqual(status, 200, saved)
+        lead_id, peer_id = [one["id"] for one in saved["board"]["agents"]]
+        self.panel.swarm_known_routes = [
+            {"route": "claude", "label": "Claude", "ready": True},
+            {"route": "codex", "label": "Codex", "ready": True},
+        ]
+        status, listed = self.ask(f"/api/swarm/chats?agent={lead_id}")
+        self.assertEqual(status, 200, listed)
+        first = next(one for one in listed["chats"] if one["pair"] == [lead_id, peer_id])
+        status, made = self.ask("/api/swarm/chats/create", {
+            "agent": lead_id, "peer": peer_id,
+        })
+        self.assertEqual(status, 200, made)
+        second = next(one for one in made["chats"] if one["id"] == made["active"])
+        return lead_id, peer_id, first, second
+
+    def fake_long_horizon_runtime(self):
+        runtime = mock.Mock()
+        runtime.store = mock.Mock()
+        runtime.store.list.return_value = []
+        runtime.close = mock.Mock()
+        self.panel._long_horizon = runtime
+        return runtime
+
+    def create_real_direct_goal(self, supplied: dict):
+        """Create a scheduler record with the exact digest used by direct admission."""
+
+        long_horizon = server._long_horizon_module()
+        payload = self.panel._canonical_direct_long_horizon_payload(supplied)
+        standing = self.panel.swarm_standing()
+        context = self.panel._direct_long_horizon_context(standing, payload)
+        store = long_horizon.GoalStore(self.panel.config)
+        inspected = store.preflight_runtime_admission(
+            standing["board"], context["project_id"], list(payload["objectives"]),
+            str(payload["request_id"]), lead_id=context["lead_id"],
+            success_criteria=payload.get("success_criteria"),
+            policy=payload.get("policy"), attachments=payload.get("attachments"),
+            participant_ids=context["participant_ids"],
+            conversation_id=context["chat_id"],
+        )
+        goal = store.create(
+            standing["board"], context["project_id"], list(payload["objectives"]),
+            str(payload["request_id"]), lead_id=context["lead_id"],
+            success_criteria=payload.get("success_criteria"),
+            policy=payload.get("policy"),
+            participant_ids=context["participant_ids"],
+            conversation_id=context["chat_id"],
+            admission_digest=str(inspected["admission_digest"]),
+            expected_project_authority_id=str(inspected["project_authority_id"]),
+        )
+        return store, standing, payload, context, inspected, goal
+
+    def assert_direct_receipt(
+        self, received: dict, supplied: dict, *, goal: dict | None = None,
+    ) -> None:
+        payload = self.panel._canonical_direct_long_horizon_payload(supplied)
+        expected = {
+            "schema_version": 1,
+            "request_id": payload["request_id"],
+            "chat_id": payload["chat_id"],
+            "project_id": payload["project_id"],
+            "lead_id": payload["lead_id"],
+            "intent_sha256": chat.long_horizon_intent_sha256(
+                payload["chat_id"], payload["project_id"], payload["lead_id"],
+                payload["text"], payload.get("attachments"),
+            ),
+        }
+        self.assertEqual(
+            {key: received.get(key) for key in expected}, expected,
+        )
+        if goal is not None:
+            self.assertEqual(goal["request_id"], expected["request_id"])
+            self.assertEqual(goal["conversation_id"], expected["chat_id"])
+            self.assertEqual(goal["project"]["id"], expected["project_id"])
+            self.assertEqual(goal["lead_agent_id"], expected["lead_id"])
 
     def test_an_empty_board_is_still_an_answer(self) -> None:
         status, said = self.ask("/api/swarm")
@@ -5136,6 +5593,998 @@ class WhatThePanelIsTold(BoardTestCase):
             "/api/swarm/activity?activity=activity-first-123"
         )
         self.assertEqual(activity["state"], "stopped")
+
+    def test_direct_receipt_only_restores_a_missing_legacy_tombstone_project(self) -> None:
+        digest = "a" * 64
+        receipt = {
+            "schema_version": 1,
+            "request_id": "direct-legacy-tombstone-project-1",
+            "chat_id": "direct-legacy-chat-1",
+            "project_id": "project-1",
+            "lead_id": "agent-1",
+            "intent_sha256": "b" * 64,
+        }
+        tombstone = {
+            "request_id": receipt["request_id"],
+            "conversation_id": receipt["chat_id"],
+            "project": {"id": ""},
+            "lead_agent_id": receipt["lead_id"],
+            "request_tombstone": True,
+            "admission_digest": digest,
+        }
+
+        for proof in (
+            {"admission_digest": digest},
+            {"transcript_proven": True},
+        ):
+            restored = self.panel._goal_for_direct_receipt(
+                tombstone, receipt, **proof,
+            )
+            self.assertEqual(restored["project"], {"id": "project-1"})
+
+        with self.assertRaisesRegex(server.HarnessError, "different project identity"):
+            self.panel._goal_for_direct_receipt(tombstone, receipt)
+
+        wrong_project = {**tombstone, "project": {"id": "project-2"}}
+        for proof in (
+            {"admission_digest": digest},
+            {"transcript_proven": True},
+        ):
+            with self.assertRaisesRegex(
+                server.HarnessError, "different project identity",
+            ):
+                self.panel._goal_for_direct_receipt(
+                    wrong_project, receipt, **proof,
+                )
+
+    def test_direct_preflight_and_discard_use_the_full_live_goal_binding(self) -> None:
+        lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-full-live-binding-1"
+        objectives = ["Keep the first boundary", "Keep the second boundary"]
+        original = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": first["id"], "text": "\n\n".join(objectives),
+            "objectives": objectives,
+            "success_criteria": ["Use the exact approved evidence"],
+            "policy": {"max_tasks": 4, "max_parallel": 2, "review_risk": "high"},
+            "request_id": request_id,
+        }
+        store, standing, payload, context, _inspected, goal = \
+            self.create_real_direct_goal(original)
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.get_by_request.side_effect = store.get_by_request
+        runtime.store.public.side_effect = lambda value: value
+        runtime.start.return_value = goal
+        mismatches = [
+            {
+                **original, "chat_id": second["id"], "text": "Different chat and text",
+                "objectives": ["Different chat and text"],
+            },
+            {**original, "success_criteria": ["Use different evidence"]},
+            {**original, "policy": {**original["policy"], "max_parallel": 1}},
+            {**original, "objectives": [original["text"]]},
+        ]
+        with mock.patch.object(
+            chat, "ask_once", side_effect=AssertionError("preflight dispatched a provider"),
+        ) as provider:
+            for changed in mismatches:
+                with self.assertRaisesRegex(server.HarnessError, "already bound to a different"):
+                    self.panel.prepare_direct_long_horizon(changed)
+        provider.assert_not_called()
+        runtime.start.assert_not_called()
+        runtime.start_background.assert_not_called()
+        runtime._enable_auto_start_watcher.assert_not_called()
+        runtime._require_no_external_owner.assert_not_called()
+        runtime.store.reconcile_project_queue.assert_not_called()
+        self.assertFalse(self.panel._direct_admission_path(request_id).exists())
+        for conversation in (first, second):
+            self.assertEqual(chat.read_it(
+                self.panel.config, str(conversation["transcript_route"]),
+                str(conversation["filed_as"]),
+            ), [])
+
+        prepared = self.panel.prepare_direct_long_horizon(original)
+        saved = self.panel._load_direct_admission(request_id, first["id"])
+        self.assertEqual(
+            saved["admission_binding"]["admission_digest"], goal["admission_digest"],
+        )
+        with mock.patch.object(
+            self.panel, "require_project_execution_authority",
+            return_value={"project_authority_id": goal["project_authority_id"]},
+        ):
+            replayed, replay_receipt = self.panel.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": first["id"]},
+                from_pending=True,
+            )
+        self.assertEqual(replayed["goal_id"], goal["goal_id"])
+        self.assert_direct_receipt(replay_receipt, original, goal=replayed)
+        self.assertEqual(self.panel.direct_admission_inventory(), [])
+        runtime.start.assert_called_once()
+
+        # Simulate the only remaining race: another admission path creates the
+        # old goal after this direct path's pure preflight but before its save.
+        conflicting = self.panel._canonical_direct_long_horizon_payload({
+            **original, "chat_id": second["id"],
+            "text": "A later conflicting attempt",
+            "objectives": ["A later conflicting attempt"],
+            "success_criteria": ["Different evidence"],
+            "policy": {**original["policy"], "max_parallel": 1},
+        })
+        conflict_context = self.panel._direct_long_horizon_context(
+            standing, conflicting,
+        )
+        conflict = store.inspect_runtime_admission(
+            standing["board"], "project-1", list(conflicting["objectives"]),
+            request_id, lead_id=lead_id,
+            success_criteria=conflicting.get("success_criteria"),
+            policy=conflicting.get("policy"),
+            attachments=conflicting.get("attachments"),
+            participant_ids=conflict_context["participant_ids"],
+            conversation_id=second["id"],
+        )
+        self.assertTrue(conflict["conflict"])
+        conflicting_record = self.panel._save_direct_admission(
+            conflicting, conflict_context, str(conflict["admission_digest"]),
+        )
+        conflict_intent = chat.long_horizon_intent_sha256(
+            second["id"], "project-1", lead_id,
+            str(conflicting["text"]), conflicting.get("attachments"),
+        )
+        chat.keep_long_horizon_prompt(
+            self.panel.config, conflict_context["transcript_route"],
+            str(conflicting["text"]), filed_as=conflict_context["filed_as"],
+            request_id=request_id, chat_id=second["id"], project_id="project-1",
+            lead_id=lead_id, intent_sha256=conflict_intent,
+            attachments=conflicting.get("attachments"),
+        )
+        runtime.store.public.reset_mock()
+        before = store.get(goal["goal_id"])
+        discarded = self.panel.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "payload_sha256": conflicting_record["payload_sha256"],
+            "intent_sha256": conflict_intent,
+        })
+        self.assertTrue(discarded["discarded"])
+        self.assertTrue(discarded["safe_to_delete"])
+        self.assertFalse(discarded["reconciled"])
+        self.assert_direct_receipt(discarded, conflicting)
+        for flag in ("discarded", "reconciled", "safe_to_delete", "transcript_noted"):
+            self.assertIs(type(discarded[flag]), bool)
+        runtime.store.public.assert_not_called()
+        after = store.get(goal["goal_id"])
+        self.assertEqual((after["status"], after["revision"]), (
+            before["status"], before["revision"],
+        ))
+        retired = self.panel._read_direct_admission_path(
+            self.panel._direct_admission_path(request_id),
+        )
+        self.assertEqual(retired["state"], "discarded")
+        self.assertEqual(self.panel.direct_admission_inventory(), [])
+        freed = self.panel.prepare_direct_long_horizon({
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "New identity can use the freed chat",
+            "request_id": "direct-full-live-binding-new-id",
+        })
+        self.assertEqual(freed["request_id"], "direct-full-live-binding-new-id")
+
+    def test_direct_preflight_and_discard_use_a_pruned_goal_tombstone_binding(self) -> None:
+        lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
+        long_horizon = server._long_horizon_module()
+        request_id = "direct-full-retired-binding-1"
+        objectives = ["Retire the first boundary", "Retire the second boundary"]
+        original = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": first["id"], "text": "\n\n".join(objectives),
+            "objectives": objectives,
+            "success_criteria": ["Keep this exact retired evidence"],
+            "policy": {"max_tasks": 4, "max_parallel": 2, "review_risk": "high"},
+            "request_id": request_id,
+        }
+        store, standing, _payload, _context, _inspected, goal = \
+            self.create_real_direct_goal(original)
+        store.control(goal["goal_id"], "cancel")
+        for index in range(long_horizon.MAX_GOALS):
+            filler = store.create(
+                standing["board"], "project-1",
+                [f"Direct tombstone rollover filler {index}"],
+                f"direct-tombstone-filler-{index}",
+            )
+            store.control(filler["goal_id"], "cancel")
+        tombstone = store.get_by_request(request_id)
+        self.assertIsNotNone(tombstone)
+        self.assertTrue(tombstone["request_tombstone"])
+
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.get_by_request.side_effect = store.get_by_request
+        runtime.store.public.side_effect = lambda value: value
+        mismatches = [
+            {
+                **original, "chat_id": second["id"], "text": "Changed retired text",
+                "objectives": ["Changed retired text"],
+            },
+            {**original, "success_criteria": ["Changed retired evidence"]},
+            {**original, "policy": {**original["policy"], "max_parallel": 1}},
+            {**original, "objectives": [original["text"]]},
+        ]
+        with mock.patch.object(
+            store, "get", side_effect=AssertionError("tombstone preflight called get()"),
+        ) as get, mock.patch.object(
+            chat, "ask_once", side_effect=AssertionError("preflight dispatched a provider"),
+        ) as provider:
+            for changed in mismatches:
+                with self.assertRaisesRegex(server.HarnessError, "already bound to a different"):
+                    self.panel.prepare_direct_long_horizon(changed)
+        get.assert_not_called()
+        provider.assert_not_called()
+        runtime.start.assert_not_called()
+        runtime.start_background.assert_not_called()
+        self.assertFalse(self.panel._direct_admission_path(request_id).exists())
+        for conversation in (first, second):
+            self.assertEqual(chat.read_it(
+                self.panel.config, str(conversation["transcript_route"]),
+                str(conversation["filed_as"]),
+            ), [])
+
+        exact = self.panel._preflight_direct_long_horizon(
+            standing,
+            self.panel._canonical_direct_long_horizon_payload(original),
+            self.panel._direct_long_horizon_context(
+                standing, self.panel._canonical_direct_long_horizon_payload(original),
+            ),
+        )
+        self.assertEqual(exact["goal"]["goal_id"], tombstone["goal_id"])
+        self.assertEqual(exact["admission_digest"], tombstone["admission_digest"])
+
+        conflicting = self.panel._canonical_direct_long_horizon_payload({
+            **original, "chat_id": second["id"], "text": "Conflicting retired attempt",
+            "objectives": ["Conflicting retired attempt"],
+            "success_criteria": ["Changed retired evidence"],
+            "policy": {**original["policy"], "max_parallel": 1},
+        })
+        conflict_context = self.panel._direct_long_horizon_context(
+            standing, conflicting,
+        )
+        conflict = store.inspect_runtime_admission(
+            standing["board"], "project-1", list(conflicting["objectives"]),
+            request_id, lead_id=lead_id,
+            success_criteria=conflicting.get("success_criteria"),
+            policy=conflicting.get("policy"),
+            attachments=conflicting.get("attachments"),
+            participant_ids=conflict_context["participant_ids"],
+            conversation_id=second["id"],
+        )
+        conflicting_record = self.panel._save_direct_admission(
+            conflicting, conflict_context, str(conflict["admission_digest"]),
+        )
+        discarded = self.panel.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "payload_sha256": conflicting_record["payload_sha256"],
+        })
+        self.assertTrue(discarded["discarded"])
+        self.assertTrue(discarded["safe_to_delete"])
+        self.assertFalse(discarded["reconciled"])
+        self.assert_direct_receipt(discarded, conflicting)
+        for flag in ("discarded", "reconciled", "safe_to_delete", "transcript_noted"):
+            self.assertIs(type(discarded[flag]), bool)
+        self.assertEqual(store.get_by_request(request_id)["goal_id"], tombstone["goal_id"])
+        self.assertEqual(self.panel.direct_admission_inventory(), [])
+        freed = self.panel.prepare_direct_long_horizon({
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Reuse chat after retired conflict",
+            "request_id": "direct-full-retired-binding-new-id",
+        })
+        self.assertEqual(freed["request_id"], "direct-full-retired-binding-new-id")
+
+    def test_direct_work_together_persists_exact_chat_two_before_admission(self) -> None:
+        lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
+        runtime = self.fake_long_horizon_runtime()
+        request_id = "direct-chat-two-success-1"
+        prompt = "Exact Chat 2 objective\n" + ("x" * 25_050)
+        goal = {
+            "goal_id": "goal-waiting-chat-two-1234567890",
+            "request_id": request_id,
+            "conversation_id": second["id"],
+            "project": {"id": "project-1", "name": "Shared", "path": str(self.where)},
+            "lead_agent_id": lead_id,
+            "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "waiting_for_project",
+            "project_queue": {
+                "state": "waiting", "blocked_by_goal_id": "owner-goal-1234567890",
+            },
+        }
+        with (
+            mock.patch.object(runtime.store, "validate_create") as validated,
+            mock.patch.object(runtime, "start", return_value=goal) as started,
+            mock.patch.object(self.panel, "require_project_execution_authority", return_value={
+                "project_authority_id": "authority-test",
+            }),
+        ):
+            for _attempt in range(2):
+                status, accepted = self.ask("/api/long-horizon/start", {
+                    "project_id": "project-1", "lead_id": lead_id,
+                    "chat_id": second["id"], "text": prompt,
+                    "objectives": [prompt],
+                    "request_id": request_id,
+                })
+                self.assertEqual(status, 202, accepted)
+                self.assertEqual(accepted["goal"]["status"], "waiting_for_project")
+                self.assertEqual(accepted["chat_id"], second["id"])
+                self.assert_direct_receipt(accepted, {
+                    "project_id": "project-1", "lead_id": lead_id,
+                    "chat_id": second["id"], "text": prompt,
+                    "objectives": [prompt], "request_id": request_id,
+                }, goal=accepted["goal"])
+        self.assertEqual(validated.call_count, 2)
+        self.assertEqual(started.call_args.args[2], [prompt])
+
+        status, exact = self.ask(
+            f"/api/swarm/said?agent={lead_id}&chat={second['id']}"
+        )
+        self.assertEqual(status, 200, exact)
+        self.assertEqual(
+            [one.get("correlation", {}).get("kind") for one in exact["said"]],
+            ["long_horizon_prompt", "long_horizon_status"],
+        )
+        self.assertEqual(exact["said"][0]["text"], prompt)
+        self.assertEqual(exact["said"][0]["phase"], "long_horizon_prompt")
+        self.assertEqual(exact["said"][0]["correlation"]["chat_id"], second["id"])
+        self.assertEqual(exact["said"][1]["correlation"]["goal_status"], "waiting_for_project")
+        self.assertNotIn("verified complete", exact["said"][1]["text"])
+        status, sibling = self.ask(
+            f"/api/swarm/said?agent={lead_id}&chat={first['id']}"
+        )
+        self.assertEqual(status, 200, sibling)
+        self.assertEqual(sibling["said"], [])
+
+    def test_direct_work_together_rejects_disagreeing_text_and_objectives(self) -> None:
+        lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
+        runtime = self.fake_long_horizon_runtime()
+        with mock.patch.object(runtime, "start") as started:
+            status, refused = self.ask("/api/long-horizon/start", {
+                "project_id": "project-1", "lead_id": lead_id,
+                "chat_id": second["id"],
+                "text": "Persist this text",
+                "objectives": ["Execute a different objective"],
+                "request_id": "direct-conflicting-shapes-1",
+            })
+        self.assertEqual(status, 400, refused)
+        self.assertIn("text and objectives disagree", refused["error"])
+        started.assert_not_called()
+        exact = chat.read_it(
+            self.panel.config,
+            str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        sibling = chat.read_it(
+            self.panel.config,
+            str(first["transcript_route"]), str(first["filed_as"]),
+        )
+        self.assertEqual(exact, [])
+        self.assertEqual(sibling, [])
+
+    def test_prepared_direct_admission_survives_restart_with_exact_attachment_payload(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-prepared-restart-1"
+        attachment = {
+            "name": "evidence.txt", "type": "text/plain", "size": 5,
+            "data": "data:text/plain;base64,aGVsbG8=",
+        }
+        request = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"],
+            "text": "Resume this exact admission\nBearer sk-secret-value-1234567890",
+            "objectives": [
+                "Resume this exact admission\nBearer sk-secret-value-1234567890",
+            ],
+            "attachments": [attachment], "request_id": request_id,
+        }
+        status, prepared = self.ask(
+            "/api/long-horizon/prepare-admission", request,
+        )
+        self.assertEqual(status, 200, prepared)
+        self.assertEqual(prepared["pending"]["request_id"], request_id)
+        self.assertEqual(prepared["pending"]["attachment_count"], 1)
+        self.assertNotIn("data", prepared["pending"])
+
+        status, inventory = self.ask("/api/long-horizon/pending-admissions")
+        self.assertEqual(status, 200, inventory)
+        self.assertEqual(len(inventory["pending"]), 1)
+        self.assertNotIn("aGVsbG8", json.dumps(inventory))
+        self.assertNotIn("sk-secret-value-1234567890", json.dumps(inventory))
+        self.assertIn("[REDACTED]", inventory["pending"][0]["text_preview"])
+        before = chat.read_it(
+            self.panel.config,
+            str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        self.assertEqual(len(before), 1)
+        self.assertEqual(before[0].phase, "long_horizon_prompt")
+
+        reopened = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(reopened.server_close)
+        reopened.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        runtime = mock.Mock()
+        runtime.store = mock.Mock()
+        runtime.store.list.return_value = []
+        runtime.close = mock.Mock()
+        reopened._long_horizon = runtime
+        goal = {
+            "goal_id": "goal-prepared-restart-1234567890",
+            "request_id": request_id,
+            "conversation_id": second["id"],
+            "project": {"id": "project-1", "name": "Shared", "path": str(self.where)},
+            "lead_agent_id": lead_id,
+            "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "queued", "revision": 1,
+            "project_queue": {"state": "owner"},
+        }
+        runtime.start.return_value = goal
+        saved_record = reopened._load_direct_admission(request_id, second["id"])
+        self.assertEqual(
+            saved_record["payload"]["attachments"][0]["data"], attachment["data"],
+        )
+        with mock.patch.object(
+            reopened, "require_project_execution_authority",
+            return_value={"project_authority_id": "authority-test"},
+        ):
+            resumed, receipt = reopened.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+        self.assert_direct_receipt(receipt, request, goal=resumed)
+        self.assertEqual(resumed["goal_id"], goal["goal_id"])
+        self.assertEqual(runtime.start.call_args.args[2], request["objectives"])
+        self.assertEqual(runtime.start.call_args.kwargs["attachments"], [attachment])
+        self.assertEqual(reopened.direct_admission_inventory(), [])
+        after = chat.read_it(
+            reopened.config,
+            str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        self.assertEqual(
+            [one.correlation.get("kind") for one in after],
+            ["long_horizon_prompt", "long_horizon_status"],
+        )
+
+    def test_direct_admission_recovers_after_journal_save_before_prompt(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-crash-before-prompt-1"
+        attachment = {
+            "name": "before-prompt.txt", "type": "text/plain", "size": 5,
+            "data": "data:text/plain;base64,aGVsbG8=",
+        }
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Persist before transcript",
+            "attachments": [attachment], "request_id": request_id,
+        }
+        with mock.patch.object(
+            chat, "keep_long_horizon_prompt",
+            side_effect=RuntimeError("simulated crash after admission journal"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "after admission journal"):
+                self.panel.prepare_direct_long_horizon(supplied)
+
+        self.assertEqual(len(self.panel.direct_admission_inventory()), 1)
+        self.assertEqual(chat.read_it(
+            self.panel.config, str(second["transcript_route"]), str(second["filed_as"]),
+        ), [])
+        with self.assertRaisesRegex(server.HarnessError, "already has a saved"):
+            self.panel.prepare_direct_long_horizon({
+                **supplied, "request_id": "different-request-same-chat",
+                "text": "Must not hide the earlier pending request",
+            })
+
+        reopened = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(reopened.server_close)
+        reopened.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        runtime = mock.Mock()
+        runtime.store = mock.Mock()
+        runtime.store.list.return_value = []
+        runtime.close = mock.Mock()
+        reopened._long_horizon = runtime
+        goal = {
+            "goal_id": "goal-crash-before-prompt-1234567890",
+            "request_id": request_id, "conversation_id": second["id"],
+            "project": {"id": "project-1", "name": "Shared", "path": str(self.where)},
+            "lead_agent_id": lead_id, "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "queued", "revision": 1, "project_queue": {"state": "owner"},
+        }
+        runtime.start.return_value = goal
+        with mock.patch.object(
+            reopened, "require_project_execution_authority",
+            return_value={"project_authority_id": "authority-test"},
+        ):
+            resumed, receipt = reopened.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+        self.assert_direct_receipt(receipt, supplied, goal=resumed)
+        self.assertEqual(resumed["goal_id"], goal["goal_id"])
+        self.assertEqual(runtime.start.call_args.kwargs["attachments"], [attachment])
+        exact = chat.read_it(
+            reopened.config, str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        self.assertEqual(
+            [one.correlation.get("kind") for one in exact],
+            ["long_horizon_prompt", "long_horizon_status"],
+        )
+
+    def test_direct_admission_recovers_after_prompt_before_goal_create(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-crash-after-prompt-1"
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Keep exactly one prompt",
+            "request_id": request_id,
+        }
+        dying = self.fake_long_horizon_runtime()
+        dying.start.side_effect = KeyboardInterrupt("simulated process death before create")
+        with mock.patch.object(
+            self.panel, "require_project_execution_authority",
+            return_value={"project_authority_id": "authority-test"},
+        ):
+            with self.assertRaisesRegex(KeyboardInterrupt, "before create"):
+                self.panel.admit_direct_long_horizon(supplied)
+        before = chat.read_it(
+            self.panel.config, str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        self.assertEqual(
+            [one.correlation.get("kind") for one in before], ["long_horizon_prompt"],
+        )
+        self.assertEqual(len(self.panel.direct_admission_inventory()), 1)
+
+        reopened = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(reopened.server_close)
+        reopened.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        runtime = mock.Mock()
+        runtime.store = mock.Mock()
+        runtime.store.list.return_value = []
+        runtime.close = mock.Mock()
+        reopened._long_horizon = runtime
+        goal = {
+            "goal_id": "goal-crash-after-prompt-1234567890",
+            "request_id": request_id, "conversation_id": second["id"],
+            "project": {"id": "project-1", "name": "Shared", "path": str(self.where)},
+            "lead_agent_id": lead_id, "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "queued", "revision": 1, "project_queue": {"state": "owner"},
+        }
+        runtime.start.return_value = goal
+        with mock.patch.object(
+            reopened, "require_project_execution_authority",
+            return_value={"project_authority_id": "authority-test"},
+        ):
+            reopened.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+        runtime.start.assert_called_once()
+        after = chat.read_it(
+            reopened.config, str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        self.assertEqual(
+            [one.correlation.get("kind") for one in after],
+            ["long_horizon_prompt", "long_horizon_status"],
+        )
+
+    def test_discard_tombstone_blocks_delayed_prepare_and_start(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-discard-replay-1"
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Discard without dispatch",
+            "request_id": request_id,
+        }
+        status, prepared = self.ask("/api/long-horizon/prepare-admission", supplied)
+        self.assertEqual(status, 200, prepared)
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.get_by_request.return_value = None
+        status, discarded = self.ask("/api/long-horizon/discard-admission", {
+            "request_id": request_id, "chat_id": second["id"],
+            "payload_sha256": prepared["pending"]["payload_sha256"],
+        })
+        self.assertEqual(status, 200, discarded)
+        self.assertTrue(discarded["discarded"])
+        self.assert_direct_receipt(discarded, supplied)
+        for flag in ("discarded", "reconciled", "safe_to_delete", "transcript_noted"):
+            self.assertIs(type(discarded[flag]), bool)
+        self.assertEqual(self.panel.direct_admission_inventory(), [])
+        retired = self.panel._read_direct_admission_path(
+            self.panel._direct_admission_path(request_id),
+        )
+        self.assertEqual(retired["state"], "discarded")
+        self.assertNotIn("payload", retired)
+        repeated = self.panel.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "intent_sha256": retired["intent_sha256"],
+        })
+        self.assert_direct_receipt(repeated, supplied)
+        self.assertTrue(repeated["safe_to_delete"])
+        with self.assertRaisesRegex(server.HarnessError, "different exact desktop"):
+            self.panel.discard_direct_admission({
+                "request_id": request_id, "chat_id": second["id"],
+                "intent_sha256": "0" * 64,
+            })
+        with self.assertRaisesRegex(server.HarnessError, "another chat"):
+            self.panel.discard_direct_admission({
+                "request_id": request_id, "chat_id": "chat-wrong-binding",
+                "intent_sha256": retired["intent_sha256"],
+            })
+
+        for endpoint, body in (
+            ("/api/long-horizon/prepare-admission", supplied),
+            ("/api/long-horizon/start", supplied),
+        ):
+            status, refused = self.ask(endpoint, body)
+            self.assertEqual(status, 400, refused)
+            self.assertIn("explicitly retired", refused["error"])
+        runtime.start.assert_not_called()
+        exact = chat.read_it(
+            self.panel.config, str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        self.assertEqual(
+            [one.correlation.get("kind") for one in exact],
+            ["long_horizon_prompt", "long_horizon_error"],
+        )
+
+        status, new_request = self.ask("/api/long-horizon/prepare-admission", {
+            **supplied, "request_id": "direct-discard-replay-new-id",
+        })
+        self.assertEqual(status, 200, new_request)
+
+    def test_two_servers_cannot_revive_a_request_discarded_after_initial_load(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-discard-race-1"
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Race must retire definitively",
+            "request_id": request_id,
+        }
+        self.panel.prepare_direct_long_horizon(supplied)
+        self.fake_long_horizon_runtime().store.get_by_request.return_value = None
+
+        starter = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(starter.server_close)
+        starter.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        start_runtime = mock.Mock()
+        start_runtime.store = mock.Mock()
+        start_runtime.store.list.return_value = []
+        start_runtime.close = mock.Mock()
+        starter._long_horizon = start_runtime
+        loaded = threading.Event()
+        continue_start = threading.Event()
+        original_load = starter._load_direct_admission
+        calls = 0
+
+        def pause_after_initial_load(wanted_request, wanted_chat=""):
+            nonlocal calls
+            record = original_load(wanted_request, wanted_chat)
+            calls += 1
+            if calls == 1:
+                loaded.set()
+                self.assertTrue(continue_start.wait(10))
+            return record
+
+        result: dict[str, object] = {}
+
+        def delayed_start() -> None:
+            try:
+                result["goal"] = starter.admit_direct_long_horizon(
+                    {"request_id": request_id, "chat_id": second["id"]},
+                    from_pending=True,
+                )
+            except BaseException as exc:  # deliberate crash/race capture
+                result["error"] = exc
+
+        with mock.patch.object(
+            starter, "_load_direct_admission", side_effect=pause_after_initial_load,
+        ):
+            thread = threading.Thread(target=delayed_start)
+            thread.start()
+            self.assertTrue(loaded.wait(10))
+            discarded = self.panel.discard_direct_admission({
+                "request_id": request_id, "chat_id": second["id"],
+            })
+            self.assertTrue(discarded["discarded"])
+            continue_start.set()
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertIsInstance(result.get("error"), server.HarnessError)
+        self.assertIn("explicitly retired", str(result["error"]))
+        start_runtime.start.assert_not_called()
+        self.assertEqual(self.panel.direct_admission_inventory(), [])
+
+    def test_two_servers_serialize_one_request_identity_across_different_chats(self) -> None:
+        lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-cross-chat-request-race-1"
+        first_payload = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": first["id"], "text": "The first exact request wins",
+            "request_id": request_id,
+        }
+        second_payload = {
+            **first_payload, "chat_id": second["id"],
+            "text": "A different chat must wait and fail closed",
+        }
+        starter = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(starter.server_close)
+        starter.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        save_entered = threading.Event()
+        release_save = threading.Event()
+        second_preflight_entered = threading.Event()
+        self.addCleanup(release_save.set)
+        original_save = starter._save_direct_admission
+        original_second_preflight = self.panel._preflight_direct_long_horizon
+
+        def paused_save(payload, context, admission_digest):
+            save_entered.set()
+            self.assertTrue(release_save.wait(10), "request lease test timed out")
+            return original_save(payload, context, admission_digest)
+
+        def noted_second_preflight(*args, **kwargs):
+            second_preflight_entered.set()
+            return original_second_preflight(*args, **kwargs)
+
+        results: dict[str, object] = {}
+
+        def prepare(which: str, panel, payload) -> None:
+            try:
+                results[which] = panel.prepare_direct_long_horizon(payload)
+            except BaseException as exc:  # deliberate cross-server race capture
+                results[which + "_error"] = exc
+
+        with mock.patch.object(
+            starter, "_save_direct_admission", side_effect=paused_save,
+        ), mock.patch.object(
+            self.panel, "_preflight_direct_long_horizon",
+            side_effect=noted_second_preflight,
+        ):
+            first_thread = threading.Thread(
+                target=prepare, args=("first", starter, first_payload),
+            )
+            second_thread = threading.Thread(
+                target=prepare, args=("second", self.panel, second_payload),
+            )
+            first_thread.start()
+            self.assertTrue(save_entered.wait(10))
+            second_thread.start()
+            self.assertFalse(
+                second_preflight_entered.wait(0.25),
+                "the different-chat request bypassed the request-scoped lease",
+            )
+            release_save.set()
+            first_thread.join(10)
+            second_thread.join(10)
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertIn("first", results)
+        self.assertIsInstance(results.get("second_error"), server.HarnessError)
+        self.assertIn("different exact payload", str(results["second_error"]))
+        self.assertEqual(
+            [one["request_id"] for one in self.panel.direct_admission_inventory()],
+            [request_id],
+        )
+        self.assertEqual(len(chat.read_it(
+            self.panel.config, str(first["transcript_route"]), str(first["filed_as"]),
+        )), 1)
+        self.assertEqual(chat.read_it(
+            self.panel.config, str(second["transcript_route"]), str(second["filed_as"]),
+        ), [])
+
+    def test_local_outbox_discard_reconciles_goal_after_lost_start_response(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-lost-start-response-1"
+        text = "The goal exists although the renderer missed the response"
+        intent_sha256 = chat.long_horizon_intent_sha256(
+            second["id"], "project-1", lead_id, text, [],
+        )
+        runtime = self.fake_long_horizon_runtime()
+        goal = {
+            "goal_id": "goal-lost-start-response-1234567890",
+            "request_id": request_id, "conversation_id": second["id"],
+            "project": {"id": "project-1", "name": "Shared", "path": str(self.where)},
+            "lead_agent_id": lead_id, "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "queued", "revision": 1, "project_queue": {"state": "owner"},
+        }
+        runtime.start.return_value = goal
+        with mock.patch.object(
+            self.panel, "require_project_execution_authority",
+            return_value={"project_authority_id": "authority-test"},
+        ):
+            self.panel.admit_direct_long_horizon({
+                "project_id": "project-1", "lead_id": lead_id,
+                "chat_id": second["id"], "text": text,
+                "request_id": request_id,
+            })
+        self.assertEqual(self.panel.direct_admission_inventory(), [])
+        runtime.store.get_by_request.return_value = goal
+        runtime.store.public.side_effect = lambda value: value
+        with self.assertRaisesRegex(server.HarnessError, "different exact saved prompt"):
+            self.panel.discard_direct_admission({
+                "request_id": request_id, "chat_id": second["id"],
+                "project_id": "project-1", "lead_id": lead_id,
+                "intent_sha256": chat.long_horizon_intent_sha256(
+                    second["id"], "project-1", lead_id,
+                    "A different local payload reused the request ID", [],
+                ),
+            })
+
+        reconciled = self.panel.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": intent_sha256,
+        })
+        self.assertTrue(reconciled["reconciled"])
+        self.assertFalse(reconciled["safe_to_delete"])
+        self.assertEqual(reconciled["goal"]["goal_id"], goal["goal_id"])
+        self.assert_direct_receipt(reconciled, {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": text,
+            "request_id": request_id,
+        }, goal=reconciled["goal"])
+        retired = self.panel._read_direct_admission_path(
+            self.panel._direct_admission_path(request_id),
+        )
+        self.assertEqual(retired["state"], "reconciled")
+        repeated = self.panel.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": intent_sha256,
+        })
+        self.assertTrue(repeated["reconciled"])
+        self.assert_direct_receipt(repeated, {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": text,
+            "request_id": request_id,
+        }, goal=repeated["goal"])
+        runtime.start.assert_called_once()
+
+    def test_local_only_outbox_discard_proves_absence_and_fences_delayed_posts(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "direct-local-only-discard-1"
+        text = "Never reached the backend prepare endpoint"
+        intent_sha256 = chat.long_horizon_intent_sha256(
+            second["id"], "project-1", lead_id, text, [],
+        )
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.get_by_request.return_value = None
+        discarded = self.panel.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": intent_sha256,
+        })
+        self.assertTrue(discarded["safe_to_delete"])
+        self.assertTrue(discarded["discarded"])
+        self.assert_direct_receipt(discarded, {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": text,
+            "request_id": request_id,
+        })
+        for flag in ("discarded", "reconciled", "safe_to_delete", "transcript_noted"):
+            self.assertIs(type(discarded[flag]), bool)
+        retired = self.panel._read_direct_admission_path(
+            self.panel._direct_admission_path(request_id),
+        )
+        self.assertEqual(retired["state"], "discarded")
+        self.assertEqual(retired["intent_sha256"], intent_sha256)
+        with self.assertRaisesRegex(server.HarnessError, "explicitly retired"):
+            self.panel.prepare_direct_long_horizon({
+                "project_id": "project-1", "lead_id": lead_id,
+                "chat_id": second["id"], "text": text,
+                "request_id": request_id,
+            })
+        runtime.start.assert_not_called()
+
+    def test_direct_admission_reserves_tombstone_capacity_for_every_pending(self) -> None:
+        lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
+        with mock.patch.object(
+            server, "DIRECT_LONG_HORIZON_ADMISSION_MAX_TOMBSTONES", 1,
+        ):
+            self.panel.prepare_direct_long_horizon({
+                "project_id": "project-1", "lead_id": lead_id,
+                "chat_id": first["id"], "text": "First reserved tombstone",
+                "request_id": "direct-capacity-first-1",
+            })
+            with self.assertRaisesRegex(server.HarnessError, "cannot reserve"):
+                self.panel.prepare_direct_long_horizon({
+                    "project_id": "project-1", "lead_id": lead_id,
+                    "chat_id": second["id"], "text": "No unsafe second pending",
+                    "request_id": "direct-capacity-second-1",
+                })
+        pending = self.panel.direct_admission_inventory()
+        self.assertEqual([one["request_id"] for one in pending], [
+            "direct-capacity-first-1",
+        ])
+
+    def test_direct_work_together_failure_is_durable_idempotent_and_restart_readable(self) -> None:
+        lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
+        runtime = self.fake_long_horizon_runtime()
+        request = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Keep this rejected request visible",
+            "request_id": "direct-chat-two-failure-1",
+        }
+        with mock.patch.object(
+            runtime.store, "validate_create",
+            side_effect=server.HarnessError("Admission deliberately refused"),
+        ):
+            for _attempt in range(2):
+                status, refused = self.ask("/api/long-horizon/start", request)
+                self.assertEqual(status, 400, refused)
+                self.assertIn("deliberately refused", refused["error"])
+
+        restarted_config = load_config(self.where)
+        exact = chat.read_it(
+            restarted_config, str(second["transcript_route"]), str(second["filed_as"]),
+        )
+        self.assertEqual(
+            [one.correlation.get("kind") for one in exact],
+            ["long_horizon_prompt", "long_horizon_error"],
+        )
+        self.assertEqual(exact[0].text, request["text"])
+        self.assertIn("remains saved", exact[1].text)
+        sibling = chat.read_it(
+            restarted_config, str(first["transcript_route"]), str(first["filed_as"]),
+        )
+        self.assertEqual(sibling, [])
+
+    def test_goal_poll_projects_only_truthful_status_transitions_to_origin_chat(self) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        runtime = self.fake_long_horizon_runtime()
+        request_id = "direct-status-projection-1"
+        base = {
+            "goal_id": "goal-status-projection-1234567890",
+            "request_id": request_id,
+            "conversation_id": second["id"],
+            "project": {"id": "project-1", "name": "Shared", "path": str(self.where)},
+            "lead_agent_id": lead_id,
+            "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "queued", "revision": 1,
+            "tasks": [], "budget": {},
+        }
+        with (
+            mock.patch.object(runtime.store, "validate_create"),
+            mock.patch.object(runtime, "start", return_value=base),
+            mock.patch.object(self.panel, "require_project_execution_authority", return_value={
+                "project_authority_id": "authority-test",
+            }),
+        ):
+            status, accepted = self.ask("/api/long-horizon/start", {
+                "project_id": "project-1", "lead_id": lead_id,
+                "chat_id": second["id"], "text": "Track the real lifecycle",
+                "request_id": request_id,
+            })
+        self.assertEqual(status, 202, accepted)
+
+        running = {**base, "status": "running", "revision": 2}
+        with mock.patch.object(runtime.store, "list", return_value=[running]):
+            for _poll in range(2):
+                status, listed = self.ask("/api/long-horizon/goals")
+                self.assertEqual(status, 200, listed)
+        complete = {**base, "status": "complete", "revision": 3}
+        with mock.patch.object(runtime.store, "list", return_value=[complete]):
+            status, listed = self.ask("/api/long-horizon/goals")
+            self.assertEqual(status, 200, listed)
+
+        status, transcript = self.ask(
+            f"/api/swarm/said?agent={lead_id}&chat={second['id']}"
+        )
+        self.assertEqual(status, 200, transcript)
+        status_turns = [
+            one for one in transcript["said"]
+            if one.get("correlation", {}).get("kind") == "long_horizon_status"
+        ]
+        self.assertEqual(
+            [one["correlation"]["goal_status"] for one in status_turns],
+            ["queued", "running", "complete"],
+        )
+        self.assertFalse(any(
+            "verified complete" in one["text"] for one in status_turns[:-1]
+        ))
+        self.assertIn("verified complete", status_turns[-1]["text"])
 
     def test_same_agent_pair_chats_run_in_parallel_and_stop_by_exact_identity(self) -> None:
         status, saved = self.ask("/api/swarm/save", {"board": {
@@ -7356,6 +8805,267 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertLess(sent.index('box.value = ""'), sent.index('await request("/api/swarm/say"'))
         self.assertNotIn('finishSwarmChatActivity(agentId, true);\n    box.value = ""', sent)
         self.assertIn('if (theBigOne === agentId && swarmChatKey(agentId) === attachmentKey', sent)
+
+    def test_work_together_refreshes_canonical_chat_before_truthful_admission_status(self) -> None:
+        ui_root = Path(__file__).resolve().parents[1] / "src/our_harness/ui"
+        script = (ui_root / "app.js").read_text(encoding="utf-8")
+        markup = (ui_root / "index.html").read_text(encoding="utf-8")
+        compact = script[
+            script.index("async function sendWhatIsTypedTo"):
+            script.index("async function startTheChatAgainFor")
+        ]
+        enlarged = script[
+            script.index("async function sendFromTheBigChat"):
+            script.index("function wireUpTheTray")
+        ]
+        compact_work = compact[
+            compact.index('if (mode === "work" && !goalQueueItem)'):
+            compact.index('const said = await request("/api/swarm/say"')
+        ]
+        enlarged_work = enlarged[
+            enlarged.index('if (mode === "work")'):
+            enlarged.index('const answered = await request("/api/swarm/say"')
+        ]
+        for body in (compact_work, enlarged_work):
+            outbox_at = body.index("await saveDirectLongGoalOutbox")
+            prepare_at = body.index('request("/api/long-horizon/prepare-admission"')
+            clear_at = body.index('box.value = ""', prepare_at)
+            start_at = body.index('request("/api/long-horizon/start"', prepare_at)
+            self.assertLess(outbox_at, prepare_at)
+            self.assertLess(prepare_at, clear_at)
+            self.assertLess(clear_at, start_at)
+            pending_start = body[start_at:start_at + 450]
+            self.assertIn("from_pending: true", pending_start)
+            self.assertNotIn("attachments", pending_start)
+            self.assertNotIn("text: words", pending_start)
+            self.assertNotIn("text: said", pending_start)
+            self.assertLess(
+                start_at,
+                body.index("await refreshTheChatFor(agentId)"),
+            )
+            self.assertLess(
+                body.index("await refreshTheChatFor(agentId)"),
+                body.index("finishLongHorizonAdmissionActivity"),
+            )
+            self.assertNotIn("finishSwarmChatActivity(agentId, true", body)
+            self.assertNotIn("Answer received", body)
+            outbox_payload = body[
+                body.index("const exactPayload = {"):
+                body.index("const outbox = await saveDirectLongGoalOutbox")
+            ]
+            self.assertNotIn("request_id", outbox_payload)
+            self.assertIn("request_id: directRequestId", body[prepare_at:clear_at])
+        admission = script[
+            script.index("function longHorizonAdmissionWords"):
+            script.index("function markSwarmChatActivityStopping")
+        ]
+        self.assertIn('status === "waiting_for_project"', admission)
+        self.assertIn("Goal accepted and queued", admission)
+        self.assertIn("Goal verified complete", admission)
+        self.assertIn('status === "cancelling"', admission)
+        self.assertIn("has not released the project yet", admission)
+        self.assertIn('"failed", "cancelling", "cancelled"', admission)
+        self.assertNotIn("Answer received", admission)
+        activity_words = script[
+            script.index("function activityWords"):
+            script.index("function showActivityInPanel")
+        ]
+        self.assertLess(
+            activity_words.index('activity.state === "attention"'),
+            activity_words.index('activity.terminalState === "admitted"'),
+        )
+        self.assertLess(
+            activity_words.index('activity.terminalState === "admitted"'),
+            activity_words.index('activity.state === "complete"'),
+        )
+        self.assertIn("Needs attention after ${seconds}s", activity_words)
+        self.assertIn("Accepted in ${seconds}s", activity_words)
+        optimistic = script[
+            script.index("function beginSwarmChatActivity"):
+            script.index("function scheduleSwarmChatActivityCollapse")
+        ]
+        self.assertIn(
+            'phase: mode === "work" ? "long_horizon_prompt" : "user_prompt"',
+            optimistic,
+        )
+        self.assertIn(
+            'long_horizon_prompt: "Saved project goal request"', script,
+        )
+        recovery = script[
+            script.index("function fillDirectLongGoalRecoveryPanel"):
+            script.index("function fillWorkRecoveryPanel")
+        ]
+        self.assertIn('request("/api/long-horizon/pending-admissions")', recovery)
+        self.assertIn("Reconcile saved goal request", recovery)
+        self.assertIn("has not automatically resent anything", recovery)
+        self.assertIn("listDirectGoalOutbox", script)
+        self.assertIn("readDirectGoalOutbox", script)
+        self.assertIn("deleteDirectGoalOutbox", script)
+        self.assertIn('request("/api/long-horizon/discard-admission"', recovery)
+        recover_call = recovery[
+            recovery.index("async function recoverDirectLongGoalAdmission"):
+        ]
+        desktop_guard_at = recover_call.index("if (recovery.desktop_outbox)")
+        local_verify_at = recover_call.index(
+            "await verifiedDirectLongGoalOutboxPayload(recovery)", desktop_guard_at,
+        )
+        prepare_replay_at = recover_call.index(
+            'request("/api/long-horizon/prepare-admission"', local_verify_at,
+        )
+        start_at = recover_call.index(
+            'request("/api/long-horizon/start"', prepare_replay_at,
+        )
+        self.assertLess(desktop_guard_at, local_verify_at)
+        self.assertLess(local_verify_at, prepare_replay_at)
+        self.assertLess(prepare_replay_at, start_at)
+        self.assertNotIn("if (!recovery.server_pending)", recover_call)
+        self.assertIn("preparedPending.payload_sha256", recover_call)
+        self.assertEqual(
+            recover_call.count('request("/api/long-horizon/start"'), 1,
+        )
+        recovery_catch = recover_call[recover_call.index("} catch (error) {"):]
+        self.assertNotIn('request("/api/long-horizon/start"', recovery_catch)
+        self.assertLess(
+            recover_call.index("await removeDirectLongGoalOutbox"),
+            recover_call.index("forgetDirectLongGoalRecovery"),
+        )
+        self.assertIn("exactDirectLongGoalOutboxInventoryValue", script)
+        self.assertNotIn("listed?.pending", script)
+        self.assertIn("verifiedDirectLongGoalOutboxPayload", recovery)
+        self.assertIn("direct-long-goal-exact-text", script)
+        self.assertIn("direct-long-goal-exact-attachments", script)
+        self.assertIn("verifyDirectLongGoalCrossAuthorityRequests", recovery)
+        self.assertIn("directLongGoalRecoveryRefreshRevision += 1", recovery)
+        self.assertIn("directLongGoalRecoveryError", script)
+        self.assertIn("durable desktop goal-request outbox could not be verified", script)
+        self.assertIn('id="directLongGoalRecoveryBoard"', markup)
+        self.assertIn('id="directLongGoalRecoveryBoardList"', markup)
+        self.assertIn("function openDirectLongGoalRecovery", recovery)
+        self.assertIn("activeConversationIdFor(agentId) !== chatId", recovery)
+        self.assertIn("direct-long-goal-board-discard", recovery)
+        boot = script[
+            script.index("async function boot()"):
+            script.index("// ---- the board of agents")
+        ]
+        self.assertIn(
+            "await refreshDirectLongGoalRecoveries()", boot,
+        )
+        self.assertIn('switchView("swarm", {recoveryOnly: true})', boot)
+        self.assertIn("userViewSelectionRevision === untouchedViewRevision", boot)
+        binding = script[
+            script.index("function bindEvents()"):
+            script.index("function teamSay")
+        ]
+        self.assertIn('document.addEventListener("pointerdown", markUserInteraction', binding)
+        self.assertIn('document.addEventListener("keydown", markUserInteraction', binding)
+        self.assertIn("if (event.isTrusted) userViewSelectionRevision += 1", binding)
+        self.assertLess(
+            boot.index("pollEvents()"),
+            boot.index("await refreshDirectLongGoalRecoveries()"),
+        )
+        self.assertNotIn("recoverDirectLongGoalAdmission", boot)
+        board_notice = recovery[
+            recovery.index("function renderDirectLongGoalBoardRecoveryNotice"):
+            recovery.index("async function refreshDirectLongGoalRecoveries")
+        ]
+        self.assertIn("open.disabled = !swarmBoardHydrated", board_notice)
+        self.assertIn('open.setAttribute("aria-describedby", loading.id)', board_notice)
+        self.assertIn("Loading the saved agent board", board_notice)
+        self.assertIn("request remains safely journalled", board_notice)
+        self.assertIn(
+            "hasPending: directLongGoalRecoveries.size > 0",
+            recovery,
+        )
+        self.assertIn("did not answer within 8 seconds", recovery)
+        swarm_refresh = script[
+            script.index("async function refreshSwarm"):
+            script.index("function keepTheSwarmPick")
+        ]
+        self.assertIn("{recoveryOnly = false}", swarm_refresh)
+        self.assertLess(
+            swarm_refresh.index("if (!recoveryOnly)"),
+            swarm_refresh.index("refreshBoardGoalQueue(false)"),
+        )
+        self.assertIn(
+            "if (!recoveryOnly && said.provider_status_stale", swarm_refresh,
+        )
+        self.assertLess(
+            swarm_refresh.index("swarmBoardHydrated = true"),
+            swarm_refresh.index("renderDirectLongGoalBoardRecoveryNotice()"),
+        )
+        intent = script[
+            script.index("function directLongGoalCanonicalValue"):
+            script.index("function confirmProjectWork")
+        ]
+        self.assertIn("schema_version: 1", intent)
+        self.assertNotIn("fnv-", intent)
+        polling = script[
+            script.index("async function refreshLongGoalOriginChats"):
+            script.index("function savedLongGoalComposer")
+        ]
+        self.assertIn("await refreshLongGoalOriginChats(nextGoal)", polling)
+        self.assertIn("await refreshLongGoalOriginChats(nextGoals)", polling)
+        self.assertIn(
+            "const loadRevision = inheritedRevision || beginLongGoalLoad()",
+            polling,
+        )
+        self.assertGreaterEqual(polling.count("if (!isCurrent()) return;"), 6)
+        self.assertIn("let nextEvents = resetsHistory ? [] : [...longGoalEvents]", polling)
+        self.assertLess(
+            polling.index("if (!isCurrent()) return;", polling.index("const goalAnswer")),
+            polling.index("longGoal = nextGoal"),
+        )
+        self.assertIn('"waiting_for_project", "queued", "running"', polling)
+        self.assertIn('"queued", "running", "cancelling"', polling)
+
+    def test_failed_long_goal_stays_cancellable_while_it_owns_the_project(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        board_controls = script[
+            script.index('$("swarmCancelGoals").disabled'):
+            script.index('$("swarmStop").disabled')
+        ]
+        self.assertIn(
+            '|| ["complete", "cancelled"].includes(longGoal.status)',
+            board_controls,
+        )
+        self.assertIn(
+            '|| (goal.status === "cancelling" && goal.project_queue?.state !== "released")',
+            board_controls,
+        )
+        self.assertIn(
+            '|| (goal.status === "failed" && goal.project_queue?.state === "owner")',
+            board_controls,
+        )
+        self.assertNotIn('"waiting_for_user", "failed"]', board_controls)
+        mission_controls = script[
+            script.index('const terminal = !longGoal'):
+            script.index('const tasks = $("missionTasks")')
+        ]
+        self.assertIn(
+            '$("missionCancel").disabled = !longGoal\n'
+            '    || ["complete", "cancelled"].includes(longGoal.status)',
+            mission_controls,
+        )
+        self.assertIn(
+            '["complete", "cancelled", "cancelling"].includes(longGoal.status)',
+            mission_controls,
+        )
+        self.assertIn(
+            '$("missionFork").disabled = immutable', mission_controls,
+        )
+        self.assertIn(
+            '$("missionProviderSetupPrepare").disabled = !longGoal '
+            '|| longGoal.status === "cancelling"',
+            mission_controls,
+        )
+        provider_rebind = script[
+            script.index("function focusCurrentBoardGoalSetup"):
+            script.index("function renderMissionControl")
+        ]
+        self.assertEqual(
+            provider_rebind.count('!["complete", "cancelled"].includes'), 2,
+        )
 
     def test_terminal_chat_activity_releases_and_collapses_without_looking_live(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(

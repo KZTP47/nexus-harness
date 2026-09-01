@@ -16,6 +16,7 @@ from unittest.mock import patch
 from our_harness.benchmark import (
     AGENTIC_TASK_TIMEOUT_SECONDS,
     CASE_FUNCTIONS,
+    _EVALUATOR_BOOTSTRAP,
     _diagnostic_text,
     _provider_profile,
     agentic_fixtures,
@@ -426,6 +427,103 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue(all(not task["checks"]["hidden_tests"] for task in result["agentic"]["tasks"]))
         self.assertTrue(all(task["checks"]["public_tree_unchanged"] for task in result["agentic"]["tasks"]))
         self.assertTrue(all(task["checks"]["hidden_tree_unchanged"] for task in result["agentic"]["tasks"]))
+
+    def test_evaluator_bootstrap_keeps_stdlib_and_workspace_but_drops_ambient_harness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ambient = root / "ambient"
+            templates = ambient / "our_harness" / "templates"
+            templates.mkdir(parents=True)
+            (ambient / "our_harness" / "__init__.py").write_text("", encoding="utf-8")
+            (templates / "__init__.py").write_text("", encoding="utf-8")
+            (templates / "benchmark_agentic_fixtures.json").write_text(
+                json.dumps({"gold": "ambient-package-must-not-be-readable"}),
+                encoding="utf-8",
+            )
+
+            workspace = root / "workspace"
+            workspace.mkdir()
+            (workspace / "candidate.py").write_text(
+                "import json\n"
+                "from importlib.resources import files\n"
+                "try:\n"
+                "    files('our_harness.templates').joinpath("
+                "'benchmark_agentic_fixtures.json').read_bytes()\n"
+                "except (ImportError, ModuleNotFoundError):\n"
+                "    ambient_harness_was_imported = False\n"
+                "else:\n"
+                "    ambient_harness_was_imported = True\n"
+                "answer = json.loads('{\"value\": 42}')[\"value\"]\n",
+                encoding="utf-8",
+                newline="",
+            )
+            evaluator = root / "evaluator.py"
+            evaluator.write_text(
+                "import json, math, pathlib, sys\n"
+                "workspace = pathlib.Path(sys.argv[1]).resolve()\n"
+                "sys.path.insert(0, str(workspace))\n"
+                "from candidate import ambient_harness_was_imported, answer\n"
+                "assert answer == 42\n"
+                "assert math.isfinite(1.0)\n"
+                "assert not ambient_harness_was_imported\n"
+                "print(json.dumps({'workspace': True, 'stdlib': True}))\n",
+                encoding="utf-8",
+                newline="",
+            )
+            injected_ambient = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(ambient)!r})\n"
+                + _EVALUATOR_BOOTSTRAP
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    injected_ambient,
+                    str(evaluator),
+                    str(workspace),
+                ],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertEqual(json.loads(completed.stdout), {"workspace": True, "stdlib": True})
+
+    def test_evaluator_bootstrap_fails_closed_if_harness_survives_path_rebuild(self) -> None:
+        forced_harness = (
+            "import importlib.util\n"
+            "real_find_spec = importlib.util.find_spec\n"
+            "importlib.util.find_spec = lambda name: "
+            "object() if name == 'our_harness' else real_find_spec(name)\n"
+            + _EVALUATOR_BOOTSTRAP
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                forced_harness,
+                str(Path(__file__)),
+                str(Path.cwd()),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn(
+            "benchmark evaluator isolation retained the harness package",
+            completed.stderr,
+        )
 
     def test_repetitions_are_bounded(self) -> None:
         with self.assertRaisesRegex(Exception, "repetitions"):

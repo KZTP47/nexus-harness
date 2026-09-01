@@ -203,12 +203,36 @@ def _run_reviewer(
         )
 
 
+def _worker_import_isolation_is_safe(flags: Any) -> bool:
+    """Accept both ordinary ``-S`` and embedded ``._pth`` isolation.
+
+    The packaged Windows interpreter imports ``site`` from ``python311._pth``,
+    so ``-S`` does not leave ``sys.flags.no_site`` set there.  That interpreter
+    is isolated more strongly instead: it ignores environment-provided import
+    paths and omits the working directory.  Keep requiring safe-path and no
+    user site in both modes, and accept the embedded mode only when both of its
+    isolation flags are present.
+    """
+
+    return bool(
+        getattr(flags, "safe_path", False)
+        and getattr(flags, "no_user_site", False)
+        and (
+            getattr(flags, "no_site", False)
+            or (
+                getattr(flags, "isolated", False)
+                and getattr(flags, "ignore_environment", False)
+            )
+        )
+    )
+
+
 def _worker_main() -> int:
     """Private subprocess entry point; input and output are isolated temp files."""
 
     if len(sys.argv) != 3:
         return 2
-    if not sys.flags.safe_path or not sys.flags.no_user_site or not sys.flags.no_site:
+    if not _worker_import_isolation_is_safe(sys.flags):
         return 3
     input_path = Path(sys.argv[1])
     output_path = Path(sys.argv[2])
@@ -402,14 +426,19 @@ class ReviewPanel:
         pending = [index for index in pending if index not in collected]
         active: dict[int, _ReviewerWorker] = {}
         stop_reason = "Review panel cancelled"
-        worker_code = "from our_harness.review_panel import _worker_main; raise SystemExit(_worker_main())"
+        trusted_package_root = str(_trusted_package_root())
+        worker_code = (
+            "import sys;"
+            f"sys.path.insert(0, {trusted_package_root!r});"
+            "from our_harness.review_panel import _worker_main;"
+            "raise SystemExit(_worker_main())"
+        )
         worker_environment = os.environ.copy()
         for name in list(worker_environment):
             if name.upper().startswith("PYTHON"):
                 worker_environment.pop(name)
         worker_environment.update(
             {
-                "PYTHONPATH": str(_trusted_package_root()),
                 "PYTHONSAFEPATH": "1",
                 "PYTHONNOUSERSITE": "1",
                 "PYTHONDONTWRITEBYTECODE": "1",

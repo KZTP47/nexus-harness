@@ -14,6 +14,7 @@ const { HarnessServer, isLoopbackUrl, isOwnPage } = require("./server");
 const { attachGuards, onlyOnce, isHarnessVersionMismatch, whyItReallyIs } = require("./guards");
 const { WebChatManager } = require("./web-chats");
 const { DesktopSettingsStore } = require("./settings-store");
+const { DirectGoalOutbox } = require("./direct-goal-outbox");
 
 function readBuildInfo() {
   try {
@@ -89,6 +90,17 @@ function writeSettings(value) {
       `Nexus could not save its desktop settings. Check available disk space and access to ${path.dirname(target)}, then try again. ${error.message || error}`,
     );
   }
+}
+
+function directGoalOutbox() {
+  if (!projectPath) throw new Error("Open a project before saving a direct goal request.");
+  return new DirectGoalOutbox({
+    userDataPath: app.getPath("userData"),
+    // DirectGoalOutbox resolves this through the filesystem and stores only a
+    // non-secret canonical fingerprint.  A renderer can neither choose nor
+    // forge the machine-local project binding.
+    projectPath,
+  });
 }
 
 function projectListFile() {
@@ -461,6 +473,32 @@ ipcMain.handle("harness:help", () => {
 ipcMain.handle("harness:diagnostics", (event) => (
   fromHarnessWindow(event) ? runtimeDiagnostics() : null
 ));
+ipcMain.handle("harness:saveDirectGoalOutbox", (event, record) => {
+  if (!fromHarnessWindow(event)) {
+    throw new Error("Only the Nexus Harness window may save a direct goal request.");
+  }
+  return directGoalOutbox().save(record);
+});
+ipcMain.handle("harness:listDirectGoalOutbox", (event) => {
+  if (!fromHarnessWindow(event) || !projectPath) return [];
+  return directGoalOutbox().list();
+});
+ipcMain.handle("harness:readDirectGoalOutbox", (event, chatId, requestId, digest) => {
+  if (!fromHarnessWindow(event)) {
+    throw new Error("Only the Nexus Harness window may continue a saved direct goal request.");
+  }
+  return directGoalOutbox().read(
+    String(chatId || ""), String(requestId || ""), String(digest || ""),
+  );
+});
+ipcMain.handle("harness:deleteDirectGoalOutbox", (event, chatId, requestId, digest) => {
+  if (!fromHarnessWindow(event)) {
+    throw new Error("Only the Nexus Harness window may discard a saved direct goal request.");
+  }
+  return directGoalOutbox().delete(
+    String(chatId || ""), String(requestId || ""), String(digest || ""),
+  );
+});
 ipcMain.handle("harness:reviewTrust", (event) => {
   if (!fromHarnessWindow(event) || !projectPath) return null;
   const local = path.join(projectPath, ".harness", "config.local.json");

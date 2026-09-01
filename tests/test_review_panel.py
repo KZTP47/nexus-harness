@@ -9,10 +9,15 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from our_harness.config import load_isolated_config
 from our_harness.providers import create_provider
-from our_harness.review_panel import ReviewPanel, _run_reviewer
+from our_harness.review_panel import (
+    ReviewPanel,
+    _run_reviewer,
+    _worker_import_isolation_is_safe,
+)
 from our_harness.runstate import canonical_json, canonical_json_sha256
 
 
@@ -114,6 +119,41 @@ def panel_config(
 
 
 class ReviewPanelTests(unittest.TestCase):
+    def test_worker_accepts_embedded_pth_isolation_without_weakening_source_mode(self) -> None:
+        standard = SimpleNamespace(
+            safe_path=True,
+            no_user_site=1,
+            no_site=1,
+            isolated=0,
+            ignore_environment=0,
+        )
+        embedded = SimpleNamespace(
+            safe_path=True,
+            no_user_site=1,
+            no_site=0,
+            isolated=1,
+            ignore_environment=1,
+        )
+        site_enabled = SimpleNamespace(
+            safe_path=True,
+            no_user_site=1,
+            no_site=0,
+            isolated=0,
+            ignore_environment=0,
+        )
+        cwd_enabled = SimpleNamespace(
+            safe_path=False,
+            no_user_site=1,
+            no_site=1,
+            isolated=0,
+            ignore_environment=0,
+        )
+
+        self.assertTrue(_worker_import_isolation_is_safe(standard))
+        self.assertTrue(_worker_import_isolation_is_safe(embedded))
+        self.assertFalse(_worker_import_isolation_is_safe(site_enabled))
+        self.assertFalse(_worker_import_isolation_is_safe(cwd_enabled))
+
     def test_parallel_reviewers_reduce_wall_time_and_record_usage_latency(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             panel = ReviewPanel(panel_config(Path(temporary), 3, 3, delays=[0.25, 0.25, 0.25]))
@@ -208,6 +248,7 @@ class ReviewPanelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             pid_path = root / "provider.pid"
+            trusted_source = str(Path(__file__).resolve().parents[1] / "src")
             program = (
                 "import json,os,pathlib,sys,time;"
                 "data={'pid':os.getpid(),'ppid':os.getppid(),'pgrp':os.getpgrp() if hasattr(os,'getpgrp') else None};"
@@ -218,6 +259,7 @@ class ReviewPanelTests(unittest.TestCase):
             script = "\n".join(
                 [
                     "import sys,time",
+                    f"sys.path.insert(0, {trusted_source!r})",
                     "from pathlib import Path",
                     "from our_harness.config import load_isolated_config",
                     "from our_harness.review_panel import ReviewPanel",

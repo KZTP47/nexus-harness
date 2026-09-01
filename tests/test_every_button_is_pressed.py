@@ -372,16 +372,23 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
                 r"getElementById\('([A-Za-z0-9_]+)'\)\.value\s*=", script
             ))
             chosen.update(re.findall(r'\$\("([A-Za-z0-9_]+)"\)\.value\s*=', script))
-    # The multi-vendor lane drives the actual packaged Electron renderer with
-    # Playwright locators. It is a stronger user-flow check than the headless
-    # workflow runner, so controls exercised there count here too.
-    packaged_e2e = (ROOT / "desktop" / "multi-vendor.e2e.js").read_text(encoding="utf-8")
-    pressed.update(re.findall(
-        r'page\.locator\("#([A-Za-z0-9_]+)"\)\.click\(\)', packaged_e2e
-    ))
-    chosen.update(re.findall(
-        r'page\.locator\("#([A-Za-z0-9_]+)"\)\.selectOption\(', packaged_e2e
-    ))
+    # These lanes drive the actual packaged Electron renderer with Playwright
+    # locators. They are stronger user-flow checks than the headless workflow
+    # runner, so controls exercised there count here too. Generated controls
+    # have no stable id; their accessible button name is the user-facing
+    # identity and is therefore collected into ``said``.
+    for packaged_name in ("multi-vendor.e2e.js", "long-horizon.smoke.js"):
+        packaged_e2e = (ROOT / "desktop" / packaged_name).read_text(encoding="utf-8")
+        pressed.update(re.findall(
+            r'page\.locator\("#([A-Za-z0-9_]+)"\)\.click\(\)', packaged_e2e
+        ))
+        chosen.update(re.findall(
+            r'page\.locator\("#([A-Za-z0-9_]+)"\)\.selectOption\(', packaged_e2e
+        ))
+        said.extend(re.findall(
+            r'getByRole\(\s*"button",\s*\{[^}]*\bname:\s*"([^"]+)"[^}]*\}\s*,?\s*\)',
+            packaged_e2e,
+        ))
     return pressed, " ".join(said), chosen
 
 

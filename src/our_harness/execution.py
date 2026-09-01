@@ -5,6 +5,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -30,6 +31,162 @@ ALWAYS_DENIED = frozenset({
 # flag, but accepts the documented CreateProcess value in ``creationflags``.
 _WINDOWS_CREATE_SUSPENDED = 0x00000004
 _WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+_PYTHON_CWD_COMMAND_BOOTSTRAP = (
+    "import sys;"
+    "sys.path.insert(0,__import__('os').getcwd());"
+    "del sys;"
+    "exec(compile(__import__('sys').argv.pop(1),'<string>','exec'),globals(),globals())"
+)
+_PYTHON_CWD_MODULE_BOOTSTRAP = (
+    "import os,runpy,sys;"
+    "sys.path.insert(0,os.getcwd());"
+    "_module=sys.argv.pop(1);"
+    "runpy.run_module(_module,run_name='__main__',alter_sys=True)"
+)
+_PYTHON_CWD_SCRIPT_BOOTSTRAP = (
+    "import os,runpy,sys;"
+    "_script=sys.argv.pop(1);"
+    "_path=os.path.abspath(_script);"
+    "sys.path.insert(0,os.path.dirname(_path));"
+    "runpy.run_path(_script,run_name='__main__')"
+)
+_PYTHON_CWD_STDIN_BOOTSTRAP = (
+    "import os,sys;"
+    "sys.path.insert(0,os.getcwd());"
+    "sys.argv[0]='-';"
+    "exec(compile(sys.stdin.read(),'<stdin>','exec'),globals(),globals())"
+)
+
+
+def _environment_value(environment: dict[str, str], name: str) -> str:
+    wanted = name.casefold()
+    return next(
+        (value for key, value in environment.items() if key.casefold() == wanted),
+        "",
+    )
+
+
+def _resolved_executable(
+    command: str, working: Path, environment: dict[str, str],
+) -> Path | None:
+    """Resolve an argv executable using the same cwd/PATH visible to its child."""
+
+    search = command
+    candidate = Path(command)
+    if not candidate.is_absolute() and ("/" in command or "\\" in command):
+        search = os.fspath(working / candidate)
+    elif os.name == "nt" and not candidate.is_absolute():
+        # CreateProcess searches the parent application's directory before
+        # PATH. In the installed app that is exactly why a plain ``python``
+        # command finds Nexus's adjacent private runtime rather than an
+        # unrelated system install returned by ``shutil.which``.
+        suffixes = [""] if candidate.suffix else ["", ".exe"]
+        for directory in (Path(sys.executable).parent, working):
+            for suffix in suffixes:
+                adjacent = directory / f"{command}{suffix}"
+                if adjacent.is_file():
+                    try:
+                        return adjacent.resolve(strict=True)
+                    except (OSError, RuntimeError):
+                        continue
+    found = shutil.which(search, path=_environment_value(environment, "PATH") or None)
+    if found is None and Path(search).is_file():
+        found = search
+    if found is None:
+        return None
+    try:
+        return Path(found).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _is_embedded_python(executable: Path | None) -> bool:
+    """Whether this is a resolved Python whose adjacent ``._pth`` owns imports."""
+
+    if executable is None or not re.fullmatch(
+        r"python(?:w)?(?:[0-9]+(?:\.[0-9]+)*)?(?:_d)?(?:\.exe)?",
+        executable.name,
+        re.IGNORECASE,
+    ):
+        return False
+    try:
+        return any(
+            entry.is_file() and re.fullmatch(r"python.*\._pth", entry.name, re.IGNORECASE)
+            for entry in executable.parent.iterdir()
+        )
+    except OSError:
+        return False
+
+
+def _embedded_python_cwd_argv(
+    argv: list[str], working: Path, environment: dict[str, str],
+) -> list[str]:
+    """Restore ordinary Python cwd imports for an embedded ``._pth`` runtime.
+
+    CPython's embeddable distribution intentionally omits the command/script
+    directory and ignores ``PYTHONPATH``. That is right for Nexus itself, but a
+    user-approved ``python -c``, ``python -m`` or script check must behave like
+    the same argv on an ordinary Python installation. Explicit ``-I``/``-P``
+    (or ``PYTHONSAFEPATH``) still means "do not expose this directory" and is
+    therefore never rewritten.
+    """
+
+    if not argv or _environment_value(environment, "PYTHONSAFEPATH"):
+        return list(argv)
+    executable = _resolved_executable(argv[0], working, environment)
+    if not _is_embedded_python(executable):
+        return list(argv)
+
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--":
+            if index + 1 >= len(argv):
+                return list(argv)
+            return [
+                *argv[:index], "-c", _PYTHON_CWD_SCRIPT_BOOTSTRAP,
+                argv[index + 1], *argv[index + 2:],
+            ]
+        if argument == "-":
+            return [*argv[:index], "-c", _PYTHON_CWD_STDIN_BOOTSTRAP, *argv[index + 1:]]
+        if argument == "-c":
+            if index + 1 >= len(argv):
+                return list(argv)
+            return [
+                *argv[:index], "-c", _PYTHON_CWD_COMMAND_BOOTSTRAP,
+                argv[index + 1], *argv[index + 2:],
+            ]
+        if argument.startswith("-c") and len(argument) > 2:
+            return [
+                *argv[:index], "-c", _PYTHON_CWD_COMMAND_BOOTSTRAP,
+                argument[2:], *argv[index + 1:],
+            ]
+        if argument == "-m":
+            if index + 1 >= len(argv):
+                return list(argv)
+            return [
+                *argv[:index], "-c", _PYTHON_CWD_MODULE_BOOTSTRAP,
+                argv[index + 1], *argv[index + 2:],
+            ]
+        if argument.startswith("-m") and len(argument) > 2:
+            return [
+                *argv[:index], "-c", _PYTHON_CWD_MODULE_BOOTSTRAP,
+                argument[2:], *argv[index + 1:],
+            ]
+        if not argument.startswith("-"):
+            return [
+                *argv[:index], "-c", _PYTHON_CWD_SCRIPT_BOOTSTRAP,
+                argument, *argv[index + 1:],
+            ]
+        if "I" in argument[1:] or "P" in argument[1:]:
+            return list(argv)
+        if argument in {"-W", "-X", "--check-hash-based-pycs"}:
+            index += 2
+        else:
+            index += 1
+    return list(argv)
 
 
 def _windows_process_cwd(working: Path) -> Path:
@@ -65,12 +222,42 @@ def _windows_process_cwd(working: Path) -> Path:
         ) from exc
 
 
-def _said_as(word: str) -> tuple[str, set[str]]:
+_POWERSHELL_PROGRAMS = frozenset({"powershell", "pwsh"})
+_POWERSHELL_PAYLOAD_SWITCHES = frozenset({
+    "command", "commandwithargs", "encodedcommand", "file",
+})
+_POWERSHELL_VALUE_SWITCHES = frozenset({
+    "configurationname", "custompipename", "executionpolicy", "inputformat",
+    "outputformat", "psconsolefile", "settingsfile", "version",
+    "windowstyle", "workingdirectory",
+})
+_POWERSHELL_SWITCH_ALIASES = {
+    "c": "command",
+    "cwa": "commandwithargs",
+    "e": "encodedcommand",
+    "ec": "encodedcommand",
+    "enc": "encodedcommand",
+    "f": "file",
+}
+
+
+def _program_leaf(word: str) -> str:
+    """Portable executable leaf for the small amount of argv-aware parsing below."""
+
+    leaf = re.split(r"[\\/]", str(word).strip().strip("\"'"))[-1].casefold()
+    for ending in (".exe", ".com", ".bat", ".cmd"):
+        if leaf.endswith(ending):
+            return leaf[: -len(ending)]
+    return leaf
+
+
+def _said_as(word: str, *, one_dash_named: bool = False) -> tuple[str, set[str]]:
     """One word of a command, as either a plain word or the switches it holds.
 
     The same switch turns up as --force, -Force, /force and /force:yes, and a
-    bundle such as -fd holds two of them. A plain word comes back as itself
-    with no switches; a switch comes back as no word with its letters.
+    bundle such as -xfd holds three of them. A plain word comes back as itself
+    with no switches; a switch comes back as no word with its letters. The
+    caller marks the one-dash named-parameter context used by PowerShell.
     """
 
     plain = word.split(":", 1)[0].split("=", 1)[0].casefold()
@@ -78,11 +265,14 @@ def _said_as(word: str) -> tuple[str, set[str]]:
         return "", {plain.lstrip("-/")}
     if plain.startswith("-") and len(plain) > 1:
         letters = plain.lstrip("-")
-        # -fd is -f and -d. A long word after one dash, such as -force, is one
-        # switch, not five.
-        if len(letters) > 1 and not letters.isalpha():
+        # Outside a command whose own grammar has named one-dash parameters,
+        # every alphabetic spelling is conservatively a short-option bundle:
+        # git accepts -xfd, -xdf and -nfd as combinations containing -f/-d.
+        # Treating arbitrary three-letter spellings as long options lets those
+        # destructive forms evade both ``clean -fd`` and ``--force`` policy.
+        if one_dash_named or not letters.isalpha():
             return "", {letters}
-        return "", set(letters) if len(letters) > 1 else {letters}
+        return "", set(letters)
     return plain, set()
 
 
@@ -91,11 +281,52 @@ def _reads_as(words: list[str]) -> tuple[list[str], set[str]]:
 
     named: list[str] = []
     switches: set[str] = set()
-    for word in words:
-        plain, found = _said_as(word)
-        if plain:
-            named.append(plain)
-        switches |= found
+    arguments = [str(word) for word in words]
+    powershell_parameters = bool(
+        arguments and _program_leaf(arguments[0]) in _POWERSHELL_PROGRAMS
+    )
+    powershell_value_pending = False
+    for index, argument in enumerate(arguments):
+        # argv[0] may itself contain spaces. Later arguments are also searched
+        # word-by-word because a shell's -c/-Command payload is commonly one
+        # argv element and deny rules must still see commands inside it.
+        parts = [argument] if index == 0 else argument.split()
+        for part_index, word in enumerate(parts):
+            launcher_executable = index == 0 and part_index == 0
+            expecting_named_value = powershell_parameters and powershell_value_pending
+            plain, found = _said_as(
+                word,
+                one_dash_named=powershell_parameters and not expecting_named_value,
+            )
+            if powershell_parameters and not expecting_named_value:
+                found = {
+                    _POWERSHELL_SWITCH_ALIASES.get(one, one) for one in found
+                }
+            if plain:
+                named.append(plain)
+            switches |= found
+            if not powershell_parameters or launcher_executable:
+                continue
+            if expecting_named_value:
+                powershell_value_pending = False
+                continue
+            # -File/-Command belongs to PowerShell, but what follows belongs to
+            # a script or command payload and must regain ordinary bundle
+            # parsing. This keeps ``pwsh -Command 'git clean -xfd'`` denied.
+            if found & _POWERSHELL_PAYLOAD_SWITCHES:
+                powershell_parameters = False
+            elif (
+                found & _POWERSHELL_VALUE_SWITCHES
+                and ":" not in word and "=" not in word
+            ):
+                # Launcher options such as ``-ExecutionPolicy Bypass`` consume
+                # one plain value before option parsing resumes.
+                powershell_value_pending = True
+            elif plain:
+                # -Command is PowerShell's default when a command is supplied
+                # positionally. Do not let that spelling keep later git flags
+                # in named-parameter mode.
+                powershell_parameters = False
     return named, switches
 
 
@@ -147,10 +378,9 @@ class CommandRunner:
             if part in denied:
                 raise HarnessError(f"Executable is denied by policy: {part}")
         normalized = " ".join(part.lower() for part in argv)
-        words = [word for part in argv for word in str(part).lower().split()]
         for sequence in self.config.get("execution.deny_argument_sequences", []):
             wanted = str(sequence).lower()
-            if wanted in normalized or _matches_rule(wanted, words):
+            if wanted in normalized or _matches_rule(wanted, argv):
                 raise HarnessError(f"Command argument sequence is denied by policy: {sequence}")
 
     # Programs that run whatever they are handed. A denied name inside one of
@@ -261,6 +491,7 @@ class CommandRunner:
             ):
                 raise HarnessError("Command environment overrides must be plain string names and values")
             environment.update(environment_overrides)
+        actual = _embedded_python_cwd_argv(actual, process_cwd, environment)
         configured_limit = int(self.config.get("execution.max_output_bytes"))
         limit = configured_limit if max_output_bytes is None else min(configured_limit, max(1, int(max_output_bytes)))
         configured_timeout = float(self.config.get("execution.timeout_seconds"))

@@ -127,11 +127,295 @@ function Get-GitHubHeaders {
 function Get-InstallationFailureMessage(
     [string] $Message, [hashtable] $Headers, [bool] $LatestReleaseMetadataDownloaded
 ) {
-    if (-not $LatestReleaseMetadataDownloaded -and -not $Headers.Authorization -and
+    if (-not $LatestReleaseMetadataDownloaded -and
         $Message -ceq 'GitHub returned HTTP 404 while downloading a release asset.') {
-        return 'No installable Nexus Harness release is visible to this installer. Either no stable release has been published yet, or the repository is private and this shell has no usable GitHub login. Check the Releases page in a signed-in browser. If no stable release is listed, publish one before retrying. If the repository is private, sign in with GitHub CLI or Git Credential Manager, or set GH_TOKEN for this process, then retry.'
+        return 'No installable Nexus Harness release is available. GitHub returned HTTP 404 for the repository''s latest stable release before any release metadata was downloaded. No Windows installer ran, so no desktop shortcut could be created. Publish a stable release, or if one already exists verify that this process can see the configured repository, then retry.'
     }
     return $Message
+}
+
+function Get-NexusStableReleaseAssets([Parameter(Mandatory = $true)] [object] $Release) {
+    $tag = [string]$Release.tag_name
+    if ($Release.draft -or $Release.prerelease -or -not $tag) {
+        throw 'There is no stable Nexus Harness release to install yet.'
+    }
+    $tagMatch = [Regex]::Match(
+        $tag, '\Av(?<version>[0-9]+(?:\.[0-9]+){2})\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $tagMatch.Success) {
+        throw "The latest stable release tag '$tag' is not an exact Nexus Harness version; nothing was run."
+    }
+    $releaseVersion = $tagMatch.Groups['version'].Value
+    $installerPattern = '\ANexus-Harness-Setup-(?<version>[0-9]+(?:\.[0-9]+){2})(?:-UNSIGNED)?\.exe\z'
+    $checksumPattern = '\ANexus-Harness-Setup-[0-9]+(?:\.[0-9]+){2}(?:-UNSIGNED)?\.exe\.sha256\z'
+    $installers = @($Release.assets | Where-Object {
+        [Regex]::IsMatch(
+            [string]$_.name, $installerPattern,
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+    })
+    $checksums = @($Release.assets | Where-Object {
+        [Regex]::IsMatch(
+            [string]$_.name, $checksumPattern,
+            [Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+    })
+    if ($installers.Count -ne 1 -or $checksums.Count -ne 1) {
+        throw 'The stable release does not contain exactly one versioned installer and checksum; nothing was run.'
+    }
+    $installerMatch = [Regex]::Match(
+        [string]$installers[0].name, $installerPattern,
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $installerMatch.Success -or
+        $installerMatch.Groups['version'].Value -cne $releaseVersion) {
+        throw "The latest stable release tag '$tag' does not match installer '$($installers[0].name)'; nothing was run."
+    }
+    if ([string]$checksums[0].name -cne "$($installers[0].name).sha256") {
+        throw 'The stable release checksum does not name the exact versioned installer; nothing was run.'
+    }
+    return [pscustomobject]@{
+        Version = $releaseVersion
+        Installer = $installers[0]
+        Checksum = $checksums[0]
+    }
+}
+
+function Get-NexusCanonicalPath([string] $Path, [string] $What) {
+    if (-not $Path) { throw "$What is empty." }
+    if (-not [IO.Path]::IsPathRooted($Path)) { throw "$What is not an absolute path: $Path" }
+    try {
+        $full = [IO.Path]::GetFullPath($Path)
+        $root = [IO.Path]::GetPathRoot($full)
+        if ([StringComparer]::OrdinalIgnoreCase.Equals($full, $root)) {
+            return $root
+        }
+        return $full.TrimEnd(
+            [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar
+        )
+    } catch {
+        throw "$What is not a valid absolute path: $Path"
+    }
+}
+
+function Assert-NexusInstalledApplicationMetadata(
+    [Parameter(Mandatory = $true)] [string] $ExpectedVersion,
+    [Parameter(Mandatory = $true)] [object] $InstallMetadata,
+    [Parameter(Mandatory = $true)] [object] $UninstallMetadata
+) {
+    if ($ExpectedVersion -notmatch '\A[0-9]+(?:\.[0-9]+){2}\z') {
+        throw "The expected installed version is invalid: $ExpectedVersion"
+    }
+    if ([string]$InstallMetadata.KeepShortcuts -cne 'true' -or
+        [string]$InstallMetadata.ShortcutName -cne 'Nexus Harness') {
+        throw 'The exact Nexus Harness install metadata is missing its shortcut ownership contract.'
+    }
+    if ([string]$UninstallMetadata.DisplayName -cne 'Nexus Harness' -or
+        [string]$UninstallMetadata.Publisher -cne 'Nexus Harness' -or
+        [string]$UninstallMetadata.DisplayVersion -cne $ExpectedVersion) {
+        throw 'The exact Nexus Harness uninstall metadata does not match the requested product and version.'
+    }
+
+    $installLocation = Get-NexusCanonicalPath `
+        ([string]$InstallMetadata.InstallLocation) `
+        'The installed Nexus Harness location'
+    if (-not (Test-Path -LiteralPath $installLocation -PathType Container)) {
+        throw "The exact Nexus Harness install location does not exist: $installLocation"
+    }
+    $application = Get-NexusCanonicalPath `
+        (Join-Path $installLocation 'Nexus Harness.exe') `
+        'The installed Nexus Harness application'
+    $uninstaller = Get-NexusCanonicalPath `
+        (Join-Path $installLocation 'Uninstall Nexus Harness.exe') `
+        'The installed Nexus Harness uninstaller'
+    if (-not (Test-Path -LiteralPath $application -PathType Leaf)) {
+        throw "The installer returned success but did not create the application: $application"
+    }
+    if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+        throw "The installer returned success but did not create the uninstaller: $uninstaller"
+    }
+
+    $uninstallMatch = [Regex]::Match(
+        [string]$UninstallMetadata.UninstallString,
+        '\A"(?<path>.+)" /currentuser\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    $quietMatch = [Regex]::Match(
+        [string]$UninstallMetadata.QuietUninstallString,
+        '\A"(?<path>.+)" /currentuser /S\z',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    if (-not $uninstallMatch.Success -or -not $quietMatch.Success) {
+        throw 'The exact Nexus Harness uninstall metadata is not bound to current-user mode.'
+    }
+    $registeredUninstaller = Get-NexusCanonicalPath `
+        $uninstallMatch.Groups['path'].Value `
+        'The registered Nexus Harness uninstaller'
+    $registeredQuietUninstaller = Get-NexusCanonicalPath `
+        $quietMatch.Groups['path'].Value `
+        'The registered quiet Nexus Harness uninstaller'
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($registeredUninstaller, $uninstaller) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($registeredQuietUninstaller, $uninstaller)) {
+        throw 'The exact Nexus Harness uninstall metadata points outside the installed application.'
+    }
+    return $application
+}
+
+function Get-NexusInstalledApplication(
+    [Parameter(Mandatory = $true)] [string] $ExpectedVersion
+) {
+    # This is electron-builder's existing UUIDv5 for appId local.ourharness.desktop.
+    # It is pinned in desktop/package.json so upgrades keep the same exact keys.
+    $applicationGuid = 'e52322ab-f15e-5dc0-963b-7588e3739e89'
+    $installSubkey = "Software\$applicationGuid"
+    $uninstallSubkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$applicationGuid"
+    $baseKey = $null
+    $installKey = $null
+    $uninstallKey = $null
+    try {
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::CurrentUser,
+            [Microsoft.Win32.RegistryView]::Registry64
+        )
+        $installKey = $baseKey.OpenSubKey($installSubkey, $false)
+        $uninstallKey = $baseKey.OpenSubKey($uninstallSubkey, $false)
+        if ($null -eq $installKey -or $null -eq $uninstallKey) {
+            throw 'The installer returned success but did not create the exact current-user Nexus Harness registry metadata.'
+        }
+        $installMetadata = [pscustomobject]@{
+            InstallLocation = $installKey.GetValue('InstallLocation')
+            KeepShortcuts = $installKey.GetValue('KeepShortcuts')
+            ShortcutName = $installKey.GetValue('ShortcutName')
+        }
+        $uninstallMetadata = [pscustomobject]@{
+            DisplayName = $uninstallKey.GetValue('DisplayName')
+            DisplayVersion = $uninstallKey.GetValue('DisplayVersion')
+            Publisher = $uninstallKey.GetValue('Publisher')
+            UninstallString = $uninstallKey.GetValue('UninstallString')
+            QuietUninstallString = $uninstallKey.GetValue('QuietUninstallString')
+        }
+    } finally {
+        if ($null -ne $uninstallKey) { $uninstallKey.Dispose() }
+        if ($null -ne $installKey) { $installKey.Dispose() }
+        if ($null -ne $baseKey) { $baseKey.Dispose() }
+    }
+    return Assert-NexusInstalledApplicationMetadata `
+        $ExpectedVersion $installMetadata $uninstallMetadata
+}
+
+function Get-NexusDesktopFolders(
+    [string] $DesktopFolder = '', [string] $CommonDesktopFolder = ''
+) {
+    if ([bool]$DesktopFolder -xor [bool]$CommonDesktopFolder) {
+        throw 'Explicit user and common desktop folders must be supplied together.'
+    }
+    $candidates = if ($DesktopFolder) {
+        @($DesktopFolder, $CommonDesktopFolder)
+    } else {
+        @(
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory),
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)
+        )
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    $folders = @()
+    foreach ($candidate in $candidates) {
+        $canonical = Get-NexusCanonicalPath $candidate 'A Windows desktop folder'
+        if (-not (Test-Path -LiteralPath $canonical -PathType Container)) {
+            throw "Windows did not provide an existing desktop folder: $canonical"
+        }
+        if ($seen.Add($canonical)) { $folders += $canonical }
+    }
+    if ($folders.Count -eq 0) {
+        throw 'Windows did not provide any desktop folders.'
+    }
+    return $folders
+}
+
+function Get-NexusShortcutIcon([string] $IconLocation) {
+    $source = ([string]$IconLocation).Trim()
+    $index = 0
+    if ($source -match '^(.*),\s*(-?\d+)$') {
+        $source = $Matches[1].Trim()
+        $index = [int]$Matches[2]
+    }
+    return [pscustomobject]@{
+        Path = $source.Trim('"')
+        Index = $index
+    }
+}
+
+function Assert-NexusDesktopShortcut(
+    [Parameter(Mandatory = $true)] [string] $InstalledApplication,
+    [string] $DesktopFolder = '', [string] $CommonDesktopFolder = ''
+) {
+    $installed = Get-NexusCanonicalPath $InstalledApplication 'The installed Nexus Harness application'
+    if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+        throw "The installer returned success but did not create the application: $installed"
+    }
+    $desktopFolders = @(Get-NexusDesktopFolders $DesktopFolder $CommonDesktopFolder)
+    $shortcutPath = Join-Path $desktopFolders[0] 'Nexus Harness.lnk'
+    $seenLinks = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase
+    )
+    $links = @()
+    foreach ($desktop in $desktopFolders) {
+        foreach ($link in @(Get-ChildItem -LiteralPath $desktop -Filter 'Nexus Harness*.lnk' -File -Force)) {
+            $linkPath = Get-NexusCanonicalPath $link.FullName 'A Nexus Harness desktop shortcut'
+            if ($seenLinks.Add($linkPath)) { $links += $linkPath }
+        }
+    }
+    if ($links.Count -ne 1 -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($links[0], $shortcutPath)) {
+        throw "The installer returned success but did not create exactly one visible desktop shortcut at ${shortcutPath}. Found: $($links -join ', ')"
+    }
+
+    $shell = $null
+    $shortcut = $null
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $target = Get-NexusCanonicalPath ([string]$shortcut.TargetPath) 'The desktop shortcut target'
+        $arguments = [string]$shortcut.Arguments
+        $shortcutIcon = Get-NexusShortcutIcon ([string]$shortcut.IconLocation)
+        $icon = Get-NexusCanonicalPath `
+            ([string]$shortcutIcon.Path) `
+            'The desktop shortcut icon source'
+        $iconIndex = [int]$shortcutIcon.Index
+    } catch {
+        throw "Windows could not read the installed desktop shortcut at ${shortcutPath}: $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $shortcut -and [Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+        }
+        if ($null -ne $shell -and [Runtime.InteropServices.Marshal]::IsComObject($shell)) {
+            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+        }
+    }
+
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($target, $installed)) {
+        throw "The desktop shortcut points to '$target' instead of the installed application '$installed'."
+    }
+    if ($arguments -cne '') {
+        throw "The desktop shortcut contains unexpected launch arguments: '$arguments'."
+    }
+    if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) {
+        throw "The desktop shortcut icon source does not exist: $icon"
+    }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($icon, $installed) -or
+        $iconIndex -ne 0) {
+        throw "The desktop shortcut does not use the installed application as its exact icon source: '$icon,$iconIndex'."
+    }
+    return [pscustomobject]@{
+        ShortcutPath = $shortcutPath
+        TargetPath = $target
+        Arguments = $arguments
+        IconPath = $icon
+        IconIndex = $iconIndex
+    }
 }
 
 $githubHeaders = Get-GitHubHeaders
@@ -220,14 +504,9 @@ try {
         $releaseMetadata 2097152 $githubHeaders 'application/vnd.github+json'
     $latestReleaseMetadataDownloaded = $true
     $release = Get-Content -Raw -LiteralPath $releaseMetadata | ConvertFrom-Json
-    if ($release.draft -or $release.prerelease -or -not $release.tag_name) {
-        throw 'There is no stable Nexus Harness release to install yet.'
-    }
-    $installers = @($release.assets | Where-Object { $_.name -match '^Nexus-Harness-Setup-[0-9][0-9.]*(?:-UNSIGNED)?\.exe$' })
-    $checksums = @($release.assets | Where-Object { $_.name -match '^Nexus-Harness-Setup-[0-9][0-9.]*(?:-UNSIGNED)?\.exe\.sha256$' })
-    if ($installers.Count -ne 1 -or $checksums.Count -ne 1) {
-        throw 'The stable release does not contain exactly one versioned installer and checksum; nothing was run.'
-    }
+    $releaseAssets = Get-NexusStableReleaseAssets $release
+    $installers = @($releaseAssets.Installer)
+    $checksums = @($releaseAssets.Checksum)
     $isExplicitlyUnsigned = $installers[0].name -match '-UNSIGNED\.exe$'
     if (-not $publisherConfigured -and -not $isExplicitlyUnsigned) {
         throw 'No Windows publisher is pinned, but the release is not explicitly named UNSIGNED; nothing was run.'
@@ -267,8 +546,11 @@ try {
         Write-Warning 'This installer is not Authenticode-signed. Its exact bytes match the SHA-256 published with the immutable GitHub release.'
         Write-Host 'SHA-256 verified for the explicitly named UNSIGNED installer.'
     }
-    $process = Start-Process -FilePath $installer -Wait -PassThru
+    $process = Start-Process -FilePath $installer -ArgumentList '/currentuser' -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "The Windows installer stopped with code $($process.ExitCode)." }
+    $installedApplication = Get-NexusInstalledApplication $releaseAssets.Version
+    $verifiedShortcut = Assert-NexusDesktopShortcut $installedApplication
+    Write-Host "Desktop shortcut verified: $($verifiedShortcut.ShortcutPath)"
     Write-Host "Nexus Harness $($release.tag_name) is installed."
 } catch {
     $message = Get-InstallationFailureMessage ([string]$_.Exception.Message) `
