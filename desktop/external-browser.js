@@ -7,6 +7,70 @@ const {spawn} = require("node:child_process");
 const {EventEmitter} = require("node:events");
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+const BROWSER_CLOSE_TIMEOUT_MS = 5000;
+
+function browserWasClosedError(provider) {
+  const error = new Error(`${provider?.label || "The provider"}'s browser was closed by Nexus`);
+  error.code = "NEXUS_EXTERNAL_BROWSER_CLOSED";
+  return error;
+}
+
+function processIsRunning(child) {
+  return Boolean(child && child.exitCode == null && child.signalCode == null);
+}
+
+function waitForProcessClose(child, timeoutMs) {
+  if (!processIsRunning(child)) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = (closed) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      child.removeListener?.("close", closedNormally);
+      resolve(closed);
+    };
+    const closedNormally = () => finish(true);
+    child.once?.("close", closedNormally);
+    timer = setTimeout(() => finish(!processIsRunning(child)), timeoutMs);
+  });
+}
+
+function promiseWithin(promise, timeoutMs, timeoutMessage) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
+async function requestGracefulBrowserClose(browser, timeoutMs) {
+  if (!browser || typeof browser.newBrowserCDPSession !== "function") return false;
+  let session = null;
+  try {
+    session = await promiseWithin(
+      browser.newBrowserCDPSession(), timeoutMs, "Browser CDP session timed out");
+    await promiseWithin(
+      session.send("Browser.close"), timeoutMs, "Browser.close timed out");
+    return true;
+  } catch (_error) {
+    // Browser.close commonly tears down the debugging connection before its
+    // reply arrives. The exact child close event below is the authority for
+    // whether the graceful request succeeded.
+    return false;
+  } finally {
+    if (session && typeof session.detach === "function") {
+      await promiseWithin(
+        Promise.resolve().then(() => session.detach()),
+        timeoutMs,
+        "Browser CDP detach timed out",
+      ).catch(() => {});
+    }
+  }
+}
 
 function browserCandidates(environment = process.env) {
   const local = environment.LOCALAPPDATA || "";
@@ -68,6 +132,11 @@ class ExternalPageContents extends EventEmitter {
       return page;
     }).catch((error) => {
       this.loading = false;
+      // Closing while Chrome/Edge is still attaching is an expected lifecycle
+      // outcome. Do not leave a rejected `ready` promise behind after its owner
+      // has deliberately gone away; pageForOperation still reports the closed
+      // state to any live caller.
+      if (this.closed || this.transport.closing || this.transport.closed) return null;
       this.emit("did-fail-load", {}, -2, error.message, this.url, true);
       throw error;
     });
@@ -293,6 +362,16 @@ class ExternalBrowserTransport {
     this.initialClaimed = false;
     this.pages = new Set();
     this.backgroundMode = Boolean(options.backgroundMode);
+    const requestedCloseTimeout = Number(options.closeTimeoutMs);
+    this.closeTimeoutMs = Number.isFinite(requestedCloseTimeout) && requestedCloseTimeout >= 0
+      ? requestedCloseTimeout : BROWSER_CLOSE_TIMEOUT_MS;
+    this.closing = false;
+    this.closed = false;
+    this.closePromise = null;
+  }
+
+  assertOpen() {
+    if (this.closing || this.closed) throw browserWasClosedError(this.provider);
   }
 
   async playwright() {
@@ -301,6 +380,7 @@ class ExternalBrowserTransport {
   }
 
   async start(initialUrl) {
+    this.assertOpen();
     if (this.context && this.browser?.isConnected()) return this.context;
     if (this.starting) return this.starting;
     this.starting = (async () => {
@@ -309,6 +389,7 @@ class ExternalBrowserTransport {
         `${this.provider.label} needs Google Chrome or Microsoft Edge for its secure sign-in, but neither browser was found.`);
       this.ensureDirectory(this.profilePath);
       this.port = await this.reservePort();
+      this.assertOpen();
       const args = [
         `--user-data-dir=${this.profilePath}`,
         `--remote-debugging-port=${this.port}`,
@@ -327,12 +408,20 @@ class ExternalBrowserTransport {
       const engine = await this.playwright();
       let lastError = null;
       for (let attempt = 0; attempt < 120; attempt += 1) {
+        this.assertOpen();
         if (this.process.exitCode != null) throw new Error(
           `${selected.family === "edge" ? "Microsoft Edge" : "Google Chrome"} closed before ${this.provider.label} opened.`);
         try {
-          this.browser = await engine.connectOverCDP(`http://127.0.0.1:${this.port}`);
+          const connected = await engine.connectOverCDP(`http://127.0.0.1:${this.port}`);
+          if (this.closing || this.closed) {
+            await requestGracefulBrowserClose(connected, this.closeTimeoutMs);
+            await Promise.resolve().then(() => connected.close()).catch(() => {});
+            throw browserWasClosedError(this.provider);
+          }
+          this.browser = connected;
           break;
         } catch (error) {
+          if (this.closing || this.closed) throw browserWasClosedError(this.provider);
           lastError = error;
           await wait(250);
         }
@@ -456,16 +545,54 @@ class ExternalBrowserTransport {
     return best;
   }
 
-  async close() {
-    for (const contents of [...this.pages]) contents.close();
-    this.pages.clear();
-    // Kill immediately as well as closing CDP so an app shutdown cannot leave
-    // a controlled browser process behind while Electron's event loop exits.
-    if (this.process && this.process.exitCode == null) this.process.kill();
-    if (this.browser) await this.browser.close().catch(() => {});
-    this.browser = null;
-    this.context = null;
-    this.process = null;
+  close() {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    const startup = this.starting;
+    // Attach the shutdown observer immediately. A startup rejected because its
+    // port reservation or CDP connection was fenced must never become an
+    // unhandled rejection after the Electron owner has closed.
+    const startupSettled = startup ? startup.catch(() => {}) : Promise.resolve();
+    this.closePromise = (async () => {
+      for (const contents of [...this.pages]) contents.close();
+      this.pages.clear();
+
+      const child = this.process;
+      let browser = this.browser;
+      if (!browser && startup) {
+        await promiseWithin(
+          startupSettled, Math.min(250, this.closeTimeoutMs),
+          "External browser startup did not settle before close",
+        ).catch(() => {});
+        browser = this.browser;
+      }
+      await requestGracefulBrowserClose(browser, this.closeTimeoutMs);
+
+      let stopped = await waitForProcessClose(child, this.closeTimeoutMs);
+      if (!stopped && processIsRunning(child)) {
+        try { child.kill(); } catch (_error) { /* already gone */ }
+        stopped = await waitForProcessClose(child, this.closeTimeoutMs);
+      }
+      if (browser && typeof browser.close === "function") {
+        await Promise.resolve().then(() => browser.close()).catch(() => {});
+      }
+      await promiseWithin(
+        startupSettled, this.closeTimeoutMs,
+        "External browser startup did not settle after close",
+      ).catch(() => {});
+
+      this.browser = null;
+      this.context = null;
+      this.process = null;
+      this.port = 0;
+      this.initialPage = null;
+      this.initialClaimed = false;
+      return stopped;
+    })().finally(() => {
+      this.closing = false;
+      this.closed = true;
+    });
+    return this.closePromise;
   }
 }
 

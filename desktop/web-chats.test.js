@@ -2148,3 +2148,80 @@ test("ChatGPT replaces a late-restored draft before any Send activation", async 
   assert.equal(commands.filter(([method]) => method === "Input.dispatchMouseEvent").length, 3);
   assert.ok(answerChecks >= 3);
 });
+
+test("web-chat shutdown is idempotent, detaches native views, and awaits transports", async () => {
+  const events = [];
+  let releaseTransport;
+  const transportClosed = new Promise((resolve) => { releaseTransport = resolve; });
+  const owner = {
+    isDestroyed: () => false,
+    contentView: {removeChildView: (view) => events.push(`detach:owner:${view.name}`)},
+  };
+  const manager = new WebChatManager({
+    electron: {}, owner,
+    readSettings: () => ({}), writeSettings: () => {},
+    shellPage: "file:///web-chat.html", shellPreload: "web-chat-shell-preload.js",
+  });
+  const makeView = (name, external = false) => ({
+    name, external,
+    webContents: {
+      isDestroyed: () => false,
+      close: () => events.push(`close:view:${name}`),
+    },
+  });
+  const embedded = makeView("embedded");
+  const background = makeView("background");
+  const shellView = makeView("shell");
+  const host = {
+    isDestroyed: () => false,
+    contentView: {removeChildView: (view) => events.push(`detach:host:${view.name}`)},
+    close: () => events.push("close:host"),
+  };
+  const shell = {
+    isDestroyed: () => false,
+    contentView: {removeChildView: (view) => events.push(`detach:shell:${view.name}`)},
+    close: () => events.push("close:shell"),
+  };
+  let wakeCount = 0;
+  const active = {cancelled: false, cancelWaiters: new Set([() => { wakeCount += 1; }])};
+  manager.views.set("one", embedded);
+  manager.views.set("two", background);
+  manager.backgroundHosts.set(background, host);
+  manager.shells.set(1, {shell, view: shellView});
+  manager.activeAsks.set("one", active);
+  manager.externalTransports.set("claude", {
+    close: () => {
+      events.push("close:transport:start");
+      return transportClosed.then(() => events.push("close:transport:end"));
+    },
+  });
+
+  const first = manager.close();
+  const second = manager.close();
+  assert.equal(second, first, "repeat close calls must share one shutdown operation");
+  let settled = false;
+  first.then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(active.cancelled, true);
+  assert.equal(wakeCount, 1);
+  assert.equal(settled, false, "transport shutdown must be awaited");
+  assert.ok(events.indexOf("detach:owner:embedded") < events.indexOf("close:view:embedded"));
+  assert.ok(events.indexOf("detach:host:background") < events.indexOf("close:view:background"));
+  assert.ok(events.indexOf("detach:shell:shell") < events.indexOf("close:view:shell"));
+  assert.ok(events.indexOf("close:view:shell") < events.indexOf("close:shell"));
+  assert.ok(events.indexOf("close:view:background") < events.indexOf("close:host"));
+  await assert.rejects(
+    manager.ask("one", "must not start"),
+    (error) => error.code === "NEXUS_WEB_CHAT_CLOSED",
+  );
+
+  releaseTransport();
+  await first;
+  assert.equal(settled, true);
+  assert.equal(events.filter((one) => one === "close:transport:start").length, 1);
+  assert.equal(manager.views.size, 0);
+  assert.equal(manager.shells.size, 0);
+  assert.equal(manager.backgroundHosts.size, 0);
+  assert.equal(manager.externalTransports.size, 0);
+});

@@ -126,8 +126,11 @@ test("every chat scenario proves dispatch, visible truth, recovery, and restart 
   assert.match(source, /await app\.close\(\)/);
   assert.match(source, /survive a full restart/);
   assert.match(source, /Repair Fixture Anthropic[\s\S]*Ask all agents again/);
-  assert.match(source, /maxRetries: 12/);
-  assert.match(source, /retryDelay: 250/);
+  assert.match(source, /async function removeAcceptedFixture\(root, timeoutMs = 120_000\)/);
+  assert.match(source, /\["EBUSY", "EPERM", "ENOTEMPTY"\]/);
+  assert.match(source, /Date\.now\(\) - started >= timeoutMs/,
+    "external Windows handles get a bounded window, never an endless cleanup mask");
+  assert.match(source, /if \(passed\) await removeAcceptedFixture\(root\)/);
 });
 
 test("unpacked and installed acceptance lanes are release gates", () => {

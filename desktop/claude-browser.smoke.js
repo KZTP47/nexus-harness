@@ -33,6 +33,7 @@ async function main() {
     timeout: 120000,
   });
   let controlled = null;
+  let browserProfile = "";
   try {
     const panel = await app.firstWindow({timeout: 120000});
     await panel.waitForFunction(() => location.protocol === "http:", null, {timeout: 90000});
@@ -41,7 +42,7 @@ async function main() {
     const shell = await shellPromise;
     await shell.waitForSelector("#external:not([hidden])", {timeout: 30000});
 
-    const browserProfile = path.join(profile, "external-web-chat", "claude");
+    browserProfile = path.join(profile, "external-web-chat", "claude");
     let commandLine = "";
     for (let attempt = 0; attempt < 80 && !commandLine; attempt += 1) {
       commandLine = matchingChrome(browserProfile);
@@ -72,6 +73,28 @@ async function main() {
     console.log("pass  Claude reaches its real sign-in page in a persistent Nexus-owned browser with webdriver disabled");
   } finally {
     await app.close();
+    if (browserProfile) {
+      let cleanupFailure = "";
+      let commandLine = matchingChrome(browserProfile);
+      for (let attempt = 0; attempt < 40 && commandLine; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        commandLine = matchingChrome(browserProfile);
+      }
+      if (commandLine) cleanupFailure =
+        `Nexus exited before its controlled browser process closed: ${commandLine}`;
+      if (controlled?.isConnected()) cleanupFailure ||=
+        "Nexus exited while the controlled Claude browser CDP connection was still live";
+      const preferences = path.join(browserProfile, "Default", "Preferences");
+      if (!fs.existsSync(preferences)) cleanupFailure ||=
+        "The controlled browser was terminated before it wrote a clean profile state";
+      const exitType = fs.existsSync(preferences)
+        ? JSON.parse(fs.readFileSync(preferences, "utf8"))?.profile?.exit_type : "";
+      if (exitType !== "Normal") cleanupFailure ||=
+        `The controlled browser profile recorded an unclean exit: ${exitType || "missing"}`;
+      if (controlled?.isConnected()) await controlled.close().catch(() => {});
+      if (cleanupFailure) throw new Error(cleanupFailure);
+      console.log("pass  Nexus awaits a normal Claude browser exit before Electron closes");
+    }
     if (controlled?.isConnected()) await controlled.close().catch(() => {});
   }
 }

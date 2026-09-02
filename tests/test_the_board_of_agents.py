@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -37,7 +38,7 @@ from unittest import mock
 
 from our_harness import (
     agent_mailbox, cancellation, chat, collaboration_outcomes, pages, server,
-    swarm, swarm_runs, swarm_work,
+    long_horizon, swarm, swarm_runs, swarm_work,
 )
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig, load_config
 
@@ -3106,11 +3107,14 @@ run().then(() => process.stdout.write("latest-list"))
         if not node:
             self.skipTest("Node.js is needed for the desktop outbox renderer contract")
         helper = self.script[
-            self.script.index("async function saveDirectLongGoalOutbox"):
+            self.script.index("const DIRECT_LONG_GOAL_DESKTOP_OUTBOX_METHODS"):
             self.script.index("function directLongGoalRecoveryFor")
         ]
         probe = f"""
 const window = {{harnessDesktop: {{
+  saveDirectGoalOutbox: async () => ({{}}),
+  listDirectGoalOutbox: async () => ([]),
+  readDirectGoalOutbox: async () => ({{}}),
   deleteDirectGoalOutbox: async () => ({{deleted: false, reason: "mismatch"}}),
 }}}};
 {helper}
@@ -4145,6 +4149,47 @@ class WhatThePanelIsTold(BoardTestCase):
             self.assertEqual(goal["conversation_id"], expected["chat_id"])
             self.assertEqual(goal["project"]["id"], expected["project_id"])
             self.assertEqual(goal["lead_agent_id"], expected["lead_id"])
+
+    def write_authenticated_direct_admission(
+        self, owner: server.HarnessHTTPServer, request_id: str,
+        unsigned: dict,
+    ) -> dict:
+        """Write exact historical journal bytes with a valid runtime MAC."""
+
+        kept = copy.deepcopy(unsigned)
+        kept.pop("integrity_mac", None)
+        record = {
+            **kept,
+            "integrity_mac": server.mac(
+                "direct-long-horizon-admission-v1", kept,
+            ),
+        }
+        owner._direct_admission_path(request_id).write_text(
+            json.dumps(
+                record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ) + "\n",
+            encoding="utf-8",
+        )
+        return record
+
+    def downgrade_terminal_direct_admission_to_v021(
+        self, owner: server.HarnessHTTPServer, request_id: str,
+    ) -> dict:
+        """Recreate an authenticated terminal row emitted before acknowledgements."""
+
+        path = owner._direct_admission_path(request_id)
+        current = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            current.get("terminal_receipt_schema_version"),
+            server.DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION,
+        )
+        self.assertIs(current.get("client_consumed"), False)
+        current.pop("terminal_receipt_schema_version")
+        current.pop("client_consumed")
+        current.pop("client_consumed_ms", None)
+        return self.write_authenticated_direct_admission(
+            owner, request_id, current,
+        )
 
     def test_an_empty_board_is_still_an_answer(self) -> None:
         status, said = self.ask("/api/swarm")
@@ -5594,7 +5639,7 @@ class WhatThePanelIsTold(BoardTestCase):
         )
         self.assertEqual(activity["state"], "stopped")
 
-    def test_direct_receipt_only_restores_a_missing_legacy_tombstone_project(self) -> None:
+    def test_direct_receipt_only_restores_a_missing_current_tombstone_project(self) -> None:
         digest = "a" * 64
         receipt = {
             "schema_version": 1,
@@ -5610,6 +5655,9 @@ class WhatThePanelIsTold(BoardTestCase):
             "project": {"id": ""},
             "lead_agent_id": receipt["lead_id"],
             "request_tombstone": True,
+            "request_tombstone_schema_version": (
+                long_horizon.REQUEST_TOMBSTONE_SCHEMA_VERSION
+            ),
             "admission_digest": digest,
         }
 
@@ -5624,6 +5672,13 @@ class WhatThePanelIsTold(BoardTestCase):
 
         with self.assertRaisesRegex(server.HarnessError, "different project identity"):
             self.panel._goal_for_direct_receipt(tombstone, receipt)
+
+        unsupported = dict(tombstone)
+        unsupported.pop("request_tombstone_schema_version")
+        with self.assertRaisesRegex(server.HarnessError, "unsupported schema"):
+            self.panel._goal_for_direct_receipt(
+                unsupported, receipt, admission_digest=digest,
+            )
 
         wrong_project = {**tombstone, "project": {"id": "project-2"}}
         for proof in (
@@ -5695,70 +5750,41 @@ class WhatThePanelIsTold(BoardTestCase):
             replayed, replay_receipt = self.panel.admit_direct_long_horizon(
                 {"request_id": request_id, "chat_id": first["id"]},
                 from_pending=True,
-            )
+        )
         self.assertEqual(replayed["goal_id"], goal["goal_id"])
         self.assert_direct_receipt(replay_receipt, original, goal=replayed)
-        self.assertEqual(self.panel.direct_admission_inventory(), [])
+        pending = self.panel.direct_admission_inventory()
+        self.assertEqual([one["request_id"] for one in pending], [request_id])
         runtime.start.assert_called_once()
 
-        # Simulate the only remaining race: another admission path creates the
-        # old goal after this direct path's pure preflight but before its save.
-        conflicting = self.panel._canonical_direct_long_horizon_payload({
-            **original, "chat_id": second["id"],
-            "text": "A later conflicting attempt",
-            "objectives": ["A later conflicting attempt"],
-            "success_criteria": ["Different evidence"],
-            "policy": {**original["policy"], "max_parallel": 1},
+        wrong_intent = chat.long_horizon_intent_sha256(
+            first["id"], "project-1", lead_id, "Different exact work", [],
+        )
+        with self.assertRaisesRegex(server.HarnessError, "different exact prompt"):
+            self.panel.discard_direct_admission({
+                "request_id": request_id, "chat_id": first["id"],
+                "payload_sha256": prepared["payload_sha256"],
+                "intent_sha256": wrong_intent,
+            })
+        self.assertEqual(
+            [one["request_id"] for one in self.panel.direct_admission_inventory()],
+            [request_id],
+        )
+
+        reconciled = self.panel.discard_direct_admission({
+            "request_id": request_id, "chat_id": first["id"],
+            "payload_sha256": prepared["payload_sha256"],
+            "intent_sha256": replay_receipt["intent_sha256"],
         })
-        conflict_context = self.panel._direct_long_horizon_context(
-            standing, conflicting,
-        )
-        conflict = store.inspect_runtime_admission(
-            standing["board"], "project-1", list(conflicting["objectives"]),
-            request_id, lead_id=lead_id,
-            success_criteria=conflicting.get("success_criteria"),
-            policy=conflicting.get("policy"),
-            attachments=conflicting.get("attachments"),
-            participant_ids=conflict_context["participant_ids"],
-            conversation_id=second["id"],
-        )
-        self.assertTrue(conflict["conflict"])
-        conflicting_record = self.panel._save_direct_admission(
-            conflicting, conflict_context, str(conflict["admission_digest"]),
-        )
-        conflict_intent = chat.long_horizon_intent_sha256(
-            second["id"], "project-1", lead_id,
-            str(conflicting["text"]), conflicting.get("attachments"),
-        )
-        chat.keep_long_horizon_prompt(
-            self.panel.config, conflict_context["transcript_route"],
-            str(conflicting["text"]), filed_as=conflict_context["filed_as"],
-            request_id=request_id, chat_id=second["id"], project_id="project-1",
-            lead_id=lead_id, intent_sha256=conflict_intent,
-            attachments=conflicting.get("attachments"),
-        )
-        runtime.store.public.reset_mock()
-        before = store.get(goal["goal_id"])
-        discarded = self.panel.discard_direct_admission({
-            "request_id": request_id, "chat_id": second["id"],
-            "payload_sha256": conflicting_record["payload_sha256"],
-            "intent_sha256": conflict_intent,
-        })
-        self.assertTrue(discarded["discarded"])
-        self.assertTrue(discarded["safe_to_delete"])
-        self.assertFalse(discarded["reconciled"])
-        self.assert_direct_receipt(discarded, conflicting)
-        for flag in ("discarded", "reconciled", "safe_to_delete", "transcript_noted"):
-            self.assertIs(type(discarded[flag]), bool)
-        runtime.store.public.assert_not_called()
-        after = store.get(goal["goal_id"])
-        self.assertEqual((after["status"], after["revision"]), (
-            before["status"], before["revision"],
-        ))
+        self.assertTrue(reconciled["reconciled"])
+        self.assertFalse(reconciled["discarded"])
+        self.assertFalse(reconciled["safe_to_delete"])
+        self.assertEqual(reconciled["goal"]["goal_id"], goal["goal_id"])
+        self.assert_direct_receipt(reconciled, original, goal=reconciled["goal"])
         retired = self.panel._read_direct_admission_path(
             self.panel._direct_admission_path(request_id),
         )
-        self.assertEqual(retired["state"], "discarded")
+        self.assertEqual(retired["state"], "reconciled")
         self.assertEqual(self.panel.direct_admission_inventory(), [])
         freed = self.panel.prepare_direct_long_horizon({
             "project_id": "project-1", "lead_id": lead_id,
@@ -5868,11 +5894,24 @@ class WhatThePanelIsTold(BoardTestCase):
             self.assertIs(type(discarded[flag]), bool)
         self.assertEqual(store.get_by_request(request_id)["goal_id"], tombstone["goal_id"])
         self.assertEqual(self.panel.direct_admission_inventory(), [])
-        freed = self.panel.prepare_direct_long_horizon({
+        replacement = {
             "project_id": "project-1", "lead_id": lead_id,
             "chat_id": second["id"], "text": "Reuse chat after retired conflict",
             "request_id": "direct-full-retired-binding-new-id",
+        }
+        with self.assertRaisesRegex(
+            server.HarnessError, "unconsumed terminal project request",
+        ):
+            self.panel.prepare_direct_long_horizon(replacement)
+        acknowledged = self.panel.acknowledge_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": discarded["intent_sha256"],
+            "terminal_state": "discarded", "goal_id": "",
         })
+        self.assertTrue(acknowledged["client_consumed"])
+        self.assertEqual(acknowledged["terminal_state"], "discarded")
+        freed = self.panel.prepare_direct_long_horizon(replacement)
         self.assertEqual(freed["request_id"], "direct-full-retired-binding-new-id")
 
     def test_direct_work_together_persists_exact_chat_two_before_admission(self) -> None:
@@ -6035,7 +6074,58 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertEqual(resumed["goal_id"], goal["goal_id"])
         self.assertEqual(runtime.start.call_args.args[2], request["objectives"])
         self.assertEqual(runtime.start.call_args.kwargs["attachments"], [attachment])
+        pending = reopened.direct_admission_inventory()
+        self.assertEqual([one["request_id"] for one in pending], [request_id])
+        goal["admission_digest"] = reopened._direct_admission_binding_digest(
+            saved_record,
+        )
+        runtime.store.get_by_request.return_value = goal
+        runtime.store.public.side_effect = lambda value: value
+        reconciled = reopened.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "payload_sha256": pending[0]["payload_sha256"],
+            "intent_sha256": receipt["intent_sha256"],
+        })
+        self.assertTrue(reconciled["reconciled"])
+        self.assertEqual(reconciled["goal"]["goal_id"], goal["goal_id"])
         self.assertEqual(reopened.direct_admission_inventory(), [])
+        terminal = reopened.terminal_direct_admission_inventory()
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0]["terminal_state"], "reconciled")
+        self.assertFalse(terminal[0]["client_consumed"])
+        self.assertEqual(terminal[0]["goal_id"], goal["goal_id"])
+        with self.assertRaisesRegex(
+            server.HarnessError, "different intent sha256|different intent digest",
+        ):
+            reopened.acknowledge_direct_admission({
+                "request_id": request_id, "chat_id": second["id"],
+                "project_id": "project-1", "lead_id": lead_id,
+                "intent_sha256": "f" * 64,
+                "terminal_state": "reconciled", "goal_id": goal["goal_id"],
+            })
+        self.assertEqual(len(reopened.terminal_direct_admission_inventory()), 1)
+        acknowledgement = reopened.acknowledge_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": receipt["intent_sha256"],
+            "terminal_state": "reconciled", "goal_id": goal["goal_id"],
+        })
+        self.assertTrue(acknowledgement["client_consumed"])
+        self.assertEqual(acknowledgement["goal"]["goal_id"], goal["goal_id"])
+        self.assertEqual(reopened.terminal_direct_admission_inventory(), [])
+        replayed_acknowledgement = reopened.acknowledge_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": receipt["intent_sha256"],
+            "terminal_state": "reconciled", "goal_id": goal["goal_id"],
+        })
+        self.assertTrue(replayed_acknowledgement["client_consumed"])
+        with self.assertRaisesRegex(server.HarnessError, "explicitly retired"):
+            reopened.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+        self.assertEqual(runtime.start.call_count, 1)
         after = chat.read_it(
             reopened.config,
             str(second["transcript_route"]), str(second["filed_as"]),
@@ -6168,6 +6258,478 @@ class WhatThePanelIsTold(BoardTestCase):
             ["long_horizon_prompt", "long_horizon_status"],
         )
 
+    def test_stale_origin_cannot_prepare_until_terminal_receipt_is_consumed(
+        self,
+    ) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        other = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(other.server_close)
+        other.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        later = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"],
+            "text": "Second request from a stale browser inventory",
+            "attachments": [], "request_id": "stale-origin-second",
+        }
+        stale_sampled = threading.Barrier(2)
+        terminal_committed = threading.Event()
+        self.addCleanup(terminal_committed.set)
+        stale_result: dict[str, object] = {}
+
+        def stale_origin_prepare() -> None:
+            stale_result["inventory"] = other.direct_admission_recovery_inventory()
+            stale_sampled.wait(timeout=5)
+            terminal_committed.wait(5)
+            try:
+                stale_result["prepared"] = other.prepare_direct_long_horizon(later)
+            except Exception as error:  # The exact error is asserted below.
+                stale_result["error"] = error
+
+        stale_thread = threading.Thread(target=stale_origin_prepare)
+        stale_thread.start()
+        self.addCleanup(lambda: stale_thread.join(5))
+        stale_sampled.wait(timeout=5)
+        self.assertEqual(stale_result.get("inventory"), {
+            "pending": [], "terminal": [],
+        })
+
+        request = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "First exact stale-origin goal",
+            "attachments": [], "request_id": "stale-origin-first",
+        }
+        pending = self.panel.prepare_direct_long_horizon(request)
+        record = self.panel._load_direct_admission(
+            request["request_id"], second["id"],
+        )
+        goal = {
+            "schema_version": 1,
+            "goal_id": "goal-stale-origin-first",
+            "request_id": request["request_id"],
+            "conversation_id": second["id"],
+            "project": {
+                "id": "project-1", "name": "Shared", "path": str(self.where),
+            },
+            "lead_agent_id": lead_id,
+            "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "complete", "revision": 1,
+            "project_queue": {"state": "released"},
+            "admission_digest": self.panel._direct_admission_binding_digest(record),
+        }
+        runtime = mock.Mock()
+        runtime.store = mock.Mock()
+        runtime.store.list.return_value = []
+        runtime.store.get_by_request.return_value = goal
+        runtime.start.return_value = goal
+        runtime.close = mock.Mock()
+        self.panel._long_horizon = runtime
+        with mock.patch.object(
+            self.panel, "require_project_execution_authority",
+            return_value={"project_authority_id": "authority-test"},
+        ):
+            started, receipt = self.panel.admit_direct_long_horizon(
+                {"request_id": request["request_id"], "chat_id": second["id"]},
+                from_pending=True,
+            )
+        self.assertEqual(started["goal_id"], goal["goal_id"])
+        outcome = self.panel.discard_direct_admission({
+            "request_id": request["request_id"], "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "payload_sha256": pending["payload_sha256"],
+            "intent_sha256": receipt["intent_sha256"],
+        })
+        self.assertTrue(outcome["reconciled"])
+        self.assertEqual(
+            [one["request_id"] for one in other.direct_admission_recovery_inventory()["terminal"]],
+            [request["request_id"]],
+        )
+
+        terminal_committed.set()
+        stale_thread.join(10)
+        self.assertFalse(stale_thread.is_alive())
+        self.assertIsInstance(stale_result.get("error"), server.HarnessError)
+        self.assertIn(
+            "unconsumed terminal project request",
+            str(stale_result.get("error")),
+        )
+        self.assertNotIn("prepared", stale_result)
+        runtime.start.assert_called_once()
+
+        acknowledged = self.panel.acknowledge_direct_admission({
+            "request_id": request["request_id"], "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": receipt["intent_sha256"],
+            "terminal_state": "reconciled", "goal_id": goal["goal_id"],
+        })
+        self.assertTrue(acknowledged["client_consumed"])
+        next_pending = other.prepare_direct_long_horizon(later)
+        self.assertEqual(next_pending["request_id"], later["request_id"])
+        self.assertEqual(other.direct_admission_recovery_inventory()["terminal"], [])
+
+    def test_v021_reconciled_terminal_is_unconsumed_until_exact_acknowledgement(
+        self,
+    ) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Recover the old reconciled result",
+            "request_id": "legacy-reconciled-terminal-v021",
+        }
+        pending = self.panel.prepare_direct_long_horizon(supplied)
+        record = self.panel._load_direct_admission(
+            supplied["request_id"], second["id"],
+        )
+        goal = {
+            "schema_version": 1,
+            "goal_id": "goal-legacy-reconciled-terminal-v021",
+            "request_id": supplied["request_id"],
+            "conversation_id": second["id"],
+            "project": {"id": "project-1", "name": "Shared", "path": str(self.where)},
+            "lead_agent_id": lead_id,
+            "requested_agent_ids": [lead_id, "agent-2"],
+            "agents": [{"id": lead_id}, {"id": "agent-2"}],
+            "status": "complete", "revision": 1,
+            "project_queue": {"state": "released"},
+            "admission_digest": self.panel._direct_admission_binding_digest(record),
+        }
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.get_by_request.return_value = goal
+        reconciled = self.panel.discard_direct_admission({
+            "request_id": supplied["request_id"], "chat_id": second["id"],
+            "payload_sha256": pending["payload_sha256"],
+        })
+        self.assertTrue(reconciled["reconciled"])
+        legacy = self.downgrade_terminal_direct_admission_to_v021(
+            self.panel, supplied["request_id"],
+        )
+        self.assertNotIn("terminal_receipt_schema_version", legacy)
+        self.assertNotIn("client_consumed", legacy)
+        self.assertNotIn("client_consumed_ms", legacy)
+
+        reopened = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(reopened.server_close)
+        reopened.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        reopened_runtime = mock.Mock()
+        reopened_runtime.store = mock.Mock()
+        reopened_runtime.store.list.return_value = []
+        # Simulate the goal details having aged out while its authenticated
+        # compact request tombstone remains. Legacy terminal recovery must
+        # still prove the exact full admission digest and restore only the
+        # receipt's already-authenticated project identity in the response.
+        reopened_runtime.store.get_by_request.return_value = {
+            "request_tombstone_schema_version": (
+                long_horizon.REQUEST_TOMBSTONE_SCHEMA_VERSION
+            ),
+            "request_tombstone": True,
+            "goal_id": goal["goal_id"],
+            "request_id": supplied["request_id"],
+            "conversation_id": second["id"],
+            "project": {"id": ""},
+            "lead_agent_id": lead_id,
+            "status": "complete",
+            "admission_digest": goal["admission_digest"],
+        }
+        reopened_runtime.close = mock.Mock()
+        reopened._long_horizon = reopened_runtime
+
+        terminal = reopened.direct_admission_recovery_inventory()["terminal"]
+        self.assertEqual([one["request_id"] for one in terminal], [supplied["request_id"]])
+        self.assertFalse(terminal[0]["client_consumed"])
+        self.assertTrue(terminal[0]["legacy_terminal"])
+        self.assertEqual(terminal[0]["goal_id"], goal["goal_id"])
+        next_request = {
+            **supplied,
+            "request_id": "legacy-reconciled-terminal-v021-next",
+            "text": "Start only after the old result is acknowledged",
+        }
+        with self.assertRaisesRegex(
+            server.HarnessError, "unconsumed terminal project request",
+        ):
+            reopened.prepare_direct_long_horizon(next_request)
+
+        acknowledged = reopened.acknowledge_direct_admission({
+            "request_id": supplied["request_id"], "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": terminal[0]["intent_sha256"],
+            "terminal_state": "reconciled", "goal_id": goal["goal_id"],
+        })
+        self.assertTrue(acknowledged["client_consumed"])
+        self.assertTrue(acknowledged["goal"]["request_tombstone"])
+        self.assertEqual(acknowledged["goal"]["project"], {"id": "project-1"})
+        self.assertEqual(acknowledged["goal"]["schema_version"], 1)
+        replayed_acknowledgement = reopened.acknowledge_direct_admission({
+            "request_id": supplied["request_id"], "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": terminal[0]["intent_sha256"],
+            "terminal_state": "reconciled", "goal_id": goal["goal_id"],
+        })
+        self.assertTrue(replayed_acknowledgement["client_consumed"])
+        self.assertEqual(
+            replayed_acknowledgement["goal"]["goal_id"], goal["goal_id"],
+        )
+        upgraded = reopened._read_direct_admission_path(
+            reopened._direct_admission_path(supplied["request_id"]),
+        )
+        self.assertEqual(
+            upgraded["terminal_receipt_schema_version"],
+            server.DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION,
+        )
+        self.assertIs(upgraded["client_consumed"], True)
+        self.assertGreater(upgraded["client_consumed_ms"], 0)
+        self.assertEqual(reopened.direct_admission_recovery_inventory()["terminal"], [])
+        prepared = reopened.prepare_direct_long_horizon(next_request)
+        self.assertEqual(prepared["request_id"], next_request["request_id"])
+
+    def test_v021_discarded_terminal_is_unconsumed_until_exact_acknowledgement(
+        self,
+    ) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Recover the old discarded result",
+            "request_id": "legacy-discarded-terminal-v021",
+        }
+        pending = self.panel.prepare_direct_long_horizon(supplied)
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.get_by_request.return_value = None
+        discarded = self.panel.discard_direct_admission({
+            "request_id": supplied["request_id"], "chat_id": second["id"],
+            "payload_sha256": pending["payload_sha256"],
+        })
+        self.assertTrue(discarded["discarded"])
+        self.downgrade_terminal_direct_admission_to_v021(
+            self.panel, supplied["request_id"],
+        )
+
+        reopened = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(reopened.server_close)
+        reopened.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        reopened_runtime = mock.Mock()
+        reopened_runtime.store = mock.Mock()
+        reopened_runtime.store.list.return_value = []
+        reopened_runtime.store.get_by_request.return_value = None
+        reopened_runtime.close = mock.Mock()
+        reopened._long_horizon = reopened_runtime
+
+        terminal = reopened.direct_admission_recovery_inventory()["terminal"]
+        self.assertEqual([one["request_id"] for one in terminal], [supplied["request_id"]])
+        self.assertTrue(terminal[0]["legacy_terminal"])
+        self.assertFalse(terminal[0]["client_consumed"])
+        self.assertEqual(terminal[0]["terminal_state"], "discarded")
+        next_request = {
+            **supplied,
+            "request_id": "legacy-discarded-terminal-v021-next",
+            "text": "Start only after the old discard is acknowledged",
+        }
+        with self.assertRaisesRegex(
+            server.HarnessError, "unconsumed terminal project request",
+        ):
+            reopened.prepare_direct_long_horizon(next_request)
+        acknowledged = reopened.acknowledge_direct_admission({
+            "request_id": supplied["request_id"], "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": terminal[0]["intent_sha256"],
+            "terminal_state": "discarded", "goal_id": "",
+        })
+        self.assertTrue(acknowledged["client_consumed"])
+        upgraded = reopened._read_direct_admission_path(
+            reopened._direct_admission_path(supplied["request_id"]),
+        )
+        self.assertEqual(
+            upgraded["terminal_receipt_schema_version"],
+            server.DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION,
+        )
+        self.assertIs(upgraded["client_consumed"], True)
+        self.assertGreater(upgraded["client_consumed_ms"], 0)
+        self.assertEqual(reopened.direct_admission_recovery_inventory()["terminal"], [])
+        prepared = reopened.prepare_direct_long_horizon(next_request)
+        self.assertEqual(prepared["request_id"], next_request["request_id"])
+
+    def test_malformed_terminal_receipt_metadata_fails_closed_with_a_valid_mac(
+        self,
+    ) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "malformed-terminal-receipt-metadata"
+        self.panel._retire_missing_direct_admission(
+            request_id=request_id, chat_id=second["id"], project_id="project-1",
+            lead_id=lead_id, intent_sha256="a" * 64,
+        )
+        path = self.panel._direct_admission_path(request_id)
+        base = json.loads(path.read_text(encoding="utf-8"))
+        base.pop("integrity_mac")
+        reopened = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(reopened.server_close)
+        reopened.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+
+        cases = {
+            "schema_without_flag": lambda one: one.pop("client_consumed"),
+            "flag_without_schema": lambda one: one.pop(
+                "terminal_receipt_schema_version"
+            ),
+            "unsupported_schema": lambda one: one.__setitem__(
+                "terminal_receipt_schema_version", 999,
+            ),
+            "non_boolean_flag": lambda one: one.__setitem__(
+                "client_consumed", "false",
+            ),
+            "unconsumed_with_timestamp": lambda one: one.__setitem__(
+                "client_consumed_ms", 1,
+            ),
+            "consumed_without_timestamp": lambda one: one.__setitem__(
+                "client_consumed", True,
+            ),
+            "consumed_with_boolean_timestamp": lambda one: one.update({
+                "client_consumed": True, "client_consumed_ms": True,
+            }),
+            "invalid_created_timestamp": lambda one: one.__setitem__(
+                "created_ms", 0,
+            ),
+            "invalid_retired_timestamp": lambda one: one.__setitem__(
+                "retired_ms", "yesterday",
+            ),
+            "missing_goal_identity_field": lambda one: one.pop("goal_id"),
+            "unknown_acknowledgement_field": lambda one: (
+                one.pop("terminal_receipt_schema_version"),
+                one.pop("client_consumed"),
+                one.__setitem__("client_acknowledged_at", 1),
+            ),
+        }
+        later = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Never bypass malformed history",
+            "request_id": "malformed-terminal-receipt-next",
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label):
+                malformed = copy.deepcopy(base)
+                mutate(malformed)
+                self.write_authenticated_direct_admission(
+                    self.panel, request_id, malformed,
+                )
+                with self.assertRaises(server.HarnessError):
+                    reopened.direct_admission_recovery_inventory()
+                with self.assertRaises(server.HarnessError):
+                    reopened.prepare_direct_long_horizon(later)
+                self.assertFalse(
+                    reopened._direct_admission_path(later["request_id"]).exists()
+                )
+
+    def test_boolean_direct_admission_schema_versions_fail_closed_with_valid_macs(
+        self,
+    ) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        request_id = "boolean-direct-admission-schema-versions"
+        self.panel._retire_missing_direct_admission(
+            request_id=request_id, chat_id=second["id"], project_id="project-1",
+            lead_id=lead_id, intent_sha256="a" * 64,
+        )
+        path = self.panel._direct_admission_path(request_id)
+        base = json.loads(path.read_text(encoding="utf-8"))
+        base.pop("integrity_mac")
+
+        def boolean_execution_contract_schema(one: dict) -> None:
+            contract = one["execution_contract"]
+            contract["schema_version"] = True
+            unsigned_contract = {
+                key: value for key, value in contract.items()
+                if key != "fingerprint_sha256"
+            }
+            contract["fingerprint_sha256"] = hashlib.sha256(json.dumps(
+                unsigned_contract, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+
+        cases = {
+            "top admission": (
+                "unsupported schema",
+                lambda one: one.__setitem__("schema_version", True),
+            ),
+            "execution contract": (
+                "unsupported execution contract",
+                boolean_execution_contract_schema,
+            ),
+            "terminal receipt": (
+                "unsupported terminal schema",
+                lambda one: one.__setitem__(
+                    "terminal_receipt_schema_version", True,
+                ),
+            ),
+        }
+        later = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Never bypass boolean schemas",
+            "request_id": "boolean-direct-admission-schema-next",
+        }
+        for label, (message, mutate) in cases.items():
+            with self.subTest(label=label):
+                malformed = copy.deepcopy(base)
+                mutate(malformed)
+                self.write_authenticated_direct_admission(
+                    self.panel, request_id, malformed,
+                )
+                with self.assertRaisesRegex(server.HarnessError, message):
+                    self.panel._read_direct_admission_path(path)
+                with self.assertRaisesRegex(server.HarnessError, message):
+                    self.panel.prepare_direct_long_horizon(later)
+                self.assertFalse(
+                    self.panel._direct_admission_path(later["request_id"]).exists()
+                )
+
+    def test_multiple_v021_terminal_rows_for_one_chat_surface_newest_first(
+        self,
+    ) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        requests = [
+            ("legacy-terminal-multiple-a", "a" * 64, 1_700_000_000_001),
+            ("legacy-terminal-multiple-b", "b" * 64, 1_700_000_000_002),
+        ]
+        for request_id, intent_sha256, created_ms in requests:
+            self.panel._retire_missing_direct_admission(
+                request_id=request_id, chat_id=second["id"], project_id="project-1",
+                lead_id=lead_id, intent_sha256=intent_sha256,
+            )
+            legacy = self.downgrade_terminal_direct_admission_to_v021(
+                self.panel, request_id,
+            )
+            legacy["created_ms"] = created_ms
+            legacy["retired_ms"] = created_ms
+            self.write_authenticated_direct_admission(
+                self.panel, request_id, legacy,
+            )
+
+        reopened = _BoundedTestHTTPServer(("127.0.0.1", 0), load_config(self.where))
+        self.addCleanup(reopened.server_close)
+        reopened.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        newest_first = list(reversed(requests))
+        for index, (request_id, intent_sha256, _created_ms) in enumerate(newest_first):
+            terminal = reopened.direct_admission_recovery_inventory()["terminal"]
+            self.assertEqual([one["request_id"] for one in terminal], [request_id])
+            self.assertTrue(terminal[0]["legacy_terminal"])
+            acknowledged = reopened.acknowledge_direct_admission({
+                "request_id": request_id, "chat_id": second["id"],
+                "project_id": "project-1", "lead_id": lead_id,
+                "intent_sha256": intent_sha256,
+                "terminal_state": "discarded", "goal_id": "",
+            })
+            self.assertTrue(acknowledged["client_consumed"])
+            if index == 0:
+                with self.assertRaisesRegex(
+                    server.HarnessError, "unconsumed terminal project request",
+                ):
+                    reopened.prepare_direct_long_horizon({
+                        "project_id": "project-1", "lead_id": lead_id,
+                        "chat_id": second["id"], "text": "Wait for both old rows",
+                        "request_id": "legacy-terminal-multiple-next",
+                    })
+        self.assertEqual(reopened.direct_admission_recovery_inventory()["terminal"], [])
+        prepared = reopened.prepare_direct_long_horizon({
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Both old rows were acknowledged",
+            "request_id": "legacy-terminal-multiple-next",
+        })
+        self.assertEqual(prepared["request_id"], "legacy-terminal-multiple-next")
+
     def test_discard_tombstone_blocks_delayed_prepare_and_start(self) -> None:
         lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
         request_id = "direct-discard-replay-1"
@@ -6228,9 +6790,25 @@ class WhatThePanelIsTold(BoardTestCase):
             ["long_horizon_prompt", "long_horizon_error"],
         )
 
-        status, new_request = self.ask("/api/long-horizon/prepare-admission", {
+        next_request = {
             **supplied, "request_id": "direct-discard-replay-new-id",
+        }
+        status, refused = self.ask(
+            "/api/long-horizon/prepare-admission", next_request,
+        )
+        self.assertEqual(status, 400, refused)
+        self.assertIn("unconsumed terminal project request", refused["error"])
+        acknowledged = self.panel.acknowledge_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "project_id": "project-1", "lead_id": lead_id,
+            "intent_sha256": retired["intent_sha256"],
+            "terminal_state": "discarded", "goal_id": "",
         })
+        self.assertTrue(acknowledged["client_consumed"])
+
+        status, new_request = self.ask(
+            "/api/long-horizon/prepare-admission", next_request,
+        )
         self.assertEqual(status, 200, new_request)
 
     def test_two_servers_cannot_revive_a_request_discarded_after_initial_load(self) -> None:
@@ -6398,13 +6976,17 @@ class WhatThePanelIsTold(BoardTestCase):
                 "chat_id": second["id"], "text": text,
                 "request_id": request_id,
             })
-        self.assertEqual(self.panel.direct_admission_inventory(), [])
+        pending = self.panel.direct_admission_inventory()
+        self.assertEqual([one["request_id"] for one in pending], [request_id])
+        saved = self.panel._load_direct_admission(request_id, second["id"])
+        goal["admission_digest"] = self.panel._direct_admission_binding_digest(saved)
         runtime.store.get_by_request.return_value = goal
         runtime.store.public.side_effect = lambda value: value
-        with self.assertRaisesRegex(server.HarnessError, "different exact saved prompt"):
+        with self.assertRaisesRegex(server.HarnessError, "different exact prompt"):
             self.panel.discard_direct_admission({
                 "request_id": request_id, "chat_id": second["id"],
                 "project_id": "project-1", "lead_id": lead_id,
+                "payload_sha256": pending[0]["payload_sha256"],
                 "intent_sha256": chat.long_horizon_intent_sha256(
                     second["id"], "project-1", lead_id,
                     "A different local payload reused the request ID", [],
@@ -6414,6 +6996,7 @@ class WhatThePanelIsTold(BoardTestCase):
         reconciled = self.panel.discard_direct_admission({
             "request_id": request_id, "chat_id": second["id"],
             "project_id": "project-1", "lead_id": lead_id,
+            "payload_sha256": pending[0]["payload_sha256"],
             "intent_sha256": intent_sha256,
         })
         self.assertTrue(reconciled["reconciled"])
@@ -6428,6 +7011,7 @@ class WhatThePanelIsTold(BoardTestCase):
             self.panel._direct_admission_path(request_id),
         )
         self.assertEqual(retired["state"], "reconciled")
+        self.assertEqual(self.panel.direct_admission_inventory(), [])
         repeated = self.panel.discard_direct_admission({
             "request_id": request_id, "chat_id": second["id"],
             "project_id": "project-1", "lead_id": lead_id,
@@ -6440,6 +7024,75 @@ class WhatThePanelIsTold(BoardTestCase):
             "request_id": request_id,
         }, goal=repeated["goal"])
         runtime.start.assert_called_once()
+
+    def test_exact_direct_goal_lookup_survives_pruned_history_and_rejects_mismatch(
+        self,
+    ) -> None:
+        lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"], "text": "Keep exact lookup after pruning",
+            "request_id": "direct-exact-pruned-lookup-1",
+        }
+        store, _standing, payload, context, inspected, goal = \
+            self.create_real_direct_goal(supplied)
+        self.panel._save_direct_admission(
+            payload, context, str(inspected["admission_digest"]),
+        )
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.get_by_request.side_effect = store.get_by_request
+        lookup = {
+            "request_id": supplied["request_id"],
+            "chat_id": supplied["chat_id"],
+            "project_id": supplied["project_id"],
+            "lead_id": supplied["lead_id"],
+            "intent_sha256": chat.long_horizon_intent_sha256(
+                supplied["chat_id"], supplied["project_id"], supplied["lead_id"],
+                supplied["text"], [],
+            ),
+        }
+
+        status, active = self.ask("/api/long-horizon/admission-goal", lookup)
+        self.assertEqual(status, 200, active)
+        self.assertTrue(active["found"])
+        self.assertEqual(active["goal"]["goal_id"], goal["goal_id"])
+        self.assert_direct_receipt(active, supplied, goal=active["goal"])
+        status, mismatch = self.ask("/api/long-horizon/admission-goal", {
+            **lookup, "intent_sha256": "f" * 64,
+        })
+        self.assertEqual(status, 400, mismatch)
+        self.assertIn("different intent", mismatch["error"])
+
+        long_horizon = server._long_horizon_module()
+        store.control(goal["goal_id"], "cancel")
+        for index in range(long_horizon.MAX_GOALS):
+            filler = store.create(
+                self.panel.swarm_standing()["board"], "project-1",
+                [f"Exact lookup pruning filler {index}"],
+                f"direct-exact-lookup-filler-{index}",
+            )
+            store.control(filler["goal_id"], "cancel")
+        tombstone = store.get_by_request(supplied["request_id"])
+        self.assertTrue(tombstone["request_tombstone"])
+        self.assertTrue(tombstone["reused"])
+
+        status, pruned = self.ask("/api/long-horizon/admission-goal", lookup)
+        self.assertEqual(status, 200, pruned)
+        self.assertTrue(pruned["found"])
+        self.assertTrue(pruned["goal"]["request_tombstone"])
+        self.assertEqual(pruned["goal"]["schema_version"], 1)
+        self.assertTrue(pruned["goal"]["reused"])
+        self.assert_direct_receipt(pruned, supplied, goal=pruned["goal"])
+
+        runtime.store.get_by_request.side_effect = None
+        runtime.store.get_by_request.return_value = {
+            **tombstone, "admission_digest": "e" * 64,
+        }
+        status, wrong_binding = self.ask(
+            "/api/long-horizon/admission-goal", lookup,
+        )
+        self.assertEqual(status, 400, wrong_binding)
+        self.assertIn("different full goal admission binding", wrong_binding["error"])
 
     def test_local_only_outbox_discard_proves_absence_and_fences_delayed_posts(self) -> None:
         lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
@@ -8826,16 +9479,20 @@ class WhatThePanelIsTold(BoardTestCase):
             enlarged.index('if (mode === "work")'):
             enlarged.index('const answered = await request("/api/swarm/say"')
         ]
+        admission_helper = script[
+            script.index("async function prepareDirectLongGoalAdmission"):
+            script.index("function confirmProjectWork")
+        ]
         for body in (compact_work, enlarged_work):
-            outbox_at = body.index("await saveDirectLongGoalOutbox")
-            prepare_at = body.index('request("/api/long-horizon/prepare-admission"')
-            clear_at = body.index('box.value = ""', prepare_at)
-            start_at = body.index('request("/api/long-horizon/start"', prepare_at)
-            self.assertLess(outbox_at, prepare_at)
-            self.assertLess(prepare_at, clear_at)
+            helper_at = body.index("await prepareDirectLongGoalAdmission")
+            clear_at = body.index('box.value = ""', helper_at)
+            start_at = body.index(
+                "await startAndReconcileDirectLongGoalAdmission", helper_at,
+            )
+            self.assertLess(helper_at, clear_at)
             self.assertLess(clear_at, start_at)
-            pending_start = body[start_at:start_at + 450]
-            self.assertIn("from_pending: true", pending_start)
+            pending_start = body[start_at:start_at + 420]
+            self.assertIn("pending.payload_sha256", pending_start)
             self.assertNotIn("attachments", pending_start)
             self.assertNotIn("text: words", pending_start)
             self.assertNotIn("text: said", pending_start)
@@ -8851,10 +9508,39 @@ class WhatThePanelIsTold(BoardTestCase):
             self.assertNotIn("Answer received", body)
             outbox_payload = body[
                 body.index("const exactPayload = {"):
-                body.index("const outbox = await saveDirectLongGoalOutbox")
+                body.index("await prepareDirectLongGoalAdmission")
             ]
             self.assertNotIn("request_id", outbox_payload)
-            self.assertIn("request_id: directRequestId", body[prepare_at:clear_at])
+            self.assertIn("directRequestId, directIntent, directRequestKey", body[helper_at:clear_at])
+            self.assertIn("if (desktopOutbox)", body[start_at:])
+        outbox_at = admission_helper.index("await saveDirectLongGoalOutbox")
+        prepare_at = admission_helper.index(
+            'request("/api/long-horizon/prepare-admission"', outbox_at,
+        )
+        receipt_at = admission_helper.index(
+            "verifiedDirectLongGoalRecoveryRows", prepare_at,
+        )
+        prepared_marker_at = admission_helper.rindex("localStorage.setItem")
+        self.assertLess(outbox_at, prepare_at)
+        self.assertLess(prepare_at, receipt_at)
+        self.assertLess(receipt_at, prepared_marker_at)
+        self.assertIn('request("/api/long-horizon/start"', admission_helper)
+        self.assertIn("verifiedDirectLongGoalStartReceipt", admission_helper)
+        self.assertIn(
+            'request("/api/long-horizon/discard-admission"', admission_helper,
+        )
+        self.assertIn("verifiedDirectLongGoalDiscardReceipt", admission_helper)
+        self.assertIn(
+            "expected, payloadSha256, started.goal.goal_id", admission_helper,
+        )
+        self.assertIn("payload_sha256: payloadSha256", admission_helper)
+        self.assertIn("intent_sha256: expected.intent_sha256", admission_helper)
+        self.assertIn("if (exactMarker) return durableRequest.id", admission_helper)
+        self.assertIn("reconcileExistingDirectLongGoalAdmission", admission_helper)
+        for field in ("request_id", "chat_id", "project_id", "lead_id"):
+            self.assertIn(f"{field}:", admission_helper)
+        self.assertIn("pending?.intent_sha256", admission_helper)
+        self.assertIn("canUseDirectLongGoalDesktopOutbox", admission_helper)
         admission = script[
             script.index("function longHorizonAdmissionWords"):
             script.index("function markSwarmChatActivityStopping")
@@ -8913,22 +9599,26 @@ class WhatThePanelIsTold(BoardTestCase):
             'request("/api/long-horizon/prepare-admission"', local_verify_at,
         )
         start_at = recover_call.index(
-            'request("/api/long-horizon/start"', prepare_replay_at,
+            "await startAndReconcileDirectLongGoalAdmission", prepare_replay_at,
         )
         self.assertLess(desktop_guard_at, local_verify_at)
         self.assertLess(local_verify_at, prepare_replay_at)
         self.assertLess(prepare_replay_at, start_at)
-        self.assertNotIn("if (!recovery.server_pending)", recover_call)
+        self.assertIn("if (!recovery.server_pending)", recover_call)
+        self.assertIn("reconcileExistingDirectLongGoalAdmission(expected)", recover_call)
         self.assertIn("preparedPending.payload_sha256", recover_call)
-        self.assertEqual(
-            recover_call.count('request("/api/long-horizon/start"'), 1,
-        )
+        self.assertNotIn('request("/api/long-horizon/start"', recover_call)
         recovery_catch = recover_call[recover_call.index("} catch (error) {"):]
-        self.assertNotIn('request("/api/long-horizon/start"', recovery_catch)
+        self.assertNotIn("startAndReconcileDirectLongGoalAdmission", recovery_catch)
         self.assertLess(
             recover_call.index("await removeDirectLongGoalOutbox"),
             recover_call.index("forgetDirectLongGoalRecovery"),
         )
+        discard_call = recovery[
+            recovery.index("async function discardDirectLongGoalAdmission"):
+        ]
+        self.assertIn("if (sameDesktopRecord)", discard_call)
+        self.assertNotIn("!recovery.server_pending || sameDesktopRecord", discard_call)
         self.assertIn("exactDirectLongGoalOutboxInventoryValue", script)
         self.assertNotIn("listed?.pending", script)
         self.assertIn("verifiedDirectLongGoalOutboxPayload", recovery)
@@ -9017,6 +9707,1047 @@ class WhatThePanelIsTold(BoardTestCase):
         )
         self.assertIn('"waiting_for_project", "queued", "running"', polling)
         self.assertIn('"queued", "running", "cancelling"', polling)
+
+    def test_browser_work_together_prepare_and_restart_recovery_need_no_desktop_bridge(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the renderer behavior contract")
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        outbox_helpers = script[
+            script.index("const DIRECT_LONG_GOAL_DESKTOP_OUTBOX_METHODS"):
+            script.index("function directLongGoalRecoveryPayloadViewKey")
+        ]
+        prepare_helper = script[
+            script.index("async function prepareDirectLongGoalAdmission"):
+            script.index("function confirmProjectWork")
+        ]
+        recovery_helper = script[
+            script.index("async function recoverDirectLongGoalAdmission"):
+            script.index("async function discardDirectLongGoalAdmission")
+        ]
+        behavior = r'''
+const assert = require("node:assert/strict");
+const DIRECT_LONG_GOAL_RECOVERY_SHA256 = /^[a-f0-9]{64}$/;
+const DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION = 1;
+const digest = "a".repeat(64);
+const payloadDigest = "b".repeat(64);
+let window = {};
+let events = [];
+let responseLead = "";
+const localStorage = {
+  setItem(key, value) { events.push({kind: "local", key, value: JSON.parse(value)}); },
+  getItem() { return null; },
+  removeItem() {},
+};
+function pendingFor(payload, requestId, intent) {
+  return {
+    schema_version: 1,
+    request_id: requestId,
+    chat_id: payload.chat_id,
+    project_id: payload.project_id,
+    lead_id: responseLead || payload.lead_id,
+    intent_sha256: intent,
+    payload_sha256: payloadDigest,
+  };
+}
+function verifiedDirectLongGoalRecoveryRows(value) {
+  assert.ok(Array.isArray(value));
+  return value;
+}
+let request = async (path, options) => {
+  assert.equal(path, "/api/long-horizon/prepare-admission");
+  const body = JSON.parse(options.body);
+  events.push({kind: "prepare", body});
+  return {pending: pendingFor(body, body.request_id, digest)};
+};
+
+  const exact = {
+    project_id: "portable-project", lead_id: "lead", objectives: ["exact goal"],
+    text: "exact goal", chat_id: "chat", attachments: [],
+  };
+  const browser = await prepareDirectLongGoalAdmission(
+    exact, "request-browser", digest, "marker-browser",
+  );
+  assert.equal(browser.desktopOutbox, false);
+  assert.deepEqual(events.map((one) => one.kind), ["prepare", "local"]);
+  assert.equal(events[1].value.prepared, true);
+
+  events = [];
+  responseLead = "different-lead";
+  await assert.rejects(
+    prepareDirectLongGoalAdmission(exact, "request-mismatch", digest, "marker-mismatch"),
+    /different exact lead/,
+  );
+  assert.deepEqual(events.map((one) => one.kind), ["prepare"]);
+
+  events = [];
+  responseLead = "";
+  window = {harnessDesktop: {saveDirectGoalOutbox: async () => ({payload_sha256: digest})}};
+  await assert.rejects(
+    prepareDirectLongGoalAdmission(exact, "request-partial", digest, "marker-partial"),
+    /incomplete durable goal-request bridge/,
+  );
+  assert.deepEqual(events, []);
+
+  events = [];
+  window = {harnessDesktop: {
+    saveDirectGoalOutbox: async (record) => {
+      events.push({kind: "desktop-save", record});
+      return {payload_sha256: record.intent};
+    },
+    listDirectGoalOutbox: async () => [],
+    readDirectGoalOutbox: async () => ({}),
+    deleteDirectGoalOutbox: async () => ({deleted: true, reason: "deleted"}),
+  }};
+  const electron = await prepareDirectLongGoalAdmission(
+    exact, "request-electron", digest, "marker-electron",
+  );
+  assert.equal(electron.desktopOutbox, true);
+  assert.ok(events.findIndex((one) => one.kind === "desktop-save")
+    < events.findIndex((one) => one.kind === "prepare"));
+
+  // Simulate a fresh browser origin/restart: no local marker and no desktop
+  // object. The only recovery identity comes from the backend inventory.
+  window = {};
+  let currentRecovery = {
+    schema_version: 1,
+    request_id: "request-restart", chat_id: "chat-restart",
+    project_id: "portable-project", lead_id: "lead",
+    intent_sha256: digest, payload_sha256: payloadDigest,
+    server_pending: true, desktop_outbox: false,
+  };
+  const directLongGoalRecoveryBusy = new Set();
+  let admissionCalls = [];
+  let desktopDeletes = 0;
+  let markerClears = 0;
+  let longGoal = {};
+  function directLongGoalRecoveryFor() { return currentRecovery; }
+  function renderWorkRecovery() {}
+  function verifiedDirectLongGoalStartReceipt(value, expected) {
+    assert.equal(expected.request_id, currentRecovery.request_id);
+    assert.equal(expected.intent_sha256, digest);
+    return value;
+  }
+  function verifiedDirectLongGoalDiscardReceipt(value, expected) {
+    assert.equal(expected.request_id, currentRecovery.request_id);
+    assert.equal(expected.intent_sha256, digest);
+    return value;
+  }
+  function verifiedDirectLongGoalReceiptIdentity(value, expected) {
+    for (const field of [
+      "request_id", "chat_id", "project_id", "lead_id", "intent_sha256",
+    ]) assert.equal(value[field], expected[field]);
+    return expected;
+  }
+  function verifiedDirectLongGoalReceiptGoal(goal, expected) {
+    assert.equal(goal.request_id, expected.request_id);
+    assert.equal(goal.conversation_id, expected.chat_id);
+    assert.equal(goal.project.id, expected.project_id);
+    assert.equal(goal.lead_agent_id, expected.lead_id);
+    return goal;
+  }
+  async function verifiedDirectLongGoalOutboxPayload() {
+    return {
+      request_id: currentRecovery.request_id, chat_id: currentRecovery.chat_id,
+      payload: {
+        project_id: currentRecovery.project_id, lead_id: currentRecovery.lead_id,
+        chat_id: currentRecovery.chat_id, text: "exact saved desktop work",
+        attachments: [],
+      },
+    };
+  }
+  async function removeDirectLongGoalOutbox() {
+    desktopDeletes += 1;
+    return {deleted: true, reason: "deleted"};
+  }
+  function forgetDirectLongGoalRecovery() { currentRecovery = null; }
+  function preparedDirectLongGoalBrowserMarker() {
+    if (!currentRecovery?.desktop_outbox) return null;
+    return {
+      request_id: currentRecovery.request_id, chat_id: currentRecovery.chat_id,
+      project_id: currentRecovery.project_id, lead_id: currentRecovery.lead_id,
+      intent_sha256: currentRecovery.outbox_payload_sha256,
+    };
+  }
+  function directLongGoalBrowserMarkerForCleanup() {
+    return preparedDirectLongGoalBrowserMarker();
+  }
+  function clearDirectLongGoalRequestMarker() {
+    markerClears += 1;
+    return true;
+  }
+  function selectLongGoalSnapshot(goal) { longGoal = goal; }
+  function activeConversationIdFor() { return "another-origin-chat"; }
+  async function refreshTheChatFor() {}
+  async function refreshLongGoals() {}
+  function longHorizonAdmissionWords() { return {detail: "accepted"}; }
+  function sayInTheChatFor() {}
+  async function refreshDirectLongGoalRecoveries() {}
+  function showError(error) { throw new Error(error); }
+  request = async (path, options) => {
+    const body = JSON.parse(options.body);
+    admissionCalls.push({path, body});
+    if (path === "/api/long-horizon/start") {
+      return {goal: {goal_id: "goal-restart", status: "queued"}};
+    }
+    if (path === "/api/long-horizon/discard-admission") {
+      return {
+        discarded: false, reconciled: true, safe_to_delete: false,
+        goal: {goal_id: "goal-restart", status: "queued"},
+      };
+    }
+    assert.equal(path, "/api/long-horizon/acknowledge-admission");
+    return {
+      schema_version: 1, request_id: body.request_id, chat_id: body.chat_id,
+      project_id: body.project_id, lead_id: body.lead_id,
+      intent_sha256: body.intent_sha256, terminal_state: "reconciled",
+      goal_id: "goal-restart", client_consumed: true,
+      goal: {
+        schema_version: 1, goal_id: "goal-restart", request_id: body.request_id,
+        conversation_id: body.chat_id, project: {id: body.project_id},
+        lead_agent_id: body.lead_id, status: "queued",
+      },
+    };
+  };
+  await recoverDirectLongGoalAdmission("lead");
+  await recoverDirectLongGoalAdmission("lead");
+  assert.deepEqual(admissionCalls, [
+    {path: "/api/long-horizon/start", body: {
+      request_id: "request-restart", chat_id: "chat-restart", from_pending: true,
+    }},
+    {path: "/api/long-horizon/discard-admission", body: {
+      request_id: "request-restart", chat_id: "chat-restart",
+      project_id: "portable-project", lead_id: "lead",
+      payload_sha256: payloadDigest, intent_sha256: digest,
+    }},
+    {path: "/api/long-horizon/acknowledge-admission", body: {
+      request_id: "request-restart", chat_id: "chat-restart",
+      project_id: "portable-project", lead_id: "lead",
+      intent_sha256: digest, terminal_state: "reconciled",
+      goal_id: "goal-restart",
+    }},
+  ]);
+  assert.equal(desktopDeletes, 0);
+
+  // The backend committed reconciliation but its response was lost. Only the
+  // desktop outbox remains. Recovery must use exact-by-request lookup and
+  // acknowledgement retry, never prepare/start or another provider dispatch.
+  currentRecovery = {
+    schema_version: 1,
+    request_id: "request-ack-lost", chat_id: "chat-ack-lost",
+    project_id: "portable-project", lead_id: "lead",
+    intent: digest, payload_sha256: digest,
+    outbox_payload_sha256: digest,
+    server_pending: false, desktop_outbox: true,
+  };
+  window = {harnessDesktop: {}};
+  admissionCalls = [];
+  request = async (path, options) => {
+    const body = JSON.parse(options.body);
+    admissionCalls.push({path, body});
+    const goal = {
+      schema_version: 1, goal_id: "goal-ack-lost",
+      request_id: body.request_id, conversation_id: body.chat_id,
+      project: {id: "portable-project"}, lead_agent_id: "lead", status: "complete",
+    };
+    const identity = {
+      schema_version: 1, request_id: body.request_id, chat_id: body.chat_id,
+      project_id: "portable-project", lead_id: "lead", intent_sha256: digest,
+    };
+    if (path === "/api/long-horizon/admission-goal") {
+      return {...identity, found: true, goal};
+    }
+    if (path === "/api/long-horizon/discard-admission") {
+      return {
+        ...identity, discarded: false, reconciled: true,
+        safe_to_delete: false, goal,
+      };
+    }
+    assert.equal(path, "/api/long-horizon/acknowledge-admission");
+    return {
+      ...identity, terminal_state: "reconciled", goal_id: goal.goal_id,
+      client_consumed: true, goal,
+    };
+  };
+  await recoverDirectLongGoalAdmission("lead");
+  assert.deepEqual(admissionCalls.map((one) => one.path), [
+    "/api/long-horizon/admission-goal",
+    "/api/long-horizon/discard-admission",
+    "/api/long-horizon/acknowledge-admission",
+  ]);
+  assert.equal(desktopDeletes, 1);
+  assert.equal(markerClears, 1);
+'''
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            probe = Path(folder) / "browser-long-horizon-contract.js"
+            probe.write_text(
+                "\"use strict\";\n(async () => {\n" + outbox_helpers + "\n"
+                + prepare_helper + "\n" + recovery_helper + "\n" + behavior
+                + "\n})().catch((error) => {\n"
+                  "  console.error(error && error.stack ? error.stack : error);\n"
+                  "  process.exitCode = 1;\n"
+                  "});\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [node, str(probe)], capture_output=True, text=True, timeout=30,
+                check=False,
+            )
+        self.assertEqual(
+            completed.returncode, 0,
+            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
+    def test_renderer_exact_lookup_accepts_normalized_pruned_goal_tombstone(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the renderer receipt contract")
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        receipt_helpers = script[
+            script.index("const DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION"):
+            script.index("function appendDirectLongGoalExactPayload")
+        ]
+        admission_helpers = script[
+            script.index("async function exactExistingDirectLongGoal"):
+            script.index("function confirmProjectWork")
+        ]
+        behavior = r'''
+const assert = require("node:assert/strict");
+const DIRECT_LONG_GOAL_RECOVERY_SHA256 = /^[a-f0-9]{64}$/;
+const digest = "a".repeat(64);
+const expected = {
+  request_id: "request-pruned", chat_id: "chat-pruned",
+  project_id: "project-pruned", lead_id: "lead-pruned",
+  intent_sha256: digest,
+};
+const tombstone = {
+  schema_version: 1,
+  request_tombstone_schema_version: 1, request_tombstone: true,
+  goal_id: "goal-pruned", request_id: expected.request_id,
+  conversation_id: expected.chat_id, project: {id: expected.project_id},
+  lead_agent_id: expected.lead_id, status: "cancelled", reused: true,
+};
+let calls = [];
+let mismatch = false;
+async function request(path, options) {
+  const body = JSON.parse(options.body);
+  calls.push({path, body});
+  const identity = {
+    schema_version: 1, request_id: body.request_id, chat_id: body.chat_id,
+    project_id: body.project_id, lead_id: body.lead_id,
+    intent_sha256: mismatch ? "b".repeat(64) : digest,
+  };
+  if (path === "/api/long-horizon/admission-goal") {
+    return {...identity, found: true, goal: tombstone};
+  }
+  assert.equal(path, "/api/long-horizon/discard-admission");
+  return {
+    ...identity, discarded: false, reconciled: true,
+    safe_to_delete: false, goal: tombstone,
+  };
+}
+const reconciled = await reconcileExistingDirectLongGoalAdmission(expected);
+assert.equal(reconciled.goal.goal_id, tombstone.goal_id);
+assert.equal(reconciled.goal.request_tombstone, true);
+assert.deepEqual(calls.map((one) => one.path), [
+  "/api/long-horizon/admission-goal",
+  "/api/long-horizon/discard-admission",
+]);
+mismatch = true;
+await assert.rejects(
+  () => reconcileExistingDirectLongGoalAdmission(expected),
+  /different exact intent digest/,
+);
+'''
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            probe = Path(folder) / "pruned-direct-goal-receipt.js"
+            probe.write_text(
+                "\"use strict\";\n(async () => {\n" + receipt_helpers + "\n"
+                + admission_helpers + "\n" + behavior
+                + "\n})().catch((error) => {\n"
+                  "  console.error(error && error.stack ? error.stack : error);\n"
+                  "  process.exitCode = 1;\n"
+                  "});\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [node, str(probe)], capture_output=True, text=True, timeout=30,
+                check=False,
+            )
+        self.assertEqual(
+            completed.returncode, 0,
+            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
+    def test_browser_marker_reconciles_without_retyping_or_second_start(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the browser recovery contract")
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        marker_helpers = script[
+            script.index("function clearDirectLongGoalRequestMarker"):
+            script.index("const DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION")
+        ]
+        receipt_helpers = script[
+            script.index("const DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION"):
+            script.index("function appendDirectLongGoalExactPayload")
+        ]
+        reconciliation_helpers = script[
+            script.index("async function exactExistingDirectLongGoal"):
+            script.index("function confirmProjectWork")
+        ]
+        recovery_helper = script[
+            script.index("async function recoverDirectLongGoalAdmission"):
+            script.index("async function discardDirectLongGoalAdmission")
+        ]
+        discard_helper = script[
+            script.index("async function discardDirectLongGoalAdmission"):
+            script.index("function fillWorkRecoveryPanel")
+        ]
+        behavior = r'''
+const assert = require("node:assert/strict");
+const DIRECT_LONG_GOAL_RECOVERY_SHA256 = /^[a-f0-9]{64}$/;
+const requestId = "browser-marker-request";
+const olderRequestId = "browser-marker-older-legacy-request";
+const digest = "a".repeat(64);
+const olderDigest = "c".repeat(64);
+const payloadDigest = "b".repeat(64);
+const conversation = {id: "chat marker", project: "project marker"};
+const agentId = "lead marker";
+const markerKey = `nexus.long-horizon.direct-request.${agentId}|${conversation.id}`;
+const markerStorage = new Map([[markerKey, JSON.stringify({
+  schema_version: 3, id: requestId, intent: digest, prepared: true,
+  payload_sha256: payloadDigest, chat_id: conversation.id,
+  project_id: conversation.project, lead_id: agentId,
+})]]);
+const timeline = [];
+const localStorage = {
+  getItem(key) { return markerStorage.has(key) ? markerStorage.get(key) : null; },
+  removeItem(key) { markerStorage.delete(key); timeline.push("marker-clear"); },
+};
+const directLongGoalRecoveries = new Map();
+const directLongGoalRecoveryBusy = new Set();
+const directLongGoalRecoveryPayloadViews = new Map();
+let directLongGoalRecoveryRefreshRevision = 0;
+let directLongGoalRecoveryInventoryReady = true;
+let directLongGoalRecoveryError = "";
+let longGoal = null;
+let forgotten = 0;
+let recoveryRefreshes = 0;
+const recoveryRefreshQueue = [];
+const calls = [];
+const window = {confirm() { return true; }};
+let activeConversation = conversation;
+function activeConversationFor() { return activeConversation; }
+function activeConversationIdFor() { return activeConversation.id; }
+function swarmChatKeyFor(lead, chat) { return `${lead}|${chat}`; }
+function renderWorkRecovery() {}
+function forgetDirectLongGoalRecovery() {
+  forgotten += 1;
+  directLongGoalRecoveries.delete(conversation.id);
+}
+function selectLongGoalSnapshot(goal) { longGoal = goal; }
+async function refreshTheChatFor() {}
+async function refreshLongGoals() {}
+function longHorizonAdmissionWords() { return {detail: "accepted"}; }
+function sayInTheChatFor() {}
+function showError(message) { throw new Error(String(message)); }
+async function refreshDirectLongGoalRecoveries() {
+  recoveryRefreshes += 1;
+  directLongGoalRecoveries.clear();
+  const next = recoveryRefreshQueue.shift();
+  if (next) directLongGoalRecoveries.set(next.chat_id, next);
+}
+let desktopDeletes = 0;
+async function removeDirectLongGoalOutbox() {
+  desktopDeletes += 1;
+  timeline.push("desktop-clear");
+  return {deleted: true, reason: "deleted"};
+}
+let discardAsAbsent = false;
+function exactGoal(exactRequestId = requestId) {
+  return {
+    schema_version: 1,
+    goal_id: exactRequestId === olderRequestId ? "goal older legacy" : "goal marker",
+    request_id: exactRequestId,
+    conversation_id: conversation.id, project: {id: conversation.project},
+    lead_agent_id: agentId, status: "complete",
+  };
+}
+async function request(path, options = {}) {
+  const body = JSON.parse(options.body);
+  calls.push({path, body});
+  timeline.push(path);
+  const exactRequestId = String(body.request_id || requestId);
+  const exactIntent = exactRequestId === olderRequestId ? olderDigest : digest;
+  const identity = {
+    schema_version: 1, request_id: exactRequestId, chat_id: conversation.id,
+    project_id: conversation.project, lead_id: agentId,
+    intent_sha256: exactIntent,
+  };
+  if (path === "/api/long-horizon/admission-goal") {
+    return {...identity, found: true, goal: exactGoal(exactRequestId)};
+  }
+  if (path === "/api/long-horizon/discard-admission") {
+    if (discardAsAbsent) {
+      return {
+        ...identity, discarded: true, reconciled: false,
+        safe_to_delete: true,
+      };
+    }
+    return {
+      ...identity, discarded: false, reconciled: true,
+      safe_to_delete: false, goal: exactGoal(exactRequestId),
+    };
+  }
+  if (path === "/api/long-horizon/acknowledge-admission") {
+    const acknowledged = {
+      ...identity, terminal_state: body.terminal_state,
+      goal_id: body.goal_id, client_consumed: true,
+    };
+    if (body.terminal_state === "reconciled") {
+      acknowledged.goal = exactGoal(exactRequestId);
+    }
+    return acknowledged;
+  }
+  throw new Error(`unexpected provider/admission request ${path}`);
+}
+
+// The newest request retains the only plausible browser marker after an old
+// response loss. Once it is acknowledged, the mandatory authority refresh
+// must reveal the next older authenticated v0.2.1 terminal row before Work can
+// be enabled again.
+recoveryRefreshQueue.push({
+  schema_version: 1, request_id: olderRequestId, chat_id: conversation.id,
+  project_id: conversation.project, lead_id: agentId,
+  intent_sha256: olderDigest, payload_sha256: "d".repeat(64),
+  terminal_state: "reconciled", server_terminal: "reconciled",
+  goal_id: "goal older legacy", client_consumed: false,
+  legacy_terminal: true, server_pending: false, desktop_outbox: false,
+});
+const recovered = directLongGoalRecoveryFor(agentId);
+assert.equal(recovered.browser_marker, true);
+assert.equal(recovered.request_id, requestId);
+assert.equal(recovered.text_preview, "");
+await recoverDirectLongGoalAdmission(agentId);
+assert.deepEqual(calls.map((one) => one.path), [
+  "/api/long-horizon/admission-goal",
+  "/api/long-horizon/discard-admission",
+  "/api/long-horizon/acknowledge-admission",
+]);
+assert.equal(calls.some((one) => one.path.includes("prepare")), false);
+assert.equal(calls.some((one) => one.path.includes("start")), false);
+assert.equal(forgotten, 1);
+assert.equal(markerStorage.size, 0);
+assert.equal(longGoal.goal_id, "goal marker");
+assert.equal(recoveryRefreshes, 1);
+assert.equal(directLongGoalRecoveryFor(agentId).request_id, olderRequestId);
+
+// The older legacy row has no local marker. Its only authority is the refreshed
+// backend inventory. Drain it through exact lookup + acknowledgement, with no
+// prepare/start/provider replay, before the chat becomes clear.
+calls.length = 0;
+await recoverDirectLongGoalAdmission(agentId);
+assert.deepEqual(calls.map((one) => one.path), [
+  "/api/long-horizon/admission-goal",
+  "/api/long-horizon/acknowledge-admission",
+]);
+assert.equal(forgotten, 2);
+assert.equal(markerStorage.size, 0);
+assert.equal(recoveryRefreshes, 2);
+assert.equal(directLongGoalRecoveries.size, 0);
+
+// An Electron outbox can crash after its exact pre-prepare schema-v3 marker
+// is written. Even while another chat is active, Discard must verify that
+// marker before any irreversible server/outbox action, then clear desktop and
+// browser authorities before consuming the terminal fence.
+calls.length = 0;
+timeline.length = 0;
+discardAsAbsent = true;
+activeConversation = {id: "different active chat", project: "different project"};
+markerStorage.set(markerKey, JSON.stringify({
+  schema_version: 3, id: requestId, intent: digest,
+  chat_id: conversation.id, project_id: conversation.project, lead_id: agentId,
+  prepared: false,
+}));
+const inactiveRecovery = {
+  schema_version: 1, request_id: requestId, chat_id: conversation.id,
+  project_id: conversation.project, lead_id: agentId,
+  intent: digest, outbox_payload_sha256: digest, payload_sha256: digest,
+  server_pending: false, desktop_outbox: true,
+};
+await discardDirectLongGoalAdmission(agentId, inactiveRecovery);
+assert.deepEqual(timeline, [
+  "/api/long-horizon/discard-admission",
+  "desktop-clear", "marker-clear",
+  "/api/long-horizon/acknowledge-admission",
+]);
+assert.equal(desktopDeletes, 1);
+assert.equal(markerStorage.size, 0);
+
+// A crash may occur after the desktop outbox commits but before localStorage
+// is written. The prior exact raw read proved absence, so desktop deletion can
+// be followed directly by terminal acknowledgement without a phantom marker
+// clear failure.
+calls.length = 0;
+timeline.length = 0;
+await discardDirectLongGoalAdmission(agentId, inactiveRecovery);
+assert.deepEqual(timeline, [
+  "/api/long-horizon/discard-admission",
+  "desktop-clear",
+  "/api/long-horizon/acknowledge-admission",
+]);
+assert.equal(desktopDeletes, 2);
+
+// Present-but-invalid inactive marker fails before server retirement or local
+// deletion; no terminal acknowledgement can hide it.
+calls.length = 0;
+timeline.length = 0;
+markerStorage.set(markerKey, "null");
+await assert.rejects(
+  () => discardDirectLongGoalAdmission(agentId, inactiveRecovery),
+  /saved browser goal-request marker/,
+);
+assert.deepEqual(timeline, []);
+assert.equal(desktopDeletes, 2);
+'''
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            probe = Path(folder) / "browser-marker-exact-recovery.js"
+            probe.write_text(
+                "\"use strict\";\n(async () => {\n" + marker_helpers + "\n"
+                + receipt_helpers + "\n" + reconciliation_helpers + "\n"
+                + recovery_helper + "\n" + discard_helper + "\n" + behavior
+                + "\n})().catch((error) => {\n"
+                  "  console.error(error && error.stack ? error.stack : error);\n"
+                  "  process.exitCode = 1;\n"
+                  "});\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [node, str(probe)], capture_output=True, text=True, timeout=30,
+                check=False,
+            )
+        self.assertEqual(
+            completed.returncode, 0,
+            msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+
+    def test_browser_work_together_executes_both_real_composer_handlers(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is required for the renderer behavior contract")
+        script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(
+            encoding="utf-8")
+        outbox_helpers = script[
+            script.index("const DIRECT_LONG_GOAL_DESKTOP_OUTBOX_METHODS"):
+            script.index("function directLongGoalRecoveryPayloadViewKey")
+        ]
+        receipt_helpers = script[
+            script.index("const DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION"):
+            script.index("function appendDirectLongGoalExactPayload")
+        ]
+        prepare_helper = script[
+            script.index("async function prepareDirectLongGoalAdmission"):
+            script.index("function confirmProjectWork")
+        ]
+        pause_helper = script[
+            script.index("function projectWorkPauseForMessage"):
+            script.index("function directLongGoalCanonicalValue")
+        ]
+        handlers = {
+            "compact": script[
+                script.index("async function sendWhatIsTypedTo"):
+                script.index("async function startTheChatAgainFor")
+            ],
+            "maximized": script[
+                script.index("async function sendFromTheBigChat"):
+                script.index("function wireUpTheTray")
+            ],
+        }
+        shared = r'''
+const assert = require("node:assert/strict");
+let window = {};
+const DIRECT_LONG_GOAL_RECOVERY_SHA256 = /^[a-f0-9]{64}$/;
+const words = "Portable exact Work Together objective";
+const digest = "a".repeat(64);
+const payloadDigest = "b".repeat(64);
+let events = [];
+const box = {
+  value: words, focus() {}, setSelectionRange() {},
+};
+const dom = new Map([
+  ["theBigChatBox", box],
+  ["theBigChatSaidBack", {textContent: ""}],
+]);
+function $(id) {
+  if (!dom.has(id)) dom.set(id, {disabled: false, textContent: ""});
+  return dom.get(id);
+}
+const card = {querySelector(selector) {
+  assert.equal(selector, ".swarm-chat-box");
+  return box;
+}};
+const agent = {id: "lead", name: "Lead", who: "codex", ready: true};
+const conversation = {id: "chat-portable", project: "project-portable"};
+let theBigOne = "lead";
+let longGoal = null;
+let forgot = 0;
+let cleared = 0;
+let desktopDeletes = 0;
+let directLongGoalRecoveryInventoryReady = true;
+let directLongGoalRecoveryError = "";
+const swarmBusy = new Set();
+const swarmStopping = new Set();
+const swarmChatResetting = new Set();
+const swarmConversationSwitching = new Set();
+const swarmChatAttachments = new Map();
+const swarmChatComposerDrafts = new Map();
+const theBigChatComposerDrafts = new Map();
+const markerStorage = new Map();
+const localStorage = {
+  getItem(key) { return markerStorage.has(key) ? markerStorage.get(key) : null; },
+  setItem(key, value) {
+    markerStorage.set(key, value);
+    events.push({kind: "local", key, value: JSON.parse(value)});
+  },
+  removeItem(key) { markerStorage.delete(key); },
+};
+function theChatCardFor() { return card; }
+function theSwarmAgent() { return agent; }
+function swarmProjectWorkPauseMessage() { return ""; }
+function limitsForSwarmChat() { return {input_characters: 200000}; }
+function activeConversationFor() { return conversation; }
+function swarmChatKey() { return "lead|chat-portable"; }
+function swarmChatRuntimeKey() { return "lead|chat-portable"; }
+function swarmChatIsHydrating() { return false; }
+function isLoneAgentChat() { return false; }
+function syncChatTeamReadiness() { return []; }
+function confirmProjectWork() { return {allowed: true, confirmed: true}; }
+function nextSwarmChatRevision() {}
+function setWhatCanBePressedInSwarm() {}
+function rememberSwarmChatComposer() {}
+function rememberTheBigChatComposer() {}
+function beginSwarmChatActivity() { return {id: "activity-portable"}; }
+function sayInTheChatFor() {}
+function sayInRuntimeChat() {}
+async function directLongGoalIntent() { return digest; }
+function verifiedDirectLongGoalRecoveryRows(rows) {
+  assert.equal(rows.length, 1);
+  return rows;
+}
+async function removeDirectLongGoalOutbox() {
+  desktopDeletes += 1;
+  return {deleted: true, reason: "deleted"};
+}
+function forgetDirectLongGoalRecovery() { forgot += 1; }
+function clearDirectLongGoalRequestMarker(agentId, chatId, requestId, intent) {
+  cleared += 1;
+  for (const [key, raw] of markerStorage) {
+    const marker = JSON.parse(raw);
+    if (marker.id === requestId && marker.intent === intent) markerStorage.delete(key);
+  }
+  return true;
+}
+function swarmActivityCanReconcileSuccess() { return true; }
+function selectLongGoalSnapshot(goal) { longGoal = goal; }
+async function refreshTheChatFor() {}
+function finishLongHorizonAdmissionActivity() {}
+function clearSwarmActivityAttachments() {}
+function longHorizonAdmissionWords() { return {detail: "accepted"}; }
+async function refreshLongGoals() {}
+function swarmActivityCanSettle() { return true; }
+function restoreSwarmChatDraft(chatKey, value) {
+  if (!box.value) box.value = value;
+  if (!swarmChatComposerDrafts.get(chatKey)?.value) {
+    swarmChatComposerDrafts.set(chatKey, {
+      value, start: value.length, end: value.length, direction: "none",
+    });
+  }
+}
+async function refreshDirectLongGoalRecoveries() {}
+function stoppedChatError() { return false; }
+function showError(error) { throw error instanceof Error ? error : new Error(String(error)); }
+function finishSwarmChatActivity() {}
+function finishSwarmActivityResponse() {}
+function swarmActivityIsCurrent() { return true; }
+function selectedChatRoundLimit() { return 3; }
+function rememberWorkRecoveryForKey() {}
+function keepWhatWasSaidToRuntime() {}
+function renderWorkRecovery() {}
+function normalizedParticipantOutcome() { return null; }
+function workResponseWords() { return "answered"; }
+function automaticRoundStopWords() { return ""; }
+function refreshSwarm() {}
+let prepareDraft = "";
+let startDraft = "";
+let startBody = null;
+let outcomeMode = "ok";
+let acknowledgementCommitted = false;
+function exactGoal(requestId, goalId = "goal-portable") {
+  return {
+    schema_version: 1, goal_id: goalId, request_id: requestId,
+    conversation_id: conversation.id, project: {id: conversation.project},
+    lead_agent_id: agent.id, status: "queued",
+  };
+}
+function exactReceipt(requestId, goalId = "goal-portable") {
+  return {
+    schema_version: 1, engine: "long_horizon", request_id: requestId,
+    chat_id: conversation.id, project_id: conversation.project,
+    lead_id: agent.id, intent_sha256: digest,
+    goal: exactGoal(requestId, goalId),
+  };
+}
+async function request(path, options = {}) {
+  if (path === "/api/long-horizon/prepare-admission") {
+    prepareDraft = box.value;
+    const body = JSON.parse(options.body);
+    events.push({kind: "prepare", body});
+    if (outcomeMode === "retry-ack") {
+      throw new Error("request identity was explicitly retired");
+    }
+    return {pending: {
+      schema_version: 1, request_id: body.request_id,
+      chat_id: body.chat_id, project_id: body.project_id, lead_id: body.lead_id,
+      intent_sha256: digest, payload_sha256: payloadDigest,
+    }};
+  }
+  if (path === "/api/long-horizon/start") {
+    startDraft = box.value;
+    startBody = JSON.parse(options.body);
+    events.push({kind: "start", body: startBody});
+    const receipt = exactReceipt(startBody.request_id);
+    if (outcomeMode === "bad-start") receipt.intent_sha256 = "c".repeat(64);
+    return receipt;
+  }
+  if (path === "/api/long-horizon/discard-admission") {
+    const body = JSON.parse(options.body);
+    events.push({kind: "reconcile", body});
+    if (outcomeMode === "lost-reconcile") {
+      throw new Error("simulated lost reconciliation response");
+    }
+    const receipt = exactReceipt(body.request_id,
+      outcomeMode === "bad-reconcile" ? "different-goal" : "goal-portable");
+    delete receipt.engine;
+    return {...receipt, discarded: false, reconciled: true, safe_to_delete: false};
+  }
+  if (path === "/api/long-horizon/admission-goal") {
+    const body = JSON.parse(options.body);
+    events.push({kind: "lookup", body});
+    const receipt = exactReceipt(body.request_id);
+    delete receipt.engine;
+    return {...receipt, found: true};
+  }
+  if (path === "/api/long-horizon/acknowledge-admission") {
+    const body = JSON.parse(options.body);
+    events.push({kind: "acknowledge", body});
+    if (outcomeMode === "lost-ack-before") {
+      throw new Error("simulated acknowledgement loss before commit");
+    }
+    if (outcomeMode === "lost-ack-after") {
+      acknowledgementCommitted = true;
+      throw new Error("simulated acknowledgement loss after commit");
+    }
+    const receipt = exactReceipt(body.request_id);
+    delete receipt.engine;
+    return {
+      ...receipt, terminal_state: body.terminal_state,
+      goal_id: body.goal_id, client_consumed: true,
+    };
+  }
+  throw new Error(`unexpected request ${path}`);
+}
+'''
+        invocations = {
+            "compact": 'await sendWhatIsTypedTo("lead", "work", {allowed: true, confirmed: true}, null);',
+            "maximized": 'await sendFromTheBigChat("work");',
+        }
+        promise_invocations = {
+            "compact": 'sendWhatIsTypedTo("lead", "work", {allowed: true, confirmed: true}, null)',
+            "maximized": 'sendFromTheBigChat("work")',
+        }
+        assertions = r'''
+assert.equal(prepareDraft, words);
+assert.equal(startDraft, "", "draft must clear only after exact prepare receipt");
+assert.equal(box.value, "");
+assert.deepEqual(events.map((event) => event.kind), [
+  "prepare", "local", "start", "reconcile", "acknowledge",
+]);
+assert.deepEqual(Object.keys(startBody).sort(), ["chat_id", "from_pending", "request_id"]);
+assert.equal(startBody.chat_id, conversation.id);
+assert.equal(startBody.from_pending, true);
+const reconcileBody = events.find((event) => event.kind === "reconcile").body;
+assert.deepEqual(Object.keys(reconcileBody).sort(), [
+  "chat_id", "intent_sha256", "lead_id", "payload_sha256", "project_id", "request_id",
+]);
+assert.equal(reconcileBody.payload_sha256, payloadDigest);
+assert.equal(reconcileBody.intent_sha256, digest);
+assert.equal(forgot, 1);
+assert.equal(cleared, 1);
+assert.equal(desktopDeletes, 0);
+'''
+        negative_template = r'''
+events = [];
+box.value = words;
+directLongGoalRecoveryInventoryReady = false;
+directLongGoalRecoveryError = "";
+await __WORK_PROMISE__;
+assert.deepEqual(events, [], "Work must not POST before recovery authority is ready");
+assert.equal(box.value, words);
+
+directLongGoalRecoveryError = "saved journal inventory unavailable";
+await __WORK_PROMISE__;
+assert.deepEqual(events, [], "Work must not POST after recovery inventory failure");
+assert.equal(box.value, words);
+directLongGoalRecoveryInventoryReady = true;
+directLongGoalRecoveryError = "";
+
+const malformedMarkerKey =
+  "nexus.long-horizon.direct-request.lead|chat-portable";
+for (const malformedMarker of ["{not-json", "null", ""]) {
+  markerStorage.set(malformedMarkerKey, malformedMarker);
+  await assert.rejects(
+    () => __WORK_PROMISE__,
+    /saved browser goal-request marker/,
+  );
+  assert.deepEqual(events, [],
+    "a present inexact marker must fail before every admission POST");
+  assert.equal(box.value, words);
+  markerStorage.delete(malformedMarkerKey);
+}
+
+window = {harnessDesktop: {saveDirectGoalOutbox: async () => ({})}};
+await assert.rejects(
+  () => __WORK_PROMISE__,
+  /incomplete durable goal-request bridge/,
+);
+assert.deepEqual(events, [], "partial desktop bridge must fail before POST");
+assert.equal(box.value, words);
+
+function exactDesktopBridge() {
+  return {harnessDesktop: {
+    saveDirectGoalOutbox: async (record) => {
+      events.push({kind: "desktop-save", record});
+      return {payload_sha256: record.intent};
+    },
+    listDirectGoalOutbox: async () => [],
+    readDirectGoalOutbox: async () => ({}),
+    deleteDirectGoalOutbox: async () => ({deleted: true, reason: "deleted"}),
+  }};
+}
+
+for (const [mode, pattern] of [
+  ["bad-start", /different exact intent digest/],
+  ["bad-reconcile", /did not reconcile the exact canonical durable goal/],
+  ["lost-reconcile", /simulated lost reconciliation response/],
+]) {
+  events = [];
+  box.value = words;
+  swarmChatComposerDrafts.clear();
+  theBigChatComposerDrafts.clear();
+  window = exactDesktopBridge();
+  outcomeMode = mode;
+  await assert.rejects(() => __WORK_PROMISE__, pattern);
+  assert.ok(events.some((event) => event.kind === "start"));
+  if (mode === "bad-start") {
+    assert.ok(!events.some((event) => event.kind === "reconcile"));
+  } else {
+    assert.ok(events.some((event) => event.kind === "reconcile"));
+  }
+  assert.equal(desktopDeletes, 0, `${mode} deleted the durable desktop outbox`);
+  assert.equal(forgot, 1, `${mode} forgot recovery without an exact receipt`);
+  assert.equal(cleared, 1, `${mode} cleared its marker without an exact receipt`);
+  assert.equal(box.value, words, `${mode} did not restore the exact draft`);
+}
+
+const lostElectronRequest = events.find((event) => event.kind === "start").body.request_id;
+assert.equal(markerStorage.size, 1, "lost Electron reconcile did not retain its marker");
+events = [];
+box.value = words;
+outcomeMode = "retry-ack";
+await __WORK_PROMISE__;
+assert.ok(events.some((event) => event.kind === "lookup"));
+assert.ok(events.some((event) => event.kind === "reconcile"));
+assert.ok(!events.some((event) => event.kind === "start"),
+  "Electron acknowledgement retry started the provider request again");
+assert.equal(events.find((event) => event.kind === "lookup").body.request_id,
+  lostElectronRequest);
+assert.equal(desktopDeletes, 1);
+assert.equal(markerStorage.size, 0);
+
+// Repeat the same committed-ack/response-loss boundary with no Electron
+// bridge. The schema-v3 marker alone must preserve the request id and turn a
+// later explicit Work press into exact lookup + acknowledgement only.
+events = [];
+box.value = words;
+window = {};
+outcomeMode = "lost-reconcile";
+await assert.rejects(() => __WORK_PROMISE__, /simulated lost reconciliation response/);
+const lostBrowserRequest = events.find((event) => event.kind === "start").body.request_id;
+assert.equal(markerStorage.size, 1, "browser reconciliation loss erased its exact marker");
+events = [];
+box.value = words;
+outcomeMode = "retry-ack";
+await __WORK_PROMISE__;
+assert.deepEqual(events.filter((event) => ["start", "lookup", "reconcile"].includes(event.kind))
+  .map((event) => event.kind), ["lookup", "reconcile"]);
+assert.equal(events.find((event) => event.kind === "lookup").body.request_id,
+  lostBrowserRequest);
+assert.equal(desktopDeletes, 1, "ordinary-browser retry touched a desktop outbox");
+assert.equal(markerStorage.size, 0, "exact browser acknowledgement did not clear its marker");
+
+// The terminal consume is deliberately the final, best-effort cleanup phase.
+// Whether its network loss happened before or after the server commit cannot
+// turn the already verified start/reconcile into a failed send or restore a
+// draft that could be clicked as a fresh request.
+for (const ackLossMode of ["lost-ack-before", "lost-ack-after"]) {
+  events = [];
+  box.value = words;
+  window = {};
+  outcomeMode = ackLossMode;
+  acknowledgementCommitted = false;
+  await __WORK_PROMISE__;
+  assert.deepEqual(events.filter((event) => [
+    "prepare", "start", "reconcile", "acknowledge",
+  ].includes(event.kind)).map((event) => event.kind), [
+    "prepare", "start", "reconcile", "acknowledge",
+  ]);
+  assert.equal(box.value, "",
+    `${ackLossMode} incorrectly restored a verified goal draft`);
+  assert.equal(markerStorage.size, 0,
+    `${ackLossMode} retained a local marker after exact local cleanup`);
+  assert.equal(acknowledgementCommitted, ackLossMode === "lost-ack-after");
+}
+'''
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            for name, handler in handlers.items():
+                negative = negative_template.replace(
+                    "__WORK_PROMISE__", promise_invocations[name],
+                )
+                probe = Path(folder) / f"browser-{name}-work-handler.js"
+                probe.write_text(
+                    "\"use strict\";\n(async () => {\n" + shared + "\n"
+                    + outbox_helpers + "\n" + receipt_helpers + "\n"
+                    + prepare_helper + "\n" + pause_helper + "\n" + handler + "\n"
+                    + invocations[name] + "\n" + assertions
+                    + "\n" + negative
+                    + "\n})().catch((error) => {\n"
+                      "  console.error(error && error.stack ? error.stack : error);\n"
+                      "  process.exitCode = 1;\n"
+                      "});\n",
+                    encoding="utf-8",
+                )
+                completed = subprocess.run(
+                    [node, str(probe)], capture_output=True, text=True, timeout=30,
+                    check=False,
+                )
+                self.assertEqual(
+                    completed.returncode, 0,
+                    msg=f"{name} stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+                )
 
     def test_failed_long_goal_stays_cancellable_while_it_owns_the_project(self) -> None:
         script = (Path(__file__).resolve().parents[1] / "src/our_harness/ui/app.js").read_text(

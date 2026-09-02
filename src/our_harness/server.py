@@ -72,6 +72,7 @@ DIRECT_LONG_HORIZON_ADMISSION_MAX_PENDING = 20
 DIRECT_LONG_HORIZON_ADMISSION_MAX_TOMBSTONES = 2048
 DIRECT_LONG_HORIZON_ADMISSION_BINDING_SCHEMA_VERSION = 1
 DIRECT_LONG_HORIZON_RECEIPT_SCHEMA_VERSION = 1
+DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION = 1
 
 
 def _long_horizon_module():
@@ -960,6 +961,125 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             )
         return digest
 
+    @staticmethod
+    def _direct_terminal_client_state(record: dict[str, Any]) -> str:
+        """Classify an authenticated terminal row without guessing its age.
+
+        Version 0.2.1 terminal rows predate client acknowledgement and contain
+        none of these three fields. They must be treated as unconsumed after an
+        upgrade: a lost response is indistinguishable from a response the old
+        renderer received. Every partially upgraded or malformed combination
+        fails closed instead of silently authorizing another request.
+        """
+
+        if str(record.get("state") or "") not in {"discarded", "reconciled"}:
+            raise HarnessError("Choose one terminal direct project request")
+        has_schema = "terminal_receipt_schema_version" in record
+        has_consumed = "client_consumed" in record
+        has_consumed_ms = "client_consumed_ms" in record
+        historical_keys = {
+            "schema_version", "state", "request_id", "chat_id", "project_id",
+            "lead_id", "payload_sha256", "intent_sha256", "execution_contract",
+            "created_ms", "retired_ms", "goal_id", "integrity_mac",
+        }
+        if historical_keys - set(record):
+            raise HarnessError(
+                "A retired direct project request is missing exact historical fields"
+            )
+        allowed_keys = historical_keys | {"admission_binding"}
+        if not has_schema and not has_consumed and not has_consumed_ms:
+            if set(record) - allowed_keys:
+                raise HarnessError(
+                    "A retired direct project request does not match the exact legacy schema"
+                )
+            return "legacy_unconsumed"
+        allowed_keys |= {
+            "terminal_receipt_schema_version", "client_consumed",
+            "client_consumed_ms",
+        }
+        if set(record) - allowed_keys:
+            raise HarnessError(
+                "A retired direct project request has unsupported terminal fields"
+            )
+        terminal_schema_version = record.get("terminal_receipt_schema_version")
+        if type(terminal_schema_version) is not int \
+                or terminal_schema_version \
+                != DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION:
+            raise HarnessError(
+                "A retired direct project request has an unsupported terminal schema"
+            )
+        if type(record.get("client_consumed")) is not bool:
+            raise HarnessError(
+                "A retired direct project request has an invalid client acknowledgement"
+            )
+        if record["client_consumed"] is False:
+            if has_consumed_ms:
+                raise HarnessError(
+                    "An unconsumed direct project request has a consumption timestamp"
+                )
+            return "unconsumed"
+        consumed_ms = record.get("client_consumed_ms")
+        if type(consumed_ms) is not int or consumed_ms <= 0:
+            raise HarnessError(
+                "A consumed direct project request has no valid consumption timestamp"
+            )
+        return "consumed"
+
+    def _validate_direct_admission_contract(
+        self, record: dict[str, Any], *, project_id: str, chat_id: str,
+        lead_id: str,
+    ) -> None:
+        contract = record.get("execution_contract")
+        if not isinstance(contract, dict) \
+                or type(contract.get("schema_version")) is not int \
+                or contract.get("schema_version") \
+                != DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION:
+            raise HarnessError(
+                "A saved direct project admission has an unsupported execution contract"
+            )
+        kind = str(contract.get("kind") or "")
+        if kind not in {
+            "direct_long_horizon_admission", "desktop_direct_long_horizon_outbox",
+        }:
+            raise HarnessError(
+                "A saved direct project admission has an unsupported execution owner"
+            )
+        _folder, authority = self._direct_admission_folder()
+        if str(contract.get("chat_scope") or "") != authority or any(
+            str(contract.get(field) or "") != expected
+            for field, expected in (
+                ("project_id", project_id), ("chat_id", chat_id),
+                ("lead_id", lead_id),
+            )
+        ):
+            raise HarnessError(
+                "A saved direct project admission disagrees with its execution contract"
+            )
+        if kind == "direct_long_horizon_admission":
+            project_root_fingerprint = str(
+                contract.get("project_root_fingerprint_sha256") or ""
+            )
+            if len(project_root_fingerprint) != 64 or any(
+                one not in "0123456789abcdef" for one in project_root_fingerprint
+            ):
+                raise HarnessError(
+                    "A saved direct project admission has no exact project-root fingerprint"
+                )
+        unsigned_contract = {
+            key: value for key, value in contract.items()
+            if key != "fingerprint_sha256"
+        }
+        expected_fingerprint = hashlib.sha256(json.dumps(
+            unsigned_contract, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(
+            str(contract.get("fingerprint_sha256") or ""), expected_fingerprint,
+        ):
+            raise HarnessError(
+                "A saved direct project admission execution contract changed"
+            )
+
     def _direct_admission_receipt(self, record: dict[str, Any]) -> dict[str, Any]:
         """Return a causal receipt only from an authenticated backend record."""
 
@@ -1058,6 +1178,16 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         if not isinstance(goal, dict):
             raise HarnessError("Direct project admission returned no canonical goal")
         canonical = dict(goal)
+        if canonical.get("request_tombstone") is True:
+            tombstone_version = canonical.get("request_tombstone_schema_version")
+            if tombstone_version != _long_horizon_module().REQUEST_TOMBSTONE_SCHEMA_VERSION:
+                raise HarnessError(
+                    "The admitted goal request tombstone has an unsupported schema"
+                )
+            # Renderer goal receipts require a bounded positive schema marker.
+            # Normalize only this response copy; the authenticated compact
+            # tombstone remains stored in its native request schema.
+            canonical.setdefault("schema_version", int(tombstone_version))
         if str(canonical.get("request_id") or "") != str(receipt["request_id"]):
             raise HarnessError("The admitted goal has a different request identity")
         if str(canonical.get("conversation_id") or "") != str(receipt["chat_id"]):
@@ -1092,7 +1222,9 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         except (OSError, json.JSONDecodeError) as exc:
             raise HarnessError("A saved direct project admission is unreadable") from exc
         if not isinstance(record, dict) \
-                or record.get("schema_version") != DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION:
+                or type(record.get("schema_version")) is not int \
+                or record.get("schema_version") \
+                != DIRECT_LONG_HORIZON_ADMISSION_SCHEMA_VERSION:
             raise HarnessError("A saved direct project admission has an unsupported schema")
         unsigned = self._direct_admission_unsigned(record)
         if not compare_runtime_mac(
@@ -1101,12 +1233,48 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         ):
             raise HarnessError("A saved direct project admission failed integrity verification")
         self._direct_admission_binding_digest(record)
+        request_id = str(record.get("request_id") or "")
+        if not request_id or len(request_id) > 160:
+            raise HarnessError("A saved direct project admission has an invalid request identity")
+        expected_name = hashlib.sha256(request_id.encode("utf-8")).hexdigest() + ".json"
+        if path.name != expected_name:
+            raise HarnessError(
+                "A saved direct project admission filename changed request identity"
+            )
         state = str(record.get("state") or "pending")
         if state in {"discarded", "reconciled"}:
-            if not str(record.get("request_id") or "") \
-                    or not str(record.get("chat_id") or "") \
-                    or not str(record.get("payload_sha256") or ""):
+            chat_id = str(record.get("chat_id") or "")
+            project_id = str(record.get("project_id") or "")
+            lead_id = str(record.get("lead_id") or "")
+            payload_sha256 = str(record.get("payload_sha256") or "")
+            intent_sha256 = str(record.get("intent_sha256") or "")
+            if not all((chat_id, project_id, lead_id)):
                 raise HarnessError("A retired direct project request is incomplete")
+            for label, digest in (
+                ("payload", payload_sha256), ("intent", intent_sha256),
+            ):
+                if len(digest) != 64 or any(
+                    one not in "0123456789abcdef" for one in digest
+                ):
+                    raise HarnessError(
+                        f"A retired direct project request has an invalid {label} digest"
+                    )
+            for field in ("created_ms", "retired_ms"):
+                timestamp = record.get(field)
+                if type(timestamp) is not int or timestamp <= 0:
+                    raise HarnessError(
+                        "A retired direct project request has an invalid timestamp"
+                    )
+            goal_id = str(record.get("goal_id") or "")
+            if (state == "reconciled" and not goal_id) \
+                    or (state == "discarded" and goal_id):
+                raise HarnessError(
+                    "A retired direct project request has an inconsistent goal outcome"
+                )
+            self._validate_direct_admission_contract(
+                record, project_id=project_id, chat_id=chat_id, lead_id=lead_id,
+            )
+            self._direct_terminal_client_state(record)
             record["state"] = state
             return record
         if state != "pending":
@@ -1120,6 +1288,20 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         if hashlib.sha256(canonical.encode("utf-8")).hexdigest() \
                 != str(record.get("payload_sha256") or ""):
             raise HarnessError("A saved direct project admission payload changed")
+        if str(payload.get("request_id") or "") != request_id:
+            raise HarnessError("A saved direct project admission changed request identity")
+        for field in ("created_ms", "updated_ms"):
+            timestamp = record.get(field)
+            if type(timestamp) is not int or timestamp <= 0:
+                raise HarnessError(
+                    "A saved direct project admission has an invalid timestamp"
+                )
+        self._validate_direct_admission_contract(
+            record,
+            project_id=str(payload.get("project_id") or ""),
+            chat_id=str(payload.get("chat_id") or ""),
+            lead_id=str(payload.get("lead_id") or ""),
+        )
         record["payload"] = payload
         record["state"] = "pending"
         return record
@@ -1208,6 +1390,15 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 held = self._read_direct_admission_path(held_path)
                 if str(held.get("state") or "pending") != "pending":
                     tombstones += 1
+                    if self._direct_terminal_client_state(held) != "consumed" \
+                            and str(held.get("chat_id") or "") == str(
+                                payload["chat_id"]
+                            ):
+                        raise HarnessError(
+                            "This exact chat has an unconsumed terminal project "
+                            "request. A client must acknowledge that outcome before "
+                            "starting another one."
+                        )
                     continue
                 pending.append(held_path)
                 held_payload = held.get("payload") \
@@ -1349,6 +1540,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 "created_ms": int(record.get("created_ms") or now),
                 "retired_ms": now,
                 "goal_id": str(goal_id or ""),
+                "terminal_receipt_schema_version": (
+                    DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION
+                ),
+                # This terminal replay fence remains discoverable until a
+                # client first verifies the exact outcome and clears its own
+                # browser marker or desktop outbox. Consumption later hides,
+                # but never deletes, the fence.
+                "client_consumed": False,
             }
             if admission_digest:
                 unsigned["admission_binding"] = {
@@ -1426,6 +1625,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 "created_ms": now,
                 "retired_ms": now,
                 "goal_id": str(goal_id or ""),
+                "terminal_receipt_schema_version": (
+                    DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION
+                ),
+                "client_consumed": False,
             }
             retired = {
                 **unsigned,
@@ -1523,6 +1726,92 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             # The board/chat may have been removed while the authenticated
             # journal remained. Discard never invents a replacement identity.
             return False
+
+    def direct_admission_goal(self, supplied: dict[str, Any]) -> dict[str, Any]:
+        """Look up one exact direct request without bounded-history loss.
+
+        This is the read-only authority used after a reconciliation response
+        may have been lost. ``get_by_request`` includes compact request
+        tombstones, unlike the bounded active/recent goal inventory.
+        """
+
+        receipt = {
+            "schema_version": DIRECT_LONG_HORIZON_RECEIPT_SCHEMA_VERSION,
+            "request_id": str(supplied.get("request_id") or "").strip(),
+            "chat_id": str(supplied.get("chat_id") or "").strip(),
+            "project_id": str(supplied.get("project_id") or "").strip(),
+            "lead_id": str(supplied.get("lead_id") or "").strip(),
+            "intent_sha256": str(supplied.get("intent_sha256") or "").strip().lower(),
+        }
+        if not all(receipt.values()) or len(receipt["request_id"]) > 160 \
+                or len(receipt["chat_id"]) > 256 \
+                or len(receipt["project_id"]) > 512 \
+                or len(receipt["lead_id"]) > 256:
+            raise HarnessError("Choose one exact direct project request identity")
+        if len(receipt["intent_sha256"]) != 64 or any(
+            one not in "0123456789abcdef" for one in receipt["intent_sha256"]
+        ):
+            raise HarnessError("Choose the exact direct project request intent digest")
+        with self.project_admission_lock, self.swarm_lock:
+            with self._direct_admission_turn(
+                receipt["request_id"], receipt["chat_id"], timeout=30.0,
+            ):
+                existing = self.long_horizon.store.get_by_request(
+                    receipt["request_id"],
+                )
+                if existing is None:
+                    # Validate that the claimed live board/chat identity is
+                    # itself exact before returning authoritative absence.
+                    self._direct_long_horizon_context(self.swarm_standing(), {
+                        "project_id": receipt["project_id"],
+                        "lead_id": receipt["lead_id"],
+                        "chat_id": receipt["chat_id"],
+                    })
+                    return {**receipt, "found": False}
+
+                path = self._direct_admission_path(receipt["request_id"])
+                binding_digest = ""
+                transcript_proven = False
+                if path.exists():
+                    record = self._read_direct_admission_path(path)
+                    saved_receipt = self._direct_admission_receipt(record)
+                    for field in (
+                        "request_id", "chat_id", "project_id", "lead_id",
+                        "intent_sha256",
+                    ):
+                        if not hmac.compare_digest(
+                            str(saved_receipt[field]), str(receipt[field]),
+                        ):
+                            raise HarnessError(
+                                "The exact direct request lookup is bound to a "
+                                f"different {field.replace('_', ' ')}"
+                            )
+                    binding_digest = self._direct_admission_binding_digest(record)
+                    goal_digest = str(existing.get("admission_digest") or "").lower()
+                    if binding_digest:
+                        if len(goal_digest) != 64 or any(
+                            one not in "0123456789abcdef" for one in goal_digest
+                        ) or not hmac.compare_digest(binding_digest, goal_digest):
+                            raise HarnessError(
+                                "The exact direct request lookup found a different "
+                                "full goal admission binding"
+                            )
+                    else:
+                        saved_receipt = self._verify_direct_goal_intent_binding(
+                            existing, receipt["request_id"], receipt["intent_sha256"],
+                        )
+                        transcript_proven = True
+                else:
+                    saved_receipt = self._verify_direct_goal_intent_binding(
+                        existing, receipt["request_id"], receipt["intent_sha256"],
+                    )
+                    transcript_proven = True
+                public_goal = self._goal_for_direct_receipt(
+                    existing, saved_receipt,
+                    admission_digest=binding_digest,
+                    transcript_proven=transcript_proven,
+                )
+        return {**saved_receipt, "found": True, "goal": public_goal}
 
     def discard_direct_admission(
         self, supplied: dict[str, Any],
@@ -1684,9 +1973,8 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                             raise HarnessError(
                                 "That request identity already belongs to a goal from another chat"
                             )
-                    public_goal = self.long_horizon.store.public(existing)
                     public_goal = self._goal_for_direct_receipt(
-                        public_goal, receipt, admission_digest=binding_digest,
+                        existing, receipt, admission_digest=binding_digest,
                         transcript_proven=transcript_proven,
                     )
                     if record is not None:
@@ -1743,6 +2031,118 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             transcript_noted=transcript_noted,
         )
 
+    def acknowledge_direct_admission(
+        self, supplied: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Consume one exact terminal receipt without removing its replay fence."""
+
+        expected = {
+            "schema_version": DIRECT_LONG_HORIZON_RECEIPT_SCHEMA_VERSION,
+            "request_id": str(supplied.get("request_id") or "").strip(),
+            "chat_id": str(supplied.get("chat_id") or "").strip(),
+            "project_id": str(supplied.get("project_id") or "").strip(),
+            "lead_id": str(supplied.get("lead_id") or "").strip(),
+            "intent_sha256": str(
+                supplied.get("intent_sha256") or ""
+            ).strip().lower(),
+        }
+        terminal_state = str(supplied.get("terminal_state") or "").strip()
+        exact_goal_id = str(supplied.get("goal_id") or "").strip()
+        if not all(expected.values()) or len(expected["request_id"]) > 160 \
+                or len(expected["chat_id"]) > 256 \
+                or len(expected["project_id"]) > 512 \
+                or len(expected["lead_id"]) > 256 \
+                or terminal_state not in {"discarded", "reconciled"}:
+            raise HarnessError("Choose one exact terminal direct project receipt")
+        if len(expected["intent_sha256"]) != 64 or any(
+            one not in "0123456789abcdef"
+            for one in expected["intent_sha256"]
+        ):
+            raise HarnessError("Choose the exact terminal request intent digest")
+        if terminal_state == "reconciled" and not exact_goal_id:
+            raise HarnessError("Choose the exact reconciled goal identity")
+        if terminal_state == "discarded" and exact_goal_id:
+            raise HarnessError("A discarded terminal request cannot name a goal")
+
+        from .safety import ProjectTransactionLock
+
+        with self.project_admission_lock, self.swarm_lock:
+            with self._direct_admission_turn(
+                expected["request_id"], expected["chat_id"], timeout=30.0,
+            ):
+                path = self._direct_admission_path(expected["request_id"])
+                if not path.exists():
+                    raise HarnessError("That terminal direct request receipt is unavailable")
+                with ProjectTransactionLock(self.config.project_root).held(30.0):
+                    record = self._read_direct_admission_path(path)
+                    state = str(record.get("state") or "pending")
+                    if state != terminal_state:
+                        raise HarnessError(
+                            "The terminal direct request has a different exact outcome"
+                        )
+                    receipt = self._direct_admission_receipt(record)
+                    for field in (
+                        "request_id", "chat_id", "project_id", "lead_id",
+                        "intent_sha256",
+                    ):
+                        if not hmac.compare_digest(
+                            str(receipt[field]), str(expected[field]),
+                        ):
+                            raise HarnessError(
+                                "The terminal direct request acknowledgement is bound "
+                                f"to a different {field.replace('_', ' ')}"
+                            )
+                    recorded_goal_id = str(record.get("goal_id") or "")
+                    if not hmac.compare_digest(recorded_goal_id, exact_goal_id):
+                        raise HarnessError(
+                            "The terminal direct request has a different exact goal"
+                        )
+                    public_goal = None
+                    if state == "reconciled":
+                        existing = self.long_horizon.store.get_by_request(
+                            expected["request_id"],
+                        )
+                        if existing is None:
+                            raise HarnessError(
+                                "The reconciled terminal request has no canonical goal"
+                            )
+                        binding_digest = self._direct_admission_binding_digest(record)
+                        public_goal = self._goal_for_direct_receipt(
+                            existing, receipt, admission_digest=binding_digest,
+                            transcript_proven=not bool(binding_digest),
+                        )
+                        if str(public_goal.get("goal_id") or "") != exact_goal_id:
+                            raise HarnessError(
+                                "The reconciled terminal receipt changed canonical goal"
+                            )
+                    terminal_client_state = self._direct_terminal_client_state(record)
+                    if terminal_client_state != "consumed":
+                        unsigned = self._direct_admission_unsigned(record)
+                        unsigned["terminal_receipt_schema_version"] = (
+                            DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION
+                        )
+                        unsigned["client_consumed"] = True
+                        unsigned["client_consumed_ms"] = int(time.time() * 1000)
+                        consumed = {
+                            **unsigned,
+                            "integrity_mac": mac(
+                                "direct-long-horizon-admission-v1", unsigned,
+                            ),
+                        }
+                        atomic_text(path, json.dumps(
+                            consumed, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ) + "\n")
+        response = {
+            **receipt,
+            "terminal_state": terminal_state,
+            "goal_id": exact_goal_id,
+            "client_consumed": True,
+        }
+        if public_goal is not None:
+            response["goal"] = public_goal
+        return response
+
     def _public_direct_admission(self, record: dict[str, Any]) -> dict[str, Any]:
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
         text = str(payload.get("text") or "")
@@ -1767,6 +2167,32 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             "execution_contract": dict(record.get("execution_contract") or {}),
         }
 
+    def _public_terminal_direct_admission(
+        self, record: dict[str, Any],
+    ) -> dict[str, Any]:
+        receipt = self._direct_admission_receipt(record)
+        state = str(record.get("state") or "")
+        client_state = self._direct_terminal_client_state(record)
+        if state not in {"discarded", "reconciled"} \
+                or client_state == "consumed":
+            raise HarnessError("Choose one unconsumed terminal direct request")
+        return {
+            **receipt,
+            "terminal_receipt_schema_version": (
+                DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION
+            ),
+            "terminal_state": state,
+            "goal_id": str(record.get("goal_id") or ""),
+            "client_consumed": False,
+            "legacy_terminal": client_state == "legacy_unconsumed",
+            "payload_sha256": str(record.get("payload_sha256") or ""),
+            "text_preview": "",
+            "text_characters": 0,
+            "attachment_count": 0,
+            "created_ms": int(record.get("created_ms") or 0),
+            "execution_contract": dict(record.get("execution_contract") or {}),
+        }
+
     def direct_admission_inventory(self) -> list[dict[str, Any]]:
         from .safety import ProjectTransactionLock
 
@@ -1782,6 +2208,80 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         ]
         records.sort(key=lambda one: int(one.get("created_ms") or 0))
         return [self._public_direct_admission(one) for one in records]
+
+    @classmethod
+    def _unconsumed_terminal_direct_admissions(
+        cls, records: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return one newest unconsumed row per chat.
+
+        Old releases could create several authenticated terminal rows for one
+        chat because they had no client-acknowledgement fence. Present them in
+        reverse retirement order, one at a time, so a surviving desktop outbox
+        or browser marker is most likely to meet its exact backend row first.
+        The renderer's one-recovery-per-chat contract stays exact while every
+        legacy outcome still requires acknowledgement.
+        """
+
+        selected: list[dict[str, Any]] = []
+        seen_chats: set[str] = set()
+        for record in sorted(
+            records, key=lambda one: (
+                -int(one.get("retired_ms") or 0),
+                -int(one.get("created_ms") or 0),
+                str(one.get("request_id") or ""),
+            ),
+        ):
+            if str(record.get("state") or "pending") \
+                    not in {"discarded", "reconciled"} \
+                    or cls._direct_terminal_client_state(record) == "consumed":
+                continue
+            chat_id = str(record.get("chat_id") or "")
+            if chat_id in seen_chats:
+                continue
+            seen_chats.add(chat_id)
+            selected.append(record)
+        return selected
+
+    def terminal_direct_admission_inventory(self) -> list[dict[str, Any]]:
+        """Return current and authenticated legacy outcomes needing acknowledgement."""
+
+        from .safety import ProjectTransactionLock
+
+        folder, _authority = self._direct_admission_folder()
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            records = [
+                self._read_direct_admission_path(path)
+                for path in folder.iterdir() if path.suffix == ".json"
+            ]
+        records = self._unconsumed_terminal_direct_admissions(records)
+        return [self._public_terminal_direct_admission(one) for one in records]
+
+    def direct_admission_recovery_inventory(self) -> dict[str, list[dict[str, Any]]]:
+        """Snapshot pending and unconsumed terminal phases under one file lock."""
+
+        from .safety import ProjectTransactionLock
+
+        folder, _authority = self._direct_admission_folder()
+        with ProjectTransactionLock(self.config.project_root).held(30.0):
+            records = [
+                self._read_direct_admission_path(path)
+                for path in folder.iterdir() if path.suffix == ".json"
+            ]
+        records.sort(key=lambda one: int(one.get("created_ms") or 0))
+        pending = [
+            self._public_direct_admission(one) for one in records
+            if str(one.get("state") or "pending") == "pending"
+        ]
+        pending_chat_ids = {
+            str(one.get("chat_id") or "") for one in pending
+        }
+        terminal = [
+            self._public_terminal_direct_admission(one)
+            for one in self._unconsumed_terminal_direct_admissions(records)
+            if str(one.get("chat_id") or "") not in pending_chat_ids
+        ]
+        return {"pending": pending, "terminal": terminal}
 
     def prepare_direct_long_horizon(
         self, supplied: dict[str, Any],
@@ -1905,9 +2405,12 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     project_id=context["project_id"], lead_id=context["lead_id"],
                     intent_sha256=intent_sha256,
                 )
-                self._remove_direct_admission(
-                    str(payload["request_id"]), str(record["payload_sha256"]),
-                )
+                # Starting the goal is not proof that the renderer received
+                # this receipt. Keep the authenticated admission journal
+                # pending until the renderer verifies this exact start and
+                # explicitly reconciles it through discard_direct_admission.
+                # A response lost after this point can then be recovered from
+                # another browser origin without redispatching the goal.
         return goal, receipt
 
     @staticmethod
@@ -2843,9 +3346,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json({"goals": goals})
             elif parsed.path == "/api/long-horizon/pending-admissions":
                 self._require_token()
-                self._json({
-                    "pending": self.server.direct_admission_inventory(),
-                })
+                self._json(self.server.direct_admission_recovery_inventory())
             elif parsed.path == "/api/long-horizon/goal":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -4214,9 +4715,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 )
                 pending = self.server.prepare_direct_long_horizon(prepared)
                 self._json({"pending": pending})
+            elif self.path == "/api/long-horizon/admission-goal":
+                self._json(self.server.direct_admission_goal(body))
             elif self.path == "/api/long-horizon/discard-admission":
                 discarded = self.server.discard_direct_admission(body)
                 self._json(discarded)
+            elif self.path == "/api/long-horizon/acknowledge-admission":
+                acknowledged = self.server.acknowledge_direct_admission(body)
+                self._json(acknowledged)
             elif self.path == "/api/long-horizon/start":
                 prepared = dict(body)
                 prepared["request_id"] = str(

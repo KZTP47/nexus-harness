@@ -5,11 +5,13 @@ import base64
 from contextlib import closing
 import json
 import multiprocessing
+import queue
 import re
 import sqlite3
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 import urllib.error
 import urllib.request
@@ -24,11 +26,212 @@ from our_harness.providers import base as provider_base
 
 
 THREAD_COORDINATION_TIMEOUT_SECONDS = 30.0
+PROCESS_STATUS_POLL_SECONDS = 0.1
+PROCESS_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+def _cross_process_status(worker_id: str, phase: str, **payload: object) -> dict:
+    process = multiprocessing.current_process()
+    return {
+        "phase": phase,
+        "worker_id": worker_id,
+        "process": {"name": process.name, "pid": process.pid},
+        "payload": payload,
+    }
+
+
+def _process_diagnostics(processes: dict[str, multiprocessing.Process]) -> dict:
+    return {
+        worker_id: {
+            "name": process.name,
+            "pid": process.pid,
+            "exitcode": process.exitcode,
+        }
+        for worker_id, process in processes.items()
+    }
+
+
+def _collect_cross_process_phase(
+    statuses: object,
+    processes: dict[str, multiprocessing.Process],
+    phase: str,
+) -> list[dict]:
+    """Collect one message per worker without hiding child errors or exits."""
+
+    deadline = time.monotonic() + THREAD_COORDINATION_TIMEOUT_SECONDS
+    received: dict[str, dict] = {}
+    while len(received) < len(processes):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(
+                f"cross-process {phase} phase timed out; received={sorted(received)}; "
+                f"processes={_process_diagnostics(processes)}"
+            )
+        try:
+            message = statuses.get(timeout=min(PROCESS_STATUS_POLL_SECONDS, remaining))
+        except queue.Empty:
+            candidates = processes if phase == "ready" else {
+                worker_id: process for worker_id, process in processes.items()
+                if worker_id not in received
+            }
+            exited = {
+                worker_id: process.exitcode
+                for worker_id, process in candidates.items()
+                if process.exitcode is not None
+            }
+            if exited:
+                raise AssertionError(
+                    f"cross-process workers exited before {phase}: {exited}; "
+                    f"received={sorted(received)}; "
+                    f"processes={_process_diagnostics(processes)}"
+                )
+            continue
+        if not isinstance(message, dict):
+            raise AssertionError(f"invalid cross-process status message: {message!r}")
+        worker_id = str(message.get("worker_id") or "")
+        if worker_id not in processes:
+            raise AssertionError(f"unknown cross-process worker status: {message!r}")
+        expected = processes[worker_id]
+        identity = message.get("process")
+        if not isinstance(identity, dict) or identity.get("pid") != expected.pid \
+                or identity.get("name") != expected.name:
+            raise AssertionError(
+                f"cross-process status identity mismatch for {worker_id}: {message!r}; "
+                f"expected name={expected.name!r}, pid={expected.pid!r}"
+            )
+        if message.get("phase") == "error":
+            payload = message.get("payload")
+            raise AssertionError(
+                f"cross-process worker {worker_id} failed during {phase}: {payload!r}"
+            )
+        if message.get("phase") != phase:
+            raise AssertionError(
+                f"cross-process worker {worker_id} reported {message.get('phase')!r} "
+                f"while {phase!r} was expected: {message!r}"
+            )
+        if worker_id in received:
+            raise AssertionError(
+                f"cross-process worker {worker_id} reported {phase!r} twice"
+            )
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            raise AssertionError(f"invalid cross-process {phase} payload: {message!r}")
+        received[worker_id] = payload
+    return [received[worker_id] for worker_id in processes]
+
+
+def _raise_on_cross_process_status_or_exit(
+    statuses: object,
+    processes: dict[str, multiprocessing.Process],
+    *,
+    timeout: float,
+    expected: str,
+) -> None:
+    """Wait briefly while treating every message or exit as an early failure."""
+
+    try:
+        message = statuses.get(timeout=max(0.0, timeout))
+    except queue.Empty:
+        exited = {
+            worker_id: process.exitcode
+            for worker_id, process in processes.items()
+            if process.exitcode is not None
+        }
+        if exited:
+            raise AssertionError(
+                f"cross-process workers exited before {expected}: {exited}; "
+                f"processes={_process_diagnostics(processes)}"
+            )
+        return
+    raise AssertionError(
+        f"cross-process worker reported before {expected}: {message!r}; "
+        f"processes={_process_diagnostics(processes)}"
+    )
+
+
+def _join_cross_processes(
+    processes: dict[str, multiprocessing.Process], timeout: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    for process in processes.values():
+        if process.pid is None or process.exitcode is not None:
+            continue
+        process.join(max(0.0, deadline - time.monotonic()))
+
+
+def _assert_cross_processes_exited_cleanly(
+    processes: dict[str, multiprocessing.Process],
+) -> None:
+    _join_cross_processes(processes, THREAD_COORDINATION_TIMEOUT_SECONDS)
+    alive = [
+        worker_id for worker_id, process in processes.items()
+        if process.pid is not None and process.is_alive()
+    ]
+    if alive:
+        raise AssertionError(
+            f"cross-process workers did not exit: {alive}; "
+            f"processes={_process_diagnostics(processes)}"
+        )
+    failed = {
+        worker_id: process.exitcode
+        for worker_id, process in processes.items()
+        if process.pid is not None and process.exitcode != 0
+    }
+    if failed:
+        raise AssertionError(
+            f"cross-process workers exited unsuccessfully: {failed}; "
+            f"processes={_process_diagnostics(processes)}"
+        )
+
+
+def _cleanup_cross_processes(
+    processes: dict[str, multiprocessing.Process],
+    *,
+    events: tuple[object, ...],
+    queues: tuple[object, ...],
+) -> None:
+    """Release barriers and reclaim every spawned process and queue handle."""
+
+    for event in events:
+        try:
+            event.set()
+        except (OSError, ValueError):
+            pass
+    _join_cross_processes(processes, PROCESS_CLEANUP_TIMEOUT_SECONDS)
+    for process in processes.values():
+        try:
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+        except (OSError, ValueError):
+            pass
+    _join_cross_processes(processes, PROCESS_CLEANUP_TIMEOUT_SECONDS)
+    for process in processes.values():
+        try:
+            if process.pid is not None and process.is_alive():
+                process.kill()
+        except (OSError, ValueError):
+            pass
+    _join_cross_processes(processes, PROCESS_CLEANUP_TIMEOUT_SECONDS)
+    for process in processes.values():
+        try:
+            if process.pid is None or not process.is_alive():
+                process.close()
+        except (OSError, ValueError):
+            pass
+    for one_queue in queues:
+        try:
+            one_queue.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            one_queue.join_thread()
+        except (OSError, RuntimeError, ValueError):
+            pass
 
 
 def _cross_process_goal_admission(
     state_path: str, authority_path: str, project_path: str, request_id: str,
-    ready: object, begin: object, results: object,
+    statuses: object, begin: object,
 ) -> None:
     """Spawn-safe admission worker used to prove the SQLite owner boundary."""
 
@@ -53,26 +256,28 @@ def _cross_process_goal_admission(
         }
         long_horizon._base = lambda: Path(state_path)
         store = long_horizon.GoalStore(config)
-        ready.put(request_id)
-        if not begin.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+        statuses.put(_cross_process_status(request_id, "ready"))
+        if not begin.wait(THREAD_COORDINATION_TIMEOUT_SECONDS * 2):
             raise RuntimeError("cross-process admission barrier timed out")
         goal = store.create(
             board, "project", ["Exact work " + request_id], request_id,
             conversation_id="chat-" + request_id,
         )
-        results.put({
-            "ok": True, "request_id": request_id,
-            "goal_id": goal["goal_id"], "status": goal["status"],
-            "queue": goal["project_queue"],
-        })
-    except Exception as exc:  # pragma: no cover - returned to parent for assertion
-        results.put({"ok": False, "error": repr(exc)})
+        statuses.put(_cross_process_status(
+            request_id, "outcome", request_id=request_id,
+            goal_id=goal["goal_id"], status=goal["status"],
+            queue=goal["project_queue"],
+        ))
+    except BaseException as exc:  # pragma: no cover - returned to parent for assertion
+        statuses.put(_cross_process_status(
+            request_id, "error", error=repr(exc), traceback=traceback.format_exc(),
+        ))
+        raise
 
 
 def _cross_process_runtime_replay(
-    state_path: str, authority_path: str, project_path: str,
-    ready: object, begin: object, release: object, dispatch_count: object,
-    results: object,
+    worker_id: str, state_path: str, authority_path: str, project_path: str,
+    statuses: object, begin: object, release: object, dispatch_count: object,
 ) -> None:
     """Spawn-safe runtime replay worker for the durable scheduler CAS."""
 
@@ -115,8 +320,8 @@ def _cross_process_runtime_replay(
                 "evidence_refs": ["verified-no-change"],
             }]))}
 
-        ready.put("ready")
-        if not begin.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+        statuses.put(_cross_process_status(worker_id, "ready"))
+        if not begin.wait(THREAD_COORDINATION_TIMEOUT_SECONDS * 2):
             raise RuntimeError("runtime replay barrier timed out")
         with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=provider), \
                 mock.patch.object(
@@ -133,12 +338,15 @@ def _cross_process_runtime_replay(
                 if current["status"] in {"complete", "failed", "cancelled", "paused"}:
                     break
                 time.sleep(0.02)
-            results.put({
-                "ok": True, "goal_id": goal["goal_id"],
-                "status": runtime.store.get(goal["goal_id"])["status"],
-            })
-    except Exception as exc:  # pragma: no cover - returned to parent for assertion
-        results.put({"ok": False, "error": repr(exc)})
+            statuses.put(_cross_process_status(
+                worker_id, "outcome", goal_id=goal["goal_id"],
+                status=runtime.store.get(goal["goal_id"])["status"],
+            ))
+    except BaseException as exc:  # pragma: no cover - returned to parent for assertion
+        statuses.put(_cross_process_status(
+            worker_id, "error", error=repr(exc), traceback=traceback.format_exc(),
+        ))
+        raise
     finally:
         if runtime is not None:
             runtime.close()
@@ -329,14 +537,871 @@ class LongHorizonTests(unittest.TestCase):
             )
             for one in goal["agents"]
         ))
+        contract = goal["collaboration_contract"]
+        self.assertEqual(contract["mode"], "required_participant_fan_in")
+        self.assertEqual(
+            contract["required_dispatch"], "serialized_terminal_attempts_v2",
+        )
+        self.assertEqual(
+            contract["required_claim_order"], "undispatched_required_tasks_first_v2",
+        )
+        self.assertEqual(
+            contract["provider_budget_reservation"],
+            "one_call_per_undispatched_required_task_v2",
+        )
+        self.assertRegex(contract["fingerprint_sha256"], r"^[0-9a-f]{64}$")
+
+    @staticmethod
+    def _complete_team_action():
+        criteria = [
+            "Original objective is satisfied",
+            "Every required task is complete",
+            "Configured deterministic verification passes",
+        ]
+        return action(criteria_evidence=[{
+            "criterion": criterion, "evidence_refs": ["verified-no-change"],
+        } for criterion in criteria])
+
+    def test_required_pair_success_runs_each_provider_once_and_final_peer_fans_in(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Work together and verify the result"],
+            "pair-success-fan-in", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-success",
+        )
+        routes: list[str] = []
+        contexts: list[tuple[str, str]] = []
+
+        def provider(_config, route, _text, **kwargs):
+            routes.append(route)
+            contexts.append((route, str(kwargs.get("context") or "")))
+            kwargs["before_provider_dispatch"]("initial")
+            kwargs["after_provider_response"]("initial")
+            return {"text": json.dumps(self._complete_team_action())}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+            return_value={"status": "passed", "basis": "pair fan-in unit test"},
+        ):
+            completed = runtime.run(goal["goal_id"])
+
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(routes, ["codex", "claude"])
+        self.assertEqual(completed["budget"]["provider_calls"], 2)
+        self.assertTrue(all(one["attempts"] == 1 for one in completed["tasks"]))
+        final_context = contexts[-1][1]
+        self.assertIn("REQUIRED CONTRIBUTION FAN-IN", final_context)
+        self.assertIn("This is the final named contribution", final_context)
+        self.assertIn('"state":"complete"', final_context)
+        self.assertNotIn("Work alone when you can", final_context)
+
+    def test_required_lead_malformed_reply_still_contacts_peer_then_pauses_truthfully(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Both named agents must contribute"],
+            "pair-malformed-fan-in", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-malformed",
+        )
+        routes: list[str] = []
+        peer_context: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            routes.append(route)
+            kwargs["before_provider_dispatch"]("initial")
+            kwargs["after_provider_response"]("initial")
+            if route == "codex":
+                return {"text": "not a structured Nexus action"}
+            peer_context.append(str(kwargs.get("context") or ""))
+            return {"text": json.dumps(self._complete_team_action())}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(routes, ["codex", "claude"])
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        by_participant = {
+            one["required_contributor_id"]: one for one in stopped["tasks"]
+        }
+        self.assertEqual(by_participant["lead"]["state"], "blocked")
+        self.assertEqual(by_participant["lead"]["attempts"], 1)
+        self.assertEqual(by_participant["reviewer"]["state"], "complete")
+        self.assertEqual(by_participant["reviewer"]["attempts"], 1)
+        self.assertEqual(stopped["status"], "paused")
+        self.assertIn("No runnable task", stopped["note"])
+        self.assertIn('"state":"blocked"', peer_context[0])
+        self.assertIn("This is the final named contribution", peer_context[0])
+        verify.assert_not_called()
+
+    def test_required_terminal_failure_restart_never_resends_first_participant(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Attempt both exact participants"],
+            "pair-restart-fan-in", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-restart",
+        )
+        lead = store.claim_ready(goal["goal_id"], "lead-worker")[0]
+        self.assertEqual(lead["assigned_agent_id"], "lead")
+        store.record_dispatch(goal["goal_id"], lead, "lead-dispatch")
+        store.record_provider_reply(goal["goal_id"], lead, phase="initial")
+        store.fail_task(
+            goal["goal_id"], lead, "malformed reply exhausted repair",
+            settle_required_contribution=True,
+        )
+
+        restarted = long_horizon.GoalStore(self.config)
+        recovered = restarted.get(goal["goal_id"])
+        lead_after = next(
+            one for one in recovered["tasks"]
+            if one.get("required_contributor_id") == "lead"
+        )
+        self.assertEqual(lead_after["state"], "blocked")
+        self.assertEqual(lead_after["attempts"], 1)
+        peer = restarted.claim_ready(goal["goal_id"], "peer-worker")[0]
+        self.assertEqual(peer["assigned_agent_id"], "reviewer")
+        self.assertEqual(peer["attempts"], 1)
+        after_claim = restarted.get(goal["goal_id"])
+        self.assertEqual(
+            next(one for one in after_claim["tasks"] if one["id"] == lead["id"])["attempts"],
+            1,
+        )
+
+    def test_required_structured_refusal_and_received_reply_block_continue_to_peer(self):
+        for outcome in ("structured_blocked", "received_reply_blocked"):
+            with self.subTest(outcome=outcome):
+                project = self.base / outcome
+                project.mkdir()
+                board = copy.deepcopy(self.board)
+                board["projects"][0]["path"] = str(project)
+                store = self.store()
+                goal = store.create(
+                    board, "project", ["Each named provider gets a terminal attempt"],
+                    f"pair-{outcome}", lead_id="lead",
+                    participant_ids=["lead", "reviewer"],
+                    conversation_id=f"chat-{outcome}",
+                )
+                lead = store.claim_ready(goal["goal_id"], f"worker-{outcome}")[0]
+                store.record_dispatch(goal["goal_id"], lead, f"dispatch-{outcome}")
+                store.record_provider_reply(goal["goal_id"], lead, phase="initial")
+                if outcome == "structured_blocked":
+                    refused = action("blocked", summary="Lead refused this concrete task")
+                    store.record_action(goal["goal_id"], lead, refused)
+                    store.apply_action(goal["goal_id"], lead, refused)
+                else:
+                    store.block_received_reply(
+                        goal["goal_id"], lead, "Reply repair could not be admitted",
+                        settle_required_contribution=True,
+                    )
+                held = store.get(goal["goal_id"])
+                self.assertEqual(held["status"], "queued")
+                peer = store.claim_ready(goal["goal_id"], f"peer-{outcome}")[0]
+                self.assertEqual(peer["assigned_agent_id"], "reviewer")
+                self.assertEqual(peer["attempts"], 1)
+
+    def test_required_structured_refusal_physically_dispatches_peer_once(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Attempt both providers even if the lead refuses"],
+            "pair-runtime-refusal", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-refusal",
+        )
+        routes: list[str] = []
+        peer_context: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            routes.append(route)
+            kwargs["before_provider_dispatch"]("initial")
+            kwargs["after_provider_response"]("initial")
+            if route == "codex":
+                return {"text": json.dumps(action(
+                    "blocked", summary="Lead explicitly refused this contribution",
+                    evidence=["provider-refusal:lead"],
+                ))}
+            peer_context.append(str(kwargs.get("context") or ""))
+            return {"text": json.dumps(self._complete_team_action())}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(routes, ["codex", "claude"])
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        by_participant = {
+            one["required_contributor_id"]: one for one in stopped["tasks"]
+        }
+        self.assertEqual(by_participant["lead"]["state"], "blocked")
+        self.assertEqual(by_participant["lead"]["attempts"], 1)
+        self.assertEqual(by_participant["reviewer"]["state"], "complete")
+        self.assertEqual(by_participant["reviewer"]["attempts"], 1)
+        self.assertEqual(stopped["status"], "paused")
+        self.assertIn("Lead explicitly refused", peer_context[0])
+        self.assertIn("This is the final named contribution", peer_context[0])
+        verify.assert_not_called()
+
+    def test_required_known_provider_throw_still_dispatches_peer_once(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Attempt the peer after a known lead outage"],
+            "pair-runtime-known-throw", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-known-throw",
+        )
+        routes: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            routes.append(route)
+            kwargs["before_provider_dispatch"]("initial")
+            if route == "codex":
+                raise HarnessError("lead provider returned a known refusal")
+            kwargs["after_provider_response"]("initial")
+            return {"text": json.dumps(self._complete_team_action())}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(routes, ["codex", "claude"])
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        self.assertEqual(stopped["status"], "paused")
+        self.assertEqual(
+            {one["required_contributor_id"]: one["attempts"] for one in stopped["tasks"]},
+            {"lead": 1, "reviewer": 1},
+        )
+        verify.assert_not_called()
+
+    def test_required_unknown_outcome_and_user_pause_never_continue_to_peer(self):
+        for boundary in ("unknown", "pause"):
+            with self.subTest(boundary=boundary):
+                project = self.base / f"safe-boundary-{boundary}"
+                project.mkdir()
+                board = copy.deepcopy(self.board)
+                board["projects"][0]["path"] = str(project)
+                store = self.store()
+                goal = store.create(
+                    board, "project", ["Do not cross an unsafe terminal boundary"],
+                    f"pair-safe-{boundary}", lead_id="lead",
+                    participant_ids=["lead", "reviewer"],
+                    conversation_id=f"chat-safe-{boundary}",
+                )
+                lead = store.claim_ready(goal["goal_id"], f"worker-{boundary}")[0]
+                store.record_dispatch(goal["goal_id"], lead, f"dispatch-{boundary}")
+                if boundary == "pause":
+                    store.control(goal["goal_id"], "pause")
+                    store.fail_task(
+                        goal["goal_id"], lead, "known failure after user pause",
+                        settle_required_contribution=True,
+                    )
+                else:
+                    store.fail_task(
+                        goal["goal_id"], lead, "provider outcome is unknown",
+                        uncertain=True, settle_required_contribution=True,
+                    )
+                held = store.get(goal["goal_id"])
+                self.assertEqual(held["status"], "paused")
+                peer = next(
+                    one for one in held["tasks"]
+                    if one.get("required_contributor_id") == "reviewer"
+                )
+                self.assertEqual(peer["attempts"], 0)
+                self.assertEqual(store.claim_ready(goal["goal_id"], "must-not-claim"), [])
+
+    def test_required_pair_rejects_provider_budget_below_named_team(self):
+        with self.assertRaisesRegex(
+            HarnessError, "provider-call budget.*required chat-participant contribution count",
+        ):
+            self.store().create(
+                self.board, "project", ["Both providers must contribute"],
+                "pair-provider-budget-too-small", lead_id="lead",
+                participant_ids=["lead", "reviewer"],
+                conversation_id="chat-provider-budget-too-small",
+                policy={"max_provider_calls": 1},
+            )
+        self.assertIsNone(
+            self.store().get_by_request("pair-provider-budget-too-small")
+        )
+        with self.assertRaisesRegex(
+            HarnessError, "provider-call budget.*required chat-participant contribution count",
+        ):
+            self.store().create(
+                self.board, "project", ["First", "Second", "Third"],
+                "pair-provider-budget-fewer-than-tasks", lead_id="lead",
+                participant_ids=["lead", "reviewer"],
+                conversation_id="chat-provider-budget-fewer-than-tasks",
+                policy={"max_provider_calls": 2},
+            )
+
+    def test_required_peer_call_is_reserved_from_web_schema_repair(self):
+        board = copy.deepcopy(self.board)
+        board["agents"][0]["who"] = "web:fixture-lead"
+
+        def route_context(_config, route):
+            digest = long_horizon.hashlib.sha256(route.encode("utf-8")).hexdigest()
+            return "fixture", {
+                "failure_context_version": 1,
+                "route_fingerprint_sha256": digest,
+                "transport_contract": "fixture/route/v1",
+                "effective_dispatch_version": 1,
+                "effective_dispatch_fingerprint_sha256": digest,
+                "effective_dispatch_contract": "fixture/effective/v1",
+                "provider_principal_version": 1,
+                "provider_principal_fingerprint_sha256": digest,
+                "provider_principal_contract": "fixture/account/v1",
+            }
+
+        physical_calls: list[str] = []
+        ask_invocations: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            ask_invocations.append(route)
+            kwargs["before_provider_dispatch"]("initial")
+            physical_calls.append(route)
+            kwargs["after_provider_response"]("initial")
+            if route.startswith("web:"):
+                return {"text": "malformed browser reply"}
+            return {"text": json.dumps(self._complete_team_action())}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "_route_failure_context", side_effect=route_context,
+        ), mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            runtime = long_horizon.LongHorizonRuntime(self.config)
+            self.addCleanup(runtime.close)
+            goal = runtime.store.create(
+                board, "project", ["Keep one provider call for each named participant"],
+                "pair-reserved-provider-budget", lead_id="lead",
+                participant_ids=["lead", "reviewer"],
+                conversation_id="chat-reserved-provider-budget",
+                policy={"max_provider_calls": 2},
+            )
+            stopped = runtime.run(goal["goal_id"])
+
+        # ask_once enters the web format-repair call, but its before-dispatch
+        # admission is rejected. Only the lead's initial call and the peer's
+        # terminal contribution cross the physical-send boundary.
+        self.assertEqual(ask_invocations, ["web:fixture-lead", "web:fixture-lead", "claude"])
+        self.assertEqual(physical_calls, ["web:fixture-lead", "claude"])
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        self.assertEqual(stopped["status"], "paused")
+        self.assertEqual(
+            {one["required_contributor_id"]: one["attempts"] for one in stopped["tasks"]},
+            {"lead": 1, "reviewer": 1},
+        )
+        verify.assert_not_called()
+
+    def test_required_unattempted_peer_precedes_lead_continuation_at_tight_budget(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Give both named participants a first attempt"],
+            "pair-prioritize-unattempted", lead_id="lead",
+            participant_ids=["lead", "reviewer"],
+            conversation_id="chat-prioritize-unattempted",
+            policy={"max_provider_calls": 2},
+        )
+        physical_calls: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            kwargs["before_provider_dispatch"]("initial")
+            physical_calls.append(route)
+            kwargs["after_provider_response"]("initial")
+            if route == "codex":
+                return {"text": json.dumps(action(
+                    "work", summary="Lead made progress but needs another turn",
+                ))}
+            return {"text": json.dumps(self._complete_team_action())}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(physical_calls, ["codex", "claude"])
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        self.assertEqual(stopped["status"], "paused")
+        self.assertEqual(
+            {one["required_contributor_id"]: one["attempts"] for one in stopped["tasks"]},
+            {"lead": 1, "reviewer": 1},
+        )
+        verify.assert_not_called()
+
+    def test_required_dispatch_reservation_survives_pre_dispatch_crash_and_retry(self):
+        board = copy.deepcopy(self.board)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            board, "project", ["Give both named participants a physical provider turn"],
+            "pair-pre-dispatch-crash-reservation", lead_id="lead",
+            participant_ids=["lead", "reviewer"],
+            conversation_id="chat-pre-dispatch-crash-reservation",
+            policy={"max_provider_calls": 2},
+        )
+
+        crashed_claim = runtime.store.claim_ready(goal["goal_id"], "crashed-worker")[0]
+        self.assertEqual(crashed_claim["assigned_agent_id"], "lead")
+        self.assertEqual(crashed_claim["attempts"], 1)
+        self.assertFalse(crashed_claim["provider_effect_id"])
+
+        def make_claim_owner_dead(document, _db):
+            document["worker"] = {
+                "pid": 99999999, "token": "dead", "worker_id": "crashed-worker",
+                "kind": "runtime",
+            }
+
+        runtime.store._mutate(goal["goal_id"], make_claim_owner_dead)
+        recovered = runtime.store.recover_dead(goal["goal_id"])
+        recovered_lead = next(
+            one for one in recovered["tasks"] if one["assigned_agent_id"] == "lead"
+        )
+        self.assertEqual(recovered_lead["state"], "blocked")
+        self.assertEqual(recovered_lead["provider_effect_state"], "never_dispatched")
+        self.assertFalse(recovered_lead["provider_effect_id"])
+
+        retried = runtime.store.control(
+            goal["goal_id"], "retry", {"task_id": recovered_lead["id"]},
+        )
+        retried_lead = next(
+            one for one in retried["tasks"] if one["assigned_agent_id"] == "lead"
+        )
+        self.assertEqual(retried_lead["attempts"], 1)
+        self.assertEqual(retried_lead["provider_effect_state"], "reconciled_for_retry")
+        self.assertFalse(
+            long_horizon._task_has_recorded_provider_dispatch(retried_lead)
+        )
+
+        ask_invocations: list[str] = []
+        physical_calls: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            ask_invocations.append(route)
+            kwargs["before_provider_dispatch"]("initial")
+            physical_calls.append(route)
+            kwargs["after_provider_response"]("initial")
+            if route == "claude":
+                return {"text": json.dumps(action("work", tool_calls=[{
+                    "call_id": "post-crash-review-context",
+                    "name": "search_workspace",
+                    "arguments": {"query": "physical provider boundary"},
+                }]))}
+            return {"text": json.dumps(self._complete_team_action())}
+
+        fake_tools = mock.Mock()
+        fake_tools.execute.return_value = {
+            "matches": [{"path": "src/our_harness/long_horizon.py", "line": 1}],
+        }
+        with mock.patch.object(
+            long_horizon.swarm_work, "CollaborationLedger",
+        ) as ledger_class, mock.patch.object(
+            long_horizon.swarm_work, "_ProjectContextTools", return_value=fake_tools,
+        ), mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            ledger_class.return_value.begin.return_value = mock.Mock(
+                session_id="pair-pre-dispatch-crash-tools",
+            )
+            stopped = runtime.run(goal["goal_id"])
+
+        # The scheduler attempt recorded before the crash is not a provider
+        # attempt. The lead still receives the first physical call, and the
+        # reviewer's acknowledged context continuation cannot consume a third
+        # call after its own required first turn.
+        self.assertEqual(
+            ask_invocations, ["codex", "claude", "claude"],
+        )
+        self.assertEqual(physical_calls, ["codex", "claude"])
+        self.assertEqual(fake_tools.execute.call_count, 1)
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        self.assertEqual(stopped["status"], "paused")
+        required = {
+            one["required_contributor_id"]: one for one in stopped["tasks"]
+            if one.get("required_contributor_id")
+        }
+        self.assertEqual(required["lead"]["attempts"], 2)
+        self.assertEqual(required["reviewer"]["attempts"], 1)
+        self.assertTrue(required["lead"]["provider_effect_id"])
+        self.assertTrue(required["reviewer"]["provider_effect_id"])
+        verify.assert_not_called()
+
+    def test_required_context_followup_yields_reserved_call_to_peer(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Inspect context, then involve the peer"],
+            "pair-context-reservation", lead_id="lead",
+            participant_ids=["lead", "reviewer"],
+            conversation_id="chat-context-reservation",
+            policy={"max_provider_calls": 2},
+        )
+        ask_invocations: list[str] = []
+        physical_calls: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            ask_invocations.append(route)
+            kwargs["before_provider_dispatch"]("initial")
+            physical_calls.append(route)
+            kwargs["after_provider_response"]("initial")
+            if route == "codex":
+                return {"text": json.dumps(action("work", tool_calls=[{
+                    "call_id": "inspect-project-tree",
+                    "name": "search_workspace",
+                    "arguments": {"query": "cooperation"},
+                }]))}
+            return {"text": json.dumps(self._complete_team_action())}
+
+        fake_tools = mock.Mock()
+        fake_tools.execute.return_value = {
+            "matches": [{"path": "src/cooperation.py", "line": 1}],
+        }
+        with mock.patch.object(
+            long_horizon.swarm_work, "CollaborationLedger",
+        ) as ledger_class, mock.patch.object(
+            long_horizon.swarm_work, "_ProjectContextTools", return_value=fake_tools,
+        ), mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            ledger_class.return_value.begin.return_value = mock.Mock(
+                session_id="pair-context-reservation-tools",
+            )
+            stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(ask_invocations, ["codex", "codex", "claude"])
+        self.assertEqual(physical_calls, ["codex", "claude"])
+        self.assertEqual(fake_tools.execute.call_count, 1)
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        self.assertEqual(stopped["status"], "paused")
+        self.assertEqual(
+            {one["required_contributor_id"]: one["attempts"] for one in stopped["tasks"]},
+            {"lead": 1, "reviewer": 1},
+        )
+        verify.assert_not_called()
+
+    def test_required_handoff_refusal_is_terminal_and_peer_still_runs(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Do not let the named lead hand its contribution away"],
+            "pair-handoff-refusal", lead_id="lead",
+            participant_ids=["lead", "reviewer"],
+            conversation_id="chat-handoff-refusal",
+        )
+        physical_calls: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            kwargs["before_provider_dispatch"]("initial")
+            physical_calls.append(route)
+            kwargs["after_provider_response"]("initial")
+            if route == "codex":
+                return {"text": json.dumps(action(
+                    "handoff", summary="Lead refuses and asks the peer to do it",
+                    handoff_agent_id="reviewer",
+                ))}
+            return {"text": json.dumps(self._complete_team_action())}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+        ) as verify:
+            stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(physical_calls, ["codex", "claude"])
+        by_participant = {
+            one["required_contributor_id"]: one for one in stopped["tasks"]
+        }
+        self.assertEqual(by_participant["lead"]["state"], "blocked")
+        self.assertIn("cannot be handed off", by_participant["lead"]["last_error"])
+        self.assertEqual(by_participant["reviewer"]["state"], "complete")
+        self.assertEqual(stopped["status"], "paused")
+        verify.assert_not_called()
+
+    def test_changed_collaboration_contract_is_inspectable_but_never_dispatched(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Keep the exact collaboration semantics"],
+            "pair-contract-change", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-contract",
+        )
+        store.control(goal["goal_id"], "pause")
+
+        def change_contract(document, _db):
+            document["collaboration_contract"]["fingerprint_sha256"] = "0" * 64
+
+        store._mutate(goal["goal_id"], change_contract)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        shown = runtime.store.public(runtime.store.get(goal["goal_id"]))
+        self.assertTrue(shown["collaboration_contract_changed"])
+        self.assertEqual(
+            shown["collaboration_contract_status"]["code"],
+            "collaboration_contract_changed",
+        )
+        with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+            with self.assertRaisesRegex(HarnessError, "collaboration scheduler contract"):
+                runtime.control(goal["goal_id"], "resume")
+        ask.assert_not_called()
+
+    def test_pristine_legacy_required_pair_adopts_current_terminal_attempt_topology(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Legacy pair has not contacted a provider"],
+            "pair-pristine-legacy-contract", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-pristine-legacy",
+        )
+
+        def make_pristine_legacy(document, _db):
+            document.pop("collaboration_contract", None)
+            lead_task = next(
+                one for one in document["tasks"]
+                if one.get("required_contributor_id") == "lead"
+            )
+            peer_task = next(
+                one for one in document["tasks"]
+                if one.get("required_contributor_id") == "reviewer"
+            )
+            peer_task["state"] = "waiting"
+            peer_task["depends_on"] = [lead_task["id"]]
+
+        store._mutate(goal["goal_id"], make_pristine_legacy)
+        reopened = long_horizon.GoalStore(self.config)
+        migrated = reopened.get(goal["goal_id"])
+        self.assertFalse(
+            reopened.public(migrated)["collaboration_contract_changed"]
+        )
+        self.assertEqual(
+            migrated["collaboration_contract"]["fingerprint_sha256"],
+            long_horizon._collaboration_contract(True)["fingerprint_sha256"],
+        )
+        required = [
+            one for one in migrated["tasks"] if one.get("required_contributor_id")
+        ]
+        self.assertTrue(all(one["state"] == "ready" for one in required))
+        self.assertTrue(all(one["depends_on"] == [] for one in required))
+        self.assertIn(
+            "execution_contract_migrated",
+            [one["type"] for one in reopened.events(goal["goal_id"])["events"]],
+        )
+
+    def test_effect_bearing_legacy_required_pair_stays_inspectable_but_cannot_dispatch(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Legacy pair already crossed a provider boundary"],
+            "pair-effectful-legacy-contract", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-effectful-legacy",
+        )
+        lead = store.claim_ready(goal["goal_id"], "legacy-effect-worker")[0]
+        store.record_dispatch(goal["goal_id"], lead, "legacy-effect-dispatch")
+        store.control(goal["goal_id"], "pause")
+        store._mutate(
+            goal["goal_id"],
+            lambda document, _db: document.pop("collaboration_contract", None),
+        )
+
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        held = runtime.store.public(runtime.store.get(goal["goal_id"]))
+        self.assertTrue(held["collaboration_contract_changed"])
+        self.assertEqual(held["budget"]["provider_calls"], 1)
+        self.assertEqual(
+            next(one for one in held["tasks"] if one["id"] == lead["id"])[
+                "provider_effect_state"
+            ],
+            "dispatched",
+        )
+        with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+            with self.assertRaisesRegex(HarnessError, "collaboration scheduler contract"):
+                runtime.control(goal["goal_id"], "resume")
+        ask.assert_not_called()
+
+    def test_changed_provider_principal_contract_stops_pair_before_peer_dispatch(self):
+        def route_context(principals):
+            def resolve(_config, route):
+                route_digest = long_horizon.hashlib.sha256(route.encode("utf-8")).hexdigest()
+                principal = principals[route]
+                return "fixture", {
+                    "failure_context_version": 1,
+                    "route_fingerprint_sha256": route_digest,
+                    "transport_contract": "fixture/route/v1",
+                    "effective_dispatch_version": 1,
+                    "effective_dispatch_fingerprint_sha256": route_digest,
+                    "effective_dispatch_contract": "fixture/effective/v1",
+                    "provider_principal_version": 1,
+                    "provider_principal_fingerprint_sha256": principal,
+                    "provider_principal_contract": "fixture/account/v1",
+                }
+            return resolve
+
+        admitted = {"codex": "a" * 64, "claude": "b" * 64}
+        changed = {"codex": "a" * 64, "claude": "c" * 64}
+        store = self.store()
+        with mock.patch.object(
+            long_horizon.chat_lab, "_route_failure_context",
+            side_effect=route_context(admitted),
+        ):
+            goal = store.create(
+                self.board, "project", ["Use the admitted provider accounts"],
+                "pair-account-change", lead_id="lead",
+                participant_ids=["lead", "reviewer"], conversation_id="chat-account",
+            )
+        store.control(goal["goal_id"], "pause")
+        with mock.patch.object(
+            long_horizon.chat_lab, "_route_failure_context",
+            side_effect=route_context(changed),
+        ):
+            runtime = long_horizon.LongHorizonRuntime(self.config)
+            self.addCleanup(runtime.close)
+            shown = runtime.store.public(runtime.store.get(goal["goal_id"]))
+            self.assertTrue(shown["provider_setup_changed"])
+            with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
+                with self.assertRaisesRegex(HarnessError, "provider setup changed"):
+                    runtime.control(goal["goal_id"], "resume")
+            ask.assert_not_called()
+
+    def test_provider_setup_change_during_known_failure_does_not_release_peer(self):
+        principals = {"codex": "a" * 64, "claude": "b" * 64}
+
+        def route_context(_config, route):
+            route_digest = long_horizon.hashlib.sha256(route.encode("utf-8")).hexdigest()
+            return "fixture", {
+                "failure_context_version": 1,
+                "route_fingerprint_sha256": route_digest,
+                "transport_contract": "fixture/route/v1",
+                "effective_dispatch_version": 1,
+                "effective_dispatch_fingerprint_sha256": route_digest,
+                "effective_dispatch_contract": "fixture/effective/v1",
+                "provider_principal_version": 1,
+                "provider_principal_fingerprint_sha256": principals[route],
+                "provider_principal_contract": "fixture/account/v1",
+            }
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "_route_failure_context", side_effect=route_context,
+        ):
+            runtime = long_horizon.LongHorizonRuntime(self.config)
+            self.addCleanup(runtime.close)
+            goal = runtime.store.create(
+                self.board, "project", ["Stop if the admitted account changes"],
+                "pair-account-change-inflight", lead_id="lead",
+                participant_ids=["lead", "reviewer"],
+                conversation_id="chat-account-change-inflight",
+            )
+            routes: list[str] = []
+
+            def provider(_config, route, _text, **kwargs):
+                routes.append(route)
+                kwargs["before_provider_dispatch"]("initial")
+                principals["claude"] = "c" * 64
+                raise HarnessError("known lead failure after provider setup drift")
+
+            with mock.patch.object(
+                long_horizon.chat_lab, "ask_once", side_effect=provider,
+            ):
+                stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(routes, ["codex"])
+        self.assertEqual(stopped["status"], "paused")
+        peer = next(
+            one for one in stopped["tasks"]
+            if one.get("required_contributor_id") == "reviewer"
+        )
+        self.assertEqual(peer["attempts"], 0)
+        self.assertTrue(stopped["provider_setup_changed"])
+
+    def test_collaboration_contract_drift_after_reply_blocks_repair_and_peer(self):
+        board = copy.deepcopy(self.board)
+        board["agents"][0]["who"] = "web:contract-drift-lead"
+
+        def route_context(_config, route):
+            digest = long_horizon.hashlib.sha256(route.encode("utf-8")).hexdigest()
+            return "fixture", {
+                "failure_context_version": 1,
+                "route_fingerprint_sha256": digest,
+                "transport_contract": "fixture/route/v1",
+                "effective_dispatch_version": 1,
+                "effective_dispatch_fingerprint_sha256": digest,
+                "effective_dispatch_contract": "fixture/effective/v1",
+                "provider_principal_version": 1,
+                "provider_principal_fingerprint_sha256": digest,
+                "provider_principal_contract": "fixture/account/v1",
+            }
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "_route_failure_context", side_effect=route_context,
+        ):
+            runtime = long_horizon.LongHorizonRuntime(self.config)
+            self.addCleanup(runtime.close)
+            goal = runtime.store.create(
+                board, "project", ["Never continue under changed team semantics"],
+                "pair-collaboration-drift-inflight", lead_id="lead",
+                participant_ids=["lead", "reviewer"],
+                conversation_id="chat-collaboration-drift-inflight",
+            )
+            ask_invocations: list[str] = []
+            physical_calls: list[str] = []
+
+            def provider(_config, route, _text, **kwargs):
+                ask_invocations.append(route)
+                if len(ask_invocations) == 2:
+                    runtime.store._mutate(
+                        goal["goal_id"],
+                        lambda document, _db: document["collaboration_contract"].update({
+                            "fingerprint_sha256": "0" * 64,
+                        }),
+                    )
+                kwargs["before_provider_dispatch"]("initial")
+                physical_calls.append(route)
+                kwargs["after_provider_response"]("initial")
+                return {"text": "malformed reply requiring repair"}
+
+            with mock.patch.object(
+                long_horizon.chat_lab, "ask_once", side_effect=provider,
+            ):
+                stopped = runtime.run(goal["goal_id"])
+
+        self.assertEqual(ask_invocations, ["web:contract-drift-lead", "web:contract-drift-lead"])
+        self.assertEqual(physical_calls, ["web:contract-drift-lead"])
+        self.assertEqual(stopped["status"], "paused")
+        self.assertTrue(stopped["collaboration_contract_changed"])
+        peer = next(
+            one for one in stopped["tasks"]
+            if one.get("required_contributor_id") == "reviewer"
+        )
+        self.assertEqual(peer["attempts"], 0)
+        self.assertNotIn("continue the remaining named", stopped["note"])
 
     def test_explicit_board_goal_every_mode_is_durable_and_intent_idempotent(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
-        with mock.patch.object(
-            runtime, "start_background",
-            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
-        ) as start:
+        # This test counts only the two synchronous start() attempts. The real
+        # start_background method records its attempt before the durable
+        # auto-start watcher can race it; replacing that method with a passive
+        # mock removes the guard, so isolate the watcher explicitly here.
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), \
+                mock.patch.object(
+                    runtime, "start_background",
+                    side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+                ) as start:
             created = runtime.start(
                 self.board, "project", ["Produce independently verified output"],
                 "composer-request", lead_id="lead",
@@ -1482,6 +2547,58 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(original["status"], "failed")
         self.assertTrue(any(one["kind"] == "repair" for one in checked["tasks"]))
 
+    def test_unavailable_verification_pauses_without_provider_repair(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Create a verified result"],
+            "verification-infrastructure-unavailable",
+        )
+        task = store.claim_ready(goal["goal_id"], "worker")[0]
+        merkle, manifest = long_horizon.swarm_work._project_tree_merkle(
+            self.project
+        )
+        store.apply_action(
+            goal["goal_id"], task,
+            action(criteria_evidence=[{
+                "criterion": "Original objective is satisfied",
+                "evidence_refs": ["verified-no-change"],
+            }]),
+            artifact={
+                "kind": "verified_no_change", "tree_merkle": merkle,
+                "file_count": len(manifest),
+            },
+        )
+        before = store.get(goal["goal_id"])
+        checked = store.complete_verification(goal["goal_id"], {
+            "status": "unavailable",
+            "basis": "verification_containment_unavailable",
+            "reason": "Windows could not register the verification sandbox.",
+            "commands": [{
+                "argv": ["python", "-m", "unittest"], "exit_code": -2,
+                "containment_unavailable": True,
+            }],
+        })
+        self.assertEqual("paused", checked["status"], checked)
+        self.assertEqual(len(before["tasks"]), len(checked["tasks"]))
+        self.assertFalse(any(
+            one["kind"] == "repair" for one in checked["tasks"]
+        ))
+        self.assertEqual(
+            before["budget"]["provider_calls"],
+            checked["budget"]["provider_calls"],
+        )
+        paused = [
+            one for one in store.events(goal["goal_id"])["events"]
+            if one["type"] == "goal_paused"
+        ][-1]
+        self.assertEqual(
+            "verification_unavailable", paused["payload"]["reason"]
+        )
+        self.assertEqual(
+            "verification_containment_unavailable",
+            paused["payload"]["basis"],
+        )
+
     def test_explicit_no_change_criterion_is_bound_to_authenticated_snapshot(self):
         store = self.store()
         goal = store.create(
@@ -1773,11 +2890,11 @@ class LongHorizonTests(unittest.TestCase):
         waiter = runtime.store.create(self.board, "project", ["Waiter"], "runtime-waiter")
         with mock.patch.object(
             runtime, "start_background",
-            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+            side_effect=lambda goal_id, answers=None, **_kwargs: runtime.store.get(goal_id),
         ) as start:
             released = runtime.control(owner["goal_id"], "cancel")
         self.assertEqual(released["promoted_goal_ids"], [waiter["goal_id"]])
-        start.assert_called_once_with(waiter["goal_id"])
+        start.assert_called_once_with(waiter["goal_id"], automatic=True)
 
     def test_failed_goal_retains_ownership_until_cancel_or_resume(self):
         store = self.store()
@@ -2139,6 +3256,42 @@ class LongHorizonTests(unittest.TestCase):
         })
         self.assertEqual(finalized["status"], "cancelled")
 
+    def test_automatic_scheduler_claim_rechecks_current_durable_eligibility(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Start only from the pristine boundary"],
+            "atomic-auto-start-eligibility",
+        )
+        goal_id = goal["goal_id"]
+
+        self.assertTrue(store.claim_scheduler(
+            goal_id, "valid-automatic-claim", automatic=True,
+        ))
+        self.assertTrue(store.release_scheduler(
+            goal_id, "valid-automatic-claim",
+        ))
+
+        store._mutate(
+            goal_id,
+            lambda document, _db: document["project_queue"].update({
+                "auto_start_pending": False,
+            }),
+        )
+        self.assertFalse(store.claim_scheduler(
+            goal_id, "consumed-automatic-claim", automatic=True,
+        ))
+
+        def make_effect_bearing(document, _db):
+            document["project_queue"]["auto_start_pending"] = True
+            document["artifacts"].append({
+                "kind": "verified_no_change", "tree_merkle": "a" * 64,
+            })
+
+        store._mutate(goal_id, make_effect_bearing)
+        self.assertFalse(store.claim_scheduler(
+            goal_id, "effect-bearing-automatic-claim", automatic=True,
+        ))
+
     def test_cancelling_allows_receipt_of_already_applied_transaction(self):
         other_root = self.base / "applied-during-drain"
         other_root.mkdir()
@@ -2340,7 +3493,7 @@ class LongHorizonTests(unittest.TestCase):
         exact = prefix + " original tail"
         with mock.patch.object(
             runtime, "start_background",
-            side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
+            side_effect=lambda goal_id, answers=None, **_kwargs: runtime.store.get(goal_id),
         ):
             created = runtime.start(
                 self.board, "project", [exact], "digest-large",
@@ -2672,47 +3825,56 @@ class LongHorizonTests(unittest.TestCase):
 
     def test_cross_process_same_project_admission_has_one_owner_and_one_waiter(self):
         context = multiprocessing.get_context("spawn")
-        ready = context.Queue()
+        statuses = context.Queue()
         begin = context.Event()
-        results = context.Queue()
         other_authority = self.base / "cross-process-authority"
         other_authority.mkdir()
         state_path = self.base / "state"
-        processes = [
-            context.Process(
+        processes = {
+            request_id: context.Process(
+                name=f"nexus-admission-{request_id}",
                 target=_cross_process_goal_admission,
                 args=(
                     str(state_path), str(authority), str(self.project), request_id,
-                    ready, begin, results,
+                    statuses, begin,
                 ),
             )
             for authority, request_id in (
                 (self.authority, "process-a"), (other_authority, "process-b"),
             )
-        ]
-        for process in processes:
-            process.start()
-        self.addCleanup(lambda: [
-            process.terminate() for process in processes if process.is_alive()
-        ])
-        self.assertEqual(
-            {ready.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS) for _ in processes},
-            {"process-a", "process-b"},
-        )
-        begin.set()
-        outcomes = [
-            results.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS) for _ in processes
-        ]
-        for process in processes:
-            process.join(THREAD_COORDINATION_TIMEOUT_SECONDS)
-            self.assertEqual(process.exitcode, 0)
-        self.assertTrue(all(one["ok"] for one in outcomes), outcomes)
-        self.assertCountEqual(
-            [one["status"] for one in outcomes], ["queued", "waiting_for_project"],
-        )
-        owner = next(one for one in outcomes if one["status"] == "queued")
-        waiter = next(one for one in outcomes if one["status"] == "waiting_for_project")
-        self.assertEqual(waiter["queue"]["blocked_by_goal_id"], owner["goal_id"])
+        }
+        cleaned = False
+
+        def cleanup():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            _cleanup_cross_processes(
+                processes, events=(begin,), queues=(statuses,),
+            )
+
+        self.addCleanup(cleanup)
+        try:
+            for process in processes.values():
+                process.start()
+            _collect_cross_process_phase(statuses, processes, "ready")
+            begin.set()
+            outcomes = _collect_cross_process_phase(statuses, processes, "outcome")
+            _assert_cross_processes_exited_cleanly(processes)
+            self.assertCountEqual(
+                [one["status"] for one in outcomes],
+                ["queued", "waiting_for_project"],
+            )
+            owner = next(one for one in outcomes if one["status"] == "queued")
+            waiter = next(
+                one for one in outcomes if one["status"] == "waiting_for_project"
+            )
+            self.assertEqual(
+                waiter["queue"]["blocked_by_goal_id"], owner["goal_id"],
+            )
+        finally:
+            cleanup()
 
         configs = {
             "process-a": self.config,
@@ -2743,52 +3905,80 @@ class LongHorizonTests(unittest.TestCase):
 
     def test_cross_process_same_request_replay_has_one_provider_dispatch(self):
         context = multiprocessing.get_context("spawn")
-        ready = context.Queue()
+        statuses = context.Queue()
         begin = context.Event()
         release = context.Event()
         dispatch_count = context.Value("i", 0)
-        results = context.Queue()
         state_path = self.base / "runtime-replay-state"
-        processes = [
-            context.Process(
+        processes = {
+            worker_id: context.Process(
+                name=f"nexus-runtime-replay-{worker_id}",
                 target=_cross_process_runtime_replay,
                 args=(
+                    worker_id,
                     str(state_path), str(self.authority), str(self.project),
-                    ready, begin, release, dispatch_count, results,
+                    statuses, begin, release, dispatch_count,
                 ),
             )
-            for _ in range(2)
-        ]
-        for process in processes:
-            process.start()
-        self.addCleanup(lambda: [
-            process.terminate() for process in processes if process.is_alive()
-        ])
-        for _ in processes:
-            self.assertEqual(
-                ready.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS), "ready",
+            for worker_id in ("process-a", "process-b")
+        }
+        cleaned = False
+
+        def cleanup():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            _cleanup_cross_processes(
+                processes, events=(begin, release), queues=(statuses,),
             )
-        begin.set()
-        deadline = time.monotonic() + THREAD_COORDINATION_TIMEOUT_SECONDS
-        while time.monotonic() < deadline and dispatch_count.value < 1:
-            time.sleep(0.02)
-        self.assertEqual(dispatch_count.value, 1)
-        time.sleep(0.35)
-        self.assertEqual(
-            dispatch_count.value, 1,
-            "two runtime processes dispatched the idempotent goal concurrently",
-        )
-        release.set()
-        outcomes = [
-            results.get(timeout=THREAD_COORDINATION_TIMEOUT_SECONDS) for _ in processes
-        ]
-        for process in processes:
-            process.join(THREAD_COORDINATION_TIMEOUT_SECONDS)
-            self.assertEqual(process.exitcode, 0)
-        self.assertTrue(all(one.get("ok") for one in outcomes), outcomes)
-        self.assertEqual(len({one["goal_id"] for one in outcomes}), 1)
-        self.assertEqual(dispatch_count.value, 1)
-        self.assertTrue(all(one["status"] == "complete" for one in outcomes), outcomes)
+
+        self.addCleanup(cleanup)
+        try:
+            for process in processes.values():
+                process.start()
+            _collect_cross_process_phase(statuses, processes, "ready")
+            begin.set()
+            deadline = time.monotonic() + THREAD_COORDINATION_TIMEOUT_SECONDS
+            while dispatch_count.value < 1:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        "cross-process runtime did not reach its first provider dispatch; "
+                        f"processes={_process_diagnostics(processes)}"
+                    )
+                _raise_on_cross_process_status_or_exit(
+                    statuses, processes,
+                    timeout=min(PROCESS_STATUS_POLL_SECONDS, remaining),
+                    expected="the first provider dispatch",
+                )
+            self.assertEqual(dispatch_count.value, 1)
+            observation_deadline = time.monotonic() + 0.35
+            while True:
+                remaining = observation_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                _raise_on_cross_process_status_or_exit(
+                    statuses, processes,
+                    timeout=min(PROCESS_STATUS_POLL_SECONDS, remaining),
+                    expected="the provider release barrier",
+                )
+            self.assertEqual(
+                dispatch_count.value, 1,
+                "two runtime processes dispatched the idempotent goal concurrently",
+            )
+            release.set()
+            outcomes = _collect_cross_process_phase(
+                statuses, processes, "outcome",
+            )
+            _assert_cross_processes_exited_cleanly(processes)
+            self.assertEqual(len({one["goal_id"] for one in outcomes}), 1)
+            self.assertEqual(dispatch_count.value, 1)
+            self.assertTrue(
+                all(one["status"] == "complete" for one in outcomes), outcomes,
+            )
+        finally:
+            cleanup()
 
     def test_shared_server_ownership_fences_legacy_and_long_horizon_both_directions(self):
         panel = harness_server.HarnessHTTPServer(("127.0.0.1", 0), self.config)
@@ -3019,6 +4209,80 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(runtime.store.get(created["goal_id"])["status"], "paused")
         self.assertEqual(runtime.store.get(after_apply["goal_id"])["status"], "paused")
 
+    def test_auto_start_watcher_cannot_dispatch_a_stale_eligible_page(self):
+        store = self.store()
+        created = store.create(
+            self.board, "project", ["Do not dispatch stale watcher state"],
+            "stale-auto-start-page",
+        )
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+
+        page_seen = threading.Event()
+        release_page = threading.Event()
+        attempt_finished = threading.Event()
+        provider_release = threading.Event()
+        unexpected_worker = threading.Event()
+        self.addCleanup(release_page.set)
+        self.addCleanup(provider_release.set)
+        original_page = runtime.store.auto_startable_authority_page
+        original_start = runtime.start_background
+        page_lock = threading.Lock()
+        page_blocked = False
+
+        def held_page(*args, **kwargs):
+            nonlocal page_blocked
+            result = original_page(*args, **kwargs)
+            with page_lock:
+                should_block = bool(result[0]) and not page_blocked
+                if should_block:
+                    page_blocked = True
+            if should_block:
+                page_seen.set()
+                release_page.wait(THREAD_COORDINATION_TIMEOUT_SECONDS)
+            return result
+
+        def observed_start(goal_id, answers=None, *, automatic=False):
+            try:
+                result = original_start(
+                    goal_id, answers, automatic=automatic,
+                )
+                with runtime.lock:
+                    if goal_id in runtime.workers:
+                        unexpected_worker.set()
+                return result
+            finally:
+                attempt_finished.set()
+
+        def held_provider(_config, _route, _text, **kwargs):
+            kwargs["before_provider_dispatch"]("initial")
+            provider_release.wait(THREAD_COORDINATION_TIMEOUT_SECONDS)
+            raise HarnessError("controlled stale-watcher test stop")
+
+        runtime.store.auto_startable_authority_page = held_page
+        runtime.start_background = observed_start
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=held_provider,
+        ) as ask:
+            runtime._enable_auto_start_watcher()
+            self.assertTrue(page_seen.wait(THREAD_COORDINATION_TIMEOUT_SECONDS))
+
+            runtime.store._mutate(
+                created["goal_id"],
+                lambda document, _db: document["project_queue"].update({
+                    "auto_start_pending": False,
+                }),
+            )
+            release_page.set()
+            self.assertTrue(
+                attempt_finished.wait(THREAD_COORDINATION_TIMEOUT_SECONDS),
+            )
+            self.assertFalse(unexpected_worker.is_set())
+            current = runtime.store.get(created["goal_id"])
+            self.assertEqual(current["status"], "queued")
+            self.assertFalse(current["project_queue"]["auto_start_pending"])
+            ask.assert_not_called()
+
     def test_auto_start_watcher_pages_past_missing_roots_to_valid_goal(self):
         store = self.store()
         goals = []
@@ -3039,7 +4303,7 @@ class LongHorizonTests(unittest.TestCase):
         attempts: list[str] = []
         valid_goal_id = goals[-1]["goal_id"]
 
-        def attempt(goal_id, answers=None):
+        def attempt(goal_id, answers=None, **_kwargs):
             attempts.append(goal_id)
             if goal_id != valid_goal_id:
                 raise FileNotFoundError("removed test project")
@@ -3362,8 +4626,23 @@ class LongHorizonTests(unittest.TestCase):
             script,
         ).group(0)
         self.assertIn('if (mode === "work")', big_chat)
-        self.assertLess(big_chat.index('request("/api/long-horizon/start"'),
-                        big_chat.index('request("/api/swarm/say"'))
+        self.assertLess(
+            big_chat.index("await startAndReconcileDirectLongGoalAdmission"),
+            big_chat.index('request("/api/swarm/say"'),
+        )
+        admission = script[
+            script.index("async function startAndReconcileDirectLongGoalAdmission"):
+            script.index("function confirmProjectWork")
+        ]
+        self.assertIn('request("/api/long-horizon/start"', admission)
+        self.assertIn("await reconcileDirectLongGoalAdmission", admission)
+        reconciliation = script[
+            script.index("async function reconcileDirectLongGoalAdmission"):
+            script.index("async function reconcileExistingDirectLongGoalAdmission")
+        ]
+        self.assertIn(
+            'request("/api/long-horizon/discard-admission"', reconciliation,
+        )
         self.assertIn('"pending_apply"', script)
         self.assertIn("expected_revision: longGoal.revision", script)
         self.assertIn("hasPendingDecision", script)

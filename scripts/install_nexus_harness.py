@@ -1,22 +1,21 @@
-"""Install the released Nexus Harness desktop app on Windows.
+"""Deprecated compatibility surface for the Windows release installer.
 
-This is intentionally separate from ``put_it_on_your_desktop.py``.  The latter
-is a source-developer convenience; it must never be presented as an installed
-desktop application.  This installer fetches a versioned NSIS release, verifies
-the checksum published beside it, and then starts the installer.
+The supported entry point is ``Install Nexus Harness.cmd`` backed by
+``install_nexus_harness.ps1``.  This module retains small parsing helpers for
+tests and old imports, but its CLI/install function fail closed so it cannot
+bypass the product-bound bootstrap, certificate pin, private execution-copy,
+installed-identity, or shortcut contracts.
 """
 
 from __future__ import annotations
 
 import argparse
-import functools
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -49,33 +48,11 @@ class InstallError(RuntimeError):
     pass
 
 
-@functools.lru_cache(maxsize=1)
 def _github_token() -> str:
-    """Reuse an existing private-repository login without printing or storing it."""
+    """Use only an explicit process-scoped token; never execute credential tools."""
 
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
-    if token:
-        return token.strip()
-    for argv, input_text, environment in (
-        (["gh", "auth", "token"], None, None),
-        (["git", "credential", "fill"], "protocol=https\nhost=github.com\n\n",
-         {**os.environ, "GCM_INTERACTIVE": "Never"}),
-    ):
-        try:
-            result = subprocess.run(
-                argv, input=input_text, capture_output=True, text=True,
-                timeout=15, check=False, env=environment,
-            )
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode != 0:
-            continue
-        if argv[0] == "gh" and result.stdout.strip():
-            return result.stdout.strip()
-        for line in result.stdout.splitlines():
-            if line.startswith("password="):
-                return line.removeprefix("password=").strip()
-    return ""
+    return token.strip()
 
 
 def _request(url: str, *, accept: str = "application/vnd.github+json") -> urllib.request.Request:
@@ -204,8 +181,14 @@ def _authenticode_signer(path: Path, expected_subject: str | None) -> str:
         "Message=[string]$signature.StatusMessage} | ConvertTo-Json -Compress"
     )
     try:
+        system_root = Path(os.environ.get("SystemRoot") or "")
+        powershell = system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if not system_root.is_absolute() or not powershell.is_file():
+            raise InstallError(
+                "Windows did not provide its built-in PowerShell signature verifier; nothing was run."
+            )
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script, str(path)],
             capture_output=True, text=True, timeout=30, check=False,
         )
         value = json.loads(result.stdout) if result.returncode == 0 else {}
@@ -232,56 +215,16 @@ def _authenticode_signer(path: Path, expected_subject: str | None) -> str:
 
 
 def install(*, api_url: str = LATEST_RELEASE_API, quiet: bool = False) -> str:
-    if os.name != "nt":
-        raise InstallError("The released desktop installer is currently for Windows only.")
-    expected_publisher = _expected_publisher()
-    release = _release(api_url)
-    installer_asset, checksum_asset = _assets(release)
-    installer_name = str(installer_asset.get("name") or "")
-    canonical = re.fullmatch(r"Nexus-Harness-Setup-[0-9][0-9.]*\.exe", installer_name)
-    checksum_only = re.fullmatch(r"Nexus-Harness-Setup-[0-9][0-9.]*-UNSIGNED\.exe", installer_name)
-    if expected_publisher is None and not checksum_only:
-        raise InstallError(
-            "The repository has no pinned Windows publisher, but the release is not explicitly named UNSIGNED; "
-            "nothing was run."
-        )
-    if expected_publisher is not None and not canonical:
-        raise InstallError("The signed release has an unexpected installer name; nothing was run.")
-    version = str(release.get("tag_name") or "the latest release")
-    with tempfile.TemporaryDirectory(prefix="nexus-harness-install-") as temporary:
-        folder = Path(temporary)
-        installer = folder / str(installer_asset["name"])
-        checksum = folder / str(checksum_asset["name"])
-        print(f"Downloading Nexus Harness {version} from GitHub Releases...")
-        authenticated = bool(_github_token())
-        _download(
-            _asset_download_url(installer_asset, authenticated=authenticated),
-            installer, MAX_INSTALLER_BYTES,
-        )
-        _download(
-            _asset_download_url(checksum_asset, authenticated=authenticated),
-            checksum, 128 * 1024,
-        )
-        expected = _expected_digest(checksum, installer.name)
-        actual = _sha256(installer)
-        if actual != expected:
-            raise InstallError("The installer checksum did not match; the file was deleted and not run.")
-        trust = _authenticode_signer(installer, expected_publisher)
-        if expected_publisher is None:
-            print(
-                "WARNING: this installer is not Authenticode-signed. Its exact bytes matched the SHA-256 "
-                "published with the immutable GitHub release."
-            )
-        print(f"Release trust verified ({trust}). Starting the installer...")
-        arguments = [str(installer), *( ["/S"] if quiet else [] )]
-        result = subprocess.run(arguments, check=False)
-        if result.returncode != 0:
-            raise InstallError(f"The Windows installer stopped with code {result.returncode}.")
-    return version
+    del api_url, quiet
+    raise InstallError(
+        "This legacy Python installer is disabled so it cannot bypass the hardened Windows bootstrap. "
+        "Run the repository's exact 'Install Nexus Harness.cmd', or the copy inside the complete "
+        "product-built offline ZIP."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Download, verify, and install Nexus Harness")
+    parser = argparse.ArgumentParser(description="Deprecated Nexus Harness installer compatibility shim")
     parser.add_argument("--api-url", default=LATEST_RELEASE_API, help=argparse.SUPPRESS)
     parser.add_argument("--quiet", action="store_true", help="Run the NSIS installer unattended")
     args = parser.parse_args(argv)
@@ -290,10 +233,9 @@ def main(argv: list[str] | None = None) -> int:
     except InstallError as exc:
         print(f"Installation stopped safely: {exc}", file=sys.stderr)
         print(
-            "Open https://github.com/KZTP47/nexus-harness/releases to install manually. "
-            "For this private repository, first sign in with GitHub CLI or Git Credential Manager, "
-            "or set GH_TOKEN only for the installer process. If you are developing Nexus itself, "
-            "see docs/DESKTOP.md instead.",
+            "Use the exact top-level Install Nexus Harness.cmd. For a private fork's source-mode "
+            "download, set GH_TOKEN or GITHUB_TOKEN only for that process. If you are developing "
+            "Nexus itself, see docs/DESKTOP.md instead.",
             file=sys.stderr,
         )
         return 1

@@ -15,6 +15,7 @@ const { attachGuards, onlyOnce, isHarnessVersionMismatch, whyItReallyIs } = requ
 const { WebChatManager } = require("./web-chats");
 const { DesktopSettingsStore } = require("./settings-store");
 const { DirectGoalOutbox } = require("./direct-goal-outbox");
+const { createShutdownCoordinator } = require("./shutdown");
 
 function readBuildInfo() {
   try {
@@ -40,6 +41,7 @@ let repairAvailable = false;
 let webChatManager = null;
 let reviewedTrust = null;
 let desktopSettingsStore = null;
+let shutdownCoordinator = null;
 const pendingJsonExports = new Map();
 const ownsApplicationInstance = app.requestSingleInstanceLock();
 
@@ -272,8 +274,13 @@ async function openProject(chosen, options = {}) {
   reviewedTrust = null;
   repairAvailable = false;
   showPage("starting.html", { project: path.basename(chosen) });
-  server.stop();
   try {
+    const stopped = await server.stop();
+    if (!stopped) {
+      throw new Error(
+        "The previous local Nexus server did not close in time. Wait a moment, then open the project again."
+      );
+    }
     const url = await server.start(chosen, options);
     if (window && !window.isDestroyed()) window.loadURL(url);
   } catch (error) {
@@ -351,11 +358,10 @@ function createWindow() {
   window.webContents.on("did-start-navigation", (_event, _url, _inPlace, mainFrame) => {
     if (mainFrame) abandonRendererExports();
   });
+  const createdWindow = window;
   window.on("closed", () => {
     abandonRendererExports();
-    if (webChatManager) webChatManager.close();
-    webChatManager = null;
-    window = null;
+    if (window === createdWindow) window = null;
   });
   window.on("enter-full-screen", () => {
     if (window && !window.isDestroyed()) {
@@ -373,10 +379,34 @@ function createWindow() {
     openExternally: (url) => shell.openExternal(url),
   });
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  webChatManager = new WebChatManager({
+  const manager = new WebChatManager({
     electron, owner: window, readSettings, writeSettings,
     shellPage: pageUrl("web-chat.html"),
     shellPreload: path.join(__dirname, "web-chat-shell-preload.js"),
+  });
+  webChatManager = manager;
+  const coordinator = createShutdownCoordinator({
+    closeWebChats: async () => {
+      // Stop accepting renderer work before native child views and controlled
+      // browser processes begin their ordered teardown.
+      if (webChatManager === manager) webChatManager = null;
+      await manager.close();
+    },
+    stopServer: () => server.stop(),
+    quit: () => app.quit(),
+    closeWindow: () => {
+      if (!createdWindow.isDestroyed()) createdWindow.close();
+    },
+  });
+  shutdownCoordinator = coordinator;
+  createdWindow.on("close", (event) => {
+    if (coordinator.isReady()) return;
+    event.preventDefault();
+    abandonRendererExports();
+    for (const identity of [...pendingJsonExports.keys()]) {
+      try { closeLargeJsonExport(identity); } catch (_error) { /* target stayed untouched */ }
+    }
+    void coordinator.request(process.platform === "darwin" ? "close" : "quit");
   });
   return window;
 }
@@ -911,14 +941,19 @@ app.on("activate", () => {
 });
 
 app.on("window-all-closed", () => {
-  server.stop();
-  if (process.platform !== "darwin") app.quit();
+  if (process.platform === "darwin") return;
+  if (shutdownCoordinator && !shutdownCoordinator.isReady()) {
+    void shutdownCoordinator.request("quit");
+    return;
+  }
+  app.quit();
 });
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
   for (const identity of [...pendingJsonExports.keys()]) {
     try { closeLargeJsonExport(identity); } catch (_error) { /* target was never replaced */ }
   }
-  server.stop();
+  if (!shutdownCoordinator || shutdownCoordinator.isReady()) return;
+  event.preventDefault();
+  void shutdownCoordinator.request("quit");
 });
-process.on("exit", () => server.stop());

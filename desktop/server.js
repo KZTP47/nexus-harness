@@ -10,6 +10,7 @@ const path = require("node:path");
 
 const READY_MARKER = "harness-ui-ready ";
 const START_TIMEOUT_MS = 45000;
+const STOP_TIMEOUT_MS = 8000;
 const LOG_LINES = 200;
 
 function privateRuntimeMissingError() {
@@ -193,6 +194,16 @@ class HarnessServer {
       this.environment, this.resources, this.bundledRequired);
     this.timeoutMs = options.timeoutMs || START_TIMEOUT_MS;
     this.child = null;
+    // Own every UI child from spawn until the operating system reports it
+    // closed.  The ready child is also exposed as `child`, but startup and
+    // timed-out shutdown processes must remain stoppable too.
+    this.children = new Set();
+    this.stopPromise = null;
+    // A stop request cancels the whole in-flight candidate search, not just the
+    // child that happened to exist when stop() took its snapshot. Without this
+    // fence, source mode could kill candidate A and then start candidate B from
+    // the rejection handler after shutdown had already completed.
+    this.stopGeneration = 0;
     this.url = "";
     this.log = [];
     this.onExit = options.onExit || (() => {});
@@ -218,6 +229,13 @@ class HarnessServer {
   // and "not on this machine" is only the answer when that was true of all of
   // them.
   async start(projectPath, options = {}) {
+    if (this.stopPromise) await this.stopPromise;
+    const stopGeneration = this.stopGeneration;
+    if (this.children.size) {
+      throw new Error(
+        "The previous local Nexus server has not stopped yet. Wait for it to close before opening another project."
+      );
+    }
     if (!this.candidates.length && this.bundledRequired) {
       throw privateRuntimeMissingError();
     }
@@ -225,8 +243,13 @@ class HarnessServer {
     let realProblem = null;
     for (const [command, leadingArguments] of this.candidates) {
       try {
-        return await this.startOnce(command, leadingArguments, projectPath, options);
+        const url = await this.startOnce(command, leadingArguments, projectPath, options);
+        if (this.stopGeneration !== stopGeneration) {
+          throw new Error("The local Nexus server was stopped before startup completed.");
+        }
+        return url;
       } catch (error) {
+        if (this.stopGeneration !== stopGeneration) throw error;
         if (error.commandIsMissing) {
           // A packaged candidate existed when the app inspected its resources,
           // but antivirus or an updater can remove it before spawn. Never turn
@@ -339,7 +362,17 @@ class HarnessServer {
         reject(notHere(error));
         return;
       }
+      this.children.add(child);
+      this.child = child;
+      child.once("close", () => {
+        this.children.delete(child);
+        if (this.child === child) {
+          this.child = null;
+          this.url = "";
+        }
+      });
       let settled = false;
+      let becameReady = false;
       let buffered = "";
       const finish = (error, value) => {
         if (settled) return;
@@ -369,36 +402,75 @@ class HarnessServer {
             finish(new Error("The control panel reported an address that is not on this machine."));
             return;
           }
-          this.child = child;
+          becameReady = true;
           this.url = ready.url;
           finish(null, ready.url);
         });
       };
       readStream(child.stdout);
       readStream(child.stderr);
-      child.on("error", (error) => finish(notHere(error)));
+      child.on("error", (error) => {
+        // A spawn error has no live operating-system process and may not emit
+        // close on every Node/Windows combination.
+        this.children.delete(child);
+        if (this.child === child) this.child = null;
+        finish(notHere(error));
+      });
       child.on("exit", (code) => {
         const detail = this.recentLog().split("\n").slice(-6).join("\n");
         finish(new Error(`${command} stopped with code ${code}.\n${detail}`));
         if (settled && this.child === child) {
           this.child = null;
           this.url = "";
-          this.onExit(code);
+          if (becameReady) this.onExit(code);
         }
       });
     });
   }
 
-  stop() {
-    const child = this.child;
+  stop(options = {}) {
+    this.stopGeneration += 1;
+    if (this.stopPromise) return this.stopPromise;
+    const children = [...this.children];
     this.child = null;
     this.url = "";
-    if (!child) return;
-    try {
-      child.kill();
-    } catch (error) {
-      /* the process was already gone */
-    }
+    if (!children.length) return Promise.resolve(true);
+    const requestedTimeout = Number(options.timeoutMs);
+    const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout >= 0
+      ? requestedTimeout : STOP_TIMEOUT_MS;
+    let tracked;
+    const waiting = Promise.all(children.map((child) => new Promise((resolve) => {
+      let timer = null;
+      let finished = false;
+      const finish = (closed) => {
+        if (finished) return;
+        finished = true;
+        if (timer) clearTimeout(timer);
+        child.removeListener?.("close", closedNormally);
+        if (closed) this.children.delete(child);
+        resolve(closed);
+      };
+      const closedNormally = () => finish(true);
+      child.once?.("close", closedNormally);
+      timer = setTimeout(() => finish(false), timeoutMs);
+      try {
+        // Terminating a Windows process is asynchronous. Wait for ChildProcess'
+        // close event so its cwd and pipe handles are gone before Electron
+        // itself exits; otherwise an immediate reinstall or project cleanup can
+        // race a Python process that is still releasing the project directory.
+        if (child.exitCode == null) child.kill();
+        else finish(true);
+      } catch (error) {
+        // Keep this exact child in `children` unless Windows already reported
+        // exit. A later stop call must retain authority to retry it.
+        finish(child.exitCode != null);
+      }
+    }))).then((closed) => closed.every(Boolean));
+    tracked = waiting.finally(() => {
+      if (this.stopPromise === tracked) this.stopPromise = null;
+    });
+    this.stopPromise = tracked;
+    return tracked;
   }
 }
 

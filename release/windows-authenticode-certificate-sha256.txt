@@ -1,0 +1,1 @@
+UNCONFIGURED - replace with the lowercase SHA-256 of the DER-encoded Authenticode signer certificate before any public signed release

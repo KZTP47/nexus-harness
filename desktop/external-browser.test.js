@@ -39,11 +39,24 @@ test("the external transport starts a normal loopback-controlled browser without
     pages: () => [page],
     newPage: async () => { throw new Error("the initial page should be claimed"); },
   };
+  const closeCommands = [];
+  let detached = 0;
+  const child = Object.assign(new EventEmitter(), {
+    exitCode: null, signalCode: null, killed: false,
+    kill() { this.killed = true; },
+  });
   const browser = Object.assign(new EventEmitter(), {
     contexts: () => [context], isConnected: () => true, close: async () => {},
-  });
-  const child = Object.assign(new EventEmitter(), {
-    exitCode: null, killed: false, kill() { this.killed = true; },
+    newBrowserCDPSession: async () => ({
+      send: async (method) => {
+        closeCommands.push(method);
+        setImmediate(() => {
+          child.exitCode = 0;
+          child.emit("close", 0);
+        });
+      },
+      detach: async () => { detached += 1; },
+    }),
   });
   const transport = new ExternalBrowserTransport({
     provider: {id: "claude", label: "Claude", home: "https://claude.ai/"},
@@ -77,8 +90,86 @@ test("the external transport starts a normal loopback-controlled browser without
   assert.ok(launched[0].args.includes("--start-minimized"));
   assert.ok(!launched[0].args.some((one) => /enable-automation|headless|remote-debugging-port=0/.test(one)));
   assert.equal(launched[0].options.windowsHide, false);
-  await transport.close();
+  const firstClose = transport.close();
+  assert.strictEqual(transport.close(), firstClose, "concurrent close calls share one operation");
+  assert.equal(await firstClose, true);
   assert.equal(contents.isDestroyed(), true);
+  assert.deepEqual(closeCommands, ["Browser.close"]);
+  assert.equal(detached, 1);
+  assert.equal(child.killed, false, "a graceful browser close must not force-kill Chrome");
+  assert.strictEqual(transport.close(), firstClose, "completed close calls stay idempotent");
+});
+
+test("external browser close force-kills only after the graceful deadline and still waits for close", async () => {
+  const commands = [];
+  let kills = 0;
+  let browserDisconnects = 0;
+  const child = Object.assign(new EventEmitter(), {
+    exitCode: null, signalCode: null,
+    kill() {
+      kills += 1;
+      setImmediate(() => {
+        this.exitCode = 1;
+        this.emit("close", 1);
+      });
+    },
+  });
+  const browser = {
+    newBrowserCDPSession: async () => ({
+      send: async (method) => { commands.push(method); },
+      detach: async () => {},
+    }),
+    close: async () => { browserDisconnects += 1; },
+  };
+  const transport = new ExternalBrowserTransport({
+    provider: {id: "claude", label: "Claude", home: "https://claude.ai/"},
+    profilePath: "nexus-timeout-profile",
+    closeTimeoutMs: 5,
+  });
+  transport.process = child;
+  transport.browser = browser;
+  transport.context = {};
+
+  assert.equal(await transport.close(), true);
+
+  assert.deepEqual(commands, ["Browser.close"]);
+  assert.equal(kills, 1);
+  assert.equal(browserDisconnects, 1);
+  assert.equal(transport.process, null);
+  assert.equal(transport.closed, true);
+});
+
+test("closing during startup fences every later spawn and remains idempotent", async () => {
+  let releasePort;
+  const reserved = new Promise((resolve) => { releasePort = resolve; });
+  let spawns = 0;
+  const transport = new ExternalBrowserTransport({
+    provider: {id: "claude", label: "Claude", home: "https://claude.ai/"},
+    profilePath: "nexus-startup-close-profile",
+    findBrowser: () => ({family: "chrome", executable: "chrome.exe"}),
+    reservePort: () => reserved,
+    ensureDirectory: () => {},
+    spawn: () => { spawns += 1; throw new Error("spawn must stay fenced"); },
+    closeTimeoutMs: 20,
+  });
+
+  const contents = transport.createContents("https://claude.ai/");
+  const rejected = assert.rejects(transport.starting, (error) => (
+    error?.code === "NEXUS_EXTERNAL_BROWSER_CLOSED"
+  ));
+  const closing = transport.close();
+  assert.strictEqual(transport.close(), closing);
+  releasePort(23456);
+
+  assert.equal(await closing, true);
+  await rejected;
+  assert.equal(await contents.ready, null, "an owner close absorbs the expected startup rejection");
+  assert.equal(contents.isDestroyed(), true);
+  assert.equal(spawns, 0);
+  await assert.rejects(
+    () => transport.start("https://claude.ai/"),
+    (error) => error?.code === "NEXUS_EXTERNAL_BROWSER_CLOSED",
+  );
 });
 
 test("background mode minimizes ordinary provider windows through the loopback CDP session", async () => {

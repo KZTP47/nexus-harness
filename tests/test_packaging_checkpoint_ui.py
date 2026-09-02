@@ -117,7 +117,7 @@ class PackagingTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("harness 0.2.1", result.stdout)
+            self.assertIn("harness 0.2.3", result.stdout)
             self.assertEqual(os.environ.get("PATH"), before_path)
 
     def test_shell_launcher_resolves_sibling_application_without_absolute_paths(self) -> None:
@@ -140,7 +140,7 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(build.returncode, 0, build.stderr)
             version = subprocess.run([sys.executable, str(output), "--version"], capture_output=True, text=True, check=False)
             self.assertEqual(version.returncode, 0, version.stderr)
-            self.assertIn("harness 0.2.1", version.stdout)
+            self.assertIn("harness 0.2.3", version.stdout)
             audit = subprocess.run([sys.executable, str(output), "audit"], capture_output=True, text=True, check=False)
             self.assertEqual(audit.returncode, 0, audit.stderr)
             audit_result = json.loads(audit.stdout)

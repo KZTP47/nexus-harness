@@ -3212,6 +3212,34 @@ os._exit(23)
         self.assertEqual(result["status"], "unavailable")
         self.assertEqual(result["basis"], "missing_runner")
 
+    def test_appcontainer_setup_error_is_unavailable_not_missing_runner(self) -> None:
+        project = copy.deepcopy(self.board["projects"][0])
+        project["test_commands"] = [[
+            "python", "-m", "unittest", "discover",
+        ]]
+        (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
+        with mock.patch.object(
+            swarm_work, "_contained_snapshot_command",
+            side_effect=OSError(
+                "CreateAppContainerProfile failed: 0x80070002"
+            ),
+        ):
+            result = swarm_work._run_selected_project_verification(
+                self.config, self.project, project,
+                "Create feature.py", ["feature.py"], None,
+            )
+        self.assertEqual("unavailable", result["status"], result)
+        self.assertEqual(
+            "verification_containment_unavailable", result["basis"], result,
+        )
+        self.assertNotEqual("missing_runner", result["basis"])
+        self.assertTrue(
+            result["commands"][0]["containment_setup_failed_before_launch"]
+        )
+        self.assertIn(
+            "CreateAppContainerProfile", result["commands"][0]["stderr"]
+        )
+
     def test_empty_host_path_never_preempts_containment_owned_runners(self) -> None:
         (self.project / "feature.py").write_text("enabled = True\n", encoding="utf-8")
 

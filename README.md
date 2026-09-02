@@ -201,52 +201,61 @@ are still documented below, but these two workspaces are the main product.
 
 ## Start here, on Windows
 
-When a stable build is published, the easiest route is its checksummed,
-versioned installer on the
+When a stable build is published, the easiest route for a company or offline
+computer is `Nexus-Harness-Windows-Offline-<version>.zip` on the
 **[GitHub Releases page](https://github.com/KZTP47/nexus-harness/releases)**.
-Download the release's exactly named `Nexus-Harness-Setup-<version>.exe` (or
-its explicitly marked `-UNSIGNED.exe` variant) and the `.sha256` file beside
-it, compare the SHA-256, and run it. An explicitly unsigned release may
-show Windows' unknown-publisher warning; its filename and release notes say so
-plainly. The installer runs for your Windows account, creates Start menu and
-desktop shortcuts, and needs neither administrator access nor a separate
-Python. If that page has no stable release, there is nothing for the bootstrap
-to install yet and it stops before creating a shortcut.
+Extract the complete ZIP, keep its files and subfolders together, and
+double-click **`Install Nexus Harness.cmd`** inside it. The bundled CMD verifies
+the exact PowerShell bootstrap SHA-256 before executing it. That bootstrap is
+bound to the build's exact version and installer SHA-256, runs in offline-only
+mode, and rejects missing, extra, renamed, development, or modified material
+without trying the network. It installs for the current Windows account and
+needs no administrator access, Python, or Node.js.
+
+The release also exposes the exactly named `Nexus-Harness-Setup-<version>.exe`
+(or explicitly marked `-UNSIGNED.exe`) and matching `.sha256` separately. An
+unsigned release may show Windows' unknown-publisher warning. Its provenance
+still depends on obtaining the complete ZIP from the trusted GitHub Release or
+an authenticated company distribution channel. The unsigned outer ZIP and CMD
+are not self-authenticating: a checksum or verification command from the same
+untrusted folder is not a digital signature.
 
 Already cloned the source? **Double-click `Install Nexus Harness.cmd`**. It
-downloads that same stable release, verifies both the published SHA-256 and
-the release's declared signature mode, and starts the Windows installer. With
-an explicitly unsigned release it requires both the `-UNSIGNED.exe`
-name and Windows' `NotSigned` status; it will not mistake an arbitrary signed
-file for the release. It uses Windows' own PowerShell downloader, so a clean
-machine does not need Python. It does not disguise a browser shortcut as the
-desktop app.
+looks for a complete product-built offline bundle beside itself first. If no
+Nexus installer material is present, it downloads the stable GitHub release.
+Incomplete, corrupt, ambiguous, version-mismatched, or untrusted local material
+stops locally instead of silently going online. A source-tree bootstrap does
+not trust arbitrary sibling unsigned EXEs; use the complete release ZIP,
+including its digest-bound `scripts` folder. It never disguises a browser
+shortcut as the desktop app.
 
 This repository is public, so a published public release can be downloaded
-anonymously. For a private fork or a future visibility change, the helper can
-reuse an existing `gh auth` or non-interactive Git Credential Manager login (or
-a process-scoped `GH_TOKEN`) without printing or storing the credential.
+anonymously. For a private fork or a future visibility change, set a
+process-scoped `GH_TOKEN` or `GITHUB_TOKEN`. The helper never executes
+PATH-resolved `gh`, `git`, or credential helpers, and never writes or echoes the
+explicit token.
 
-For a browser download of a published `0.2.1`, open PowerShell in the download
+For a browser download of a published `0.2.3`, open PowerShell in the download
 folder and run:
 
 ```powershell
-$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.1-UNSIGNED.exe').Hash.ToLowerInvariant()
-$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.1-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.3-UNSIGNED.exe').Hash.ToLowerInvariant()
+$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.3-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
 $actual -eq $expected
 ```
 
 The last command must print `True` before you run the installer.
 
-The measured 0.2.1 development build is about 234 MiB to download and about
+The measured 0.2.3 development build is about 234 MiB to download and about
 810 MiB unpacked; confirm the final sizes in the release notes.
 Allow at least 2 GiB free while installing so the download, temporary unpacking,
 and installed app can coexist. It includes a private Python 3.11 runtime and locked
 dependencies. Nexus does not silently auto-update. **About
 and diagnostics** shows the exact installed version and commit; install a newer
 version from the same Releases page when one is published. When the repository
-pins a real publisher certificate, the same bootstrap automatically requires
-that exact valid Authenticode signer and rejects unsigned assets.
+pins a real publisher certificate, the same bootstrap requires both the exact
+valid Authenticode Subject and the certificate's versioned SHA-256 pin, and
+rejects unsigned or lookalike-signer assets.
 
 Source developers who intentionally want a shortcut tied to this checkout can
 create one with:
@@ -296,14 +305,24 @@ cd nexus-harness
 
 ### Install the released Windows app
 
-**Double-click `Install Nexus Harness.cmd`** in the folder you just cloned.
+For an offline or company computer, extract the stable release's complete
+`Nexus-Harness-Windows-Offline-<version>.zip` and double-click
+**`Install Nexus Harness.cmd`** inside it.
 
-The helper downloads the latest stable NSIS installer from GitHub Releases,
-requires exactly one installer and matching checksum asset, verifies both the
-checksum and the release's declared signature mode, and only then starts it.
+The helper uses the product-bound sibling NSIS installer first. With no local
+installer material, the same helper in a source checkout downloads the latest
+stable installer from GitHub Releases. Both routes verify the exact version,
+bytes, Windows product metadata, and declared signature mode before execution.
+The validated installer is copied into an ACL-protected per-user temporary
+directory, any Mark-of-the-Web stream is preserved, and every check is repeated
+on that private copy. After installation, Nexus verifies the installed EXE's
+exact product/version/signature mode and the desktop shortcut's target and icon.
+The current user's redirected Desktop is required. Nexus also scans the Common
+Desktop for stale duplicates when policy permits it, but lack of access to that
+machine-wide folder does not make a standard-user installation fail.
 An explicitly unsigned release may display Windows' normal unknown-publisher
-warning. A future signed release must match the exact pinned
-publisher. The app is
+warning. A future signed release must match the exact pinned publisher Subject
+and certificate SHA-256. The app is
 installed below your own account and can be removed from Windows Installed
 apps or with the repository uninstaller.
 
@@ -312,9 +331,14 @@ one thing somebody who has just downloaded this cannot be expected to know is
 which command to type first.
 
 The public repository needs no GitHub login for a published public release. For
-a private fork, the helper can use an existing GitHub CLI or Git Credential
-Manager login, or `GH_TOKEN` scoped to that process. It never writes or echoes
-that credential.
+a private fork, use `GH_TOKEN` or `GITHUB_TOKEN` scoped to that process. The
+helper does not probe GitHub CLI, Git Credential Manager, or PATH commands.
+The old `scripts/install_nexus_harness.py` entry point is a disabled,
+fail-closed compatibility shim; it cannot bypass these checks.
+
+Computers governed by AppLocker, WDAC, SmartScreen, or endpoint allowlists may
+require an Authenticode-signed release from the pinned company publisher and an
+IT allowlist. Application code cannot bypass those company policies.
 
 If you are developing Nexus itself and deliberately want to run this checkout
 instead of the release:

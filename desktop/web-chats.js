@@ -809,6 +809,8 @@ class WebChatManager {
     this.activeAsks = new Map();
     this.externalTransports = new Map();
     this.backgroundHosts = new Map();
+    this.closed = false;
+    this.closePromise = null;
     this.persistenceError = "";
     this.externalBrowserFactory = options.externalBrowserFactory || ((transportOptions) => (
       new ExternalBrowserTransport(transportOptions)
@@ -982,6 +984,8 @@ class WebChatManager {
   }
 
   externalTransportFor(providerId) {
+    if (this.closed) throw controlError(
+      "Nexus is closing its web chats.", "NEXUS_WEB_CHAT_CLOSED");
     const provider = PROVIDERS[providerId];
     if (!provider?.externalBrowser) return null;
     let transport = this.externalTransports.get(providerId);
@@ -1314,6 +1318,7 @@ class WebChatManager {
   }
 
   openSetup(providerId, connectionId = "", conversationKey = "", preferExisting = false) {
+    if (this.closed) return false;
     const provider = PROVIDERS[providerId];
     if (!provider) throw new Error("That web-chat provider is not supported");
     connectionId = String(connectionId || "").toLowerCase();
@@ -1484,6 +1489,8 @@ class WebChatManager {
   }
 
   viewFor(id, conversationKey = "", preferExisting = false) {
+    if (this.closed) throw controlError(
+      "Nexus is closing its web chats.", "NEXUS_WEB_CHAT_CLOSED");
     const one = this.connections.get(id);
     if (!one) throw new Error("That web chat is no longer connected");
     const key = cleanConversationKey(conversationKey);
@@ -1657,13 +1664,19 @@ class WebChatManager {
   ask(
     id, prompt, attachments = [], conversationKey = "", preferExisting = false
   ) {
+    if (this.closed) return Promise.reject(controlError(
+      "Nexus is closing its web chats.", "NEXUS_WEB_CHAT_CLOSED"));
     id = String(id || "");
     const key = cleanConversationKey(conversationKey);
     const channel = channelKey(id, key);
     const before = this.queues.get(channel) || Promise.resolve();
-    const mine = before.catch(() => {}).then(() => this.askNow(
-      id, String(prompt || ""), Array.isArray(attachments) ? attachments : [],
-      key, preferExisting));
+    const mine = before.catch(() => {}).then(() => {
+      if (this.closed) throw controlError(
+        "Nexus is closing its web chats.", "NEXUS_WEB_CHAT_CLOSED");
+      return this.askNow(
+        id, String(prompt || ""), Array.isArray(attachments) ? attachments : [],
+        key, preferExisting);
+    });
     this.queues.set(channel, mine);
     return mine.finally(() => {
       if (this.queues.get(channel) === mine) this.queues.delete(channel);
@@ -2128,14 +2141,73 @@ class WebChatManager {
   }
 
   close() {
-    this.hideEmbedded();
-    for (const held of this.shells.values()) if (!held.shell.isDestroyed()) held.shell.close();
-    for (const view of this.views.values()) if (!view.webContents.isDestroyed()) view.webContents.close();
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+
+    const owner = this.owner;
+    const activeAsks = [...this.activeAsks.values()];
+    const shells = [...this.shells.values()];
+    const ordinaryViews = [...this.views.values()];
+    const views = [...new Set([
+      ...ordinaryViews, ...shells.map((held) => held.view).filter(Boolean),
+    ])];
+    const backgroundHosts = [...this.backgroundHosts.entries()];
+    const transports = [...this.externalTransports.values()];
+
+    // Clear ownership before any Electron close callback can re-enter the
+    // manager. In-flight and queued asks see `closed` and cannot recreate a
+    // provider view while native Chromium objects are being dismantled.
+    this.activeEmbedded = "";
+    this.activeAsks.clear();
+    this.queues.clear();
+    this.shells.clear();
     this.views.clear();
-    for (const host of this.backgroundHosts.values()) if (!host.isDestroyed()) host.close();
     this.backgroundHosts.clear();
-    for (const transport of this.externalTransports.values()) transport.close().catch(() => {});
     this.externalTransports.clear();
+
+    this.closePromise = Promise.resolve().then(async () => {
+      for (const active of activeAsks) {
+        active.cancelled = true;
+        for (const wake of [...(active.cancelWaiters || [])]) {
+          try { wake(); } catch (_error) {}
+        }
+      }
+
+      // Detach every WebContentsView while its owning BrowserWindow is still
+      // alive. Closing a child only after Electron has destroyed its owner can
+      // re-enter Chromium teardown and surface as a native breakpoint dialog.
+      for (const view of views) {
+        if (!view || view.external) continue;
+        if (owner && !owner.isDestroyed?.()) {
+          try { owner.contentView?.removeChildView?.(view); } catch (_error) {}
+        }
+        for (const [hostView, host] of backgroundHosts) {
+          if (hostView !== view || host.isDestroyed?.()) continue;
+          try { host.contentView?.removeChildView?.(view); } catch (_error) {}
+        }
+        for (const held of shells) {
+          if (held.view !== view || held.shell.isDestroyed?.()) continue;
+          try { held.shell.contentView?.removeChildView?.(view); } catch (_error) {}
+        }
+      }
+
+      for (const view of views) {
+        try {
+          if (!view.webContents?.isDestroyed?.()) view.webContents?.close?.();
+        } catch (_error) {}
+      }
+      for (const held of shells) {
+        try { if (!held.shell.isDestroyed?.()) held.shell.close?.(); } catch (_error) {}
+      }
+      for (const [, host] of backgroundHosts) {
+        try { if (!host.isDestroyed?.()) host.close?.(); } catch (_error) {}
+      }
+
+      await Promise.allSettled(transports.map((transport) => (
+        Promise.resolve().then(() => transport.close())
+      )));
+    });
+    return this.closePromise;
   }
 }
 

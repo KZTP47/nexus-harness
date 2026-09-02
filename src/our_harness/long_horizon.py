@@ -68,6 +68,7 @@ PROJECT_OWNER_GOALS = {
 }
 ACTIVE_GOALS = PROJECT_OWNER_GOALS | {"waiting_for_project"}
 EXECUTION_CONTRACT_SCHEMA_VERSION = 1
+COLLABORATION_CONTRACT_SCHEMA_VERSION = 1
 PROJECT_QUEUE_SCHEMA_VERSION = 1
 CANCELLATION_SCHEMA_VERSION = 1
 SCHEDULER_LEASE_SCHEMA_VERSION = 1
@@ -80,6 +81,10 @@ INTERRUPT_REASONS = {
     "requirement_ambiguity", "new_authority", "risky_action",
     "missing_access", "unresolved_blocker",
 }
+
+
+class RequiredParticipantCallReserved(HarnessError):
+    """A continuation tried to consume a call promised to an untouched teammate."""
 
 
 AGENT_ACTION_FORMAT = ResponseFormat("nexus_long_horizon_action_v1", {
@@ -261,6 +266,45 @@ def _exclusive_project_contract(project_path: Path, project_authority_id: str) -
     }
 
 
+def _collaboration_contract(require_all_participants: bool) -> dict[str, Any]:
+    """Version and fingerprint the scheduler/prompt semantics admitted by a goal."""
+
+    basis = {
+        "schema_version": COLLABORATION_CONTRACT_SCHEMA_VERSION,
+        "mode": "required_participant_fan_in" if require_all_participants else "adaptive",
+        "required_dispatch": (
+            "serialized_terminal_attempts_v2" if require_all_participants
+            else "useful_task_claims_v1"
+        ),
+        "required_claim_order": (
+            "undispatched_required_tasks_first_v2" if require_all_participants
+            else "task_order_v1"
+        ),
+        "provider_budget_reservation": (
+            "one_call_per_undispatched_required_task_v2"
+            if require_all_participants else "none"
+        ),
+        "required_handoff": (
+            "nontransferable_v1" if require_all_participants else "allowed_v1"
+        ),
+        "known_failure_policy": (
+            "continue_remaining_named_participants_v1" if require_all_participants
+            else "independent_provider_failover_v1"
+        ),
+        "fan_in": (
+            "final_named_contribution_bounded_outcome_packet_v1"
+            if require_all_participants else "shared_task_ledger_v1"
+        ),
+        "completion": "all_required_tasks_and_deterministic_verification_v1",
+    }
+    return {
+        **basis,
+        "fingerprint_sha256": hashlib.sha256(
+            _canonical(basis).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
 def _redacted_objectives(
     redactor: CredentialRedactor, objectives: list[str],
 ) -> list[str]:
@@ -284,6 +328,7 @@ def _goal_admission_digest(
     lead_id: str, objectives: list[str], success_criteria: list[str] | None,
     policy: dict[str, Any] | None, attachments: object,
     agent_bindings: list[dict[str, Any]] | None = None,
+    require_all_participants: bool = False,
 ) -> str:
     """Bind an idempotency key to the exact user-authorized goal intent."""
 
@@ -295,6 +340,9 @@ def _goal_admission_digest(
         "participant_ids": list(dict.fromkeys(str(one) for one in participant_ids if str(one))),
         "lead_id": str(lead_id),
         "agent_bindings": copy.deepcopy(agent_bindings or []),
+        "collaboration_contract": _collaboration_contract(
+            require_all_participants,
+        ),
         "execution_contract": _exclusive_project_contract(
             project_path, project_authority_id,
         ),
@@ -392,6 +440,15 @@ def _task_has_unsettled_effect(task: dict[str, Any]) -> bool:
     }
 
 
+def _task_has_recorded_provider_dispatch(task: dict[str, Any]) -> bool:
+    """Return whether a provider-call boundary was durably crossed for this task."""
+
+    # Scheduler attempts advance when a lease is claimed, before record_dispatch
+    # persists the effect boundary.  The stable effect identity is created only
+    # by record_dispatch and is intentionally retained through recovery/retry.
+    return bool(str(task.get("provider_effect_id") or "").strip())
+
+
 def _durable_evidence(value: object, *, string_limit: int = 32_000, list_limit: int = 500) -> object:
     """Bound noisy leaves without destroying the structured evidence envelope."""
     if isinstance(value, dict):
@@ -430,6 +487,10 @@ def _validate_action_semantics(action: dict[str, Any], task: dict[str, Any]) -> 
         raise HarnessError("Delegated tasks are allowed only in a delegate action")
     if handoff and kind != "handoff":
         raise HarnessError("A handoff target is allowed only in a handoff action")
+    if kind == "handoff" and task.get("required_contributor_id"):
+        raise HarnessError(
+            "A named Work Together contribution cannot be handed off to another agent"
+        )
     if task.get("kind") == "review":
         if changes:
             raise HarnessError("Independent review is read-only and cannot change project files")
@@ -960,6 +1021,21 @@ class GoalStore:
                             "settled_ms": 0,
                         }
                         changed = True
+                    if not isinstance(document.get("collaboration_contract"), dict) \
+                            and self._pristine_for_queue_migration(document):
+                        if document.get("require_all_participants"):
+                            # Legacy pair goals used success-dependencies which
+                            # let a failed lead prevent the peer from ever being
+                            # contacted. With no provider or file effect yet it
+                            # is safe to adopt the terminal-attempt topology.
+                            for task in document.get("tasks", []):
+                                if task.get("required_contributor_id"):
+                                    task["state"] = "ready"
+                                    task["depends_on"] = []
+                        document["collaboration_contract"] = _collaboration_contract(
+                            bool(document.get("require_all_participants")),
+                        )
+                        changed = True
                     worker = document.get("worker")
                     if not isinstance(worker, dict):
                         worker = {}
@@ -987,6 +1063,7 @@ class GoalStore:
                     if changed:
                         self._event(db, document, "execution_contract_migrated", payload={
                             "execution_contract": document["execution_contract"],
+                            "collaboration_contract": document.get("collaboration_contract", {}),
                             "project_queue_state": document["project_queue"]["state"],
                         })
                         document["revision"] = int(document["revision"]) + 1
@@ -1250,6 +1327,38 @@ class GoalStore:
             "recovery_action": "start_new_goal_with_current_setup",
         }
 
+    @staticmethod
+    def collaboration_setup_status(document: dict[str, Any]) -> dict[str, Any]:
+        expected = _collaboration_contract(
+            bool(document.get("require_all_participants")),
+        )
+        held = document.get("collaboration_contract")
+        same = isinstance(held, dict) \
+            and held.get("schema_version") == COLLABORATION_CONTRACT_SCHEMA_VERSION \
+            and str(held.get("mode") or "") == str(expected["mode"]) \
+            and hmac.compare_digest(
+                str(held.get("fingerprint_sha256") or ""),
+                str(expected["fingerprint_sha256"]),
+            )
+        if same:
+            return {
+                "changed": False,
+                "code": "current",
+                "message": "The saved collaboration scheduler contract is current.",
+                "recovery_action": "",
+            }
+        return {
+            "changed": True,
+            "code": "collaboration_contract_changed",
+            "message": (
+                "The saved collaboration scheduler contract is missing or changed. "
+                "Nexus kept this goal inspectable but will not dispatch it under different "
+                "participant, fan-in, or completion semantics. Start a new goal with the "
+                "current Work Together contract."
+            ),
+            "recovery_action": "start_new_goal_with_current_setup",
+        }
+
     def sanitize_action(self, action: dict[str, Any]) -> dict[str, Any]:
         clean = copy.deepcopy(action)
         clean["summary"] = self.redactor.text(str(clean.get("summary") or ""))
@@ -1300,6 +1409,25 @@ class GoalStore:
         required_initial_tasks = max(
             len(clean_objectives), len(admitted_agents) if require_all else 0,
         )
+        raw_provider_budget = (policy or {}).get("max_provider_calls")
+        requested_max_provider_calls = min(
+            MAX_PROVIDER_CALLS,
+            max(1, int(raw_provider_budget if raw_provider_budget is not None
+                       else MAX_PROVIDER_CALLS)),
+        )
+        if require_all and raw_provider_budget is not None \
+                and int(raw_provider_budget) < required_initial_tasks:
+            raise HarnessError(
+                "The explicit provider-call budget is smaller than the required "
+                "chat-participant contribution count. Increase max_provider_calls, "
+                "reduce the initial objectives, or choose adaptive collaboration; "
+                "Nexus did not silently reduce the named team."
+            )
+        if require_all and requested_max_provider_calls < required_initial_tasks:
+            raise HarnessError(
+                "The provider-call budget cannot give every required chat participant "
+                "one terminal contribution attempt."
+            )
         if required_initial_tasks > requested_max_tasks:
             raise HarnessError(
                 "The initial objectives and required chat-participant contributions "
@@ -1375,6 +1503,7 @@ class GoalStore:
             },
             attachments=attachments,
             agent_bindings=[one.get("route_binding") for one in agents],
+            require_all_participants=require_all,
         )
         goal = self.get_by_request(request_id)
         conflict = ""
@@ -1559,8 +1688,12 @@ class GoalStore:
                     "title": f"{owner['name']} contribution",
                     "description": contribution,
                     "kind": "work",
-                    "state": "waiting" if initial_ids else "ready",
-                    "depends_on": list(initial_ids),
+                    # Required participants are serialized by the conservative
+                    # empty-resource claim rule, not by success dependencies.
+                    # A lead refusal or malformed provider reply must not stop
+                    # the remaining named participants from being attempted.
+                    "state": "ready",
+                    "depends_on": [],
                     "parent_id": "",
                     "review_of": "",
                     "assigned_agent_id": owner["id"],
@@ -1623,6 +1756,7 @@ class GoalStore:
             "legacy_available": True,
         }
         execution_contract = _exclusive_project_contract(root, target_authority_id)
+        collaboration_contract = _collaboration_contract(require_all)
         bound_admission_digest = _short(admission_digest, 128) or hashlib.sha256(
             _canonical({
                 "project_id": project_id,
@@ -1634,6 +1768,7 @@ class GoalStore:
                 "lead_id": lead["id"],
                 "agent_bindings": [one.get("route_binding") for one in agents],
                 "execution_contract": execution_contract,
+                "collaboration_contract": collaboration_contract,
                 "objectives": clean_objectives,
                 "success_criteria": criteria,
                 "policy": runtime_policy,
@@ -1660,6 +1795,7 @@ class GoalStore:
             "project": {"id": project_id, "name": _short(project.get("name") or root.name, 300), "path": str(root)},
             "project_authority_id": target_authority_id,
             "execution_contract": execution_contract,
+            "collaboration_contract": collaboration_contract,
             "project_queue": self._queue_record(
                 "owner", now, auto_start_pending=True,
             ),
@@ -1768,6 +1904,7 @@ class GoalStore:
                     "objective": objective, "success_criteria": criteria,
                     "task_ids": [one["id"] for one in tasks], "policy": runtime_policy,
                     "execution_contract": execution_contract,
+                    "collaboration_contract": collaboration_contract,
                     "project_queue_state": document["project_queue"]["state"],
                 })
                 if document["status"] == "waiting_for_project":
@@ -2009,6 +2146,12 @@ class GoalStore:
                 "agents": [],
                 "recovery_action": "",
             }
+            value["collaboration_contract_changed"] = False
+            value["collaboration_contract_status"] = {
+                "changed": False, "code": "terminal_request_retired",
+                "message": "The retired request cannot dispatch again.",
+                "recovery_action": "",
+            }
             return value
         value["promoted_goal_ids"] = list(value.pop("_promoted_goal_ids", []))
         value.pop("input_provider_attachments", None)
@@ -2027,6 +2170,9 @@ class GoalStore:
         setup = self.provider_setup_status(value)
         value["provider_setup_changed"] = setup["changed"]
         value["provider_setup_status"] = setup
+        collaboration = self.collaboration_setup_status(value)
+        value["collaboration_contract_changed"] = collaboration["changed"]
+        value["collaboration_contract_status"] = collaboration
         return value
 
     def clone_to_project(
@@ -2206,6 +2352,42 @@ class GoalStore:
                         changed = True
 
     @staticmethod
+    def _continue_required_team_after_terminal(
+        document: dict[str, Any], current: dict[str, Any], reason: str,
+    ) -> bool:
+        """Continue a chat-bound team only after a known, effect-safe outcome."""
+
+        if not document.get("require_all_participants") \
+                or not current.get("required_contributor_id"):
+            return False
+        if current.get("outcome_unknown") or current.get("pending_action") \
+                or current.get("pending_transaction"):
+            return False
+        if document.get("status") not in {"queued", "running"}:
+            # Never override Pause, Ask user, Cancel, changed-project, or
+            # changed-provider/account contract boundaries.
+            return False
+        GoalStore._refresh_waiting(document)
+        remaining = [
+            one for one in document["tasks"]
+            if one.get("required_contributor_id")
+            and one["state"] in {"ready", "waiting", "running", "pending_apply"}
+        ]
+        if not remaining:
+            return False
+        document["status"] = (
+            "running" if any(one["state"] == "running" for one in remaining)
+            else "queued"
+        )
+        document["note"] = (
+            _short(reason, 1_000)
+            + " Nexus kept that terminal contribution outcome and will continue "
+              "the remaining named contributions; the final contributor receives the bounded "
+              "team fan-in before deterministic verification."
+        )
+        return True
+
+    @staticmethod
     def _compatible(task: dict[str, Any], chosen: list[dict[str, Any]]) -> bool:
         if not task.get("parallel_safe") and chosen:
             return False
@@ -2236,7 +2418,9 @@ class GoalStore:
             int(worker.get("pid") or 0), str(worker.get("token") or ""),
         )
 
-    def claim_scheduler(self, goal_id: str, worker_id: str) -> bool:
+    def claim_scheduler(
+        self, goal_id: str, worker_id: str, *, automatic: bool = False,
+    ) -> bool:
         """Atomically acquire the one durable graph-dispatch lease for a goal."""
 
         worker_id = str(worker_id)
@@ -2252,6 +2436,19 @@ class GoalStore:
                 if document is None:
                     raise HarnessError("That long-horizon goal does not exist")
                 if document.get("status") != "queued" or not self._is_project_owner(document):
+                    db.rollback()
+                    return False
+                if automatic and (
+                    (document.get("project_queue") or {}).get(
+                        "auto_start_pending"
+                    ) is not True
+                    or not self._pristine_for_queue_migration(document)
+                ):
+                    # The watcher selects candidates from a prior SQLite
+                    # snapshot. Revalidate its one-time automatic-dispatch
+                    # authority in the same transaction that acquires the
+                    # scheduler lease so a stale page cannot cross a provider
+                    # boundary after recovery or user state changed.
                     db.rollback()
                     return False
                 held = document.get("worker") or {}
@@ -2363,7 +2560,15 @@ class GoalStore:
             )
             chosen: list[dict[str, Any]] = []
             agents = {one["id"]: one for one in document["agents"]}
-            for task in document["tasks"]:
+            ordered_tasks = sorted(
+                enumerate(document["tasks"]),
+                key=lambda held: (
+                    0 if held[1].get("required_contributor_id")
+                    and not _task_has_recorded_provider_dispatch(held[1]) else 1,
+                    held[0],
+                ),
+            )
+            for _position, task in ordered_tasks:
                 if task["state"] != "ready" or not self._compatible(task, chosen):
                     continue
                 if any(not _providers_independent(
@@ -2407,6 +2612,31 @@ class GoalStore:
                 raise HarnessError("The goal changed or paused before this provider continuation")
             if document["budget"]["provider_calls"] >= document["budget"]["max_provider_calls"]:
                 raise HarnessError("The explicit provider-call budget was reached before dispatch")
+            if document.get("require_all_participants"):
+                # A context continuation or schema-repair turn for one member
+                # must not spend the final slot promised to a named member who
+                # has not crossed a durable provider-dispatch boundary. A task
+                # claim is not that boundary: the process can die after claim
+                # but before record_dispatch. The stable effect identity makes
+                # this reservation survive that crash/retry gap and applies
+                # equally to initial, repair, and tool-follow-up calls.
+                unattempted_required = [
+                    str(one.get("id") or "")
+                    for one in document.get("tasks", [])
+                    if one.get("required_contributor_id")
+                    and one.get("id") != current.get("id")
+                    and not _task_has_recorded_provider_dispatch(one)
+                ]
+                remaining_after_dispatch = (
+                    int(document["budget"]["max_provider_calls"])
+                    - int(document["budget"]["provider_calls"])
+                    - 1
+                )
+                if remaining_after_dispatch < len(unattempted_required):
+                    raise RequiredParticipantCallReserved(
+                        "The remaining provider-call budget is reserved for required "
+                        "chat participants who have not received a terminal attempt."
+                    )
             document["budget"]["provider_calls"] += 1
             queue = document.get("project_queue") or {}
             if queue.get("auto_start_pending") is True:
@@ -2453,7 +2683,8 @@ class GoalStore:
         self._mutate(goal_id, change)
 
     def block_received_reply(
-        self, goal_id: str, task: dict[str, Any], error: str
+        self, goal_id: str, task: dict[str, Any], error: str, *,
+        settle_required_contribution: bool = False,
     ) -> None:
         """Require reconciliation when parsing/repair stopped after a real reply."""
 
@@ -2467,15 +2698,23 @@ class GoalStore:
                 "outcome_unknown": False, "reconciliation_required": True,
                 "provider_effect_state": "reply_received_reconciliation_required",
             })
-            if document["status"] not in {
-                "cancelled", "waiting_for_user", "cancelling",
+            continued = bool(settle_required_contribution) and \
+                self._continue_required_team_after_terminal(
+                    document, current, current["last_error"],
+                )
+            if not continued and document["status"] not in {
+                "cancelled", "waiting_for_user", "cancelling", "paused",
             }:
                 document["status"] = "paused"
-            document["note"] = current["last_error"]
+            if not continued:
+                document["note"] = current["last_error"]
             self._event(
                 db, document, "provider_reply_reconciliation_required",
                 task_id=current["id"], agent_id=current["assigned_agent_id"],
-                payload={"error": current["last_error"], "retry_requires_user": True},
+                payload={
+                    "error": current["last_error"], "retry_requires_user": True,
+                    "remaining_required_contributions_continue": continued,
+                },
             )
 
         self._mutate(goal_id, change)
@@ -2652,6 +2891,7 @@ class GoalStore:
     def fail_task(
         self, goal_id: str, task: dict[str, Any], error: str, *,
         uncertain: bool = False, allow_failover: bool = False,
+        settle_required_contribution: bool = False,
     ) -> None:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             if document["status"] in TERMINAL_GOALS:
@@ -2765,6 +3005,21 @@ class GoalStore:
                         "from_agent_id": previous_agent,
                         "to_agent_id": str(replacement["id"]),
                         "error": current["last_error"],
+                    },
+                )
+                return
+            continued = bool(settle_required_contribution) and not uncertain and \
+                self._continue_required_team_after_terminal(
+                    document, current, current["last_error"],
+                )
+            if continued:
+                self._event(
+                    db, document, "task_failed",
+                    task_id=current["id"], agent_id=current["assigned_agent_id"],
+                    payload={
+                        "error": current["last_error"],
+                        "retry_requires_user": current.get("reconciliation_required") is True,
+                        "remaining_required_contributions_continue": True,
                     },
                 )
                 return
@@ -4178,6 +4433,19 @@ class GoalStore:
                 self._event(db, document, "goal_completed", payload={"basis": result.get("basis"), "success_criteria": document["success_criteria"]})
                 return
             reason = _short(checked.get("reason") or "Deterministic verification failed", 4_000)
+            if checked.get("status") == "unavailable":
+                # A provider cannot repair a verifier that never launched.
+                # Keep the completed work and exact verification evidence
+                # resumable, but spend no additional provider calls or task
+                # budget until the operator restores the named runtime.
+                document["status"] = "paused"
+                document["note"] = reason
+                self._event(db, document, "goal_paused", payload={
+                    "reason": "verification_unavailable",
+                    "detail": reason,
+                    "basis": checked.get("basis"),
+                })
+                return
             prior = [one for one in document["tasks"] if one.get("kind") == "repair" and one.get("last_error") == reason]
             if len(prior) >= MAX_NO_PROGRESS:
                 document["status"] = "paused"
@@ -4413,6 +4681,11 @@ class LongHorizonRuntime:
             )
 
     def _require_agent_setup(self, goal: dict[str, Any]) -> None:
+        collaboration = self.store.collaboration_setup_status(goal)
+        if collaboration.get("changed"):
+            raise HarnessError(str(collaboration.get("message") or (
+                "The saved collaboration scheduler contract changed. Start a new goal."
+            )))
         setup = self.store.provider_setup_status(goal)
         if setup.get("changed"):
             raise HarnessError(str(setup.get("message") or (
@@ -4487,7 +4760,9 @@ class LongHorizonRuntime:
                         recent = self._auto_start_attempted.get(str(goal["goal_id"]), 0.0)
                     if time.monotonic() - recent < 60.0:
                         continue
-                    self.start_background(str(goal["goal_id"]))
+                    self.start_background(
+                        str(goal["goal_id"]), automatic=True,
+                    )
                 except Exception:
                     continue
 
@@ -4518,6 +4793,7 @@ class LongHorizonRuntime:
             "paused", "waiting_for_user", "waiting_for_project", "cancelling",
         }:
             return {"task_ids": [], "route": "end"}
+        self._require_agent_setup(goal)
         pending = [one["id"] for one in goal["tasks"] if one["state"] == "pending_apply" and one.get("pending_action")]
         if pending:
             return {"task_ids": pending, "actions": [], "route": "apply"}
@@ -4552,6 +4828,46 @@ class LongHorizonRuntime:
                    "owner": one["assigned_agent_id"], "depends_on": one["depends_on"],
                    "summary": _short(one.get("summary"), 1_000)} for one in goal["tasks"]]
         files = swarm_work._file_snapshot(root, list(extra_files or [])) if extra_files else "No additional file contents requested yet."
+        contribution_packet = ""
+        if goal.get("require_all_participants"):
+            agents = {
+                str(one.get("id") or ""): _short(one.get("name") or one.get("id"), 300)
+                for one in goal.get("agents", []) if isinstance(one, dict)
+            }
+            contributions = [
+                {
+                    "task_id": one["id"],
+                    "participant_id": one.get("required_contributor_id", ""),
+                    "participant_name": agents.get(
+                        str(one.get("required_contributor_id") or ""),
+                        str(one.get("required_contributor_id") or ""),
+                    ),
+                    "assigned_agent_id": one.get("assigned_agent_id", ""),
+                    "state": one.get("state", ""),
+                    "attempts": int(one.get("attempts") or 0),
+                    "provider_effect_state": one.get("provider_effect_state", ""),
+                    "summary": _short(one.get("summary"), 4_000),
+                    "last_error": _short(one.get("last_error"), 4_000),
+                    "evidence": one.get("evidence", [])[-24:],
+                    "artifacts": one.get("artifacts", [])[-12:],
+                }
+                for one in goal["tasks"] if one.get("required_contributor_id")
+            ]
+            contribution_packet = (
+                "\n\nREQUIRED CONTRIBUTION FAN-IN (durable bounded outcomes)\n"
+                + _canonical(_durable_evidence(
+                    contributions, string_limit=4_000, list_limit=100,
+                ))
+            )
+        required_tasks = [
+            one for one in goal["tasks"] if one.get("required_contributor_id")
+        ]
+        final_required_fan_in = bool(task.get("required_contributor_id")) \
+            and len(required_tasks) > 1 and all(
+                one["id"] == task["id"]
+                or one["state"] in {"complete", "blocked", "failed", "cancelled"}
+                for one in required_tasks
+            )
         review_packet = ""
         if task.get("kind") == "review" and task.get("review_of"):
             target = next((
@@ -4596,6 +4912,23 @@ class LongHorizonRuntime:
                       "Every proposed path is listed. Use read_proposed_change with path/offset/limit to "
                       "inspect any content that is longer than its preview before returning a verdict."
                 )
+        team_guidance = (
+            "This is a Work Together goal: do the concrete contribution assigned to this task. "
+            "Every named participant receives an independent terminal attempt even if another "
+            "participant refuses, blocks, or returns malformed output. A named contribution cannot "
+            "be handed off. Consume the durable bounded outcomes from earlier contributors and current "
+            "project state; preserve every partial failure explicitly and never claim a missing "
+            "contribution succeeded. "
+            + (
+                "This is the final named contribution, so perform the bounded team fan-in now: "
+                "reconcile compatible work and close any remaining safe gap before deterministic verification. "
+                if final_required_fan_in else ""
+            )
+            + "Delegate only a concrete bounded supporting subtask when needed. "
+            if goal.get("require_all_participants") else
+            "Work alone when you can. Delegate only a concrete bounded subtask that another authorized "
+            "agent can do independently. "
+        )
         return (
             "LONG-HORIZON GOAL\n" + goal["objective"]
             + "\n\nSUCCESS CRITERIA\n- " + "\n- ".join(goal["success_criteria"])
@@ -4604,10 +4937,11 @@ class LongHorizonRuntime:
             + "\n\nPROJECT TREE\n" + swarm_work._tree(root)
             + "\n\nREQUESTED FILE CONTENTS\n" + files
             + "\n\nUSER STEERING / EVIDENCE\n" + "\n".join(task.get("evidence", [])[-12:])
+            + contribution_packet
             + review_packet
             + "\n\nCOMPLETION EVIDENCE\nFor every success criterion this task supports, return criteria_evidence using the exact criterion text and refs such as artifact:<transaction-id>, file:<relative-path>, or review:<task-id>. For genuinely read-only work, use the exact reserved ref verified-no-change; Nexus will bind that declaration to the authenticated snapshot it records after your response. Generic claims or a generic test pass do not prove a custom criterion. Nexus records file transactions or a no-change tree observation itself and still runs deterministic project verification before completing the goal."
-            + "\n\nChoose only the next useful action. Work alone when you can. Delegate only a concrete bounded subtask that another authorized agent can do independently. "
-              "Request review only for meaningful risk, broad changes, failed checks, or when you need it. Ask the user only for genuine ambiguity, new authority, risky/irreversible action, missing access, or an unresolved blocker. "
+            + "\n\nChoose only the next useful action. " + team_guidance
+            + "Request review only for meaningful risk, broad changes, failed checks, or when you need it. Ask the user only for genuine ambiguity, new authority, risky/irreversible action, missing access, or an unresolved blocker. "
               "Do not hold meetings, restate the plan, or ask another agent merely because it exists."
         )
 
@@ -4880,14 +5214,40 @@ class LongHorizonRuntime:
                     one for one in current_goal["tasks"] if one["id"] == task_id
                 )
                 if str(current_task.get("provider_effect_state") or "") == "reply_received":
+                    setup_changed = (
+                        self.store.provider_setup_status(current_goal).get("changed") is True
+                        or self.store.collaboration_setup_status(current_goal).get("changed") is True
+                    )
                     self.store.block_received_reply(
                         goal_id, task,
                         "A provider reply was received, but the next repair/continuation was not admitted. "
                         "Inspect the provider transcript and explicitly reconcile before retrying.",
+                        settle_required_contribution=(
+                            not setup_changed
+                            and current_goal["status"] not in {
+                                "paused", "waiting_for_user", "waiting_for_project", "cancelling",
+                            }
+                        ),
                     )
                     return task, {
                         "action": "deferred",
                         "summary": "A received provider reply requires reconciliation before retry.",
+                        "changes": [],
+                    }
+                if isinstance(exc, RequiredParticipantCallReserved) and str(
+                    current_task.get("provider_effect_state") or ""
+                ) == "context_step_acknowledged":
+                    # The prior response and its requested file/tool context
+                    # are already durable. Yield this continuation without
+                    # losing or replaying it; claim ordering now gives every
+                    # untouched required teammate its reserved first turn.
+                    self.store.defer_context_continuation(goal_id, task)
+                    return task, {
+                        "action": "deferred",
+                        "summary": (
+                            "This acknowledged continuation yielded its provider-call "
+                            "slot to an unattempted required teammate."
+                        ),
                         "changes": [],
                     }
                 if current_goal["status"] in {"paused", "waiting_for_user"}:
@@ -4902,11 +5262,20 @@ class LongHorizonRuntime:
                         "action": "superseded", "summary": "The goal was cancelled before dispatch.",
                         "changes": [],
                     }
+            current_goal = self.store.get(goal_id)
+            setup_changed = (
+                self.store.provider_setup_status(current_goal).get("changed") is True
+                or self.store.collaboration_setup_status(current_goal).get("changed") is True
+            )
             self.store.fail_task(
                 goal_id, task, str(exc), uncertain=uncertain,
                 allow_failover=(
                     provider_attempt_started and not dispatch_admission_failed
                     and not effect_acknowledged and not uncertain
+                ),
+                settle_required_contribution=(
+                    provider_attempt_started and not dispatch_admission_failed
+                    and not uncertain and not setup_changed
                 ),
             )
             return task, {"action": "failed", "summary": str(exc), "changes": []}
@@ -5119,7 +5488,10 @@ class LongHorizonRuntime:
             self._start_promoted_goals(promoted)
         return self.store.public(self.store.get(goal_id))
 
-    def start_background(self, goal_id: str, answers: dict[str, Any] | None = None) -> dict[str, Any]:
+    def start_background(
+        self, goal_id: str, answers: dict[str, Any] | None = None, *,
+        automatic: bool = False,
+    ) -> dict[str, Any]:
         self._enable_auto_start_watcher()
         with self.lock:
             self._auto_start_attempted[goal_id] = time.monotonic()
@@ -5142,7 +5514,9 @@ class LongHorizonRuntime:
                     "Another long-horizon goal already owns this project. Cancel or finish it, or create an isolated fork."
                 )
             scheduler_id = uuid.uuid4().hex
-            if not self.store.claim_scheduler(goal_id, scheduler_id):
+            if not self.store.claim_scheduler(
+                goal_id, scheduler_id, automatic=automatic,
+            ):
                 return self.store.public(self.store.get(goal_id), reused=True)
             self.scheduler_ids[goal_id] = scheduler_id
             def work() -> None:
@@ -5233,7 +5607,7 @@ class LongHorizonRuntime:
             try:
                 goal = self.store.get(goal_id)
                 if goal["status"] == "queued" and self.store._is_project_owner(goal):
-                    self.start_background(goal_id)
+                    self.start_background(goal_id, automatic=True)
             except HarnessError:
                 # Promotion is already durable.  A changed provider setup or a
                 # newly arrived legacy owner must not roll back terminal work
@@ -5303,7 +5677,9 @@ class LongHorizonRuntime:
                             "auto_start_pending"
                         ) is True:
                     try:
-                        self.start_background(goal["goal_id"])
+                        self.start_background(
+                            goal["goal_id"], automatic=True,
+                        )
                     except Exception:
                         # Recovery is an availability path. A removed project,
                         # provider drift, or external owner must leave the

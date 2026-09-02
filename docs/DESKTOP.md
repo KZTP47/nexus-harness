@@ -25,9 +25,9 @@ Windows may show an unknown-publisher warning. Untagged local/development
 builds remain `*-UNSIGNED-DEV.exe` and are not accepted as public releases.
 
 The public repository needs no GitHub login for a published public release.
-For a private fork, the bootstrap can reuse an existing GitHub CLI or
-non-interactive Git Credential Manager login, or a process-scoped `GH_TOKEN`.
-It never prints or stores the token.
+For a private fork, give the bootstrap a process-scoped `GH_TOKEN` or
+`GITHUB_TOKEN`. It deliberately does not inspect GitHub CLI, Git, or Credential
+Manager state, and it never prints or stores the token.
 
 Only use `python scripts/put_it_on_your_desktop.py` when developing from a
 checkout. Its source fallback is intentionally described as a development

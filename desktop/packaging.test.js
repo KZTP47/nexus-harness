@@ -218,7 +218,8 @@ test("every source-tree UI smoke uses the dependency installed by a clean checko
 
 test("test and smoke files stay out of the installer", () => {
   for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js",
-                      "automations.smoke.js", "long-horizon.smoke.js"]) {
+                      "automations.smoke.js", "long-horizon.smoke.js",
+                      "browser-long-horizon.smoke.js"]) {
     assert.ok(!shipped(name), `${name} should not be shipped`);
   }
 });
@@ -243,16 +244,30 @@ test("the pattern matcher treats stars the way the builder does", () => {
 
 test("the desktop app owns one server process and exposes exact diagnostics", () => {
   const main = fs.readFileSync(path.join(__dirname, "main.js"), "utf8");
+  const server = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+  const shutdown = fs.readFileSync(path.join(__dirname, "shutdown.js"), "utf8");
   const preload = fs.readFileSync(path.join(__dirname, "preload.js"), "utf8");
   assert.match(main, /requestSingleInstanceLock\(\)/);
   assert.match(main, /["']second-instance["']/);
   assert.match(main, /harness:diagnostics/);
   assert.match(main, /project:\s*projectPath/);
   assert.match(main, /serverUrl:\s*server\.url/);
+  assert.match(main, /const stopped = await server\.stop\(\)/,
+    "a project switch must await release of the prior backend's cwd");
+  assert.match(main, /createdWindow\.on\("close"[\s\S]*event\.preventDefault\(\)[\s\S]*coordinator\.request/,
+    "the window close event must enter coordinated cleanup before native destruction");
+  assert.match(main, /before-quit[\s\S]*event\.preventDefault\(\)[\s\S]*shutdownCoordinator\.request\("quit"\)/,
+    "menu and operating-system quit must enter the same cleanup gate");
+  assert.match(shutdown, /await Promise\.all\([\s\S]*closeWebChatsOnce\(\)[\s\S]*stopServerUntilReady\(\)/,
+    "the quit gate must await browser-chat and backend cleanup together");
+  assert.match(server, /this\.children = new Set\(\)/);
+  assert.match(server, /this\.children\.add\(child\)[\s\S]*child\.once\("close"/,
+    "startup children remain owned until their real close event");
   assert.match(preload, /diagnostics.*harness:diagnostics/);
 });
 
 test("the release is a versioned per-user NSIS installer", () => {
+  const include = fs.readFileSync(path.join(__dirname, "installer.nsh"), "utf8");
   assert.strictEqual(PACKAGE.build.win.target, "nsis");
   assert.match(PACKAGE.build.win.artifactName, /\$\{version\}/);
   assert.match(PACKAGE.build.win.artifactName, /UNSIGNED-DEV/,
@@ -261,4 +276,9 @@ test("the release is a versioned per-user NSIS installer", () => {
   assert.strictEqual(PACKAGE.build.nsis.createDesktopShortcut, "always",
     "every normal reinstall must restore a missing desktop shortcut");
   assert.strictEqual(PACKAGE.build.nsis.createStartMenuShortcut, true);
+  assert.match(include, /!macro customInstall/);
+  assert.match(include, /Delete "\$newDesktopLink"[\s\S]*CreateShortCut "\$newDesktopLink" "\$appExe"/,
+    "a reinstall must freshly replace a same-name stale development shortcut");
+  assert.match(include, /CreateShortCut[\s\S]*\$\{If\} \$\{Errors\}[\s\S]*SetErrorLevel 4/,
+    "direct EXE installs must fail instead of claiming success without a shortcut");
 });

@@ -150,13 +150,17 @@ contacts one provider or the team:
   ceiling. New chats default to a finite three-round ceiling; **Unlimited** is
   an explicit opt-in for a user who intentionally wants an open-ended run.
 - **Work on project files** is explicit mutation authority. It starts one
-  durable long-horizon goal led by the selected agent. The agent works alone
-  when that is sufficient and may create bounded subtasks, hand work off, or
-  ask for targeted independent review. Nexus validates relative paths and
-  current-file baselines, journals transactions before applying them, and runs
-  deterministic verification before claiming completion. The older paired
-  plan/review/execution ritual is still available as an explicit legacy mode
-  on the board, not as the default.
+  durable long-horizon goal bound to the exact saved-chat participants. In a
+  two-agent chat both named agents receive a serialized contribution attempt;
+  a known refusal or malformed answer from one does not erase the other's
+  turn. Later contributors see a bounded durable outcome packet, and the final
+  named contributor performs the safe fan-in. Unknown provider outcomes and
+  pending file effects still stop fail-closed, and any missing required
+  contribution prevents a completion claim. Nexus validates relative paths
+  and current-file baselines, journals transactions before applying them, and
+  runs deterministic verification before claiming completion. The older
+  paired plan/review/execution ritual is still available as an explicit legacy
+  mode on the board, not as the default.
 
 When an agent needs a real user decision, Nexus can render the request inline
 as a question card. The card supports recommended choices, descriptions,

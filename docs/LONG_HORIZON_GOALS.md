@@ -8,10 +8,16 @@ A single ready agent is enough to begin and finish.
 ## Default behavior
 
 **Work on project files** and **Work until the goals are achieved** use the
-long-horizon engine by default. **Send** remains a faithful direct message and
-**Ask connected agents** remains explicit conversational collaboration. The
-older paired plan/review/execute workflow is available only through **Use
-legacy paired workflow**.
+long-horizon engine by default. When **Work on project files** starts from a
+saved two-agent chat, that exact pair is a required team: each named participant
+gets its own serialized contribution task and at least one provider-call slot is
+reserved for every initially required task. Untouched required tasks are chosen
+before repeat turns. The final named contribution receives a bounded durable
+packet of the earlier outcomes and performs the safe fan-in before deterministic
+verification. **Send** remains a faithful direct message and **Ask connected
+agents** remains explicit conversational collaboration. The older paired
+plan/review/execute workflow is available only through **Use legacy paired
+workflow**.
 
 An agent can return one structured next action:
 
@@ -23,8 +29,14 @@ An agent can return one structured next action:
 - report a concrete blocker.
 
 Nexus does not require every agent to propose a plan, review the plan, execute
-the same phase, or vote unanimously. Independent tasks may run in parallel
-when their resource paths and provider identities do not conflict.
+the same phase, or vote unanimously. A required participant cannot hand its
+named contribution to somebody else. A known refusal, malformed reply, or
+known provider failure is recorded truthfully and does not prevent the other
+named participants from being attempted; an unknown provider outcome, pending
+file effect, changed provider/account contract, Pause, or user question remains
+fail-closed. If any required contribution failed, the goal pauses after the
+remaining safe attempts and never claims complete. Independent tasks may run
+in parallel when their resource paths and provider identities do not conflict.
 
 ## Durable state and restart behavior
 
@@ -45,6 +57,23 @@ the objective epoch: an in-flight or acknowledged-but-unapplied result from the
 older objective is durably marked superseded and cannot touch project files.
 File transaction identity and intended paths are journalled before the atomic
 transaction is applied.
+
+The initial **Work on project files** click also has an authenticated admission
+journal. Prepare is persisted before Start, and a terminal receipt stays fenced
+until the renderer has cleared its exact browser/desktop record and explicitly
+acknowledged the matching outcome. Authenticated terminal rows created by
+`0.2.1` did not yet record client acknowledgement; after an upgrade they are
+treated as unknown and unconsumed, never as permission to resend. Nexus exposes
+the newest one for each chat, verifies its exact goal or discard outcome, and
+then reveals any older row. A fresh request for that chat remains blocked until
+every such outcome has been acknowledged.
+
+Required-team scheduling is itself a versioned, non-secret collaboration
+contract in the admission digest. It covers claim fairness, call reservation,
+non-transferable named work, failure continuation, fan-in, and completion. A
+pristine legacy goal can adopt the current contract without provider or file
+effects. Once a legacy goal has crossed either boundary, a missing or changed
+contract stays inspectable but cannot dispatch under silently different rules.
 
 Each admitted agent also carries a hash-only binding to its exact route,
 provider profile, selected model/command semantics, and adapter transport
@@ -94,7 +123,10 @@ concrete evidence marker, and the goal still remains incomplete until
 deterministic project verification passes. Each success criterion receives a
 recorded result and basis. Verification failure creates one bounded repair
 task; repeated no-progress or exhausted budgets pause the goal instead of
-manufacturing progress.
+manufacturing progress. Verification infrastructure that is unavailable
+before a test launches pauses immediately with the completed work resumable;
+it does not spend provider calls asking an agent to repair the Windows sandbox
+or a missing runner.
 
 No-progress fingerprints compare semantic evidence and before/after content,
 not fresh transaction IDs or timestamps. Repeated identical questions,

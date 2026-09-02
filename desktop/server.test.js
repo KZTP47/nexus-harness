@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert");
 const { EventEmitter } = require("node:events");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -19,7 +20,11 @@ function fakeChild(behaviour) {
   child.stdout.setEncoding = () => {};
   child.stderr.setEncoding = () => {};
   child.killed = false;
-  child.kill = () => { child.killed = true; };
+  child.autoCloseOnKill = true;
+  child.kill = () => {
+    child.killed = true;
+    if (child.autoCloseOnKill) setImmediate(() => child.emit("close", 0));
+  };
   // A test can say what this pretend Python does once someone is listening.
   if (behaviour) setImmediate(() => behaviour(child));
   return child;
@@ -140,6 +145,159 @@ test("stopping kills the running server once", async () => {
   assert.ok(child.killed);
   assert.strictEqual(server.child, null);
   server.stop();
+});
+
+test("stopping waits for the Python child to release its handles", async () => {
+  const child = fakeChild();
+  child.autoCloseOnKill = false;
+  const server = new HarnessServer({ candidates: [["python", []]], spawn: () => child });
+  const started = server.start("demo-project");
+  child.stdout.emit("data", 'harness-ui-ready {"url": "http://127.0.0.1:3/", "port": 3}\n');
+  await started;
+
+  const first = server.stop({timeoutMs: 1000});
+  const second = server.stop({timeoutMs: 1000});
+  assert.strictEqual(first, second, "concurrent shutdown calls share one lifecycle wait");
+  let settled = false;
+  first.then(() => { settled = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(settled, false, "kill being requested is not the same as process close");
+  child.emit("close", 0);
+  assert.strictEqual(await first, true);
+  assert.strictEqual(server.stopPromise, null);
+});
+
+test("stopping has a bounded fallback when a child never reports close", async () => {
+  const child = fakeChild();
+  child.autoCloseOnKill = false;
+  const server = new HarnessServer({ candidates: [["python", []]], spawn: () => child });
+  const started = server.start("demo-project");
+  child.stdout.emit("data", 'harness-ui-ready {"url": "http://127.0.0.1:3/", "port": 3}\n');
+  await started;
+  assert.strictEqual(await server.stop({timeoutMs: 5}), false);
+  assert.ok(child.killed);
+  assert.strictEqual(server.stopPromise, null);
+  assert.ok(server.children.has(child), "a timeout retains authority over the exact child");
+  child.emit("close", 0);
+  assert.strictEqual(server.children.size, 0, "a late close releases retained shutdown authority");
+  assert.strictEqual(await server.stop({timeoutMs: 5}), true);
+});
+
+test("stopping during startup owns and closes the unready Python child", async () => {
+  const child = fakeChild();
+  child.autoCloseOnKill = false;
+  const server = new HarnessServer({ candidates: [["python", []]], spawn: () => child });
+  const started = server.start("demo-project");
+  assert.ok(server.children.has(child));
+  assert.strictEqual(server.child, child);
+
+  const stopping = server.stop({timeoutMs: 1000});
+  assert.ok(child.killed);
+  let stopped = false;
+  stopping.then(() => { stopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(stopped, false);
+  child.emit("exit", 143);
+  child.emit("close", 143);
+  await assert.rejects(started, /stopped with code 143/);
+  assert.strictEqual(await stopping, true);
+  assert.strictEqual(server.children.size, 0);
+});
+
+test("stopping a candidate search cannot launch a fallback after shutdown", async () => {
+  const childA = fakeChild();
+  const childB = fakeChild();
+  childA.autoCloseOnKill = false;
+  childB.autoCloseOnKill = false;
+  const spawned = [];
+  const server = new HarnessServer({
+    candidates: [["candidate-a", []], ["candidate-b", []]],
+    spawn: () => {
+      const child = spawned.length ? childB : childA;
+      spawned.push(child);
+      return child;
+    },
+  });
+
+  const stoppedStart = assert.rejects(server.start("demo-project"), /stopped with code 143/);
+  assert.deepStrictEqual(spawned, [childA]);
+  const stopping = server.stop({timeoutMs: 1000});
+  assert.ok(childA.killed);
+  childA.emit("exit", 143);
+  childA.emit("close", 143);
+
+  await stoppedStart;
+  assert.strictEqual(await stopping, true);
+  assert.deepStrictEqual(spawned, [childA], "shutdown must fence off candidate B");
+  assert.strictEqual(server.children.size, 0);
+});
+
+test("a project switch cannot start child B until child A has closed", async () => {
+  const childA = fakeChild();
+  const childB = fakeChild();
+  childA.autoCloseOnKill = false;
+  childB.autoCloseOnKill = false;
+  const spawned = [];
+  const server = new HarnessServer({
+    candidates: [["python", []]],
+    spawn: () => {
+      const child = spawned.length ? childB : childA;
+      spawned.push(child);
+      return child;
+    },
+  });
+  const startedA = server.start("project-a");
+  childA.stdout.emit("data", 'harness-ui-ready {"url": "http://127.0.0.1:3/", "port": 3}\n');
+  await startedA;
+
+  const stoppingA = server.stop({timeoutMs: 1000});
+  const startedB = server.start("project-b");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(spawned.length, 1, "child B is gated on child A's real close");
+  childA.emit("close", 0);
+  assert.strictEqual(await stoppingA, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.strictEqual(spawned.length, 2);
+  childB.stdout.emit("data", 'harness-ui-ready {"url": "http://127.0.0.1:4/", "port": 4}\n');
+  assert.strictEqual(await startedB, "http://127.0.0.1:4/");
+
+  const stoppingB = server.stop({timeoutMs: 1000});
+  assert.ok(childB.killed, "the next stop targets child B, not A's stale promise");
+  childB.emit("close", 0);
+  assert.strictEqual(await stoppingB, true);
+});
+
+test("confirmed stop releases a real child cwd for immediate project deletion", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-server-stop-cwd-"));
+  const project = path.join(root, "arbitrary project");
+  fs.mkdirSync(project);
+  let child = null;
+  const server = new HarnessServer({
+    candidates: [["fixture-runtime", []]],
+    spawn: (_command, _argv, options) => {
+      child = childProcess.spawn(
+        process.execPath,
+        ["-e", "setInterval(() => {}, 1000)"],
+        {...options, stdio: ["ignore", "pipe", "pipe"]},
+      );
+      return child;
+    },
+  });
+  // Attach the rejection observer before stop() terminates the unready child.
+  // On a fast Windows host the real process can exit before stop() resolves;
+  // observing only afterwards makes Node report a transient unhandled rejection
+  // even though the expected failure is asserted a line later.
+  const stoppedStart = assert.rejects(server.start(project), /stopped with code/);
+  try {
+    assert.ok(child, "the unready child is owned immediately after spawn");
+    assert.strictEqual(await server.stop({timeoutMs: 5000}), true);
+    await stoppedStart;
+    fs.rmSync(root, {recursive: true});
+    assert.strictEqual(fs.existsSync(root), false);
+  } finally {
+    if (child?.exitCode == null) child.kill();
+    if (fs.existsSync(root)) fs.rmSync(root, {recursive: true, force: true});
+  }
 });
 
 test("the kept log stays short", async () => {

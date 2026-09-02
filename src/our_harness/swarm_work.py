@@ -4984,10 +4984,24 @@ def _run_disposable_verification_command(
             copy.deepcopy(config.data), snapshot.resolve(), list(config.sources),
             dict(config.provenance), copy.deepcopy(config.trusted_floor),
         )
-        payload = _contained_snapshot_command(
-            snapshot_config, snapshot, _snapshot_command(command, root, snapshot),
-            timeout=timeout, denied_root=root,
-        )
+        try:
+            payload = _contained_snapshot_command(
+                snapshot_config, snapshot, _snapshot_command(command, root, snapshot),
+                timeout=timeout, denied_root=root,
+            )
+        except OSError as error:
+            # Native containment setup can fail before CreateProcess (for
+            # example, when Windows cannot register an AppContainer SID for
+            # the current logon token).  This is verification infrastructure,
+            # not a missing selected-project runner and not evidence that the
+            # applied work needs another provider repair attempt.
+            payload = {
+                "argv": list(command), "cwd": ".", "exit_code": -2,
+                "stdout": "", "stderr": str(error), "duration_ms": 0,
+                "timed_out": False, "output_truncated": False,
+                "containment_unavailable": True,
+                "containment_setup_failed_before_launch": True,
+            }
         # Public evidence remains bound to the approved argv, not ephemeral
         # temporary paths that disappear after this call.
         payload["argv"] = list(command)

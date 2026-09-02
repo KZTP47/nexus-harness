@@ -399,6 +399,30 @@ function filteredEnvironment(overrides) {
   return {...filtered, ...overrides};
 }
 
+async function removeAcceptedFixture(root, timeoutMs = 120_000) {
+  const started = Date.now();
+  let retries = 0;
+  while (true) {
+    try {
+      fs.rmSync(root, {recursive: true, force: true});
+      if (retries) {
+        console.log(
+          `pass  Windows released the accepted fixture after ${retries} bounded cleanup retries`,
+        );
+      }
+      return;
+    } catch (error) {
+      const retryable = ["EBUSY", "EPERM", "ENOTEMPTY"].includes(String(error?.code || ""));
+      if (!retryable || Date.now() - started >= timeoutMs) {
+        error.message = `${error.message} after ${Date.now() - started}ms of bounded cleanup retries`;
+        throw error;
+      }
+      retries += 1;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+}
+
 async function waitUntil(description, probe, timeout = TIMEOUT_MS) {
   const deadline = Date.now() + timeout;
   let last = "";
@@ -912,15 +936,11 @@ async function main() {
   } finally {
     if (app) await app.close().catch(() => {});
     await new Promise((resolve) => fixture.server.close(resolve));
-    if (passed) fs.rmSync(root, {
-      recursive: true,
-      force: true,
-      // Windows can briefly retain a cwd/file handle after Electron and its
-      // server have exited. Keep a successful release acceptance from turning
-      // red solely because that temporary directory needs another moment.
-      maxRetries: 12,
-      retryDelay: 250,
-    });
+    // app.close() is already gated on the product-owned Python child closing.
+    // Endpoint scanners and indexers can still hold a just-written SQLite
+    // directory briefly, so give only those external handles a fixed, bounded
+    // cleanup window. A durable leak still fails this release acceptance.
+    if (passed) await removeAcceptedFixture(root);
   }
 }
 

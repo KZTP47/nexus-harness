@@ -301,6 +301,9 @@ jobs:
       - name: Exercise real multi-vendor dispatch and recovery in packaged Electron
         working-directory: desktop
         run: npm run e2e:multi-vendor
+      - name: Exercise Work together recovery in an ordinary source browser
+        working-directory: desktop
+        run: npm run smoke:browser-long-horizon
 
   package:
     name: What we would hand out

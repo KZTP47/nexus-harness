@@ -7063,6 +7063,7 @@ const directLongGoalRecoveryBusy = new Set();
 const directLongGoalRecoveryPayloadViews = new Map();
 let directLongGoalRecoveryRefreshRevision = 0;
 let directLongGoalRecoveryError = "";
+let directLongGoalRecoveryInventoryReady = false;
 // A long provider request remains one HTTP call, but its truthful Nexus stages
 // arrive through a second, lightweight activity feed.  This map lets both the
 // movable and maximised views show the same live state.
@@ -7813,8 +7814,27 @@ function workRecoveryTitle(status) {
         : "Applied changes are not verified yet";
 }
 
+const DIRECT_LONG_GOAL_DESKTOP_OUTBOX_METHODS = Object.freeze([
+  "saveDirectGoalOutbox", "listDirectGoalOutbox",
+  "readDirectGoalOutbox", "deleteDirectGoalOutbox",
+]);
+
+function canUseDirectLongGoalDesktopOutbox() {
+  if (typeof window.harnessDesktop === "undefined") return false;
+  const missing = DIRECT_LONG_GOAL_DESKTOP_OUTBOX_METHODS.filter(
+    (method) => typeof window.harnessDesktop?.[method] !== "function",
+  );
+  if (missing.length) {
+    throw new Error(
+      "This Nexus desktop build has an incomplete durable goal-request bridge "
+      + `(${missing.join(", ")} missing). Restart or update Nexus before starting project work.`,
+    );
+  }
+  return true;
+}
+
 async function saveDirectLongGoalOutbox(record) {
-  if (!window.harnessDesktop?.saveDirectGoalOutbox) {
+  if (!canUseDirectLongGoalDesktopOutbox()) {
     throw new Error(
       "This Nexus desktop build cannot durably stage an exact goal request before sending it.",
     );
@@ -7832,7 +7852,7 @@ function exactDirectLongGoalOutboxInventoryValue(listed) {
 }
 
 async function readDirectLongGoalOutbox() {
-  if (!window.harnessDesktop?.listDirectGoalOutbox) return [];
+  if (!canUseDirectLongGoalDesktopOutbox()) return [];
   const listed = await window.harnessDesktop.listDirectGoalOutbox();
   // The desktop contract is an array. A fulfilled malformed IPC value is not
   // evidence that the durable outbox is empty: treating `{}` or `null` as []
@@ -7841,7 +7861,7 @@ async function readDirectLongGoalOutbox() {
 }
 
 async function loadDirectLongGoalOutboxPayload(recovery) {
-  if (!window.harnessDesktop?.readDirectGoalOutbox) {
+  if (!canUseDirectLongGoalDesktopOutbox()) {
     throw new Error("The exact local goal request cannot be read by this desktop build.");
   }
   return window.harnessDesktop.readDirectGoalOutbox(
@@ -7918,7 +7938,7 @@ async function verifiedDirectLongGoalOutboxPayload(recovery) {
 }
 
 async function removeDirectLongGoalOutbox(chatId, requestId, payloadSha256 = "") {
-  if (!window.harnessDesktop?.deleteDirectGoalOutbox) {
+  if (!canUseDirectLongGoalDesktopOutbox()) {
     throw new Error(
       "This Nexus desktop build cannot confirm deletion of the exact saved goal request.",
     );
@@ -7959,7 +7979,7 @@ function clearDirectLongGoalRequestMarker(
   try { marker = JSON.parse(localStorage.getItem(key) || "null"); }
   catch (_) { return false; }
   if (!marker || typeof marker !== "object" || Array.isArray(marker)
-      || marker.schema_version !== 2
+      || ![2, 3].includes(marker.schema_version)
       || typeof marker.id !== "string" || marker.id !== String(requestId || "")
       || typeof marker.intent !== "string"
       || marker.intent !== String(intentSha256 || "")) {
@@ -7969,10 +7989,98 @@ function clearDirectLongGoalRequestMarker(
   return true;
 }
 
+function directLongGoalBrowserMarkerForCleanup(
+  agentId, chatId, projectId,
+) {
+  if (!chatId || !projectId || !agentId) return null;
+  const key = `nexus.long-horizon.direct-request.${swarmChatKeyFor(
+    agentId, chatId,
+  )}`;
+  const rawMarker = localStorage.getItem(key);
+  if (rawMarker === null) return null;
+  let marker;
+  try { marker = JSON.parse(rawMarker); }
+  catch (_) {
+    throw new Error("The saved browser goal-request marker is unreadable.");
+  }
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)
+      || ![2, 3].includes(marker.schema_version)
+      || typeof marker.id !== "string" || !marker.id || marker.id.length > 160
+      || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(String(marker.intent || ""))
+      || ![undefined, false, true].includes(marker.prepared)
+      || (marker.prepared === true
+        && !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
+          String(marker.payload_sha256 || ""),
+        ))) {
+    throw new Error("The saved browser goal-request marker has no exact identity.");
+  }
+  if (marker.schema_version === 3 && (
+    marker.chat_id !== chatId
+    || marker.project_id !== projectId
+    || marker.lead_id !== agentId
+  )) {
+    throw new Error("The saved browser goal-request marker belongs to another exact chat binding.");
+  }
+  return Object.freeze({
+    schema_version: 1,
+    request_id: marker.id,
+    chat_id: chatId,
+    project_id: projectId,
+    lead_id: agentId,
+    intent_sha256: marker.intent,
+    payload_sha256: String(marker.payload_sha256 || ""),
+    prepared: marker.prepared === true,
+    text_preview: "",
+    text_characters: 0,
+    attachment_count: 0,
+    created_ms: 0,
+    server_pending: false,
+    desktop_outbox: false,
+    browser_marker: true,
+  });
+}
+
+function preparedDirectLongGoalBrowserMarkerFor(
+  agentId, chatId, projectId,
+) {
+  const marker = directLongGoalBrowserMarkerForCleanup(
+    agentId, chatId, projectId,
+  );
+  if (!marker) return null;
+  if (!marker.prepared || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
+    String(marker.payload_sha256 || ""),
+  )) {
+    throw new Error(
+      "The saved browser goal-request marker has not reached an exact prepared state.",
+    );
+  }
+  return marker;
+}
+
+function preparedDirectLongGoalBrowserMarker(agentId) {
+  const conversation = activeConversationFor(agentId);
+  return preparedDirectLongGoalBrowserMarkerFor(
+    agentId, conversation?.id, conversation?.project,
+  );
+}
+
 function directLongGoalRecoveryFor(agentId) {
   const recovery = directLongGoalRecoveries.get(activeConversationIdFor(agentId)) || null;
-  return recovery && String(recovery.lead_id || "") === String(agentId || "")
-    ? recovery : null;
+  if (recovery && String(recovery.lead_id || "") === String(agentId || "")) {
+    return recovery;
+  }
+  try {
+    const marker = preparedDirectLongGoalBrowserMarker(agentId);
+    if (marker) {
+      directLongGoalRecoveries.set(marker.chat_id, marker);
+      return marker;
+    }
+  } catch (_) {
+    directLongGoalRecoveryInventoryReady = false;
+    directLongGoalRecoveryError =
+      "Nexus could not verify this chat's saved browser goal-request marker. No new project work was sent.";
+  }
+  return null;
 }
 
 const DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION = 1;
@@ -8327,17 +8435,33 @@ function verifiedDirectLongGoalRecoveryRows(value, journal) {
       exactDirectLongGoalRecoveryCount(
         pending, "created_ms", journal, index,
       );
+      const terminalState = String(pending.terminal_state || "");
+      if (terminalState) {
+        if (!["discarded", "reconciled"].includes(terminalState)
+            || pending.client_consumed !== false
+            || typeof pending.goal_id !== "string"
+            || (terminalState === "reconciled" && !pending.goal_id)
+            || (terminalState === "discarded" && pending.goal_id)) {
+          throw new Error(
+            `${journal} record ${index + 1} has an invalid terminal outcome.`,
+          );
+        }
+      }
       const contract = pending.execution_contract;
       if (!contract || typeof contract !== "object" || Array.isArray(contract)
           || contract.schema_version !== 1
-          || contract.kind !== "direct_long_horizon_admission"
+          || ![
+            "direct_long_horizon_admission",
+            "desktop_direct_long_horizon_outbox",
+          ].includes(contract.kind)
           || String(contract.project_id || "") !== projectId
           || String(contract.chat_id || "") !== chatId
           || String(contract.lead_id || "") !== leadId
           || typeof contract.chat_scope !== "string" || !contract.chat_scope
-          || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
+          || (contract.kind === "direct_long_horizon_admission"
+            && !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
             String(contract.project_root_fingerprint_sha256 || ""),
-          )
+            ))
           || !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
             String(contract.fingerprint_sha256 || ""),
           )) {
@@ -8371,11 +8495,13 @@ function verifiedDirectLongGoalRecoveryRows(value, journal) {
 
 function verifiedDirectLongGoalRemoteInventory(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
-      || !Object.hasOwn(value, "pending")) {
+      || !Object.hasOwn(value, "pending")
+      || !Object.hasOwn(value, "terminal")
+      || !Array.isArray(value.pending) || !Array.isArray(value.terminal)) {
     throw new Error("The backend recovery journal did not return its exact inventory envelope.");
   }
   return verifiedDirectLongGoalRecoveryRows(
-    value.pending, "The backend recovery journal",
+    [...value.pending, ...value.terminal], "The backend recovery journal",
   );
 }
 
@@ -8416,7 +8542,13 @@ function mergeDirectLongGoalRecoveryInventories(remote, local, replace = false) 
   for (const pending of remoteRows) {
     const chatId = String(pending?.chat_id || "");
     if (!chatId) continue;
-    const remoteMetadata = {...pending, server_pending: true, desktop_outbox: false};
+    const terminalState = String(pending?.terminal_state || "");
+    const remoteMetadata = {
+      ...pending,
+      server_pending: !terminalState,
+      server_terminal: terminalState,
+      desktop_outbox: false,
+    };
     const existing = merged.get(chatId);
     if (!existing || !existing.desktop_outbox) {
       merged.set(chatId, {...existing, ...remoteMetadata});
@@ -8551,6 +8683,8 @@ async function boundedDirectLongGoalRecoveryRead(reader, journalName) {
 
 async function refreshDirectLongGoalRecoveries() {
   const mine = ++directLongGoalRecoveryRefreshRevision;
+  directLongGoalRecoveryInventoryReady = false;
+  setWhatCanBePressedInSwarm();
   const [remoteResult, localResult] = await Promise.allSettled([
     boundedDirectLongGoalRecoveryRead(
       () => request("/api/long-horizon/pending-admissions"), "The backend recovery journal",
@@ -8580,6 +8714,7 @@ async function refreshDirectLongGoalRecoveries() {
   if (remoteProblem && localProblem) {
     directLongGoalRecoveryError = "Nexus could not verify either saved goal-request journal. Existing recovery records were kept; no request was assumed absent or resent.";
     renderDirectLongGoalBoardRecoveryNotice();
+    setWhatCanBePressedInSwarm();
     return directLongGoalRecoveryInventoryState();
   }
   if (remoteProblem || localProblem) {
@@ -8604,14 +8739,22 @@ async function refreshDirectLongGoalRecoveries() {
     }
     renderDirectLongGoalBoardRecoveryNotice();
     for (const held of swarmChats) renderWorkRecovery(held.agent);
+    // Rendering an open chat can discover a schema-v2/v3 browser marker from
+    // a lost reconciliation response. Reflect that exact synthetic recovery
+    // row in the board-wide notice in the same refresh.
+    renderDirectLongGoalBoardRecoveryNotice();
     setWhatCanBePressedInSwarm();
     return directLongGoalRecoveryInventoryState();
   }
   try {
     directLongGoalRecoveryError = "";
     mergeDirectLongGoalRecoveryInventories(remote, local, true);
+    directLongGoalRecoveryInventoryReady = true;
     renderDirectLongGoalBoardRecoveryNotice();
     for (const held of swarmChats) renderWorkRecovery(held.agent);
+    // An open chat can surface a browser marker left by a lost reconciliation
+    // response after the authoritative journals have returned empty.
+    renderDirectLongGoalBoardRecoveryNotice();
     setWhatCanBePressedInSwarm();
   } catch (_) {
     // A recovery inventory read is not authority to discard a previously
@@ -8621,6 +8764,7 @@ async function refreshDirectLongGoalRecoveries() {
     directLongGoalRecoveryError =
       "Nexus could not safely interpret the saved goal-request journals. Existing records were kept and no request was resent.";
     renderDirectLongGoalBoardRecoveryNotice();
+    setWhatCanBePressedInSwarm();
   }
   return directLongGoalRecoveryInventoryState();
 }
@@ -8637,79 +8781,167 @@ async function recoverDirectLongGoalAdmission(agentId) {
         + "Nexus refused to resend or delete either record.",
       );
     }
-    let backendIntentSha256 = String(recovery.intent_sha256 || "");
-    if (recovery.desktop_outbox) {
+    let backendIntentSha256 = String(
+      recovery.outbox_payload_sha256 || recovery.intent_sha256 || "",
+    );
+    let backendPayloadSha256 = recovery.server_pending
+      ? String(recovery.payload_sha256 || "") : "";
+    let started = null;
+    let terminalState = String(recovery.server_terminal || "");
+    const expected = {
+      request_id: recovery.request_id,
+      chat_id: recovery.chat_id,
+      project_id: recovery.project_id,
+      lead_id: recovery.lead_id,
+      intent_sha256: backendIntentSha256,
+    };
+    if (terminalState) {
+      if (!["discarded", "reconciled"].includes(terminalState)) {
+        throw new Error("The saved terminal goal request has an unsupported outcome.");
+      }
+      const existing = await exactExistingDirectLongGoal(expected);
+      if (terminalState === "reconciled") {
+        if (!existing || existing.goal_id !== String(recovery.goal_id || "")) {
+          throw new Error(
+            "The saved terminal reconciliation does not match its exact canonical goal.",
+          );
+        }
+        started = {
+          schema_version: DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION,
+          engine: "long_horizon", ...expected, goal: existing,
+          terminal_state: "reconciled",
+        };
+      } else if (existing) {
+        throw new Error(
+          "The saved discarded request unexpectedly resolves to a canonical goal.",
+        );
+      }
+    } else if (recovery.desktop_outbox) {
       const saved = await verifiedDirectLongGoalOutboxPayload(recovery);
       const exactPayload = saved?.payload;
       if (!exactPayload || saved.request_id !== recovery.request_id
           || saved.chat_id !== recovery.chat_id) {
         throw new Error("The exact local goal-request outbox identity changed.");
       }
-      const prepared = await request("/api/long-horizon/prepare-admission", {
-        method: "POST", body: JSON.stringify({
-          ...exactPayload, request_id: recovery.request_id,
-        }),
-      });
-      const preparedPending = verifiedDirectLongGoalRecoveryRows(
-        [prepared?.pending], "The backend recovery journal",
-      )[0];
-      for (const [field, expected] of Object.entries({
-        request_id: recovery.request_id,
-        chat_id: recovery.chat_id,
-        project_id: recovery.project_id,
-        lead_id: recovery.lead_id,
-      })) {
-        if (String(preparedPending[field] || "") !== String(expected || "")) {
-          throw new Error(
-            `The backend prepare replay changed the exact ${field.replaceAll("_", " ")}.`,
-          );
-        }
+      if (!recovery.server_pending) {
+        // A reconciliation response may have been lost after the backend
+        // retired its journal. Prove an exact canonical goal first and retry
+        // only the idempotent acknowledgement; never replay prepare/start.
+        started = await reconcileExistingDirectLongGoalAdmission(expected);
       }
-      if (recovery.server_pending
-          && String(preparedPending.payload_sha256 || "")
-          !== String(recovery.payload_sha256 || "")) {
-        throw new Error(
-          "The backend prepare replay found a different full goal payload. Nexus did not start or delete it.",
-        );
-      }
-      backendIntentSha256 = String(preparedPending.intent_sha256 || "");
-    }
-    if (recovery.desktop_outbox
-        && String(recovery.outbox_payload_sha256 || recovery.payload_sha256) !== backendIntentSha256) {
-      throw new Error(
-        "The backend saved a different exact goal-request digest. Nexus did not start or delete it.",
-      );
-    }
-    const started = verifiedDirectLongGoalStartReceipt(
-      await request("/api/long-horizon/start", {
-        method: "POST", body: JSON.stringify({
+      if (!started) {
+        const prepared = await request("/api/long-horizon/prepare-admission", {
+          method: "POST", body: JSON.stringify({
+            ...exactPayload, request_id: recovery.request_id,
+          }),
+        });
+        const preparedPending = verifiedDirectLongGoalRecoveryRows(
+          [prepared?.pending], "The backend recovery journal",
+        )[0];
+        for (const [field, exact] of Object.entries({
           request_id: recovery.request_id,
           chat_id: recovery.chat_id,
-          from_pending: true,
-        }),
-      }),
-      {
+          project_id: recovery.project_id,
+          lead_id: recovery.lead_id,
+        })) {
+          if (String(preparedPending[field] || "") !== String(exact || "")) {
+            throw new Error(
+              `The backend prepare replay changed the exact ${field.replaceAll("_", " ")}.`,
+            );
+          }
+        }
+        if (recovery.server_pending
+            && String(preparedPending.payload_sha256 || "")
+            !== String(recovery.payload_sha256 || "")) {
+          throw new Error(
+            "The backend prepare replay found a different full goal payload. Nexus did not start or delete it.",
+          );
+        }
+        backendIntentSha256 = String(preparedPending.intent_sha256 || "");
+        backendPayloadSha256 = String(preparedPending.payload_sha256 || "");
+      }
+    }
+    if (!terminalState && recovery.browser_marker && !recovery.server_pending) {
+      started = await reconcileExistingDirectLongGoalAdmission({
         request_id: recovery.request_id,
         chat_id: recovery.chat_id,
         project_id: recovery.project_id,
         lead_id: recovery.lead_id,
         intent_sha256: backendIntentSha256,
-      },
-    );
-    await removeDirectLongGoalOutbox(
-      recovery.chat_id, recovery.request_id,
-      recovery.outbox_payload_sha256 || recovery.payload_sha256,
-    );
+      });
+      if (!started) {
+        throw new Error(
+          "The saved browser request has no matching canonical goal. Nexus kept its marker and did not start new work.",
+        );
+      }
+    }
+    if (recovery.desktop_outbox && recovery.intent_sha256
+        && String(recovery.outbox_payload_sha256 || recovery.payload_sha256)
+        !== String(recovery.intent_sha256)) {
+      throw new Error(
+        "The backend saved a different exact goal-request digest. Nexus did not start or delete it.",
+      );
+    }
+    if (!terminalState) {
+      started = started || await startAndReconcileDirectLongGoalAdmission(
+        expected, backendPayloadSha256,
+      );
+      terminalState = String(started.terminal_state || "reconciled");
+    }
+    let browserMarker = null;
+    try {
+      browserMarker = directLongGoalBrowserMarkerForCleanup(
+        agentId, recovery.chat_id, recovery.project_id,
+      );
+    }
+    catch (error) { throw error; }
+    if (browserMarker && (
+      browserMarker.request_id !== recovery.request_id
+      || browserMarker.chat_id !== recovery.chat_id
+      || browserMarker.project_id !== recovery.project_id
+      || browserMarker.lead_id !== recovery.lead_id
+      || browserMarker.intent_sha256 !== backendIntentSha256
+    )) {
+      throw new Error(
+        "The browser marker changed before exact terminal reconciliation.",
+      );
+    }
+    if (recovery.desktop_outbox) {
+      await removeDirectLongGoalOutbox(
+        recovery.chat_id, recovery.request_id,
+        recovery.outbox_payload_sha256 || recovery.payload_sha256,
+      );
+    }
+    if (browserMarker && !clearDirectLongGoalRequestMarker(
+      agentId, recovery.chat_id, recovery.request_id, backendIntentSha256,
+    )) {
+      throw new Error(
+        "The exact browser marker could not be cleared. The server terminal receipt was not acknowledged.",
+      );
+    }
     forgetDirectLongGoalRecovery(
       recovery.chat_id, recovery.request_id,
       recovery.outbox_payload_sha256 || recovery.intent_sha256
         || recovery.payload_sha256,
     );
-    clearDirectLongGoalRequestMarker(
-      agentId, recovery.chat_id, recovery.request_id,
-      recovery.outbox_payload_sha256 || recovery.intent_sha256
-        || recovery.payload_sha256,
+    await bestEffortAcknowledgeDirectLongGoalTerminal(
+      expected, terminalState,
+      terminalState === "reconciled" ? String(started?.goal?.goal_id || "") : "",
     );
+    // An older release could leave several authenticated terminal rows for
+    // one chat because it had no client-acknowledgement fence. The backend
+    // exposes only the newest row so it can match the one surviving desktop
+    // outbox/browser marker. Refresh after every acknowledgement—even a
+    // reconciled goal—before Start can be enabled, so any older row becomes
+    // visible and must be acknowledged next.
+    await refreshDirectLongGoalRecoveries();
+    if (!started) {
+      sayInTheChatFor(
+        agentId,
+        "The exact discarded goal request was acknowledged. No provider work was started.",
+      );
+      return;
+    }
     selectLongGoalSnapshot(started.goal);
     if (activeConversationIdFor(agentId) === recovery.chat_id) {
       await refreshTheChatFor(agentId);
@@ -8747,6 +8979,29 @@ async function discardDirectLongGoalAdmission(agentId, exactRecovery = null) {
     const exactIntent = recovery.outbox_payload_sha256
       || recovery.intent_sha256 || "";
     const exactLead = recovery.lead_id || agentId || "";
+    // Validate any present origin-local marker before the server journal or
+    // desktop outbox changes. This reader deliberately accepts the exact
+    // schema-v3 pre-prepare marker written immediately after durable desktop
+    // save, as well as a fully prepared marker.
+    const browserMarker = agentId
+      ? directLongGoalBrowserMarkerForCleanup(
+        exactLead, recovery.chat_id, recovery.project_id,
+      ) : null;
+    if (browserMarker && (
+      browserMarker.request_id !== recovery.request_id
+      || browserMarker.intent_sha256 !== exactIntent
+    )) {
+      throw new Error(
+        "The browser marker changed before the exact request could be discarded.",
+      );
+    }
+    const expected = {
+      request_id: recovery.request_id,
+      chat_id: recovery.chat_id,
+      project_id: recovery.project_id || "",
+      lead_id: exactLead,
+      intent_sha256: exactIntent,
+    };
     const outcome = verifiedDirectLongGoalDiscardReceipt(
       await request("/api/long-horizon/discard-admission", {
         method: "POST", body: JSON.stringify({
@@ -8758,18 +9013,12 @@ async function discardDirectLongGoalAdmission(agentId, exactRecovery = null) {
           intent_sha256: exactIntent,
         }),
       }),
-      {
-        request_id: recovery.request_id,
-        chat_id: recovery.chat_id,
-        project_id: recovery.project_id || "",
-        lead_id: exactLead,
-        intent_sha256: exactIntent,
-      },
+      expected,
     );
     const sameDesktopRecord = recovery.desktop_outbox
       && !recovery.outbox_conflict && !recovery.outbox_digest_mismatch;
     let desktopOutboxRemoved = false;
-    if (!recovery.server_pending || sameDesktopRecord) {
+    if (sameDesktopRecord) {
       const removed = await removeDirectLongGoalOutbox(
         recovery.chat_id, recovery.request_id,
         recovery.outbox_payload_sha256 || recovery.payload_sha256,
@@ -8780,11 +9029,26 @@ async function discardDirectLongGoalAdmission(agentId, exactRecovery = null) {
       (recovery.desktop_outbox && !desktopOutboxRemoved)
       || recovery.outbox_conflict?.desktop_outbox === true
     );
-    if (agentId && !retainedDesktopOutbox) {
-      clearDirectLongGoalRequestMarker(
-        agentId, recovery.chat_id, recovery.request_id, exactIntent,
+    if (retainedDesktopOutbox) {
+      throw new Error(
+        "The exact desktop outbox was kept, so the server terminal receipt was not acknowledged.",
       );
     }
+    if (browserMarker && !clearDirectLongGoalRequestMarker(
+        agentId, recovery.chat_id, recovery.request_id, exactIntent,
+        )) {
+      throw new Error(
+        "The exact browser marker could not be cleared, so the server terminal receipt was not acknowledged.",
+      );
+    }
+    forgetDirectLongGoalRecovery(
+      recovery.chat_id, recovery.request_id, exactIntent,
+    );
+    await bestEffortAcknowledgeDirectLongGoalTerminal(
+      expected,
+      outcome.reconciled ? "reconciled" : "discarded",
+      outcome.reconciled ? String(outcome.goal?.goal_id || "") : "",
+    );
     if (outcome.reconciled && outcome.goal) {
       selectLongGoalSnapshot(outcome.goal);
       if (agentId) sayInTheChatFor(agentId,
@@ -10909,7 +11173,11 @@ function setWhatCanBePressedInSwarm() {
       ? `Repair ${unavailablePeers.map((one) => one.name || one.id).join(", ")} before asking the team.`
       : `${recipientWords.team}. Expected initial replies: ${recipientWords.expected}.`);
     if ($("theBigChatWork")) {
-      const workTitle = bindingWords || (lone
+      const recoveryAuthorityWords = !directLongGoalRecoveryInventoryReady
+        ? (directLongGoalRecoveryError
+          || "Checking the saved goal-request journals before enabling project work")
+        : "";
+      const workTitle = bindingWords || recoveryAuthorityWords || (lone
         ? loneAgentActionMessage("work")
         : recovery
         ? "Resume the saved project-work run before starting another"
@@ -10917,6 +11185,7 @@ function setWhatCanBePressedInSwarm() {
         ? "Choose this chat's active project first"
         : "Start durable project work with a required contribution from every ready agent in this chat");
       setSwarmProjectWorkControl($("theBigChatWork"), waiting || lone || Boolean(recovery)
+        || !directLongGoalRecoveryInventoryReady
         || Boolean(bindingProblem)
         || (Boolean(conversation) && !conversation.project), workTitle, theBigOne);
     }
@@ -12367,11 +12636,16 @@ function setWhatCanBePressedInAChat(card) {
       ? `Repair ${unavailablePeers.map((one) => one.name || one.id).join(", ")} before asking the team.`
       : `${recipientWords.team}. Expected initial replies: ${recipientWords.expected}.`);
   syncChatRoundPolicy(card.dataset.agent);
+  const recoveryAuthorityWords = !directLongGoalRecoveryInventoryReady
+    ? (directLongGoalRecoveryError
+      || "Checking the saved goal-request journals before enabling project work")
+    : "";
   const workDisabled = waiting || lone || !agent || !agent.ready
+    || !directLongGoalRecoveryInventoryReady
     || Boolean(bindingProblem)
     || Boolean(workRecoveryFor(card.dataset.agent))
     || (Boolean(conversation) && !conversation.project);
-  const workTitle = bindingWords || (lone
+  const workTitle = bindingWords || recoveryAuthorityWords || (lone
     ? loneAgentActionMessage("work")
     : workRecoveryFor(card.dataset.agent)
     ? "Resume the saved project-work run before starting another"
@@ -12972,8 +13246,15 @@ function setSwarmProjectWorkControl(
 }
 
 function projectWorkPauseForMessage(mode, words, agentId = theBigOne) {
-  return mode === "work" || (mode === "auto" && looksLikeProjectWork(words))
-    ? swarmProjectWorkPauseMessage(agentId) : "";
+  if (!(mode === "work" || (mode === "auto" && looksLikeProjectWork(words)))) {
+    return "";
+  }
+  if (!directLongGoalRecoveryInventoryReady || directLongGoalRecoveryError) {
+    return directLongGoalRecoveryError
+      ? "Nexus cannot verify the saved goal-request journals yet. Repair or restart Nexus before starting any new project work; no request was sent."
+      : "Nexus is still checking the saved goal-request journals. Wait for that exact recovery check before starting project work; no request was sent.";
+  }
+  return swarmProjectWorkPauseMessage(agentId);
 }
 
 function directLongGoalCanonicalValue(value) {
@@ -13007,9 +13288,288 @@ async function directLongGoalIntent(conversation, agentId, text, attachments) {
   );
 }
 
+async function prepareDirectLongGoalAdmission(
+  exactPayload, directRequestId, directIntent, directRequestKey,
+) {
+  const desktopOutbox = canUseDirectLongGoalDesktopOutbox();
+  let outbox = null;
+  if (desktopOutbox) {
+    outbox = await saveDirectLongGoalOutbox({
+      schema_version: 1,
+      chat_id: exactPayload.chat_id,
+      request_id: directRequestId,
+      intent: directIntent,
+      payload: exactPayload,
+    });
+    if (String(outbox?.payload_sha256 || "") !== directIntent) {
+      throw new Error("The durable desktop outbox saved a different exact request digest.");
+    }
+    localStorage.setItem(directRequestKey, JSON.stringify({
+      schema_version: 3, id: directRequestId, intent: directIntent,
+      chat_id: exactPayload.chat_id, project_id: exactPayload.project_id,
+      lead_id: exactPayload.lead_id,
+      prepared: false,
+    }));
+  }
+  const expected = {
+    request_id: directRequestId,
+    chat_id: exactPayload.chat_id,
+    project_id: exactPayload.project_id,
+    lead_id: exactPayload.lead_id,
+    intent_sha256: directIntent,
+  };
+  let prepared;
+  try {
+    prepared = await request("/api/long-horizon/prepare-admission", {
+      method: "POST", body: JSON.stringify({
+        ...exactPayload, request_id: directRequestId,
+      }),
+    });
+  } catch (prepareError) {
+    // A prior reconciliation may have committed while its response was lost.
+    // Only an authenticated, exact canonical goal may turn that retired
+    // request into success; otherwise preserve the original prepare failure.
+    const reconciled = await reconcileExistingDirectLongGoalAdmission(expected);
+    if (!reconciled) throw prepareError;
+    return {desktopOutbox, outbox, pending: null, started: reconciled};
+  }
+  const pending = verifiedDirectLongGoalRecoveryRows(
+    [prepared?.pending], "The backend recovery journal",
+  )[0];
+  for (const [field, expected] of Object.entries({
+    request_id: directRequestId,
+    chat_id: exactPayload.chat_id,
+    project_id: exactPayload.project_id,
+    lead_id: exactPayload.lead_id,
+  })) {
+    if (String(pending?.[field] || "") !== String(expected || "")) {
+      throw new Error(
+        `The backend admission journal saved a different exact ${field.replaceAll("_", " ")}. Nexus did not start it.`,
+      );
+    }
+  }
+  if (String(pending?.intent_sha256 || "") !== directIntent) {
+    throw new Error(
+      "The backend admission journal saved a different exact request digest. Nexus did not start it.",
+    );
+  }
+  // In a normal browser window this authenticated backend record is the first
+  // durable boundary. It cannot dispatch a provider. Only after its exact
+  // receipt is verified may origin-local state or the visible draft change.
+  localStorage.setItem(directRequestKey, JSON.stringify({
+    schema_version: 3, id: directRequestId, intent: directIntent,
+    chat_id: exactPayload.chat_id, project_id: exactPayload.project_id,
+    lead_id: exactPayload.lead_id,
+    prepared: true, payload_sha256: pending.payload_sha256,
+  }));
+  return {desktopOutbox, outbox, pending, started: null};
+}
+
+function directLongGoalRequestId(durableRequest, directIntent, exactBinding) {
+  if (durableRequest === null) {
+    return globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID()
+      : `long-goal-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+  const exactMarker = durableRequest
+    && typeof durableRequest === "object" && !Array.isArray(durableRequest)
+    && [2, 3].includes(durableRequest.schema_version)
+    && typeof durableRequest.id === "string" && durableRequest.id
+    && durableRequest.id.length <= 160
+    && durableRequest.intent === directIntent
+    && DIRECT_LONG_GOAL_RECOVERY_SHA256.test(String(durableRequest.intent || ""))
+    && typeof durableRequest.prepared === "boolean"
+    && (!durableRequest.prepared
+      || DIRECT_LONG_GOAL_RECOVERY_SHA256.test(
+        String(durableRequest.payload_sha256 || ""),
+      ))
+    && (durableRequest.schema_version !== 3 || (
+      durableRequest.chat_id === exactBinding?.chat_id
+      && durableRequest.project_id === exactBinding?.project_id
+      && durableRequest.lead_id === exactBinding?.lead_id
+    ));
+  // A prepared marker can remain after a successful reconciliation response
+  // was lost or another origin settled it. Reuse its id once: prepare either
+  // finds the still-pending journal or the exact-goal fallback above retries
+  // reconciliation. Only verified success clears the marker, so it can never
+  // silently turn into a duplicate provider dispatch.
+  if (exactMarker) return durableRequest.id;
+  throw new Error(
+    "The saved browser goal-request marker could not be verified. No new project work was sent.",
+  );
+}
+
+async function exactExistingDirectLongGoal(expected) {
+  const lookedUp = await request("/api/long-horizon/admission-goal", {
+    method: "POST", body: JSON.stringify({
+      request_id: expected.request_id,
+      chat_id: expected.chat_id,
+      project_id: expected.project_id,
+      lead_id: expected.lead_id,
+      intent_sha256: expected.intent_sha256,
+    }),
+  });
+  const identity = verifiedDirectLongGoalReceiptIdentity(
+    lookedUp, expected, "The exact durable-goal lookup",
+  );
+  if (lookedUp.schema_version !== DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION
+      || typeof lookedUp.found !== "boolean") {
+    throw new Error("The exact durable-goal lookup returned an unsupported receipt.");
+  }
+  if (!lookedUp.found) {
+    if (lookedUp.goal !== undefined && lookedUp.goal !== null) {
+      throw new Error("The exact durable-goal lookup returned a goal while claiming absence.");
+    }
+    return null;
+  }
+  return verifiedDirectLongGoalReceiptGoal(
+    lookedUp.goal, identity, "The exact durable-goal lookup",
+  );
+}
+
+async function reconcileDirectLongGoalAdmission(
+  expected, payloadSha256 = "", exactGoalId = "",
+) {
+  if (payloadSha256
+      && !DIRECT_LONG_GOAL_RECOVERY_SHA256.test(String(payloadSha256))) {
+    throw new Error("Nexus has no exact backend payload digest for goal reconciliation.");
+  }
+  const reconciled = verifiedDirectLongGoalDiscardReceipt(
+    await request("/api/long-horizon/discard-admission", {
+      method: "POST", body: JSON.stringify({
+        request_id: expected.request_id,
+        chat_id: expected.chat_id,
+        project_id: expected.project_id,
+        lead_id: expected.lead_id,
+        payload_sha256: payloadSha256,
+        intent_sha256: expected.intent_sha256,
+      }),
+    }),
+    expected,
+  );
+  if (!reconciled.reconciled || reconciled.discarded
+      || reconciled.safe_to_delete
+      || (exactGoalId && reconciled.goal.goal_id !== exactGoalId)) {
+    throw new Error(
+      "The backend did not reconcile the exact canonical durable goal. The saved request was kept visible.",
+    );
+  }
+  return reconciled;
+}
+
+async function acknowledgeDirectLongGoalTerminal(
+  expected, terminalState, exactGoalId = "",
+) {
+  const acknowledged = await request(
+    "/api/long-horizon/acknowledge-admission", {
+      method: "POST", body: JSON.stringify({
+        request_id: expected.request_id,
+        chat_id: expected.chat_id,
+        project_id: expected.project_id,
+        lead_id: expected.lead_id,
+        intent_sha256: expected.intent_sha256,
+        terminal_state: terminalState,
+        goal_id: exactGoalId,
+      }),
+    },
+  );
+  const identity = verifiedDirectLongGoalReceiptIdentity(
+    acknowledged, expected, "The terminal goal acknowledgement",
+  );
+  if (acknowledged.schema_version !== DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION
+      || acknowledged.client_consumed !== true
+      || acknowledged.terminal_state !== terminalState
+      || String(acknowledged.goal_id || "") !== String(exactGoalId || "")) {
+    throw new Error(
+      "The backend did not acknowledge the exact terminal goal receipt.",
+    );
+  }
+  if (terminalState === "reconciled") {
+    const goal = verifiedDirectLongGoalReceiptGoal(
+      acknowledged.goal, identity, "The terminal goal acknowledgement",
+    );
+    if (goal.goal_id !== exactGoalId) {
+      throw new Error(
+        "The terminal goal acknowledgement returned a different canonical goal.",
+      );
+    }
+  } else if (terminalState !== "discarded"
+      || (acknowledged.goal !== undefined && acknowledged.goal !== null)) {
+    throw new Error("The terminal goal acknowledgement returned an invalid outcome.");
+  }
+  return acknowledged;
+}
+
+async function bestEffortAcknowledgeDirectLongGoalTerminal(
+  expected, terminalState, exactGoalId = "",
+) {
+  try {
+    await acknowledgeDirectLongGoalTerminal(
+      expected, terminalState, exactGoalId,
+    );
+    return true;
+  } catch (_) {
+    // Local browser/desktop authorities have already been cleared after an
+    // exact start/reconcile receipt. A lost final acknowledgement can only
+    // leave the authenticated terminal fence visible on the next inventory;
+    // it must never turn verified provider work back into a failed send.
+    try { await refreshDirectLongGoalRecoveries(); } catch (_) { /* Retry is explicit. */ }
+    return false;
+  }
+}
+
+async function reconcileExistingDirectLongGoalAdmission(expected) {
+  const existing = await exactExistingDirectLongGoal(expected);
+  if (!existing) return null;
+  const reconciled = await reconcileDirectLongGoalAdmission(
+    expected, "", existing.goal_id,
+  );
+  return {
+    schema_version: DIRECT_LONG_GOAL_RECEIPT_SCHEMA_VERSION,
+    engine: "long_horizon",
+    request_id: expected.request_id,
+    chat_id: expected.chat_id,
+    project_id: expected.project_id,
+    lead_id: expected.lead_id,
+    intent_sha256: expected.intent_sha256,
+    goal: reconciled.goal,
+    terminal_state: "reconciled",
+  };
+}
+
+async function startAndReconcileDirectLongGoalAdmission(expected, payloadSha256) {
+  if (!DIRECT_LONG_GOAL_RECOVERY_SHA256.test(String(payloadSha256 || ""))) {
+    throw new Error(
+      "Nexus has no exact backend payload digest for durable goal reconciliation.",
+    );
+  }
+  // Never acknowledge a journal until the start response proves the exact
+  // request/chat/project/lead/intent and its matching canonical goal.
+  const started = verifiedDirectLongGoalStartReceipt(
+    await request("/api/long-horizon/start", {
+      method: "POST", body: JSON.stringify({
+        request_id: expected.request_id,
+        chat_id: expected.chat_id,
+        from_pending: true,
+      }),
+    }),
+    expected,
+  );
+  const reconciled = await reconcileDirectLongGoalAdmission(
+    expected, payloadSha256, started.goal.goal_id,
+  );
+  return {...started, goal: reconciled.goal, terminal_state: "reconciled"};
+}
+
 function confirmProjectWork(agent, words, mode) {
   const needsConfirmation = mode === "work" || (mode === "auto" && looksLikeProjectWork(words));
   if (!needsConfirmation) return {allowed: true, confirmed: false};
+  if (!directLongGoalRecoveryInventoryReady || directLongGoalRecoveryError) {
+    const message = projectWorkPauseForMessage(mode, words, agent?.id);
+    sayInTheChatFor(agent?.id, message);
+    if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
+    return {allowed: false, confirmed: false};
+  }
   if (workRecoveryFor(agent?.id)) {
     const message = "Resume the saved project-work run before starting another file task in this chat.";
     sayInTheChatFor(agent?.id, message);
@@ -13025,6 +13585,16 @@ function confirmProjectWork(agent, words, mode) {
     sayInTheChatFor(agent?.id, message);
     if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
     renderWorkRecovery(agent?.id);
+    return {allowed: false, confirmed: false};
+  }
+  // Marker discovery is deliberately repeated at confirmation time. If an
+  // origin-local marker became unreadable after the last inventory refresh,
+  // directLongGoalRecoveryFor fails the authority state closed; never let the
+  // same click cross into a fresh admission.
+  if (!directLongGoalRecoveryInventoryReady || directLongGoalRecoveryError) {
+    const message = projectWorkPauseForMessage(mode, words, agent?.id);
+    sayInTheChatFor(agent?.id, message);
+    if (theBigOne === agent?.id) $("theBigChatSaidBack").textContent = message;
     return {allowed: false, confirmed: false};
   }
   const conversation = activeConversationFor(agent?.id);
@@ -13330,16 +13900,30 @@ async function sendWhatIsTypedTo(agentId) {
       if (!conversation?.project) throw new Error("Choose this chat's project before starting file work.");
       const directRequestKey = `nexus.long-horizon.direct-request.${recoveryKey}`;
       let durableRequest = null;
-      try { durableRequest = JSON.parse(localStorage.getItem(directRequestKey) || "null"); }
-      catch (_) { durableRequest = null; }
+      const rawDurableRequest = localStorage.getItem(directRequestKey);
+      if (rawDurableRequest !== null) {
+        try { durableRequest = JSON.parse(rawDurableRequest); }
+        catch (_) {
+          throw new Error(
+            "The saved browser goal-request marker is unreadable. No new project work was sent.",
+          );
+        }
+        if (durableRequest === null) {
+          throw new Error(
+            "The saved browser goal-request marker has no exact identity. No new project work was sent.",
+          );
+        }
+      }
       const directIntent = await directLongGoalIntent(
         conversation, agentId, words, attachments,
       );
-      const directRequestId = durableRequest?.intent === directIntent && durableRequest?.id
-        ? durableRequest.id
-        : (globalThis.crypto?.randomUUID
-          ? globalThis.crypto.randomUUID()
-          : `long-goal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const directRequestId = directLongGoalRequestId(
+        durableRequest, directIntent, {
+          chat_id: conversation.id,
+          project_id: conversation.project,
+          lead_id: agentId,
+        },
+      );
       const exactPayload = {
         project_id: conversation.project,
         lead_id: agentId,
@@ -13347,33 +13931,10 @@ async function sendWhatIsTypedTo(agentId) {
         text: words,
         attachments,
       };
-      const outbox = await saveDirectLongGoalOutbox({
-        schema_version: 1,
-        chat_id: conversation.id,
-        request_id: directRequestId,
-        intent: directIntent,
-        payload: exactPayload,
-      });
-      if (String(outbox?.payload_sha256 || "") !== directIntent) {
-        throw new Error("The durable desktop outbox saved a different exact request digest.");
-      }
-      localStorage.setItem(directRequestKey, JSON.stringify({
-        schema_version: 2, id: directRequestId, intent: directIntent,
-      }));
-      const prepared = await request("/api/long-horizon/prepare-admission", {
-        method: "POST", body: JSON.stringify({
-          ...exactPayload, request_id: directRequestId,
-        }),
-      });
-      if (String(prepared.pending?.intent_sha256 || "") !== outbox.payload_sha256) {
-        throw new Error(
-          "The backend admission journal saved a different exact request digest. Nexus did not start it.",
-        );
-      }
-      localStorage.setItem(directRequestKey, JSON.stringify({
-        schema_version: 2, id: directRequestId, intent: directIntent,
-        prepared: true, payload_sha256: prepared.pending?.payload_sha256 || "",
-      }));
+      const preparedAdmission = await prepareDirectLongGoalAdmission(
+        exactPayload, directRequestId, directIntent, directRequestKey,
+      );
+      const {desktopOutbox, outbox, pending} = preparedAdmission;
       const heldDraft = swarmChatComposerDrafts.get(requestChatKey);
       if (!heldDraft || heldDraft.value === words) {
         swarmChatComposerDrafts.delete(requestChatKey);
@@ -13382,30 +13943,34 @@ async function sendWhatIsTypedTo(agentId) {
         box.value = "";
         rememberSwarmChatComposer(agentId);
       }
-      const started = verifiedDirectLongGoalStartReceipt(
-        await request("/api/long-horizon/start", {
-          method: "POST", body: JSON.stringify({
-            request_id: directRequestId,
-            chat_id: conversation.id,
-            from_pending: true,
-          }),
-        }),
-        {
+      const exactAdmission = {
           request_id: directRequestId,
           chat_id: conversation.id,
           project_id: conversation.project,
           lead_id: agentId,
           intent_sha256: directIntent,
-        },
-      );
-      await removeDirectLongGoalOutbox(
-        conversation.id, directRequestId, outbox.payload_sha256,
-      );
-      forgetDirectLongGoalRecovery(
-        conversation.id, directRequestId, outbox.payload_sha256,
-      );
-      clearDirectLongGoalRequestMarker(
+      };
+      const started = preparedAdmission.started
+        || await startAndReconcileDirectLongGoalAdmission(
+          exactAdmission, pending.payload_sha256,
+        );
+      if (desktopOutbox) {
+        await removeDirectLongGoalOutbox(
+          conversation.id, directRequestId, outbox.payload_sha256,
+        );
+      }
+      if (!clearDirectLongGoalRequestMarker(
         agentId, conversation.id, directRequestId, directIntent,
+      )) {
+        throw new Error(
+          "The exact browser goal-request marker could not be cleared. The server receipt was left recoverable.",
+        );
+      }
+      forgetDirectLongGoalRecovery(
+        conversation.id, directRequestId, directIntent,
+      );
+      await bestEffortAcknowledgeDirectLongGoalTerminal(
+        exactAdmission, "reconciled", started.goal.goal_id,
       );
       if (!swarmActivityCanReconcileSuccess(activity)) return started;
       selectLongGoalSnapshot(started.goal);
@@ -16974,16 +17539,30 @@ async function sendFromTheBigChat(mode = "chat") {
       if (!conversation?.project) throw new Error("Choose this chat's project before starting file work.");
       const directRequestKey = `nexus.long-horizon.direct-request.${recoveryKey}`;
       let durableRequest = null;
-      try { durableRequest = JSON.parse(localStorage.getItem(directRequestKey) || "null"); }
-      catch (_) { durableRequest = null; }
+      const rawDurableRequest = localStorage.getItem(directRequestKey);
+      if (rawDurableRequest !== null) {
+        try { durableRequest = JSON.parse(rawDurableRequest); }
+        catch (_) {
+          throw new Error(
+            "The saved browser goal-request marker is unreadable. No new project work was sent.",
+          );
+        }
+        if (durableRequest === null) {
+          throw new Error(
+            "The saved browser goal-request marker has no exact identity. No new project work was sent.",
+          );
+        }
+      }
       const directIntent = await directLongGoalIntent(
         conversation, agentId, said, attachments,
       );
-      const directRequestId = durableRequest?.intent === directIntent && durableRequest?.id
-        ? durableRequest.id
-        : (globalThis.crypto?.randomUUID
-          ? globalThis.crypto.randomUUID()
-          : `long-goal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const directRequestId = directLongGoalRequestId(
+        durableRequest, directIntent, {
+          chat_id: conversation.id,
+          project_id: conversation.project,
+          lead_id: agentId,
+        },
+      );
       const exactPayload = {
         project_id: conversation.project,
         lead_id: agentId,
@@ -16991,33 +17570,10 @@ async function sendFromTheBigChat(mode = "chat") {
         chat_id: conversation.id,
         attachments,
       };
-      const outbox = await saveDirectLongGoalOutbox({
-        schema_version: 1,
-        chat_id: conversation.id,
-        request_id: directRequestId,
-        intent: directIntent,
-        payload: exactPayload,
-      });
-      if (String(outbox?.payload_sha256 || "") !== directIntent) {
-        throw new Error("The durable desktop outbox saved a different exact request digest.");
-      }
-      localStorage.setItem(directRequestKey, JSON.stringify({
-        schema_version: 2, id: directRequestId, intent: directIntent,
-      }));
-      const prepared = await request("/api/long-horizon/prepare-admission", {
-        method: "POST", body: JSON.stringify({
-          ...exactPayload, request_id: directRequestId,
-        }),
-      });
-      if (String(prepared.pending?.intent_sha256 || "") !== outbox.payload_sha256) {
-        throw new Error(
-          "The backend admission journal saved a different exact request digest. Nexus did not start it.",
-        );
-      }
-      localStorage.setItem(directRequestKey, JSON.stringify({
-        schema_version: 2, id: directRequestId, intent: directIntent,
-        prepared: true, payload_sha256: prepared.pending?.payload_sha256 || "",
-      }));
+      const preparedAdmission = await prepareDirectLongGoalAdmission(
+        exactPayload, directRequestId, directIntent, directRequestKey,
+      );
+      const {desktopOutbox, outbox, pending} = preparedAdmission;
       const heldDraft = theBigChatComposerDrafts.get(attachmentKey);
       if (!heldDraft || heldDraft.value === said) {
         theBigChatComposerDrafts.delete(attachmentKey);
@@ -17027,30 +17583,34 @@ async function sendFromTheBigChat(mode = "chat") {
         box.value = "";
         rememberTheBigChatComposer();
       }
-      const started = verifiedDirectLongGoalStartReceipt(
-        await request("/api/long-horizon/start", {
-          method: "POST", body: JSON.stringify({
-            request_id: directRequestId,
-            chat_id: conversation.id,
-            from_pending: true,
-          }),
-        }),
-        {
+      const exactAdmission = {
           request_id: directRequestId,
           chat_id: conversation.id,
           project_id: conversation.project,
           lead_id: agentId,
           intent_sha256: directIntent,
-        },
-      );
-      await removeDirectLongGoalOutbox(
-        conversation.id, directRequestId, outbox.payload_sha256,
-      );
-      forgetDirectLongGoalRecovery(
-        conversation.id, directRequestId, outbox.payload_sha256,
-      );
-      clearDirectLongGoalRequestMarker(
+      };
+      const started = preparedAdmission.started
+        || await startAndReconcileDirectLongGoalAdmission(
+          exactAdmission, pending.payload_sha256,
+        );
+      if (desktopOutbox) {
+        await removeDirectLongGoalOutbox(
+          conversation.id, directRequestId, outbox.payload_sha256,
+        );
+      }
+      if (!clearDirectLongGoalRequestMarker(
         agentId, conversation.id, directRequestId, directIntent,
+      )) {
+        throw new Error(
+          "The exact browser goal-request marker could not be cleared. The server receipt was left recoverable.",
+        );
+      }
+      forgetDirectLongGoalRecovery(
+        conversation.id, directRequestId, directIntent,
+      );
+      await bestEffortAcknowledgeDirectLongGoalTerminal(
+        exactAdmission, "reconciled", started.goal.goal_id,
       );
       if (!swarmActivityCanReconcileSuccess(activity)) return;
       selectLongGoalSnapshot(started.goal);
