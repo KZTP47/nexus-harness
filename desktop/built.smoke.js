@@ -43,6 +43,42 @@ function theBuiltApp() {
   );
 }
 
+function cleanSmokeWorkspace() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-built-smoke-"));
+  const profile = path.join(root, "fresh Electron profile");
+  const project = path.join(root, "Fresh project - Åsa & O'Brien (QA)!");
+  const appData = path.join(root, "fresh roaming app data");
+  const localAppData = path.join(root, "fresh local app data");
+  const home = path.join(root, "fresh user profile");
+  const temp = path.join(root, "fresh temporary files");
+  for (const directory of [profile, project, appData, localAppData, home, temp]) {
+    fs.mkdirSync(directory);
+  }
+  fs.writeFileSync(
+    path.join(project, "README.md"),
+    "# Clean packaged-app smoke project\n",
+    "utf8",
+  );
+  fs.writeFileSync(
+    path.join(project, "package.json"),
+    `${JSON.stringify({name: "nexus-built-smoke-fixture", private: true}, null, 2)}\n`,
+    "utf8",
+  );
+  const environment = {...process.env};
+  for (const key of Object.keys(environment)) {
+    if (key.toUpperCase().startsWith("NEXUS_")) delete environment[key];
+  }
+  Object.assign(environment, {
+    APPDATA: appData,
+    LOCALAPPDATA: localAppData,
+    USERPROFILE: home,
+    HOME: home,
+    TEMP: temp,
+    TMP: temp,
+  });
+  return {root, profile, project, environment};
+}
+
 async function reachThePanel(page) {
   const first = await Promise.race([
     page.waitForFunction(() => location.protocol === "http:", null, { timeout: 90000 })
@@ -61,16 +97,17 @@ async function reachThePanel(page) {
 
 async function main() {
   const exe = theBuiltApp();
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-clean-profile-"));
-  const project = path.resolve(__dirname, "..");
+  const {root: smokeRoot, profile, project, environment} = cleanSmokeWorkspace();
   console.log(`Starting the built app at ${exe}\n`);
-  const app = await electron.launch({
-    executablePath: exe,
-    args: [`--user-data-dir=${profile}`, "--project", project],
-    timeout: TIMEOUT_MS,
-  });
+  let app = null;
   let verified = false;
   try {
+    app = await electron.launch({
+      executablePath: exe,
+      args: [`--user-data-dir=${profile}`, "--project", project],
+      env: environment,
+      timeout: TIMEOUT_MS,
+    });
     const page = await app.firstWindow({ timeout: TIMEOUT_MS });
     try {
       await reachThePanel(page);
@@ -109,7 +146,7 @@ async function main() {
     console.log("\nThe app somebody installs opens.");
   } finally {
     try {
-      if (CLOSE_THROUGH_WINDOW && verified) {
+      if (app && CLOSE_THROUGH_WINDOW && verified) {
         const processExited = new Promise((resolve) => {
           const timer = setTimeout(() => resolve(false), 30000);
           app.process().once("exit", () => {
@@ -128,11 +165,11 @@ async function main() {
           throw new Error("The packaged app did not exit after Windows closed its owner window");
         }
         console.log("pass  closing the owner window awaits coordinated shutdown");
-      } else {
+      } else if (app) {
         await app.close().catch(() => {});
       }
     } finally {
-      fs.rmSync(profile, { recursive: true, force: true });
+      fs.rmSync(smokeRoot, { recursive: true, force: true });
     }
   }
 }

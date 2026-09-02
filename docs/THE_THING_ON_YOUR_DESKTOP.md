@@ -67,12 +67,12 @@ process-scoped `GH_TOKEN` or `GITHUB_TOKEN`; otherwise the request is anonymous.
 You can instead download both release assets in a signed-in browser and verify
 the checksum manually.
 
-If you download the two `0.2.3` assets in a browser, open PowerShell in the
+If you download the two `0.2.4` assets in a browser, open PowerShell in the
 download folder and run:
 
 ```powershell
-$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.3-UNSIGNED.exe').Hash.ToLowerInvariant()
-$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.3-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.4-UNSIGNED.exe').Hash.ToLowerInvariant()
+$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.4-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
 $actual -eq $expected
 ```
 

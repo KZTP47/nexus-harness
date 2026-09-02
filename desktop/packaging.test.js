@@ -216,6 +216,21 @@ test("every source-tree UI smoke uses the dependency installed by a clean checko
     `playwright-core resolved outside desktop/node_modules: ${resolved}`);
 });
 
+test("the built-app smoke uses a throwaway project with no checkout authority", () => {
+  const source = fs.readFileSync(path.join(__dirname, "built.smoke.js"), "utf8");
+  assert.match(source, /function cleanSmokeWorkspace\(/);
+  assert.match(source, /mkdtempSync\(path\.join\(os\.tmpdir\(\), "nexus-built-smoke-"\)\)/);
+  assert.match(source, /Fresh project - Åsa & O'Brien \(QA\)!/);
+  assert.match(source, /nexus-built-smoke-fixture/);
+  assert.doesNotMatch(source, /const project = path\.resolve\(__dirname, "\.\."\)/);
+  for (const isolated of ["APPDATA", "LOCALAPPDATA", "USERPROFILE", "HOME", "TEMP", "TMP"]) {
+    assert.match(source, new RegExp(`${isolated}:`), `${isolated} is not isolated`);
+  }
+  assert.match(source, /startsWith\("NEXUS_"\)/);
+  assert.match(source, /env: environment/);
+  assert.match(source, /fs\.rmSync\(smokeRoot, \{ recursive: true, force: true \}\)/);
+});
+
 test("test and smoke files stay out of the installer", () => {
   for (const name of ["server.test.js", "packaging.test.js", "smoke.js", "packaged.smoke.js",
                       "automations.smoke.js", "long-horizon.smoke.js",

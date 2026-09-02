@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "our-harness-cli"
-version = "0.2.3"
+version = "0.2.4"
 description = "A local test lab and coding assistant: writes your checks, runs them, and says plainly what broke"
 readme = "README.md"
 requires-python = ">=3.11"
