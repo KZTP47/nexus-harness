@@ -188,6 +188,51 @@ function normalizedPathForComparison(value) {
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
+function directoryPathParts(value) {
+  const parsed = path.parse(value);
+  return {
+    root: parsed.root,
+    names: value.slice(parsed.root.length).split(path.sep).filter(Boolean),
+  };
+}
+
+function assertRealDirectoryChain(resolved, label) {
+  const parts = directoryPathParts(resolved);
+  let current = parts.root;
+  for (const name of parts.names) {
+    current = path.join(current, name);
+    let held;
+    try { held = fs.lstatSync(current); } catch (error) {
+      throw fail("NEXUS_OUTBOX_PATH", `${label} is unavailable. ${error.message || error}`);
+    }
+    // On Windows, lstat reports both symbolic links and directory junctions as
+    // symbolic links.  Inspect every component rather than only the leaf so a
+    // parent reparse point cannot redirect application-owned storage.
+    if (!held.isDirectory() || held.isSymbolicLink()) {
+      throw fail("NEXUS_OUTBOX_PATH", `${label} must use real directories, not a reparse point.`);
+    }
+  }
+}
+
+function sameWindowsDirectoryAliases(resolved, canonical) {
+  const requested = directoryPathParts(resolved);
+  const real = directoryPathParts(canonical);
+  if (requested.root.toLowerCase() !== real.root.toLowerCase()
+      || requested.names.length !== real.names.length) return false;
+
+  let requestedPart = requested.root;
+  let realPart = real.root;
+  for (let index = 0; index < requested.names.length; index += 1) {
+    requestedPart = path.join(requestedPart, requested.names[index]);
+    realPart = path.join(realPart, real.names[index]);
+    const requestedStat = fs.statSync(requestedPart, {bigint: true});
+    const realStat = fs.statSync(realPart, {bigint: true});
+    if (!requestedStat.isDirectory() || !realStat.isDirectory()
+        || requestedStat.dev !== realStat.dev || requestedStat.ino !== realStat.ino) return false;
+  }
+  return true;
+}
+
 function canonicalDirectory(directory, label, options = {}) {
   if (typeof directory !== "string" || !directory.trim()) {
     throw fail("NEXUS_OUTBOX_PATH", `${label} is not configured.`);
@@ -197,15 +242,12 @@ function canonicalDirectory(directory, label, options = {}) {
     throw fail("NEXUS_OUTBOX_PATH", `${label} is not a safe application-owned directory.`);
   }
   if (options.create) fs.mkdirSync(resolved, {recursive: true});
-  let held;
-  try { held = fs.lstatSync(resolved); } catch (error) {
-    throw fail("NEXUS_OUTBOX_PATH", `${label} is unavailable. ${error.message || error}`);
-  }
-  if (!held.isDirectory() || held.isSymbolicLink()) {
-    throw fail("NEXUS_OUTBOX_PATH", `${label} must be a real directory, not a reparse point.`);
-  }
+  assertRealDirectoryChain(resolved, label);
   const real = fs.realpathSync.native(resolved);
-  if (normalizedPathForComparison(real) !== normalizedPathForComparison(resolved)) {
+  const exactSpelling = normalizedPathForComparison(real) === normalizedPathForComparison(resolved);
+  const exactWindowsAlias = !exactSpelling && process.platform === "win32"
+    && sameWindowsDirectoryAliases(resolved, real);
+  if (!exactSpelling && !exactWindowsAlias) {
     throw fail("NEXUS_OUTBOX_PATH", `${label} resolves outside its application-owned path.`);
   }
   return real;

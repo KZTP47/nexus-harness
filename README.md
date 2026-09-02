@@ -220,14 +220,22 @@ an authenticated company distribution channel. The unsigned outer ZIP and CMD
 are not self-authenticating: a checksum or verification command from the same
 untrusted folder is not a digital signature.
 
-Already cloned the source? **Double-click `Install Nexus Harness.cmd`**. It
-looks for a complete product-built offline bundle beside itself first. If no
-Nexus installer material is present, it downloads the stable GitHub release.
+Already cloned the source, or used GitHub's green **Code → Download ZIP**?
+Extract the complete source ZIP and **double-click `Install Nexus Harness.cmd`**.
+It looks for a complete product-built offline bundle beside itself first. If no
+Nexus installer material is present, it downloads the stable GitHub release,
+installs it for the current user, and creates or repairs `Nexus Harness.lnk` in
+that user's actual Windows Desktop known folder.
 Incomplete, corrupt, ambiguous, version-mismatched, or untrusted local material
 stops locally instead of silently going online. A source-tree bootstrap does
 not trust arbitrary sibling unsigned EXEs; use the complete release ZIP,
 including its digest-bound `scripts` folder. It never disguises a browser
 shortcut as the desktop app.
+
+Keep the extracted folder's ordinary downloaded name. Like every Windows batch
+file, a `.cmd` cannot start when its own path contains paired `%NAME%` text:
+Windows expands that text as an environment variable before the file gets
+control. If the folder was renamed that way, rename it and double-click again.
 
 This repository is public, so a published public release can be downloaded
 anonymously. For a private fork or a future visibility change, set a
@@ -328,7 +336,10 @@ apps or with the repository uninstaller.
 
 It is at the top of the project with a name that says what it does, because the
 one thing somebody who has just downloaded this cannot be expected to know is
-which command to type first.
+which command to type first. GitHub's **Code → Download ZIP** is a source archive,
+not the roughly 234 MiB Windows application; the top-level CMD obtains the exact
+published app automatically. The separately published offline ZIP already
+contains that installer for computers that cannot reach GitHub.
 
 The public repository needs no GitHub login for a published public release. For
 a private fork, use `GH_TOKEN` or `GITHUB_TOKEN` scoped to that process. The

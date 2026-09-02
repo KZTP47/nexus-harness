@@ -11,6 +11,7 @@ echo.
 echo   Nexus Harness
 echo   =============
 echo   Checking this folder for a verified offline Windows installer first.
+echo   This one file installs the app and creates or repairs Nexus Harness.lnk on your Desktop.
 if "%NEXUS_BUNDLED_OFFLINE_MODE%"=="1" (
   echo   This product-built bundle is offline-only and will never use the network.
 ) else (
@@ -30,11 +31,14 @@ set "NEXUS_BOOTSTRAP_PATH=%~dp0scripts\install_nexus_harness.ps1"
 set "NEXUS_BOOTSTRAP_RESOURCE_ROOT=%~dp0scripts"
 set "NEXUS_BUNDLE_ROOT=%~dp0."
 
+if not exist "%NEXUS_BOOTSTRAP_PATH%" (
+  echo   The installer helper is missing from this extracted ZIP:
+  echo   "%NEXUS_BOOTSTRAP_PATH%"
+  echo   Extract the complete ZIP again, keep its scripts folder, and retry. Nothing was run.
+  exit /b 1
+)
+
 if "%NEXUS_BUNDLED_OFFLINE_MODE%"=="1" (
-  if not exist "%NEXUS_BOOTSTRAP_PATH%" (
-    echo   The exact bundled installer bootstrap is missing. Nothing was run.
-    exit /b 1
-  )
   rem One PowerShell process hashes the open PS1, decodes those same verified
   rem bytes, and executes the resulting in-memory script block. No path or
   rem ancestor directory is resolved again after verification.

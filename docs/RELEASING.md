@@ -103,7 +103,15 @@ runners. A source tag is not a release. After publication, the workflow polls
 GitHub's latest-release API without credentials, requires the exact tag,
 installer, checksum, and product-bound offline ZIP, anonymously downloads all
 three assets, compares their bytes with the verified build artifacts, and
-verifies the published SHA-256.
+verifies the published SHA-256. Publication also requires the release tag and
+public `master` to identify the same commit. It then starts a second clean
+Windows runner, downloads GitHub's actual public `master` source ZIP into an
+awkward path, and invokes the unmodified top-level
+`Install Nexus Harness.cmd` from an unrelated working directory with no token
+or sibling installer. That final
+consumer-path check must install the published version, read back the exact
+desktop shortcut target, working folder, arguments, and icon, and launch the
+installed executable through the `.lnk`.
 The real-package Windows job installs the package, validates the desktop
 shortcut, removes it, reinstalls to prove it is recreated exactly once, and
 launches the app through that shortcut before publication may proceed. The

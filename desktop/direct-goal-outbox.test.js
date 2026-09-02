@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const childProcess = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -58,6 +59,18 @@ function dataAttachment(bytes, name = "exact.bin", type = "application/octet-str
     name, type, size: bytes.length,
     data: `data:${type};base64,${bytes.toString("base64")}`,
   };
+}
+
+function windowsShortPath(directory) {
+  const variable = "NEXUS_OUTBOX_ALIAS_TARGET";
+  return childProcess.execFileSync(
+    process.env.ComSpec || "cmd.exe",
+    ["/d", "/c", `for %I in ("%${variable}%") do @echo %~sI`],
+    {
+      encoding: "utf8", env: {...process.env, [variable]: directory},
+      windowsHide: true, windowsVerbatimArguments: true,
+    },
+  ).trim();
 }
 
 test("save is atomic, restart-persistent, and public inventory omits exact payload bytes", (t) => {
@@ -282,15 +295,30 @@ test("project fingerprint files isolate inventory and do not let a full old proj
   assert.equal(savedB.project_fingerprint, second.projectFingerprint);
 });
 
-test("a project alias has one canonical fingerprint while user-data reparse points fail closed", (t) => {
+test("a Windows DOS short-name alias for the exact user-data directory is accepted", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const held = fixture(t);
+  const shortRoot = windowsShortPath(held.root);
+  if (shortRoot.toLowerCase() === path.resolve(held.root).toLowerCase()) {
+    t.skip("This volume does not expose an 8.3 short-name alias for the test directory.");
+    return;
+  }
+
+  const aliasedUserData = path.join(shortRoot, path.basename(held.userData));
+  const store = new DirectGoalOutbox({
+    userDataPath: aliasedUserData, projectPath: held.projectA, now: held.now,
+  });
+  assert.equal(store.root, fs.realpathSync.native(aliasedUserData));
+  const saved = store.save(record());
+  assert.deepEqual(store.list(), [saved]);
+});
+
+test("a project alias has one canonical fingerprint", (t) => {
   const held = fixture(t);
   const projectAlias = path.join(held.root, "project alias");
-  const userDataReal = path.join(held.root, "real user data");
-  const userDataAlias = path.join(held.root, "user data alias");
-  fs.mkdirSync(userDataReal, {recursive: true});
   try {
     fs.symlinkSync(held.projectA, projectAlias, process.platform === "win32" ? "junction" : "dir");
-    fs.symlinkSync(userDataReal, userDataAlias, process.platform === "win32" ? "junction" : "dir");
   } catch (error) {
     if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
       t.skip(`This filesystem cannot create a test reparse point: ${error.code}`);
@@ -302,9 +330,36 @@ test("a project alias has one canonical fingerprint while user-data reparse poin
   const viaAlias = oneStore(held, projectAlias);
   assert.equal(viaAlias.projectFingerprint, direct.projectFingerprint);
   assert.equal(viaAlias.file, direct.file);
+});
+
+test("final and ancestor user-data reparse points fail closed", (t) => {
+  const held = fixture(t);
+  const userDataReal = path.join(held.root, "real user data");
+  const userDataAlias = path.join(held.root, "user data alias");
+  const parentReal = path.join(held.root, "real parent");
+  const parentAlias = path.join(held.root, "parent alias");
+  const nestedName = "nested Nexus user data";
+  fs.mkdirSync(userDataReal, {recursive: true});
+  fs.mkdirSync(path.join(parentReal, nestedName), {recursive: true});
+  try {
+    fs.symlinkSync(userDataReal, userDataAlias, process.platform === "win32" ? "junction" : "dir");
+    fs.symlinkSync(parentReal, parentAlias, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error.code)) {
+      t.skip(`This filesystem cannot create a test reparse point: ${error.code}`);
+      return;
+    }
+    throw error;
+  }
   assert.throws(
     () => new DirectGoalOutbox({userDataPath: userDataAlias, projectPath: held.projectA}),
-    /reparse point|resolves outside/,
+    /reparse point/,
+  );
+  assert.throws(
+    () => new DirectGoalOutbox({
+      userDataPath: path.join(parentAlias, nestedName), projectPath: held.projectA,
+    }),
+    /reparse point/,
   );
 });
 

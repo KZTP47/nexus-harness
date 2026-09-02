@@ -490,6 +490,16 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          if [[ "$default_branch" != "master" ]]; then
+            echo "The public source-ZIP contract expects master, not $default_branch." >&2
+            exit 1
+          fi
+          master_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq '.sha')"
+          if [[ "$master_sha" != "$GITHUB_SHA" ]]; then
+            echo "Release tag $tag points at $GITHUB_SHA while master points at $master_sha." >&2
+            exit 1
+          fi
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists. Refusing to replace or append assets." >&2
             exit 1
@@ -635,3 +645,141 @@ jobs:
             echo "The anonymously downloaded public installer does not match its checksum." >&2
             exit 1
           fi
+
+  prove-public-source-zip:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish-release
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - name: Install from the exact public GitHub source ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $tag = [string]$env:GITHUB_REF_NAME
+          if ($tag -cnotmatch '\Av(?<version>[0-9]+(?:\.[0-9]+){2})\z') {
+            throw "The source-ZIP acceptance tag is invalid: $tag"
+          }
+          $version = $Matches['version']
+          $masterMetadata = Join-Path $env:RUNNER_TEMP 'nexus-master.json'
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/commits/master" `
+            -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'nexus-source-zip-acceptance' } `
+            -OutFile $masterMetadata
+          $masterSha = [string](Get-Content -Raw -LiteralPath $masterMetadata | ConvertFrom-Json).sha
+          if ($masterSha -cne [string]$env:GITHUB_SHA) {
+            throw "The release commit is '$env:GITHUB_SHA', but public master is '$masterSha'."
+          }
+          $probeRoot = Join-Path $env:RUNNER_TEMP "Nexus source ZIP - Åsa & O'Brien (QA)!"
+          $archive = Join-Path $probeRoot 'nexus-source.zip'
+          $extractRoot = Join-Path $probeRoot 'extracted source'
+          $unrelated = Join-Path $probeRoot 'unrelated working directory'
+          New-Item -ItemType Directory -Force -Path $extractRoot, $unrelated | Out-Null
+          Invoke-WebRequest -UseBasicParsing `
+            -Uri "https://github.com/$env:GITHUB_REPOSITORY/archive/refs/heads/master.zip" `
+            -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
+          $sourceRoots = @(Get-ChildItem -LiteralPath $extractRoot -Directory)
+          if ($sourceRoots.Count -ne 1) {
+            throw "Expected one source root in the public ZIP, found $($sourceRoots.Count)."
+          }
+          $sourceRoot = $sourceRoots[0].FullName
+          $installerCommand = Join-Path $sourceRoot 'Install Nexus Harness.cmd'
+          if (-not (Test-Path -LiteralPath $installerCommand -PathType Leaf)) {
+            throw 'The public source ZIP does not contain Install Nexus Harness.cmd.'
+          }
+          if (@(Get-ChildItem -LiteralPath $sourceRoot -Filter 'Nexus-Harness-Setup-*.exe' -File).Count -ne 0) {
+            throw 'The source-ZIP check unexpectedly found a sibling installer instead of exercising the public release download.'
+          }
+
+          $env:NEXUS_INSTALLER_NO_PAUSE = '1'
+          $env:NEXUS_INSTALLER_SILENT = '1'
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          # Start-Process uses the registered Windows .cmd association, matching
+          # the ShellExecute path used by an Explorer double-click.
+          $installerProcess = Start-Process -FilePath $installerCommand `
+            -WorkingDirectory $unrelated -Wait -PassThru -WindowStyle Hidden
+          $installerExit = $installerProcess.ExitCode
+          if ($installerExit -ne 0) {
+            throw "The exact public source-ZIP CMD stopped with code $installerExit."
+          }
+
+          $applicationGuid = 'e52322ab-f15e-5dc0-963b-7588e3739e89'
+          $installKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\$applicationGuid")
+          try {
+            if ($null -eq $installKey) {
+              throw 'The source-ZIP CMD returned success without exact current-user install metadata.'
+            }
+            $installLocation = [string]$installKey.GetValue('InstallLocation')
+          } finally {
+            if ($null -ne $installKey) { $installKey.Dispose() }
+          }
+          $installed = Join-Path $installLocation 'Nexus Harness.exe'
+          if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+            throw "The source-ZIP CMD returned success without the installed app: $installed"
+          }
+          $versionInfo = (Get-Item -LiteralPath $installed).VersionInfo
+          $fileVersion = [string]$versionInfo.FileVersion
+          $productVersion = [string]$versionInfo.ProductVersion
+          $versionPattern = '\A' + [Regex]::Escape($version) + '(?:\.0)?\z'
+          if ($fileVersion -cnotmatch $versionPattern -or
+              $productVersion -cnotmatch $versionPattern) {
+            throw "The source ZIP installed file/product versions '$fileVersion'/'$productVersion' instead of '$version'."
+          }
+
+          $desktop = [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory)
+          $shortcutPath = Join-Path $desktop 'Nexus Harness.lnk'
+          if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) {
+            throw "The source-ZIP CMD did not create the desktop shortcut: $shortcutPath"
+          }
+          $shell = New-Object -ComObject WScript.Shell
+          $shortcut = $null
+          try {
+            $shortcut = $shell.CreateShortcut($shortcutPath)
+            $target = [IO.Path]::GetFullPath([string]$shortcut.TargetPath)
+            $arguments = [string]$shortcut.Arguments
+            $workingDirectory = [IO.Path]::GetFullPath([string]$shortcut.WorkingDirectory)
+            $iconLocation = [string]$shortcut.IconLocation
+          } finally {
+            if ($null -ne $shortcut -and [Runtime.InteropServices.Marshal]::IsComObject($shortcut)) {
+              [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+            }
+            if ([Runtime.InteropServices.Marshal]::IsComObject($shell)) {
+              [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
+            }
+          }
+          $installed = [IO.Path]::GetFullPath($installed)
+          $installedFolder = [IO.Path]::GetFullPath((Split-Path -Parent $installed))
+          if (-not [StringComparer]::OrdinalIgnoreCase.Equals($target, $installed) -or
+              $arguments -cne '' -or
+              -not [StringComparer]::OrdinalIgnoreCase.Equals($workingDirectory, $installedFolder) -or
+              $iconLocation -cne "$installed,0") {
+            throw "The source-ZIP desktop shortcut is stale or malformed: target='$target'; arguments='$arguments'; working='$workingDirectory'; icon='$iconLocation'."
+          }
+
+          $launched = @()
+          try {
+            [void](Start-Process -FilePath $shortcutPath -PassThru)
+            $deadline = [DateTime]::UtcNow.AddSeconds(30)
+            do {
+              $launched = @(Get-CimInstance Win32_Process | Where-Object {
+                $_.ExecutablePath -and [StringComparer]::OrdinalIgnoreCase.Equals(
+                  [IO.Path]::GetFullPath($_.ExecutablePath), $installed
+                )
+              })
+              if ($launched.Count -eq 0) { Start-Sleep -Milliseconds 250 }
+            } while ($launched.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($launched.Count -eq 0) {
+              throw 'The source-ZIP desktop shortcut did not launch the installed app.'
+            }
+          } finally {
+            foreach ($process in $launched) {
+              [void](Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" `
+                -ArgumentList @('/PID', [string]$process.ProcessId, '/T', '/F') `
+                -Wait -PassThru -WindowStyle Hidden)
+            }
+          }

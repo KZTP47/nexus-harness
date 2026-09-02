@@ -166,6 +166,14 @@ def _copy_product_bound_bootstrap(destination: Path, *, version: str, digest: st
 
 
 class ReleaseInstallerTests(unittest.TestCase):
+    def assertSamePhysicalPath(self, actual: str | Path, expected: str | Path) -> None:
+        actual_path = Path(actual)
+        expected_path = Path(expected)
+        self.assertTrue(
+            actual_path.samefile(expected_path),
+            f"{actual_path!s} and {expected_path!s} do not identify the same filesystem object",
+        )
+
     def test_public_version_surfaces_cannot_drift(self):
         expected = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))["version"]
         root_package = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
@@ -492,9 +500,26 @@ if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actual.TrimEnd('\'), $expec
             (unrelated / "powershell.exe").write_bytes(b"not a Windows executable")
             environment = os.environ.copy()
             environment["NEXUS_INSTALLER_NO_PAUSE"] = "1"
+            environment["NEXUS_INSTALLER_COMMAND"] = str(
+                bundle / "Install Nexus Harness.cmd"
+            )
+            environment["NEXUS_INSTALLER_WORKING_DIRECTORY"] = str(unrelated)
+            launcher = r'''
+$process = Start-Process -FilePath $env:NEXUS_INSTALLER_COMMAND `
+    -WorkingDirectory $env:NEXUS_INSTALLER_WORKING_DIRECTORY `
+    -Wait -PassThru -WindowStyle Hidden
+exit $process.ExitCode
+'''
             result = subprocess.run(
-                f'"{bundle / "Install Nexus Harness.cmd"}"',
-                shell=True,
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    launcher,
+                ],
                 cwd=unrelated,
                 env=environment,
                 text=True,
@@ -506,9 +531,42 @@ if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actual.TrimEnd('\'), $expec
             observed = json.loads(
                 (bundle / "cmd-observed.json").read_text(encoding="utf-8-sig")
             )
-            self.assertEqual(Path(observed["BundleRoot"]), bundle)
-            self.assertEqual(Path(observed["WorkingDirectory"]), unrelated)
+            self.assertSamePhysicalPath(observed["BundleRoot"], bundle)
+            self.assertSamePhysicalPath(observed["WorkingDirectory"], unrelated)
             self.assertIn(str(Path(powershell).name).casefold(), "powershell.exe")
+
+    @unittest.skipUnless(os.name == "nt", "The distributed bootstrap is Windows-specific")
+    def test_top_level_cmd_reports_a_missing_installer_helper_actionably(self):
+        with tempfile.TemporaryDirectory() as folder:
+            bundle = (
+                Path(folder)
+                / "incomplete Åsa & O'Brien (QA)! source ZIP"
+            )
+            bundle.mkdir()
+            command = bundle / "Install Nexus Harness.cmd"
+            shutil.copy2(ROOT / "Install Nexus Harness.cmd", command)
+            environment = os.environ.copy()
+            environment["NEXUS_INSTALLER_NO_PAUSE"] = "1"
+            result = subprocess.run(
+                f'"{command}"',
+                shell=True,
+                cwd=bundle,
+                env=environment,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                errors="replace",
+            )
+            output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn(
+                "The installer helper is missing from this extracted ZIP:", output
+            )
+            self.assertIn(
+                "Extract the complete ZIP again, keep its scripts folder, and retry. Nothing was run.",
+                output,
+            )
+            self.assertNotIn("Done. Open Nexus Harness", output)
 
     @unittest.skipUnless(os.name == "nt", "Bundled CMD locking is Windows-specific")
     def test_bundled_cmd_holds_verified_bootstrap_locked_through_execution(self):
@@ -628,7 +686,10 @@ $script:activeDesktop = $DesktopOne
 $script:activeCommon = $CommonOne
 function Get-NexusDesktopFolders {
     param([string] $DesktopFolder = '', [string] $CommonDesktopFolder = '')
-    return @($script:activeDesktop, $script:activeCommon)
+    return @(
+        Get-NexusCanonicalPath $script:activeDesktop 'The fixture user desktop'
+        Get-NexusCanonicalPath $script:activeCommon 'The fixture common desktop'
+    )
 }
 function Download-ReleaseAsset {
     $script:networkTouched = $true
@@ -725,11 +786,13 @@ try {
             self.assertEqual(payload["Version"], version)
             self.assertEqual(payload["InstallCount"], 4)
             self.assertFalse(payload["NetworkTouched"])
-            self.assertEqual(Path(payload["FirstShortcut"]).parent, desktop_one)
+            self.assertSamePhysicalPath(Path(payload["FirstShortcut"]).parent, desktop_one)
             self.assertEqual(payload["FirstShortcut"], payload["RepairedShortcut"])
-            self.assertEqual(Path(payload["RedirectedShortcut"]).parent, desktop_two)
-            self.assertEqual(Path(payload["RedirectedTarget"]), installed)
-            self.assertEqual(Path(payload["RedirectedIcon"]), installed)
+            self.assertSamePhysicalPath(
+                Path(payload["RedirectedShortcut"]).parent, desktop_two
+            )
+            self.assertSamePhysicalPath(payload["RedirectedTarget"], installed)
+            self.assertSamePhysicalPath(payload["RedirectedIcon"], installed)
             self.assertEqual(len(payload["ExecutedPaths"]), 4)
             self.assertTrue(all(Path(item) != installer_path for item in payload["ExecutedPaths"]))
             self.assertTrue(payload["PrivateCopiesCleaned"])
@@ -1518,13 +1581,15 @@ $after = [Convert]::ToBase64String([IO.File]::ReadAllBytes($shortcutPath))
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     payload = json.loads(result.stdout.strip().splitlines()[-1])
-                    self.assertEqual(Path(payload["ShortcutPath"]).parent,
-                                     Path(folder) / "Karo's redirected OneDrive desktop")
+                    self.assertSamePhysicalPath(
+                        Path(payload["ShortcutPath"]).parent,
+                        Path(folder) / "Karo's redirected OneDrive desktop",
+                    )
                     self.assertEqual(Path(payload["TargetPath"]).name, "Nexus Harness.exe")
                     self.assertEqual(Path(payload["IconPath"]).name, "Nexus Harness.exe")
                     self.assertEqual(payload["Arguments"], "")
-                    self.assertEqual(
-                        Path(payload["WorkingDirectory"]),
+                    self.assertSamePhysicalPath(
+                        payload["WorkingDirectory"],
                         Path(folder) / "installed application",
                     )
                     self.assertEqual(payload["LinkCount"], 1)
@@ -1710,14 +1775,14 @@ $directoryUnchanged = Test-Path -LiteralPath $shortcutPath -PathType Container
                     self.assertEqual(result.returncode, 0, result.stderr)
                     payload = json.loads(result.stdout.strip().splitlines()[-1])
                     expected = case_folder / "Policy redirected Programs" / "Nexus Harness.exe"
-                    self.assertEqual(Path(payload["StaleTarget"]), expected)
-                    self.assertEqual(Path(payload["MissingTarget"]), expected)
-                    self.assertEqual(Path(payload["HiddenTarget"]), expected)
+                    self.assertSamePhysicalPath(payload["StaleTarget"], expected)
+                    self.assertSamePhysicalPath(payload["MissingTarget"], expected)
+                    self.assertSamePhysicalPath(payload["HiddenTarget"], expected)
                     self.assertEqual(payload["Arguments"], "")
-                    self.assertEqual(Path(payload["IconPath"]), expected)
+                    self.assertSamePhysicalPath(payload["IconPath"], expected)
                     self.assertEqual(payload["IconIndex"], 0)
-                    self.assertEqual(
-                        Path(payload["WorkingDirectory"]),
+                    self.assertSamePhysicalPath(
+                        payload["WorkingDirectory"],
                         case_folder / "Policy redirected Programs",
                     )
                     self.assertEqual(payload["Description"], "Nexus Harness")
@@ -1977,6 +2042,15 @@ $verified = Assert-NexusDesktopShortcut $installed $desktop $desktop
         ).read_text(encoding="utf-8")
         release_guide = (ROOT / "docs" / "RELEASING.md").read_text(encoding="utf-8")
         self.assertIn("runs-on: windows-latest", workflow)
+        self.assertIn("Install from the exact public GitHub source ZIP", workflow)
+        self.assertIn("archive/refs/heads/master.zip", workflow)
+        self.assertIn("public master", workflow)
+        self.assertIn("GITHUB_SHA", workflow)
+        self.assertIn("Install Nexus Harness.cmd", workflow)
+        self.assertIn("NEXUS_INSTALLER_SILENT", workflow)
+        self.assertIn("Start-Process -FilePath $installerCommand", workflow)
+        self.assertIn("ShellExecute", workflow)
+        self.assertIn("source-ZIP desktop shortcut did not launch", workflow)
         self.assertIn("npm run smoke:built", workflow)
         self.assertIn("Security.Cryptography.SHA256", workflow)
         self.assertNotRegex(workflow, r"uses:\s+[^\s]+@v\d")
