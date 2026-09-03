@@ -1815,6 +1815,77 @@ os._exit(23)
                 "ChatGPT", swarm_work.PLAN_FORMAT,
             )
 
+    def test_work_tool_call_schema_accepts_each_closed_argument_contract(self) -> None:
+        calls = (
+            {
+                "call_id": "tree", "name": "list_tree",
+                "arguments": {"path": ".", "max_depth": 2, "max_entries": 100},
+            },
+            {
+                "call_id": "read", "name": "read_file",
+                "arguments": {
+                    "path": "src/example.py", "start_line": 1,
+                    "end_line": 20, "max_bytes": 4_000,
+                },
+            },
+            {
+                "call_id": "search", "name": "search_workspace",
+                "arguments": {"query": "schema", "max_results": 8},
+            },
+            {
+                "call_id": "verify", "name": "run_selected_verification",
+                "arguments": {},
+            },
+        )
+
+        for call in calls:
+            with self.subTest(tool=call["name"]):
+                decoded = swarm_work._decode(
+                    {"text": json.dumps({
+                        "reply": "Use bounded project context.",
+                        "changes": [],
+                        "tool_calls": [call],
+                    })},
+                    "Agent", swarm_work.WORK_FORMAT,
+                )
+                self.assertEqual(decoded["tool_calls"], [call])
+
+        without_optional_calls = swarm_work._decode(
+            {"text": json.dumps({"reply": "No context needed.", "changes": []})},
+            "Agent", swarm_work.WORK_FORMAT,
+        )
+        self.assertNotIn("tool_calls", without_optional_calls)
+
+    def test_work_tool_call_schema_rejects_mismatched_or_open_arguments(self) -> None:
+        invalid_calls = (
+            {
+                "call_id": "wrong-shape", "name": "read_file",
+                "arguments": {"query": "schema", "max_results": 8},
+            },
+            {
+                "call_id": "open-object", "name": "search_workspace",
+                "arguments": {"query": "schema", "max_results": 8, "shell": "whoami"},
+            },
+            {
+                "call_id": "wrong-type", "name": "list_tree",
+                "arguments": {"path": ".", "max_depth": "2", "max_entries": 100},
+            },
+        )
+
+        for call in invalid_calls:
+            with self.subTest(call=call), self.assertRaisesRegex(
+                swarm_work.StructuredCollaborationError,
+                "does not match any allowed schema",
+            ):
+                swarm_work._decode(
+                    {"text": json.dumps({
+                        "reply": "Malformed context request.",
+                        "changes": [],
+                        "tool_calls": [call],
+                    })},
+                    "Agent", swarm_work.WORK_FORMAT,
+                )
+
     def test_structured_web_standalone_json_label_and_private_marker_are_accepted(self) -> None:
         payload = json.dumps({
             "contribution": "plan", "message_to_lead": "go", "needs_files": [],

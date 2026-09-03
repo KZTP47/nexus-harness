@@ -12805,6 +12805,8 @@ const chatPhaseNames = {
   agent_verification: "Work verification",
   final_answer: "Final answer",
   nexus_error: "Nexus failure",
+  nexus_recovery: "Nexus recovery",
+  nexus_gap: "Nexus history gap",
   participant_outcome: "Team response status",
   long_horizon_status: "Project goal status",
 };
@@ -14610,6 +14612,9 @@ async function prepareNewGoalWithCurrentProviderSetup() {
 function renderMissionControl() {
   const select = $("missionGoalSelect");
   const selected = longGoal?.goal_id || missionSelectedGoalId();
+  const goalOrderNote = "Goals are listed by recent activity, not queue position.";
+  select.setAttribute("aria-label", "Long-horizon goals listed by recent activity, not queue position");
+  select.title = goalOrderNote;
   select.replaceChildren();
   if (!longGoals.length) {
     const option = make("option", "", "No goals yet");
@@ -14625,8 +14630,8 @@ function renderMissionControl() {
     select.append(option);
   }
   $("missionGoalSummary").textContent = longGoal
-    ? `${longGoal.objective} · Success: ${(longGoal.success_criteria || []).join("; ")}`
-    : "Start a project goal to see durable work here.";
+    ? `${goalOrderNote} ${longGoal.objective} · Success: ${(longGoal.success_criteria || []).join("; ")}`
+    : `Start a project goal to see durable work here. ${goalOrderNote}`;
   const lastActivity = longGoalEvents.length
     ? ` Last activity ${new Date(longGoalEvents[longGoalEvents.length - 1].at_ms).toLocaleString()}.`
     : "";
@@ -14684,6 +14689,10 @@ function renderMissionControl() {
       card.append(make("strong", "", task.title));
       card.append(make("span", "", `Owner: ${task.assigned_agent_id || "unassigned"} · attempt ${task.attempts || 0}`));
       if ((task.depends_on || []).length) card.append(make("span", "", `Needs: ${task.depends_on.join(", ")}`));
+      if (task.summary) card.append(make(
+        "span", "mission-task-summary",
+        `Saved task summary: ${boundedLongHorizonText(task.summary, 800)}`,
+      ));
       if (task.last_error) card.append(make("span", "warning-one", task.last_error));
       if ((task.evidence || []).length) card.append(make("span", "", `Evidence: ${task.evidence.slice(-2).join("; ")}`));
       card.addEventListener("click", () => { selectedMissionTaskId = task.id; renderMissionControl(); });
@@ -14826,6 +14835,7 @@ function renderMissionControl() {
     evidence.append(details);
   }
   renderMissionEvents();
+  if (theBigOne) renderWhatItHasGoingOn(theSwarmAgent(theBigOne));
 }
 
 function renderMissionEvents() {
@@ -17009,8 +17019,85 @@ function renderTheBigChat() {
   renderWorkRecovery(theBigOne);
   if (bigChatPartChanged("doing", {
     doing: (swarmDoing?.turns || []).filter((one) => one.agent === theBigOne),
+    longHorizon: longHorizonActivitySnapshotForAgent(theBigOne),
     trouble: agent?.trouble_last_time || "", fix: agent?.how_to_fix_it || "",
   })) renderWhatItHasGoingOn(agent);
+}
+
+function boundedLongHorizonText(value, limit = 360) {
+  const words = String(value || "").replace(/\s+/g, " ").trim();
+  return words.length > limit ? `${words.slice(0, Math.max(1, limit - 1)).trimEnd()}…` : words;
+}
+
+function longHorizonStateWords(value) {
+  const state = String(value || "unknown");
+  return ({
+    waiting_for_project: "waiting for project access",
+    waiting_for_user: "waiting for you",
+    pending_apply: "waiting to apply reviewed changes",
+    waiting_review: "waiting for review",
+    ready: "ready to run",
+    queued: "queued",
+    running: "running",
+    paused: "paused",
+    waiting: "waiting",
+    blocked: "blocked",
+    failed: "failed",
+    cancelling: "cancelling",
+    complete: "complete",
+    cancelled: "cancelled",
+  })[state] || state.replaceAll("_", " ");
+}
+
+function longHorizonAssignmentsForAgent(agentId) {
+  const wanted = String(agentId || "");
+  if (!wanted) return [];
+  const selectedId = String(longGoal?.goal_id || "");
+  const snapshots = longGoals.map((goal) => (
+    selectedId && goal.goal_id === selectedId ? longGoal : goal
+  ));
+  if (longGoal && !snapshots.some((goal) => goal.goal_id === selectedId)) {
+    snapshots.unshift(longGoal);
+  }
+  const active = [];
+  for (const goal of snapshots) {
+    const goalState = String(goal?.status || "unknown");
+    if (!["waiting_for_project", "queued", "running", "paused", "waiting_for_user", "failed", "cancelling"]
+      .includes(goalState)) continue;
+    if (goalState === "failed" && goal?.project_queue?.state === "released") continue;
+    const tasks = Array.isArray(goal?.tasks) ? goal.tasks : [];
+    const assigned = tasks.filter((task) => String(task?.assigned_agent_id || "") === wanted);
+    const participants = new Set([
+      String(goal?.lead_agent_id || ""),
+      ...(Array.isArray(goal?.requested_agent_ids) ? goal.requested_agent_ids : [])
+        .map((id) => String(id || "")),
+      ...(Array.isArray(goal?.agents) ? goal.agents : [])
+        .map((one) => String(one?.id || one?.agent_id || "")),
+    ].filter(Boolean));
+    if (!assigned.length && !participants.has(wanted)) continue;
+    const unfinished = assigned.filter(
+      (task) => !["complete", "cancelled"].includes(String(task?.state || "")),
+    );
+    const shown = unfinished.length
+      ? unfinished
+      : assigned.length ? [assigned[assigned.length - 1]] : [null];
+    for (const task of shown) active.push({goal, task});
+  }
+  return active;
+}
+
+function longHorizonActivitySnapshotForAgent(agentId) {
+  return longHorizonAssignmentsForAgent(agentId).map(({goal, task}) => ({
+    goal_id: goal.goal_id,
+    status: goal.status,
+    note: goal.note,
+    project: goal.project,
+    blocked_by_goal_id: goal.project_queue?.blocked_by_goal_id,
+    task: task ? {
+      id: task.id, title: task.title, state: task.state, summary: task.summary,
+      last_error: task.last_error, updated_ms: task.updated_ms,
+    } : null,
+  }));
 }
 
 function renderWhatItHasGoingOn(agent) {
@@ -17019,8 +17106,32 @@ function renderWhatItHasGoingOn(agent) {
   list.replaceChildren();
   const doing = swarmDoing || {};
   const mine = (doing.turns || []).filter((one) => one.agent === theBigOne);
-  if (!mine.length) {
+  const longHorizon = longHorizonAssignmentsForAgent(theBigOne);
+  if (!mine.length && !longHorizon.length) {
     list.append(make("li", "hint", "Nothing running for this one right now."));
+  }
+  for (const {goal, task} of longHorizon) {
+    const row = make("li", "the-big-chat-doing-one long-horizon-doing-one");
+    const project = goal.project?.name || goal.project?.id || "Project";
+    const goalId = String(goal.goal_id || "unknown").slice(0, 8);
+    const objective = boundedLongHorizonText(goal.objective, 240) || "Saved project goal";
+    row.append(make("strong", "", `Long-horizon · ${project}`));
+    row.append(make("p", "", `Goal ${goalId}: ${objective}`));
+    const states = [`Goal state: ${longHorizonStateWords(goal.status)}`];
+    if (task) states.push(`Task state: ${longHorizonStateWords(task.state)}`);
+    row.append(make("p", "hint", states.join(" | ")));
+    if (task) row.append(make("p", "", `Task: ${task.title || task.id || "Assigned work"}`));
+    else row.append(make("p", "hint", "This agent is a goal participant; no task is assigned to it yet."));
+    if (task?.summary) row.append(make(
+      "p", "hint", `Saved task summary: ${boundedLongHorizonText(task.summary)}`,
+    ));
+    if (task?.last_error) row.append(make("p", "warning-one", task.last_error));
+    const blocker = String(goal.project_queue?.blocked_by_goal_id || "");
+    if (goal.status === "waiting_for_project" && blocker) {
+      row.append(make("p", "hint", `Waiting for goal ${blocker.slice(0, 8)} to release this project.`));
+    }
+    if (goal.note) row.append(make("p", "hint", boundedLongHorizonText(goal.note)));
+    list.append(row);
   }
   for (const one of mine) {
     const row = make("li", "the-big-chat-doing-one");

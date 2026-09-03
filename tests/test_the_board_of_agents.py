@@ -2389,6 +2389,113 @@ class MovingAroundTheBoard(unittest.TestCase):
             self.assertNotIn("repairClaudeAccess", surface)
             self.assertNotIn("showGeminiProjectHelp", surface)
 
+    def test_agent_activity_panel_projects_real_long_horizon_assignments(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        surface = self.script[
+            self.script.index("function boundedLongHorizonText"):
+            self.script.index("const GOOGLE_CLOUD_PROJECT_WELCOME")
+        ]
+        probe = f"""
+class Element {{
+  constructor(text = "") {{ this.textContent = text; this.children = []; }}
+  append(...children) {{ this.children.push(...children); }}
+  replaceChildren() {{ this.children = []; this.textContent = ""; }}
+}}
+const activityList = new Element();
+function $(id) {{ return id === "theBigChatDoing" ? activityList : null; }}
+function make(_tag, _className = "", text = "") {{ return new Element(String(text || "")); }}
+function visibleText(element) {{
+  return [element.textContent, ...element.children.map(visibleText)].filter(Boolean).join("\\n");
+}}
+let theBigOne = "agent-a";
+let swarmDoing = {{turns: []}};
+let longGoal = null;
+let longGoals = [{{
+  goal_id: "goal-waiting-1234",
+  status: "waiting_for_project",
+  objective: "Repair the portable scheduler",
+  note: "Waiting honestly for the current owner.",
+  project: {{id: "project-a", name: "Portable project"}},
+  project_queue: {{blocked_by_goal_id: "goal-owner-9876"}},
+  lead_agent_id: "agent-a",
+  requested_agent_ids: ["agent-a", "agent-b"],
+  agents: [{{id: "agent-a"}}, {{id: "agent-b"}}],
+  tasks: [{{
+    id: "task-a", title: "Inspect scheduler", state: "ready",
+    assigned_agent_id: "agent-a", summary: "Recovered a durable checkpoint.",
+  }}],
+}}, {{
+  goal_id: "goal-other-agent",
+  status: "running",
+  objective: "Must stay isolated",
+  project: {{id: "project-b", name: "Other agent project"}},
+  lead_agent_id: "agent-b",
+  agents: [{{id: "agent-b"}}],
+  tasks: [{{
+    id: "task-b", title: "Other agent task", state: "running",
+    assigned_agent_id: "agent-b",
+  }}],
+}}];
+{surface}
+const agent = {{id: "agent-a", ready: true, trouble_last_time: "", how_to_fix_it: ""}};
+renderWhatItHasGoingOn(agent);
+let words = visibleText(activityList);
+for (const expected of [
+  "Long-horizon · Portable project",
+  "Goal goal-wai: Repair the portable scheduler",
+  "Goal state: waiting for project access | Task state: ready to run",
+  "Task: Inspect scheduler",
+  "Saved task summary: Recovered a durable checkpoint.",
+  "Waiting for goal goal-own to release this project.",
+]) {{
+  if (!words.includes(expected)) throw new Error(`missing long-horizon activity: ${{expected}}\n${{words}}`);
+}}
+if (words.includes("Nothing running")) throw new Error("active long-horizon work was labelled idle");
+if (words.includes("Other agent project") || words.includes("Other agent task")) {{
+  throw new Error(`another agent's long-horizon activity leaked\n${{words}}`);
+}}
+longGoals[0].status = "running";
+longGoals[0].tasks[0].state = "blocked";
+longGoals[0].tasks[0].last_error = "Needs a portable fixture.";
+renderWhatItHasGoingOn(agent);
+words = visibleText(activityList);
+if (!words.includes("Goal state: running | Task state: blocked")
+    || !words.includes("Needs a portable fixture.")) {{
+  throw new Error(`blocked task state was hidden\n${{words}}`);
+}}
+longGoals[0].status = "complete";
+renderWhatItHasGoingOn(agent);
+words = visibleText(activityList);
+if (!words.includes("Nothing running for this one right now.")) {{
+  throw new Error(`terminal goal remained active\n${{words}}`);
+}}
+for (const [state, expected] of [
+  ["queued", "queued"], ["paused", "paused"], ["waiting", "waiting"],
+  ["blocked", "blocked"],
+]) {{
+  if (longHorizonStateWords(state) !== expected) throw new Error(`bad state label: ${{state}}`);
+}}
+process.stdout.write("long-horizon activity visible");
+"""
+        completed = subprocess.run(
+            [node, "-e", probe], capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "long-horizon activity visible")
+
+    def test_mission_control_labels_recent_order_and_shows_saved_task_summaries(self) -> None:
+        mission = self.script[
+            self.script.index("function renderMissionControl()"):
+            self.script.index("function renderMissionEvents()")
+        ]
+        self.assertIn("Goals are listed by recent activity, not queue position.", mission)
+        self.assertIn("Long-horizon goals listed by recent activity, not queue position", mission)
+        self.assertIn("Saved task summary:", mission)
+        self.assertIn("boundedLongHorizonText(task.summary, 800)", mission)
+        self.assertIn("renderWhatItHasGoingOn(theSwarmAgent(theBigOne))", mission)
+
     def test_agent_panel_discloses_actual_route_and_renders_every_repair_action(self) -> None:
         repaired = self.script[
             self.script.index("function renderAgentRepairPanel"):
@@ -5793,6 +5900,468 @@ class WhatThePanelIsTold(BoardTestCase):
         })
         self.assertEqual(freed["request_id"], "direct-full-live-binding-new-id")
 
+    def test_pending_direct_admission_replays_after_exact_schema_binding_migration(
+        self,
+    ) -> None:
+        from our_harness import swarm_chats
+        from our_harness.providers import codex_cli
+
+        self.panel.config.data["providers"] = {
+            "claude": {
+                "kind": "codex-cli", "model": "gpt-test", "endpoint": "",
+            },
+            "codex": {
+                "kind": "claude-cli", "model": "", "endpoint": "",
+            },
+        }
+        request_id = "direct-pending-schema-binding-v1"
+        schema_error = (
+            "Invalid request error in response_format. In context=('properties',"
+            "'tool_calls','items','properties','arguments'), 'additionalProperties' "
+            "is required to be supplied and to be false."
+        )
+
+        with mock.patch.object(
+            codex_cli.CodexCLIProvider, "_effective_dispatch_contract",
+            return_value="codex-cli/effective-dispatch/v1",
+        ):
+            lead_id, _peer_id, _first, second = \
+                self.saved_project_pair_with_two_chats()
+            supplied = {
+                "project_id": "project-1", "lead_id": lead_id,
+                "chat_id": second["id"],
+                "text": "Resume the exact pending goal after the provider schema repair",
+                "request_id": request_id,
+                "policy": {"max_parallel": 1},
+            }
+            store, _standing, _payload, _context, _inspected, goal = \
+                self.create_real_direct_goal(supplied)
+            prepared = self.panel.prepare_direct_long_horizon(supplied)
+            old_digest = goal["admission_digest"]
+            self.assertEqual(
+                self.panel._load_direct_admission(request_id, second["id"])[
+                    "admission_binding"
+                ]["admission_digest"],
+                old_digest,
+            )
+            claimed = store.claim_ready(goal["goal_id"], "v1-direct-worker")
+            self.assertEqual(len(claimed), 1)
+            self.assertEqual(claimed[0]["assigned_agent_id"], lead_id)
+            store.record_dispatch(goal["goal_id"], claimed[0], "old-open-schema")
+            store.fail_task(goal["goal_id"], claimed[0], schema_error)
+            self.assertTrue(
+                store.release_scheduler(goal["goal_id"], "v1-direct-worker")
+            )
+            old_chat = next(
+                one for one in swarm_chats._read(self.panel.config)["chats"]  # noqa: SLF001
+                if one["id"] == second["id"]
+            )
+            self.assertEqual(
+                old_chat["binding"]["agent_routes"][lead_id][
+                    "effective_dispatch_contract"
+                ],
+                "codex-cli/effective-dispatch/v1",
+            )
+
+        reopened = long_horizon.GoalStore(self.panel.config)
+        recovered = reopened.get_by_request(request_id)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(
+            recovered["agents"][0]["route_binding"][
+                "effective_dispatch_contract"
+            ],
+            "codex-cli/effective-dispatch/v2",
+        )
+        self.assertEqual(recovered["admission_digest"], old_digest)
+        self.assertEqual(len(recovered["provider_binding_migrations"]), 1)
+
+        runtime = self.fake_long_horizon_runtime()
+        runtime.store.validate_create.side_effect = reopened.validate_create
+        runtime.start.return_value = recovered
+        self.panel.config.data["providers"]["claude"]["command"] = [
+            "different-codex-command-for-binding-test",
+        ]
+        with self.assertRaises(server.HarnessError):
+            self.panel.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+        runtime.start.assert_not_called()
+        still_old_chat = next(
+            one for one in swarm_chats._read(self.panel.config)["chats"]  # noqa: SLF001
+            if one["id"] == second["id"]
+        )
+        self.assertEqual(
+            still_old_chat["binding"]["agent_routes"][lead_id][
+                "effective_dispatch_contract"
+            ],
+            "codex-cli/effective-dispatch/v1",
+        )
+        self.panel.config.data["providers"]["claude"].pop("command")
+
+        changed_registry = swarm_chats._read(self.panel.config)  # noqa: SLF001
+        changed_chat = next(
+            one for one in changed_registry["chats"] if one["id"] == second["id"]
+        )
+        old_route_binding = copy.deepcopy(
+            changed_chat["binding"]["agent_routes"][lead_id]
+        )
+        changed_chat["binding"]["agent_routes"][lead_id][
+            "effective_dispatch_fingerprint_sha256"
+        ] = "f" * 64
+        swarm_chats._write(self.panel.config, changed_registry)  # noqa: SLF001
+        with self.assertRaises(server.HarnessError):
+            self.panel.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+        runtime.start.assert_not_called()
+        changed_registry = swarm_chats._read(self.panel.config)  # noqa: SLF001
+        changed_chat = next(
+            one for one in changed_registry["chats"] if one["id"] == second["id"]
+        )
+        self.assertEqual(
+            changed_chat["binding"]["agent_routes"][lead_id][
+                "effective_dispatch_fingerprint_sha256"
+            ],
+            "f" * 64,
+        )
+        changed_chat["binding"]["agent_routes"][lead_id] = old_route_binding
+        swarm_chats._write(self.panel.config, changed_registry)  # noqa: SLF001
+
+        reprepared = self.panel.prepare_direct_long_horizon(supplied)
+        self.assertEqual(reprepared["request_id"], request_id)
+        self.assertEqual(reprepared["payload_sha256"], prepared["payload_sha256"])
+        runtime.start.assert_not_called()
+        prepared_chat = next(
+            one for one in swarm_chats._read(self.panel.config)["chats"]  # noqa: SLF001
+            if one["id"] == second["id"]
+        )
+        self.assertEqual(
+            prepared_chat["binding"]["agent_routes"][lead_id][
+                "effective_dispatch_contract"
+            ],
+            "codex-cli/effective-dispatch/v2",
+        )
+
+        with mock.patch.object(
+            self.panel, "require_project_execution_authority",
+            return_value={
+                "project_authority_id": recovered["project_authority_id"],
+            },
+        ):
+            replayed, receipt = self.panel.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+
+        self.assertEqual(replayed["goal_id"], goal["goal_id"])
+        self.assertEqual(replayed["admission_digest"], old_digest)
+        self.assert_direct_receipt(receipt, supplied, goal=replayed)
+        runtime.start.assert_called_once()
+        saved = self.panel._load_direct_admission(request_id, second["id"])
+        self.assertEqual(
+            saved["admission_binding"]["admission_digest"], old_digest,
+        )
+        self.assertEqual(
+            self.panel.direct_admission_inventory()[0]["payload_sha256"],
+            prepared["payload_sha256"],
+        )
+        migrated_chat = next(
+            one for one in swarm_chats._read(self.panel.config)["chats"]  # noqa: SLF001
+            if one["id"] == second["id"]
+        )
+        self.assertEqual(
+            migrated_chat["binding"]["agent_routes"][lead_id][
+                "effective_dispatch_contract"
+            ],
+            "codex-cli/effective-dispatch/v2",
+        )
+
+    def test_prepare_only_v1_admission_migrates_once_and_fences_both_start_races(
+        self,
+    ) -> None:
+        from our_harness import swarm_chats
+        from our_harness.providers import codex_cli
+
+        self.panel.config.data["providers"] = {
+            "claude": {
+                "kind": "codex-cli", "model": "gpt-test", "endpoint": "",
+            },
+            "codex": {
+                "kind": "claude-cli", "model": "", "endpoint": "",
+            },
+        }
+        request_id = "direct-prepare-only-schema-v1"
+        with mock.patch.object(
+            codex_cli.CodexCLIProvider, "_effective_dispatch_contract",
+            return_value="codex-cli/effective-dispatch/v1",
+        ):
+            lead_id, _peer_id, _first, second = \
+                self.saved_project_pair_with_two_chats()
+            supplied = {
+                "project_id": "project-1", "lead_id": lead_id,
+                "chat_id": second["id"],
+                "text": "Recover this prepare-only request exactly once",
+                "request_id": request_id,
+                "policy": {"max_parallel": 1},
+            }
+            old_prepared = self.panel.prepare_direct_long_horizon(supplied)
+            old_record = self.panel._load_direct_admission(
+                request_id, second["id"],
+            )
+            old_digest = self.panel._direct_admission_binding_digest(old_record)
+            self.assertNotIn("migration", old_record["admission_binding"])
+            self.assertIsNone(long_horizon.GoalStore(
+                self.panel.config, migrate_execution_metadata=False,
+            ).get_by_request(request_id))
+
+        def reopened_config() -> LoadedConfig:
+            source = self.panel.config
+            return LoadedConfig(
+                copy.deepcopy(source.data), self.where,
+                list(source.sources), dict(source.provenance),
+                copy.deepcopy(source.trusted_floor),
+            )
+
+        # A bad full-payload replay may migrate the independently authenticated
+        # saved chat, but it must leave the old journal bytes intact. The exact
+        # original payload can then finish the journal migration after restart.
+        replay = _BoundedTestHTTPServer(("127.0.0.1", 0), reopened_config())
+        self.addCleanup(replay.server_close)
+        replay.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        journal_path = replay._direct_admission_path(request_id)
+        before_bad_replay = journal_path.read_bytes()
+        with self.assertRaisesRegex(server.HarnessError, "different exact payload"):
+            replay.prepare_direct_long_horizon({
+                **supplied,
+                "text": "A changed payload must not inherit the old request",
+                "objectives": ["A changed payload must not inherit the old request"],
+            })
+        self.assertEqual(journal_path.read_bytes(), before_bad_replay)
+        self.assertIsNone(long_horizon.GoalStore(
+            replay.config, migrate_execution_metadata=False,
+        ).get_by_request(request_id))
+        chat_after_bad_replay = next(
+            one for one in swarm_chats._read(replay.config)["chats"]  # noqa: SLF001
+            if one["id"] == second["id"]
+        )
+        self.assertEqual(
+            chat_after_bad_replay["binding"]["agent_routes"][lead_id][
+                "effective_dispatch_contract"
+            ],
+            "codex-cli/effective-dispatch/v2",
+        )
+
+        current_prepared = replay.prepare_direct_long_horizon(supplied)
+        self.assertEqual(
+            current_prepared["payload_sha256"], old_prepared["payload_sha256"],
+        )
+        migrated_record = replay._load_direct_admission(
+            request_id, second["id"],
+        )
+        current_digest = replay._direct_admission_binding_digest(migrated_record)
+        self.assertNotEqual(current_digest, old_digest)
+        self.assertEqual(
+            migrated_record["admission_binding"]["migration"][
+                "from_admission_digest"
+            ],
+            old_digest,
+        )
+        self.assertEqual(
+            migrated_record["admission_binding"]["migration"][
+                "to_admission_digest"
+            ],
+            current_digest,
+        )
+        self.assertIsNone(long_horizon.GoalStore(
+            replay.config, migrate_execution_metadata=False,
+        ).get_by_request(request_id))
+
+        starter = _BoundedTestHTTPServer(("127.0.0.1", 0), reopened_config())
+        self.addCleanup(starter.server_close)
+        starter.swarm_known_routes = list(self.panel.swarm_known_routes or [])
+        runtime = long_horizon.LongHorizonRuntime(
+            starter.config, external_project_conflicts=lambda _root: [],
+        )
+        runtime._enable_auto_start_watcher = mock.Mock()
+        runtime._require_no_external_owner = mock.Mock()
+        runtime.start_background = mock.Mock()
+        starter._long_horizon = runtime
+        authority_id = long_horizon.project_identity(self.where)
+
+        original_save = starter._save_direct_admission
+
+        def change_config_after_journal(*args: object, **kwargs: object) -> dict:
+            saved = original_save(*args, **kwargs)
+            starter.config.data["providers"]["claude"]["command"] = [
+                "changed-after-journal-cas",
+            ]
+            return saved
+
+        with mock.patch.object(
+            starter, "_save_direct_admission",
+            side_effect=change_config_after_journal,
+        ), mock.patch.object(
+            starter, "require_project_execution_authority",
+            return_value={"project_authority_id": authority_id},
+        ):
+            with self.assertRaisesRegex(
+                server.HarnessError, "admission binding changed before goal creation",
+            ):
+                starter.admit_direct_long_horizon(
+                    {"request_id": request_id, "chat_id": second["id"]},
+                    from_pending=True,
+                )
+        starter.config.data["providers"]["claude"].pop("command")
+        self.assertIsNone(runtime.store.get_by_request(request_id))
+        runtime.start_background.assert_not_called()
+
+        standing = starter.swarm_standing()
+        payload = starter._load_direct_admission(request_id, second["id"])["payload"]
+        context = starter._direct_long_horizon_context(standing, payload)
+        stable_agents = runtime.store._agents_for_project(
+            standing["board"], context["project_id"], context["participant_ids"],
+        )
+        changed_agents = copy.deepcopy(stable_agents)
+        changed_agents[0]["route_binding"][
+            "effective_dispatch_fingerprint_sha256"
+        ] = "d" * 64
+        observations = 0
+
+        def change_during_create(*_args: object, **_kwargs: object) -> list[dict]:
+            nonlocal observations
+            observations += 1
+            return copy.deepcopy(
+                stable_agents if observations <= 3 else changed_agents
+            )
+
+        with mock.patch.object(
+            runtime.store, "_agents_for_project", side_effect=change_during_create,
+        ), mock.patch.object(
+            starter, "require_project_execution_authority",
+            return_value={"project_authority_id": authority_id},
+        ):
+            with self.assertRaisesRegex(
+                server.HarnessError, "provider binding changed before goal creation",
+            ):
+                starter.admit_direct_long_horizon(
+                    {"request_id": request_id, "chat_id": second["id"]},
+                    from_pending=True,
+                )
+        self.assertGreaterEqual(observations, 5)
+        self.assertIsNone(runtime.store.get_by_request(request_id))
+        runtime.start_background.assert_not_called()
+
+        with mock.patch.object(
+            starter, "require_project_execution_authority",
+            return_value={"project_authority_id": authority_id},
+        ):
+            goal, receipt = starter.admit_direct_long_horizon(
+                {"request_id": request_id, "chat_id": second["id"]},
+                from_pending=True,
+            )
+        self.assertEqual(goal["admission_digest"], current_digest)
+        self.assert_direct_receipt(receipt, supplied, goal=goal)
+        self.assertEqual(
+            runtime.store.get_by_request(request_id)["goal_id"], goal["goal_id"],
+        )
+        runtime.start_background.assert_called_once_with(goal["goal_id"])
+
+        retired = starter.discard_direct_admission({
+            "request_id": request_id, "chat_id": second["id"],
+            "payload_sha256": current_prepared["payload_sha256"],
+            "intent_sha256": receipt["intent_sha256"],
+        })
+        self.assertTrue(retired["reconciled"])
+        terminal = starter._read_direct_admission_path(journal_path)
+        self.assertEqual(
+            terminal["admission_binding"]["migration"],
+            migrated_record["admission_binding"]["migration"],
+        )
+
+    def test_direct_admission_refuses_chat_to_preflight_provider_binding_race(
+        self,
+    ) -> None:
+        from our_harness import swarm_chats
+        from our_harness.providers import codex_cli
+
+        self.panel.config.data["providers"] = {
+            "claude": {
+                "kind": "codex-cli", "model": "gpt-test", "endpoint": "",
+            },
+            "codex": {
+                "kind": "claude-cli", "model": "", "endpoint": "",
+            },
+        }
+        with mock.patch.object(
+            codex_cli.CodexCLIProvider, "_effective_dispatch_contract",
+            return_value="codex-cli/effective-dispatch/v1",
+        ):
+            lead_id, _peer_id, _first, second = \
+                self.saved_project_pair_with_two_chats()
+        supplied = {
+            "project_id": "project-1", "lead_id": lead_id,
+            "chat_id": second["id"],
+            "text": "Do not detach this goal from its authenticated chat binding",
+            "request_id": "direct-chat-preflight-binding-race",
+            "policy": {"max_parallel": 1},
+        }
+        runtime = long_horizon.LongHorizonRuntime(
+            self.panel.config, external_project_conflicts=lambda _root: [],
+        )
+        self.addCleanup(runtime.close)
+        runtime._enable_auto_start_watcher = mock.Mock()
+        runtime._require_no_external_owner = mock.Mock()
+        runtime.start_background = mock.Mock()
+        self.panel._long_horizon = runtime
+        original_context = self.panel._direct_long_horizon_context
+        captured_bindings: dict[str, dict] = {}
+
+        def change_after_chat_resolution(*args: object, **kwargs: object) -> dict:
+            context = original_context(*args, **kwargs)
+            captured_bindings.update(copy.deepcopy(
+                context["participant_route_bindings"]
+            ))
+            self.panel.config.data["providers"]["claude"]["command"] = [
+                "changed-after-chat-binding-resolution",
+            ]
+            return context
+
+        with mock.patch.object(
+            self.panel, "_direct_long_horizon_context",
+            side_effect=change_after_chat_resolution,
+        ), mock.patch.object(
+            chat, "ask_once", side_effect=AssertionError("provider was dispatched"),
+        ) as provider:
+            with self.assertRaisesRegex(
+                server.HarnessError, "chat's provider binding changed",
+            ):
+                self.panel.admit_direct_long_horizon(supplied)
+
+        provider.assert_not_called()
+        runtime._enable_auto_start_watcher.assert_not_called()
+        runtime.start_background.assert_not_called()
+        self.assertFalse(
+            self.panel._direct_admission_path(supplied["request_id"]).exists()
+        )
+        self.assertIsNone(runtime.store.get_by_request(supplied["request_id"]))
+        saved_chat = next(
+            one for one in swarm_chats._read(self.panel.config)["chats"]  # noqa: SLF001
+            if one["id"] == second["id"]
+        )
+        self.assertEqual(
+            saved_chat["binding"]["agent_routes"], captured_bindings,
+        )
+        current = runtime.store._agents_for_project(  # noqa: SLF001
+            self.panel.swarm_standing()["board"], "project-1",
+            list(captured_bindings),
+        )
+        current_by_id = {
+            agent["id"]: agent["route_binding"] for agent in current
+        }
+        self.assertNotEqual(current_by_id, captured_bindings)
+
     def test_direct_preflight_and_discard_use_a_pruned_goal_tombstone_binding(self) -> None:
         lead_id, _peer_id, first, second = self.saved_project_pair_with_two_chats()
         long_horizon = server._long_horizon_module()
@@ -6895,10 +7464,10 @@ class WhatThePanelIsTold(BoardTestCase):
         original_save = starter._save_direct_admission
         original_second_preflight = self.panel._preflight_direct_long_horizon
 
-        def paused_save(payload, context, admission_digest):
+        def paused_save(payload, context, admission_digest, **kwargs):
             save_entered.set()
             self.assertTrue(release_save.wait(10), "request lease test timed out")
-            return original_save(payload, context, admission_digest)
+            return original_save(payload, context, admission_digest, **kwargs)
 
         def noted_second_preflight(*args, **kwargs):
             second_preflight_entered.set()
@@ -6938,7 +7507,7 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertFalse(second_thread.is_alive())
         self.assertIn("first", results)
         self.assertIsInstance(results.get("second_error"), server.HarnessError)
-        self.assertIn("different exact payload", str(results["second_error"]))
+        self.assertIn("belongs to another chat", str(results["second_error"]))
         self.assertEqual(
             [one["request_id"] for one in self.panel.direct_admission_inventory()],
             [request_id],

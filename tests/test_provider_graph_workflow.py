@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import http.server
 import io
@@ -334,6 +335,108 @@ class OpenAIProviderTests(unittest.TestCase):
             encoding="utf-8",
         )
         return load_config(root)
+
+    def test_openai_strict_schema_closes_every_object_without_mutating_contract(self) -> None:
+        from our_harness import long_horizon
+
+        def assert_strict(value: object, path: str = "schema") -> None:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    assert_strict(item, f"{path}[{index}]")
+                return
+            if not isinstance(value, dict):
+                return
+            if value.get("type") == "object":
+                properties = value.get("properties")
+                self.assertIsInstance(properties, dict, path)
+                self.assertIs(value.get("additionalProperties"), False, path)
+                self.assertEqual(value.get("required"), list(properties), path)
+            for name, child in value.items():
+                assert_strict(child, f"{path}.{name}")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = OpenAIProvider(self._config(Path(temporary)))
+            contract = long_horizon.AGENT_ACTION_FORMAT.schema
+            before = json.loads(json.dumps(contract))
+            request = ProviderRequest(
+                "policy", "", [{"role": "user", "content": "work"}], "model",
+                response_format=long_horizon.AGENT_ACTION_FORMAT,
+                tools=[{
+                    "name": "empty_probe", "description": "No arguments",
+                    "input_schema": {
+                        "type": "object", "properties": {},
+                        "required": [], "additionalProperties": False,
+                    },
+                }],
+            )
+
+            responses = provider._structured_format(request, "responses")
+            chat_completions = provider._structured_format(request, "chat-completions")
+            response_schema = responses["text"]["format"]["schema"]
+            chat_schema = chat_completions["response_format"]["json_schema"]["schema"]
+            assert_strict(response_schema)
+            self.assertEqual(chat_schema, response_schema)
+            tool = provider._tools(request, "responses")[0]
+            assert_strict(tool["parameters"], "tool.parameters")
+            self.assertEqual(tool["parameters"]["properties"], {})
+            self.assertEqual(contract, before)
+
+    def test_openai_dynamic_mcp_arguments_stay_nonstrict_on_both_wires(self) -> None:
+        from our_harness.agent_tools import MCP_TOOL_DEFINITION
+
+        with tempfile.TemporaryDirectory() as temporary:
+            provider = OpenAIProvider(self._config(Path(temporary)))
+            source = copy.deepcopy(MCP_TOOL_DEFINITION)
+            request = ProviderRequest(
+                "policy", "", [{"role": "user", "content": "look up q"}], "model",
+                tools=[copy.deepcopy(source)],
+            )
+
+            responses_tool = provider._payload(
+                request, "responses", stream=False,
+            )["tools"][0]
+            chat_tool = provider._payload(
+                request, "chat-completions", stream=False,
+            )["tools"][0]["function"]
+
+            for tool in (responses_tool, chat_tool):
+                with self.subTest(wire=tool):
+                    self.assertFalse(tool["strict"])
+                    self.assertEqual(tool["parameters"], source["input_schema"])
+                    dynamic = tool["parameters"]["properties"]["arguments"]
+                    self.assertEqual(dynamic, {"type": "object"})
+                    self.assertNotIn("additionalProperties", dynamic)
+            self.assertEqual(MCP_TOOL_DEFINITION, source)
+
+    def test_strict_schema_does_not_rewrite_literal_annotation_objects(self) -> None:
+        from our_harness.providers import base as provider_base
+
+        literals = {
+            "default": {"properties": {"kept": "default"}, "type": "object"},
+            "examples": [{"properties": {"kept": "example"}, "type": "object"}],
+            "const": {"properties": {"kept": "const"}, "type": "object"},
+            "enum": [{"properties": {"kept": "enum"}, "type": "object"}],
+        }
+        contract = {
+            "type": "object",
+            "properties": {
+                "payload": {"type": "object", "properties": {}, **literals},
+            },
+            "required": [],
+        }
+        before = copy.deepcopy(contract)
+
+        strict = provider_base._strict_output_schema(contract)  # noqa: SLF001
+
+        self.assertEqual(contract, before)
+        self.assertEqual(strict["properties"]["payload"]["default"], literals["default"])
+        self.assertEqual(strict["properties"]["payload"]["examples"], literals["examples"])
+        self.assertEqual(strict["properties"]["payload"]["const"], literals["const"])
+        self.assertEqual(strict["properties"]["payload"]["enum"], literals["enum"])
+        self.assertNotIn(
+            "additionalProperties",
+            strict["properties"]["payload"]["default"],
+        )
 
     def test_provider_boundary_redacts_credentials_before_serialization(self) -> None:
         secret = "sk-providercredential0123456789"

@@ -391,6 +391,29 @@ PLAN_FORMAT = ResponseFormat("nexus_board_contribution_v1", {
     "additionalProperties": False,
 })
 
+
+def _context_tool_call_schema(
+    name: str, argument_properties: dict[str, Any], required_arguments: list[str],
+) -> dict[str, Any]:
+    """Describe one provider-neutral context-tool call without an open object."""
+
+    return {
+        "type": "object",
+        "properties": {
+            "call_id": {"type": "string", "maxLength": 160},
+            "name": {"type": "string", "enum": [name]},
+            "arguments": {
+                "type": "object",
+                "properties": argument_properties,
+                "required": required_arguments,
+                "additionalProperties": False,
+            },
+        },
+        "required": ["call_id", "name", "arguments"],
+        "additionalProperties": False,
+    }
+
+
 WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
     "type": "object",
     "properties": {
@@ -412,17 +435,26 @@ WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
         "tool_calls": {
             "type": "array", "maxItems": 8,
             "items": {
-                "type": "object",
-                "properties": {
-                    "call_id": {"type": "string", "maxLength": 160},
-                    "name": {
-                        "type": "string",
-                        "enum": ["list_tree", "read_file", "search_workspace", "run_selected_verification"],
-                    },
-                    "arguments": {"type": "object"},
-                },
-                "required": ["call_id", "name", "arguments"],
-                "additionalProperties": False,
+                "anyOf": [
+                    _context_tool_call_schema("list_tree", {
+                        "path": {"type": "string"},
+                        "max_depth": {"type": "integer", "minimum": 0, "maximum": 8},
+                        "max_entries": {"type": "integer", "minimum": 1, "maximum": 500},
+                    }, ["path", "max_depth", "max_entries"]),
+                    _context_tool_call_schema("read_file", {
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer", "minimum": 1},
+                        "end_line": {"type": "integer", "minimum": 1},
+                        "max_bytes": {"type": "integer", "minimum": 1},
+                    }, ["path", "start_line", "end_line", "max_bytes"]),
+                    _context_tool_call_schema("search_workspace", {
+                        "query": {"type": "string"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
+                    }, ["query", "max_results"]),
+                    _context_tool_call_schema(
+                        "run_selected_verification", {}, [],
+                    ),
+                ],
             },
         },
     },
@@ -1587,6 +1619,16 @@ def _remaining(value: dict[str, Any]) -> list[str]:
 def _schema_problem(value: object, schema: dict[str, Any], path: str = "result") -> str:
     """Validate the small strict JSON-schema subset used by board agents."""
 
+    alternatives = schema.get("anyOf")
+    if isinstance(alternatives, list):
+        if alternatives and any(
+            isinstance(alternative, dict)
+            and not _schema_problem(value, alternative, path)
+            for alternative in alternatives
+        ):
+            return ""
+        return f"{path} does not match any allowed schema"
+
     kind = schema.get("type")
     if kind == "object":
         if not isinstance(value, dict):
@@ -1621,9 +1663,25 @@ def _schema_problem(value: object, schema: dict[str, Any], path: str = "result")
     if kind == "string":
         if not isinstance(value, str):
             return f"{path} must be text"
+        minimum = schema.get("minLength")
+        if isinstance(minimum, int) and len(value) < minimum:
+            return f"{path} is too short"
         maximum = schema.get("maxLength")
         if isinstance(maximum, int) and len(value) > maximum:
             return f"{path} is too long"
+        allowed = schema.get("enum")
+        if isinstance(allowed, list) and value not in allowed:
+            return f"{path} is not an allowed value"
+        return ""
+    if kind == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"{path} must be an integer"
+        minimum = schema.get("minimum")
+        if isinstance(minimum, int) and value < minimum:
+            return f"{path} is too small"
+        maximum = schema.get("maximum")
+        if isinstance(maximum, int) and value > maximum:
+            return f"{path} is too large"
         return ""
     if kind == "boolean" and not isinstance(value, bool):
         return f"{path} must be true or false"

@@ -416,6 +416,21 @@ class LongHorizonTests(unittest.TestCase):
     def store(self):
         return long_horizon.GoalStore(self.config)
 
+    def auto_arm(self, store, goal_id):
+        arm_id = long_horizon._auto_start_arm_id(  # noqa: SLF001 - CAS contract assertion
+            store.get(goal_id)
+        )
+        self.assertRegex(arm_id, r"^[0-9a-f]{32}$")
+        return arm_id
+
+    @staticmethod
+    def schema_rejection_error():
+        return (
+            "Invalid request error in response_format. In context=('properties',"
+            "'tool_calls','items','properties','arguments'), 'additionalProperties' "
+            "is required to be supplied and to be false."
+        )
+
     def assert_one_compact_rollover_tombstone(self, store):
         with closing(sqlite3.connect(store.database)) as db:
             db.row_factory = sqlite3.Row
@@ -592,11 +607,75 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(routes, ["codex", "claude"])
         self.assertEqual(completed["budget"]["provider_calls"], 2)
         self.assertTrue(all(one["attempts"] == 1 for one in completed["tasks"]))
+        self.assertIn(
+            "visible project-work message to Reviewer", contexts[0][1],
+        )
         final_context = contexts[-1][1]
         self.assertIn("REQUIRED CONTRIBUTION FAN-IN", final_context)
         self.assertIn("This is the final named contribution", final_context)
+        self.assertIn("visible project-work response to Lead's", final_context)
         self.assertIn('"state":"complete"', final_context)
         self.assertNotIn("Work alone when you can", final_context)
+
+    def test_required_pair_relays_the_complete_eight_thousand_character_summary(self):
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(
+            self.board, "project", ["Relay the complete teammate result"],
+            "pair-full-summary-relay", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-full-summary",
+        )
+        suffix = "UNIQUE-END-OF-LEAD-SUMMARY"
+        lead_summary = "A" * 4_100 + suffix
+        peer_context: list[str] = []
+
+        def provider(_config, route, _text, **kwargs):
+            kwargs["before_provider_dispatch"]("initial")
+            kwargs["after_provider_response"]("initial")
+            response = self._complete_team_action()
+            if route == "codex":
+                response["summary"] = lead_summary
+            else:
+                peer_context.append(str(kwargs.get("context") or ""))
+            return {"text": json.dumps(response)}
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "ask_once", side_effect=provider,
+        ), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+            return_value={"status": "passed", "basis": "full summary relay"},
+        ):
+            completed = runtime.run(goal["goal_id"])
+
+        self.assertEqual(completed["status"], "complete")
+        self.assertEqual(len(peer_context), 1)
+        self.assertIn(suffix, peer_context[0])
+        acknowledged = [
+            event for event in runtime.store.events(goal["goal_id"])["events"]
+            if event["type"] == "provider_acknowledged"
+            and event["agent_id"] == "lead"
+        ]
+        self.assertEqual(acknowledged[0]["payload"]["summary"], lead_summary)
+
+    def test_named_contribution_cannot_acknowledge_a_blank_visible_summary(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Every named contribution must be visible"],
+            "pair-blank-summary", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="chat-blank-summary",
+        )
+        task = store.claim_ready(goal["goal_id"], "blank-summary-worker")[0]
+        store.record_dispatch(goal["goal_id"], task, "blank-summary-prompt")
+        blank = self._complete_team_action()
+        blank["summary"] = "   "
+        with self.assertRaisesRegex(HarnessError, "visible nonblank summary"):
+            store.record_action(goal["goal_id"], task, blank)
+        current = store.get(goal["goal_id"])
+        self.assertEqual(current["tasks"][0]["summary"], "")
+        self.assertFalse(any(
+            event["type"] == "provider_acknowledged"
+            for event in store.events(goal["goal_id"])["events"]
+        ))
 
     def test_required_lead_malformed_reply_still_contacts_peer_then_pauses_truthfully(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
@@ -999,7 +1078,7 @@ class LongHorizonTests(unittest.TestCase):
                 return {"text": json.dumps(action("work", tool_calls=[{
                     "call_id": "post-crash-review-context",
                     "name": "search_workspace",
-                    "arguments": {"query": "physical provider boundary"},
+                    "arguments": {"query": "physical provider boundary", "max_results": 8},
                 }]))}
             return {"text": json.dumps(self._complete_team_action())}
 
@@ -1064,7 +1143,7 @@ class LongHorizonTests(unittest.TestCase):
                 return {"text": json.dumps(action("work", tool_calls=[{
                     "call_id": "inspect-project-tree",
                     "name": "search_workspace",
-                    "arguments": {"query": "cooperation"},
+                    "arguments": {"query": "cooperation", "max_results": 8},
                 }]))}
             return {"text": json.dumps(self._complete_team_action())}
 
@@ -2729,7 +2808,7 @@ class LongHorizonTests(unittest.TestCase):
         ]
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
-        with mock.patch.object(
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
             runtime, "start_background",
             side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
         ) as start:
@@ -2778,7 +2857,7 @@ class LongHorizonTests(unittest.TestCase):
     def test_overlap_is_persisted_as_waiter_without_dispatch(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
-        with mock.patch.object(
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
             runtime, "start_background",
             side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id),
         ) as start:
@@ -2894,7 +2973,10 @@ class LongHorizonTests(unittest.TestCase):
         ) as start:
             released = runtime.control(owner["goal_id"], "cancel")
         self.assertEqual(released["promoted_goal_ids"], [waiter["goal_id"]])
-        start.assert_called_once_with(waiter["goal_id"], automatic=True)
+        start.assert_called_once_with(
+            waiter["goal_id"], automatic=True,
+            expected_auto_start_arm_id=self.auto_arm(runtime.store, waiter["goal_id"]),
+        )
 
     def test_failed_goal_retains_ownership_until_cancel_or_resume(self):
         store = self.store()
@@ -3264,32 +3346,121 @@ class LongHorizonTests(unittest.TestCase):
         )
         goal_id = goal["goal_id"]
 
+        initial_arm_id = self.auto_arm(store, goal_id)
         self.assertTrue(store.claim_scheduler(
             goal_id, "valid-automatic-claim", automatic=True,
+            expected_auto_start_arm_id=initial_arm_id,
         ))
         self.assertTrue(store.release_scheduler(
             goal_id, "valid-automatic-claim",
         ))
 
-        store._mutate(
-            goal_id,
-            lambda document, _db: document["project_queue"].update({
-                "auto_start_pending": False,
-            }),
-        )
+        def consume_arm(document, _db):
+            queue = document["project_queue"]
+            document["project_queue"] = store._queue_record(  # noqa: SLF001
+                "owner", long_horizon._now(),  # noqa: SLF001
+                queued_ms=int(queue.get("queued_ms") or 0),
+                promoted_ms=int(queue.get("promoted_ms") or 0),
+            )
+
+        store._mutate(goal_id, consume_arm)
         self.assertFalse(store.claim_scheduler(
             goal_id, "consumed-automatic-claim", automatic=True,
+            expected_auto_start_arm_id=initial_arm_id,
         ))
 
         def make_effect_bearing(document, _db):
-            document["project_queue"]["auto_start_pending"] = True
+            queue = document["project_queue"]
+            document["project_queue"] = store._queue_record(  # noqa: SLF001
+                "owner", long_horizon._now(),  # noqa: SLF001
+                queued_ms=int(queue.get("queued_ms") or 0),
+                promoted_ms=int(queue.get("promoted_ms") or 0),
+                auto_start_pending=True,
+            )
             document["artifacts"].append({
                 "kind": "verified_no_change", "tree_merkle": "a" * 64,
             })
 
         store._mutate(goal_id, make_effect_bearing)
+        effect_arm_id = self.auto_arm(store, goal_id)
         self.assertFalse(store.claim_scheduler(
             goal_id, "effect-bearing-automatic-claim", automatic=True,
+            expected_auto_start_arm_id=effect_arm_id,
+        ))
+
+    def test_normal_dispatch_consumes_auto_start_arm_and_reopens_cleanly(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Consume exactly one automatic-start arm"],
+            "auto-arm-normal-dispatch-restart",
+        )
+        arm_id = self.auto_arm(store, goal["goal_id"])
+        task = store.claim_ready(goal["goal_id"], "normal-dispatch-worker")[0]
+
+        store.record_dispatch(goal["goal_id"], task, "normal-dispatch-prompt")
+
+        dispatched = store.get(goal["goal_id"])
+        self.assertFalse(dispatched["project_queue"]["auto_start_pending"])
+        self.assertEqual(dispatched["project_queue"]["auto_start_arm_id"], "")
+        self.assertNotEqual(arm_id, dispatched["project_queue"]["auto_start_arm_id"])
+        reopened = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(reopened["tasks"][0]["provider_effect_state"], "dispatched")
+        self.assertFalse(reopened["project_queue"]["auto_start_pending"])
+
+    def test_stale_auto_start_failure_callback_cannot_override_pause_or_resume(self):
+        store = self.store()
+        owner = store.create(
+            self.board, "project", ["Keep stale callbacks fenced"],
+            "auto-arm-stale-callback-owner",
+        )
+        waiter = store.create(
+            self.board, "project", ["Do not promote from a stale callback"],
+            "auto-arm-stale-callback-waiter",
+        )
+        old_arm_id = self.auto_arm(store, owner["goal_id"])
+        self.assertTrue(store.claim_scheduler(
+            owner["goal_id"], "newer-same-arm-worker", automatic=True,
+            expected_auto_start_arm_id=old_arm_id,
+        ))
+        claimed_snapshot = store.get(owner["goal_id"])
+        stale_while_claimed = store.record_automatic_start_failure(
+            owner["goal_id"], "A superseded local starter failed.",
+            reason_code="provider_setup_changed", release_pristine=True,
+            expected_auto_start_arm_id=old_arm_id,
+        )
+        self.assertEqual(stale_while_claimed["revision"], claimed_snapshot["revision"])
+        self.assertEqual(stale_while_claimed["event_seq"], claimed_snapshot["event_seq"])
+        self.assertEqual(stale_while_claimed["note"], claimed_snapshot["note"])
+        self.assertTrue(store.release_scheduler(
+            owner["goal_id"], "newer-same-arm-worker",
+        ))
+        paused = store.control(owner["goal_id"], "pause")
+        paused_revision = paused["revision"]
+
+        stale = store.record_automatic_start_failure(
+            owner["goal_id"], "A delayed provider setup callback.",
+            reason_code="provider_setup_changed", release_pristine=True,
+            expected_auto_start_arm_id=old_arm_id,
+        )
+        self.assertEqual(stale["revision"], paused_revision)
+        self.assertEqual((stale["status"], stale["project_queue"]["state"]), (
+            "paused", "owner",
+        ))
+        self.assertEqual(store.get(waiter["goal_id"])["status"], "waiting_for_project")
+
+        resumed = store.control(owner["goal_id"], "resume")
+        resumed_revision = resumed["revision"]
+        stale_after_resume = store.record_automatic_start_failure(
+            owner["goal_id"], "The same delayed provider setup callback.",
+            reason_code="provider_setup_changed", release_pristine=True,
+            expected_auto_start_arm_id=old_arm_id,
+        )
+        self.assertEqual(stale_after_resume["revision"], resumed_revision)
+        self.assertEqual(stale_after_resume["status"], "queued")
+        self.assertEqual(store.get(waiter["goal_id"])["status"], "waiting_for_project")
+        self.assertFalse(any(
+            event["type"] == "goal_auto_start_blocked"
+            for event in store.events(owner["goal_id"])["events"]
         ))
 
     def test_cancelling_allows_receipt_of_already_applied_transaction(self):
@@ -3558,6 +3729,60 @@ class LongHorizonTests(unittest.TestCase):
             db.commit()
         with self.assertRaisesRegex(HarnessError, "integrity verification"):
             reopened.get_by_request(request_id)
+
+    def test_released_failed_auto_starts_roll_over_to_compact_replay_tombstones(self):
+        store = self.store()
+        first_goal_id = ""
+        for index in range(long_horizon.MAX_GOALS + 1):
+            request_id = f"retired-auto-start-failure-{index}"
+            objective = f"Bound failed auto-start intent {index}"
+            goal = store.create(self.board, "project", [objective], request_id)
+            if index == 0:
+                first_goal_id = goal["goal_id"]
+            released = store.record_automatic_start_failure(
+                goal["goal_id"], "The saved provider setup changed.",
+                reason_code="provider_setup_changed", release_pristine=True,
+                expected_auto_start_arm_id=self.auto_arm(store, goal["goal_id"]),
+            )
+            self.assertEqual(
+                (released["status"], released["project_queue"]["state"]),
+                ("failed", "released"),
+            )
+
+        with closing(sqlite3.connect(store.database)) as db:
+            rows = db.execute(
+                "SELECT document_json FROM long_goals ORDER BY created_ms,goal_id"
+            ).fetchall()
+            self.assertEqual(len(rows), long_horizon.MAX_GOALS)
+            documents = [json.loads(str(row[0])) for row in rows]
+            self.assertTrue(all(
+                document["status"] == "failed"
+                and document["project_queue"]["state"] == "released"
+                for document in documents
+            ))
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goal_request_tombstones"
+            ).fetchone()[0], 1)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goals WHERE goal_id=?", (first_goal_id,)
+            ).fetchone()[0], 0)
+            self.assertEqual(db.execute(
+                "SELECT COUNT(*) FROM long_goal_events WHERE goal_id=?", (first_goal_id,)
+            ).fetchone()[0], 0)
+
+        replayed = store.create(
+            self.board, "project", ["Bound failed auto-start intent 0"],
+            "retired-auto-start-failure-0",
+        )
+        self.assertTrue(replayed["request_tombstone"])
+        self.assertTrue(replayed["reused"])
+        self.assertEqual(replayed["status"], "failed")
+        self.assertEqual(replayed["goal_id"], first_goal_id)
+        with self.assertRaisesRegex(HarnessError, "retired .*different work"):
+            store.create(
+                self.board, "project", ["A different retired objective"],
+                "retired-auto-start-failure-0",
+            )
 
     def test_max_goals_plus_one_runtime_replay_never_dispatches_or_loads_goal(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
@@ -4242,10 +4467,14 @@ class LongHorizonTests(unittest.TestCase):
                 release_page.wait(THREAD_COORDINATION_TIMEOUT_SECONDS)
             return result
 
-        def observed_start(goal_id, answers=None, *, automatic=False):
+        def observed_start(
+            goal_id, answers=None, *, automatic=False,
+            expected_auto_start_arm_id="",
+        ):
             try:
                 result = original_start(
                     goal_id, answers, automatic=automatic,
+                    expected_auto_start_arm_id=expected_auto_start_arm_id,
                 )
                 with runtime.lock:
                     if goal_id in runtime.workers:
@@ -4267,12 +4496,15 @@ class LongHorizonTests(unittest.TestCase):
             runtime._enable_auto_start_watcher()
             self.assertTrue(page_seen.wait(THREAD_COORDINATION_TIMEOUT_SECONDS))
 
-            runtime.store._mutate(
-                created["goal_id"],
-                lambda document, _db: document["project_queue"].update({
-                    "auto_start_pending": False,
-                }),
-            )
+            def consume_stale_page_arm(document, _db):
+                queue = document["project_queue"]
+                document["project_queue"] = runtime.store._queue_record(  # noqa: SLF001
+                    "owner", long_horizon._now(),  # noqa: SLF001
+                    queued_ms=int(queue.get("queued_ms") or 0),
+                    promoted_ms=int(queue.get("promoted_ms") or 0),
+                )
+
+            runtime.store._mutate(created["goal_id"], consume_stale_page_arm)
             release_page.set()
             self.assertTrue(
                 attempt_finished.wait(THREAD_COORDINATION_TIMEOUT_SECONDS),
@@ -4318,7 +4550,7 @@ class LongHorizonTests(unittest.TestCase):
         self.assertIn(valid_goal_id, attempts)
         self.assertGreaterEqual(len(set(attempts)), 18)
 
-    def test_recovery_keeps_pristine_goal_visible_when_provider_setup_changed(self):
+    def test_recovery_releases_pristine_goal_when_provider_setup_changed(self):
         store = self.store()
         goal = store.create(
             self.board, "project", ["Keep checkpoint visible"], "recovery-provider-drift",
@@ -4336,8 +4568,1182 @@ class LongHorizonTests(unittest.TestCase):
             runtime.close()
         self.assertTrue(recovered)
         current = store.get(goal["goal_id"])
-        self.assertEqual(current["status"], "queued")
+        self.assertEqual(current["status"], "failed")
+        self.assertEqual(current["project_queue"]["state"], "released")
         self.assertTrue(store.provider_setup_status(current)["changed"])
+        events = store.events(goal["goal_id"])["events"]
+        blocked = [one for one in events if one["type"] == "goal_auto_start_blocked"]
+        self.assertEqual(len(blocked), 1)
+        self.assertEqual(blocked[0]["payload"]["reason_code"], "provider_setup_changed")
+        self.assertTrue(blocked[0]["payload"]["released_project"])
+        ask.assert_not_called()
+
+    def test_automatic_start_failure_releases_only_pristine_owner_and_promotes_waiter(self):
+        store = self.store()
+        owner = store.create(
+            self.board, "project", ["Obsolete pristine owner"], "obsolete-owner",
+        )
+        waiter = store.create(
+            self.board, "project", ["Current runnable goal"], "current-waiter",
+        )
+        self.assertEqual(waiter["status"], "waiting_for_project")
+
+        released = store.record_automatic_start_failure(
+            owner["goal_id"], "The saved provider setup changed.",
+            reason_code="provider_setup_changed", release_pristine=True,
+            expected_auto_start_arm_id=self.auto_arm(store, owner["goal_id"]),
+        )
+
+        self.assertEqual(released["status"], "failed")
+        self.assertEqual(released["project_queue"]["state"], "released")
+        self.assertEqual(released["promoted_goal_ids"], [waiter["goal_id"]])
+        promoted = store.get(waiter["goal_id"])
+        self.assertEqual(promoted["status"], "queued")
+        self.assertEqual(promoted["project_queue"]["state"], "owner")
+        self.assertTrue(promoted["project_queue"]["auto_start_pending"])
+        promoted_arm_id = self.auto_arm(store, promoted["goal_id"])
+
+        claimed = store.claim_ready(promoted["goal_id"], "effectful-worker")[0]
+        store.record_dispatch(promoted["goal_id"], claimed, "prompt-digest")
+        store.fail_task(promoted["goal_id"], claimed, "Known provider failure")
+        retained_before = store.get(promoted["goal_id"])
+        retained = store.record_automatic_start_failure(
+            promoted["goal_id"], "Provider setup changed after dispatch.",
+            reason_code="provider_setup_changed", release_pristine=True,
+            expected_auto_start_arm_id=promoted_arm_id,
+        )
+        # record_dispatch consumed the exact arm. A delayed callback from that
+        # automatic start is stale and may not mutate or release the owner.
+        self.assertEqual(retained["revision"], retained_before["revision"])
+        self.assertEqual(retained["event_seq"], retained_before["event_seq"])
+        self.assertEqual(retained["note"], retained_before["note"])
+        self.assertEqual(retained["status"], "paused")
+        self.assertEqual(retained["project_queue"]["state"], "owner")
+        self.assertNotIn("automatic_start_failure", retained)
+
+    def test_same_automatic_start_failure_reapplies_after_released_goal_resume(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Release this obsolete setup every ownership epoch"],
+            "automatic-failure-resume-reclaim",
+        )
+        first = store.record_automatic_start_failure(
+            goal["goal_id"], "The saved provider setup changed.",
+            reason_code="provider_setup_changed", release_pristine=True,
+            expected_auto_start_arm_id=self.auto_arm(store, goal["goal_id"]),
+        )
+        self.assertEqual((first["status"], first["project_queue"]["state"]), (
+            "failed", "released",
+        ))
+
+        resumed = store.control(goal["goal_id"], "resume")
+        self.assertEqual(
+            (
+                resumed["status"], resumed["project_queue"]["state"],
+                resumed["project_queue"]["auto_start_pending"],
+            ),
+            ("queued", "owner", True),
+        )
+        second = store.record_automatic_start_failure(
+            goal["goal_id"], "The saved provider setup changed.",
+            reason_code="provider_setup_changed", release_pristine=True,
+            expected_auto_start_arm_id=self.auto_arm(store, goal["goal_id"]),
+        )
+        self.assertEqual((second["status"], second["project_queue"]["state"]), (
+            "failed", "released",
+        ))
+        self.assertFalse(second["project_queue"]["auto_start_pending"])
+        self.assertEqual(sum(
+            event["type"] == "goal_auto_start_blocked"
+            for event in store.events(goal["goal_id"])["events"]
+        ), 2)
+
+    def test_known_codex_open_arguments_rejection_migrates_once_to_safe_retry(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Recover the rejected schema request"],
+            "codex-schema-recovery",
+        )
+        claimed = store.claim_ready(goal["goal_id"], "schema-worker")[0]
+        store.record_dispatch(goal["goal_id"], claimed, "old-schema-prompt")
+        old_effect_id = store.get(goal["goal_id"])["tasks"][0]["provider_effect_id"]
+        store.fail_task(
+            goal["goal_id"], claimed, self.schema_rejection_error(),
+        )
+        store.release_scheduler(goal["goal_id"], "schema-worker")
+        stopped = store.get(goal["goal_id"])
+        self.assertEqual(stopped["status"], "paused")
+        self.assertEqual(stopped["tasks"][0]["provider_effect_state"], "failed_before_effect")
+
+        reopened = long_horizon.GoalStore(self.config)
+        migrated = reopened.get(goal["goal_id"])
+        task = migrated["tasks"][0]
+        self.assertEqual(migrated["status"], "queued")
+        self.assertTrue(migrated["project_queue"]["auto_start_pending"])
+        self.assertEqual(task["state"], "ready")
+        self.assertEqual(task["provider_effect_state"], "never_dispatched")
+        self.assertFalse(task["provider_effect_id"])
+        self.assertIn(old_effect_id, task["superseded_provider_effect_ids"])
+        self.assertRegex(
+            task["schema_recovery_contract"]["fingerprint_sha256"], r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            task["schema_recovery_contract"]["strict_wire_schema_contract"],
+            long_horizon.STRICT_OUTPUT_SCHEMA_CONTRACT,
+        )
+        self.assertEqual(
+            task["schema_recovery_contract"]["strict_wire_schema_sha256"],
+            long_horizon.hashlib.sha256(long_horizon._canonical(  # noqa: SLF001 - contract assertion
+                long_horizon._strict_output_schema(  # noqa: SLF001 - contract assertion
+                    long_horizon.AGENT_ACTION_FORMAT.schema
+                )
+            ).encode("utf-8")).hexdigest(),
+        )
+        first_events = reopened.events(goal["goal_id"])["events"]
+        self.assertEqual(sum(
+            one["type"] == "codex_schema_rejection_recovered" for one in first_events
+        ), 1)
+
+        reopened_again = long_horizon.GoalStore(self.config)
+        second_events = reopened_again.events(goal["goal_id"])["events"]
+        self.assertEqual(sum(
+            one["type"] == "codex_schema_rejection_recovered" for one in second_events
+        ), 1)
+
+    def test_schema_recovery_signature_rejects_unordered_or_negated_near_misses(self):
+        goal = self.store().create(
+            self.board, "project", ["Classify only the observed strict-schema error"],
+            "schema-recovery-signature-near-misses",
+        )
+        agent = goal["agents"][0]
+        task = {
+            "state": "blocked", "provider_effect_state": "failed_before_effect",
+            "outcome_unknown": False, "reconciliation_required": False,
+            "pending_action": {}, "pending_transaction": {},
+            "schema_recovery_contract": None,
+            "last_error": self.schema_rejection_error(),
+        }
+        self.assertTrue(long_horizon._is_recoverable_codex_schema_rejection(  # noqa: SLF001
+            task, agent,
+        ))
+        near_misses = (
+            (
+                "invalid request response_format: required arguments items tool_calls "
+                "does not permit additionalProperties"
+            ),
+            (
+                "invalid request response_format: tool_calls items arguments; "
+                "additionalProperties is not required to be supplied and to be false"
+            ),
+            (
+                "invalid request response_format: tool_calls items arguments; "
+                "additionalProperties is required to be supplied and to be true"
+            ),
+            (
+                "invalid request response_format: arguments items tool_calls; "
+                "additionalProperties is required to be supplied and to be false"
+            ),
+            (
+                "response_format tool_calls items arguments; additionalProperties "
+                "is required to be supplied and to be false"
+            ),
+        )
+        for error in near_misses:
+            with self.subTest(error=error):
+                held = copy.deepcopy(task)
+                held["last_error"] = error
+                self.assertFalse(
+                    long_horizon._is_recoverable_codex_schema_rejection(  # noqa: SLF001
+                        held, agent,
+                    )
+                )
+
+    def test_schema_recovery_contract_changes_when_strict_flag_changes(self):
+        original = long_horizon.AGENT_ACTION_FORMAT
+        strict_contract = long_horizon._codex_schema_recovery_contract()  # noqa: SLF001
+        relaxed = type(original)(original.name, original.schema, False)
+
+        with mock.patch.object(long_horizon, "AGENT_ACTION_FORMAT", relaxed):
+            relaxed_contract = long_horizon._codex_schema_recovery_contract()  # noqa: SLF001
+
+        self.assertTrue(strict_contract["response_format_strict"])
+        self.assertFalse(relaxed_contract["response_format_strict"])
+        self.assertNotEqual(
+            strict_contract["fingerprint_sha256"],
+            relaxed_contract["fingerprint_sha256"],
+        )
+
+    def test_exact_v1_openai_binding_upgrades_only_with_schema_recovery(self):
+        board = copy.deepcopy(self.board)
+        board["agents"] = [board["agents"][0]]
+        board["works_on"] = [board["works_on"][0]]
+        objectives = ["Upgrade the otherwise-identical dispatch contract"]
+        request_id = "schema-recovery-openai-binding-v1"
+        with mock.patch.object(
+            provider_base.OpenAIProvider, "_effective_dispatch_contract",
+            return_value="openai/effective-dispatch/v1",
+        ):
+            store = self.store()
+            inspected = store.preflight_runtime_admission(
+                board, "project", objectives, request_id,
+            )
+            goal = store.create(
+                board, "project", objectives, request_id,
+                admission_digest=inspected["admission_digest"],
+                expected_project_authority_id=inspected["project_authority_id"],
+            )
+            self.assertEqual(
+                goal["agents"][0]["route_binding"]["effective_dispatch_contract"],
+                "openai/effective-dispatch/v1",
+            )
+            task = store.claim_ready(goal["goal_id"], "v1-binding-worker")[0]
+            store.record_dispatch(goal["goal_id"], task, "old-open-schema")
+            store.fail_task(goal["goal_id"], task, self.schema_rejection_error())
+            store.release_scheduler(goal["goal_id"], "v1-binding-worker")
+
+        reopened = long_horizon.GoalStore(self.config)
+        recovered = reopened.get(goal["goal_id"])
+        binding = recovered["agents"][0]["route_binding"]
+        self.assertEqual(
+            binding["effective_dispatch_contract"],
+            "openai/effective-dispatch/v2",
+        )
+        self.assertFalse(reopened.provider_setup_status(recovered)["changed"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertTrue(recovered["project_queue"]["auto_start_pending"])
+        migrations = [
+            event for event in reopened.events(goal["goal_id"])["events"]
+            if event["type"] == "provider_binding_migrated_for_schema_recovery"
+        ]
+        self.assertEqual(len(migrations), 1)
+        self.assertEqual(
+            migrations[0]["payload"]["from_effective_dispatch_contract"],
+            "openai/effective-dispatch/v1",
+        )
+        proof = recovered["provider_binding_migrations"]
+        self.assertEqual(len(proof), 1)
+        self.assertEqual(proof[0]["agent_id"], "lead")
+        self.assertRegex(proof[0]["from_binding_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(proof[0]["to_binding_sha256"], r"^[0-9a-f]{64}$")
+
+        replay = reopened.preflight_runtime_admission(
+            board, "project", objectives, request_id,
+        )
+        self.assertEqual(replay["goal"]["goal_id"], goal["goal_id"])
+        self.assertEqual(
+            replay["admission_digest"], recovered["admission_digest"],
+        )
+        with self.assertRaisesRegex(HarnessError, "already bound to a different"):
+            reopened.preflight_runtime_admission(
+                board, "project", ["Changed intent must not cross the upgrade"],
+                request_id,
+            )
+
+        tombstone = reopened._request_tombstone_document(  # noqa: SLF001
+            {**recovered, "status": "cancelled"}, long_horizon._now(),  # noqa: SLF001
+        )
+        self.assertEqual(tombstone["provider_binding_migrations"], proof)
+        with mock.patch.object(
+            reopened, "get_by_request", return_value=tombstone,
+        ):
+            retired_replay = reopened.preflight_runtime_admission(
+                board, "project", objectives, request_id,
+            )
+            self.assertTrue(retired_replay["request_retired"])
+            with self.assertRaisesRegex(HarnessError, "already bound to a different"):
+                reopened.preflight_runtime_admission(
+                    board, "project", ["Changed retired intent"], request_id,
+                )
+
+        changed_data = copy.deepcopy(self.config.data)
+        changed_data["providers"]["codex"]["endpoint"] = (
+            "http://127.0.0.1/different-openai"
+        )
+        changed_config = LoadedConfig(changed_data, self.authority, [], {})
+        changed_store = long_horizon.GoalStore(changed_config)
+        with self.assertRaisesRegex(HarnessError, "already bound to a different"):
+            changed_store.preflight_runtime_admission(
+                board, "project", objectives, request_id,
+            )
+
+    def test_pristine_v1_binding_is_not_broadly_migrated_without_exact_failure(self):
+        board = copy.deepcopy(self.board)
+        board["agents"] = [board["agents"][0]]
+        board["works_on"] = [board["works_on"][0]]
+        objective = ["Keep unrelated old dispatch state fail-visible"]
+        request_id = "pristine-openai-binding-v1"
+        with mock.patch.object(
+            provider_base.OpenAIProvider, "_effective_dispatch_contract",
+            return_value="openai/effective-dispatch/v1",
+        ):
+            store = self.store()
+            inspected = store.preflight_runtime_admission(
+                board, "project", objective, request_id,
+            )
+            goal = store.create(
+                board, "project", objective, request_id,
+                admission_digest=inspected["admission_digest"],
+                expected_project_authority_id=inspected["project_authority_id"],
+            )
+
+        reopened = long_horizon.GoalStore(self.config)
+        held = reopened.get(goal["goal_id"])
+        self.assertEqual(
+            held["agents"][0]["route_binding"]["effective_dispatch_contract"],
+            "openai/effective-dispatch/v1",
+        )
+        self.assertNotIn("provider_binding_migrations", held)
+        self.assertTrue(reopened.provider_setup_status(held)["changed"])
+        with self.assertRaisesRegex(HarnessError, "already bound to a different"):
+            reopened.preflight_runtime_admission(
+                board, "project", objective, request_id,
+            )
+
+    def test_prepare_only_previous_digest_supports_openai_compatible_transport(self):
+        board = copy.deepcopy(self.board)
+        board["agents"] = [board["agents"][0]]
+        board["works_on"] = [board["works_on"][0]]
+        self.config.data["providers"]["codex"] = {
+            "kind": "openai-compatible", "model": "portable-test",
+            "endpoint": "http://127.0.0.1:8123/v1", "api_key_env": "",
+        }
+        objectives = ["Resume the exact portable prepare-only request"]
+        request_id = "prepare-only-openai-compatible-v1"
+        with mock.patch.object(
+            provider_base.OpenAIProvider, "_effective_dispatch_contract",
+            return_value="openai/effective-dispatch/v1",
+        ):
+            old = self.store().preflight_runtime_admission(
+                board, "project", objectives, request_id,
+            )
+        current = self.store().preflight_runtime_admission(
+            board, "project", objectives, request_id,
+            strict_schema_pending_admission_digest=old["admission_digest"],
+        )
+        self.assertNotEqual(current["admission_digest"], old["admission_digest"])
+        self.assertEqual(
+            current["strict_schema_previous_admission_digest"],
+            old["admission_digest"],
+        )
+        self.assertEqual(
+            current["agents"][0]["route_binding"]["transport_contract"],
+            "openai-compatible/dispatch/v1",
+        )
+
+    def test_prepare_only_previous_digest_rejects_unchanged_peer_drift(self):
+        board = copy.deepcopy(self.board)
+        board["agents"] = [board["agents"][0], board["agents"][2]]
+        board["works_on"] = [board["works_on"][0], board["works_on"][2]]
+        objectives = ["Keep every participant binding inside the migration proof"]
+        request_id = "prepare-only-peer-binding-drift"
+        with mock.patch.object(
+            provider_base.OpenAIProvider, "_effective_dispatch_contract",
+            return_value="openai/effective-dispatch/v1",
+        ):
+            old = self.store().preflight_runtime_admission(
+                board, "project", objectives, request_id,
+                participant_ids=["lead", "reviewer"],
+            )
+
+        real_context = long_horizon.chat_lab._route_failure_context  # noqa: SLF001
+        reviewer_observations = 0
+
+        def drifting_context(config, route, **kwargs):
+            nonlocal reviewer_observations
+            kind, context = real_context(config, route, **kwargs)
+            if route == "claude" and not kwargs.get(
+                "effective_dispatch_contract_override"
+            ):
+                reviewer_observations += 1
+                if reviewer_observations >= 2:
+                    context = copy.deepcopy(context)
+                    context["effective_dispatch_fingerprint_sha256"] = "e" * 64
+            return kind, context
+
+        with mock.patch.object(
+            long_horizon.chat_lab, "_route_failure_context",
+            side_effect=drifting_context,
+        ):
+            current = self.store().preflight_runtime_admission(
+                board, "project", objectives, request_id,
+                participant_ids=["lead", "reviewer"],
+                strict_schema_pending_admission_digest=old["admission_digest"],
+            )
+        self.assertGreaterEqual(reviewer_observations, 2)
+        self.assertEqual(current["strict_schema_previous_admission_digest"], "")
+
+    def test_pause_before_schema_repair_suppresses_restart_and_runtime_recovery(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Do not undo the user's explicit Pause"],
+            "schema-recovery-pause-before-migration",
+        )
+        task = store.claim_ready(goal["goal_id"], "pause-before-repair-worker")[0]
+        store.record_dispatch(goal["goal_id"], task, "old-open-schema")
+        store.fail_task(goal["goal_id"], task, self.schema_rejection_error())
+        store.release_scheduler(goal["goal_id"], "pause-before-repair-worker")
+        paused = store.control(goal["goal_id"], "pause")
+        self.assertTrue(paused["automatic_recovery_control"]["suppressed"])
+
+        reopened = long_horizon.GoalStore(self.config)
+        held = reopened.get(goal["goal_id"])
+        self.assertEqual(held["status"], "paused")
+        self.assertFalse(held["project_queue"]["auto_start_pending"])
+        self.assertFalse(any(
+            event["type"] == "codex_schema_rejection_recovered"
+            for event in reopened.events(goal["goal_id"])["events"]
+        ))
+
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
+            runtime, "start_background",
+        ) as started:
+            runtime.recover_all()
+        started.assert_not_called()
+        self.assertEqual(runtime.store.get(goal["goal_id"])["status"], "paused")
+
+    def test_paused_reassign_does_not_authorize_schema_recovery(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Keep Pause while arranging untouched work"],
+            "schema-recovery-paused-reassign", lead_id="lead",
+            participant_ids=["lead", "reviewer"],
+            conversation_id="schema-paused-reassign-chat",
+        )
+        lead = store.claim_ready(goal["goal_id"], "paused-reassign-worker")[0]
+        store.record_dispatch(goal["goal_id"], lead, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], lead, self.schema_rejection_error(),
+            settle_required_contribution=True,
+        )
+        peer = next(
+            task for task in store.get(goal["goal_id"])["tasks"]
+            if task["required_contributor_id"] == "reviewer"
+        )
+        store.control(goal["goal_id"], "pause")
+        arranged = store.control(goal["goal_id"], "reassign", {
+            "task_id": peer["id"], "agent_id": "reviewer",
+        })
+        self.assertEqual(arranged["status"], "paused")
+        self.assertTrue(arranged["automatic_recovery_control"]["suppressed"])
+        store.release_scheduler(goal["goal_id"], "paused-reassign-worker")
+
+        reopened = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(reopened["status"], "paused")
+        self.assertFalse(reopened["project_queue"]["auto_start_pending"])
+
+    def test_schema_recovery_preserves_completed_peer_and_dispatches_only_failed_codex(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Preserve the peer while retrying Codex"],
+            "codex-schema-team-recovery", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="schema-team-chat",
+        )
+        codex_task = store.claim_ready(goal["goal_id"], "team-worker")[0]
+        store.record_dispatch(goal["goal_id"], codex_task, "old-codex-schema")
+        old_codex_effect = store.get(goal["goal_id"])["tasks"][0]["provider_effect_id"]
+        store.fail_task(
+            goal["goal_id"], codex_task, self.schema_rejection_error(),
+            settle_required_contribution=True,
+        )
+        peer_task = store.claim_ready(goal["goal_id"], "team-worker")[0]
+        self.assertEqual(peer_task["assigned_agent_id"], "reviewer")
+        store.record_dispatch(goal["goal_id"], peer_task, "peer-prompt")
+        store.record_provider_reply(goal["goal_id"], peer_task, phase="initial")
+        peer_action = self._complete_team_action()
+        self.assertTrue(store.record_action(goal["goal_id"], peer_task, peer_action))
+        peer_artifact = {
+            "kind": "verified_no_change", "tree_merkle": "a" * 64,
+            "file_count": 0, "observed_at_ms": 123,
+        }
+        store.apply_action(
+            goal["goal_id"], peer_task, peer_action, artifact=peer_artifact,
+        )
+        store.pause_deadlock(
+            goal["goal_id"],
+            "No runnable task remains after all named contributors were attempted.",
+        )
+        store.release_scheduler(goal["goal_id"], "team-worker")
+        stopped = store.get(goal["goal_id"])
+        self.assertEqual(stopped["status"], "paused")
+        peer_before = copy.deepcopy(next(
+            one for one in stopped["tasks"] if one["assigned_agent_id"] == "reviewer"
+        ))
+
+        reopened = long_horizon.GoalStore(self.config)
+        migrated = reopened.get(goal["goal_id"])
+        codex_after = next(
+            one for one in migrated["tasks"] if one["assigned_agent_id"] == "lead"
+        )
+        peer_after = next(
+            one for one in migrated["tasks"] if one["assigned_agent_id"] == "reviewer"
+        )
+        self.assertEqual(migrated["status"], "queued")
+        self.assertEqual(migrated["project_queue"]["auto_start_reason"], "codex_schema_recovery")
+        self.assertTrue(migrated["project_queue"]["auto_start_pending"])
+        self.assertEqual(codex_after["state"], "ready")
+        self.assertFalse(codex_after["provider_effect_id"])
+        self.assertIn(old_codex_effect, codex_after["superseded_provider_effect_ids"])
+        for key in (
+            "state", "summary", "evidence", "artifacts", "provider_effect_state",
+            "provider_effect_id", "attempts",
+        ):
+            self.assertEqual(peer_after[key], peer_before[key], key)
+
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        recovered_context = runtime._agent_context(migrated, codex_after)
+        self.assertIn(peer_after["summary"], recovered_context)
+        self.assertIn("visible project-work response to Reviewer", recovered_context)
+        self.assertNotIn(
+            "relay that exact summary to the teammate", recovered_context,
+        )
+        self.assertEqual(
+            long_horizon._summary_delivery(  # noqa: SLF001 - routing invariant
+                migrated, codex_after, self._complete_team_action(),
+            )["kind"],
+            "team",
+        )
+        dispatched: list[str] = []
+
+        def start_recovered(
+            goal_id, _answers=None, *, automatic=False,
+            expected_auto_start_arm_id="",
+        ):
+            self.assertTrue(automatic)
+            self.assertEqual(
+                expected_auto_start_arm_id, self.auto_arm(runtime.store, goal_id),
+            )
+            self.assertTrue(runtime.store.claim_scheduler(
+                goal_id, "schema-auto-worker", automatic=True,
+                expected_auto_start_arm_id=expected_auto_start_arm_id,
+            ))
+            claimed = runtime.store.claim_ready(goal_id, "schema-auto-worker")
+            self.assertEqual(len(claimed), 1)
+            dispatched.append(claimed[0]["assigned_agent_id"])
+            runtime.store.record_dispatch(goal_id, claimed[0], "fixed-schema-prompt")
+            runtime.store.fail_task(goal_id, claimed[0], "controlled post-dispatch stop")
+            runtime.store.release_scheduler(goal_id, "schema-auto-worker")
+            return runtime.store.get(goal_id)
+
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
+            runtime, "start_background", side_effect=start_recovered,
+        ) as started:
+            runtime.recover_all()
+        started.assert_called_once()
+        self.assertEqual(dispatched, ["lead"])
+        final_peer = next(
+            one for one in runtime.store.get(goal["goal_id"])["tasks"]
+            if one["assigned_agent_id"] == "reviewer"
+        )
+        self.assertEqual(final_peer["state"], "complete")
+        self.assertEqual(final_peer["summary"], peer_before["summary"])
+
+    def test_schema_recovery_preserves_structured_blocked_peer_outcome(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Preserve the peer's genuine blocker"],
+            "schema-recovery-structured-blocked-peer", lead_id="reviewer",
+            participant_ids=["reviewer", "lead"],
+            conversation_id="schema-blocked-peer-chat",
+        )
+        peer = store.claim_ready(goal["goal_id"], "blocked-peer-worker")[0]
+        self.assertEqual(peer["assigned_agent_id"], "reviewer")
+        store.record_dispatch(goal["goal_id"], peer, "peer-blocked-prompt")
+        store.record_provider_reply(goal["goal_id"], peer, phase="initial")
+        blocked = action(
+            "blocked", summary="Reviewer found a concrete external blocker.",
+            evidence=["provider-blocker:reviewer"],
+        )
+        store.record_action(goal["goal_id"], peer, blocked)
+        store.apply_action(goal["goal_id"], peer, blocked)
+
+        codex = store.claim_ready(goal["goal_id"], "blocked-peer-worker")[0]
+        self.assertEqual(codex["assigned_agent_id"], "lead")
+        store.record_dispatch(goal["goal_id"], codex, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], codex, self.schema_rejection_error(),
+            settle_required_contribution=True,
+        )
+        store.pause_deadlock(goal["goal_id"], "The Codex contribution needs recovery.")
+        store.release_scheduler(goal["goal_id"], "blocked-peer-worker")
+
+        migrated = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        peer_after = next(
+            task for task in migrated["tasks"] if task["assigned_agent_id"] == "reviewer"
+        )
+        codex_after = next(
+            task for task in migrated["tasks"] if task["assigned_agent_id"] == "lead"
+        )
+        self.assertEqual(migrated["status"], "queued")
+        self.assertTrue(migrated["project_queue"]["auto_start_pending"])
+        self.assertEqual(peer_after["state"], "blocked")
+        self.assertEqual(peer_after["summary"], blocked["summary"])
+        self.assertEqual(peer_after["provider_effect_state"], "acknowledged")
+        self.assertEqual(codex_after["state"], "ready")
+
+    def test_schema_recovery_preserves_other_known_pre_effect_failure(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Preserve each known terminal provider outcome"],
+            "schema-recovery-known-failed-peer", lead_id="reviewer",
+            participant_ids=["reviewer", "lead"],
+            conversation_id="schema-known-failed-peer-chat",
+        )
+        peer = store.claim_ready(goal["goal_id"], "known-failure-worker")[0]
+        store.record_dispatch(goal["goal_id"], peer, "peer-known-failure-prompt")
+        store.fail_task(
+            goal["goal_id"], peer, "Anthropic rejected this request before inference.",
+            settle_required_contribution=True,
+        )
+        codex = store.claim_ready(goal["goal_id"], "known-failure-worker")[0]
+        store.record_dispatch(goal["goal_id"], codex, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], codex, self.schema_rejection_error(),
+            settle_required_contribution=True,
+        )
+        store.pause_deadlock(goal["goal_id"], "The Codex contribution needs recovery.")
+        store.release_scheduler(goal["goal_id"], "known-failure-worker")
+
+        migrated = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        peer_after = next(
+            task for task in migrated["tasks"] if task["assigned_agent_id"] == "reviewer"
+        )
+        codex_after = next(
+            task for task in migrated["tasks"] if task["assigned_agent_id"] == "lead"
+        )
+        self.assertEqual(migrated["status"], "queued")
+        self.assertTrue(migrated["project_queue"]["auto_start_pending"])
+        self.assertEqual(peer_after["state"], "blocked")
+        self.assertEqual(peer_after["provider_effect_state"], "failed_before_effect")
+        self.assertIn("Anthropic rejected", peer_after["last_error"])
+        self.assertEqual(codex_after["state"], "ready")
+
+    def test_schema_recovery_reserves_tight_final_call_for_untouched_peer(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Use the final call for the untouched teammate"],
+            "schema-recovery-tight-team-budget", lead_id="lead",
+            participant_ids=["lead", "reviewer"],
+            conversation_id="schema-tight-budget-chat",
+            policy={"max_provider_calls": 2},
+        )
+        lead = store.claim_ready(goal["goal_id"], "schema-tight-first")[0]
+        store.record_dispatch(goal["goal_id"], lead, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], lead, self.schema_rejection_error(),
+            settle_required_contribution=True,
+        )
+        store.release_scheduler(goal["goal_id"], "schema-tight-first")
+
+        repaired = long_horizon.GoalStore(self.config)
+        migrated = repaired.get(goal["goal_id"])
+        recovered_lead = next(
+            task for task in migrated["tasks"]
+            if task["required_contributor_id"] == "lead"
+        )
+        self.assertTrue(long_horizon._task_has_recorded_provider_dispatch(  # noqa: SLF001
+            recovered_lead
+        ))
+        self.assertEqual(migrated["budget"]["provider_calls"], 1)
+        self.assertTrue(repaired.claim_scheduler(
+            goal["goal_id"], "schema-tight-retry", automatic=True,
+            expected_auto_start_arm_id=self.auto_arm(repaired, goal["goal_id"]),
+        ))
+        claimed = repaired.claim_ready(goal["goal_id"], "schema-tight-retry")
+        self.assertEqual(len(claimed), 1)
+        self.assertEqual(claimed[0]["required_contributor_id"], "reviewer")
+        repaired.record_dispatch(goal["goal_id"], claimed[0], "untouched-peer-prompt")
+        self.assertEqual(
+            repaired.get(goal["goal_id"])["budget"]["provider_calls"], 2,
+        )
+
+    def test_schema_recovery_refuses_incomplete_legacy_peer_publication(self):
+        exact_error = self.schema_rejection_error()
+        for corruption in ("blank_summary", "unpublished_artifact"):
+            with self.subTest(corruption=corruption):
+                project = self.base / f"legacy-peer-{corruption}"
+                project.mkdir()
+                board = copy.deepcopy(self.board)
+                board["projects"][0]["path"] = str(project)
+                store = self.store()
+                goal = store.create(
+                    board, "project", ["Do not auto-retry incomplete legacy fan-in"],
+                    f"schema-legacy-peer-{corruption}", lead_id="lead",
+                    participant_ids=["lead", "reviewer"],
+                    conversation_id=f"schema-legacy-{corruption}-chat",
+                )
+                lead = store.claim_ready(goal["goal_id"], f"legacy-{corruption}")[0]
+                store.record_dispatch(goal["goal_id"], lead, "old-open-schema")
+                store.fail_task(
+                    goal["goal_id"], lead, exact_error,
+                    settle_required_contribution=True,
+                )
+                peer = store.claim_ready(goal["goal_id"], f"legacy-{corruption}")[0]
+                store.record_dispatch(goal["goal_id"], peer, "legacy-peer-prompt")
+                store.record_provider_reply(goal["goal_id"], peer, phase="initial")
+                peer_action = self._complete_team_action()
+                store.record_action(goal["goal_id"], peer, peer_action)
+                store.apply_action(goal["goal_id"], peer, peer_action, artifact={
+                    "kind": "verified_no_change", "tree_merkle": "a" * 64,
+                    "file_count": 0, "observed_at_ms": 123,
+                })
+                store.pause_deadlock(goal["goal_id"], "The rejected lead needs recovery.")
+                store.release_scheduler(goal["goal_id"], f"legacy-{corruption}")
+
+                def corrupt_legacy_peer(document, _db):
+                    held = next(
+                        task for task in document["tasks"]
+                        if task.get("required_contributor_id") == "reviewer"
+                    )
+                    if corruption == "blank_summary":
+                        held["summary"] = ""
+                    else:
+                        held["artifacts"].append({
+                            "kind": "verified_no_change", "tree_merkle": "b" * 64,
+                            "file_count": 0, "observed_at_ms": 456,
+                        })
+
+                store._mutate(goal["goal_id"], corrupt_legacy_peer)
+                reopened = long_horizon.GoalStore(self.config)
+                stopped = reopened.get(goal["goal_id"])
+                self.assertEqual(stopped["status"], "paused")
+                self.assertFalse(stopped["project_queue"]["auto_start_pending"])
+                self.assertFalse(any(
+                    event["type"] == "codex_schema_rejection_recovered"
+                    for event in reopened.events(goal["goal_id"])["events"]
+                ))
+
+    def test_same_schema_contract_is_never_automatically_retried_twice(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Retry this fixed schema only once"],
+            "codex-schema-once",
+        )
+        first = store.claim_ready(goal["goal_id"], "schema-once-first")[0]
+        store.record_dispatch(goal["goal_id"], first, "old-schema-one")
+        exact_error = self.schema_rejection_error()
+        store.fail_task(goal["goal_id"], first, exact_error)
+        store.release_scheduler(goal["goal_id"], "schema-once-first")
+
+        repaired_store = long_horizon.GoalStore(self.config)
+        repaired = repaired_store.get(goal["goal_id"])
+        contract = copy.deepcopy(repaired["tasks"][0]["schema_recovery_contract"])
+        self.assertTrue(repaired_store.claim_scheduler(
+            goal["goal_id"], "schema-once-second", automatic=True,
+            expected_auto_start_arm_id=self.auto_arm(
+                repaired_store, goal["goal_id"],
+            ),
+        ))
+        second = repaired_store.claim_ready(goal["goal_id"], "schema-once-second")[0]
+        repaired_store.record_dispatch(goal["goal_id"], second, "fixed-schema-one")
+        repaired_store.fail_task(goal["goal_id"], second, exact_error)
+        repaired_store.release_scheduler(goal["goal_id"], "schema-once-second")
+
+        reopened = long_horizon.GoalStore(self.config)
+        stopped = reopened.get(goal["goal_id"])
+        self.assertEqual(stopped["status"], "paused")
+        self.assertEqual(stopped["tasks"][0]["state"], "blocked")
+        self.assertEqual(stopped["tasks"][0]["schema_recovery_contract"], contract)
+        self.assertEqual(stopped["tasks"][0]["attempts"], 2)
+        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        self.assertEqual(sum(
+            event["type"] == "codex_schema_rejection_recovered"
+            for event in reopened.events(goal["goal_id"])["events"]
+        ), 1)
+
+    def test_stale_schema_recovery_contract_pauses_and_disarms_without_remigration(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Never spin an obsolete schema recovery"],
+            "schema-recovery-stale-contract",
+        )
+        task = store.claim_ready(goal["goal_id"], "stale-schema-first")[0]
+        store.record_dispatch(goal["goal_id"], task, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], task, self.schema_rejection_error(),
+        )
+        store.release_scheduler(goal["goal_id"], "stale-schema-first")
+        repaired = long_horizon.GoalStore(self.config)
+        self.assertTrue(repaired.get(goal["goal_id"])["project_queue"]["auto_start_pending"])
+
+        def make_contract_stale(document, _db):
+            document["project_queue"]["auto_start_contract"][
+                "fingerprint_sha256"
+            ] = "0" * 64
+            for held in document["tasks"]:
+                if isinstance(held.get("schema_recovery_contract"), dict):
+                    held["schema_recovery_contract"]["fingerprint_sha256"] = "0" * 64
+
+        repaired._mutate(goal["goal_id"], make_contract_stale)
+        reopened = long_horizon.GoalStore(self.config)
+        stopped = reopened.get(goal["goal_id"])
+        self.assertEqual((stopped["status"], stopped["project_queue"]["state"]), (
+            "paused", "owner",
+        ))
+        self.assertFalse(stopped["project_queue"]["auto_start_pending"])
+        self.assertEqual(stopped["project_queue"]["auto_start_reason"], "")
+        self.assertEqual(stopped["project_queue"]["auto_start_contract"], {})
+        self.assertEqual(reopened.auto_startable_authority_page(0, "")[0], [])
+        events = reopened.events(goal["goal_id"])["events"]
+        self.assertEqual(sum(
+            event["type"] == "codex_schema_rejection_recovered" for event in events
+        ), 1)
+        self.assertEqual(sum(
+            event["type"] == "goal_schema_recovery_auto_start_disarmed"
+            for event in events
+        ), 1)
+        reopened_again = long_horizon.GoalStore(self.config)
+        self.assertEqual(sum(
+            event["type"] == "goal_schema_recovery_auto_start_disarmed"
+            for event in reopened_again.events(goal["goal_id"])["events"]
+        ), 1)
+
+    def test_current_schema_retry_crash_before_dispatch_remains_eligible_once(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Continue the current retry after a pre-send crash"],
+            "schema-recovery-current-pre-dispatch-crash",
+        )
+        first = store.claim_ready(goal["goal_id"], "schema-crash-first")[0]
+        store.record_dispatch(goal["goal_id"], first, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], first, self.schema_rejection_error(),
+        )
+        store.release_scheduler(goal["goal_id"], "schema-crash-first")
+        repaired = long_horizon.GoalStore(self.config)
+        self.assertTrue(repaired.claim_scheduler(
+            goal["goal_id"], "schema-crash-retry", automatic=True,
+            expected_auto_start_arm_id=self.auto_arm(repaired, goal["goal_id"]),
+        ))
+        retry = repaired.claim_ready(goal["goal_id"], "schema-crash-retry")[0]
+        self.assertEqual(retry["assigned_agent_id"], "lead")
+
+        def kill_retry_worker(document, _db):
+            document["worker"].update({
+                "pid": 99999999, "token": "dead-schema-retry",
+                "worker_id": "schema-crash-retry", "kind": "runtime",
+            })
+
+        repaired._mutate(goal["goal_id"], kill_retry_worker)
+        dead = repaired.recover_dead(goal["goal_id"])
+        self.assertEqual(dead["status"], "paused")
+        self.assertEqual(dead["tasks"][0]["state"], "blocked")
+        reopened = long_horizon.GoalStore(self.config)
+        continued = reopened.get(goal["goal_id"])
+        self.assertEqual(continued["status"], "queued")
+        self.assertEqual(continued["tasks"][0]["state"], "ready")
+        self.assertTrue(continued["project_queue"]["auto_start_pending"])
+        self.assertEqual(continued["budget"]["provider_calls"], 1)
+        self.assertEqual(continued["tasks"][0]["attempts"], 2)
+        events = reopened.events(goal["goal_id"])["events"]
+        self.assertEqual(sum(
+            event["type"] == "codex_schema_rejection_recovered" for event in events
+        ), 1)
+        self.assertEqual(sum(
+            event["type"] == "task_dead_before_dispatch_recovered"
+            and event["payload"].get("schema_recovery_continued") is True
+            for event in events
+        ), 1)
+
+    def test_user_pause_cancels_schema_recovery_auto_start_across_restart(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Respect pause before the recovered provider send"],
+            "schema-recovery-user-pause-before-dispatch",
+        )
+        first = store.claim_ready(goal["goal_id"], "schema-pause-first")[0]
+        store.record_dispatch(goal["goal_id"], first, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], first, self.schema_rejection_error(),
+        )
+        store.release_scheduler(goal["goal_id"], "schema-pause-first")
+        repaired = long_horizon.GoalStore(self.config)
+        self.assertTrue(repaired.claim_scheduler(
+            goal["goal_id"], "schema-pause-retry", automatic=True,
+            expected_auto_start_arm_id=self.auto_arm(repaired, goal["goal_id"]),
+        ))
+        repaired.claim_ready(goal["goal_id"], "schema-pause-retry")
+        paused = repaired.control(goal["goal_id"], "pause")
+        self.assertEqual(paused["status"], "paused")
+        self.assertFalse(paused["project_queue"]["auto_start_pending"])
+        self.assertEqual(paused["project_queue"]["auto_start_reason"], "")
+        self.assertEqual(paused["project_queue"]["auto_start_contract"], {})
+
+        def kill_paused_worker(document, _db):
+            document["worker"].update({
+                "pid": 99999999, "token": "dead-paused-schema-retry",
+                "worker_id": "schema-pause-retry", "kind": "runtime",
+            })
+
+        repaired._mutate(goal["goal_id"], kill_paused_worker)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
+            runtime, "start_background",
+        ) as started:
+            runtime.recover_all()
+        final = runtime.store.get(goal["goal_id"])
+        self.assertEqual(final["status"], "paused")
+        self.assertFalse(final["project_queue"]["auto_start_pending"])
+        started.assert_not_called()
+
+    def test_answer_after_pause_reauthorizes_later_schema_recovery(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Continue after an explicitly answered decision"],
+            "schema-recovery-pause-answer-continuation",
+        )
+        worker_id = "pause-answer-worker"
+        task = store.claim_ready(goal["goal_id"], worker_id)[0]
+        store.record_dispatch(goal["goal_id"], task, "question-prompt")
+        store.record_provider_reply(goal["goal_id"], task, phase="initial")
+        question = action(
+            "ask_user", summary="Lead needs the user's concrete choice.",
+            interrupt_reason="requirement_ambiguity", questions=[{
+                "id": "choice", "prompt": "Which path?", "multiple": False,
+                "allow_other": True, "options": [{
+                    "label": "A", "description": "Continue with A", "recommended": True,
+                }],
+            }],
+        )
+        store.record_action(goal["goal_id"], task, question)
+        interrupt_ids = store.apply_action(goal["goal_id"], task, question)
+        paused = store.control(goal["goal_id"], "pause")
+        self.assertTrue(paused["automatic_recovery_control"]["suppressed"])
+
+        store.resolve_interrupts(goal["goal_id"], {
+            "answers": {interrupt_ids[0]: "Which path?: A"},
+            "expected_revision": paused["revision"],
+            "pending_ids": interrupt_ids,
+        })
+        answered = store.get(goal["goal_id"])
+        self.assertEqual(answered["status"], "queued")
+        self.assertFalse(answered["automatic_recovery_control"]["suppressed"])
+        self.assertTrue(any(
+            event["type"] == "goal_interrupt_continuation_authorized"
+            for event in store.events(goal["goal_id"])["events"]
+        ))
+
+        continued = store.claim_ready(goal["goal_id"], worker_id)[0]
+        store.record_dispatch(goal["goal_id"], continued, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], continued, self.schema_rejection_error(),
+        )
+        store.release_scheduler(goal["goal_id"], worker_id)
+        recovered = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        self.assertEqual(recovered["status"], "queued")
+        self.assertTrue(recovered["project_queue"]["auto_start_pending"])
+
+    def test_risk_stop_after_pause_keeps_automatic_recovery_suppressed(self):
+        self.board["agents"] = [self.board["agents"][0]]
+        self.board["works_on"] = [self.board["works_on"][0]]
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Stop a risky proposal without reauthorizing work"],
+            "pause-risk-stop-suppression",
+        )
+        task = store.claim_ready(goal["goal_id"], "risk-stop-worker")[0]
+        interrupt_ids = self.stage_review(
+            store, goal, task, action("request_review", risk="high"),
+        )
+        paused = store.control(goal["goal_id"], "pause")
+        current = store.get(goal["goal_id"])
+        prompt = current["interrupts"][-1]["questions"][0]["prompt"]
+        store.resolve_interrupts(goal["goal_id"], {
+            "answers": {interrupt_ids[0]: f"{prompt}: Stop this task"},
+            "expected_revision": paused["revision"], "pending_ids": interrupt_ids,
+        })
+        stopped = store.get(goal["goal_id"])
+        self.assertEqual(stopped["status"], "paused")
+        self.assertTrue(stopped["automatic_recovery_control"]["suppressed"])
+        self.assertFalse(any(
+            event["type"] == "goal_interrupt_continuation_authorized"
+            for event in store.events(goal["goal_id"])["events"]
+        ))
+
+    def test_one_recovery_pass_normalizes_dead_peer_then_retries_rejected_codex(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Recover the whole named team after one restart"],
+            "schema-one-restart", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="schema-crash-chat",
+        )
+        lead = store.claim_ready(goal["goal_id"], "crashed-team-worker")[0]
+        store.record_dispatch(goal["goal_id"], lead, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], lead, self.schema_rejection_error(),
+            settle_required_contribution=True,
+        )
+        peer = store.claim_ready(goal["goal_id"], "crashed-team-worker")[0]
+        self.assertEqual(peer["assigned_agent_id"], "reviewer")
+        self.assertEqual(peer["provider_effect_state"], "never_dispatched")
+
+        def persist_dead_owner(document, _db):
+            document["status"] = "running"
+            document["worker"] = {
+                "schema_version": 1, "pid": 99999999, "token": "dead-owner",
+                "worker_id": "crashed-team-worker", "kind": "runtime",
+                "acquired_ms": 1,
+            }
+            held = next(one for one in document["tasks"] if one["id"] == peer["id"])
+            held.update({"owner_pid": 99999999, "owner_token": "dead-owner"})
+
+        store._mutate(goal["goal_id"], persist_dead_owner)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        dispatched: list[str] = []
+
+        def start_recovered(
+            goal_id, _answers=None, *, automatic=False,
+            expected_auto_start_arm_id="",
+        ):
+            before_claim = runtime.store.get(goal_id)
+            lead_before = next(
+                one for one in before_claim["tasks"]
+                if one["assigned_agent_id"] == "lead"
+            )
+            peer_before = next(
+                one for one in before_claim["tasks"]
+                if one["assigned_agent_id"] == "reviewer"
+            )
+            self.assertTrue(automatic)
+            self.assertEqual(
+                expected_auto_start_arm_id, self.auto_arm(runtime.store, goal_id),
+            )
+            self.assertEqual(before_claim["status"], "queued")
+            self.assertEqual(lead_before["state"], "ready")
+            self.assertEqual(peer_before["state"], "ready")
+            self.assertEqual(peer_before["provider_effect_state"], "never_dispatched")
+            self.assertEqual(peer_before["last_error"], "")
+            self.assertTrue(runtime.store.claim_scheduler(
+                goal_id, "one-pass-auto-worker", automatic=True,
+                expected_auto_start_arm_id=expected_auto_start_arm_id,
+            ))
+            claimed = runtime.store.claim_ready(goal_id, "one-pass-auto-worker")
+            self.assertEqual(len(claimed), 1)
+            dispatched.append(claimed[0]["assigned_agent_id"])
+            runtime.store.record_dispatch(goal_id, claimed[0], "fixed-closed-schema")
+            runtime.store.fail_task(goal_id, claimed[0], "controlled retry stop")
+            runtime.store.release_scheduler(goal_id, "one-pass-auto-worker")
+            return runtime.store.get(goal_id)
+
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
+            runtime, "start_background", side_effect=start_recovered,
+        ) as started:
+            recovered = runtime.recover_all()
+
+        started.assert_called_once()
+        # The rejected lead already crossed its first provider boundary. The
+        # untouched required peer owns the next reserved call; the recovered
+        # lead remains ready for the following scheduler turn.
+        self.assertEqual(dispatched, ["reviewer"])
+        self.assertTrue(any(
+            one.get("schema_recovery_applied") for one in recovered
+            if isinstance(one, dict)
+        ))
+        event_types = [
+            event["type"] for event in runtime.store.events(goal["goal_id"])["events"]
+        ]
+        self.assertEqual(event_types.count("goal_recovered"), 1)
+        self.assertEqual(event_types.count("task_dead_before_dispatch_recovered"), 1)
+        self.assertEqual(event_types.count("codex_schema_rejection_recovered"), 1)
+
+    def test_schema_recovery_refuses_live_scheduler_and_non_openai_transport(self):
+        exact_error = self.schema_rejection_error()
+        live_store = self.store()
+        live = live_store.create(
+            self.board, "project", ["Do not race this scheduler"], "schema-live-worker",
+        )
+        claimed = live_store.claim_ready(live["goal_id"], "still-live")[0]
+        live_store.record_dispatch(live["goal_id"], claimed, "old-live-schema")
+        live_store.fail_task(live["goal_id"], claimed, exact_error)
+        self.assertEqual(
+            long_horizon.GoalStore(self.config).get(live["goal_id"])["status"], "paused",
+        )
+        live_store.release_scheduler(live["goal_id"], "still-live")
+
+        other_project = self.base / "other-provider-project"
+        other_project.mkdir()
+        board = copy.deepcopy(self.board)
+        board["projects"][0].update({"id": "other-provider", "path": str(other_project)})
+        board["works_on"] = [{"agent": "reviewer", "project": "other-provider"}]
+        other = live_store.create(
+            board, "other-provider", ["Do not misclassify another adapter"],
+            "schema-other-provider", lead_id="reviewer",
+        )
+        other_task = live_store.claim_ready(other["goal_id"], "other-worker")[0]
+        live_store.record_dispatch(other["goal_id"], other_task, "other-prompt")
+        live_store.fail_task(other["goal_id"], other_task, exact_error)
+        live_store.release_scheduler(other["goal_id"], "other-worker")
+        reopened = long_horizon.GoalStore(self.config)
+        self.assertEqual(reopened.get(other["goal_id"])["status"], "paused")
+        self.assertFalse(any(
+            event["type"] == "codex_schema_rejection_recovered"
+            for event in reopened.events(other["goal_id"])["events"]
+        ))
+
+    def test_schema_recovery_provider_drift_pauses_and_disarms_completed_team(self):
+        store = self.store()
+        goal = store.create(
+            self.board, "project", ["Never spin on an immutable changed provider"],
+            "schema-recovery-provider-drift", lead_id="lead",
+            participant_ids=["lead", "reviewer"], conversation_id="schema-drift-chat",
+        )
+        lead = store.claim_ready(goal["goal_id"], "schema-drift-worker")[0]
+        store.record_dispatch(goal["goal_id"], lead, "old-open-schema")
+        store.fail_task(
+            goal["goal_id"], lead, self.schema_rejection_error(),
+            settle_required_contribution=True,
+        )
+        peer = store.claim_ready(goal["goal_id"], "schema-drift-worker")[0]
+        store.record_dispatch(goal["goal_id"], peer, "peer-prompt")
+        store.record_provider_reply(goal["goal_id"], peer, phase="initial")
+        peer_action = self._complete_team_action()
+        store.record_action(goal["goal_id"], peer, peer_action)
+        store.apply_action(goal["goal_id"], peer, peer_action, artifact={
+            "kind": "verified_no_change", "tree_merkle": "b" * 64,
+            "file_count": 0, "observed_at_ms": 456,
+        })
+        store.pause_deadlock(goal["goal_id"], "The rejected lead needs recovery.")
+        store.release_scheduler(goal["goal_id"], "schema-drift-worker")
+
+        migrated_store = long_horizon.GoalStore(self.config)
+        migrated = migrated_store.get(goal["goal_id"])
+        self.assertEqual(migrated["status"], "queued")
+        self.assertTrue(migrated["project_queue"]["auto_start_pending"])
+
+        def drift_saved_provider(document, _db):
+            lead_agent = next(
+                one for one in document["agents"] if one["id"] == "lead"
+            )
+            lead_agent["route_binding"]["route_fingerprint_sha256"] = "0" * 64
+
+        migrated_store._mutate(goal["goal_id"], drift_saved_provider)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
+            long_horizon.chat_lab, "ask_once",
+        ) as ask:
+            runtime.recover_all()
+            first = runtime.store.get(goal["goal_id"])
+            runtime.recover_all()
+
+        self.assertEqual(first["status"], "paused")
+        self.assertEqual(first["project_queue"]["state"], "owner")
+        self.assertFalse(first["project_queue"]["auto_start_pending"])
+        self.assertEqual(first["project_queue"]["auto_start_reason"], "")
+        self.assertEqual(first["project_queue"]["auto_start_contract"], {})
+        self.assertFalse(first["automatic_start_failure"]["retry_automatically"])
+        self.assertFalse(first["automatic_start_failure"]["released_project"])
+        self.assertEqual(
+            runtime.store.auto_startable_authority_page(0, "")[0], [],
+        )
+        self.assertEqual(sum(
+            event["type"] == "goal_auto_start_blocked"
+            for event in runtime.store.events(goal["goal_id"])["events"]
+        ), 1)
         ask.assert_not_called()
 
     def test_verification_result_is_superseded_by_steer_and_cannot_revive_cancel(self):
@@ -4898,7 +6304,8 @@ class LongHorizonTests(unittest.TestCase):
         task = runtime.store.claim_ready(goal["goal_id"], "worker")[0]
         responses = [
             action("work", tool_calls=[{
-                "call_id": "search-1", "name": "search_workspace", "arguments": {"query": "needle"},
+                "call_id": "search-1", "name": "search_workspace",
+                "arguments": {"query": "needle", "max_results": 8},
             }]),
             action("work", tool_calls=[{
                 "call_id": "verify-1", "name": "run_selected_verification", "arguments": {},
@@ -5323,13 +6730,51 @@ class LongHorizonTests(unittest.TestCase):
         self.assertIn("read_proposed_change", context)
         self.assertNotIn('"truncated":true,"summary"', context)
 
+    def test_review_reader_schema_is_closed_with_provider_neutral_optional_bounds(self):
+        variants = long_horizon.AGENT_ACTION_FORMAT.schema[
+            "properties"
+        ]["tool_calls"]["items"]["anyOf"]
+        review = next(
+            variant for variant in variants
+            if variant["properties"]["name"]["enum"] == ["read_proposed_change"]
+        )
+        arguments = review["properties"]["arguments"]
+        self.assertEqual(arguments["required"], ["path"])
+        self.assertIs(arguments["additionalProperties"], False)
+
+        proposed = action("work", tool_calls=[{
+            "call_id": "review-read", "name": "read_proposed_change",
+            "arguments": {"path": "src/large.py"},
+        }])
+        decoded = long_horizon.swarm_work._decode(
+            {"text": json.dumps(proposed)}, "Reviewer",
+            long_horizon.AGENT_ACTION_FORMAT,
+        )
+        self.assertEqual(
+            decoded["tool_calls"][0]["arguments"], {"path": "src/large.py"},
+        )
+
+        proposed["tool_calls"][0]["arguments"]["command"] = "git status"
+        with self.assertRaisesRegex(
+            long_horizon.swarm_work.StructuredCollaborationError,
+            "does not match any allowed schema",
+        ):
+            long_horizon.swarm_work._decode(
+                {"text": json.dumps(proposed)}, "Reviewer",
+                long_horizon.AGENT_ACTION_FORMAT,
+            )
+
     def test_pause_after_tool_request_stops_tools_and_followup_provider_calls(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
         goal = runtime.store.create(self.board, "project", ["Explore safely"], "pause-tool-boundary")
         task = runtime.store.claim_ready(goal["goal_id"], "worker")[0]
         proposed = action("work", tool_calls=[{
-            "call_id": "read-1", "name": "read_file", "arguments": {"path": "missing.txt"},
+            "call_id": "read-1", "name": "read_file",
+            "arguments": {
+                "path": "missing.txt", "start_line": 1,
+                "end_line": 20, "max_bytes": 4_000,
+            },
         }])
         entered = threading.Event()
         release = threading.Event()

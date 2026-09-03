@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import json
 import os
@@ -14,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from our_harness import cancellation, execution
+from our_harness import cancellation, execution, long_horizon, swarm_work
 from our_harness.config import load_isolated_config
 from our_harness.doctor import run_doctor
 from our_harness.models import HarnessError, ProviderRequest, ResponseFormat
@@ -207,6 +208,47 @@ class CodexCLIProviderTests(unittest.TestCase):
         self.assertEqual(contract["required"], ["answer"])
         self.assertNotIn("additionalProperties", contract)
         self.assertEqual(contract["properties"]["detail"]["required"], [])
+
+    def test_codex_native_context_tool_schemas_are_strict_without_mutation(self) -> None:
+        contracts = (
+            swarm_work.WORK_FORMAT.schema,
+            long_horizon.AGENT_ACTION_FORMAT.schema,
+        )
+
+        def assert_every_object_is_strict(value: object, path: str = "result") -> None:
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    assert_every_object_is_strict(item, f"{path}[{index}]")
+                return
+            if not isinstance(value, dict):
+                return
+            if value.get("type") == "object":
+                properties = value.get("properties")
+                self.assertIsInstance(properties, dict, path)
+                self.assertIs(value.get("additionalProperties"), False, path)
+                self.assertEqual(
+                    value.get("required"), list(properties), path,
+                )
+            for name, child in value.items():
+                assert_every_object_is_strict(child, f"{path}.{name}")
+
+        for contract in contracts:
+            with self.subTest(schema=contract):
+                before = copy.deepcopy(contract)
+                native = codex_cli._codex_output_schema(contract)
+                assert_every_object_is_strict(native)
+                self.assertEqual(contract, before)
+
+        review_arguments = long_horizon.AGENT_ACTION_FORMAT.schema[
+            "properties"
+        ]["tool_calls"]["items"]["anyOf"][-1]["properties"]["arguments"]
+        native_review_arguments = codex_cli._codex_output_schema(
+            long_horizon.AGENT_ACTION_FORMAT.schema
+        )["properties"]["tool_calls"]["items"]["anyOf"][-1]["properties"]["arguments"]
+        self.assertEqual(review_arguments["required"], ["path"])
+        self.assertEqual(
+            native_review_arguments["required"], ["path", "offset", "limit"],
+        )
 
     def test_stop_terminates_the_active_cli_process_tree(self) -> None:
         token = cancellation.Cancellation()

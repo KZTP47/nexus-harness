@@ -37,6 +37,7 @@ from .changes import FileTransaction
 from .config import LoadedConfig
 from .models import HarnessError, ProviderOutcomeUnknown, ResponseFormat
 from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_authority, project_identity
+from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
 from .redaction import CredentialRedactor
 from .runtime_integrity import mac, quarantine_marker
 from .swarm_runs import _base
@@ -72,6 +73,20 @@ COLLABORATION_CONTRACT_SCHEMA_VERSION = 1
 PROJECT_QUEUE_SCHEMA_VERSION = 1
 CANCELLATION_SCHEMA_VERSION = 1
 SCHEDULER_LEASE_SCHEMA_VERSION = 1
+AUTOMATIC_START_FAILURE_SCHEMA_VERSION = 1
+AUTOMATIC_RECOVERY_CONTROL_SCHEMA_VERSION = 1
+AUTO_START_ARM_SCHEMA_VERSION = 1
+PROVIDER_BINDING_MIGRATION_SCHEMA_VERSION = 1
+CODEX_SCHEMA_RECOVERY_VERSION = 1
+CODEX_SCHEMA_AUTO_START_REASON = "codex_schema_recovery"
+STRICT_SCHEMA_BINDING_MIGRATION = "strict-output-schema-object-closure-v2"
+DEAD_BEFORE_PROVIDER_EFFECT_ERROR = (
+    "Nexus restarted before the provider effect began; retry is safe."
+)
+STRICT_SCHEMA_EFFECTIVE_CONTRACT_UPGRADES = {
+    "openai/effective-dispatch/v1": "openai/effective-dispatch/v2",
+    "codex-cli/effective-dispatch/v1": "codex-cli/effective-dispatch/v2",
+}
 _NO_MUTATION = object()
 TASK_STATES = {
     "ready", "running", "pending_apply", "waiting", "waiting_review", "blocked", "failed",
@@ -97,7 +112,7 @@ AGENT_ACTION_FORMAT = ResponseFormat("nexus_long_horizon_action_v1", {
                 "request_review", "ask_user", "blocked",
             ],
         },
-        "summary": {"type": "string", "maxLength": 8_000},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 8_000},
         "evidence": {"type": "array", "maxItems": 24,
                      "items": {"type": "string", "maxLength": 1_000}},
         "risk": {"type": "string", "enum": ["low", "medium", "high", "critical"]},
@@ -151,8 +166,12 @@ AGENT_ACTION_FORMAT = ResponseFormat("nexus_long_horizon_action_v1", {
                  "needs_files", "tasks", "handoff_agent_id", "questions", "criteria_evidence"],
     "additionalProperties": False,
 })
-AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["properties"]["name"]["enum"].append(
-    "read_proposed_change"
+AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
+    swarm_work._context_tool_call_schema("read_proposed_change", {
+        "path": {"type": "string", "maxLength": 240},
+        "offset": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 20_000},
+    }, ["path"])
 )
 
 
@@ -170,6 +189,128 @@ def _now() -> int:
 
 def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _codex_schema_recovery_contract() -> dict[str, Any]:
+    """Version the one safe migration for the former open tool-argument schema."""
+
+    basis = {
+        "schema_version": CODEX_SCHEMA_RECOVERY_VERSION,
+        "migration": "codex-closed-context-tool-arguments-v1",
+        "rejection_signature": (
+            "openai-strict-additional-properties-required-false/v1"
+        ),
+        "eligible_transports": [
+            "codex-cli/isolated-exec/v1", "openai/dispatch/v1",
+        ],
+        "strict_wire_schema_contract": STRICT_OUTPUT_SCHEMA_CONTRACT,
+        "response_format": AGENT_ACTION_FORMAT.name,
+        "response_format_strict": AGENT_ACTION_FORMAT.strict is True,
+        "response_schema_sha256": hashlib.sha256(
+            _canonical(AGENT_ACTION_FORMAT.schema).encode("utf-8")
+        ).hexdigest(),
+        "strict_wire_schema_sha256": hashlib.sha256(
+            _canonical(_strict_output_schema(AGENT_ACTION_FORMAT.schema)).encode("utf-8")
+        ).hexdigest(),
+    }
+    return {
+        **basis,
+        "fingerprint_sha256": hashlib.sha256(
+            _canonical(basis).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _is_current_codex_schema_recovery_contract(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    expected = _codex_schema_recovery_contract()
+    held_fingerprint = str(value.get("fingerprint_sha256") or "")
+    return bool(re.fullmatch(r"[0-9a-f]{64}", held_fingerprint)) and hmac.compare_digest(
+        held_fingerprint, str(expected["fingerprint_sha256"]),
+    ) and int(value.get("schema_version") or 0) == CODEX_SCHEMA_RECOVERY_VERSION
+
+
+def _automatic_recovery_control(
+    suppressed: bool, *, reason: str = "", changed_ms: int = 0,
+) -> dict[str, Any]:
+    return {
+        "schema_version": AUTOMATIC_RECOVERY_CONTROL_SCHEMA_VERSION,
+        "suppressed": bool(suppressed),
+        "reason": str(reason if suppressed else ""),
+        "changed_ms": int(changed_ms or _now()),
+    }
+
+
+def _automatic_recovery_suppressed(document: dict[str, Any]) -> bool:
+    control = document.get("automatic_recovery_control")
+    if not isinstance(control, dict):
+        return False
+    # A malformed future/partial control record fails closed for automatic
+    # recovery. Execution-metadata validation will report the corruption.
+    return control.get("schema_version") != AUTOMATIC_RECOVERY_CONTROL_SCHEMA_VERSION \
+        or control.get("suppressed") is not False
+
+
+def _auto_start_arm_id(document: dict[str, Any]) -> str:
+    queue = document.get("project_queue")
+    if not isinstance(queue, dict) or queue.get("auto_start_pending") is not True:
+        return ""
+    return str(queue.get("auto_start_arm_id") or "")
+
+
+def _uses_openai_strict_response_schema(agent: object) -> bool:
+    """Bind the compatibility retry to the adapters which sent this schema."""
+
+    if not isinstance(agent, dict):
+        return False
+    binding = agent.get("route_binding")
+    if not isinstance(binding, dict) or binding.get(
+        "binding_schema_version"
+    ) != AGENT_BINDING_SCHEMA_VERSION:
+        return False
+    transport = str(binding.get("transport_contract") or "")
+    return transport in {
+        "codex-cli/isolated-exec/v1", "openai/dispatch/v1",
+    }
+
+
+def _is_recoverable_codex_schema_rejection(
+    task: dict[str, Any], agent: object,
+) -> bool:
+    """Recognise only the known pre-inference strict-schema rejection."""
+
+    if task.get("state") != "blocked" \
+            or str(task.get("provider_effect_state") or "") != "failed_before_effect" \
+            or task.get("outcome_unknown") is True \
+            or task.get("reconciliation_required") is True \
+            or task.get("pending_action") or task.get("pending_transaction"):
+        return False
+    # This bridge gets one automatic retry for each exact fixed schema.  If the
+    # same provider rejection happens again, preserve it for explicit diagnosis
+    # instead of burning another call on every application restart.
+    if isinstance(task.get("schema_recovery_contract"), dict):
+        return False
+    error = str(task.get("last_error") or "").casefold()
+    # Bind the compatibility bridge to the provider's exact schema-path
+    # rejection, not an unordered bag of words which might describe a
+    # different validation failure. The two bounded relations cover both the
+    # tuple context emitted by Codex/OpenAI and its dotted-path rendering.
+    rejected_open_object = re.search(
+        r"additionalproperties['\"]?\s+is\s+required\s+to\s+be\s+"
+        r"(?:supplied|provided|specified)\s+and\s+to\s+be\s+false\b",
+        error,
+    ) is not None
+    rejected_path = re.search(
+        r"tool_calls.{0,240}\bitems\b.{0,240}\barguments\b", error,
+        flags=re.DOTALL,
+    ) is not None
+    return rejected_open_object and rejected_path \
+        and "response_format" in error \
+        and any(marker in error for marker in (
+            "invalid_request_error", "invalid request", "schema error",
+        )) \
+        and _uses_openai_strict_response_schema(agent)
 
 
 def _short(value: object, limit: int) -> str:
@@ -361,6 +502,52 @@ def _goal_admission_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _binding_sha256(binding: object) -> str:
+    """Return the stable, non-secret identity of one persisted route binding."""
+
+    return hashlib.sha256(_canonical(binding).encode("utf-8")).hexdigest()
+
+
+def _provider_binding_migration_map(
+    document: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Validate the bounded migration proof carried by an authenticated goal."""
+
+    raw = document.get("provider_binding_migrations", [])
+    if raw in (None, []):
+        return {}
+    if not isinstance(raw, list) or len(raw) > 64:
+        raise HarnessError("Long-horizon provider-binding migration metadata is invalid")
+    answer: dict[str, dict[str, Any]] = {}
+    for one in raw:
+        if not isinstance(one, dict) \
+                or one.get("schema_version") \
+                != PROVIDER_BINDING_MIGRATION_SCHEMA_VERSION \
+                or one.get("migration") != STRICT_SCHEMA_BINDING_MIGRATION:
+            raise HarnessError(
+                "Long-horizon provider-binding migration metadata is invalid"
+            )
+        agent_id = str(one.get("agent_id") or "")
+        route = str(one.get("route") or "")
+        old_contract = str(one.get("from_effective_dispatch_contract") or "")
+        new_contract = str(one.get("to_effective_dispatch_contract") or "")
+        old_hash = str(one.get("from_binding_sha256") or "")
+        new_hash = str(one.get("to_binding_sha256") or "")
+        if not agent_id or len(agent_id) > 160 or not route or len(route) > 300 \
+                or agent_id in answer \
+                or STRICT_SCHEMA_EFFECTIVE_CONTRACT_UPGRADES.get(old_contract) \
+                != new_contract \
+                or not re.fullmatch(r"[0-9a-f]{64}", old_hash) \
+                or not re.fullmatch(r"[0-9a-f]{64}", new_hash) \
+                or not isinstance(one.get("at_ms"), int) \
+                or int(one.get("at_ms") or 0) <= 0:
+            raise HarnessError(
+                "Long-horizon provider-binding migration metadata is invalid"
+            )
+        answer[agent_id] = one
+    return answer
+
+
 def _path_baseline_marker(root: Path, relative: str) -> str:
     path = swarm_work.confined_path(root, relative, allow_missing=True)
     if path.is_symlink():
@@ -428,6 +615,142 @@ def _semantic_artifact(value: object) -> object:
     }
 
 
+def _schema_recovery_pristine_task(task: dict[str, Any]) -> bool:
+    """Return whether a teammate has never crossed a provider/effect boundary."""
+
+    return bool(
+        task.get("state") in {"ready", "waiting"}
+        and not task.get("pending_action")
+        and not task.get("pending_transaction")
+        and not task.get("artifacts")
+        and not task.get("provider_effect_id")
+        and task.get("outcome_unknown") is not True
+        and task.get("reconciliation_required") is not True
+        and str(task.get("provider_effect_state") or "never_dispatched")
+        in {"", "never_dispatched"}
+    )
+
+
+def _schema_recovery_settled_complete_task(task: dict[str, Any]) -> bool:
+    """Recognise a fully published teammate result which must be preserved."""
+
+    return bool(
+        task.get("state") == "complete"
+        and (
+            not str(task.get("required_contributor_id") or "")
+            or bool(str(task.get("summary") or "").strip())
+        )
+        and isinstance(task.get("artifacts"), list)
+        and task.get("artifacts")
+        and all(isinstance(one, dict) for one in task.get("artifacts", []))
+        and not task.get("pending_action")
+        and not task.get("pending_transaction")
+        and task.get("outcome_unknown") is not True
+        and task.get("reconciliation_required") is not True
+        and str(task.get("provider_effect_id") or "")
+        and str(task.get("provider_effect_state") or "") in {
+            "acknowledged", "applied_recovered_and_published",
+        }
+    )
+
+
+def _schema_recovery_settled_provider_only_task(task: dict[str, Any]) -> bool:
+    """Recognise a genuine terminal named contribution with no project effect.
+
+    A structured ``blocked`` response is still a real, visible contribution.
+    It may safely survive recovery of a different teammate's pre-inference
+    schema rejection, but only when the acknowledgement is fully settled and
+    contains no file/application effect to reconcile.
+    """
+
+    summary = str(task.get("summary") or "").strip()
+    return bool(
+        task.get("state") == "blocked"
+        and str(task.get("required_contributor_id") or "")
+        and summary
+        and str(task.get("last_error") or "").strip() == summary
+        and not task.get("artifacts")
+        and not task.get("pending_action")
+        and not task.get("pending_transaction")
+        and task.get("outcome_unknown") is not True
+        and task.get("reconciliation_required") is not True
+        and str(task.get("provider_effect_id") or "")
+        and str(task.get("provider_effect_state") or "") == "acknowledged"
+    )
+
+
+def _schema_recovery_settled_known_failure_task(task: dict[str, Any]) -> bool:
+    """Recognise another named provider's known pre-effect terminal outcome."""
+
+    return bool(
+        task.get("state") == "blocked"
+        and str(task.get("required_contributor_id") or "")
+        and str(task.get("last_error") or "").strip()
+        and not task.get("artifacts")
+        and not task.get("pending_action")
+        and not task.get("pending_transaction")
+        and task.get("outcome_unknown") is not True
+        and task.get("reconciliation_required") is not True
+        and str(task.get("provider_effect_id") or "")
+        and str(task.get("provider_effect_state") or "") == "failed_before_effect"
+    )
+
+
+def _schema_recovery_dead_before_dispatch_task(task: dict[str, Any]) -> bool:
+    """Recognise the exact fail-safe state made by dead-worker recovery."""
+
+    return bool(
+        task.get("state") == "blocked"
+        and str(task.get("last_error") or "") == DEAD_BEFORE_PROVIDER_EFFECT_ERROR
+        and not task.get("provider_effect_id")
+        and not task.get("pending_action")
+        and not task.get("pending_transaction")
+        and not task.get("artifacts")
+        and task.get("outcome_unknown") is not True
+        and task.get("reconciliation_required") is not True
+        and str(task.get("provider_effect_state") or "never_dispatched")
+        in {"", "never_dispatched"}
+    )
+
+
+def _schema_recovery_artifacts_are_published(document: dict[str, Any]) -> bool:
+    """Bind every goal-level artifact to a settled completed teammate task."""
+
+    tasks = {
+        str(task.get("id") or ""): task
+        for task in document.get("tasks", []) if isinstance(task, dict)
+    }
+    published_by_task: dict[str, list[str]] = {}
+    for artifact in document.get("artifacts", []):
+        if not isinstance(artifact, dict):
+            return False
+        task = tasks.get(str(artifact.get("task_id") or ""))
+        if task is None or not _schema_recovery_settled_complete_task(task):
+            return False
+        payload = {key: one for key, one in artifact.items() if key != "task_id"}
+        if not any(
+            _semantic_artifact(one) == _semantic_artifact(payload)
+            for one in task.get("artifacts", [])
+        ):
+            return False
+        task_id = str(task.get("id") or "")
+        published_by_task.setdefault(task_id, []).append(
+            _canonical(_semantic_artifact(payload))
+        )
+    for task_id, task in tasks.items():
+        if task.get("state") != "complete":
+            continue
+        if not _schema_recovery_settled_complete_task(task):
+            return False
+        task_artifacts = sorted(
+            _canonical(_semantic_artifact(one))
+            for one in task.get("artifacts", [])
+        )
+        if task_artifacts != sorted(published_by_task.get(task_id, [])):
+            return False
+    return True
+
+
 def _task_has_unsettled_effect(task: dict[str, Any]) -> bool:
     return bool(
         task.get("pending_action") or task.get("pending_transaction")
@@ -446,7 +769,57 @@ def _task_has_recorded_provider_dispatch(task: dict[str, Any]) -> bool:
     # Scheduler attempts advance when a lease is claimed, before record_dispatch
     # persists the effect boundary.  The stable effect identity is created only
     # by record_dispatch and is intentionally retained through recovery/retry.
-    return bool(str(task.get("provider_effect_id") or "").strip())
+    superseded = task.get("superseded_provider_effect_ids")
+    return bool(str(task.get("provider_effect_id") or "").strip()) or bool(
+        isinstance(superseded, list)
+        and any(str(one or "").strip() for one in superseded)
+    )
+
+
+def _can_receive_future_required_contribution(task: dict[str, Any]) -> bool:
+    """Return whether a named task still has a future project-work turn."""
+
+    return bool(
+        str(task.get("required_contributor_id") or "")
+        and task.get("state") in {"ready", "waiting"}
+    )
+
+
+def _summary_delivery(
+    document: dict[str, Any], task: dict[str, Any], action: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze truthful visible-summary routing at the acknowledgement boundary."""
+
+    if action.get("action") == "ask_user":
+        return {"schema_version": 1, "kind": "user", "agent_id": "", "name": "You"}
+    required = [
+        one for one in document.get("tasks", [])
+        if isinstance(one, dict) and str(one.get("required_contributor_id") or "")
+    ]
+    position = next((
+        index for index, one in enumerate(required)
+        if str(one.get("id") or "") == str(task.get("id") or "")
+    ), -1)
+    recipient = next((
+        one for one in required[position + 1:]
+        if position >= 0 and _can_receive_future_required_contribution(one)
+        and str(one.get("required_contributor_id") or one.get("assigned_agent_id") or "")
+        != str(task.get("assigned_agent_id") or "")
+    ), None)
+    if recipient is None:
+        return {"schema_version": 1, "kind": "team", "agent_id": "", "name": "the team"}
+    recipient_id = str(
+        recipient.get("required_contributor_id")
+        or recipient.get("assigned_agent_id") or ""
+    )
+    agent = next((
+        one for one in document.get("agents", [])
+        if isinstance(one, dict) and str(one.get("id") or "") == recipient_id
+    ), {})
+    return {
+        "schema_version": 1, "kind": "agent", "agent_id": recipient_id,
+        "name": str(agent.get("name") or recipient_id or "the team"),
+    }
 
 
 def _durable_evidence(value: object, *, string_limit: int = 32_000, list_limit: int = 500) -> object:
@@ -475,6 +848,10 @@ def _durable_evidence(value: object, *, string_limit: int = 32_000, list_limit: 
 
 def _validate_action_semantics(action: dict[str, Any], task: dict[str, Any]) -> None:
     kind = str(action.get("action") or "")
+    if task.get("required_contributor_id") and not str(action.get("summary") or "").strip():
+        raise HarnessError(
+            "A named Work Together contribution must include a visible nonblank summary"
+        )
     changes = action.get("changes") or []
     questions = action.get("questions") or []
     delegated = action.get("tasks") or []
@@ -643,7 +1020,7 @@ class GoalStore:
             raise HarnessError(
                 "That long-horizon request belongs to a different Nexus project authority"
             )
-        if str(document.get("status") or "") not in RELEASED_GOALS:
+        if str(document.get("status") or "") not in RELEASED_GOALS | {"failed"}:
             raise HarnessError(
                 "Long-horizon request replay protection has a non-terminal state"
             )
@@ -659,7 +1036,7 @@ class GoalStore:
         client_request_id = str(document.get("client_request_id") or "")
         if not client_request_id and ":" in stored_request_id:
             client_request_id = stored_request_id.split(":", 1)[1]
-        return {
+        tombstone = {
             "request_tombstone_schema_version": REQUEST_TOMBSTONE_SCHEMA_VERSION,
             "request_tombstone": True,
             "goal_id": str(document.get("goal_id") or ""),
@@ -683,11 +1060,19 @@ class GoalStore:
             "lead_agent_id": str(document.get("lead_agent_id") or ""),
             "parent_goal_id": str(document.get("parent_goal_id") or ""),
         }
+        migrations = document.get("provider_binding_migrations")
+        if migrations:
+            # Keep the small authenticated compatibility proof so an exact
+            # idempotent replay still works after detailed goal history rolls
+            # over. No provider configuration or prompt content is retained.
+            _provider_binding_migration_map(document)
+            tombstone["provider_binding_migrations"] = copy.deepcopy(migrations)
+        return tombstone
 
     def _remember_request_tombstone(
         self, db: sqlite3.Connection, document: dict[str, Any],
     ) -> dict[str, Any]:
-        if str(document.get("status") or "") not in RELEASED_GOALS:
+        if not self._is_released_terminal(document):
             raise HarnessError(
                 "Only released long-horizon goals can become replay tombstones"
             )
@@ -725,18 +1110,22 @@ class GoalStore:
     def _prune_released_goals(self, db: sqlite3.Connection) -> None:
         """Retire request identities before bounded terminal details disappear."""
 
-        old = db.execute(
-            "SELECT * FROM long_goals WHERE status IN ('complete','cancelled') "
+        rows = db.execute(
+            "SELECT * FROM long_goals WHERE status IN ('complete','cancelled','failed') "
             "AND request_id LIKE ? "
             "ORDER BY updated_ms DESC,created_ms DESC,rowid DESC",
             (self.authority_key + ":%",),
         ).fetchall()
-        for row in old[MAX_GOALS:]:
-            released = self._decode(row)
-            if released is None:
+        released_rows: list[tuple[sqlite3.Row, dict[str, Any]]] = []
+        for row in rows:
+            document = self._decode(row)
+            if document is None:
                 raise HarnessError(
                     "A terminal goal disappeared before replay protection was saved"
                 )
+            if self._is_released_terminal(document):
+                released_rows.append((row, document))
+        for row, released in released_rows[MAX_GOALS:]:
             self._remember_request_tombstone(db, released)
             if db.execute(
                 "DELETE FROM long_goals WHERE goal_id=?",
@@ -756,6 +1145,13 @@ class GoalStore:
         if document.get("status") in RELEASED_GOALS:
             return "released"
         return "owner"
+
+    @classmethod
+    def _is_released_terminal(cls, document: dict[str, Any]) -> bool:
+        status = str(document.get("status") or "")
+        return status in RELEASED_GOALS or (
+            status == "failed" and cls._project_queue_state(document) == "released"
+        )
 
     @classmethod
     def _is_project_owner(cls, document: dict[str, Any]) -> bool:
@@ -815,6 +1211,51 @@ class GoalStore:
                 return False
         return True
 
+    @classmethod
+    def _codex_schema_auto_start_safe(cls, document: dict[str, Any]) -> bool:
+        """Validate the one non-pristine automatic retry admitted by migration."""
+
+        queue = document.get("project_queue") or {}
+        if document.get("status") != "queued" \
+                or queue.get("auto_start_reason") != CODEX_SCHEMA_AUTO_START_REASON \
+                or _automatic_recovery_suppressed(document) \
+                or not _is_current_codex_schema_recovery_contract(
+                    queue.get("auto_start_contract")
+                ):
+            return False
+        if any(
+            isinstance(one, dict) and one.get("state") == "pending"
+            for one in document.get("interrupts", [])
+        ) or (document.get("cancellation") or {}).get("state") not in {None, "none"}:
+            return False
+        if not _schema_recovery_artifacts_are_published(document):
+            return False
+        recovered_ready = False
+        for task in document.get("tasks", []):
+            if not isinstance(task, dict):
+                return False
+            if _schema_recovery_settled_complete_task(task) \
+                    or _schema_recovery_settled_provider_only_task(task) \
+                    or _schema_recovery_settled_known_failure_task(task):
+                continue
+            if not _schema_recovery_pristine_task(task):
+                return False
+            if _is_current_codex_schema_recovery_contract(
+                task.get("schema_recovery_contract")
+            ):
+                recovered_ready = True
+        budget = document.get("budget") or {}
+        return bool(
+            recovered_ready
+            and int(budget.get("provider_calls") or 0)
+            < int(budget.get("max_provider_calls") or 0)
+        )
+
+    @classmethod
+    def _automatic_start_safe(cls, document: dict[str, Any]) -> bool:
+        return cls._pristine_for_queue_migration(document) \
+            or cls._codex_schema_auto_start_safe(document)
+
     def _execution_contract_for(self, document: dict[str, Any]) -> dict[str, Any]:
         return _exclusive_project_contract(
             Path(str(document.get("project", {}).get("path") or "")),
@@ -855,6 +1296,12 @@ class GoalStore:
             raise HarnessError("An executable long-horizon goal does not own its project")
         if status == "failed" and state not in {"owner", "released"}:
             raise HarnessError("A failed long-horizon goal has invalid project ownership")
+        arm_id = str(queue.get("auto_start_arm_id") or "")
+        if not isinstance(queue.get("auto_start_pending"), bool) \
+                or queue.get("auto_start_arm_schema_version") != AUTO_START_ARM_SCHEMA_VERSION \
+                or (queue.get("auto_start_pending") is True) \
+                != bool(re.fullmatch(r"[0-9a-f]{32}", arm_id)):
+            raise HarnessError("Long-horizon automatic-start arm metadata is invalid")
         cancellation = document.get("cancellation")
         if not isinstance(cancellation, dict) or cancellation.get(
             "schema_version"
@@ -864,13 +1311,26 @@ class GoalStore:
             raise HarnessError("Long-horizon cancellation metadata is invalid")
         if status == "cancelling" and cancellation.get("state") != "draining":
             raise HarnessError("A cancelling goal has no durable drain request")
+        recovery_control = document.get("automatic_recovery_control")
+        if not isinstance(recovery_control, dict) or recovery_control.get(
+            "schema_version"
+        ) != AUTOMATIC_RECOVERY_CONTROL_SCHEMA_VERSION \
+                or not isinstance(recovery_control.get("suppressed"), bool):
+            raise HarnessError("Long-horizon automatic-recovery control is invalid")
+        _provider_binding_migration_map(document)
 
     @staticmethod
     def _queue_record(
         state: str, now: int, *, blocked_by_goal_id: str = "",
         queued_ms: int = 0, promoted_ms: int = 0,
         auto_start_pending: bool = False,
+        auto_start_reason: str = "", auto_start_contract: object = None,
+        auto_start_arm_id: str = "",
     ) -> dict[str, Any]:
+        armed = bool(auto_start_pending and state == "owner")
+        arm_id = str(auto_start_arm_id or "")
+        if armed and not re.fullmatch(r"[0-9a-f]{32}", arm_id):
+            arm_id = uuid.uuid4().hex
         return {
             "schema_version": PROJECT_QUEUE_SCHEMA_VERSION,
             "state": state,
@@ -878,7 +1338,17 @@ class GoalStore:
             "queued_ms": int(queued_ms),
             "promoted_ms": int(promoted_ms),
             "released_ms": int(now if state == "released" else 0),
-            "auto_start_pending": bool(auto_start_pending and state == "owner"),
+            "auto_start_pending": armed,
+            "auto_start_arm_schema_version": AUTO_START_ARM_SCHEMA_VERSION,
+            "auto_start_arm_id": arm_id if armed else "",
+            "auto_start_reason": (
+                str(auto_start_reason) if auto_start_pending and state == "owner" else ""
+            ),
+            "auto_start_contract": (
+                copy.deepcopy(auto_start_contract)
+                if auto_start_pending and state == "owner"
+                and isinstance(auto_start_contract, dict) else {}
+            ),
         }
 
     def _shared_documents(
@@ -944,6 +1414,428 @@ class GoalStore:
             owners.append(waiter)
             promoted.append(str(waiter["goal_id"]))
         return promoted
+
+    def _repair_codex_schema_rejection(
+        self, db: sqlite3.Connection, document: dict[str, Any],
+    ) -> bool:
+        """Repair only the authenticated, known pre-effect schema rejection once."""
+
+        agents = {
+            str(agent.get("id") or ""): agent
+            for agent in document.get("agents", []) if isinstance(agent, dict)
+        }
+        recoverable = [
+            task for task in document.get("tasks", [])
+            if isinstance(task, dict) and _is_recoverable_codex_schema_rejection(
+                task, agents.get(str(task.get("assigned_agent_id") or "")),
+            )
+        ]
+        if not recoverable \
+                or document.get("status") not in {"paused", "queued", "running"} \
+                or _automatic_recovery_suppressed(document) \
+                or self._project_queue_state(document) != "owner" \
+                or self._scheduler_live(document) \
+                or any(
+                    isinstance(task, dict) and task.get("state") == "running"
+                    for task in document.get("tasks", [])
+                ) \
+                or any(
+                    isinstance(one, dict) and one.get("state") == "pending"
+                    for one in document.get("interrupts", [])
+                ) \
+                or (document.get("cancellation") or {}).get("state") not in {None, "none"} \
+                or not _schema_recovery_artifacts_are_published(document):
+            return False
+        recoverable_ids = {str(task.get("id") or "") for task in recoverable}
+        if not all(
+            isinstance(task, dict) and (
+                str(task.get("id") or "") in recoverable_ids
+                or _schema_recovery_pristine_task(task)
+                or _schema_recovery_settled_complete_task(task)
+                or _schema_recovery_settled_provider_only_task(task)
+                or _schema_recovery_settled_known_failure_task(task)
+                or _schema_recovery_dead_before_dispatch_task(task)
+            )
+            for task in document.get("tasks", [])
+        ):
+            return False
+        budget = document.get("budget") or {}
+        if int(budget.get("provider_calls") or 0) >= int(
+            budget.get("max_provider_calls") or 0
+        ):
+            return False
+
+        # The strict-schema serializer is itself versioned dispatch semantics.
+        # Reconstruct each v1 binding using today's route, executable, config,
+        # and provider principal; only an exact old fingerprint match may move
+        # to v2. Any unrelated drift keeps the goal paused and sends nothing.
+        candidate = copy.deepcopy(document)
+        upgraded_bindings: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        for agent in candidate.get("agents", []):
+            if not isinstance(agent, dict):
+                return False
+            route = _short(agent.get("who"), 300)
+            _kind, current_context = chat_lab._route_failure_context(  # noqa: SLF001
+                self.config, route,
+            )
+            current_binding = {
+                "binding_schema_version": AGENT_BINDING_SCHEMA_VERSION,
+                "route": route,
+                **current_context,
+            }
+            if agent.get("route_binding") == current_binding:
+                continue
+            upgraded = self._strict_schema_route_binding_upgrade(agent)
+            if upgraded is None:
+                return False
+            agent_id = str(agent.get("id") or "")
+            upgraded_bindings[agent_id] = (
+                copy.deepcopy(agent.get("route_binding") or {}),
+                copy.deepcopy(upgraded),
+            )
+            agent["route_binding"] = upgraded
+        if self.provider_setup_status(candidate).get("changed"):
+            return False
+        if upgraded_bindings:
+            migrations = document.setdefault("provider_binding_migrations", [])
+            if not isinstance(migrations, list):
+                return False
+            existing_migrations = _provider_binding_migration_map(document)
+            if set(existing_migrations).intersection(upgraded_bindings):
+                return False
+            for agent in document.get("agents", []):
+                agent_id = str(agent.get("id") or "")
+                if agent_id not in upgraded_bindings:
+                    continue
+                before, after = upgraded_bindings[agent_id]
+                agent["route_binding"] = after
+                migration = {
+                    "schema_version": PROVIDER_BINDING_MIGRATION_SCHEMA_VERSION,
+                    "migration": STRICT_SCHEMA_BINDING_MIGRATION,
+                    "agent_id": agent_id,
+                    "route": _short(agent.get("who"), 300),
+                    "from_effective_dispatch_contract": before.get(
+                        "effective_dispatch_contract", ""
+                    ),
+                    "to_effective_dispatch_contract": after.get(
+                        "effective_dispatch_contract", ""
+                    ),
+                    "from_binding_sha256": _binding_sha256(before),
+                    "to_binding_sha256": _binding_sha256(after),
+                    "at_ms": _now(),
+                }
+                migrations.append(migration)
+                self._event(
+                    db, document, "provider_binding_migrated_for_schema_recovery",
+                    agent_id=agent_id,
+                    payload={
+                        key: migration[key] for key in (
+                            "schema_version", "migration", "route",
+                            "from_effective_dispatch_contract",
+                            "to_effective_dispatch_contract",
+                            "from_binding_sha256", "to_binding_sha256",
+                        )
+                    },
+                )
+
+        recovery_contract = _codex_schema_recovery_contract()
+        for task in recoverable:
+            old_effect_id = str(task.get("provider_effect_id") or "")
+            task.setdefault("superseded_provider_effect_ids", []).append(old_effect_id)
+            task["superseded_provider_effect_ids"] = [
+                one for one in task["superseded_provider_effect_ids"] if str(one)
+            ][-12:]
+            task.update({
+                "state": "ready", "last_error": "",
+                "lease_id": "", "owner_pid": 0, "owner_token": "",
+                "pending_action": {}, "pending_transaction": {},
+                "outcome_unknown": False, "reconciliation_required": False,
+                "provider_effect_state": "never_dispatched",
+                "provider_effect_id": "",
+                "schema_recovery_contract": recovery_contract,
+            })
+            self._event(
+                db, document, "codex_schema_rejection_recovered",
+                task_id=str(task.get("id") or ""),
+                agent_id=str(task.get("assigned_agent_id") or ""),
+                payload={
+                    "automatic_retry": True,
+                    "superseded_effect_id": old_effect_id,
+                    "schema_recovery_contract": recovery_contract,
+                },
+            )
+        for task in document.get("tasks", []):
+            if isinstance(task, dict) and _schema_recovery_dead_before_dispatch_task(task):
+                task.update({
+                    "state": "ready", "last_error": "", "lease_id": "",
+                    "owner_pid": 0, "owner_token": "",
+                })
+                self._event(
+                    db, document, "task_dead_before_dispatch_recovered",
+                    task_id=str(task.get("id") or ""),
+                    agent_id=str(task.get("assigned_agent_id") or ""),
+                    payload={"automatic_retry": True, "provider_dispatched": False},
+                )
+        document["status"] = "queued"
+        old_queue = document.get("project_queue") or {}
+        document["project_queue"] = self._queue_record(
+            "owner", _now(),
+            queued_ms=int(old_queue.get("queued_ms") or 0),
+            promoted_ms=int(old_queue.get("promoted_ms") or 0),
+            auto_start_pending=True,
+            auto_start_reason=CODEX_SCHEMA_AUTO_START_REASON,
+            auto_start_contract=recovery_contract,
+        )
+        preserved = sum(
+            _schema_recovery_settled_complete_task(task)
+            or _schema_recovery_settled_provider_only_task(task)
+            or _schema_recovery_settled_known_failure_task(task)
+            for task in document.get("tasks", []) if isinstance(task, dict)
+        )
+        document["note"] = (
+            "Nexus repaired the former Codex strict output-schema rejection before "
+            "the rejected provider call produced a new agent reply or project effect, preserved "
+            f"{preserved} settled teammate outcome(s), and queued one safe retry."
+        )
+        return True
+
+    def _recover_interrupted_codex_schema_retry(
+        self, db: sqlite3.Connection, document: dict[str, Any],
+    ) -> bool:
+        """Resume a current-contract retry which died before provider dispatch."""
+
+        queue = document.get("project_queue") or {}
+        if document.get("status") not in {"paused", "queued"} \
+                or self._project_queue_state(document) != "owner" \
+                or _automatic_recovery_suppressed(document) \
+                or queue.get("auto_start_pending") is not True \
+                or queue.get("auto_start_reason") != CODEX_SCHEMA_AUTO_START_REASON \
+                or not _is_current_codex_schema_recovery_contract(
+                    queue.get("auto_start_contract")
+                ) \
+                or self._scheduler_live(document) \
+                or any(
+                    isinstance(task, dict) and task.get("state") == "running"
+                    for task in document.get("tasks", [])
+                ) \
+                or any(
+                    isinstance(one, dict) and one.get("state") == "pending"
+                    for one in document.get("interrupts", [])
+                ) \
+                or (document.get("cancellation") or {}).get("state") not in {None, "none"} \
+                or not _schema_recovery_artifacts_are_published(document):
+            return False
+        tasks = [
+            task for task in document.get("tasks", []) if isinstance(task, dict)
+        ]
+        interrupted = [
+            task for task in tasks if _schema_recovery_dead_before_dispatch_task(task)
+        ]
+        if not interrupted or not any(
+            _is_current_codex_schema_recovery_contract(
+                task.get("schema_recovery_contract")
+            )
+            for task in tasks
+        ) or not all(
+            _schema_recovery_dead_before_dispatch_task(task)
+            or _schema_recovery_pristine_task(task)
+            or _schema_recovery_settled_complete_task(task)
+            or _schema_recovery_settled_provider_only_task(task)
+            or _schema_recovery_settled_known_failure_task(task)
+            for task in tasks
+        ):
+            return False
+        budget = document.get("budget") or {}
+        if int(budget.get("provider_calls") or 0) >= int(
+            budget.get("max_provider_calls") or 0
+        ):
+            return False
+
+        for task in interrupted:
+            task.update({
+                "state": "ready", "last_error": "", "lease_id": "",
+                "owner_pid": 0, "owner_token": "",
+            })
+            self._event(
+                db, document, "task_dead_before_dispatch_recovered",
+                task_id=str(task.get("id") or ""),
+                agent_id=str(task.get("assigned_agent_id") or ""),
+                payload={
+                    "automatic_retry": True, "provider_dispatched": False,
+                    "schema_recovery_continued": True,
+                },
+            )
+        now = _now()
+        document["status"] = "queued"
+        document["worker"] = {
+            "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+            "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
+            "acquired_ms": 0,
+        }
+        document["project_queue"] = self._queue_record(
+            "owner", now,
+            queued_ms=int(queue.get("queued_ms") or 0),
+            promoted_ms=int(queue.get("promoted_ms") or 0),
+            auto_start_pending=True,
+            auto_start_reason=CODEX_SCHEMA_AUTO_START_REASON,
+            auto_start_contract=_codex_schema_recovery_contract(),
+        )
+        document["note"] = (
+            "Nexus recovered the current schema retry before provider dispatch and "
+            "kept its one-time automatic start eligible."
+        )
+        return True
+
+    def _disarm_invalid_codex_schema_auto_start(
+        self, db: sqlite3.Connection, document: dict[str, Any],
+    ) -> bool:
+        """Pause an obsolete recovery contract instead of leaving an invisible queue stall."""
+
+        queue = document.get("project_queue") or {}
+        if document.get("status") not in {"paused", "queued"} \
+                or self._project_queue_state(document) != "owner" \
+                or queue.get("auto_start_pending") is not True \
+                or queue.get("auto_start_reason") != CODEX_SCHEMA_AUTO_START_REASON \
+                or self._scheduler_live(document) \
+                or any(
+                    isinstance(task, dict) and task.get("state") == "running"
+                    for task in document.get("tasks", [])
+                ):
+            return False
+        if document.get("status") == "queued" \
+                and self._codex_schema_auto_start_safe(document):
+            return False
+
+        held_contract = queue.get("auto_start_contract")
+        held_fingerprint = (
+            str(held_contract.get("fingerprint_sha256") or "")
+            if isinstance(held_contract, dict) else ""
+        )
+        current_contract = _codex_schema_recovery_contract()
+        reason_code = (
+            "schema_recovery_contract_changed"
+            if not _is_current_codex_schema_recovery_contract(held_contract)
+            else "schema_recovery_preconditions_changed"
+        )
+        now = _now()
+        document["status"] = "paused"
+        document["worker"] = {
+            "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
+            "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
+            "acquired_ms": 0,
+        }
+        document["project_queue"] = self._queue_record(
+            "owner", now,
+            queued_ms=int(queue.get("queued_ms") or 0),
+            promoted_ms=int(queue.get("promoted_ms") or 0),
+        )
+        document["note"] = (
+            "Nexus paused an obsolete or no-longer-safe schema-recovery automatic "
+            "start without resending provider work. Review the saved state and resume explicitly."
+        )
+        self._event(db, document, "goal_schema_recovery_auto_start_disarmed", payload={
+            "reason_code": reason_code,
+            "automatic_retry": False,
+            "project_ownership_retained": True,
+            "held_contract_fingerprint_sha256": held_fingerprint,
+            "current_contract_fingerprint_sha256": current_contract[
+                "fingerprint_sha256"
+            ],
+        })
+        return True
+
+    def _legacy_user_suppressed_automatic_recovery(
+        self, db: sqlite3.Connection, document: dict[str, Any],
+    ) -> bool:
+        """Derive a pre-control-record user Pause from authenticated history."""
+
+        current_user_pause = str(document.get("note") or "") == (
+            "Paused by the user at the next safe boundary."
+        )
+        # The authenticated current snapshot is newer than every retained
+        # event. This exact note can only be written by the user Pause control;
+        # do not let older activation history override it.
+        if current_user_pause:
+            return True
+        activation_types = {
+            "goal_resumed", "task_retried",
+            "goal_steered", "agent_messaged",
+            "goal_interrupt_continuation_authorized",
+        }
+        rows = db.execute(
+            "SELECT * FROM long_goal_events WHERE goal_id=? ORDER BY seq",
+            (str(document.get("goal_id") or ""),),
+        ).fetchall()
+        floor = int(document.get("event_floor_seq") or 1)
+        head_seq = int(document.get("event_seq") or 0)
+        expected_seq = floor
+        expected_previous = str(
+            document.get("event_floor_previous_sha256") or ""
+        )
+        # When older history was normally compacted, the pre-floor control
+        # state is unknowable. Start suppressed and require a retained,
+        # authenticated user continuation to clear it.
+        suppressed = floor > 1
+        for row in rows:
+            raw = str(row["event_json"])
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            material = [
+                str(document.get("goal_id") or ""), int(row["seq"]),
+                str(row["event_id"]), str(row["type"]), raw, digest,
+            ]
+            if digest != str(row["event_sha256"]) or not hmac.compare_digest(
+                str(row["integrity_mac"]),
+                mac("long-horizon-event-v1", material),
+            ):
+                quarantine_marker(
+                    "long-horizon-events", self.database,
+                    "Automatic-recovery control history failed integrity",
+                )
+                raise HarnessError(
+                    "Long-horizon automatic-recovery control history failed integrity verification"
+                )
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise HarnessError(
+                    "Long-horizon automatic-recovery control history is unreadable"
+                ) from exc
+            if int(row["seq"]) != expected_seq \
+                    or int(event.get("seq") or 0) != expected_seq \
+                    or str(event.get("goal_id") or "") != str(document.get("goal_id") or "") \
+                    or str(event.get("event_id") or "") != str(row["event_id"]) \
+                    or str(event.get("type") or "") != str(row["type"]) \
+                    or not hmac.compare_digest(
+                        str(event.get("previous_sha256") or ""), expected_previous,
+                    ):
+                raise HarnessError(
+                    "Long-horizon automatic-recovery control history has mismatched identity"
+                )
+            expected_seq += 1
+            expected_previous = digest
+            payload = event.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            if event.get("type") == "goal_paused" and payload.get("reason") == "user":
+                suppressed = True
+            elif event.get("type") in activation_types:
+                suppressed = False
+            elif event.get("type") == "review_requested" \
+                    and payload.get("requested_by") == "user":
+                suppressed = False
+        expected_row_count = max(0, head_seq - floor + 1)
+        if len(rows) != expected_row_count or expected_seq != head_seq + 1 \
+                or not hmac.compare_digest(
+                    expected_previous,
+                    str(document.get("event_head_sha256") or ""),
+                ):
+            quarantine_marker(
+                "long-horizon-events", self.database,
+                "Automatic-recovery control history is incomplete",
+            )
+            raise HarnessError(
+                "Long-horizon automatic-recovery control history is incomplete"
+            )
+        return suppressed
 
     def _migrate_execution_metadata(self) -> None:
         """Add the v1 project claim contract to authenticated schema-v2 rows."""
@@ -1013,6 +1905,24 @@ class GoalStore:
                         # boundary even when its top-level status is queued.
                         queue["auto_start_pending"] = False
                         changed = True
+                    if queue.get("auto_start_arm_schema_version") \
+                            != AUTO_START_ARM_SCHEMA_VERSION \
+                            or "auto_start_arm_id" not in queue:
+                        queue["auto_start_arm_schema_version"] = AUTO_START_ARM_SCHEMA_VERSION
+                        queue["auto_start_arm_id"] = (
+                            uuid.uuid4().hex
+                            if queue.get("auto_start_pending") is True else ""
+                        )
+                        changed = True
+                    if not isinstance(document.get("automatic_recovery_control"), dict):
+                        suppressed = self._legacy_user_suppressed_automatic_recovery(
+                            db, document,
+                        )
+                        document["automatic_recovery_control"] = _automatic_recovery_control(
+                            suppressed,
+                            reason="legacy_authenticated_user_pause" if suppressed else "",
+                        )
+                        changed = True
                     if not isinstance(document.get("cancellation"), dict):
                         document["cancellation"] = {
                             "schema_version": CANCELLATION_SCHEMA_VERSION,
@@ -1035,6 +1945,12 @@ class GoalStore:
                         document["collaboration_contract"] = _collaboration_contract(
                             bool(document.get("require_all_participants")),
                         )
+                        changed = True
+                    if self._recover_interrupted_codex_schema_retry(db, document):
+                        changed = True
+                    elif self._disarm_invalid_codex_schema_auto_start(db, document):
+                        changed = True
+                    elif self._repair_codex_schema_rejection(db, document):
                         changed = True
                     worker = document.get("worker")
                     if not isinstance(worker, dict):
@@ -1160,7 +2076,6 @@ class GoalStore:
                     returned = copy.deepcopy(document)
                     returned["_promoted_goal_ids"] = []
                     return returned, None
-                released = was_owner and document.get("status") in RELEASED_GOALS
                 if document.get("status") in RELEASED_GOALS \
                         and self._project_queue_state(document) != "released":
                     queued_ms = int((document.get("project_queue") or {}).get("queued_ms") or 0)
@@ -1174,9 +2089,10 @@ class GoalStore:
                             "execution_contract"
                         ]["fingerprint_sha256"],
                     })
+                released = was_owner and not self._is_project_owner(document)
                 document["revision"] = int(document["revision"]) + 1
                 self._write(db, document)
-                if document.get("status") in RELEASED_GOALS:
+                if self._is_released_terminal(document):
                     self._prune_released_goals(db)
                 promoted = self._promote_eligible_waiters(db) if released else []
                 db.commit()
@@ -1234,6 +2150,242 @@ class GoalStore:
                 + ", ".join(board_agents.get(one, one) for one in missing)
             )
         return [by_id[one] for one in required]
+
+    def _strict_schema_route_binding_upgrade(
+        self, agent: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Upgrade only an otherwise-identical v1 strict-schema dispatch binding."""
+
+        saved = agent.get("route_binding")
+        if not isinstance(saved, dict) or saved.get(
+            "binding_schema_version"
+        ) != AGENT_BINDING_SCHEMA_VERSION:
+            return None
+        old_contract = str(saved.get("effective_dispatch_contract") or "")
+        expected_new_contract = STRICT_SCHEMA_EFFECTIVE_CONTRACT_UPGRADES.get(
+            old_contract
+        )
+        if not expected_new_contract:
+            return None
+        route = _short(agent.get("who"), 300)
+        _old_kind, old_context = chat_lab._route_failure_context(  # noqa: SLF001
+            self.config, route,
+            effective_dispatch_contract_override=old_contract,
+        )
+        reconstructed_old = {
+            "binding_schema_version": AGENT_BINDING_SCHEMA_VERSION,
+            "route": route,
+            **old_context,
+        }
+        if not hmac.compare_digest(
+            hashlib.sha256(_canonical(saved).encode("utf-8")).hexdigest(),
+            hashlib.sha256(_canonical(reconstructed_old).encode("utf-8")).hexdigest(),
+        ):
+            return None
+        _current_kind, current_context = chat_lab._route_failure_context(  # noqa: SLF001
+            self.config, route,
+        )
+        if str(current_context.get("effective_dispatch_contract") or "") \
+                != expected_new_contract:
+            return None
+        return {
+            "binding_schema_version": AGENT_BINDING_SCHEMA_VERSION,
+            "route": route,
+            **current_context,
+        }
+
+    def _strict_schema_previous_admission_digest(
+        self, *, project_id: str, project_path: Path,
+        project_authority_id: str, conversation_id: str,
+        participant_ids: list[str], lead_id: str, objectives: list[str],
+        success_criteria: list[str] | None, policy: dict[str, Any],
+        attachments: object, agents: list[dict[str, Any]],
+        require_all_participants: bool,
+    ) -> str:
+        """Reconstruct the one pre-v2 digest for a prepare-only journal replay."""
+
+        previous_by_current = {
+            current: previous
+            for previous, current in STRICT_SCHEMA_EFFECTIVE_CONTRACT_UPGRADES.items()
+        }
+        former_bindings: list[dict[str, Any]] = []
+        downgraded = False
+        for agent in agents:
+            current = agent.get("route_binding")
+            if not isinstance(current, dict) or current.get(
+                "binding_schema_version"
+            ) != AGENT_BINDING_SCHEMA_VERSION:
+                return ""
+            current_contract = str(
+                current.get("effective_dispatch_contract") or ""
+            )
+            previous_contract = previous_by_current.get(current_contract)
+            if previous_contract is None:
+                former_bindings.append(copy.deepcopy(current))
+                continue
+            route = _short(agent.get("who"), 300)
+            try:
+                _kind, previous_context = chat_lab._route_failure_context(  # noqa: SLF001
+                    self.config, route,
+                    effective_dispatch_contract_override=previous_contract,
+                )
+                _current_kind, stable_current_context = chat_lab._route_failure_context(  # noqa: SLF001
+                    self.config, route,
+                )
+            except Exception:
+                return ""
+            former = {
+                "binding_schema_version": AGENT_BINDING_SCHEMA_VERSION,
+                "route": route,
+                **previous_context,
+            }
+            stable_current = {
+                "binding_schema_version": AGENT_BINDING_SCHEMA_VERSION,
+                "route": route,
+                **stable_current_context,
+            }
+            if str(former.get("effective_dispatch_contract") or "") \
+                    != previous_contract or stable_current != current:
+                return ""
+            former_bindings.append(former)
+            downgraded = True
+        if not downgraded:
+            return ""
+        # The authenticated old digest covers the whole participant set, not
+        # only the provider whose strict-schema contract changed. Re-observe
+        # every current binding immediately before returning the migration
+        # proof so a concurrent drift in an otherwise-unchanged teammate
+        # cannot rewrite the pending journal with a stale current digest.
+        for agent in agents:
+            current = agent.get("route_binding")
+            route = _short(agent.get("who"), 300)
+            try:
+                _kind, current_context = chat_lab._route_failure_context(  # noqa: SLF001
+                    self.config, route,
+                )
+            except Exception:
+                return ""
+            if current != {
+                "binding_schema_version": AGENT_BINDING_SCHEMA_VERSION,
+                "route": route,
+                **current_context,
+            }:
+                return ""
+        return _goal_admission_digest(
+            self.redactor,
+            project_id=project_id,
+            project_path=project_path,
+            project_authority_id=project_authority_id,
+            conversation_id=conversation_id,
+            participant_ids=participant_ids,
+            lead_id=lead_id,
+            objectives=objectives,
+            success_criteria=success_criteria,
+            policy=policy,
+            attachments=attachments,
+            agent_bindings=former_bindings,
+            require_all_participants=require_all_participants,
+        )
+
+    def _matches_migrated_admission_digest(
+        self, goal: dict[str, Any], *, project_id: str, project_path: Path,
+        project_authority_id: str, conversation_id: str,
+        participant_ids: list[str], lead_id: str, objectives: list[str],
+        success_criteria: list[str] | None, policy: dict[str, Any],
+        attachments: object, agents: list[dict[str, Any]],
+        require_all_participants: bool,
+    ) -> bool:
+        """Accept an exact replay across the one authenticated schema upgrade.
+
+        The original admission digest deliberately includes provider bindings.
+        Replacing that digest would weaken attachment and intent replay checks,
+        because old attachment bytes are not retained in goal state. Instead,
+        reconstruct the former bindings from the current route/configuration,
+        recompute the former digest from the caller's exact inputs, and require
+        both sides of every migration to match the authenticated proof.
+        """
+
+        migrations = _provider_binding_migration_map(goal)
+        if not migrations:
+            return False
+        saved_agents: dict[str, dict[str, Any]] = {}
+        if goal.get("request_tombstone") is not True:
+            saved_agents = {
+                str(one.get("id") or ""): one
+                for one in goal.get("agents", []) if isinstance(one, dict)
+            }
+            if set(saved_agents) != {
+                str(one.get("id") or "") for one in agents
+            }:
+                return False
+
+        former_bindings: list[dict[str, Any]] = []
+        seen_migrations: set[str] = set()
+        for agent in agents:
+            agent_id = str(agent.get("id") or "")
+            route = _short(agent.get("who"), 300)
+            current_binding = agent.get("route_binding")
+            if not isinstance(current_binding, dict):
+                return False
+            current_hash = _binding_sha256(current_binding)
+            if saved_agents:
+                saved = saved_agents.get(agent_id) or {}
+                if _short(saved.get("who"), 300) != route \
+                        or _binding_sha256(saved.get("route_binding")) != current_hash:
+                    return False
+            migration = migrations.get(agent_id)
+            if migration is None:
+                former_bindings.append(copy.deepcopy(current_binding))
+                continue
+            seen_migrations.add(agent_id)
+            if str(migration.get("route") or "") != route \
+                    or not hmac.compare_digest(
+                        str(migration.get("to_binding_sha256") or ""),
+                        current_hash,
+                    ):
+                return False
+            old_contract = str(
+                migration.get("from_effective_dispatch_contract") or ""
+            )
+            try:
+                _kind, old_context = chat_lab._route_failure_context(  # noqa: SLF001
+                    self.config, route,
+                    effective_dispatch_contract_override=old_contract,
+                )
+            except Exception:
+                return False
+            former = {
+                "binding_schema_version": AGENT_BINDING_SCHEMA_VERSION,
+                "route": route,
+                **old_context,
+            }
+            if str(former.get("effective_dispatch_contract") or "") != old_contract \
+                    or not hmac.compare_digest(
+                        str(migration.get("from_binding_sha256") or ""),
+                        _binding_sha256(former),
+                    ):
+                return False
+            former_bindings.append(former)
+        if seen_migrations != set(migrations):
+            return False
+        former_digest = _goal_admission_digest(
+            self.redactor,
+            project_id=project_id,
+            project_path=project_path,
+            project_authority_id=project_authority_id,
+            conversation_id=conversation_id,
+            participant_ids=participant_ids,
+            lead_id=lead_id,
+            objectives=objectives,
+            success_criteria=success_criteria,
+            policy=policy,
+            attachments=attachments,
+            agent_bindings=former_bindings,
+            require_all_participants=require_all_participants,
+        )
+        return hmac.compare_digest(
+            str(goal.get("admission_digest") or ""), former_digest,
+        )
 
     def provider_setup_status(self, document: dict[str, Any]) -> dict[str, Any]:
         """Compare saved dispatch semantics with this runtime configuration.
@@ -1452,6 +2604,7 @@ class GoalStore:
         policy: dict[str, Any] | None = None, attachments: object = None,
         participant_ids: list[str] | None = None, conversation_id: str = "",
         expected_project_authority_id: str = "",
+        strict_schema_pending_admission_digest: str = "",
         require_all_participants: bool | None = None,
     ) -> dict[str, Any]:
         """Inspect one exact runtime admission without changing scheduler state."""
@@ -1486,6 +2639,11 @@ class GoalStore:
             raise HarnessError(
                 "The selected project's execution authority changed during goal admission."
             )
+        admission_policy = {
+            **(policy or {}),
+            **({"participant_requirement": "adaptive"}
+               if participant_ids and not require_all else {}),
+        }
         admission_digest = _goal_admission_digest(
             self.redactor,
             project_id=project_id,
@@ -1496,17 +2654,36 @@ class GoalStore:
             lead_id=lead["id"],
             objectives=objectives,
             success_criteria=success_criteria,
-            policy={
-                **(policy or {}),
-                **({"participant_requirement": "adaptive"}
-                   if participant_ids and not require_all else {}),
-            },
+            policy=admission_policy,
             attachments=attachments,
             agent_bindings=[one.get("route_binding") for one in agents],
             require_all_participants=require_all,
         )
         goal = self.get_by_request(request_id)
+        strict_schema_previous_admission_digest = ""
+        pending_digest = str(strict_schema_pending_admission_digest or "").lower()
+        if goal is None and re.fullmatch(r"[0-9a-f]{64}", pending_digest) \
+                and not hmac.compare_digest(pending_digest, admission_digest):
+            candidate_previous = self._strict_schema_previous_admission_digest(
+                project_id=project_id,
+                project_path=root,
+                project_authority_id=actual_authority_id,
+                conversation_id=exact_conversation_id,
+                participant_ids=exact_participants,
+                lead_id=lead["id"],
+                objectives=objectives,
+                success_criteria=success_criteria,
+                policy=admission_policy,
+                attachments=attachments,
+                agents=agents,
+                require_all_participants=require_all,
+            )
+            if candidate_previous and hmac.compare_digest(
+                candidate_previous, pending_digest,
+            ):
+                strict_schema_previous_admission_digest = candidate_previous
         conflict = ""
+        accepted_admission_digest = admission_digest
         request_retired = bool(
             goal is not None and goal.get("request_tombstone") is True
         )
@@ -1539,10 +2716,30 @@ class GoalStore:
                     "request for changed work."
                 )
             elif not hmac.compare_digest(stored_digest, admission_digest):
-                conflict = (
-                    "That long-horizon request identity is already bound to a different "
-                    "project, chat, participant set, objective, policy, or attachment set."
-                )
+                if self._matches_migrated_admission_digest(
+                    goal,
+                    project_id=project_id,
+                    project_path=root,
+                    project_authority_id=actual_authority_id,
+                    conversation_id=exact_conversation_id,
+                    participant_ids=exact_participants,
+                    lead_id=lead["id"],
+                    objectives=objectives,
+                    success_criteria=success_criteria,
+                    policy=admission_policy,
+                    attachments=attachments,
+                    agents=agents,
+                    require_all_participants=require_all,
+                ):
+                    # Existing direct-admission journals and goal receipts are
+                    # bound to this original digest. Preserve it for an exact
+                    # replay rather than rewriting durable idempotency state.
+                    accepted_admission_digest = stored_digest
+                else:
+                    conflict = (
+                        "That long-horizon request identity is already bound to a different "
+                        "project, chat, participant set, objective, policy, or attachment set."
+                    )
         return {
             "project": project,
             "root": root,
@@ -1551,7 +2748,10 @@ class GoalStore:
             "participant_ids": exact_participants,
             "require_all_participants": require_all,
             "project_authority_id": actual_authority_id,
-            "admission_digest": admission_digest,
+            "admission_digest": accepted_admission_digest,
+            "strict_schema_previous_admission_digest": (
+                strict_schema_previous_admission_digest
+            ),
             "goal": goal,
             "request_retired": request_retired,
             "conflict": conflict,
@@ -1576,6 +2776,7 @@ class GoalStore:
         policy: dict[str, Any] | None = None, input_bundle: dict[str, Any] | None = None,
         participant_ids: list[str] | None = None, conversation_id: str = "",
         admission_digest: str = "", expected_project_authority_id: str = "",
+        expected_agents: list[dict[str, Any]] | None = None,
         require_all_participants: bool | None = None,
     ) -> dict[str, Any]:
         exact_conversation_id = _exact_conversation_id(conversation_id)
@@ -1600,6 +2801,10 @@ class GoalStore:
         agents = self._agents_for_project(board, project_id, participant_ids)
         if not agents:
             raise HarnessError("Assign at least one ready agent to this project")
+        if expected_agents is not None and agents != expected_agents:
+            raise HarnessError(
+                "The long-horizon provider binding changed before goal creation."
+            )
         if lead_id and not any(one["id"] == lead_id for one in agents):
             raise HarnessError("The selected lead is not one of this chat's ready project agents")
         lead = next((one for one in agents if one["id"] == lead_id), agents[0])
@@ -1829,6 +3034,7 @@ class GoalStore:
                 "schema_version": CANCELLATION_SCHEMA_VERSION,
                 "state": "none", "requested_ms": 0, "settled_ms": 0,
             },
+            "automatic_recovery_control": _automatic_recovery_control(False),
             "note": "Ready to begin useful project work.",
             "parent_goal_id": "",
             "fork_checkpoint": 0,
@@ -2032,7 +3238,7 @@ class GoalStore:
             self.public(document) for document in documents
             if document is not None and self._is_project_owner(document)
             and (document.get("project_queue") or {}).get("auto_start_pending") is True
-            and self._pristine_for_queue_migration(document)
+            and self._automatic_start_safe(document)
             and not str((document.get("worker") or {}).get("worker_id") or "")
         ][:max(1, min(MAX_GOALS, int(limit) if limit else MAX_GOALS))]
 
@@ -2067,7 +3273,7 @@ class GoalStore:
             self.public(document) for document in documents
             if document is not None and self._is_project_owner(document)
             and (document.get("project_queue") or {}).get("auto_start_pending") is True
-            and self._pristine_for_queue_migration(document)
+            and self._automatic_start_safe(document)
             and not str((document.get("worker") or {}).get("worker_id") or "")
         ], cursor)
 
@@ -2105,6 +3311,137 @@ class GoalStore:
             self.public(goal) for goal in promoted
             if str(goal.get("authority_key") or "") == self.authority_key
         ]
+
+    def record_automatic_start_failure(
+        self, goal_id: str, error: str, *, reason_code: str = "startup_blocked",
+        release_pristine: bool = False, expected_auto_start_arm_id: str = "",
+    ) -> dict[str, Any]:
+        """Persist an automatic-start rejection and safely release obsolete owners.
+
+        Only a pristine, lease-free goal can be released here.  Anything with a
+        provider reply, project artifact, pending transaction, or uncertain
+        effect keeps ownership and remains fail-closed for explicit recovery.
+        """
+
+        safe_error = _short(self.redactor.text(str(error or "Automatic start failed")), 4_000)
+        safe_code = _short(reason_code or "startup_blocked", 100)
+        expected_arm_id = str(expected_auto_start_arm_id or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", expected_arm_id):
+            raise HarnessError("The automatic-start failure has an invalid arm identity")
+        fingerprint = hashlib.sha256(_canonical({
+            "goal_id": goal_id, "reason_code": safe_code, "error": safe_error,
+            "release_pristine": bool(release_pristine),
+            "auto_start_arm_id": expected_arm_id,
+        }).encode("utf-8")).hexdigest()
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if document.get("status") in TERMINAL_GOALS - {"failed"} \
+                    or self._is_project_waiter(document) \
+                    or not self._is_project_owner(document):
+                return _NO_MUTATION
+            queue = document.get("project_queue") or {}
+            if queue.get("auto_start_pending") is not True:
+                return _NO_MUTATION
+            held_arm_id = _auto_start_arm_id(document)
+            if not hmac.compare_digest(
+                held_arm_id, expected_arm_id,
+            ):
+                return _NO_MUTATION
+            worker = document.get("worker") or {}
+            # A newer scheduler may have claimed the same still-current arm
+            # after an earlier starter failed locally. The failed starter
+            # releases its own lease before reporting; a nonblank lease here
+            # therefore belongs to newer work and must remain untouched.
+            if str(worker.get("worker_id") or ""):
+                return _NO_MUTATION
+            pristine = self._pristine_for_queue_migration(document)
+            automatic_safe = self._automatic_start_safe(document)
+            can_release = bool(
+                release_pristine
+                and self._is_project_owner(document)
+                and pristine
+                and not str(worker.get("worker_id") or "")
+            )
+            # Contract/authority drift is not transient. In particular, a
+            # schema-recovery goal may legitimately contain a completed peer,
+            # which makes it non-pristine; repeatedly waking that goal cannot
+            # make its immutable saved dispatch binding current again.
+            transient_startup_failure = safe_code == "startup_blocked"
+            retry_automatically = bool(
+                transient_startup_failure and not can_release and automatic_safe
+                and (document.get("project_queue") or {}).get("auto_start_pending") is True
+                and not str(worker.get("worker_id") or "")
+            )
+            previous = document.get("automatic_start_failure")
+            already_disarmed = bool(
+                retry_automatically
+                or (
+                    document.get("status") == "paused"
+                    and queue.get("auto_start_pending") is not True
+                )
+            )
+            if isinstance(previous, dict) \
+                    and hmac.compare_digest(
+                        str(previous.get("fingerprint_sha256") or ""), fingerprint,
+                    ) \
+                    and bool(previous.get("released_project")) == can_release \
+                    and bool(previous.get("retry_automatically")) == retry_automatically \
+                    and already_disarmed:
+                return _NO_MUTATION
+            now = _now()
+            document["automatic_start_failure"] = {
+                "schema_version": AUTOMATIC_START_FAILURE_SCHEMA_VERSION,
+                "reason_code": safe_code,
+                "error": safe_error,
+                "retry_automatically": retry_automatically,
+                "released_project": can_release,
+                "at_ms": now,
+                "fingerprint_sha256": fingerprint,
+            }
+            document["note"] = (
+                ("Automatic start stopped before any provider or project effect: " if pristine
+                 else "Automatic start is blocked and existing effects remain protected: ")
+                + safe_error
+            )
+            self._event(db, document, "goal_auto_start_blocked", payload={
+                "reason_code": safe_code,
+                "error": safe_error,
+                "retry_automatically": retry_automatically,
+                "released_project": can_release,
+            })
+            if can_release:
+                document["status"] = "failed"
+                document["project_queue"] = self._queue_record(
+                    "released", now,
+                    queued_ms=int(queue.get("queued_ms") or 0),
+                    promoted_ms=int(queue.get("promoted_ms") or 0),
+                )
+                document["note"] += (
+                    " Nexus released this obsolete pristine owner so the next "
+                    "saved goal can run with the current setup."
+                )
+                self._event(db, document, "goal_project_released", payload={
+                    "terminal_status": "failed",
+                    "reason": "automatic_start_rejected_before_effect",
+                    "execution_contract_fingerprint": document[
+                        "execution_contract"
+                    ]["fingerprint_sha256"],
+                })
+            elif not retry_automatically and not str(worker.get("worker_id") or ""):
+                document["status"] = "paused"
+                document["project_queue"] = self._queue_record(
+                    "owner", now,
+                    queued_ms=int(queue.get("queued_ms") or 0),
+                    promoted_ms=int(queue.get("promoted_ms") or 0),
+                )
+                document["note"] += (
+                    " Nexus kept project ownership because prior effects exist, "
+                    "paused the goal, and disabled automatic retries until the "
+                    "saved setup is explicitly reconciled."
+                )
+            return None
+
+        return self.public(self._mutate(goal_id, change)[0])
 
     def owned_queued_goals(self) -> list[dict[str, Any]]:
         with self.lock, self._connect() as db:
@@ -2420,12 +3757,16 @@ class GoalStore:
 
     def claim_scheduler(
         self, goal_id: str, worker_id: str, *, automatic: bool = False,
+        expected_auto_start_arm_id: str = "",
     ) -> bool:
         """Atomically acquire the one durable graph-dispatch lease for a goal."""
 
         worker_id = str(worker_id)
         if not worker_id:
             raise HarnessError("A stable scheduler identity is required")
+        expected_arm_id = str(expected_auto_start_arm_id or "")
+        if automatic and not re.fullmatch(r"[0-9a-f]{32}", expected_arm_id):
+            raise HarnessError("The automatic scheduler claim has an invalid arm identity")
         with self.lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -2442,7 +3783,10 @@ class GoalStore:
                     (document.get("project_queue") or {}).get(
                         "auto_start_pending"
                     ) is not True
-                    or not self._pristine_for_queue_migration(document)
+                    or not self._automatic_start_safe(document)
+                    or not hmac.compare_digest(
+                        _auto_start_arm_id(document), expected_arm_id,
+                    )
                 ):
                     # The watcher selects candidates from a prior SQLite
                     # snapshot. Revalidate its one-time automatic-dispatch
@@ -2640,7 +3984,11 @@ class GoalStore:
             document["budget"]["provider_calls"] += 1
             queue = document.get("project_queue") or {}
             if queue.get("auto_start_pending") is True:
-                queue["auto_start_pending"] = False
+                document["project_queue"] = self._queue_record(
+                    "owner", _now(),
+                    queued_ms=int(queue.get("queued_ms") or 0),
+                    promoted_ms=int(queue.get("promoted_ms") or 0),
+                )
                 self._event(db, document, "goal_auto_start_consumed", payload={
                     "task_id": current["id"],
                 })
@@ -2869,6 +4217,12 @@ class GoalStore:
                 raise HarnessError("A late agent result cannot overwrite the task's current owner")
             if document["status"] == "cancelled":
                 raise HarnessError("The goal was cancelled while its provider call was in flight")
+            # Revalidate at the durable acknowledgement boundary. Provider
+            # adapters normally validate before reaching the store, but this
+            # prevents malformed or blank named contributions from ever being
+            # persisted as genuine agent speech when another caller invokes
+            # the store directly.
+            _validate_action_semantics(action, current)
             action_bytes = len(_canonical(action).encode("utf-8"))
             if action_bytes > MAX_PENDING_ACTION_BYTES:
                 raise HarnessError(
@@ -2878,10 +4232,12 @@ class GoalStore:
             current["pending_action"] = copy.deepcopy(action)
             current["provider_effect_state"] = "acknowledged"
             current["reconciliation_required"] = False
+            summary_delivery = _summary_delivery(document, current, action)
             self._event(db, document, "provider_acknowledged", task_id=current["id"],
                         agent_id=current["assigned_agent_id"], payload={
                             "action": action["action"], "summary": action["summary"],
                             "effect_id": current.get("provider_effect_id", ""),
+                            "summary_delivery": summary_delivery,
                         }, run_id=goal_id)
             self._event(db, document, "agent_stopped", task_id=current["id"],
                         agent_id=current["assigned_agent_id"], payload={"outcome": "structured_action"})
@@ -3705,8 +5061,18 @@ class GoalStore:
                 document["status"] = "paused"
                 document["note"] = "The user rejected a risky proposal; no project file was changed."
             else:
+                document["automatic_recovery_control"] = _automatic_recovery_control(
+                    False,
+                )
                 document["status"] = "queued"
                 document["note"] = "The exact paused task has the user's answer and can continue."
+                self._event(
+                    db, document, "goal_interrupt_continuation_authorized",
+                    payload={
+                        "interrupt_ids": sorted(actual_pending_ids),
+                        "automatic_recovery_suppression_cleared": True,
+                    },
+                )
         self._mutate(goal_id, change)
 
     def pause_deadlock(self, goal_id: str, reason: str) -> None:
@@ -3720,6 +5086,24 @@ class GoalStore:
             self._event(db, document, "goal_paused", payload={
                 "reason": "dependency_deadlock", "detail": document["note"],
             })
+        self._mutate(goal_id, change)
+
+    def pause_runtime_failure(self, goal_id: str, reason: str) -> None:
+        """Persist an internal scheduler stop without impersonating a user Pause."""
+
+        safe_reason = _short(self.redactor.text(reason), 4_000)
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if document["status"] in TERMINAL_GOALS | {
+                "paused", "waiting_for_user", "waiting_for_project", "cancelling",
+            }:
+                return _NO_MUTATION
+            document["status"] = "paused"
+            document["note"] = "The runtime stopped at a safe boundary: " + safe_reason
+            self._event(db, document, "goal_paused", payload={
+                "reason": "runtime_failure", "detail": safe_reason,
+            })
+
         self._mutate(goal_id, change)
 
     def control(self, goal_id: str, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -3871,9 +5255,23 @@ class GoalStore:
             if action == "pause":
                 if document["status"] in TERMINAL_GOALS:
                     raise HarnessError("A terminal goal cannot be paused")
+                queue = document.get("project_queue") or {}
+                cancelled_auto_start = queue.get("auto_start_pending") is True
+                if cancelled_auto_start:
+                    document["project_queue"] = self._queue_record(
+                        "owner", _now(),
+                        queued_ms=int(queue.get("queued_ms") or 0),
+                        promoted_ms=int(queue.get("promoted_ms") or 0),
+                    )
+                document["automatic_recovery_control"] = _automatic_recovery_control(
+                    True, reason="user_pause",
+                )
                 document["status"] = "paused"
                 document["note"] = "Paused by the user at the next safe boundary."
-                self._event(db, document, "goal_paused", payload={"reason": "user"})
+                self._event(db, document, "goal_paused", payload={
+                    "reason": "user",
+                    "automatic_start_cancelled": cancelled_auto_start,
+                })
             elif action == "resume":
                 if document["status"] == "waiting_for_user":
                     raise HarnessError("Answer the pending question before resuming")
@@ -3888,6 +5286,9 @@ class GoalStore:
                     raise HarnessError(
                         "Reconcile or supersede pending provider/file effects before resuming this goal"
                     )
+                document["automatic_recovery_control"] = _automatic_recovery_control(
+                    False,
+                )
                 for task in document["tasks"]:
                     if task["state"] in {"blocked", "failed"} and task.get("outcome_unknown") is not True:
                         task["state"] = "ready"
@@ -4094,6 +5495,9 @@ class GoalStore:
                              "owner_token": "", "outcome_unknown": False,
                              "reconciliation_required": False,
                              "provider_effect_state": "reconciled_for_retry"})
+                document["automatic_recovery_control"] = _automatic_recovery_control(
+                    False,
+                )
                 document["status"] = "queued"
                 self._event(db, document, "task_retried", task_id=task_id,
                             agent_id=task["assigned_agent_id"], payload={
@@ -4146,6 +5550,9 @@ class GoalStore:
                 if task["state"] in {"blocked", "failed"}:
                     task["state"] = "ready"
                 if document["status"] not in {"paused", "waiting_for_user"}:
+                    document["automatic_recovery_control"] = _automatic_recovery_control(
+                        False,
+                    )
                     document["status"] = (
                         "running" if any(one["state"] == "running" for one in document["tasks"])
                         else "queued"
@@ -4261,6 +5668,9 @@ class GoalStore:
                     self._event(db, document, "task_created", task_id=steering_id,
                                 agent_id=owner_id, payload={"kind": "steering", "reason": "user_steering"})
                 if document["status"] not in TERMINAL_GOALS:
+                    document["automatic_recovery_control"] = _automatic_recovery_control(
+                        False,
+                    )
                     document["status"] = (
                         "running" if any(one["state"] == "running" for one in document["tasks"])
                         else "queued"
@@ -4345,6 +5755,9 @@ class GoalStore:
                 document["budget"]["tasks_created"] += 1
                 task["review_return_state"] = task["state"]
                 task["state"] = "waiting_review"
+                document["automatic_recovery_control"] = _automatic_recovery_control(
+                    False,
+                )
                 document["status"] = (
                     "running" if any(one["state"] == "running" for one in document["tasks"])
                     else "queued"
@@ -4478,6 +5891,45 @@ class GoalStore:
                         agent_id=document["lead_agent_id"], payload={"kind": "repair", "verification_failure": reason})
         return self.public(self._mutate(goal_id, change)[0])
 
+    def recover_codex_schema_rejection(self, goal_id: str) -> dict[str, Any]:
+        """Retry the known fixed schema rejection after restart normalization."""
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if not self._repair_codex_schema_rejection(db, document):
+                return _NO_MUTATION
+            return True
+
+        document, repaired = self._mutate(goal_id, change)
+        result = self.public(document)
+        result["schema_recovery_applied"] = bool(repaired)
+        return result
+
+    def recover_interrupted_codex_schema_retry(self, goal_id: str) -> dict[str, Any]:
+        """Restore a one-time schema retry which never reached its provider."""
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if not self._recover_interrupted_codex_schema_retry(db, document):
+                return _NO_MUTATION
+            return True
+
+        document, recovered = self._mutate(goal_id, change)
+        result = self.public(document)
+        result["schema_retry_before_dispatch_recovered"] = bool(recovered)
+        return result
+
+    def disarm_invalid_codex_schema_auto_start(self, goal_id: str) -> dict[str, Any]:
+        """Persistently expose an invalid automatic recovery instead of spinning."""
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if not self._disarm_invalid_codex_schema_auto_start(db, document):
+                return _NO_MUTATION
+            return True
+
+        document, disarmed = self._mutate(goal_id, change)
+        result = self.public(document)
+        result["schema_recovery_auto_start_disarmed"] = bool(disarmed)
+        return result
+
     def recover_dead(self, goal_id: str) -> dict[str, Any]:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             worker = document.get("worker", {})
@@ -4561,7 +6013,7 @@ class GoalStore:
                         task["last_error"] = (
                             "Provider outcome is unknown after restart; explicitly reconcile before retrying."
                             if task["outcome_unknown"] else
-                            "Nexus restarted before the provider effect began; retry is safe."
+                            DEAD_BEFORE_PROVIDER_EFFECT_ERROR
                         )
                         task.update({"lease_id": "", "owner_pid": 0, "owner_token": ""})
             document["worker"] = {
@@ -4595,7 +6047,7 @@ class GoalStore:
             if any(one["state"] == "running" for one in document["tasks"]):
                 raise HarnessError("A queued goal with an active lease must use provider-effect recovery")
             if (document.get("project_queue") or {}).get("auto_start_pending") is True \
-                    and self._pristine_for_queue_migration(document):
+                    and self._automatic_start_safe(document):
                 document["worker"] = {
                     "schema_version": SCHEDULER_LEASE_SCHEMA_VERSION,
                     "pid": 0, "token": "", "worker_id": "", "kind": "runtime",
@@ -4739,6 +6191,40 @@ class LongHorizonRuntime:
             self._auto_start_enabled = True
             self._watcher_wake.set()
 
+    def _record_automatic_start_failure(
+        self, goal_id: str, exc: BaseException, *, expected_auto_start_arm_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Make a rejected background start durable instead of swallowing it."""
+
+        try:
+            goal = self.store.get(goal_id)
+            collaboration = self.store.collaboration_setup_status(goal)
+            provider = self.store.provider_setup_status(goal)
+            if collaboration.get("changed"):
+                reason_code = "collaboration_contract_changed"
+                release_pristine = True
+            elif provider.get("changed"):
+                reason_code = "provider_setup_changed"
+                release_pristine = True
+            else:
+                try:
+                    self._require_goal_authority(goal)
+                except Exception:
+                    reason_code = "project_authority_changed"
+                    release_pristine = True
+                else:
+                    reason_code = "startup_blocked"
+                    release_pristine = False
+            recorded = self.store.record_automatic_start_failure(
+                goal_id, str(exc), reason_code=reason_code,
+                release_pristine=release_pristine,
+                expected_auto_start_arm_id=expected_auto_start_arm_id,
+            )
+        except Exception:
+            return None
+        self._start_promoted_goals(recorded.get("promoted_goal_ids", []))
+        return recorded
+
     def _auto_start_watch(self) -> None:
         while not self._watcher_stop.is_set():
             self._watcher_wake.wait(timeout=0.25)
@@ -4756,14 +6242,20 @@ class LongHorizonRuntime:
                 if self._watcher_stop.is_set():
                     break
                 try:
+                    expected_arm_id = _auto_start_arm_id(goal)
                     with self.lock:
                         recent = self._auto_start_attempted.get(str(goal["goal_id"]), 0.0)
                     if time.monotonic() - recent < 60.0:
                         continue
                     self.start_background(
                         str(goal["goal_id"]), automatic=True,
+                        expected_auto_start_arm_id=expected_arm_id,
                     )
-                except Exception:
+                except Exception as exc:
+                    self._record_automatic_start_failure(
+                        str(goal.get("goal_id") or ""), exc,
+                        expected_auto_start_arm_id=expected_arm_id,
+                    )
                     continue
 
     def _build_graph(self):
@@ -4846,7 +6338,7 @@ class LongHorizonRuntime:
                     "state": one.get("state", ""),
                     "attempts": int(one.get("attempts") or 0),
                     "provider_effect_state": one.get("provider_effect_state", ""),
-                    "summary": _short(one.get("summary"), 4_000),
+                    "summary": _short(one.get("summary"), 8_000),
                     "last_error": _short(one.get("last_error"), 4_000),
                     "evidence": one.get("evidence", [])[-24:],
                     "artifacts": one.get("artifacts", [])[-12:],
@@ -4856,7 +6348,7 @@ class LongHorizonRuntime:
             contribution_packet = (
                 "\n\nREQUIRED CONTRIBUTION FAN-IN (durable bounded outcomes)\n"
                 + _canonical(_durable_evidence(
-                    contributions, string_limit=4_000, list_limit=100,
+                    contributions, string_limit=8_000, list_limit=100,
                 ))
             )
         required_tasks = [
@@ -4867,6 +6359,55 @@ class LongHorizonRuntime:
                 one["id"] == task["id"]
                 or one["state"] in {"complete", "blocked", "failed", "cancelled"}
                 for one in required_tasks
+            )
+        required_position = next((
+            index for index, one in enumerate(required_tasks)
+            if one["id"] == task["id"]
+        ), -1)
+        prior_named_contributions = [
+            one for one in required_tasks
+            if one["id"] != task["id"] and _short(one.get("summary"), 8_000)
+        ]
+        next_named_task = next((
+            one for one in required_tasks[required_position + 1:]
+            if required_position >= 0
+            and _can_receive_future_required_contribution(one)
+        ), None)
+        agent_names = {
+            str(one.get("id") or ""): _short(one.get("name") or one.get("id"), 300)
+            for one in goal.get("agents", []) if isinstance(one, dict)
+        }
+        dialogue_guidance = ""
+        if task.get("required_contributor_id") and len(required_tasks) > 1:
+            if prior_named_contributions:
+                prior_names = ", ".join(dict.fromkeys(
+                    agent_names.get(
+                        str(one.get("required_contributor_id") or ""),
+                        str(one.get("required_contributor_id") or "another agent"),
+                    )
+                    for one in prior_named_contributions
+                ))
+                dialogue_guidance = (
+                    f"Your summary is your visible project-work response to {prior_names}'s "
+                    "durable contributions in the shared chat. "
+                    "Respond substantively to their durable contributions: state what you accept, "
+                    "challenge, or improve, then give your concrete result and evidence. Nexus will "
+                    "relay this exact summary into the shared chat; do not invent words for anyone else. "
+                )
+            elif next_named_task is not None:
+                next_id = str(
+                    next_named_task.get("required_contributor_id")
+                    or next_named_task.get("assigned_agent_id") or ""
+                )
+                dialogue_guidance = (
+                    "Write your summary as a concrete visible project-work message to "
+                    + agent_names.get(next_id, next_id or "the next teammate")
+                    + ": include the result, evidence, and any specific issue they should evaluate. "
+                      "Nexus will relay that exact summary to the teammate and the shared chat. "
+                )
+            dialogue_guidance += (
+                "If you choose ask_user, address the summary and questions to the user; "
+                "Nexus will not misroute that request as a teammate message. "
             )
         review_packet = ""
         if task.get("kind") == "review" and task.get("review_of"):
@@ -4919,6 +6460,7 @@ class LongHorizonRuntime:
             "be handed off. Consume the durable bounded outcomes from earlier contributors and current "
             "project state; preserve every partial failure explicitly and never claim a missing "
             "contribution succeeded. "
+            + dialogue_guidance
             + (
                 "This is the final named contribution, so perform the bounded team fan-in now: "
                 "reconcile compatible work and close any remaining safe gap before deterministic verification. "
@@ -5490,7 +7032,7 @@ class LongHorizonRuntime:
 
     def start_background(
         self, goal_id: str, answers: dict[str, Any] | None = None, *,
-        automatic: bool = False,
+        automatic: bool = False, expected_auto_start_arm_id: str = "",
     ) -> dict[str, Any]:
         self._enable_auto_start_watcher()
         with self.lock:
@@ -5516,6 +7058,7 @@ class LongHorizonRuntime:
             scheduler_id = uuid.uuid4().hex
             if not self.store.claim_scheduler(
                 goal_id, scheduler_id, automatic=automatic,
+                expected_auto_start_arm_id=expected_auto_start_arm_id,
             ):
                 return self.store.public(self.store.get(goal_id), reused=True)
             self.scheduler_ids[goal_id] = scheduler_id
@@ -5533,15 +7076,17 @@ class LongHorizonRuntime:
                             if goal["status"] not in TERMINAL_GOALS | {
                                 "waiting_for_user", "waiting_for_project", "paused", "cancelling",
                             }:
-                                self.store.control(goal_id, "pause")
+                                self.store.pause_runtime_failure(goal_id, str(exc))
                     except Exception:
                         pass
                 finally:
                     with self.lock:
                         self.workers.pop(goal_id, None)
-            thread = threading.Thread(target=work, name=f"nexus-goal-{goal_id[:8]}", daemon=True)
-            self.workers[goal_id] = thread
             try:
+                thread = threading.Thread(
+                    target=work, name=f"nexus-goal-{goal_id[:8]}", daemon=True,
+                )
+                self.workers[goal_id] = thread
                 thread.start()
             except Exception:
                 self.workers.pop(goal_id, None)
@@ -5604,15 +7149,22 @@ class LongHorizonRuntime:
         if not isinstance(goal_ids, list):
             return
         for goal_id in list(dict.fromkeys(str(one) for one in goal_ids if str(one))):
+            expected_arm_id = ""
             try:
                 goal = self.store.get(goal_id)
                 if goal["status"] == "queued" and self.store._is_project_owner(goal):
-                    self.start_background(goal_id, automatic=True)
-            except HarnessError:
-                # Promotion is already durable.  A changed provider setup or a
-                # newly arrived legacy owner must not roll back terminal work
-                # or cause an automatic resend; recovery exposes the queued
-                # checkpoint for explicit continuation.
+                    expected_arm_id = _auto_start_arm_id(goal)
+                    self.start_background(
+                        goal_id, automatic=True,
+                        expected_auto_start_arm_id=expected_arm_id,
+                    )
+            except Exception as exc:
+                # Promotion is already durable. Persist the exact rejection;
+                # only an obsolete pristine owner may release the project.
+                self._record_automatic_start_failure(
+                    goal_id, exc,
+                    expected_auto_start_arm_id=expected_arm_id,
+                )
                 continue
 
     def start_board(self, board: dict[str, Any], request_id: str) -> list[dict[str, Any]]:
@@ -5667,24 +7219,52 @@ class LongHorizonRuntime:
                     })
                     recovered.append(finalized)
                     self._start_promoted_goals(finalized.get("promoted_goal_ids", []))
-            elif any(one["state"] == "running" for one in goal["tasks"]):
-                recovered.append(self.store.recover_dead(goal["goal_id"]))
-            elif goal["status"] == "queued":
-                queued = self.store.recover_orphaned_queue(goal["goal_id"])
-                recovered.append(queued)
-                if queued.get("status") == "queued" \
-                        and (queued.get("project_queue") or {}).get(
+            else:
+                current = goal
+                if any(one["state"] == "running" for one in current["tasks"]):
+                    current = self.store.recover_dead(goal["goal_id"])
+                    recovered.append(current)
+                if current.get("status") == "queued":
+                    current = self.store.recover_orphaned_queue(goal["goal_id"])
+                    recovered.append(current)
+                # Dead-worker/orphan normalization may be the operation that
+                # makes a current retry safe to continue or the former exact
+                # rejection safe to repair. Resolve both in this same recovery
+                # pass so an upgrade never needs a second application restart.
+                continued = self.store.recover_interrupted_codex_schema_retry(
+                    goal["goal_id"]
+                )
+                if continued.get("schema_retry_before_dispatch_recovered"):
+                    recovered.append(continued)
+                current = continued
+                disarmed = self.store.disarm_invalid_codex_schema_auto_start(
+                    goal["goal_id"]
+                )
+                if disarmed.get("schema_recovery_auto_start_disarmed"):
+                    recovered.append(disarmed)
+                current = disarmed
+                if not disarmed.get("schema_recovery_auto_start_disarmed"):
+                    repaired = self.store.recover_codex_schema_rejection(goal["goal_id"])
+                    if repaired.get("schema_recovery_applied"):
+                        recovered.append(repaired)
+                    current = repaired
+                if current.get("status") == "queued" \
+                        and (current.get("project_queue") or {}).get(
                             "auto_start_pending"
-                        ) is True:
+                        ) is True \
+                        and not self.store._scheduler_live(current):
                     try:
                         self.start_background(
                             goal["goal_id"], automatic=True,
+                            expected_auto_start_arm_id=_auto_start_arm_id(current),
                         )
-                    except Exception:
-                        # Recovery is an availability path. A removed project,
-                        # provider drift, or external owner must leave the
-                        # durable checkpoint inspectable instead of preventing
-                        # the runtime from loading other goals.
+                    except Exception as exc:
+                        # Recovery is an availability path, but a rejected
+                        # start must still be an inspectable durable event.
+                        self._record_automatic_start_failure(
+                            str(goal.get("goal_id") or ""), exc,
+                            expected_auto_start_arm_id=_auto_start_arm_id(current),
+                        )
                         continue
         return recovered
 
@@ -5715,6 +7295,7 @@ class LongHorizonRuntime:
         policy: dict[str, Any] | None = None, attachments: object = None,
         participant_ids: list[str] | None = None, conversation_id: str = "",
         expected_project_authority_id: str = "",
+        expected_admission_digest: str = "",
         require_all_participants: bool | None = None,
     ) -> dict[str, Any]:
         with self.lock:
@@ -5729,11 +7310,21 @@ class LongHorizonRuntime:
             require_all = bool(inspected["require_all_participants"])
             root = Path(inspected["root"])
             agents = list(inspected["agents"])
+            admitted_agents = copy.deepcopy(agents)
             lead = dict(inspected["lead"])
             goal = inspected["goal"]
             request_retired = bool(inspected["request_retired"])
             actual_authority_id = str(inspected["project_authority_id"])
             admission_digest = str(inspected["admission_digest"])
+            expected_digest = str(expected_admission_digest or "").lower()
+            if expected_digest:
+                if not re.fullmatch(r"[0-9a-f]{64}", expected_digest) \
+                        or not hmac.compare_digest(
+                            expected_digest, admission_digest.lower(),
+                        ):
+                    raise HarnessError(
+                        "The long-horizon admission binding changed before goal creation."
+                    )
             if goal is not None:
                 if request_retired:
                     # Replay protection is already the terminal result. Do not
@@ -5749,12 +7340,6 @@ class LongHorizonRuntime:
                 self._require_no_external_owner(root)
                 input_bundle = None
                 if attachments:
-                    agents = self.store._agents_for_project(
-                        board, project_id, participant_ids
-                    )
-                    if not agents:
-                        raise HarnessError("Assign at least one ready agent to this project")
-                    lead = next((one for one in agents if one["id"] == lead_id), agents[0])
                     attachment_root = (
                         self.store.root / "long-horizon-inputs" / self.store.authority_key
                         / hashlib.sha256(_exact_request_id(request_id).encode("utf-8")).hexdigest()
@@ -5788,6 +7373,7 @@ class LongHorizonRuntime:
                             conversation_id=conversation_id,
                             admission_digest=admission_digest,
                             expected_project_authority_id=actual_authority_id,
+                            expected_agents=admitted_agents,
                         )
                     except Exception:
                         if attachment_root.exists() and expected_parent in attachment_root.parents:
@@ -5803,6 +7389,7 @@ class LongHorizonRuntime:
                         conversation_id=conversation_id,
                         admission_digest=admission_digest,
                         expected_project_authority_id=actual_authority_id,
+                        expected_agents=admitted_agents,
                     )
             if goal.get("request_tombstone") is True:
                 # Detailed terminal history is intentionally bounded, but a

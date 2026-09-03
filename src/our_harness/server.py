@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import hmac
@@ -71,6 +72,10 @@ DIRECT_LONG_HORIZON_ADMISSION_MAX_BYTES = 12_000_000
 DIRECT_LONG_HORIZON_ADMISSION_MAX_PENDING = 20
 DIRECT_LONG_HORIZON_ADMISSION_MAX_TOMBSTONES = 2048
 DIRECT_LONG_HORIZON_ADMISSION_BINDING_SCHEMA_VERSION = 1
+DIRECT_LONG_HORIZON_ADMISSION_BINDING_MIGRATION_SCHEMA_VERSION = 1
+DIRECT_LONG_HORIZON_STRICT_SCHEMA_BINDING_MIGRATION = (
+    "strict-output-schema-object-closure-v2"
+)
 DIRECT_LONG_HORIZON_RECEIPT_SCHEMA_VERSION = 1
 DIRECT_LONG_HORIZON_TERMINAL_RECEIPT_SCHEMA_VERSION = 1
 
@@ -417,6 +422,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # Serializes project switching with the short admission window before
         # a command owns its durable run/provider lease.
         self.project_admission_lock = threading.Lock()
+        # Marks the exact cross-process request+chat lease held by this thread.
+        # A compatibility rewrite of authenticated pending admission metadata
+        # is never allowed from a helper call outside that lease.
+        self._direct_admission_lease_context = threading.local()
         # Created only when automation functionality is first used. Merely
         # opening an unrelated chat must not write a project authority
         # descriptor into that project.
@@ -735,7 +744,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
     def project_long_horizon_chat_statuses(
         self, goals: list[dict[str, Any]],
     ) -> None:
-        """Idempotently copy canonical goal transitions into origin chats."""
+        """Idempotently copy canonical goal progress into origin chats."""
 
         chat_goals = [
             goal for goal in goals
@@ -758,17 +767,80 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                         )
                         if conversation is None:
                             continue
-                        chat_lab.keep_long_horizon_status(
+                        transcript_route = str(
+                            conversation.get("transcript_route") or ""
+                        )
+                        filed_as = str(conversation.get("filed_as") or "")
+                        cursor = chat_lab.long_horizon_event_cursor(
+                            self.config, transcript_route,
+                            str(goal.get("goal_id") or ""), filed_as=filed_as,
+                        )
+                        expected = int(goal.get("event_seq") or 0)
+                        binding_missing = False
+                        while cursor < expected:
+                            page = self.long_horizon.store.events(
+                                str(goal.get("goal_id") or ""), after=cursor,
+                                limit=200,
+                            )
+                            page_events = list(page.get("events") or [])
+                            bounded_events = [
+                                event for event in page_events
+                                if isinstance(event, dict)
+                                and int(event.get("seq") or 0) <= expected
+                            ]
+                            oldest_available = int(page.get("oldest_available") or 0)
+                            bounded_oldest = min(oldest_available, expected + 1)
+                            next_cursor = max([
+                                cursor,
+                                *[
+                                    int(event.get("seq") or 0)
+                                    for event in bounded_events
+                                ],
+                                *(
+                                    [bounded_oldest - 1]
+                                    if page.get("truncated") else []
+                                ),
+                            ])
+                            if next_cursor <= cursor:
+                                break
+                            projection = chat_lab.keep_long_horizon_events(
+                                self.config, transcript_route, goal,
+                                bounded_events,
+                                filed_as=filed_as, chat_id=chat_id,
+                                project_id=str(
+                                    (goal.get("project") or {}).get("id") or ""
+                                ),
+                                lead_id=str(goal.get("lead_agent_id") or ""),
+                                truncated_after=(cursor if page.get("truncated") else 0),
+                                oldest_available=(
+                                    bounded_oldest
+                                    if page.get("truncated") else 0
+                                ),
+                            )
+                            if projection.get("binding_missing"):
+                                binding_missing = True
+                                break
+                            cursor = min(expected, max(
+                                next_cursor,
+                                int(projection.get("projected_event_cursor") or 0),
+                            ))
+                            if not page.get("has_more") and cursor < expected:
+                                break
+                        if binding_missing:
+                            continue
+                        status_projection = chat_lab.keep_long_horizon_status(
                             self.config,
-                            str(conversation.get("transcript_route") or ""),
+                            transcript_route,
                             goal,
-                            filed_as=str(conversation.get("filed_as") or ""),
+                            filed_as=filed_as,
                             chat_id=chat_id,
                             project_id=str(
                                 (goal.get("project") or {}).get("id") or ""
                             ),
                             lead_id=str(goal.get("lead_agent_id") or ""),
                         )
+                        if status_projection.get("binding_missing"):
+                            continue
                 except HarnessError as exc:
                     # A normal chat turn owns this exact transcript briefly.
                     # Its next goal poll will reconcile the status; unrelated
@@ -871,6 +943,17 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             for one in conversation.get("pair_agents", [])
             if isinstance(one, dict) and str(one.get("id") or "")
         ]
+        binding = conversation.get("binding")
+        agent_routes = (
+            binding.get("agent_routes") if isinstance(binding, dict) else None
+        )
+        if not isinstance(agent_routes, dict) or any(
+            not isinstance(agent_routes.get(agent_id), dict)
+            for agent_id in participant_ids
+        ):
+            raise HarnessError(
+                "The selected chat does not have exact provider bindings for every participant."
+            )
         return {
             "project_id": project_id,
             "project_root": project_root,
@@ -878,6 +961,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             "chat_id": chat_id,
             "conversation": conversation,
             "participant_ids": participant_ids,
+            "participant_route_bindings": {
+                agent_id: copy.deepcopy(agent_routes[agent_id])
+                for agent_id in participant_ids
+            },
             "transcript_route": str(conversation.get("transcript_route") or ""),
             "filed_as": str(conversation.get("filed_as") or ""),
         }
@@ -902,18 +989,41 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             with self.swarm_communication_runs.conversation_turn(
                 chat_owner, chat, timeout=timeout,
             ):
-                yield
+                leases = getattr(
+                    self._direct_admission_lease_context, "leases", None,
+                )
+                if not isinstance(leases, dict):
+                    leases = {}
+                    self._direct_admission_lease_context.leases = leases
+                lease_key = (request, chat)
+                leases[lease_key] = int(leases.get(lease_key) or 0) + 1
+                try:
+                    yield
+                finally:
+                    remaining = int(leases.get(lease_key) or 0) - 1
+                    if remaining > 0:
+                        leases[lease_key] = remaining
+                    else:
+                        leases.pop(lease_key, None)
+
+    def _holds_direct_admission_turn(self, request_id: str, chat_id: str) -> bool:
+        leases = getattr(self._direct_admission_lease_context, "leases", None)
+        if not isinstance(leases, dict):
+            return False
+        return int(leases.get((
+            str(request_id or "").strip(), str(chat_id or "").strip(),
+        )) or 0) > 0
 
     def _preflight_direct_long_horizon(
         self, standing: dict[str, Any], payload: dict[str, Any],
-        context: dict[str, Any],
+        context: dict[str, Any], *, pending_admission_digest: str = "",
     ) -> dict[str, Any]:
         """Compute the exact goal binding without constructing a scheduler runtime."""
 
         store = _long_horizon_module().GoalStore(
             self.config, migrate_execution_metadata=False,
         )
-        return store.preflight_runtime_admission(
+        inspected = store.preflight_runtime_admission(
             standing["board"], context["project_id"],
             list(payload["objectives"]), str(payload["request_id"]),
             lead_id=context["lead_id"],
@@ -921,7 +1031,27 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             policy=payload.get("policy"), attachments=payload.get("attachments"),
             participant_ids=context["participant_ids"],
             conversation_id=context["chat_id"],
+            strict_schema_pending_admission_digest=pending_admission_digest,
         )
+        expected_bindings = context.get("participant_route_bindings")
+        observed_bindings = {
+            str(agent.get("id") or ""): swarm_chats._verified_chat_route_projection(  # noqa: SLF001
+                {
+                    **(
+                        agent.get("route_binding")
+                        if isinstance(agent.get("route_binding"), dict) else {}
+                    ),
+                    "effective_dispatch_strength": "verified",
+                }
+            )
+            for agent in inspected.get("agents", []) if isinstance(agent, dict)
+        }
+        if not isinstance(expected_bindings, dict) \
+                or observed_bindings != expected_bindings:
+            raise HarnessError(
+                "The selected chat's provider binding changed during goal admission."
+            )
+        return inspected
 
     def _direct_admission_folder(self) -> tuple[Path, str]:
         store = self.swarm_communication_runs
@@ -959,6 +1089,38 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             raise HarnessError(
                 "A saved direct project admission has an invalid goal binding"
             )
+        allowed = {"schema_version", "admission_digest", "migration"}
+        if set(binding) - allowed:
+            raise HarnessError(
+                "A saved direct project admission has unsupported goal-binding fields"
+            )
+        migration = binding.get("migration")
+        if migration not in (None, {}):
+            exact_keys = {
+                "schema_version", "migration", "from_admission_digest",
+                "to_admission_digest", "migrated_ms",
+            }
+            if not isinstance(migration, dict) or set(migration) != exact_keys \
+                    or migration.get("schema_version") \
+                    != DIRECT_LONG_HORIZON_ADMISSION_BINDING_MIGRATION_SCHEMA_VERSION \
+                    or migration.get("migration") \
+                    != DIRECT_LONG_HORIZON_STRICT_SCHEMA_BINDING_MIGRATION \
+                    or str(migration.get("to_admission_digest") or "").lower() \
+                    != digest \
+                    or not isinstance(migration.get("migrated_ms"), int) \
+                    or int(migration.get("migrated_ms") or 0) <= 0:
+                raise HarnessError(
+                    "A saved direct project admission has invalid goal-binding migration proof"
+                )
+            previous = str(
+                migration.get("from_admission_digest") or ""
+            ).lower()
+            if len(previous) != 64 or any(
+                one not in "0123456789abcdef" for one in previous
+            ) or hmac.compare_digest(previous, digest):
+                raise HarnessError(
+                    "A saved direct project admission has invalid goal-binding migration proof"
+                )
         return digest
 
     @staticmethod
@@ -1308,7 +1470,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
 
     def _save_direct_admission(
         self, payload: dict[str, Any], context: dict[str, Any],
-        admission_digest: str,
+        admission_digest: str, *, strict_schema_previous_admission_digest: str = "",
     ) -> dict[str, Any]:
         from .safety import ProjectTransactionLock
 
@@ -1361,10 +1523,51 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 if existing_digest and not hmac.compare_digest(
                     existing_digest, bound_digest,
                 ):
-                    raise HarnessError(
-                        "That saved direct project request is bound to a different "
-                        "full goal admission contract."
+                    previous_digest = str(
+                        strict_schema_previous_admission_digest or ""
+                    ).lower()
+                    exact_previous = (
+                        len(previous_digest) == 64
+                        and all(one in "0123456789abcdef" for one in previous_digest)
+                        and hmac.compare_digest(existing_digest, previous_digest)
                     )
+                    lease_held = self._holds_direct_admission_turn(
+                        str(payload["request_id"]), str(payload["chat_id"]),
+                    )
+                    canonical_goal = _long_horizon_module().GoalStore(
+                        self.config, migrate_execution_metadata=False,
+                    ).get_by_request(str(payload["request_id"]))
+                    if not exact_previous or not lease_held \
+                            or canonical_goal is not None:
+                        raise HarnessError(
+                            "That saved direct project request is bound to a different "
+                            "full goal admission contract."
+                        )
+                    now = int(time.time() * 1000)
+                    admission_binding["migration"] = {
+                        "schema_version": (
+                            DIRECT_LONG_HORIZON_ADMISSION_BINDING_MIGRATION_SCHEMA_VERSION
+                        ),
+                        "migration": DIRECT_LONG_HORIZON_STRICT_SCHEMA_BINDING_MIGRATION,
+                        "from_admission_digest": existing_digest,
+                        "to_admission_digest": bound_digest,
+                        "migrated_ms": now,
+                    }
+                    upgraded_unsigned = {
+                        **self._direct_admission_unsigned(existing),
+                        "admission_binding": admission_binding,
+                        "updated_ms": now,
+                    }
+                    existing = {
+                        **upgraded_unsigned,
+                        "integrity_mac": mac(
+                            "direct-long-horizon-admission-v1", upgraded_unsigned,
+                        ),
+                    }
+                    atomic_text(path, json.dumps(
+                        existing, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ) + "\n")
                 if not existing_digest:
                     now = int(time.time() * 1000)
                     upgraded_unsigned = {
@@ -1550,10 +1753,12 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 "client_consumed": False,
             }
             if admission_digest:
-                unsigned["admission_binding"] = {
-                    "schema_version": DIRECT_LONG_HORIZON_ADMISSION_BINDING_SCHEMA_VERSION,
-                    "admission_digest": admission_digest,
-                }
+                # Preserve authenticated migration provenance with the current
+                # digest when compacting the payload into a terminal fence.
+                unsigned["admission_binding"] = json.loads(json.dumps(
+                    current["admission_binding"],
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ))
             retired = {
                 **unsigned,
                 "integrity_mac": mac("direct-long-horizon-admission-v1", unsigned),
@@ -2288,20 +2493,35 @@ class HarnessHTTPServer(ThreadingHTTPServer):
     ) -> dict[str, Any]:
         payload = self._canonical_direct_long_horizon_payload(supplied)
         with self.project_admission_lock, self.swarm_lock:
-            standing = self.swarm_standing()
-            context = self._direct_long_horizon_context(standing, payload)
-            intent_sha256 = chat_lab.long_horizon_intent_sha256(
-                context["chat_id"], context["project_id"], context["lead_id"],
-                str(payload["text"]), payload.get("attachments"),
-            )
             with self._direct_admission_turn(
-                str(payload["request_id"]), context["chat_id"], timeout=30.0,
+                str(payload["request_id"]), str(payload["chat_id"]), timeout=30.0,
             ):
+                pending_path = self._direct_admission_path(
+                    str(payload["request_id"])
+                )
+                pending_admission_digest = ""
+                if pending_path.exists():
+                    pending_record = self._load_direct_admission(
+                        str(payload["request_id"]), str(payload["chat_id"]),
+                    )
+                    pending_admission_digest = self._direct_admission_binding_digest(
+                        pending_record,
+                    )
+                standing = self.swarm_standing()
+                context = self._direct_long_horizon_context(standing, payload)
+                intent_sha256 = chat_lab.long_horizon_intent_sha256(
+                    context["chat_id"], context["project_id"], context["lead_id"],
+                    str(payload["text"]), payload.get("attachments"),
+                )
                 preflight = self._preflight_direct_long_horizon(
                     standing, payload, context,
+                    pending_admission_digest=pending_admission_digest,
                 )
                 record = self._save_direct_admission(
                     payload, context, str(preflight["admission_digest"]),
+                    strict_schema_previous_admission_digest=str(
+                        preflight.get("strict_schema_previous_admission_digest") or ""
+                    ),
                 )
                 chat_lab.keep_long_horizon_prompt(
                     self.config, context["transcript_route"], str(payload["text"]),
@@ -2324,10 +2544,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         else:
             payload = self._canonical_direct_long_horizon_payload(supplied)
         with self.project_admission_lock, self.swarm_lock:
-            standing = self.swarm_standing()
-            context = self._direct_long_horizon_context(standing, payload)
+            standing: dict[str, Any] | None = None
+            context: dict[str, Any] | None = None
             with self._direct_admission_turn(
-                str(payload["request_id"]), context["chat_id"], timeout=30.0,
+                str(payload["request_id"]), str(payload["chat_id"]), timeout=30.0,
             ):
                 if from_pending:
                     # Re-read only after the cross-process request+chat leases. A
@@ -2340,15 +2560,41 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     payload = record["payload"]
                     standing = self.swarm_standing()
                     context = self._direct_long_horizon_context(standing, payload)
+                else:
+                    # Resolve and freeze the chat only after holding its exact
+                    # cross-process admission lease. A pre-lease snapshot can
+                    # otherwise be replaced while this request is waiting.
+                    standing = self.swarm_standing()
+                    context = self._direct_long_horizon_context(standing, payload)
+                    pending_path = self._direct_admission_path(
+                        str(payload["request_id"])
+                    )
+                    record = (
+                        self._load_direct_admission(
+                            str(payload["request_id"]), str(payload["chat_id"]),
+                        )
+                        if pending_path.exists() else None
+                    )
+                if context is None or standing is None:  # Defensive type/runtime boundary.
+                    raise HarnessError(
+                        "Direct project admission did not resolve its saved chat."
+                    )
                 intent_sha256 = chat_lab.long_horizon_intent_sha256(
                     context["chat_id"], context["project_id"], context["lead_id"],
                     str(payload["text"]), payload.get("attachments"),
                 )
                 preflight = self._preflight_direct_long_horizon(
                     standing, payload, context,
+                    pending_admission_digest=(
+                        self._direct_admission_binding_digest(record)
+                        if isinstance(record, dict) else ""
+                    ),
                 )
                 record = self._save_direct_admission(
                     payload, context, str(preflight["admission_digest"]),
+                    strict_schema_previous_admission_digest=str(
+                        preflight.get("strict_schema_previous_admission_digest") or ""
+                    ),
                 )
                 chat_lab.keep_long_horizon_prompt(
                     self.config, context["transcript_route"], str(payload["text"]),
@@ -2379,6 +2625,9 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                         conversation_id=context["chat_id"],
                         expected_project_authority_id=str(
                             admitted_authority.get("project_authority_id") or ""
+                        ),
+                        expected_admission_digest=(
+                            self._direct_admission_binding_digest(record)
                         ),
                     )
                 except Exception as exc:

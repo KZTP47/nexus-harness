@@ -586,6 +586,20 @@ def _route_binding(config: LoadedConfig, member: dict[str, Any]) -> dict[str, An
     }
 
 
+_VERIFIED_CHAT_ROUTE_FIELDS = (
+    "route", "failure_context_version", "route_fingerprint_sha256",
+    "transport_contract", "effective_dispatch_version",
+    "effective_dispatch_fingerprint_sha256", "effective_dispatch_contract",
+    "effective_dispatch_strength",
+)
+
+
+def _verified_chat_route_projection(value: dict[str, Any]) -> dict[str, Any]:
+    """Project a provider context onto the fields persisted by chat schema 3."""
+
+    return {key: value.get(key) for key in _VERIFIED_CHAT_ROUTE_FIELDS}
+
+
 def _web_route_binding_for_contract(
     config: LoadedConfig, route: str, transport_contract: str,
 ) -> dict[str, Any]:
@@ -1329,6 +1343,186 @@ def _upgrade_exact_legacy_web_bindings(
     return changed
 
 
+_STRICT_SCHEMA_EFFECTIVE_CONTRACT_UPGRADES = {
+    "openai/effective-dispatch/v1": "openai/effective-dispatch/v2",
+    "codex-cli/effective-dispatch/v1": "codex-cli/effective-dispatch/v2",
+}
+
+
+def _route_binding_for_effective_contract(
+    config: LoadedConfig, member: dict[str, Any], contract: str,
+) -> dict[str, Any]:
+    route = str(member.get("who") or "")
+    _kind, context = chat_lab._route_failure_context(  # noqa: SLF001
+        config, route, effective_dispatch_contract_override=contract,
+    )
+    return _verified_chat_route_projection({
+        "route": route, **context,
+        "effective_dispatch_strength": "verified",
+    })
+
+
+def _upgrade_exact_strict_schema_chat_bindings(
+    config: LoadedConfig, registry: dict[str, Any], board: dict[str, Any], *,
+    chat_id: str = "",
+) -> list[dict[str, Any]]:
+    """Upgrade only an otherwise-identical OpenAI/Codex schema contract.
+
+    This changes saved chat metadata and sends no provider request. Recomputing
+    the old fingerprint with the explicit v1 contract proves the route, full
+    provider configuration, executable identity, and principal material still
+    match. Every participant and the project binding must validate before any
+    route in that chat is changed.
+    """
+
+    workspace_id = _board_workspace_id(board)
+    agents = _agents(board)
+    plans: list[dict[str, Any]] = []
+    for raw in registry.get("chats", []):
+        if not isinstance(raw, dict) \
+                or str(raw.get("workspace_id") or "") != workspace_id \
+                or (chat_id and str(raw.get("id") or "") != chat_id) \
+                or any(one not in agents for one in raw.get("pair", [])):
+            continue
+        binding = raw.get("binding")
+        participants = list(raw.get("pair") or [])
+        if not isinstance(binding, dict) or binding.get(
+            "binding_schema_version"
+        ) != CHAT_BINDING_SCHEMA_VERSION:
+            continue
+        held_routes = binding.get("agent_routes")
+        if not isinstance(held_routes, dict) \
+                or set(held_routes) != set(participants):
+            continue
+        if not any(
+            isinstance(held, dict)
+            and str(held.get("effective_dispatch_contract") or "")
+            in _STRICT_SCHEMA_EFFECTIVE_CONTRACT_UPGRADES
+            for held in held_routes.values()
+        ):
+            continue
+        project_id = str(raw.get("project") or "")
+        project = next((
+            one for one in board.get("projects", [])
+            if isinstance(one, dict) and str(one.get("id") or "") == project_id
+        ), None)
+        if binding.get("project") != _project_binding(
+            project, project_id if project else "",
+        ):
+            continue
+
+        observations: dict[str, dict[str, Any]] = {}
+        replacements: dict[str, dict[str, Any]] = {}
+        eligible = True
+        for member_id in participants:
+            held = held_routes.get(member_id)
+            current = _verified_chat_route_projection(
+                _route_binding(config, agents[member_id])
+            )
+            observation = {
+                "held": dict(held) if isinstance(held, dict) else held,
+                "current": current,
+                "former": None,
+            }
+            observations[member_id] = observation
+            if held == current:
+                continue
+            if not isinstance(held, dict):
+                eligible = False
+                break
+            old_contract = str(held.get("effective_dispatch_contract") or "")
+            if _STRICT_SCHEMA_EFFECTIVE_CONTRACT_UPGRADES.get(old_contract) \
+                    != str(current.get("effective_dispatch_contract") or ""):
+                eligible = False
+                break
+            try:
+                former = _route_binding_for_effective_contract(
+                    config, agents[member_id], old_contract,
+                )
+            except Exception:
+                eligible = False
+                break
+            if former != held:
+                eligible = False
+                break
+            observation["former"] = former
+            replacements[member_id] = current
+        if not eligible or not replacements:
+            continue
+        plans.append({
+            "raw": raw,
+            "project": project,
+            "project_id": project_id,
+            "observations": observations,
+            "replacements": replacements,
+        })
+
+    # The registry lock cannot freeze external executable identity (for example
+    # PATH or the executable's bytes). Do not replace authenticated v1 metadata
+    # from one observation with a v2 fingerprint from another. Recheck the whole
+    # staged plan before mutating even one chat; one unstable participant aborts all.
+    for plan in plans:
+        raw = plan["raw"]
+        binding = raw.get("binding") or {}
+        held_routes = binding.get("agent_routes") or {}
+        if binding.get("project") != _project_binding(
+            plan["project"], plan["project_id"] if plan["project"] else "",
+        ):
+            return []
+        for member_id, observation in plan["observations"].items():
+            held = held_routes.get(member_id)
+            if held != observation["held"]:
+                return []
+            current = _verified_chat_route_projection(
+                _route_binding(config, agents[member_id])
+            )
+            if current != observation["current"]:
+                return []
+            former = observation["former"]
+            if former is not None:
+                old_contract = str(
+                    observation["held"].get("effective_dispatch_contract") or ""
+                )
+                try:
+                    stable_former = _route_binding_for_effective_contract(
+                        config, agents[member_id], old_contract,
+                    )
+                except Exception:
+                    return []
+                if stable_former != former:
+                    return []
+
+    for plan in plans:
+        held_routes = plan["raw"]["binding"]["agent_routes"]
+        for member_id, current in plan["replacements"].items():
+            held_routes[member_id] = current
+    return plans
+
+
+def _keep_exact_strict_schema_chat_upgrades(
+    config: LoadedConfig, board: dict[str, Any], plans: list[dict[str, Any]],
+) -> bool:
+    """Keep staged upgrades only when their locally applied v2 binding validates."""
+
+    if not plans:
+        return False
+    agents = _agents(board)
+    try:
+        stable = all(
+            _binding_problem(config, board, plan["raw"], agents) is None
+            for plan in plans
+        )
+    except Exception:
+        stable = False
+    if stable:
+        return True
+    for plan in plans:
+        held_routes = plan["raw"]["binding"]["agent_routes"]
+        for member_id in plan["replacements"]:
+            held_routes[member_id] = plan["observations"][member_id]["held"]
+    return False
+
+
 def _project_work_authority(project: dict[str, Any]) -> dict[str, Any]:
     """Read execution authority for the exact board-project target."""
     path = Path(str(project.get("path") or ""))
@@ -1709,6 +1903,9 @@ def list_for_agent(
             changed = True
         if _upgrade_exact_legacy_web_bindings(config, registry, board):
             changed = True
+        strict_schema_plans = _upgrade_exact_strict_schema_chat_bindings(
+            config, registry, board,
+        )
         pairs = _conversation_pairs(board, agent_id)
 
         def ensure_initial_chat(
@@ -1820,6 +2017,10 @@ def list_for_agent(
             active = preferred
             registry["active"][selection_key] = active
             changed = True
+        if _keep_exact_strict_schema_chat_upgrades(
+            config, board, strict_schema_plans,
+        ):
+            changed = True
         if changed:
             _write(config, registry)
         return {
@@ -1844,12 +2045,19 @@ def resolve(
             changed = True
         if _upgrade_exact_legacy_web_bindings(config, registry, board):
             changed = True
-        if changed:
-            _write(config, registry)
+        strict_schema_plans = _upgrade_exact_strict_schema_chat_bindings(
+            config, registry, board, chat_id=chat_id,
+        )
+        if _keep_exact_strict_schema_chat_upgrades(
+            config, board, strict_schema_plans,
+        ):
+            changed = True
         raw, agents = _validated_conversation(
             config, registry, board, agent_id, chat_id,
             require_current_binding=not allow_binding_drift,
         )
+        if changed:
+            _write(config, registry)
         presented = _present(config, board, agent_id, raw, agents)
         presented["peer"] = next((one for one in raw["pair"] if one != agent_id), "")
         return presented
@@ -1919,6 +2127,12 @@ def select_project(
         registry = _read(config)
         _adopt_legacy_registry(config, registry, board)
         _upgrade_exact_legacy_web_bindings(config, registry, board)
+        strict_schema_plans = _upgrade_exact_strict_schema_chat_bindings(
+            config, registry, board, chat_id=chat_id,
+        )
+        _keep_exact_strict_schema_chat_upgrades(
+            config, board, strict_schema_plans,
+        )
         raw, agents_by_id = _validated_conversation(
             config, registry, board, agent_id, chat_id,
             require_current_binding=False,
@@ -1979,6 +2193,12 @@ def restart_provider_conversation(
         registry = _read(config)
         _adopt_legacy_registry(config, registry, board)
         _upgrade_exact_legacy_web_bindings(config, registry, board)
+        strict_schema_plans = _upgrade_exact_strict_schema_chat_bindings(
+            config, registry, board, chat_id=chat_id,
+        )
+        _keep_exact_strict_schema_chat_upgrades(
+            config, board, strict_schema_plans,
+        )
         raw, agents = _validated_conversation(
             config, registry, board, agent_id, chat_id,
         )

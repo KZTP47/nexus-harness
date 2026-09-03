@@ -23,7 +23,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from our_harness import chat, user_questions, web_chats
+from our_harness import chat, server as server_lab, user_questions, web_chats
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError, ResponseFormat
 
@@ -710,6 +710,524 @@ class WhatItRefuses(TalkingTestCase):
         self.assertEqual(statuses, ["waiting_for_project", "queued", "complete"])
         self.assertIn("verified complete", chat.read_it(reopened, "claude", filed_as)[-1].text)
 
+    def test_long_goal_events_project_real_agent_speech_and_nexus_failures_once(self) -> None:
+        filed_as = "pair-chat-long-goal-events"
+        request_id = "long-goal-events-request"
+        chat_id = "long-goal-events-chat"
+        project_id = "long-goal-events-project"
+        lead_id = "agent-claude"
+        goal_id = "goal-events-1234567890"
+        prompt = "Have the agents inspect and review this project together"
+        intent = chat.long_horizon_intent_sha256(
+            chat_id, project_id, lead_id, prompt, [],
+        )
+        chat.keep_long_horizon_prompt(
+            self.config, "claude", prompt, filed_as=filed_as,
+            request_id=request_id, chat_id=chat_id, project_id=project_id,
+            lead_id=lead_id, intent_sha256=intent,
+        )
+        goal = {
+            "goal_id": goal_id,
+            "request_id": request_id,
+            "conversation_id": chat_id,
+            "project": {"id": project_id},
+            "lead_agent_id": lead_id,
+            "status": "running",
+            "agents": [
+                {"id": lead_id, "name": "Claude", "who": "claude-route"},
+                {"id": "agent-codex", "name": "Codex", "who": "codex-route"},
+            ],
+            "tasks": [
+                {
+                    "id": "task-claude", "title": "Inspect the implementation",
+                    "required_contributor_id": lead_id,
+                    "assigned_agent_id": lead_id,
+                },
+                {
+                    "id": "task-codex", "title": "Review the implementation",
+                    "required_contributor_id": "agent-codex",
+                    "assigned_agent_id": "agent-codex",
+                },
+            ],
+        }
+        acknowledged_id = "1" * 32
+        failed_id = "2" * 32
+        events = [
+            {
+                "schema_version": 1,
+                "event_id": acknowledged_id,
+                "seq": 1,
+                "type": "provider_acknowledged",
+                "goal_id": goal_id,
+                "task_id": "task-claude",
+                "agent_id": lead_id,
+                "payload": {
+                    "action": "report",
+                    "summary": "I found the stalled ownership boundary and its exact release path.",
+                    "summary_delivery": {
+                        "schema_version": 1, "kind": "agent",
+                        "agent_id": "agent-codex", "name": "Codex",
+                    },
+                },
+            },
+            {
+                "schema_version": 1,
+                "event_id": failed_id,
+                "seq": 2,
+                "type": "task_failed",
+                "goal_id": goal_id,
+                "task_id": "task-codex",
+                "agent_id": "agent-codex",
+                "payload": {"error": "The provider stopped before returning a review."},
+            },
+        ]
+
+        first = chat.keep_long_horizon_events(
+            self.config, "claude", goal, events, filed_as=filed_as,
+        )
+        self.assertEqual(first["projected_event_cursor"], 2)
+        projected = [
+            one for one in chat.read_it(self.config, "claude", filed_as)
+            if one.correlation.get("kind") == "long_horizon_agent_event"
+        ]
+        self.assertEqual(len(projected), 2)
+        reply, failure = projected
+        self.assertEqual(
+            reply.text,
+            "I found the stalled ownership boundary and its exact release path.",
+        )
+        self.assertEqual(reply.phase, "agent_discussion")
+        self.assertEqual(
+            (reply.speaker_id, reply.speaker_name, reply.speaker_route),
+            (lead_id, "Claude", "claude-route"),
+        )
+        self.assertEqual(
+            (reply.recipient_id, reply.recipient_name),
+            ("agent-codex", "Codex"),
+        )
+        self.assertEqual(reply.correlation["source_goal_event_id"], acknowledged_id)
+        self.assertEqual(reply.correlation["source_goal_event_type"], "provider_acknowledged")
+        self.assertEqual(reply.correlation["goal_event_cursor"], 1)
+        self.assertEqual(reply.correlation["task_id"], "task-claude")
+
+        self.assertEqual(failure.phase, "nexus_error")
+        self.assertEqual((failure.speaker_id, failure.speaker_name), ("nexus", "Nexus"))
+        self.assertEqual(failure.recipient_name, "You")
+        self.assertIn("not counted as agent speech", failure.text)
+        self.assertIn("provider stopped", failure.text)
+        self.assertEqual(failure.correlation["source_goal_event_id"], failed_id)
+        self.assertEqual(failure.correlation["source_goal_event_type"], "task_failed")
+        self.assertFalse(any(
+            one.speaker_id == "agent-codex"
+            and one.correlation.get("source_goal_event_id") == failed_id
+            for one in projected
+        ))
+        self.assertFalse(any(
+            one.phase == "long_horizon_checkpoint"
+            for one in chat.read_it(self.config, "claude", filed_as)
+        ))
+
+        before_replay = [one.to_dict() for one in chat.read_it(
+            self.config, "claude", filed_as,
+        )]
+        replay = chat.keep_long_horizon_events(
+            self.config, "claude", goal, list(reversed(events)), filed_as=filed_as,
+        )
+        self.assertEqual(replay["projected_event_cursor"], 2)
+        self.assertEqual(
+            [one.to_dict() for one in chat.read_it(self.config, "claude", filed_as)],
+            before_replay,
+        )
+
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        self.assertEqual(
+            chat.long_horizon_event_cursor(
+                reopened, "claude", goal_id, filed_as=filed_as,
+            ),
+            2,
+        )
+        codex_reply_id = "3" * 32
+        chat.keep_long_horizon_events(
+            reopened, "claude", goal, [{
+                "schema_version": 1,
+                "event_id": codex_reply_id,
+                "seq": 3,
+                "type": "provider_acknowledged",
+                "goal_id": goal_id,
+                "task_id": "task-codex",
+                "agent_id": "agent-codex",
+                "payload": {
+                    "action": "report",
+                    "summary": "I reviewed Claude's finding and confirmed the release sequence.",
+                },
+            }], filed_as=filed_as,
+        )
+        restarted_turns = chat.read_it(reopened, "claude", filed_as)
+        codex_reply = next(
+            one for one in restarted_turns
+            if one.correlation.get("source_goal_event_id") == codex_reply_id
+        )
+        self.assertEqual(codex_reply.phase, "agent_discussion")
+        self.assertEqual((codex_reply.speaker_id, codex_reply.speaker_name), ("agent-codex", "Codex"))
+        self.assertEqual((codex_reply.recipient_id, codex_reply.recipient_name), ("", "the team"))
+        self.assertEqual(
+            chat.long_horizon_event_cursor(
+                reopened, "claude", goal_id, filed_as=filed_as,
+            ),
+            3,
+        )
+        ask_user_id = "a" * 32
+        chat.keep_long_horizon_events(
+            reopened, "claude", goal, [{
+                "schema_version": 1,
+                "event_id": ask_user_id,
+                "seq": 4,
+                "type": "provider_acknowledged",
+                "goal_id": goal_id,
+                "task_id": "task-claude",
+                "agent_id": lead_id,
+                "payload": {
+                    "action": "ask_user",
+                    "summary": "I need the user's decision before the agents continue.",
+                    # Even corrupted/stale delivery metadata cannot turn a user
+                    # question into a teammate-directed statement.
+                    "summary_delivery": {
+                        "schema_version": 1, "kind": "agent",
+                        "agent_id": "agent-codex", "name": "Codex",
+                    },
+                },
+            }], filed_as=filed_as,
+        )
+        ask_user_turn = next(
+            one for one in chat.read_it(reopened, "claude", filed_as)
+            if one.correlation.get("source_goal_event_id") == ask_user_id
+        )
+        self.assertEqual(
+            (ask_user_turn.recipient_id, ask_user_turn.recipient_name), ("", "You"),
+        )
+
+    def test_long_goal_event_projection_rejects_wrong_goal_or_chat_binding(self) -> None:
+        filed_as = "pair-chat-long-goal-event-identity"
+        request_id = "long-goal-event-identity-request"
+        chat_id = "long-goal-event-identity-chat"
+        project_id = "long-goal-event-identity-project"
+        lead_id = "agent-lead"
+        goal_id = "goal-event-identity-1234567890"
+        prompt = "Keep this event projection bound to the exact origin chat"
+        intent = chat.long_horizon_intent_sha256(
+            chat_id, project_id, lead_id, prompt, [],
+        )
+        chat.keep_long_horizon_prompt(
+            self.config, "codex", prompt, filed_as=filed_as,
+            request_id=request_id, chat_id=chat_id, project_id=project_id,
+            lead_id=lead_id, intent_sha256=intent,
+        )
+        goal = {
+            "goal_id": goal_id,
+            "request_id": request_id,
+            "conversation_id": chat_id,
+            "project": {"id": project_id},
+            "lead_agent_id": lead_id,
+            "status": "running",
+            "agents": [{"id": lead_id, "name": "Lead", "who": "codex-route"}],
+            "tasks": [{
+                "id": "task-one", "title": "Inspect",
+                "required_contributor_id": lead_id,
+                "assigned_agent_id": lead_id,
+            }],
+        }
+        event = {
+            "schema_version": 1,
+            "event_id": "4" * 32,
+            "seq": 1,
+            "type": "provider_acknowledged",
+            "goal_id": "different-goal",
+            "task_id": "task-one",
+            "agent_id": lead_id,
+            "payload": {"action": "report", "summary": "This must not be copied."},
+        }
+
+        with self.assertRaisesRegex(chat.ChatError, "wrong durable goal identity"):
+            chat.keep_long_horizon_events(
+                self.config, "codex", goal, [event], filed_as=filed_as,
+            )
+        with self.assertRaisesRegex(chat.ChatError, "already bound to a different chat"):
+            chat.keep_long_horizon_events(
+                self.config, "codex",
+                {**goal, "conversation_id": "different-chat"}, [],
+                filed_as=filed_as,
+            )
+
+        turns = chat.read_it(self.config, "codex", filed_as)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0].correlation["kind"], "long_horizon_prompt")
+        self.assertEqual(
+            chat.long_horizon_event_cursor(
+                self.config, "codex", goal_id, filed_as=filed_as,
+            ),
+            0,
+        )
+
+    def test_long_goal_event_projection_requires_saved_prompt_binding(self) -> None:
+        filed_as = "missing-long-goal-prompt-binding"
+        goal = {
+            "goal_id": "missing-prompt-goal-1234567890",
+            "request_id": "missing-prompt-request",
+            "conversation_id": "reused-chat-id",
+            "project": {"id": "project-id"},
+            "lead_agent_id": "lead-id",
+            "status": "running",
+            "agents": [{"id": "lead-id", "name": "Lead", "who": "codex"}],
+            "tasks": [{
+                "id": "task-id", "title": "Inspect",
+                "required_contributor_id": "lead-id", "assigned_agent_id": "lead-id",
+            }],
+        }
+        result = chat.keep_long_horizon_events(
+            self.config, "codex", goal, [{
+                "schema_version": 1, "event_id": "6" * 32, "seq": 1,
+                "type": "provider_acknowledged", "goal_id": goal["goal_id"],
+                "task_id": "task-id", "agent_id": "lead-id",
+                "payload": {"summary": "This must not enter an unbound transcript."},
+            }], filed_as=filed_as,
+        )
+        self.assertTrue(result["binding_missing"])
+        self.assertEqual(result["projected_event_cursor"], 0)
+        status_result = chat.keep_long_horizon_status(
+            self.config, "codex", {**goal, "revision": 1}, filed_as=filed_as,
+        )
+        self.assertTrue(status_result["binding_missing"])
+        self.assertEqual(chat.read_it(self.config, "codex", filed_as), [])
+
+        server_goal = {**goal, "revision": 1, "event_seq": 1}
+        state = mock.MagicMock()
+        state.config = self.config
+        state.swarm_lock = threading.Lock()
+        state.swarm_standing.return_value = {"board": {}}
+        state._long_horizon_chat.return_value = {
+            "transcript_route": "codex", "filed_as": filed_as,
+        }
+        state.long_horizon.store.events.return_value = {
+            "goal_id": goal["goal_id"], "events": [{
+                "schema_version": 1, "event_id": "6" * 32, "seq": 1,
+                "type": "provider_acknowledged", "goal_id": goal["goal_id"],
+                "task_id": "task-id", "agent_id": "lead-id",
+                "payload": {"summary": "Still must not enter this transcript."},
+            }], "next": 1, "has_more": False,
+            "oldest_available": 1, "truncated": False,
+        }
+        server_lab.HarnessHTTPServer.project_long_horizon_chat_statuses(
+            state, [server_goal],
+        )
+        state.long_horizon.store.events.assert_called_once_with(
+            goal["goal_id"], after=0, limit=200,
+        )
+        self.assertEqual(chat.read_it(self.config, "codex", filed_as), [])
+
+    def test_long_goal_recovery_and_retention_gap_are_truthful_nexus_events(self) -> None:
+        filed_as = "long-goal-recovery-gap"
+        request_id = "long-goal-recovery-request"
+        chat_id = "long-goal-recovery-chat"
+        project_id = "long-goal-recovery-project"
+        lead_id = "lead-id"
+        prompt = "Recover the exact pre-effect schema failure"
+        intent = chat.long_horizon_intent_sha256(
+            chat_id, project_id, lead_id, prompt, [],
+        )
+        chat.keep_long_horizon_prompt(
+            self.config, "codex", prompt, filed_as=filed_as,
+            request_id=request_id, chat_id=chat_id, project_id=project_id,
+            lead_id=lead_id, intent_sha256=intent,
+        )
+        goal = {
+            "goal_id": "recovery-gap-goal-1234567890",
+            "request_id": request_id, "conversation_id": chat_id,
+            "project": {"id": project_id}, "lead_agent_id": lead_id,
+            "status": "queued",
+            "agents": [{"id": lead_id, "name": "Codex", "who": "codex"}],
+            "tasks": [{
+                "id": "codex-task", "title": "Inspect the project",
+                "required_contributor_id": lead_id, "assigned_agent_id": lead_id,
+            }],
+        }
+        result = chat.keep_long_horizon_events(
+            self.config, "codex", goal, [{
+                "schema_version": 1, "event_id": "7" * 32, "seq": 5,
+                "type": "codex_schema_rejection_recovered",
+                "goal_id": goal["goal_id"], "task_id": "codex-task",
+                "agent_id": lead_id, "payload": {"automatic_retry": True},
+            }], filed_as=filed_as, truncated_after=0, oldest_available=5,
+        )
+        self.assertEqual(result["projected_event_cursor"], 5)
+        turns = chat.read_it(self.config, "codex", filed_as)
+        gap = next(one for one in turns if one.phase == "nexus_gap")
+        recovery = next(one for one in turns if one.phase == "nexus_recovery")
+        self.assertEqual((gap.speaker_id, gap.speaker_name), ("nexus", "Nexus"))
+        self.assertIn("could not reconstruct goal events 1–4", gap.text)
+        self.assertIn("No missing text was invented", gap.text)
+        self.assertEqual((recovery.speaker_id, recovery.speaker_name), ("nexus", "Nexus"))
+        self.assertIn("repaired Codex's former strict output-schema rejection", recovery.text)
+        self.assertNotEqual(recovery.speaker_id, lead_id)
+        before = [one.to_dict() for one in turns]
+        chat.keep_long_horizon_events(
+            self.config, "codex", goal, [{
+                "schema_version": 1, "event_id": "7" * 32, "seq": 5,
+                "type": "codex_schema_rejection_recovered",
+                "goal_id": goal["goal_id"], "task_id": "codex-task",
+                "agent_id": lead_id, "payload": {"automatic_retry": True},
+            }], filed_as=filed_as, truncated_after=0, oldest_available=5,
+        )
+        self.assertEqual(
+            [one.to_dict() for one in chat.read_it(self.config, "codex", filed_as)],
+            before,
+        )
+
+    def test_server_projects_only_goal_events_after_the_saved_chat_cursor(self) -> None:
+        filed_as = "pair-chat-server-long-goal-events"
+        request_id = "server-long-goal-events-request"
+        chat_id = "server-long-goal-events-chat"
+        project_id = "server-long-goal-events-project"
+        lead_id = "agent-lead"
+        goal_id = "server-goal-events-1234567890"
+        prompt = "Project each real agent contribution into this exact chat"
+        intent = chat.long_horizon_intent_sha256(
+            chat_id, project_id, lead_id, prompt, [],
+        )
+        chat.keep_long_horizon_prompt(
+            self.config, "codex", prompt, filed_as=filed_as,
+            request_id=request_id, chat_id=chat_id, project_id=project_id,
+            lead_id=lead_id, intent_sha256=intent,
+        )
+        goal = {
+            "goal_id": goal_id,
+            "request_id": request_id,
+            "conversation_id": chat_id,
+            "project": {"id": project_id},
+            "lead_agent_id": lead_id,
+            "status": "running",
+            "revision": 3,
+            "event_seq": 1,
+            "agents": [
+                {"id": lead_id, "name": "Lead", "who": "codex-route"},
+                {"id": "agent-peer", "name": "Peer", "who": "claude-route"},
+            ],
+            "tasks": [
+                {
+                    "id": "task-lead", "title": "Inspect",
+                    "required_contributor_id": lead_id,
+                    "assigned_agent_id": lead_id,
+                },
+                {
+                    "id": "task-peer", "title": "Review",
+                    "required_contributor_id": "agent-peer",
+                    "assigned_agent_id": "agent-peer",
+                },
+            ],
+        }
+        source_id = "5" * 32
+        source_event = {
+            "schema_version": 1,
+            "event_id": source_id,
+            "seq": 1,
+            "type": "provider_acknowledged",
+            "goal_id": goal_id,
+            "task_id": "task-lead",
+            "agent_id": lead_id,
+            "payload": {
+                "action": "report", "summary": "The first reviewable fact.",
+                "summary_delivery": {
+                    "schema_version": 1, "kind": "agent",
+                    "agent_id": "agent-peer", "name": "Peer",
+                },
+            },
+        }
+        newer_id = "8" * 32
+        newer_event = {
+            "schema_version": 1,
+            "event_id": newer_id,
+            "seq": 2,
+            "type": "provider_acknowledged",
+            "goal_id": goal_id,
+            "task_id": "task-peer",
+            "agent_id": "agent-peer",
+            "payload": {
+                "action": "report", "summary": "The newer review result.",
+                "summary_delivery": {
+                    "schema_version": 1, "kind": "team",
+                    "agent_id": "", "name": "the team",
+                },
+            },
+        }
+        state = mock.MagicMock()
+        state.config = self.config
+        state.swarm_lock = threading.Lock()
+        state.swarm_standing.return_value = {"board": {}}
+        state._long_horizon_chat.return_value = {
+            "transcript_route": "codex", "filed_as": filed_as,
+        }
+        state.long_horizon.store.events.return_value = {
+            # The canonical store advanced after the caller captured `goal`.
+            # This projection pass must remain bounded to goal.event_seq == 1.
+            "goal_id": goal_id, "events": [source_event, newer_event], "next": 2,
+            "has_more": False, "oldest_available": 1, "truncated": False,
+        }
+
+        server_lab.HarnessHTTPServer.project_long_horizon_chat_statuses(
+            state, [goal],
+        )
+        state.long_horizon.store.events.assert_called_once_with(
+            goal_id, after=0, limit=200,
+        )
+        saved = chat.read_it(self.config, "codex", filed_as)
+        contribution = next(
+            one for one in saved
+            if one.correlation.get("source_goal_event_id") == source_id
+        )
+        self.assertEqual(contribution.text, "The first reviewable fact.")
+        self.assertEqual(contribution.phase, "agent_discussion")
+        self.assertFalse(any(
+            one.correlation.get("source_goal_event_id") == newer_id
+            for one in saved
+        ))
+        self.assertEqual(
+            chat.long_horizon_event_cursor(
+                self.config, "codex", goal_id, filed_as=filed_as,
+            ),
+            1,
+        )
+
+        state.long_horizon.store.events.reset_mock()
+        server_lab.HarnessHTTPServer.project_long_horizon_chat_statuses(
+            state, [goal],
+        )
+        state.long_horizon.store.events.assert_not_called()
+        self.assertEqual(sum(
+            one.correlation.get("source_goal_event_id") == source_id
+            for one in chat.read_it(self.config, "codex", filed_as)
+        ), 1)
+
+        state.long_horizon.store.events.return_value = {
+            "goal_id": goal_id, "events": [newer_event], "next": 2,
+            "has_more": False, "oldest_available": 1, "truncated": False,
+        }
+        server_lab.HarnessHTTPServer.project_long_horizon_chat_statuses(
+            state, [{**goal, "event_seq": 2, "revision": 4}],
+        )
+        state.long_horizon.store.events.assert_called_once_with(
+            goal_id, after=1, limit=200,
+        )
+        final_turns = chat.read_it(self.config, "codex", filed_as)
+        self.assertEqual(sum(
+            one.correlation.get("source_goal_event_id") == newer_id
+            for one in final_turns
+        ), 1)
+        self.assertEqual(
+            chat.long_horizon_event_cursor(
+                self.config, "codex", goal_id, filed_as=filed_as,
+            ),
+            2,
+        )
+
     def test_direct_long_goal_identity_boundaries_survive_restart_without_clipping(self) -> None:
         prompt = "Keep every accepted identity character"
         request_id = "r" * chat.DIRECT_LONG_HORIZON_REQUEST_ID_CHARACTERS
@@ -791,14 +1309,24 @@ class WhatItRefuses(TalkingTestCase):
             "intent_sha256": "a" * 64,
         }
 
+        chat.keep_long_horizon_prompt(
+            self.config, "claude", "Bind the exact status identity",
+            filed_as=filed_as, request_id=goal["request_id"],
+            chat_id=goal["conversation_id"], project_id=goal["project"]["id"],
+            lead_id=goal["lead_agent_id"], intent_sha256="a" * 64,
+        )
         chat.keep_long_horizon_status(self.config, "claude", goal, **supplied)
         reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
         chat.keep_long_horizon_status(reopened, "claude", goal, **supplied)
 
         turns = chat.read_it(reopened, "claude", filed_as)
-        self.assertEqual(len(turns), 1)
-        self.assertEqual(turns[0].correlation["goal_id"], goal_id)
-        self.assertEqual(turns[0].correlation["intent_sha256"], "a" * 64)
+        statuses = [
+            one for one in turns
+            if one.correlation.get("kind") == "long_horizon_status"
+        ]
+        self.assertEqual(len(statuses), 1)
+        self.assertEqual(statuses[0].correlation["goal_id"], goal_id)
+        self.assertEqual(statuses[0].correlation["intent_sha256"], "a" * 64)
 
     def test_long_goal_status_rejects_clippable_identity_before_transcript_write(self) -> None:
         base = {
@@ -886,6 +1414,12 @@ class WhatItRefuses(TalkingTestCase):
         queued = {**base, "status": "queued", "revision": 1}
         complete = {**base, "status": "complete", "revision": 10}
         stale_running = {**base, "status": "running", "revision": 9}
+        chat.keep_long_horizon_prompt(
+            self.config, "claude", "Bind revision projections",
+            filed_as=filed_as, request_id=base["request_id"],
+            chat_id=base["conversation_id"], project_id=base["project"]["id"],
+            lead_id=base["lead_agent_id"], intent_sha256="a" * 64,
+        )
         chat.keep_long_horizon_status(
             self.config, "claude", queued, filed_as=filed_as,
         )
@@ -895,7 +1429,10 @@ class WhatItRefuses(TalkingTestCase):
         chat.keep_long_horizon_status(
             self.config, "claude", stale_running, filed_as=filed_as,
         )
-        turns = chat.read_it(self.config, "claude", filed_as)
+        turns = [
+            one for one in chat.read_it(self.config, "claude", filed_as)
+            if one.correlation.get("kind") == "long_horizon_status"
+        ]
         self.assertEqual(
             [one.correlation.get("goal_status") for one in turns],
             ["queued", "complete"],
@@ -919,6 +1456,12 @@ class WhatItRefuses(TalkingTestCase):
             "project": {"id": "project-one"},
             "lead_agent_id": "lead",
         }
+        chat.keep_long_horizon_prompt(
+            self.config, "claude", "Bind resumed status projections",
+            filed_as=filed_as, request_id=base["request_id"],
+            chat_id=base["conversation_id"], project_id=base["project"]["id"],
+            lead_id=base["lead_agent_id"], intent_sha256="a" * 64,
+        )
         chat.keep_long_horizon_status(
             self.config, "claude",
             {**base, "status": "failed", "revision": 4},
@@ -929,7 +1472,10 @@ class WhatItRefuses(TalkingTestCase):
             {**base, "status": "queued", "revision": 5},
             filed_as=filed_as,
         )
-        turns = chat.read_it(self.config, "claude", filed_as)
+        turns = [
+            one for one in chat.read_it(self.config, "claude", filed_as)
+            if one.correlation.get("kind") == "long_horizon_status"
+        ]
         self.assertEqual(
             [one.correlation.get("goal_status") for one in turns],
             ["failed", "queued"],
@@ -945,13 +1491,22 @@ class WhatItRefuses(TalkingTestCase):
             "project": {"id": "project-one"},
             "lead_agent_id": "lead",
         }
+        chat.keep_long_horizon_prompt(
+            self.config, "claude", "Bind cancellation status projections",
+            filed_as=filed_as, request_id=base["request_id"],
+            chat_id=base["conversation_id"], project_id=base["project"]["id"],
+            lead_id=base["lead_agent_id"], intent_sha256="a" * 64,
+        )
         for revision, status in ((6, "running"), (7, "cancelling"), (8, "cancelled")):
             chat.keep_long_horizon_status(
                 self.config, "claude",
                 {**base, "status": status, "revision": revision},
                 filed_as=filed_as,
             )
-        turns = chat.read_it(self.config, "claude", filed_as)
+        turns = [
+            one for one in chat.read_it(self.config, "claude", filed_as)
+            if one.correlation.get("kind") == "long_horizon_status"
+        ]
         self.assertEqual(
             [one.correlation.get("goal_status") for one in turns],
             ["running", "cancelling", "cancelled"],
@@ -993,6 +1548,12 @@ class WhatItRefuses(TalkingTestCase):
         newer_written = context.Event()
         results = context.Queue()
         filed_as = "pair-chat-cross-process-revision"
+        chat.keep_long_horizon_prompt(
+            self.config, "claude", "Bind the cross-process status race",
+            filed_as=filed_as, request_id="goal-race-request",
+            chat_id="chat-race", project_id="project-race", lead_id="lead",
+            intent_sha256="a" * 64,
+        )
         workers = [
             context.Process(
                 target=_racing_long_status_worker,
@@ -1011,7 +1572,10 @@ class WhatItRefuses(TalkingTestCase):
             self.assertEqual(worker.exitcode, 0)
         outcomes = [results.get(timeout=5) for _worker in workers]
         self.assertEqual(sorted(one[0] for one in outcomes), ["ok", "ok"])
-        turns = chat.read_it(self.config, "claude", filed_as)
+        turns = [
+            one for one in chat.read_it(self.config, "claude", filed_as)
+            if one.correlation.get("kind") == "long_horizon_status"
+        ]
         self.assertEqual(len(turns), 1)
         self.assertEqual(turns[0].correlation["goal_revision"], 10)
         self.assertEqual(turns[0].correlation["goal_status"], "complete")

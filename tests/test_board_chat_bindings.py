@@ -374,6 +374,124 @@ class BoardChatBindingTests(unittest.TestCase):
             swarm_chats.LEGACY_WEB_RELAY_CONTRACT,
         )
 
+    def test_exact_strict_schema_contract_upgrade_restores_ordinary_chat(self) -> None:
+        from our_harness.providers import codex_cli
+
+        board = self.board("workspace-12121212121212121212121212121212")
+        with mock.patch.object(provider_base.shutil, "which", return_value=None):
+            with mock.patch.object(
+                codex_cli.CodexCLIProvider, "_effective_dispatch_contract",
+                return_value="codex-cli/effective-dispatch/v1",
+            ):
+                original = swarm_chats.list_for_agent(
+                    self.config, board, "agent-1",
+                )["chats"][0]
+                chat.keep_exchange(
+                    self.config, "route-a", "old question", "old answer",
+                    filed_as=original["filed_as"],
+                )
+            self.assertEqual(
+                original["binding"]["agent_routes"]["agent-2"][
+                    "effective_dispatch_contract"
+                ],
+                "codex-cli/effective-dispatch/v1",
+            )
+
+            self.config.data["providers"]["route-b"]["command"] = [
+                "different-codex-command",
+            ]
+            protected = next(
+                one for one in swarm_chats.list_for_agent(
+                    self.config, board, "agent-1",
+                )["chats"] if one["id"] == original["id"]
+            )
+            self.assertEqual(
+                protected["binding_problem"]["code"], "agent_binding_changed",
+            )
+            self.assertEqual(
+                protected["binding"]["agent_routes"]["agent-2"][
+                    "effective_dispatch_contract"
+                ],
+                "codex-cli/effective-dispatch/v1",
+            )
+            with self.assertRaisesRegex(Exception, "will not send that history"):
+                swarm_chats.resolve(
+                    self.config, board, "agent-1", original["id"],
+                )
+
+            self.config.data["providers"]["route-b"].pop("command")
+            recovered = swarm_chats.resolve(
+                self.config, board, "agent-1", original["id"],
+            )
+
+        self.assertEqual(recovered["id"], original["id"])
+        self.assertIsNone(recovered["binding_problem"])
+        self.assertEqual(
+            recovered["binding"]["agent_routes"]["agent-2"][
+                "effective_dispatch_contract"
+            ],
+            "codex-cli/effective-dispatch/v2",
+        )
+        self.assertEqual(
+            chat.read_it(
+                self.config, "route-a", recovered["filed_as"],
+            )[-1].text,
+            "old answer",
+        )
+
+    def test_strict_schema_upgrade_never_persists_an_unstable_projection(self) -> None:
+        from our_harness.providers import codex_cli
+
+        board = self.board("workspace-13131313131313131313131313131313")
+        with mock.patch.object(provider_base.shutil, "which", return_value=None):
+            with mock.patch.object(
+                codex_cli.CodexCLIProvider, "_effective_dispatch_contract",
+                return_value="codex-cli/effective-dispatch/v1",
+            ):
+                listed = swarm_chats.list_for_agent(
+                    self.config, board, "agent-2",
+                )
+            original = next(one for one in listed["chats"] if one["pair"] == ["agent-2"])
+
+        registry = swarm_chats._read(self.config)
+        raw = next(one for one in registry["chats"] if one["id"] == original["id"])
+        registry["chats"] = [raw]
+        swarm_chats._write(self.config, registry)
+        held = copy.deepcopy(raw["binding"]["agent_routes"]["agent-2"])
+        first_current = copy.deepcopy(held)
+        first_current["effective_dispatch_contract"] = (
+            "codex-cli/effective-dispatch/v2"
+        )
+        first_current["effective_dispatch_fingerprint_sha256"] = "a" * 64
+        later_current = copy.deepcopy(first_current)
+        later_current["effective_dispatch_fingerprint_sha256"] = "b" * 64
+        calls = 0
+
+        def changing_projection(*_args: object, **_kwargs: object) -> dict:
+            nonlocal calls
+            calls += 1
+            return copy.deepcopy(first_current if calls == 1 else later_current)
+
+        with mock.patch.object(
+            swarm_chats, "_route_binding", side_effect=changing_projection,
+        ), mock.patch.object(
+            swarm_chats, "_route_binding_for_effective_contract",
+            return_value=copy.deepcopy(held),
+        ):
+            with self.assertRaisesRegex(swarm.SwarmError, "will not send that history"):
+                swarm_chats.resolve(
+                    self.config, board, "agent-2", original["id"],
+                )
+
+        self.assertGreaterEqual(calls, 2)
+        persisted = swarm_chats._read(self.config)
+        persisted_raw = next(
+            one for one in persisted["chats"] if one["id"] == original["id"]
+        )
+        self.assertEqual(
+            persisted_raw["binding"]["agent_routes"]["agent-2"], held,
+        )
+
     def test_effective_executable_drift_fences_a_new_pair_chat(self) -> None:
         first = self.root / "provider-a" / "agent-tool"
         second = self.root / "provider-b" / "agent-tool"

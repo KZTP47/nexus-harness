@@ -38,6 +38,7 @@ from ..redaction import CredentialRedactor, bounded_redacted_text
 # represent each non-BMP character as a twelve-byte surrogate pair.
 MAX_PROVIDER_RESPONSE_BYTES = 100_000_000
 EFFECTIVE_DISPATCH_FINGERPRINT_VERSION = 1
+STRICT_OUTPUT_SCHEMA_CONTRACT = "openai-strict-object-closure/v2"
 _EFFECTIVE_CONFIG_FIELDS = (
     "name", "model", "endpoint", "api_mode", "api_key_env", "command",
     "arguments", "auth_mode", "google_project", "microsoft_app",
@@ -46,6 +47,125 @@ _EFFECTIVE_CONFIG_FIELDS = (
 )
 _dispatch_version_lock = threading.Lock()
 _dispatch_version_cache: dict[tuple[object, ...], dict[str, Any]] = {}
+
+
+def _strict_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Close a deep-copied schema for OpenAI strict structured output.
+
+    Harness contracts intentionally model some fields as optional. OpenAI's
+    strict wire dialect instead requires every declared property in
+    ``required`` and forbids undeclared object keys. Adapt only at provider
+    serialization so the shared contract and other providers are unchanged.
+    """
+
+    schema_map_keywords = {
+        "$defs", "definitions", "properties", "patternProperties",
+        "dependentSchemas",
+    }
+    schema_value_keywords = {
+        "additionalProperties", "additionalItems", "contains", "contentSchema",
+        "else", "if", "items", "not", "propertyNames", "then",
+        "unevaluatedItems", "unevaluatedProperties",
+    }
+    schema_list_keywords = {"allOf", "anyOf", "oneOf", "prefixItems"}
+
+    def transform(value: Any) -> Any:
+        if not isinstance(value, dict):
+            return copy.deepcopy(value)
+        # JSON values under annotations such as default/examples/const/enum are
+        # data, not subschemas. Traverse only keywords whose values are defined
+        # by JSON Schema as schemas so literal objects remain byte-for-byte
+        # equivalent to the caller's contract.
+        copied = copy.deepcopy(value)
+        for keyword in schema_map_keywords:
+            mapping = value.get(keyword)
+            if isinstance(mapping, dict):
+                copied[keyword] = {
+                    name: transform(child) for name, child in mapping.items()
+                }
+        for keyword in schema_value_keywords:
+            child = value.get(keyword)
+            if isinstance(child, (dict, bool)):
+                copied[keyword] = transform(child)
+            elif keyword == "items" and isinstance(child, list):
+                copied[keyword] = [transform(item) for item in child]
+        for keyword in schema_list_keywords:
+            children = value.get(keyword)
+            if isinstance(children, list):
+                copied[keyword] = [transform(child) for child in children]
+        dependencies = value.get("dependencies")
+        if isinstance(dependencies, dict):
+            copied["dependencies"] = {
+                name: transform(child) if isinstance(child, (dict, bool))
+                else copy.deepcopy(child)
+                for name, child in dependencies.items()
+            }
+        properties = copied.get("properties")
+        if isinstance(properties, dict):
+            copied["required"] = list(properties)
+            copied["additionalProperties"] = False
+        elif copied.get("type") == "object":
+            copied["properties"] = {}
+            copied["required"] = []
+            copied["additionalProperties"] = False
+        return copied
+
+    return transform(schema)
+
+
+def _has_open_object_schema(schema: object) -> bool:
+    """Whether a tool schema intentionally permits undeclared object keys.
+
+    OpenAI strict function tools cannot preserve a dynamic object such as an
+    MCP argument bag: closing it would silently change ``{"q": "value"}``
+    into an empty-only object.  Inspect only JSON Schema subschema keywords,
+    just as the strict normalizer does, so annotation objects are not mistaken
+    for executable schema.
+    """
+
+    if not isinstance(schema, dict):
+        return False
+    kind = schema.get("type")
+    object_typed = kind == "object" or (
+        isinstance(kind, list) and "object" in kind
+    )
+    if (object_typed or isinstance(schema.get("properties"), dict)) \
+            and schema.get("additionalProperties") is not False:
+        return True
+    for keyword in (
+        "$defs", "definitions", "properties", "patternProperties",
+        "dependentSchemas",
+    ):
+        mapping = schema.get(keyword)
+        if isinstance(mapping, dict) and any(
+            _has_open_object_schema(child) for child in mapping.values()
+        ):
+            return True
+    for keyword in (
+        "additionalProperties", "additionalItems", "contains", "contentSchema",
+        "else", "if", "items", "not", "propertyNames", "then",
+        "unevaluatedItems", "unevaluatedProperties",
+    ):
+        child = schema.get(keyword)
+        if isinstance(child, dict) and _has_open_object_schema(child):
+            return True
+        if keyword == "items" and isinstance(child, list) and any(
+            _has_open_object_schema(item) for item in child
+        ):
+            return True
+    for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
+        children = schema.get(keyword)
+        if isinstance(children, list) and any(
+            _has_open_object_schema(child) for child in children
+        ):
+            return True
+    dependencies = schema.get("dependencies")
+    return bool(
+        isinstance(dependencies, dict) and any(
+            isinstance(child, dict) and _has_open_object_schema(child)
+            for child in dependencies.values()
+        )
+    )
 
 
 def effective_dispatch_fingerprint(
@@ -139,7 +259,20 @@ class Provider(ABC):
         creates, repairs, signs in, or sends a provider request.
         """
 
-        contract = self._effective_dispatch_contract()
+        return self._effective_dispatch_fingerprint_for_contract(
+            self._effective_dispatch_contract()
+        )
+
+    def _effective_dispatch_fingerprint_for_contract(
+        self, contract: str,
+    ) -> dict[str, Any]:
+        """Recompute the current dispatch material under an explicit contract.
+
+        This is used only by bounded engine-contract migrations. Recomputing
+        with the older label proves that route configuration, executable, and
+        adapter version still match the saved fingerprint before upgrading it.
+        """
+
         executable: dict[str, Any]
         try:
             command = self._effective_dispatch_command()
@@ -632,6 +765,9 @@ def _chat_tool_calls(fragments: object) -> list[dict[str, Any]]:
 
 
 class OpenAIProvider(Provider):
+    def _effective_dispatch_contract(self) -> str:
+        return "openai/effective-dispatch/v2"
+
     structured_retry_is_safe = True
     @staticmethod
     def _with_images(request: ProviderRequest, messages: list[dict[str, Any]], mode: str) -> list[dict[str, Any]]:
@@ -696,7 +832,10 @@ class OpenAIProvider(Provider):
         definition = {
             "name": response_format.name,
             "strict": response_format.strict,
-            "schema": response_format.schema,
+            "schema": (
+                _strict_output_schema(response_format.schema)
+                if response_format.strict else response_format.schema
+            ),
         }
         if mode == "responses":
             return {"text": {"format": {"type": "json_schema", **definition}}}
@@ -710,14 +849,19 @@ class OpenAIProvider(Provider):
                 raise HarnessError("Provider tool definition is malformed")
             name = tool["name"]
             description = str(tool.get("description") or "")
-            parameters = tool["input_schema"]
+            dynamic_object = _has_open_object_schema(tool["input_schema"])
+            parameters = (
+                copy.deepcopy(tool["input_schema"])
+                if dynamic_object else _strict_output_schema(tool["input_schema"])
+            )
+            strict = not dynamic_object
             if mode == "responses":
-                translated.append({"type": "function", "name": name, "description": description, "parameters": parameters, "strict": True})
+                translated.append({"type": "function", "name": name, "description": description, "parameters": parameters, "strict": strict})
             else:
                 translated.append(
                     {
                         "type": "function",
-                        "function": {"name": name, "description": description, "parameters": parameters, "strict": True},
+                        "function": {"name": name, "description": description, "parameters": parameters, "strict": strict},
                     }
                 )
         return translated

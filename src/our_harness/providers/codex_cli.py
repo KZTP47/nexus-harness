@@ -27,7 +27,7 @@ from ..execution import (
 )
 from ..models import CommandResult, HarnessError, ProviderRequest, ProviderResponse
 from ..redaction import CredentialRedactor, bounded_redacted_text
-from .base import Provider
+from .base import Provider, _strict_output_schema
 
 
 _AUTH_MODE = "chatgpt"
@@ -120,19 +120,7 @@ def _codex_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
     that provider boundary so the shared, provider-neutral contract keeps its
     original optional-field semantics.
     """
-    def transform(value: Any) -> Any:
-        if isinstance(value, list):
-            return [transform(item) for item in value]
-        if not isinstance(value, dict):
-            return value
-        copied = {name: transform(child) for name, child in value.items()}
-        properties = copied.get("properties")
-        if isinstance(properties, dict):
-            copied["required"] = list(properties)
-            copied["additionalProperties"] = False
-        return copied
-
-    return transform(schema)
+    return _strict_output_schema(schema)
 
 
 def _load_json(value: str) -> Any:
@@ -606,6 +594,9 @@ def _prompt(request: ProviderRequest, fallback: bool) -> str:
 
 class CodexCLIProvider(Provider):
     """Trusted-local Codex CLI boundary using Codex-owned ChatGPT authentication."""
+
+    def _effective_dispatch_contract(self) -> str:
+        return "codex-cli/effective-dispatch/v2"
 
     def __init__(self, config):  # type: ignore[no-untyped-def]
         super().__init__(config)
