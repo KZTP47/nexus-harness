@@ -4533,20 +4533,32 @@ class LongHorizonTests(unittest.TestCase):
             ))
         runtime = long_horizon.LongHorizonRuntime(self.config)
         attempts: list[str] = []
-        valid_goal_id = goals[-1]["goal_id"]
+        all_attempted = threading.Event()
+        valid_goal_id = max(
+            goals,
+            key=lambda one: (int(one["created_ms"]), str(one["goal_id"])),
+        )["goal_id"]
 
         def attempt(goal_id, answers=None, **_kwargs):
             attempts.append(goal_id)
+            if len(set(attempts)) == len(goals):
+                all_attempted.set()
             if goal_id != valid_goal_id:
                 raise FileNotFoundError("removed test project")
             return runtime.store.get(goal_id)
 
-        with mock.patch.object(runtime, "start_background", side_effect=attempt):
+        with mock.patch.object(
+            runtime, "start_background", side_effect=attempt,
+        ), mock.patch.object(
+            runtime, "_record_automatic_start_failure", return_value=None,
+        ):
             runtime._enable_auto_start_watcher()
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and valid_goal_id not in attempts:
-                time.sleep(0.02)
-            runtime.close()
+            try:
+                self.assertTrue(
+                    all_attempted.wait(THREAD_COORDINATION_TIMEOUT_SECONDS),
+                )
+            finally:
+                runtime.close()
         self.assertIn(valid_goal_id, attempts)
         self.assertGreaterEqual(len(set(attempts)), 18)
 

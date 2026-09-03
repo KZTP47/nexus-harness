@@ -196,6 +196,27 @@ class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
         raise HarnessError("Provider HTTP redirects are not accepted")
 
 
+class _LazyHttpOpener:
+    """Build one provider's private network transport only when it is used."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._opener: Any | None = None
+
+    def open(self, *args: Any, **kwargs: Any) -> Any:
+        opener = self._opener
+        if opener is None:
+            with self._lock:
+                opener = self._opener
+                if opener is None:
+                    # HTTPSHandler loads the operating system certificate stores.
+                    # Provider identity/fingerprint checks never send a request and
+                    # must not pay for, or block on, that transport-only operation.
+                    opener = urllib.request.build_opener(_RejectRedirectHandler())
+                    self._opener = opener
+        return opener.open(*args, **kwargs)
+
+
 def _interrupt_http_response(response: Any) -> None:
     """Best-effort interruption for a read blocked below urllib's framing layer."""
     stream = getattr(response, "fp", None)
@@ -223,7 +244,7 @@ class Provider(ABC):
         # urllib copies Authorization and other credential headers to redirect
         # requests. A private opener that refuses redirects keeps complete,
         # stream, and embedding traffic on the reviewed endpoint.
-        self._http_opener = urllib.request.build_opener(_RejectRedirectHandler())
+        self._http_opener = _LazyHttpOpener()
         self._redactor = CredentialRedactor(config)
 
     def _effective_dispatch_contract(self) -> str:

@@ -172,6 +172,50 @@ class EffectiveDispatchIdentityTests(unittest.TestCase):
             second["provider_principal_fingerprint_sha256"],
         )
 
+    def test_api_route_identity_does_not_initialize_network_transport(self) -> None:
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["providers"] = {
+            "worker": {
+                "kind": "openai", "model": "gpt-test",
+                "endpoint": "https://api.openai.com/v1",
+            },
+        }
+        config = LoadedConfig(data, self.root, [], {})
+
+        with mock.patch.object(
+            provider_base.urllib.request, "build_opener",
+            side_effect=AssertionError("identity inspection initialized HTTP transport"),
+        ) as build_opener:
+            kind, context = chat._route_failure_context(config, "worker")
+
+        build_opener.assert_not_called()
+        self.assertEqual(kind, "openai")
+        self.assertRegex(
+            context["effective_dispatch_fingerprint_sha256"], r"^[0-9a-f]{64}$",
+        )
+
+    def test_api_transport_builds_one_private_redirect_refusing_opener_on_demand(self) -> None:
+        config = self.config(["unused"])
+        config.data["provider"].update({
+            "name": "openai", "endpoint": "https://api.openai.com/v1",
+        })
+        transport = mock.Mock()
+        transport.open.side_effect = ["first answer", "second answer"]
+
+        with mock.patch.object(
+            provider_base.urllib.request, "build_opener", return_value=transport,
+        ) as build_opener:
+            provider = provider_base.OpenAIProvider(config)
+            provider.effective_dispatch_fingerprint()
+            build_opener.assert_not_called()
+            self.assertEqual(provider._http_opener.open("first request"), "first answer")
+            self.assertEqual(provider._http_opener.open("second request"), "second answer")
+
+        build_opener.assert_called_once()
+        self.assertIsInstance(
+            build_opener.call_args.args[0], provider_base._RejectRedirectHandler,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
