@@ -6,8 +6,11 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+const {samePhysicalDirectory} = require("./built.smoke");
 
 // Exported for the matcher tests below.
 const PACKAGE = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
@@ -44,6 +47,20 @@ function shipped(relative) {
   );
   const takenOut = removed.some((pattern) => matches(pattern, relative));
   return letIn && !takenOut;
+}
+
+function windowsShortPath(directory) {
+  const variable = "NEXUS_BUILT_SMOKE_ALIAS_TARGET";
+  return childProcess.execFileSync(
+    process.env.ComSpec || "cmd.exe",
+    ["/d", "/c", `for %I in ("%${variable}%") do @echo %~sI`],
+    {
+      encoding: "utf8",
+      env: {...process.env, [variable]: directory},
+      windowsHide: true,
+      windowsVerbatimArguments: true,
+    },
+  ).trim();
 }
 
 test("every local file the app loads is in the installer", () => {
@@ -228,7 +245,39 @@ test("the built-app smoke uses a throwaway project with no checkout authority", 
   }
   assert.match(source, /startsWith\("NEXUS_"\)/);
   assert.match(source, /env: environment/);
+  assert.match(source, /samePhysicalDirectory\(runtime\.project_root, project\)/);
   assert.match(source, /fs\.rmSync\(smokeRoot, \{ recursive: true, force: true \}\)/);
+});
+
+test("the built-app smoke treats a Windows short path as the same physical project", {
+  skip: process.platform !== "win32",
+}, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nexus-built-smoke-path-"));
+  const project = path.join(root, "arbitrary project with a long name");
+  const sibling = path.join(root, "different sibling project");
+  const ordinaryFile = path.join(root, "not a project directory.txt");
+  fs.mkdirSync(project);
+  fs.mkdirSync(sibling);
+  fs.writeFileSync(ordinaryFile, "not a directory\n", "utf8");
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+
+  let shortProject;
+  try {
+    shortProject = windowsShortPath(project);
+  } catch (error) {
+    t.skip(`This machine cannot query Windows 8.3 aliases: ${error.message || error}`);
+    return;
+  }
+  if (!shortProject
+      || shortProject.toLowerCase() === path.resolve(project).toLowerCase()) {
+    t.skip("This volume does not expose an 8.3 short-name alias for the test directory.");
+    return;
+  }
+
+  assert.strictEqual(samePhysicalDirectory(shortProject, project), true);
+  assert.strictEqual(samePhysicalDirectory(project, sibling), false);
+  assert.strictEqual(samePhysicalDirectory(project, path.join(root, "missing project")), false);
+  assert.strictEqual(samePhysicalDirectory(ordinaryFile, ordinaryFile), false);
 });
 
 test("test and smoke files stay out of the installer", () => {

@@ -1,6 +1,6 @@
 {
   "name": "nexus-harness-qa",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "private": true,
   "description": "Development-only browser QA dependencies for Nexus Harness.",
   "scripts": {

@@ -24,6 +24,21 @@ const OUTPUT = path.join(__dirname, "build-output");
 const GIVEN_APP = process.argv[2] || "";
 const CLOSE_THROUGH_WINDOW = process.env.NEXUS_CLOSE_THROUGH_WINDOW === "1";
 
+function samePhysicalDirectory(left, right) {
+  if (typeof left !== "string" || !left.trim()
+      || typeof right !== "string" || !right.trim()) return false;
+  try {
+    const leftIdentity = fs.statSync(path.resolve(left), {bigint: true});
+    const rightIdentity = fs.statSync(path.resolve(right), {bigint: true});
+    return leftIdentity.isDirectory()
+      && rightIdentity.isDirectory()
+      && leftIdentity.dev === rightIdentity.dev
+      && leftIdentity.ino === rightIdentity.ino;
+  } catch (_error) {
+    return false;
+  }
+}
+
 function theBuiltApp() {
   if (GIVEN_APP) {
     const given = path.resolve(GIVEN_APP);
@@ -129,8 +144,10 @@ async function main() {
       const answer = await fetch("/api/bootstrap");
       return (await answer.json()).runtime;
     });
-    if (!runtime || path.resolve(runtime.project_root) !== project) {
-      throw new Error(`The clean first-run project was not selected: ${JSON.stringify(runtime)}`);
+    if (!runtime || !samePhysicalDirectory(runtime.project_root, project)) {
+      throw new Error(
+        `The clean first-run project was not selected. Expected ${project}; got ${JSON.stringify(runtime)}`
+      );
     }
     if (!/[\\/]resources[\\/]runtime[\\/]python\.exe$/i.test(String(runtime.python_executable || ""))) {
       throw new Error(`The packaged app did not use its private Python: ${runtime.python_executable}`);
@@ -174,7 +191,11 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(`\n${error && error.message ? error.message : error}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`\n${error && error.message ? error.message : error}`);
+    process.exit(1);
+  });
+}
+
+module.exports = {samePhysicalDirectory};
