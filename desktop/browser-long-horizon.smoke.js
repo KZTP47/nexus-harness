@@ -1122,6 +1122,13 @@ async function main() {
     await ackAfterCard.locator(".swarm-chat-box").fill(ackAfterText);
     await ackAfterCard.locator(".swarm-chat-work").click();
     await until(() => Promise.resolve(ackAfterReceipt), "committed acknowledgement", 30_000);
+    await page.waitForFunction(
+      ([agentId, chatId]) => {
+        const activity = swarmChatActivityFor(agentId, chatId);
+        return !activity || activity.responseFinished === true;
+      },
+      [AGENT_A, chats.ackAfterChat], {timeout: 30_000},
+    );
     await page.unroute("**/api/long-horizon/acknowledge-admission");
     const ackAfterGoal = await waitForGoal(page, chats.ackAfterChat);
     assertExactTeamGoal(ackAfterGoal, ackAfterReceipt.request_id);
@@ -1147,7 +1154,6 @@ async function main() {
       ]),
       `Committed acknowledgement response loss triggered a resend: ${JSON.stringify(ackAfterRequests)}`,
     );
-    await sleep(750);
     assertExactDispatches(coordination, "ack-after");
     console.log("pass  committed acknowledgement response loss cannot fail or replay verified Work");
 
