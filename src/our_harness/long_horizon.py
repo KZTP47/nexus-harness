@@ -59,6 +59,9 @@ MAX_CRITERIA = 32
 MAX_OBJECTIVE_CHARACTERS = 240_000
 MAX_PENDING_ACTION_BYTES = 8_000_000
 MAX_REQUEST_ID_CHARACTERS = 160
+_GOAL_STORE_DATABASE_TIMEOUT_SECONDS = 30.0
+_GOAL_STORE_STARTUP_ATTEMPT_TIMEOUT_SECONDS = 1.0
+_GOAL_STORE_WAL_RETRY_MAX_DELAY_SECONDS = 0.25
 MAX_CONVERSATION_ID_CHARACTERS = (
     chat_lab.DIRECT_LONG_HORIZON_CHAT_ID_CHARACTERS
 )
@@ -935,11 +938,51 @@ class GoalStore:
 
     @contextmanager
     def _connect(self):
-        db = sqlite3.connect(self.database, timeout=30.0, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        db.execute("PRAGMA foreign_keys=ON")
+        deadline = time.monotonic() + _GOAL_STORE_DATABASE_TIMEOUT_SECONDS
+        retry_delay = 0.01
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            db = sqlite3.connect(
+                self.database,
+                timeout=min(_GOAL_STORE_STARTUP_ATTEMPT_TIMEOUT_SECONDS, remaining),
+                isolation_level=None,
+            )
+            try:
+                db.row_factory = sqlite3.Row
+                row = db.execute("PRAGMA journal_mode").fetchone()
+                mode = str(row[0] if row else "").casefold()
+                if mode != "wal":
+                    row = db.execute("PRAGMA journal_mode=WAL").fetchone()
+                    mode = str(row[0] if row else "").casefold()
+                if mode != "wal":
+                    raise HarnessError(
+                        "Long-horizon storage could not enable WAL journaling"
+                    )
+                busy_timeout_ms = int(_GOAL_STORE_DATABASE_TIMEOUT_SECONDS * 1_000)
+                db.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+                db.execute("PRAGMA synchronous=FULL")
+                db.execute("PRAGMA foreign_keys=ON")
+                break
+            except sqlite3.OperationalError as error:
+                db.close()
+                code = getattr(error, "sqlite_errorcode", None)
+                locked = (
+                    isinstance(code, int)
+                    and code & 0xFF in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                ) or str(error).casefold() in {
+                    "database is locked", "database table is locked",
+                    "database schema is locked",
+                }
+                remaining = deadline - time.monotonic()
+                if not locked or remaining <= 0:
+                    raise
+                time.sleep(min(retry_delay, remaining))
+                retry_delay = min(
+                    retry_delay * 2, _GOAL_STORE_WAL_RETRY_MAX_DELAY_SECONDS,
+                )
+            except BaseException:
+                db.close()
+                raise
         try:
             yield db
         finally:

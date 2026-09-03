@@ -275,6 +275,30 @@ def _cross_process_goal_admission(
         raise
 
 
+def _cross_process_hold_goal_store_wal_lock(
+    database_path: str, statuses: object, release: object,
+) -> None:
+    """Hold the pre-WAL database write lock until the startup retry begins."""
+
+    connection = None
+    try:
+        connection = sqlite3.connect(database_path, isolation_level=None)
+        connection.execute("BEGIN IMMEDIATE")
+        statuses.put(_cross_process_status("holder", "locked"))
+        if not release.wait(THREAD_COORDINATION_TIMEOUT_SECONDS):
+            raise RuntimeError("WAL lock release barrier timed out")
+        connection.rollback()
+        statuses.put(_cross_process_status("holder", "released"))
+    except BaseException as exc:  # pragma: no cover - returned to parent for assertion
+        statuses.put(_cross_process_status(
+            "holder", "error", error=repr(exc), traceback=traceback.format_exc(),
+        ))
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def _cross_process_runtime_replay(
     worker_id: str, state_path: str, authority_path: str, project_path: str,
     statuses: object, begin: object, release: object, dispatch_count: object,
@@ -415,6 +439,74 @@ class LongHorizonTests(unittest.TestCase):
 
     def store(self):
         return long_horizon.GoalStore(self.config)
+
+    def test_goal_store_retries_transient_wal_startup_lock(self):
+        state = self.base / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        database = state / "long-horizon.sqlite3"
+        with sqlite3.connect(database) as initial:
+            initial.execute("CREATE TABLE startup_lock_fixture(id INTEGER)")
+
+        context = multiprocessing.get_context("spawn")
+        statuses = context.Queue()
+        release = context.Event()
+        holder = context.Process(
+            name="nexus-goal-store-wal-lock-holder",
+            target=_cross_process_hold_goal_store_wal_lock,
+            args=(str(database), statuses, release),
+        )
+        processes = {"holder": holder}
+        original_connect = sqlite3.connect
+        opened = 0
+        released = False
+        cleaned = False
+
+        def connect_without_sqlite_wait(*args, **kwargs):
+            nonlocal opened
+            opened += 1
+            kwargs["timeout"] = 0.0
+            return original_connect(*args, **kwargs)
+
+        def release_holder(_delay):
+            nonlocal released
+            if released:
+                return
+            release.set()
+            _collect_cross_process_phase(statuses, processes, "released")
+            released = True
+
+        def cleanup():
+            nonlocal cleaned
+            if cleaned:
+                return
+            cleaned = True
+            _cleanup_cross_processes(
+                processes, events=(release,), queues=(statuses,),
+            )
+
+        self.addCleanup(cleanup)
+        try:
+            holder.start()
+            _collect_cross_process_phase(statuses, processes, "locked")
+            with mock.patch.object(
+                long_horizon.sqlite3, "connect", side_effect=connect_without_sqlite_wait,
+            ), mock.patch.object(
+                long_horizon.time, "sleep", side_effect=release_holder,
+            ) as sleep:
+                store = long_horizon.GoalStore(
+                    self.config, migrate_execution_metadata=False,
+                )
+            _assert_cross_processes_exited_cleanly(processes)
+        finally:
+            cleanup()
+
+        self.assertTrue(released)
+        self.assertGreaterEqual(opened, 2)
+        sleep.assert_called()
+        with original_connect(store.database) as reopened:
+            self.assertEqual(
+                "wal", reopened.execute("PRAGMA journal_mode").fetchone()[0],
+            )
 
     def auto_arm(self, store, goal_id):
         arm_id = long_horizon._auto_start_arm_id(  # noqa: SLF001 - CAS contract assertion
