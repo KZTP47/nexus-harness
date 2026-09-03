@@ -4081,6 +4081,36 @@ def _trusted_host_node(
     return candidate
 
 
+def _probe_node_major_version(node: Path) -> tuple[int, str]:
+    """Probe trusted Node deterministically without inherited preload options."""
+
+    probe_environment = {
+        key: value for key, value in os.environ.items()
+        if key.casefold() != "node_options"
+    }
+    failure = "the version probe returned no recognizable version"
+    for _attempt in range(2):
+        try:
+            completed = subprocess.run(
+                [str(node), "--version"], check=False, capture_output=True,
+                text=True, timeout=5, env=probe_environment,
+            )
+        except subprocess.TimeoutExpired:
+            failure = "the version probe timed out"
+            continue
+        except (OSError, ValueError, subprocess.SubprocessError):
+            failure = "the version probe could not start"
+            continue
+        if completed.returncode != 0:
+            failure = f"the version probe exited with code {completed.returncode}"
+            continue
+        try:
+            return int(completed.stdout.strip().lstrip("v").split(".", 1)[0]), ""
+        except ValueError:
+            failure = "the version probe returned no recognizable version"
+    return 0, failure
+
+
 def _runtime_is_selected_project_data(runtime_root: Path, project_root: Path) -> bool:
     """Reject runtime roots supplied through or located in the selected project."""
 
@@ -4678,18 +4708,17 @@ def _contained_snapshot_command_with_engine(
                     "containment_unavailable": True,
                 }
             argv[0] = str(node_source)
-        try:
-            version = subprocess.run(
-                [str(node_source), "--version"], check=False, capture_output=True,
-                text=True, timeout=5,
-            ).stdout.strip()
-            major = int(version.lstrip("v").split(".", 1)[0])
-        except (OSError, ValueError, subprocess.SubprocessError):
-            major = 0
+        major, probe_failure = _probe_node_major_version(node_source)
         if major < 20:
+            reason = (
+                probe_failure
+                or f"Node {major} is older than the required Node 20"
+            )
             return {
                 "argv": command, "cwd": ".", "exit_code": -2,
-                "stdout": "", "stderr": "Node permission-model containment is unavailable",
+                "stdout": "", "stderr": (
+                    "Node permission-model containment is unavailable: " + reason
+                ),
                 "timed_out": False, "output_truncated": False,
                 "containment_unavailable": True,
             }

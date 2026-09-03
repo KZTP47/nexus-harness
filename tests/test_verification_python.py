@@ -691,17 +691,81 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         runtime_root = self.snapshot / ".nexus-verification" / "runtime"
         runtime_root.mkdir(parents=True)
         (runtime_root / "node.exe").write_bytes(b"project supplied node")
-        result = swarm_work._contained_snapshot_command(
-            config, self.snapshot,
-            [shutil.which("node") or "node", "-e", "process.stdout.write('contained node')"],
-            timeout=20, denied_root=self.root,
-        )
+        with mock.patch.dict(
+            os.environ, {"NODE_OPTIONS": "--nexus-invalid-probe-option"}, clear=False,
+        ):
+            result = swarm_work._contained_snapshot_command(
+                config, self.snapshot,
+                [shutil.which("node") or "node", "-e", "process.stdout.write('contained node')"],
+                timeout=20, denied_root=self.root,
+            )
         self.assertEqual(0, result["exit_code"], result)
         self.assertIn("contained node", result["stdout"])
         contained = Path(result["contained_argv"][0])
         self.assertEqual("node.exe", contained.name.casefold())
         self.assertFalse(contained.is_relative_to(self.snapshot.resolve()))
         self.assertFalse(runtime_root.exists())
+
+    def test_node_version_probe_retries_a_transient_timeout(self) -> None:
+        node = self.guard / "node.exe"
+        successful = subprocess.CompletedProcess(
+            [str(node), "--version"], 0, "v22.23.2\n", "",
+        )
+        timeout = subprocess.TimeoutExpired([str(node), "--version"], 5)
+        with mock.patch.dict(
+            os.environ, {"NODE_OPTIONS": "--require=project-controlled.js"}, clear=False,
+        ), mock.patch.object(
+            swarm_work.subprocess, "run", side_effect=[timeout, successful],
+        ) as probe:
+            result = swarm_work._probe_node_major_version(node)
+
+        self.assertEqual((22, ""), result)
+        self.assertEqual(2, probe.call_count)
+        for call in probe.call_args_list:
+            environment = call.kwargs["env"]
+            self.assertFalse(any(
+                key.casefold() == "node_options" for key in environment
+            ))
+
+    def test_node_version_probe_preserves_a_real_unsupported_version(self) -> None:
+        node = self.guard / "node.exe"
+        unsupported = subprocess.CompletedProcess(
+            [str(node), "--version"], 0, "v18.20.8\n", "",
+        )
+        with mock.patch.object(
+            swarm_work.subprocess, "run", return_value=unsupported,
+        ) as probe:
+            result = swarm_work._probe_node_major_version(node)
+
+        self.assertEqual((18, ""), result)
+        probe.assert_called_once()
+
+    def test_node_version_probe_exhaustion_fails_closed_before_launch(self) -> None:
+        node = self.guard / "node.exe"
+        config = LoadedConfig(dict(DEFAULT_CONFIG), self.root, [], {})
+        command = [str(node), "-e", "process.stdout.write('must not run')"]
+        timeouts = [
+            subprocess.TimeoutExpired([str(node), "--version"], 5),
+            subprocess.TimeoutExpired([str(node), "--version"], 5),
+        ]
+        with mock.patch.object(
+            swarm_work, "_trusted_host_node", return_value=node,
+        ), mock.patch.object(
+            swarm_work.subprocess, "run", side_effect=timeouts,
+        ) as probe, mock.patch.object(swarm_work, "run_appcontainer") as launch:
+            result = swarm_work._contained_snapshot_command(
+                config, self.snapshot, command, timeout=20, denied_root=self.root,
+            )
+
+        self.assertEqual(-2, result["exit_code"])
+        self.assertTrue(result["containment_unavailable"])
+        self.assertEqual(
+            "Node permission-model containment is unavailable: "
+            "the version probe timed out",
+            result["stderr"],
+        )
+        self.assertEqual(2, probe.call_count)
+        launch.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Windows contained dependency probe")
     def test_bare_pytest_uses_prepared_snapshot_dependency_without_installing(self) -> None:
