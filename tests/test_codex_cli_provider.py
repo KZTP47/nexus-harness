@@ -111,7 +111,10 @@ if mode == "brokered-grandchild-tree":
         "pathlib.Path(sys.argv[2]).write_text(str(__import__('os').getpid()),encoding='utf-8'); "
         "trigger=pathlib.Path(sys.argv[3]); "
         "list(iter(lambda:(time.sleep(0.005),trigger.exists())[1],True)); "
-        "child_code=\"import json,os,pathlib,sys,time;pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid()}));time.sleep(30)\"; "
+        "child_code=\"import json,os,pathlib,sys,time;"
+        "target=pathlib.Path(sys.argv[1]);staged=target.with_name(target.name+'.tmp');"
+        "staged.write_text(json.dumps({'pid':os.getpid()}),encoding='utf-8');"
+        "os.replace(staged,target);time.sleep(30)\"; "
         "subprocess.Popen([sys.executable,'-c',child_code,sys.argv[4]],cwd=sys.argv[1])"
     )
     subprocess.Popen(
