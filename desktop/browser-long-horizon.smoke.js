@@ -452,6 +452,9 @@ async function openBigChat(page, chatId) {
   const card = await openCompactChat(page, chatId);
   await card.getByRole("button", {name: "Open full Nexus chat"}).click();
   await page.waitForSelector("#theBigChat", {state: "visible", timeout: 30_000});
+  if (await page.getAttribute("#theBigChatHistoryToggle", "aria-expanded") !== "true") {
+    await page.click("#theBigChatHistoryToggle");
+  }
   await page.click(
     `#theBigChatConversationList [data-conversation-action="pick"][data-chat-id="${chatId}"]`,
     {timeout: 30_000},
@@ -1193,6 +1196,17 @@ async function main() {
     console.log("\nSource-browser Work together acceptance passed.");
     passed = true;
   } finally {
+    if (!passed) {
+      if (server) fs.writeFileSync(path.join(fixture, "source-server.log"), server.lines.join("\n"));
+      for (const [index, failedPage] of (context?.pages() || []).entries()) {
+        await failedPage.screenshot({path: path.join(fixture, `failure-${index}.png`)}).catch(() => {});
+        const diagnostic = await failedPage.evaluate(() => ({
+          text: document.body.innerText,
+          hydrated: typeof swarmBoardHydrated === "undefined" ? null : swarmBoardHydrated,
+        })).catch(error => ({error: String(error)}));
+        fs.writeFileSync(path.join(fixture, `failure-${index}.json`), JSON.stringify(diagnostic, null, 2));
+      }
+    }
     if (context) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
     if (server) await server.stop().catch((error) => {

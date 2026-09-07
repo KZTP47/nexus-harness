@@ -1,10 +1,10 @@
 """Durable, event-driven long-horizon work for the agent board.
 
-This is intentionally not a group-chat loop.  A goal owns a small dependency
-graph of concrete tasks.  Ready tasks are claimed by useful agents, agents may
-delegate or request a targeted review, and deterministic evidence decides when
-the goal is finished.  LangGraph supplies the resumable scheduler and interrupt
-boundary; the authenticated goal store is the UI-facing source of truth.
+Work Together is a shared conversation: participants take turns doing useful
+work, see each other's real messages, and agree on the current result. A small
+task graph retains dependencies and targeted reviews. LangGraph supplies the
+resumable scheduler and interrupt boundary; the authenticated goal store is the
+UI-facing source of truth and deterministic evidence verifies completion.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_auth
 from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
 from .redaction import CredentialRedactor
 from .runtime_integrity import mac, quarantine_marker
+from .goal_verification import capture_verification_contract, verification_project
 from .swarm_runs import _base
 from . import swarm_work
 
@@ -54,6 +55,9 @@ MAX_EVENTS = 4_000
 MAX_PARALLEL = 3
 MAX_PROVIDER_CALLS = 1_000
 MAX_CONTEXT_TOOL_CALLS = 500
+MAX_DIALOGUE_MESSAGES = 64
+MAX_DIALOGUE_CHARACTERS = 96_000
+DIALOGUE_SCHEMA_VERSION = 1
 MAX_NO_PROGRESS = 4
 MAX_CRITERIA = 32
 MAX_OBJECTIVE_CHARACTERS = 240_000
@@ -415,13 +419,13 @@ def _collaboration_contract(require_all_participants: bool) -> dict[str, Any]:
 
     basis = {
         "schema_version": COLLABORATION_CONTRACT_SCHEMA_VERSION,
-        "mode": "required_participant_fan_in" if require_all_participants else "adaptive",
+        "mode": "shared_project_dialogue" if require_all_participants else "adaptive",
         "required_dispatch": (
-            "serialized_terminal_attempts_v2" if require_all_participants
+            "serialized_useful_turns_v3" if require_all_participants
             else "useful_task_claims_v1"
         ),
         "required_claim_order": (
-            "undispatched_required_tasks_first_v2" if require_all_participants
+            "undispatched_then_alternating_participants_v3" if require_all_participants
             else "task_order_v1"
         ),
         "provider_budget_reservation": (
@@ -436,16 +440,31 @@ def _collaboration_contract(require_all_participants: bool) -> dict[str, Any]:
             else "independent_provider_failover_v1"
         ),
         "fan_in": (
-            "final_named_contribution_bounded_outcome_packet_v1"
+            "ordered_actual_messages_and_current_project_v2"
             if require_all_participants else "shared_task_ledger_v1"
         ),
-        "completion": "all_required_tasks_and_deterministic_verification_v1",
+        "completion": (
+            "all_participants_agree_on_latest_artifacts_and_verification_v2"
+            if require_all_participants
+            else "all_required_tasks_and_deterministic_verification_v1"
+        ),
     }
+    if require_all_participants:
+        basis["verification_profile"] = "shared_goal_v1"
     return {
         **basis,
         "fingerprint_sha256": hashlib.sha256(
             _canonical(basis).encode("utf-8")
         ).hexdigest(),
+    }
+
+
+def _new_dialogue() -> dict[str, Any]:
+    return {
+        "schema_version": DIALOGUE_SCHEMA_VERSION,
+        "contract_fingerprint_sha256": _collaboration_contract(True)["fingerprint_sha256"],
+        "sequence": 0, "last_turn_agent_id": "", "artifact_generation": 0,
+        "messages": [],
     }
 
 
@@ -580,6 +599,16 @@ def _project_baseline_manifest(root: Path) -> dict[str, str]:
     return manifest
 
 
+def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
+    manifest = baseline if baseline is not None else _project_baseline_manifest(Path(document["project"]["path"]))
+    return {
+        "schema_version": 2, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "artifact_generation": int((document.get("dialogue") or {}).get("artifact_generation") or 0),
+        "source_sha256": hashlib.sha256(_canonical(manifest).encode("utf-8")).hexdigest(),
+        "verification_contract_sha256": str((document.get("verification_contract") or {}).get("fingerprint_sha256") or ""),
+    }
+
+
 def _bounded_json(value: object, limit: int = 32_000) -> object:
     raw = _canonical(value)
     if len(raw.encode("utf-8")) <= limit:
@@ -616,6 +645,38 @@ def _semantic_artifact(value: object) -> object:
         key: copy.deepcopy(one) for key, one in value.items()
         if key not in {"transaction_id", "created_at", "created_ms", "observed_at_ms", "updated_ms"}
     }
+
+
+def _semantic_tool_result(value: object, *, verification: bool = False) -> object:
+    """Compare observations without counting a fresh tool envelope as progress."""
+    if isinstance(value, list):
+        return [_semantic_tool_result(one, verification=verification) for one in value]
+    if not isinstance(value, dict):
+        return value
+    ignored = {
+        "call_id", "span_id", "elapsed_ms", "created_ms", "observed_at_ms", "updated_ms",
+        "started_ms", "finished_ms", "completed_ms", "at_ms", "transaction_id",
+        "verification_session_id", "session_id", "run_id", "duplicate", "replayed", "notice",
+        "content_bytes", "content_sha256",
+        "duration_ms", "duration_seconds", "elapsed_seconds",
+    }
+    answer = {}
+    for key, item in value.items():
+        if key in ignored:
+            continue
+        if key == "content" and isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except (TypeError, ValueError):
+                pass
+        if verification and key in {"stdout", "stderr"} and isinstance(item, str):
+            item = re.sub(r"(?m)(^Ran \d+ tests? in )[\d.]+s(\r?$)", r"\1<duration>\2", item)
+            item = re.sub(r"(?m)(^.*\d+ (?:passed|failed|skipped).*?\bin )[\d.]+s", r"\1<duration>", item)
+            item = re.sub(r"(?m)(^\s*(?:#\s*)?duration_ms\s*:?\s*)[\d.]+", r"\1<duration>", item)
+            item = re.sub(r"(?m)(^\s*\d+ (?:passed|failed|skipped).*?\()[\d.]+(?:ms|s|m|h)(\)\s*$)", r"\1<duration>\2", item)
+            item = re.sub(r"(?m)^\s*(?:Time:|Duration\s+)[\d.]+\s*(?:ms|s|m|h).*$", "Duration: <duration>", item)
+        answer[key] = _semantic_tool_result(item, verification=verification)
+    return answer
 
 
 def _schema_recovery_pristine_task(task: dict[str, Any]) -> bool:
@@ -803,9 +864,12 @@ def _summary_delivery(
         index for index, one in enumerate(required)
         if str(one.get("id") or "") == str(task.get("id") or "")
     ), -1)
+    # Conversation routing wraps around after the peer's turn. A completed
+    # teammate may still need to inspect this turn's changes before agreeing.
+    ordered = required[position + 1:] + required[:position] if position >= 0 else required
     recipient = next((
-        one for one in required[position + 1:]
-        if position >= 0 and _can_receive_future_required_contribution(one)
+        one for one in ordered
+        if one.get("state") not in {"blocked", "failed", "cancelled"}
         and str(one.get("required_contributor_id") or one.get("assigned_agent_id") or "")
         != str(task.get("assigned_agent_id") or "")
     ), None)
@@ -1988,6 +2052,8 @@ class GoalStore:
                         document["collaboration_contract"] = _collaboration_contract(
                             bool(document.get("require_all_participants")),
                         )
+                        if document.get("require_all_participants"):
+                            document["dialogue"] = _new_dialogue()
                         changed = True
                     if self._recover_interrupted_codex_schema_retry(db, document):
                         changed = True
@@ -2535,6 +2601,14 @@ class GoalStore:
                 str(held.get("fingerprint_sha256") or ""),
                 str(expected["fingerprint_sha256"]),
             )
+        if same and document.get("require_all_participants"):
+            dialogue = document.get("dialogue")
+            same = isinstance(dialogue, dict) \
+                and dialogue.get("schema_version") == DIALOGUE_SCHEMA_VERSION \
+                and hmac.compare_digest(
+                    str(dialogue.get("contract_fingerprint_sha256") or ""),
+                    str(expected["fingerprint_sha256"]),
+                )
         if same:
             return {
                 "changed": False,
@@ -2548,7 +2622,7 @@ class GoalStore:
             "message": (
                 "The saved collaboration scheduler contract is missing or changed. "
                 "Nexus kept this goal inspectable but will not dispatch it under different "
-                "participant, fan-in, or completion semantics. Start a new goal with the "
+                "conversation or completion semantics. Start a new goal with the "
                 "current Work Together contract."
             ),
             "recovery_action": "start_new_goal_with_current_setup",
@@ -2687,6 +2761,10 @@ class GoalStore:
             **({"participant_requirement": "adaptive"}
                if participant_ids and not require_all else {}),
         }
+        verification_contract = capture_verification_contract(self.config, project, root)
+        if verification_contract["test_commands"] or verification_contract["approved_test_command_digest"] \
+                or (verification_contract["uses_project_config"] and self.config.get("project.test_commands", [])):
+            admission_policy["project_verification_fingerprint_sha256"] = verification_contract["fingerprint_sha256"]
         admission_digest = _goal_admission_digest(
             self.redactor,
             project_id=project_id,
@@ -2923,11 +3001,11 @@ class GoalStore:
                 if owner["id"] in represented_agents:
                     continue
                 contribution = (
-                    "Make a distinct, useful contribution to the shared user objective after "
-                    "reviewing the preceding task results. Close a concrete gap, add or improve "
-                    "an artifact, or perform targeted verification; do not merely restate earlier "
-                    "work. If the user asked each agent to create or own something, produce this "
-                    "agent's distinct requested artifact.\n\nSHARED OBJECTIVE\n"
+                    "Work with your teammate on the shared user objective. Read their messages, "
+                    "respond to the concrete points they raise, and take the next useful step: "
+                    "implement, investigate, test, or improve the result. Continue the conversation "
+                    "until the shared objective is fulfilled. If the user assigned individual "
+                    "deliverables, also complete your own.\n\nSHARED OBJECTIVE\n"
                     + "\n\n".join(clean_objectives)
                 )
                 task_id = _stable_id("participant", goal_id, owner["id"], contribution)
@@ -3005,6 +3083,7 @@ class GoalStore:
         }
         execution_contract = _exclusive_project_contract(root, target_authority_id)
         collaboration_contract = _collaboration_contract(require_all)
+        verification_contract = capture_verification_contract(self.config, project, root)
         bound_admission_digest = _short(admission_digest, 128) or hashlib.sha256(
             _canonical({
                 "project_id": project_id,
@@ -3017,6 +3096,7 @@ class GoalStore:
                 "agent_bindings": [one.get("route_binding") for one in agents],
                 "execution_contract": execution_contract,
                 "collaboration_contract": collaboration_contract,
+                "verification_contract": verification_contract,
                 "objectives": clean_objectives,
                 "success_criteria": criteria,
                 "policy": runtime_policy,
@@ -3044,6 +3124,9 @@ class GoalStore:
             "project_authority_id": target_authority_id,
             "execution_contract": execution_contract,
             "collaboration_contract": collaboration_contract,
+            "dialogue": _new_dialogue() if require_all else {},
+            "verification_contract": verification_contract,
+            "verification_settings_revision": 1,
             "project_queue": self._queue_record(
                 "owner", now, auto_start_pending=True,
             ),
@@ -3596,6 +3679,22 @@ class GoalStore:
             "fork_checkpoint": int(source.get("event_seq") or 0),
             "note": "Forked from the saved task/evidence checkpoint into an isolated Git worktree. Resume when ready.",
         })
+        if source.get("verification_contract") is not None:
+            source_verification = verification_project(self.config, source)
+            commands = source_verification.get("test_commands") or (
+                self.config.get("project.test_commands", [])
+                if (source.get("verification_contract") or {}).get("uses_project_config") else []
+            )
+            evidence_contracts = source_verification.get("test_evidence_contracts") or (
+                self.config.get("project.test_evidence_contracts", [])
+                if (source.get("verification_contract") or {}).get("uses_project_config") else []
+            )
+            document["verification_contract"] = capture_verification_contract(
+                self.config, {
+                    "test_commands": commands,
+                    "test_evidence_contracts": evidence_contracts,
+                }, project_path,
+            )
         by_id = {one["id"]: one for one in document["tasks"]}
         for task in document["tasks"]:
             task.update({"lease_id": "", "owner_pid": 0, "owner_token": ""})
@@ -3947,11 +4046,21 @@ class GoalStore:
             )
             chosen: list[dict[str, Any]] = []
             agents = {one["id"]: one for one in document["agents"]}
+            turn_order = [document["lead_agent_id"], *[
+                agent_id for agent_id in agents if agent_id != document["lead_agent_id"]
+            ]]
+            last_agent = (document.get("dialogue") or {}).get("last_turn_agent_id")
+            if last_agent in turn_order:
+                offset = turn_order.index(last_agent) + 1
+                turn_order = turn_order[offset:] + turn_order[:offset]
+            turn_rank = {agent_id: index for index, agent_id in enumerate(turn_order)}
             ordered_tasks = sorted(
                 enumerate(document["tasks"]),
                 key=lambda held: (
                     0 if held[1].get("required_contributor_id")
                     and not _task_has_recorded_provider_dispatch(held[1]) else 1,
+                    turn_rank.get(held[1].get("assigned_agent_id"), 0)
+                    if document.get("require_all_participants") else 0,
                     held[0],
                 ),
             )
@@ -3964,7 +4073,9 @@ class GoalStore:
                 ) for one in chosen):
                     continue
                 chosen.append(task)
-                if len(chosen) >= min(int(document["policy"]["max_parallel"]), available_calls):
+                if document.get("require_all_participants") or len(chosen) >= min(
+                    int(document["policy"]["max_parallel"]), available_calls,
+                ):
                     break
             for task in chosen:
                 task.update({
@@ -4146,7 +4257,8 @@ class GoalStore:
         return bool(self._mutate(goal_id, change)[1])
 
     def acknowledge_context_step(
-        self, goal_id: str, task: dict[str, Any], action: dict[str, Any], phase: str
+        self, goal_id: str, task: dict[str, Any], action: dict[str, Any], phase: str,
+        context_binding: dict[str, Any] | None = None,
     ) -> None:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
@@ -4166,6 +4278,7 @@ class GoalStore:
                 ),
                 "phase": _short(phase, 100), "calls": calls, "results": [],
                 "provider_effect_id": current.get("provider_effect_id", ""),
+                "context_binding": context_binding or _context_binding(document),
                 "state": "tools_pending", "created_ms": _now(),
             }
             history = current.setdefault("context_steps", [])
@@ -4177,6 +4290,27 @@ class GoalStore:
                             "step_id": step["step_id"], "phase": phase,
                             "calls": calls, "effect_id": current.get("provider_effect_id", ""),
                         }, run_id=goal_id)
+            if document.get("require_all_participants"):
+                self._record_dialogue_message(db, document, current, action, phase=phase)
+        self._mutate(goal_id, change)
+
+    def supersede_stale_context_steps(
+        self, goal_id: str, task: dict[str, Any], context_binding: dict[str, Any],
+    ) -> None:
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            current = next(one for one in document["tasks"] if one["id"] == task["id"])
+            if current.get("lease_id") != task.get("lease_id") or current["state"] != "running":
+                raise HarnessError("The context snapshot belongs to a stale task lease")
+            stale = []
+            for step in current.get("context_steps", []):
+                if step.get("state") != "superseded" and step.get("context_binding") != context_binding:
+                    step["state"] = "superseded"
+                    stale.append(step.get("step_id"))
+            if stale:
+                self._event(db, document, "context_snapshot_superseded", task_id=current["id"],
+                            agent_id=current["assigned_agent_id"], payload={
+                                "step_ids": stale, "reason": "objective_or_project_changed",
+                            })
         self._mutate(goal_id, change)
 
     def record_context_tool_result(
@@ -4191,6 +4325,12 @@ class GoalStore:
                 "call_id": call.get("call_id"), "name": call.get("name"),
                 "result": _durable_evidence(result), "error": _short(error, 4_000),
             }
+            payload["semantic_result_sha256"] = hashlib.sha256(_canonical({
+                "name": payload["name"], "result": _semantic_tool_result(
+                    payload["result"], verification=payload["name"] == "run_selected_verification",
+                ),
+                "error": payload["error"],
+            }).encode("utf-8")).hexdigest()
             steps = current.get("context_steps") or []
             if steps:
                 step = steps[-1]
@@ -4235,6 +4375,45 @@ class GoalStore:
                         payload=payload, run_id=goal_id)
         self._mutate(goal_id, change)
 
+    def _record_dialogue_message(
+        self, db: sqlite3.Connection, document: dict[str, Any], task: dict[str, Any],
+        action: dict[str, Any], *, phase: str = "action",
+    ) -> None:
+        """Publish actual provider words once, with a bounded ordered prompt history."""
+
+        summary = _short(self.redactor.text(action.get("summary") or ""), 8_000)
+        if not summary:
+            return
+        delivery = _summary_delivery(document, task, action)
+        dialogue = document.get("dialogue") if document.get("require_all_participants") else None
+        message_id = _stable_id(
+            "message", document["goal_id"], task["id"],
+            task.get("provider_effect_id") or task.get("lease_id"), phase, summary,
+        )
+        if isinstance(dialogue, dict):
+            if any(one.get("id") == message_id for one in dialogue.get("messages", [])):
+                return
+            dialogue["sequence"] = int(dialogue.get("sequence") or 0) + 1
+            dialogue.setdefault("messages", []).append({
+                "id": message_id, "sequence": dialogue["sequence"],
+                "agent_id": task["assigned_agent_id"], "task_id": task["id"],
+                "objective_epoch": int(document.get("objective_epoch") or 1),
+                "action": str(action.get("action") or "work"), "phase": phase,
+                "summary": summary, "recipient": delivery, "at_ms": _now(),
+            })
+            messages = dialogue["messages"][-MAX_DIALOGUE_MESSAGES:]
+            while len(messages) > 1 and sum(len(one["summary"]) for one in messages) > MAX_DIALOGUE_CHARACTERS:
+                messages.pop(0)
+            dialogue["messages"] = messages
+        self._event(
+            db, document, "provider_acknowledged", task_id=task["id"],
+            agent_id=task["assigned_agent_id"], payload={
+                "action": str(action.get("action") or "work"), "summary": summary,
+                "effect_id": task.get("provider_effect_id", ""),
+                "summary_delivery": delivery, "phase": phase,
+            }, run_id=document["goal_id"],
+        )
+
     def record_action(self, goal_id: str, task: dict[str, Any], action: dict[str, Any]) -> bool:
         action = self.sanitize_action(action)
         def change(document: dict[str, Any], db: sqlite3.Connection):
@@ -4275,13 +4454,7 @@ class GoalStore:
             current["pending_action"] = copy.deepcopy(action)
             current["provider_effect_state"] = "acknowledged"
             current["reconciliation_required"] = False
-            summary_delivery = _summary_delivery(document, current, action)
-            self._event(db, document, "provider_acknowledged", task_id=current["id"],
-                        agent_id=current["assigned_agent_id"], payload={
-                            "action": action["action"], "summary": action["summary"],
-                            "effect_id": current.get("provider_effect_id", ""),
-                            "summary_delivery": summary_delivery,
-                        }, run_id=goal_id)
+            self._record_dialogue_message(db, document, current, action)
             self._event(db, document, "agent_stopped", task_id=current["id"],
                         agent_id=current["assigned_agent_id"], payload={"outcome": "structured_action"})
             return True
@@ -4456,7 +4629,9 @@ class GoalStore:
         self._mutate(goal_id, change)
 
     def acknowledge_file_request(
-        self, goal_id: str, task: dict[str, Any], paths: list[str], phase: str
+        self, goal_id: str, task: dict[str, Any], paths: list[str], phase: str,
+        action: dict[str, Any] | None = None,
+        context_binding: dict[str, Any] | None = None,
     ) -> None:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
@@ -4473,6 +4648,7 @@ class GoalStore:
                 ),
                 "phase": _short(phase, 100), "calls": [], "results": [],
                 "requested_files": list(paths), "provider_effect_id": current.get("provider_effect_id", ""),
+                "context_binding": context_binding or _context_binding(document),
                 "state": "complete", "created_ms": _now(), "completed_ms": _now(),
             }
             history = current.setdefault("context_steps", [])
@@ -4483,6 +4659,8 @@ class GoalStore:
                         agent_id=current["assigned_agent_id"], payload={
                             "paths": paths, "effect_id": current.get("provider_effect_id", ""),
                         }, run_id=goal_id)
+            if document.get("require_all_participants") and action:
+                self._record_dialogue_message(db, document, current, action, phase=phase)
         self._mutate(goal_id, change)
 
     def prepare_transaction(
@@ -4726,6 +4904,31 @@ class GoalStore:
                 self._event(db, document, "artifact_changed", task_id=current["id"],
                             agent_id=current["assigned_agent_id"], payload=artifact)
             kind = str(action["action"])
+            dialogue = document.get("dialogue") if document.get("require_all_participants") else None
+            if isinstance(dialogue, dict):
+                dialogue["last_turn_agent_id"] = current["assigned_agent_id"]
+                changed_result = bool(artifact and artifact.get("changes"))
+                if changed_result:
+                    dialogue["artifact_generation"] = int(dialogue.get("artifact_generation") or 0) + 1
+                # A teammate's earlier completion agrees with the earlier
+                # result. New files (including repairs) require another look;
+                # a continuing conversation also gives a finished peer a turn.
+                if changed_result or (kind == "work" and current.get("required_contributor_id")):
+                    for peer in document["tasks"]:
+                        if peer["id"] == current["id"] or not peer.get("required_contributor_id") \
+                                or peer["state"] != "complete":
+                            continue
+                        peer.update({
+                            "state": "ready", "criteria_evidence": [],
+                            "agreed_artifact_generation": -1,
+                            "updated_ms": _now(), "last_error": "",
+                        })
+                        self._event(db, document, "teammate_turn_requested", task_id=peer["id"],
+                                    agent_id=peer["assigned_agent_id"], payload={
+                                        "from_agent_id": current["assigned_agent_id"],
+                                        "reason": "shared_result_changed" if changed_result else "conversation_continues",
+                                        "artifact_generation": dialogue["artifact_generation"],
+                                    })
             if kind == "ask_user":
                 reason = str(action.get("interrupt_reason") or "")
                 if reason not in INTERRUPT_REASONS:
@@ -4892,6 +5095,8 @@ class GoalStore:
                 if not concrete:
                     raise HarnessError("A task cannot complete until Nexus records a concrete artifact or verified no-change snapshot")
                 current["state"] = "complete"
+                if isinstance(dialogue, dict) and current.get("required_contributor_id"):
+                    current["agreed_artifact_generation"] = int(dialogue.get("artifact_generation") or 0)
                 self._event(db, document, "task_completed", task_id=current["id"],
                             agent_id=current["assigned_agent_id"], payload={"evidence": current["evidence"], "artifacts": current["artifacts"]})
                 if current.get("review_of"):
@@ -4908,9 +5113,15 @@ class GoalStore:
                         )
             else:
                 fingerprint = hashlib.sha256(_canonical({
-                    "summary": current["summary"],
+                    # Rephrasing a stalled conversation is not fresh progress.
+                    "summary": "" if current.get("required_contributor_id") else current["summary"],
                     "evidence": evidence,
                     "artifact": _semantic_artifact(artifact or {}),
+                    "tool_observations": sorted({
+                        str(result["semantic_result_sha256"])
+                        for step in current.get("context_steps", []) if step.get("state") != "superseded"
+                        for result in step.get("results", []) if result.get("semantic_result_sha256")
+                    }),
                 }).encode("utf-8")).hexdigest()
                 if fingerprint == current.get("progress_fingerprint"):
                     current["no_progress"] = int(current.get("no_progress") or 0) + 1
@@ -5149,7 +5360,72 @@ class GoalStore:
 
         self._mutate(goal_id, change)
 
-    def control(self, goal_id: str, action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _adopt_project_verification_settings(
+        self, document: dict[str, Any], db: sqlite3.Connection, selected: dict[str, Any],
+    ) -> bool:
+        """Adopt the server's current board settings only at explicit paused-team Resume."""
+        if not document.get("require_all_participants") or document.get("status") != "paused":
+            return False
+        project = document["project"]
+        root = Path(str(project["path"])).resolve(strict=True)
+        if not isinstance(selected, dict) or selected.get("is_there") is not True \
+                or str(selected.get("id") or "") != str(project["id"]) \
+                or Path(str(selected.get("path") or "")).resolve(strict=True) != root:
+            raise HarnessError("Resume verification settings must come from this goal's exact selected project")
+        status = inspect_project_authority(root)
+        if not status.get("can_run") or not hmac.compare_digest(
+            str(document.get("project_authority_id") or ""), project_identity(root),
+        ):
+            raise HarnessError("The selected project's execution authority changed before verification settings could refresh")
+        if self.provider_setup_status(document).get("changed") or self.collaboration_setup_status(document).get("changed"):
+            raise HarnessError("Restore the goal's saved provider and collaboration setup before resuming")
+        evidence_contracts = selected.get("test_evidence_contracts", [])
+        if not isinstance(evidence_contracts, list) or any(not isinstance(one, dict) for one in evidence_contracts):
+            raise HarnessError("Project test evidence contracts must be a list of contract objects")
+        adopted = copy.deepcopy(selected)
+        captured = capture_verification_contract(self.config, adopted, root)
+        commands, source = swarm_work._verification_commands(self.config, root, adopted)
+        approval = str(captured.get("approved_test_command_digest") or "")
+        if approval and source == "discovered":
+            current_digest = swarm_work._command_approval_digest(
+                root, commands, declared_path=str(adopted.get("path") or ""),
+            )
+            if not hmac.compare_digest(approval, current_digest):
+                raise HarnessError("Discovered project checks changed; review and approve the current checks before resuming")
+        elif approval:
+            # Explicit commands already have their own user authorization. An
+            # old discovery approval must not survive as authority for a later
+            # unrelated manifest after those commands are removed.
+            adopted["approved_test_command_digest"] = ""
+            captured = capture_verification_contract(self.config, adopted, root)
+        previous = document.get("verification_contract") or {}
+        if captured == previous:
+            return False
+        if self._scheduler_live(document) or any(
+            one.get("state") == "running" for one in document["tasks"]
+        ):
+            raise HarnessError("Wait for the current turn to finish pausing before refreshing project checks")
+        document["verification_contract"] = captured
+        document["verification_settings_revision"] = int(document.get("verification_settings_revision") or 1) + 1
+        document["verification"] = {
+            "status": "not_run", "reason": "Project checks were refreshed by explicit Resume.", "commands": [],
+        }
+        for task in document["tasks"]:
+            for step in task.get("context_steps", []):
+                if any(one.get("name") == "run_selected_verification" for one in step.get("calls", [])):
+                    step["state"] = "superseded"
+        self._event(db, document, "verification_settings_updated", payload={
+            "schema_version": 1, "revision": document["verification_settings_revision"],
+            "previous_fingerprint_sha256": str(previous.get("fingerprint_sha256") or ""),
+            "fingerprint_sha256": captured["fingerprint_sha256"], "trigger": "explicit_resume",
+            "changed_fields": sorted(key for key in captured if key != "fingerprint_sha256" and captured[key] != previous.get(key)),
+        })
+        return True
+
+    def control(
+        self, goal_id: str, action: str, payload: dict[str, Any] | None = None, *,
+        project_verification_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         payload = payload or {}
         cancellation_error: list[str] = []
 
@@ -5329,6 +5605,8 @@ class GoalStore:
                     raise HarnessError(
                         "Reconcile or supersede pending provider/file effects before resuming this goal"
                     )
+                if project_verification_settings is not None:
+                    self._adopt_project_verification_settings(document, db, project_verification_settings)
                 document["automatic_recovery_control"] = _automatic_recovery_control(
                     False,
                 )
@@ -5623,6 +5901,13 @@ class GoalStore:
                                             "transaction_id": pending["transaction_id"],
                                             "reason": "user_steering",
                                         })
+                    if document.get("require_all_participants"):
+                        for participant in document["tasks"]:
+                            if participant.get("required_contributor_id") and participant["state"] == "complete":
+                                participant.update({
+                                    "state": "ready", "criteria_evidence": [],
+                                    "agreed_artifact_generation": -1, "last_error": "",
+                                })
                 needs_steering_task = action == "steer" and not any(
                     one["state"] not in {"complete", "cancelled"} for one in document["tasks"]
                 )
@@ -5634,6 +5919,22 @@ class GoalStore:
                 })
                 if action == "steer":
                     document["objective_epoch"] = int(document.get("objective_epoch") or 1) + 1
+                    if document.get("require_all_participants"):
+                        dialogue = document["dialogue"]
+                        dialogue["artifact_generation"] = int(dialogue.get("artifact_generation") or 0) + 1
+                        dialogue["sequence"] = int(dialogue.get("sequence") or 0) + 1
+                        dialogue.setdefault("messages", []).append({
+                            "id": _stable_id("steer", goal_id, document["objective_epoch"]),
+                            "sequence": dialogue["sequence"], "agent_id": "", "task_id": "",
+                            "objective_epoch": document["objective_epoch"],
+                            "action": "steer", "phase": "user", "summary": words,
+                            "recipient": {"kind": "team", "name": "the team"}, "at_ms": _now(),
+                        })
+                        dialogue["messages"] = dialogue["messages"][-MAX_DIALOGUE_MESSAGES:]
+                        while len(dialogue["messages"]) > 1 and sum(
+                            len(one["summary"]) for one in dialogue["messages"]
+                        ) > MAX_DIALOGUE_CHARACTERS:
+                            dialogue["messages"].pop(0)
                     document["objective"] = (
                         str(document.get("original_objective") or document["objective"])
                         + "\n\nACTIVE USER STEERING\n"
@@ -5647,6 +5948,8 @@ class GoalStore:
                         if one["state"] == "waiting_review" or one.get("pending_action")
                     }
                     for unfinished in document["tasks"]:
+                        unfinished["no_progress"] = 0
+                        unfinished.pop("progress_fingerprint", None)
                         if unfinished.get("kind") == "review" \
                                 and unfinished.get("review_of") in review_parents \
                                 and unfinished["state"] not in {"complete", "cancelled"}:
@@ -5859,6 +6162,13 @@ class GoalStore:
             for criterion in document["success_criteria"]:
                 if criterion == "Every required task is complete":
                     passed = all(one["state"] in {"complete", "cancelled"} for one in document["tasks"])
+                    if document.get("require_all_participants"):
+                        generation = int((document.get("dialogue") or {}).get("artifact_generation") or 0)
+                        passed = passed and all(
+                            one.get("agreed_artifact_generation") == generation
+                            for one in document["tasks"] if one.get("required_contributor_id")
+                            and one["state"] != "cancelled"
+                        )
                     refs = ["task-ledger"]
                 elif criterion == "Configured deterministic verification passes":
                     passed = result.get("status") == "passed"
@@ -6394,63 +6704,44 @@ class LongHorizonRuntime:
                     contributions, string_limit=8_000, list_limit=100,
                 ))
             )
-        required_tasks = [
-            one for one in goal["tasks"] if one.get("required_contributor_id")
-        ]
-        final_required_fan_in = bool(task.get("required_contributor_id")) \
-            and len(required_tasks) > 1 and all(
-                one["id"] == task["id"]
-                or one["state"] in {"complete", "blocked", "failed", "cancelled"}
-                for one in required_tasks
-            )
-        required_position = next((
-            index for index, one in enumerate(required_tasks)
-            if one["id"] == task["id"]
-        ), -1)
-        prior_named_contributions = [
-            one for one in required_tasks
-            if one["id"] != task["id"] and _short(one.get("summary"), 8_000)
-        ]
-        next_named_task = next((
-            one for one in required_tasks[required_position + 1:]
-            if required_position >= 0
-            and _can_receive_future_required_contribution(one)
-        ), None)
         agent_names = {
             str(one.get("id") or ""): _short(one.get("name") or one.get("id"), 300)
             for one in goal.get("agents", []) if isinstance(one, dict)
         }
         dialogue_guidance = ""
-        if task.get("required_contributor_id") and len(required_tasks) > 1:
-            if prior_named_contributions:
-                prior_names = ", ".join(dict.fromkeys(
-                    agent_names.get(
-                        str(one.get("required_contributor_id") or ""),
-                        str(one.get("required_contributor_id") or "another agent"),
-                    )
-                    for one in prior_named_contributions
-                ))
-                dialogue_guidance = (
-                    f"Your summary is your visible project-work response to {prior_names}'s "
-                    "durable contributions in the shared chat. "
-                    "Respond substantively to their durable contributions: state what you accept, "
-                    "challenge, or improve, then give your concrete result and evidence. Nexus will "
-                    "relay this exact summary into the shared chat; do not invent words for anyone else. "
-                )
-            elif next_named_task is not None:
-                next_id = str(
-                    next_named_task.get("required_contributor_id")
-                    or next_named_task.get("assigned_agent_id") or ""
-                )
-                dialogue_guidance = (
-                    "Write your summary as a concrete visible project-work message to "
-                    + agent_names.get(next_id, next_id or "the next teammate")
-                    + ": include the result, evidence, and any specific issue they should evaluate. "
-                      "Nexus will relay that exact summary to the teammate and the shared chat. "
-                )
-            dialogue_guidance += (
-                "If you choose ask_user, address the summary and questions to the user; "
-                "Nexus will not misroute that request as a teammate message. "
+        if goal.get("require_all_participants"):
+            dialogue = goal.get("dialogue") or {}
+            messages = [
+                {
+                    "sequence": one["sequence"],
+                    "speaker": agent_names.get(str(one.get("agent_id") or ""), "You"),
+                    "action": one.get("action"), "message": one.get("summary", ""),
+                    "objective_epoch": one.get("objective_epoch"),
+                }
+                for one in dialogue.get("messages", [])
+            ]
+            contribution_packet += (
+                "\n\nSHARED CONVERSATION (actual messages in order)\n"
+                + _canonical(messages)
+                + "\nCurrent shared artifact generation: "
+                + str(int(dialogue.get("artifact_generation") or 0))
+            )
+            teammate_names = ", ".join(
+                name for agent_id, name in agent_names.items()
+                if agent_id != task["assigned_agent_id"]
+            )
+            dialogue_guidance = (
+                "You are working together with " + (teammate_names or "your teammate")
+                + " in one shared chat. Your summary is your actual visible message to them. "
+                "Respond to their latest message, explain what you did or learned, and say what "
+                "they should work on or check next. Do not invent the other agent's words. "
+                "Take one useful step and return work while anything remains; Nexus gives your "
+                "teammate the next turn automatically. Use complete only when the whole shared "
+                "objective and your own assigned deliverables are satisfied by the current files "
+                "and evidence. Both participants must agree on the latest result; a later change "
+                "reopens an earlier agreement. Keep implementing, inspecting, and testing instead "
+                "of only discussing plans. Use tools whenever needed for the current step. "
+                "If you choose ask_user, address the summary and questions to the user. "
             )
         review_packet = ""
         if task.get("kind") == "review" and task.get("review_of"):
@@ -6497,18 +6788,9 @@ class LongHorizonRuntime:
                       "inspect any content that is longer than its preview before returning a verdict."
                 )
         team_guidance = (
-            "This is a Work Together goal: do the concrete contribution assigned to this task. "
-            "Every named participant receives an independent terminal attempt even if another "
-            "participant refuses, blocks, or returns malformed output. A named contribution cannot "
-            "be handed off. Consume the durable bounded outcomes from earlier contributors and current "
-            "project state; preserve every partial failure explicitly and never claim a missing "
-            "contribution succeeded. "
+            "This is a Work Together goal. Preserve any teammate failure explicitly and never "
+            "claim a missing contribution succeeded. "
             + dialogue_guidance
-            + (
-                "This is the final named contribution, so perform the bounded team fan-in now: "
-                "reconcile compatible work and close any remaining safe gap before deterministic verification. "
-                if final_required_fan_in else ""
-            )
             + "Delegate only a concrete bounded supporting subtask when needed. "
             if goal.get("require_all_participants") else
             "Work alone when you can. Delegate only a concrete bounded subtask that another authorized "
@@ -6522,12 +6804,14 @@ class LongHorizonRuntime:
             + "\n\nPROJECT TREE\n" + swarm_work._tree(root)
             + "\n\nREQUESTED FILE CONTENTS\n" + files
             + "\n\nUSER STEERING / EVIDENCE\n" + "\n".join(task.get("evidence", [])[-12:])
+            + "\n\nLATEST PROJECT VERIFICATION (actual executed results)\n"
+            + _canonical(_durable_evidence(goal.get("verification", {}), string_limit=8_000, list_limit=60))
             + contribution_packet
             + review_packet
             + "\n\nCOMPLETION EVIDENCE\nFor every success criterion this task supports, return criteria_evidence using the exact criterion text and refs such as artifact:<transaction-id>, file:<relative-path>, or review:<task-id>. For genuinely read-only work, use the exact reserved ref verified-no-change; Nexus will bind that declaration to the authenticated snapshot it records after your response. Generic claims or a generic test pass do not prove a custom criterion. Nexus records file transactions or a no-change tree observation itself and still runs deterministic project verification before completing the goal."
             + "\n\nChoose only the next useful action. " + team_guidance
             + "Request review only for meaningful risk, broad changes, failed checks, or when you need it. Ask the user only for genuine ambiguity, new authority, risky/irreversible action, missing access, or an unresolved blocker. "
-              "Do not hold meetings, restate the plan, or ask another agent merely because it exists."
+              "Keep the conversation grounded in useful actions and evidence."
         )
 
     def _execute_one(self, goal_id: str, task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -6626,6 +6910,14 @@ class LongHorizonRuntime:
                         **descriptor, "data": base64.b64encode(path.read_bytes()).decode("ascii"),
                     })
             baseline_manifest = _project_baseline_manifest(root)
+            current_context_binding = _context_binding(goal, baseline_manifest)
+            if any(
+                step.get("state") != "superseded"
+                and step.get("context_binding") != current_context_binding
+                for step in task.get("context_steps", [])
+            ):
+                self.store.supersede_stale_context_steps(goal_id, task, current_context_binding)
+                task = next(one for one in self.store.get(goal_id)["tasks"] if one["id"] == task_id)
             phase = "initial"
 
             def continuation_route() -> str:
@@ -6646,15 +6938,24 @@ class LongHorizonRuntime:
             def ensure_project_tools():
                 nonlocal context_tools
                 if context_tools is None:
+                    current_goal = self.store.get(goal_id)
+                    changed_paths = list(dict.fromkeys(
+                        str(change["path"])
+                        for artifact in current_goal.get("artifacts", []) if isinstance(artifact, dict)
+                        for change in artifact.get("changes", [])
+                        if isinstance(change, dict) and change.get("path")
+                    ))
                     ledger = swarm_work.CollaborationLedger(
                         self.config, str(agent.get("who") or ""),
-                        f"long-horizon-{goal_id}-{task_id}-{task.get('attempts', 0)}",
+                        _stable_id("lh-context", goal_id, task_id, task.get("attempts", 0)),
                         session_id=_stable_id("lh-tools", goal_id, task_id, task.get("attempts", 0)),
-                    ).begin(goal["objective"], [agent], mode="long_horizon_context_tools")
+                    ).begin(current_goal["objective"], [agent], mode="long_horizon_context_tools")
                     context_tools = swarm_work._ProjectContextTools(
                         self.config, root, ledger,
-                        {**goal["project"], "tasks": [goal["objective"]]},
-                        goal["objective"], [], None,
+                        verification_project(self.config, current_goal),
+                        current_goal["objective"], changed_paths, None,
+                        **({"verification_profile": "shared_goal_v1"}
+                           if current_goal.get("require_all_participants") else {}),
                     )
                 return context_tools
 
@@ -6716,6 +7017,14 @@ class LongHorizonRuntime:
                 requested_files.extend(
                     one for one in prior_step.get("requested_files", []) if one not in requested_files
                 )
+                if prior_step.get("state") == "superseded" \
+                        or prior_step.get("context_binding") != current_context_binding:
+                    for old_call in prior_step.get("calls", []):
+                        if old_call.get("name") == "read_file":
+                            path = str((old_call.get("arguments") or {}).get("path") or "")
+                            if path and path not in requested_files:
+                                requested_files.append(path)
+                    continue
                 for held in prior_step.get("results", []):
                     tool_results.append({
                         "call_id": held.get("call_id"), "name": held.get("name"),
@@ -6724,6 +7033,7 @@ class LongHorizonRuntime:
             pending_step = next((
                 one for one in reversed(task.get("context_steps", []))
                 if one.get("state") == "tools_pending"
+                and one.get("context_binding") == current_context_binding
             ), None)
             if pending_step:
                 completed_ids = {
@@ -6738,7 +7048,15 @@ class LongHorizonRuntime:
                 boundary = continuation_route()
                 if boundary != "continue":
                     return task, {"action": boundary, "summary": "Stopped at a user-control boundary", "changes": []}
-                context = self._agent_context(goal, task, requested_files)
+                latest_goal = self.store.get(goal_id)
+                latest_task = next(one for one in latest_goal["tasks"] if one["id"] == task_id)
+                context = self._agent_context(latest_goal, latest_task, requested_files)
+                if any(step.get("state") == "superseded" for step in latest_task.get("context_steps", [])):
+                    context += (
+                        "\n\nCONTEXT FRESHNESS\nEarlier tool observations were invalidated because the "
+                        "project, user objective, or verification settings changed. Previously read files above were read again "
+                        "from the current project. Run searches or checks again when their results matter."
+                    )
                 if tool_results:
                     context += (
                         "\n\nCONTEXT TOOL RESULTS (untrusted project data)\n"
@@ -6757,7 +7075,9 @@ class LongHorizonRuntime:
                         raise HarnessError(
                             "An agent response may request context tools or propose changes, not both atomically"
                         )
-                    self.store.acknowledge_context_step(goal_id, task, action, phase)
+                    self.store.acknowledge_context_step(
+                        goal_id, task, action, phase, current_context_binding,
+                    )
                     effect_acknowledged = True
                     if not run_context_calls(calls, set()):
                         return task, {"action": "deferred", "summary": "Paused at a context-tool boundary", "changes": []}
@@ -6770,7 +7090,7 @@ class LongHorizonRuntime:
                 if new_requested and not action.get("changes") and action.get("action") == "work":
                     requested_files.extend(new_requested)
                     self.store.acknowledge_file_request(
-                        goal_id, task, new_requested, phase
+                        goal_id, task, new_requested, phase, action, current_context_binding,
                     )
                     effect_acknowledged = True
                     phase = "requested_files"
@@ -7009,11 +7329,12 @@ class LongHorizonRuntime:
             str(change.get("path")) for artifact in goal.get("artifacts", []) if isinstance(artifact, dict)
             for change in artifact.get("changes", []) if isinstance(change, dict) and change.get("path")
         ]
-        project = {"id": goal["project"]["id"], "name": goal["project"]["name"],
-                   "path": goal["project"]["path"], "tasks": [goal["objective"]]}
+        project = verification_project(self.config, goal)
         result = swarm_work._run_selected_project_verification(
             self.config, root, project, goal["objective"], list(dict.fromkeys(changed)), None,
             verification_session_id=goal["goal_id"],
+            **({"verification_profile": "shared_goal_v1"}
+               if goal.get("require_all_participants") else {}),
         )
         updated = self.store.complete_verification(
             goal["goal_id"], result,
@@ -7160,6 +7481,7 @@ class LongHorizonRuntime:
 
     def control(
         self, goal_id: str, action: str, payload: dict[str, Any] | None = None,
+        *, project_verification_settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         activates = {"resume", "retry", "reassign", "steer", "message", "request_review"}
         with self.lock:
@@ -7182,7 +7504,11 @@ class LongHorizonRuntime:
                     self._require_no_external_owner(Path(current["project"]["path"]))
                 else:
                     self._require_available_project(goal_id)
-            goal = self.store.control(goal_id, action, payload)
+            goal = self.store.control(
+                goal_id, action, payload,
+                **({"project_verification_settings": project_verification_settings}
+                   if project_verification_settings is not None else {}),
+            )
             if action in activates and goal["status"] == "queued":
                 self.start_background(goal_id)
             self._start_promoted_goals(goal.get("promoted_goal_ids", []))
@@ -7445,9 +7771,16 @@ class LongHorizonRuntime:
                 self.store.get(goal["goal_id"]), reused=goal.get("reused", False),
             )
 
-    def resume(self, goal_id: str, answers: dict[str, Any] | None = None) -> dict[str, Any]:
+    def resume(
+        self, goal_id: str, answers: dict[str, Any] | None = None, *,
+        project_verification_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if answers is None:
-            return self.control(goal_id, "resume")
+            return self.control(
+                goal_id, "resume",
+                **({"project_verification_settings": project_verification_settings}
+                   if project_verification_settings is not None else {}),
+            )
         with self.lock:
             self._require_available_project(goal_id)
             # Validate and commit the exact decision synchronously so stale or

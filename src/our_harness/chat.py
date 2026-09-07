@@ -213,6 +213,20 @@ HOW_TO_ANSWER = (
     "Nexus's bounded transaction layer."
 )
 
+HOW_TO_WORK_TOGETHER = (
+    "You are one of the user's agents working together on a shared project goal. "
+    "Take the next useful step, read the shared conversation, and respond directly "
+    "to your teammate's real observations and the user's latest steering. Your "
+    "summary is shown verbatim as your chat message. Never invent another agent's "
+    "reply or claim a check ran without its result. Nexus provides bounded file "
+    "reading, workspace search, and project verification through tool_calls; "
+    "request them when needed. Propose project file changes in changes and Nexus "
+    "will apply them. Work together is authorized project work. Return the exact "
+    "action schema, with a clear summary and concrete results. Continue useful "
+    "work until the user's goal is met, or explain the specific missing access "
+    "or decision that prevents progress."
+)
+
 # Provider diagnostics sometimes include the identity behind a subscription.
 # An email address and the rest of an auth-status line are not needed to fix a
 # connection and must not be kept in chat history or painted on the board.
@@ -2415,7 +2429,9 @@ def ask_once(
             routed = ProviderRegistry(config).provider_config(named) if named else config
             provider = create_provider(routed)
         request = ProviderRequest(
-            system_prefix=HOW_TO_ANSWER,
+            system_prefix=(HOW_TO_WORK_TOGETHER if response_format is not None
+                           and response_format.name == "nexus_long_horizon_action_v1"
+                           else HOW_TO_ANSWER),
             dynamic_context=str(context or ""),
             messages=[{"role": "user", "content": redactor.text(asked)}],
             model=str(routed.get("provider.model") or ""),
@@ -3127,6 +3143,7 @@ def keep_long_horizon_events(
             "provider_reply_reconciliation_required", "task_reassigned_after_provider_failure",
             "goal_auto_start_blocked", "task_handed_off",
             "codex_schema_rejection_recovered",
+            "goal_steered", "agent_messaged", "interrupt_resolved",
         }
         for event in accepted:
             kind = str(event.get("type") or "")
@@ -3154,6 +3171,15 @@ def keep_long_horizon_events(
                 "source_goal_event_type": kind,
                 "task_id": str(event.get("task_id") or ""),
             }
+            if kind in {"goal_steered", "agent_messaged", "interrupt_resolved"}:
+                words = redactor.text(str(payload.get("text") or payload.get("answer") or "")).strip()
+                if words:
+                    additions.append(Said(
+                        "you", words, _now(), speaker_id="user", speaker_name="You",
+                        recipient_name="the team", phase="user_steering",
+                        correlation={**correlation, "kind": "long_horizon_user_event"},
+                    ))
+                continue
             if kind == "provider_acknowledged":
                 summary = redactor.text(str(payload.get("summary") or "")).strip()
                 if not summary:

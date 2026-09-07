@@ -85,6 +85,19 @@ def _text_proof(command: list[str], output: str) -> dict[str, Any] | None:
     lower = output.lower()
     joined = " ".join(str(one).replace("\\", "/").lower() for one in command)
 
+    if words and words[0] in {"node", "nodejs"}:
+        # Native node:test emits this summary for --test and direct test files.
+        # Exit status/truncation are checked separately by analyze_verification.
+        summary = {}
+        for field in ("tests", "pass", "fail", "cancelled", "skipped", "todo"):
+            matches = re.findall(rf"(?mi)^(?:#|ℹ)\s+{field}\s+(\d+)\s*$", output)
+            if matches:
+                summary[field] = int(matches[-1])
+        if summary.get("tests", 0) > 0 and summary.get("pass", 0) > 0 \
+                and summary.get("fail") == 0 and summary.get("cancelled", 0) == 0 \
+                and summary["pass"] <= summary["tests"]:
+            return {"framework": "node:test", "executed": summary["pass"], "source": "Node TAP test summary"}
+
     if _module(words, "unittest") or (words and words[0] == "unittest"):
         match = re.search(r"(?mi)^ran\s+(\d+)\s+tests?\s+in\s+", output)
         count = int(match.group(1)) if match else 0

@@ -1,21 +1,23 @@
-# Long-horizon goals and Mission control
+# Work together on a project
 
-Nexus project work is an event-driven task system, not a required meeting
-between every connected agent. The board defines who is allowed to work on a
-project. A goal then assigns the next concrete ready task to one useful agent.
-A single ready agent is enough to begin and finish.
+Choose two connected agents and their shared project, type a goal, and click
+**Work together on project files**. The agents take turns in that chat, see
+each other's real messages and current files, and work toward the goal. Type
+in the same composer to steer them. **Pause team** retains the work and
+**Resume team** continues it. Questions, errors, and progress appear inline;
+Mission control provides optional detail.
 
 ## Default behavior
 
 **Work on project files** and **Work until the goals are achieved** use the
 long-horizon engine by default. When **Work on project files** starts from a
 saved two-agent chat, that exact pair is a required team: each named participant
-gets its own serialized contribution task and at least one provider-call slot is
-reserved for every initially required task. Untouched required tasks are chosen
-before repeat turns. The final named contribution receives a bounded durable
-packet of the earlier outcomes and performs the safe fan-in before deterministic
-verification. **Send** remains a faithful direct message and **Ask connected
-agents** remains explicit conversational collaboration. The older paired
+gets serialized turns on the same goal and at least one provider-call slot is
+reserved for every initially required participant. Useful turns alternate;
+the ordered conversation and current verification results go to the next
+agent. A new file change reopens the other agent's previous completion so it
+can inspect the latest work. **Send to team** steers this exact active goal;
+before work starts, **Send** is ordinary direct chat. The older paired
 plan/review/execute workflow is available only through **Use legacy paired
 workflow**.
 
@@ -28,9 +30,9 @@ An agent can return one structured next action:
 - ask the user a structured question for a permitted blocking reason; or
 - report a concrete blocker.
 
-Nexus does not require every agent to propose a plan, review the plan, execute
-the same phase, or vote unanimously. A required participant cannot hand its
-named contribution to somebody else. A known refusal, malformed reply, or
+Agents choose useful work rather than following a fixed plan/review ceremony.
+Both participants must finish against the latest shared changes. A required
+participant cannot hand its named contribution to somebody else. A known refusal, malformed reply, or
 known provider failure is recorded truthfully and does not prevent the other
 named participants from being attempted; an unknown provider outcome, pending
 file effect, changed provider/account contract, Pause, or user question remains
@@ -69,8 +71,8 @@ then reveals any older row. A fresh request for that chat remains blocked until
 every such outcome has been acknowledged.
 
 Required-team scheduling is itself a versioned, non-secret collaboration
-contract in the admission digest. It covers claim fairness, call reservation,
-non-transferable named work, failure continuation, fan-in, and completion. A
+contract in the admission digest. It covers turn order, conversation history,
+call reservation, named work, failure continuation, and completion. A
 pristine legacy goal can adopt the current contract without provider or file
 effects. Once a legacy goal has crossed either boundary, a missing or changed
 contract stays inspectable but cannot dispatch under silently different rules.
@@ -127,6 +129,17 @@ manufacturing progress. Verification infrastructure that is unavailable
 before a test launches pauses immediately with the completed work resumable;
 it does not spend provider calls asking an agent to repair the Windows sandbox
 or a missing runner.
+
+Work together runs the selected project's real test commands and retains their
+results. Its shared verification profile requires positive test evidence plus
+both agents' completion and task evidence for the user's criteria. It does not
+turn arbitrary wording into a fixed set of inferred test scenarios. Configured
+commands retain their execution scope; discovered commands still require the
+user's approval and run in a disposable, protected copy of the project.
+If a goal pauses because its new project has no approved checks, configure or
+approve the checks in that project's settings and press **Resume team**. Resume
+adopts the current settings for that exact project, records their new fingerprint,
+and clears obsolete test observations while retaining the agents' work and chat.
 
 No-progress fingerprints compare semantic evidence and before/after content,
 not fresh transaction IDs or timestamps. Repeated identical questions,

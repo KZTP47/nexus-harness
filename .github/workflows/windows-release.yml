@@ -336,8 +336,13 @@ jobs:
           Push-Location desktop
           try {
             npm run smoke:built -- "$installed"
+            if ($LASTEXITCODE -ne 0) { throw 'Installed app acceptance failed.' }
             npm run e2e:multi-vendor -- "$installed"
+            if ($LASTEXITCODE -ne 0) { throw 'Installed multi-vendor acceptance failed.' }
             npm run smoke:long-horizon -- "$installed"
+            if ($LASTEXITCODE -ne 0) { throw 'Installed long-horizon acceptance failed.' }
+            npm run smoke:team-chat -- "$installed"
+            if ($LASTEXITCODE -ne 0) { throw 'Installed two-agent chat acceptance failed.' }
           } finally { Pop-Location }
 
           Remove-Item -LiteralPath $shortcut -Force

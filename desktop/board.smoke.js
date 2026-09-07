@@ -255,6 +255,7 @@ async function main() {
 
     await page.getByRole("button", {name: "Open full Nexus chat"}).click();
     await page.waitForSelector("#theBigChat:not([hidden])", {timeout: 20000});
+    await page.click("#theBigChatHistoryToggle");
     const fullStop = page.locator("#theBigChatStop");
     if (!(await fullStop.isVisible()) || !(await fullStop.isDisabled())) {
       throw new Error("the maximised chat does not expose an idle Stop button");

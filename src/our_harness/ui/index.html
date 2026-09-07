@@ -1093,6 +1093,10 @@
           <div class="the-big-chat-top">
             <h3 id="theBigChatTitle">Chat</h3>
             <div id="theBigChatActions" class="button-row">
+              <button id="theBigChatHistoryToggle" type="button" aria-expanded="false"
+                aria-controls="theBigChatConversationList">History</button>
+              <button id="theBigChatActivityToggle" type="button" aria-expanded="false"
+                aria-controls="theBigChatDoing">Activity</button>
               <button id="theBigChatResetLayout" type="button"
                 title="Restore the default chat window and pane sizes">Reset sizes</button>
               <button id="theBigChatSmall" type="button">Minimise</button>
@@ -1115,13 +1119,23 @@
               aria-label="Resize the agent chats list" aria-controls="theBigChatConversationList"
               title="Drag left or right. Double-click to reset this pane."><span aria-hidden="true"></span></button>
             <div class="the-big-chat-main">
-              <div id="theBigChatDestination"></div>
+              <details id="theBigChatDestination">
+                <summary>Chat setup and saved files</summary>
+                <div class="the-big-chat-project-row">
+                  <label for="theBigChatProject">Project</label>
+                  <select id="theBigChatProject" aria-describedby="theBigChatProjectHelp"></select>
+                  <span id="theBigChatProjectHelp" class="hint">Start Work together to let both agents build, discuss, and check the result here.</span>
+                </div>
+                <div id="theBigChatDestinationInfo"></div>
+              </details>
               <button id="theBigChatDestinationResize" class="the-big-chat-resizer horizontal" type="button"
                 role="separator" aria-orientation="horizontal"
                 aria-label="Resize where this chat happens" aria-controls="theBigChatDestination"
                 title="Drag up or down. Double-click to reset this pane."><span aria-hidden="true"></span></button>
               <div class="the-big-chat-middle">
                 <div class="the-big-chat-transcript">
+                  <section id="theBigChatTeamGoal" class="chat-team-goal" hidden
+                    aria-live="polite" aria-label="Team goal and questions"></section>
                   <ol id="theBigChatSaid" class="the-big-chat-said"
                     aria-labelledby="theBigChatTitle"></ol>
                   <section id="theBigChatActivity" class="chat-activity" hidden
@@ -1151,11 +1165,8 @@
               <div class="the-big-chat-bottom">
             <section id="theBigChatWorkRecovery" class="work-recovery the-big-chat-work-recovery"
               hidden aria-live="polite" aria-label="Saved project-work run"></section>
-            <div class="the-big-chat-project-row">
-              <label for="theBigChatProject">This chat writes to</label>
-              <select id="theBigChatProject" aria-describedby="theBigChatProjectHelp"></select>
-              <span id="theBigChatProjectHelp" class="hint">Work uses one or more ready agents assigned to the selected project.</span>
-            </div>
+            <details class="the-big-chat-options">
+              <summary>Relay options</summary>
             <div class="chat-round-policy the-big-chat-round-policy">
               <strong>Connected-agent collaboration only</strong>
               <label class="chat-round-maximum" for="theBigChatRoundLimit">Maximum relay rounds
@@ -1170,9 +1181,10 @@
                 Ask connected agents stops after 3 relay rounds by default. Unlimited is an explicit opt-in. Project-file Work uses the separate goal engine and ignores this limit.
               </span>
             </div>
+            </details>
             <label class="sr-only" for="theBigChatBox">What to say to this agent</label>
-            <textarea id="theBigChatBox" rows="3"
-              placeholder="Type here to talk to this agent."></textarea>
+            <textarea id="theBigChatBox" rows="2"
+              placeholder="Describe your goal, or send a message to steer the team."></textarea>
             <div id="theBigChatAttachments" class="chat-attachments" aria-live="polite"></div>
             <input id="theBigChatFiles" class="sr-only" type="file" multiple
               aria-label="Attach files or screenshots to this chat"
@@ -1182,7 +1194,7 @@
               asks for confirmation.</p>
             <section id="theBigChatTeamReadiness" class="chat-team-readiness" hidden
               aria-live="polite" aria-label="Team connection readiness"></section>
-            <div class="button-row">
+            <div class="button-row the-big-chat-send-actions">
               <button id="theBigChatSend" class="primary" type="button"
                 title="Send only to the selected agent">Ask selected agent only</button>
               <button id="theBigChatStop" class="danger" type="button"
@@ -1190,9 +1202,12 @@
               <button id="theBigChatAttach" type="button">Attach files or screenshots</button>
               <button id="theBigChatCollaborate" type="button">Ask connected agents</button>
               <button id="theBigChatWork" type="button">Work together on project files</button>
-              <span id="theBigChatCount" class="hint" aria-live="polite"></span>
               <span id="theBigChatSaidBack" class="hint" role="status" aria-live="polite"></span>
             </div>
+            <details id="theBigChatLimits" class="the-big-chat-limits">
+              <summary>Message limits</summary>
+              <span id="theBigChatCount" class="hint" aria-live="polite"></span>
+            </details>
             <p id="theBigChatWorkStatus" class="hint" role="status" aria-live="polite" hidden></p>
               </div>
             </div>

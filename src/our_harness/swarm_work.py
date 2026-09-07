@@ -4724,6 +4724,18 @@ def _contained_snapshot_command_with_engine(
             }
         joined = " ".join(str(one).casefold() for one in argv)
         allow_child = "playwright" in joined
+        if "--test" in argv and not allow_child:
+            # Node's default test isolation launches unrestricted child
+            # processes, which the permission model correctly denies. Native
+            # tests can run in this already disposable OS-contained process.
+            if major < 22:
+                return {
+                    "argv": command, "cwd": ".", "exit_code": -2,
+                    "stdout": "", "stderr": "Contained node --test requires Node 22 or newer for in-process test isolation.",
+                    "timed_out": False, "output_truncated": False,
+                    "containment_unavailable": True,
+                }
+            argv.insert(1, "--experimental-test-isolation=none")
         permissions = [
             "--permission", "--allow-fs-read=*",
             # SUBST-backed canonical paths may resolve to either the private
@@ -6082,6 +6094,15 @@ def _goal_named_paths(goal: str) -> list[str]:
 
     text = str(goal or "")
     _validate_goal_path_syntax(text)
+    # URLs are references, not project filenames. Mask the entire URL before
+    # parsing prose spans: checking a phrase such as "Three.js loaded from
+    # https://cdn.example/lib.js in index.html" as one path mistakes the URL's
+    # colon for an NTFS stream and can also grant authority to a URL basename.
+    # Token validation above still rejects unsafe local paths beside the URL.
+    text = re.sub(
+        r"\b[a-z][a-z0-9+.-]*://[^\s<>\"'`()\[\]{}]+",
+        lambda match: " " * len(match.group(0)), text, flags=re.I,
+    )
     found: list[str] = []
 
     def remember(raw: str) -> None:
@@ -8873,8 +8894,20 @@ def _run_selected_project_verification(
     verification_session_id: str = "",
     read_only_baseline_merkle: str = "",
     transaction_ids: list[str] | None = None,
+    verification_profile: str = "legacy",
+    context_check: bool = False,
 ) -> dict[str, Any]:
     """Run deterministic checks in the selected project, never the Harness checkout."""
+
+    if verification_profile == "shared_goal_v1":
+        from .goal_verification import run_configured_goal_verification
+        return run_configured_goal_verification(
+            config, root, project, goal, changed, progress,
+            deadline=deadline, verification_session_id=verification_session_id,
+            require_changes=not context_check,
+        )
+    if verification_profile != "legacy":
+        raise HarnessError("Unknown project verification profile")
 
     commands, source = _verification_commands(config, root, project)
     requirement_contract = requirement_contract or _derive_requirement_contract(
@@ -9554,8 +9587,14 @@ class _ProjectContextTools:
         requirement_contract: dict[str, Any] | None = None,
         *,
         reset_execution_budget: bool = False,
+        verification_profile: str = "legacy",
     ) -> None:
         data = copy.deepcopy(config.data)
+        if verification_profile == "shared_goal_v1" and config.project_root.resolve() != root.resolve():
+            # Rebinding read tools must not turn the host app's check commands
+            # into authority to execute them against a different project.
+            data.setdefault("project", {})["test_commands"] = []
+            data["project"]["test_evidence_contracts"] = []
         # Long-horizon exploration gets a useful epoch rather than the generic
         # twelve-call conversational default.  Epochs remain bounded and are
         # renewable only by an engine-owned durable project-state transition.
@@ -9585,11 +9624,12 @@ class _ProjectContextTools:
         self.changed = changed
         self.progress = progress
         self.required_effect_paths = list(required_effect_paths or [])
+        self.verification_profile = verification_profile
         self.requirement_contract = copy.deepcopy(
             requirement_contract or _derive_requirement_contract(
                 root, goal, required_effect_paths
             )
-        )
+        ) if verification_profile == "legacy" else {}
         self.indexed = False
         self.epoch = 1
         self.lifetime_calls_before_epoch = 0
@@ -9686,6 +9726,9 @@ class _ProjectContextTools:
             self.execution_budget,
             self.requirement_contract,
             verification_session_id=self.ledger.session_id,
+            **({"verification_profile": self.verification_profile}
+               if self.verification_profile != "legacy" else {}),
+            **({"context_check": True} if self.verification_profile == "shared_goal_v1" else {}),
         )
 
     def _prepare_tool(self, name: str, _arguments: object, deadline: Deadline) -> None:

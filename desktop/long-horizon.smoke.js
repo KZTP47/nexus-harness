@@ -320,6 +320,9 @@ async function openBigChat(page, chatId) {
   await page.click(card, {timeout: 30000});
   await page.getByRole("button", {name: "Open full Nexus chat"}).click();
   await page.waitForSelector("#theBigChat:not([hidden])", {timeout: 30000});
+  if (await page.getAttribute("#theBigChatHistoryToggle", "aria-expanded") !== "true") {
+    await page.click("#theBigChatHistoryToggle");
+  }
   await page.click(
     `#theBigChatConversationList [data-conversation-action="pick"][data-chat-id="${chatId}"]`,
     {timeout: 30000},

@@ -10054,7 +10054,7 @@ class WhatThePanelIsTold(BoardTestCase):
         ]
         for body in (compact_work, enlarged_work):
             helper_at = body.index("await prepareDirectLongGoalAdmission")
-            clear_at = body.index('box.value = ""', helper_at)
+            clear_at = body.index('currentBox.value = ""', helper_at)
             start_at = body.index(
                 "await startAndReconcileDirectLongGoalAdmission", helper_at,
             )
@@ -11000,6 +11000,7 @@ function setWhatCanBePressedInSwarm() {}
 function rememberSwarmChatComposer() {}
 function rememberTheBigChatComposer() {}
 function beginSwarmChatActivity() { return {id: "activity-portable"}; }
+async function sendToActiveChatGoal() { return {handled: false}; }
 function sayInTheChatFor() {}
 function sayInRuntimeChat() {}
 async function directLongGoalIntent() { return digest; }

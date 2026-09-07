@@ -579,6 +579,9 @@ async function connectPair(page, one, other) {
 }
 
 async function assertOneDirectChatGroup(page) {
+  if (await page.getAttribute("#theBigChatHistoryToggle", "aria-expanded") !== "true") {
+    await page.click("#theBigChatHistoryToggle");
+  }
   const directNew = page.getByRole(
     "button", {name: "+ New chat for this agent", exact: true},
   );
@@ -618,6 +621,9 @@ async function openPairChat(page, one, other, create = true) {
       .waitFor({state: "visible"});
     await page.getByRole("button", {name: "Open full Nexus chat", exact: true}).click();
     await page.locator("#theBigChat:not([hidden])").waitFor({state: "visible"});
+  }
+  if (await page.getAttribute("#theBigChatHistoryToggle", "aria-expanded") !== "true") {
+    await page.click("#theBigChatHistoryToggle");
   }
   const pair = page.locator("#theBigChatConversationList .the-big-chat-pair")
     .filter({hasText: one}).filter({hasText: other});

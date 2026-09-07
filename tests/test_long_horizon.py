@@ -645,12 +645,12 @@ class LongHorizonTests(unittest.TestCase):
             for one in goal["agents"]
         ))
         contract = goal["collaboration_contract"]
-        self.assertEqual(contract["mode"], "required_participant_fan_in")
+        self.assertEqual(contract["mode"], "shared_project_dialogue")
         self.assertEqual(
-            contract["required_dispatch"], "serialized_terminal_attempts_v2",
+            contract["required_dispatch"], "serialized_useful_turns_v3",
         )
         self.assertEqual(
-            contract["required_claim_order"], "undispatched_required_tasks_first_v2",
+            contract["required_claim_order"], "undispatched_then_alternating_participants_v3",
         )
         self.assertEqual(
             contract["provider_budget_reservation"],
@@ -700,12 +700,13 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(completed["budget"]["provider_calls"], 2)
         self.assertTrue(all(one["attempts"] == 1 for one in completed["tasks"]))
         self.assertIn(
-            "visible project-work message to Reviewer", contexts[0][1],
+            "working together with Reviewer in one shared chat", contexts[0][1],
         )
         final_context = contexts[-1][1]
         self.assertIn("REQUIRED CONTRIBUTION FAN-IN", final_context)
-        self.assertIn("This is the final named contribution", final_context)
-        self.assertIn("visible project-work response to Lead's", final_context)
+        self.assertIn("Both participants must agree on the latest result", final_context)
+        self.assertIn("working together with Lead in one shared chat", final_context)
+        self.assertIn('"speaker":"Lead"', final_context)
         self.assertIn('"state":"complete"', final_context)
         self.assertNotIn("Work alone when you can", final_context)
 
@@ -808,7 +809,7 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(stopped["status"], "paused")
         self.assertIn("No runnable task", stopped["note"])
         self.assertIn('"state":"blocked"', peer_context[0])
-        self.assertIn("This is the final named contribution", peer_context[0])
+        self.assertIn("Preserve any teammate failure explicitly", peer_context[0])
         verify.assert_not_called()
 
     def test_required_terminal_failure_restart_never_resends_first_participant(self):
@@ -917,7 +918,7 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(by_participant["reviewer"]["attempts"], 1)
         self.assertEqual(stopped["status"], "paused")
         self.assertIn("Lead explicitly refused", peer_context[0])
-        self.assertIn("This is the final named contribution", peer_context[0])
+        self.assertIn("Preserve any teammate failure explicitly", peer_context[0])
         verify.assert_not_called()
 
     def test_required_known_provider_throw_still_dispatches_peer_once(self):
@@ -5199,15 +5200,16 @@ class LongHorizonTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         recovered_context = runtime._agent_context(migrated, codex_after)
         self.assertIn(peer_after["summary"], recovered_context)
-        self.assertIn("visible project-work response to Reviewer", recovered_context)
+        self.assertIn("working together with Reviewer in one shared chat", recovered_context)
+        self.assertIn('"speaker":"Reviewer"', recovered_context)
         self.assertNotIn(
             "relay that exact summary to the teammate", recovered_context,
         )
         self.assertEqual(
             long_horizon._summary_delivery(  # noqa: SLF001 - routing invariant
                 migrated, codex_after, self._complete_team_action(),
-            )["kind"],
-            "team",
+            )["agent_id"],
+            "reviewer",
         )
         dispatched: list[str] = []
 

@@ -139,12 +139,13 @@ state too, so switching chats does not silently carry the previous folder into
 the next one.
 
 Ordinary chat is read-only with respect to project files. A file-changing task
-uses the explicit **Work on project files** action and starts a durable,
-event-driven goal. One agent may finish it alone; Nexus delegates, hands off,
-or requests an independent review only when the task or risk calls for it.
-Mission control shows the task graph, owners, questions, diffs, tests, budgets,
-and event history. The older paired plan/review/execute loop remains available
-behind the clearly labelled **Use legacy paired workflow** action.
+uses the explicit **Work together on project files** action. The two agents
+take turns on the same goal, see each other's actual messages and changes, and
+continue building, checking, and improving the project in that chat. Type into
+the same box to steer them; **Pause team** and **Resume team** control that
+goal. Questions and progress appear inline. Both agents must agree on the
+latest work and project verification must pass before Nexus marks it complete.
+Mission control remains available for detailed tasks, diffs, tests, and history.
 
 See [LONG_HORIZON_GOALS.md](docs/LONG_HORIZON_GOALS.md) for the goal engine,
 [AGENT_BOARD.md](docs/AGENT_BOARD.md) for the board model, and
@@ -243,12 +244,12 @@ process-scoped `GH_TOKEN` or `GITHUB_TOKEN`. The helper never executes
 PATH-resolved `gh`, `git`, or credential helpers, and never writes or echoes the
 explicit token.
 
-For a browser download of a published `0.2.6`, open PowerShell in the download
+For a browser download of a published `0.2.7`, open PowerShell in the download
 folder and run:
 
 ```powershell
-$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.6-UNSIGNED.exe').Hash.ToLowerInvariant()
-$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.6-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.7-UNSIGNED.exe').Hash.ToLowerInvariant()
+$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.7-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
 $actual -eq $expected
 ```
 
@@ -522,17 +523,18 @@ the same time, and lays the answers side by side. That is what two
 subscriptions are actually for: one model's blind spot is not usually the
 other's.
 
-**Send** talks only to the selected agent. Nexus does not automatically turn a
-pair chat into a multi-agent ritual. It can never change project files. You can
+Before project work starts, **Send** talks to the selected agent. You can
 attach bounded text files and screenshots for the agent to inspect. **Ask
 connected agents** starts collaboration explicitly when you want it. If an
 agent needs a decision, Nexus can show an inline question card with recommended
 options and a custom-answer field, then continue the same conversation after
 you answer. In the full board chat, a left
 pane keeps multiple durable chats for each exact two-agent pair, and each chat
-has its own active-project dropdown. **Work together on project files** gathers
-structured contributions from that pair and applies validated,
-baseline-checked changes only to the selected shared project, with rollback backups.
+has its own active-project dropdown. **Work together on project files** starts
+the pair's shared goal and applies validated, baseline-checked changes only to
+the selected shared project, with rollback backups. While that goal is active,
+**Send to team** updates its instructions, including during an agent turn.
+Replies for superseded instructions cannot overwrite the new direction.
 Fenced code replies have a per-block **Copy code** control.
 Everything typed and everything said back has credentials taken
 out before it is written down, and the conversations live in `.harness/chats`,

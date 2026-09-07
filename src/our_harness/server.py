@@ -850,6 +850,34 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     raise
 
     @staticmethod
+    def require_long_horizon_chat_binding(
+        goal: dict[str, Any], supplied: dict[str, Any],
+    ) -> None:
+        """Fence chat controls to the exact conversation, project, and team.
+
+        Mission controls have no chat envelope. A chat-originated request must
+        carry both identities and may also freeze its visible participants.
+        """
+        payload = supplied.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        binding = {**payload, **{key: supplied[key] for key in (
+            "chat_id", "project_id", "participant_ids",
+        ) if key in supplied}}
+        if not any(key in binding for key in ("chat_id", "project_id", "participant_ids")):
+            return
+        if not binding.get("chat_id") or str(binding["chat_id"]) != str(goal.get("conversation_id") or ""):
+            raise HarnessError("This control belongs to a different saved chat; reopen the goal's chat")
+        if not binding.get("project_id") or str(binding["project_id"]) != str(goal.get("project", {}).get("id") or ""):
+            raise HarnessError("This control belongs to a different project; reopen the goal's chat")
+        if "participant_ids" in binding:
+            participants = binding["participant_ids"]
+            expected = goal.get("requested_agent_ids") or [one["id"] for one in goal.get("agents", [])]
+            if not isinstance(participants, list) or any(
+                not isinstance(one, str) or not one.strip() for one in participants
+            ) or sorted(participants) != sorted(expected):
+                raise HarnessError("The chat participants changed; reopen the goal's original team")
+
+    @staticmethod
     def _canonical_direct_long_horizon_payload(
         supplied: dict[str, Any],
     ) -> dict[str, Any]:
@@ -4986,8 +5014,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/long-horizon/control":
                 goal_id = str(body.get("goal_id") or "")
                 action = str(body.get("action") or "")
+                held_goal = self.server.long_horizon.store.get(goal_id)
+                self.server.require_long_horizon_chat_binding(held_goal, body)
                 if action not in {"pause", "cancel"}:
-                    held_goal = self.server.long_horizon.store.get(goal_id)
                     self.server.require_project_execution_authority(
                         Path(str(held_goal.get("project", {}).get("path") or ""))
                     )
@@ -4995,7 +5024,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 with self.server.project_admission_lock, self.server.swarm_lock:
                     runtime = self.server.long_horizon
                     if action == "resume":
-                        goal = runtime.resume(goal_id)
+                        if held_goal.get("require_all_participants") is True:
+                            projects = self.server.swarm_standing().get("board", {}).get("projects", [])
+                            selected = next((one for one in projects if isinstance(one, dict)
+                                             and one.get("id") == held_goal.get("project", {}).get("id")), None)
+                            if selected is None:
+                                raise HarnessError("This goal's project is no longer on the board; restore it before resuming")
+                            goal = runtime.resume(goal_id, project_verification_settings=selected)
+                        else:
+                            goal = runtime.resume(goal_id)
                     elif action == "fork":
                         goal = runtime.fork(goal_id, str(body.get("request_id") or uuid.uuid4().hex))
                     else:
@@ -5004,6 +5041,7 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/long-horizon/answer":
                 goal_id = str(body.get("goal_id") or "")
                 held_goal = self.server.long_horizon.store.get(goal_id)
+                self.server.require_long_horizon_chat_binding(held_goal, body)
                 self.server.require_project_execution_authority(
                     Path(str(held_goal.get("project", {}).get("path") or ""))
                 )

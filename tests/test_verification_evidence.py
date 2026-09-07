@@ -31,6 +31,15 @@ def analyze(command: list[str], output: str, **kwargs) -> dict:
 
 
 class VerificationEvidenceTests(unittest.TestCase):
+    def test_native_node_tests_require_positive_uncancelled_complete_summary(self):
+        good = "TAP version 13\n1..3\n# tests 3\n# pass 3\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n"
+        self.assertTrue(analyze(["node", "--test", "game.test.cjs"], good)["passed"])
+        self.assertTrue(analyze(["node", "game.test.cjs"], good)["passed"])
+        for bad in (good.replace("# pass 3", "# pass 0"), good.replace("# fail 0", "# fail 1"),
+                    good.replace("# cancelled 0", "# cancelled 1"), "TAP version 13\nok 1 partial\n"):
+            self.assertFalse(analyze(["node", "--test", "game.test.cjs"], bad)["passed"])
+        self.assertFalse(analyze_verification([["node", "--test"]], [result(good, output_truncated=True)])["passed"])
+
     def test_legacy_application_and_quick_start_path_use_the_same_positive_analyzer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             data = copy.deepcopy(DEFAULT_CONFIG)
