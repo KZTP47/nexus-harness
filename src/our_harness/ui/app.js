@@ -9843,6 +9843,8 @@ function scheduleSwarmChatActivityCollapse(agentId, activity, delay) {
 }
 
 function finishSwarmActivityResponse(agentId, activity) {
+  // Callers must release their own busy lease first: an already collapsed
+  // activity loses its current-owner identity when this removes the tombstone.
   activity.responseFinished = true;
   if (!activity.collapsed || !swarmActivityIsCurrent(activity)) return;
   swarmChatActivity.delete(activity.chatKey);
@@ -14163,11 +14165,11 @@ async function resumeSwarmWork(agentId, resetToolExecutionBudget = false) {
     finishSwarmChatActivity(agentId, false, message, activity);
     return null;
   } finally {
-    finishSwarmActivityResponse(agentId, activity);
     if (swarmActivityIsCurrent(activity)) {
       swarmBusy.delete(runtimeKey);
       swarmStopping.delete(runtimeKey);
     }
+    finishSwarmActivityResponse(agentId, activity);
     setWhatCanBePressedInSwarm();
     renderWorkRecovery(agentId);
   }
@@ -14421,11 +14423,11 @@ async function sendWhatIsTypedTo(agentId) {
     finishSwarmChatActivity(agentId, false, String(error.message || error), activity);
     return null;
   } finally {
-    finishSwarmActivityResponse(agentId, activity);
     if (swarmActivityIsCurrent(activity)) {
       swarmBusy.delete(runtimeKey);
       swarmStopping.delete(runtimeKey);
     }
+    finishSwarmActivityResponse(agentId, activity);
     setWhatCanBePressedInSwarm();
   }
 }
@@ -18173,11 +18175,11 @@ async function sendFromTheBigChat(mode = "chat") {
     if (!stoppedChatError(trouble)) showError(words);
     finishSwarmChatActivity(agentId, false, words, activity);
   } finally {
-    finishSwarmActivityResponse(agentId, activity);
     if (swarmActivityIsCurrent(activity)) {
       swarmBusy.delete(runtimeKey);
       swarmStopping.delete(runtimeKey);
     }
+    finishSwarmActivityResponse(agentId, activity);
     setWhatCanBePressedInSwarm();
   }
 }

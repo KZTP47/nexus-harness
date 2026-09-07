@@ -343,6 +343,39 @@ async function transcriptContains(page, words) {
   }, `visible transcript messages: ${words.join(", ")}`);
 }
 
+async function delayAdmissionRefreshUntilCollapse(page, chatId) {
+  const observed={chatId,activityId:"",interceptedRequests:0,collapsedBeforeResponse:false};
+  let gate=null;
+  const pattern="**/api/long-horizon/goals";
+  const handler=async route=>{
+    const pending=await page.evaluate(([agent,id])=>{
+      const activity=swarmChatActivityFor(agent,id);
+      return activity?.chatId===id && activity.terminalState==="admitted"
+        && activity.settledBy==="response" && !activity.responseFinished
+        ? {id:activity.id} : null;
+    },[AGENT_A,chatId]);
+    if(pending) {
+      observed.interceptedRequests++;
+      if(!gate) {
+        observed.activityId=pending.id;
+        // Delay real HTTP reads, including the awaited post-admission refresh.
+        // The product timer must collapse the still-unfinished activity itself.
+        gate=(async ()=>{
+          await page.waitForFunction(([agent,id,activityId])=>{
+            const activity=swarmChatActivityFor(agent,id);
+            return activity?.id===activityId && activity.collapsed && !activity.responseFinished;
+          },[AGENT_A,chatId,pending.id],{timeout:15_000});
+          observed.collapsedBeforeResponse=true;
+        })();
+      }
+      await gate;
+    }
+    await route.continue();
+  };
+  await page.route(pattern,handler);
+  return {observed,remove:()=>page.unroute(pattern,handler)};
+}
+
 async function captureReadableConversation(page, goalId, markers, destination) {
   // API completion alone is not UI evidence. Wait for the actual persisted
   // complete status to reach this chat, then show both agents' latest messages.
@@ -526,9 +559,20 @@ async function main() {
     for(const name of ["arena.js","arena.html","arena-config.json","server.cjs","test_acceptance.py","test_runtime.cjs"])
       fs.copyFileSync(path.join(project,name),path.join(testProject,name));
     await openChat(page,testChat);
+    const admissionDelay=await delayAdmissionRefreshUntilCollapse(page,testChat);
     await startGoal(page,TEST_GOAL);
     const waitingForChecks=await goalFor(page,testChat,goal=>goal.status==="paused"
       &&goal.verification?.basis==="discovered_command_approval_required");
+    await admissionDelay.remove();
+    assert.ok(admissionDelay.observed.interceptedRequests>0 && admissionDelay.observed.collapsedBeforeResponse,
+      "The packaged admission did not exercise its real collapse-before-response boundary");
+    fs.writeFileSync(path.join(coordination,"admission-collapse.json"),JSON.stringify(admissionDelay.observed,null,2));
+    await page.waitForFunction(()=>{
+      const send=document.querySelector("#theBigChatSend"),resume=document.querySelector("#theBigChatStop");
+      return send?.textContent==="Send to team" && !send.disabled
+        && resume?.textContent==="Resume team" && !resume.disabled;
+    },null,{timeout:30_000});
+    console.log("pass  the real activity collapses before the admission response finishes and still releases Send and Resume");
     assert.equal(waitingForChecks.verification.status,"unavailable");
     assert.equal(waitingForChecks.verification.commands.length,0,"Unapproved discovered checks executed");
     assert.equal(waitingForChecks.verification_contract.approved_test_command_digest,"");

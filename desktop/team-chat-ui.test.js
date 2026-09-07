@@ -164,6 +164,88 @@ function fixture(view = "maximized") {
 }
 
 for (const view of ["compact", "maximized"]) {
+  for (const newerOwner of [false, true]) {
+    test(`${view}: collapsed admission releases only its own busy lease after delayed refresh (newer owner: ${newerOwner})`, async () => {
+      const f = fixture(view);
+      f.goal.status = "paused";
+      f.inventory = [];
+      f.context.longGoals = [];
+      f.context.swarmChatActivity = new Map();
+      f.context.window = {clearInterval() {}, clearTimeout() {},
+        setTimeout(callback) { f.collapse = callback; return 1; }};
+      f.context.renderSwarmChatActivity = () => {};
+      f.context.renderTheBigChat = () => {};
+      f.context.renderTurnsThatArrived = () => {};
+      f.context.selectedChatIs = () => true;
+      f.context.beginSwarmChatActivity = () => {
+        f.activity = {id: "original-admission", chatKey: f.key, responseFinished: false};
+        f.context.swarmChatActivity.set(f.key, f.activity);
+        return f.activity;
+      };
+      vm.runInContext(section("function swarmActivityIsCurrent", "function selectedChatIs")
+        + section("function scheduleSwarmChatActivityCollapse", "function settleSwarmChatActivityFromFeed")
+        + section("function finishLongHorizonAdmissionActivity", "function markSwarmChatActivityStopping"), f.context);
+      let entered;
+      let release;
+      const refreshing = new Promise(resolve => { entered = resolve; });
+      const delayed = new Promise(resolve => { release = resolve; });
+      f.context.refreshLongGoals = async () => {
+        f.context.longGoals = [f.goal];
+        entered();
+        await delayed;
+      };
+      const sending = f.send("work");
+      await refreshing;
+      assert.equal(f.context.swarmBusy.has(f.key), true);
+      assert.equal(f.activity.responseFinished, false);
+      assert.equal(f.activity.terminalState, "admitted");
+      f.context.swarmStopping.add(f.key);
+      f.collapse();
+      assert.equal(f.activity.collapsed, true);
+      assert.equal(f.context.swarmChatActivity.get(f.key), f.activity,
+        "the collapsed activity must retain reconciliation identity until the response finishes");
+      f.box.value = "A second goal must wait for the current admission";
+      await f.send("work");
+      assert.equal(f.calls.filter(call => call.url === "prepare").length, 1);
+      assert.equal(f.calls.filter(call => call.url === "start").length, 1,
+        "a pending admission must not permit duplicate dispatch");
+      const replacement = {id: "newer-independent-activity", chatKey: f.key};
+      if (newerOwner) {
+        f.context.swarmChatActivity.set(f.key, replacement);
+        f.context.swarmStopping.add(f.key);
+      }
+      release();
+      await sending;
+      assert.equal(f.activity.responseFinished, true);
+      assert.equal(f.context.swarmBusy.has(f.key), newerOwner);
+      assert.equal(f.context.swarmStopping.has(f.key), newerOwner);
+      assert.equal(f.context.swarmChatActivity.get(f.key), newerOwner ? replacement : undefined);
+      if (newerOwner) return;
+      const send = {disabled: true, setAttribute() {}};
+      const stop = {textContent: "Stop", disabled: true};
+      const card = {querySelector(selector) {
+        return selector === ".swarm-chat-send" ? send : selector === ".swarm-chat-stop" ? stop : null;
+      }};
+      f.context.fillChatGoalPanel = () => {};
+      f.context.swarmChatIsBusy = () => f.context.swarmBusy.has(f.key);
+      f.context.swarmChatIsResetting = () => false;
+      f.context.testCard = card;
+      vm.runInContext("syncChatGoalControls(state.agent.id, testCard)", f.context);
+      assert.equal(stop.textContent, "Resume team");
+      assert.equal(stop.disabled, false);
+      assert.equal(send.disabled, false);
+      f.context.refreshLongGoals = async () => {};
+      f.inventory = [f.goal];
+      await vm.runInContext("controlChatGoal(state.agent.id)", f.context);
+      const resume = f.calls.filter(call => call.body?.action === "resume");
+      assert.equal(resume.length, 1);
+      assert.equal(resume[0].body.goal_id, f.goal.goal_id);
+      f.box.value = "Keep the amber theme after resuming";
+      await f.send();
+      assert.equal(f.calls.filter(call => call.body?.action === "steer").length, 1);
+      assert.equal(f.calls.filter(call => call.url === "start").length, 1);
+    });
+  }
   for (const mode of ["work", "chat"]) {
     for (const mutation of ["same draft", "newer draft", "switched chat"]) {
       test(`${view}: accepted ${mode} clears only the exact live composer after ${mutation} replacement`, async () => {
