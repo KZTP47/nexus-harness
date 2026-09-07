@@ -13,27 +13,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Enable temporary runner-only child PowerShell transcription
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $policy = 'HKCU:\Software\Policies\Microsoft\Windows\PowerShell\Transcription'
-          $output = Join-Path $env:RUNNER_TEMP 'nexus-source-zip-transcripts'
-          New-Item -ItemType Directory -Force -Path $output | Out-Null
-          $names = @('EnableTranscripting', 'EnableInvocationHeader', 'OutputDirectory')
-          $before = @{}
-          if (Test-Path -LiteralPath $policy) {
-            $properties = Get-ItemProperty -LiteralPath $policy
-            foreach ($name in $names) {
-              if ($null -ne $properties.PSObject.Properties[$name]) { $before[$name] = $properties.$name }
-            }
-          }
-          $before | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'nexus-transcription-before.json')
-          New-Item -Path $policy -Force | Out-Null
-          New-ItemProperty -LiteralPath $policy -Name EnableTranscripting -Value 1 -PropertyType DWord -Force | Out-Null
-          New-ItemProperty -LiteralPath $policy -Name EnableInvocationHeader -Value 1 -PropertyType DWord -Force | Out-Null
-          New-ItemProperty -LiteralPath $policy -Name OutputDirectory -Value $output -PropertyType String -Force | Out-Null
-          Write-Output "Child PowerShell transcription directory: $output"
       - name: Install from the exact public GitHub source ZIP
         shell: pwsh
         run: |
@@ -165,33 +144,54 @@ jobs:
             }
           }
 
-      - name: Print bounded child installer diagnostics and restore runner policy
-        if: always()
+      - name: Diagnose first failure with separately captured unchanged child invocations
+        if: failure()
         shell: pwsh
         run: |
-          $output = Join-Path $env:RUNNER_TEMP 'nexus-source-zip-transcripts'
-          if (Test-Path -LiteralPath $output) {
-            $logs = @(Get-ChildItem -LiteralPath $output -File -Recurse)
-            Write-Output "Captured $($logs.Count) child PowerShell transcript file(s)."
-            foreach ($log in $logs) {
-              Write-Output "Transcript: $($log.FullName)"
-              Get-Content -LiteralPath $log.FullName -Tail 100
-            }
+          $ErrorActionPreference = 'Stop'
+          $output = Join-Path $env:RUNNER_TEMP 'nexus-source-zip-reentry'
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          $context = [ordered]@{}
+          foreach ($name in @('GITHUB_REF', 'GITHUB_REF_NAME', 'GITHUB_SHA', 'PSModulePath', 'TEMP', 'TMP')) {
+            $context[$name] = [Environment]::GetEnvironmentVariable($name)
           }
-          $policy = 'HKCU:\Software\Policies\Microsoft\Windows\PowerShell\Transcription'
-          $backup = Join-Path $env:RUNNER_TEMP 'nexus-transcription-before.json'
-          if (Test-Path -LiteralPath $backup) {
-            $before = Get-Content -Raw -LiteralPath $backup | ConvertFrom-Json -AsHashtable
-            foreach ($name in @('EnableTranscripting', 'EnableInvocationHeader', 'OutputDirectory')) {
-              if ($before.ContainsKey($name)) { Set-ItemProperty -LiteralPath $policy -Name $name -Value $before[$name] }
-              else { Remove-ItemProperty -LiteralPath $policy -Name $name -ErrorAction SilentlyContinue }
-            }
+          $context.InstallMetadata = Get-ItemProperty -LiteralPath 'HKCU:\Software\e52322ab-f15e-5dc0-963b-7588e3739e89' -ErrorAction SilentlyContinue | Select-Object InstallLocation, ShortcutName, KeepShortcuts
+          $context.NexusProcesses = @(Get-CimInstance Win32_Process | Where-Object Name -eq 'Nexus Harness.exe' | Select-Object ProcessId, ExecutablePath)
+          $context | ConvertTo-Json -Depth 5 | Tee-Object -FilePath (Join-Path $output 'before-reentry.json')
+          $probeRoot = Join-Path $env:RUNNER_TEMP "Nexus source ZIP - Åsa & O'Brien (QA)!"
+          $sourceRoots = @(Get-ChildItem -LiteralPath (Join-Path $probeRoot 'extracted source') -Directory)
+          if ($sourceRoots.Count -ne 1) { throw 'Diagnostic reentry has no exact extracted source root.' }
+          $sourceRoot = $sourceRoots[0].FullName
+          $unrelated = Join-Path $probeRoot 'unrelated working directory'
+          $installerCommand = Join-Path $sourceRoot 'Install Nexus Harness.cmd'
+          $env:NEXUS_INSTALLER_NO_PAUSE = '1'
+          $env:NEXUS_INSTALLER_SILENT = '1'
+          Remove-Item Env:GH_TOKEN -ErrorAction SilentlyContinue
+          Remove-Item Env:GITHUB_TOKEN -ErrorAction SilentlyContinue
+          Write-Output 'The original ShellExecute proof already failed; this is a distinct diagnostic CMD reentry with captured output.'
+          $commandLine = '/d /s /c ""' + $installerCommand + '""'
+          $cmdOut = Join-Path $output 'cmd.stdout.txt'
+          $cmdError = Join-Path $output 'cmd.stderr.txt'
+          $cmdProcess = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList $commandLine -WorkingDirectory $unrelated -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $cmdOut -RedirectStandardError $cmdError
+          Write-Output "Diagnostic CMD exit: $($cmdProcess.ExitCode)"
+          Get-Content -LiteralPath $cmdOut -Tail 100
+          Get-Content -LiteralPath $cmdError -Tail 100
+          if ($cmdProcess.ExitCode -ne 0) {
+            Write-Output 'The captured CMD reentry also failed; now capture the exact unchanged PowerShell helper independently.'
+            $helper = Join-Path $sourceRoot 'scripts\install_nexus_harness.ps1'
+            $psOut = Join-Path $output 'powershell.stdout.txt'
+            $psError = Join-Path $output 'powershell.stderr.txt'
+            $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $helper + '"'), '-BundleRoot', ('"' + $sourceRoot + '\."'))
+            $psProcess = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList $arguments -WorkingDirectory $unrelated -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $psOut -RedirectStandardError $psError
+            Write-Output "Diagnostic PowerShell exit: $($psProcess.ExitCode)"
+            Get-Content -LiteralPath $psOut -Tail 100
+            Get-Content -LiteralPath $psError -Tail 100
           }
-      - name: Preserve child installer error evidence
+      - name: Preserve first-failure diagnostic reentry evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: source-zip-child-diagnostics
+          name: source-zip-reentry-diagnostics
           if-no-files-found: warn
-          path: ${{ runner.temp }}/nexus-source-zip-transcripts/**
+          path: ${{ runner.temp }}/nexus-source-zip-reentry/**
           retention-days: 7
