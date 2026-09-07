@@ -5791,10 +5791,11 @@ def _command_approval_digest(
 ) -> str:
     """Bind approval to path, argv, and the project files that selected it.
 
-    ``declared_path`` is included for user approvals so moving a board project
-    to another path cannot carry authority even when both folders happen to
-    contain byte-identical manifests. Internal execution receipts omit it and
-    remain bound to the canonical snapshot root.
+    User approvals bind both roots canonically: DOS aliases and the saved
+    goal's expanded path name identify the same project. Moving to a different
+    directory still invalidates approval even with byte-identical manifests.
+    Internal execution receipts omit ``declared_path`` and remain bound to the
+    canonical snapshot root.
     """
 
     evidence: list[tuple[str, str | None]] = []
@@ -5812,8 +5813,9 @@ def _command_approval_digest(
         "evidence": evidence,
     }
     if declared_path:
-        payload["declared_path"] = os.path.normcase(os.path.abspath(
-            os.path.expanduser(str(declared_path))
+        payload["approval_contract"] = "canonical-project-command-approval-v2"
+        payload["declared_path"] = os.path.normcase(str(
+            Path(declared_path).expanduser().resolve()
         ))
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

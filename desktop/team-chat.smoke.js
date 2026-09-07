@@ -122,7 +122,7 @@ payload = json.loads(sys.stdin.read())
 context = str(payload.get('dynamic_context') or '')
 project_tree = context.split('\n\nPROJECT TREE\n', 1)[1].split('\n\nREQUESTED FILE CONTENTS\n', 1)[0]
 def project_has(name):
-    # Provider processes belong to the app's configured route. The selected
+    # Provider processes belong to the configured app route. The selected
     # work repository is supplied by Nexus in context and may be elsewhere.
     return name in project_tree.splitlines()
 templates = json.loads((coordination / 'templates.json').read_text(encoding='utf-8'))

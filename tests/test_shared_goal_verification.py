@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -180,6 +182,86 @@ class SharedGoalVerificationTests(unittest.TestCase):
             result = self.verify()
             self.assertEqual(result["status"], "unavailable", result)
             run.assert_not_called()
+
+    def _check_discovered_approval_survives_alias_and_restart(self, alias):
+        manifest = "[project]\nname = 'portable-approval'\nversion = '1.0'\n"
+        (self.root / "pyproject.toml").write_text(manifest, encoding="utf-8")
+        selected = {"id": self.project["id"], "name": self.project["name"], "path": str(alias)}
+        proposal = swarm_work.verification_command_approval(self.config, selected)
+        self.assertTrue(proposal["requires_approval"], proposal)
+        selected["approved_test_command_digest"] = proposal["approval_digest"]
+        goal = {
+            "project": {**selected, "path": str(self.root.resolve())},
+            "objective": "Create the amber game and test its scoring",
+            "verification_contract": goal_verification.capture_verification_contract(self.config, selected, self.root),
+        }
+        restarted = json.loads(json.dumps(goal))
+        restored = goal_verification.verification_project(self.config, restarted)
+        current = swarm_work.verification_command_approval(self.config, restored)
+        self.assertTrue(current["approved"], current)
+        checked = goal_verification.run_configured_goal_verification(
+            self.config, self.root, restored, goal["objective"], ["game.py", "test_game.py"],
+        )
+        self.assertEqual(checked["status"], "passed", checked)
+        self.assertTrue(checked["verification_analysis"]["passed"], checked)
+        self.assertFalse((self.root / "runner-created.txt").exists())
+        relocated = self.base / "byte identical separate project"
+        relocated.mkdir()
+        for name in ("pyproject.toml", "game.py", "test_game.py"):
+            shutil.copy2(self.root / name, relocated / name)
+        moved = {**restored, "path": str(relocated)}
+        moved_approval = swarm_work.verification_command_approval(self.config, moved)
+        self.assertFalse(moved_approval["approved"], moved_approval)
+        self.assertTrue(moved_approval["stale_approval"], moved_approval)
+        with mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            blocked = goal_verification.run_configured_goal_verification(
+                self.config, relocated, moved, goal["objective"], ["game.py", "test_game.py"],
+            )
+        self.assertEqual(blocked["basis"], "discovered_command_approval_required", blocked)
+        run.assert_not_called()
+
+    def test_equivalent_root_spelling_keeps_approved_discovery_after_restart(self):
+        component = self.root / "alias component"
+        component.mkdir()
+        self._check_discovered_approval_survives_alias_and_restart(component / "..")
+
+    def test_old_approval_contract_requires_reapproval_without_changing_internal_receipts(self):
+        manifest = self.root / "pyproject.toml"
+        manifest.write_text("[project]\nname = 'legacy-approval'\n", encoding="utf-8")
+        selected = {"id": self.project["id"], "path": str(self.root)}
+        proposal = swarm_work.verification_command_approval(self.config, selected)
+        internal = {
+            "project_root": os.path.normcase(str(self.root.resolve())),
+            "commands": proposal["commands"], "evidence": [("pyproject.toml", swarm_work.file_sha256(manifest))],
+        }
+        digest = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        self.assertEqual(swarm_work._command_approval_digest(self.root, proposal["commands"]), digest(internal))
+        old_user = {**internal, "declared_path": os.path.normcase(os.path.abspath(str(self.root)))}
+        selected["approved_test_command_digest"] = digest(old_user)
+        checked = swarm_work.verification_command_approval(self.config, selected)
+        self.assertFalse(checked["approved"], checked)
+        self.assertTrue(checked["stale_approval"], checked)
+        selected["approved_test_command_digest"] = checked["approval_digest"]
+        self.assertTrue(swarm_work.verification_command_approval(self.config, selected)["approved"])
+
+    @unittest.skipUnless(os.name == "nt", "DOS aliases are a Windows compatibility boundary")
+    def test_windows_dos_approval_runs_after_canonical_goal_restart(self):
+        import ctypes
+        get_short = ctypes.windll.kernel32.GetShortPathNameW
+        get_short.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        get_short.restype = ctypes.c_uint
+        capacity = get_short(str(self.root), None, 0)
+        if not capacity:
+            self.skipTest("This Windows volume does not expose DOS aliases")
+        buffer = ctypes.create_unicode_buffer(capacity)
+        length = get_short(str(self.root), buffer, capacity)
+        self.assertGreater(length, 0)
+        self.assertLess(length, capacity)
+        alias = Path(buffer.value)
+        if str(alias).casefold() == str(self.root).casefold():
+            self.skipTest("This Windows volume has no distinct DOS alias for this project")
+        self.assertEqual(alias.resolve(), self.root.resolve())
+        self._check_discovered_approval_survives_alias_and_restart(alias)
 
     def test_explicit_protected_path_violation_is_rejected_without_execution(self):
         (self.root / "settings.json").write_text("{}\n", encoding="utf-8")
