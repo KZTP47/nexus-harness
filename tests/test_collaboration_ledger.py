@@ -179,6 +179,48 @@ class SharedCollaborationLedgerTests(unittest.TestCase):
         self.assertIn("collaboration.md", projection)
         self.assertNotIn(str(self.root), projection)
 
+    def test_equivalent_project_root_spelling_preserves_projection_restart_and_confinement(self) -> None:
+        alias_component = self.root / "temporary alias component"
+        alias_component.mkdir()
+        alias = alias_component / ".."
+        config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), alias, [], {})
+        ledger = CollaborationLedger(config, "claude", "alias-chat", session_id="alias-session").begin(
+            "Continue the shared project", self.participants, mode="project_work",
+        )
+        self.assertEqual(ledger.describe()["canonical_path"], ".harness/chats/alias-chat.collaboration.jsonl")
+        self.assertEqual(ledger._relative(alias / ".harness/chats/alias-chat.collaboration.jsonl"),
+                         ".harness/chats/alias-chat.collaboration.jsonl")
+        ledger.record_state("alias_observation", {"observed": "current files"})
+        restarted = CollaborationLedger(self.config, "claude", "alias-chat", session_id="alias-session")
+        self.assertEqual(restarted.describe(), ledger.describe())
+        self.assertIn("current files", restarted.projection_for("agent-1"))
+        with self.assertRaises(ValueError):
+            ledger._relative(alias / ".." / "outside-project.txt")
+
+    @unittest.skipUnless(os.name == "nt", "DOS short paths are a Windows compatibility boundary")
+    def test_windows_dos_project_root_alias_uses_the_same_ledger(self) -> None:
+        import ctypes
+        get_short = ctypes.windll.kernel32.GetShortPathNameW
+        get_short.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        get_short.restype = ctypes.c_uint
+        capacity = get_short(str(self.root), None, 0)
+        if not capacity:
+            self.skipTest("This Windows volume does not expose a DOS short path")
+        buffer = ctypes.create_unicode_buffer(capacity)
+        length = get_short(str(self.root), buffer, capacity)
+        self.assertGreater(length, 0)
+        self.assertLess(length, capacity)
+        alias = Path(buffer.value)
+        if str(alias).casefold() == str(self.root).casefold():
+            self.skipTest("This Windows volume has no distinct DOS alias for the temporary project")
+        self.assertEqual(alias.resolve(), self.root)
+        config = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), alias, [], {})
+        ledger = CollaborationLedger(config, "claude", "dos-chat", session_id="dos-session").begin(
+            "Continue through a DOS project path", self.participants, mode="project_work",
+        )
+        self.assertEqual(ledger.describe()["canonical_path"], ".harness/chats/dos-chat.collaboration.jsonl")
+        self.assertIn("Continue through a DOS project path", ledger.projection_for("agent-1"))
+
     def test_a_new_process_instance_can_resume_the_same_session_and_cursors(self) -> None:
         first = self.ledger()
         first.projection_for("agent-1")

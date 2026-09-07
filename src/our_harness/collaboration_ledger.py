@@ -416,7 +416,9 @@ class CollaborationLedger:
             )
 
     def _relative(self, path: Path) -> str:
-        return path.relative_to(self.config.project_root).as_posix()
+        # Confined ledger paths are canonical; Windows DOS aliases and other
+        # equivalent root spellings must use that same basis for projections.
+        return path.resolve().relative_to(self.config.project_root.resolve()).as_posix()
 
     def describe(self) -> dict[str, str]:
         return {

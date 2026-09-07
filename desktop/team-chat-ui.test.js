@@ -16,6 +16,18 @@ const handlers = {
   maximized: section("async function sendFromTheBigChat", "function wireUpTheTray"),
 };
 
+test("an admission receipt points to the shared chat without claiming that the team is still running", () => {
+  const context = vm.createContext({});
+  vm.runInContext(section("function longHorizonAdmissionWords", "function finishLongHorizonAdmissionActivity"), context);
+  for (const status of ["running", "queued", "waiting_for_user"]) {
+    context.status = status;
+    const words = vm.runInContext('longHorizonAdmissionWords({goal_id: "portable-goal", status})', context);
+    assert.match(words.detail, /was accepted/);
+    assert.match(words.detail, /this chat/);
+    assert.doesNotMatch(words.detail, /is running|Mission control/);
+  }
+});
+
 function fixture(view = "maximized") {
   const state = {
     agent: {id: "builder-portable", name: "Builder", who: "vendor-one", ready: true},

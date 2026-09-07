@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const {randomBytes} = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
@@ -24,15 +25,16 @@ function fixture() {
 
 test("an early Swarm read and boot share bootstrap and never dispatch an empty token", async () => {
   const f = fixture();
+  const sessionValue = randomBytes(24).toString("hex");
   const board = f.run('request("/api/swarm?refresh_providers=false")');
   const boot = f.run("bootstrapSession()");
   const inventory = f.run('request("/api/long-horizon/goals")');
   assert.deepEqual(f.calls.map((one) => one.url), ["/api/bootstrap"]);
-  f.release({ok: true, json: async () => ({token: "fresh-local-session"})});
+  f.release({ok: true, json: async () => ({token: sessionValue})});
   await Promise.all([board, boot, inventory]);
   assert.equal(f.calls.filter((one) => one.url === "/api/bootstrap").length, 1);
   assert.equal(f.calls.length, 3);
-  for (const call of f.calls.slice(1)) assert.equal(call.options.headers["X-Harness-Token"], "fresh-local-session");
+  for (const call of f.calls.slice(1)) assert.equal(call.options.headers["X-Harness-Token"], sessionValue);
 });
 
 test("failed bootstrap prevents both board hydration and provider submission without automatic retries", async () => {
@@ -56,10 +58,11 @@ test("a tokenless bootstrap response fails before any protected dispatch", async
 
 test("a provider request rejected after session establishment is sent exactly once", async () => {
   const f = fixture();
+  const sessionValue = randomBytes(24).toString("hex");
   f.context.fetch = async (url, options) => {
     f.calls.push({url, options});
     return url === "/api/bootstrap"
-      ? {ok: true, json: async () => ({token: "session"})}
+      ? {ok: true, json: async () => ({token: sessionValue})}
       : {ok: false, status: 502, json: async () => ({error: "Delivery unknown"})};
   };
   await assert.rejects(f.run('request("/api/swarm/say", {method: "POST", body: "one message"})'), /Delivery unknown/);

@@ -120,6 +120,11 @@ coordination = Path(sys.argv[1])
 route = sys.argv[2]
 payload = json.loads(sys.stdin.read())
 context = str(payload.get('dynamic_context') or '')
+project_tree = context.split('\n\nPROJECT TREE\n', 1)[1].split('\n\nREQUESTED FILE CONTENTS\n', 1)[0]
+def project_has(name):
+    # Provider processes belong to the app's configured route. The selected
+    # work repository is supplied by Nexus in context and may be elsewhere.
+    return name in project_tree.splitlines()
 templates = json.loads((coordination / 'templates.json').read_text(encoding='utf-8'))
 scenario = 'tests' if 'TEAM-TESTS-GOAL' in context else 'game'
 def record(event):
@@ -137,12 +142,12 @@ record('entered')
 changes = []
 kind = 'complete'
 if scenario == 'game':
-    if not Path('arena.js').is_file():
+    if not project_has('arena.js'):
         assert route == 'team-a', 'The selected lead did not start'
         changes = [change('arena.js', templates['engine'])]
         kind = 'work'
         summary = 'TEAM-A-BASE: Teammate B, I implemented the arena mechanics. Please build the playable page and score API, then I will check your work.'
-    elif not Path('arena.html').is_file():
+    elif not project_has('arena.html'):
         assert route == 'team-b', 'The team did not alternate after the first work turn'
         assert 'TEAM-A-BASE' in context, 'B did not receive A\'s real preceding message'
         if 'AMBER-STEER' not in context:
@@ -160,12 +165,12 @@ if scenario == 'game':
         if route == 'team-a' and not (coordination / 'entered-pause').exists(): hold('pause')
         summary = ('TEAM-A-REVIEW: B, I checked your amber page, three-coin win, reset, and API against the goal.'
                    if route == 'team-a' else 'TEAM-B-FINAL: A, our latest files satisfy the steered goal and are ready for deterministic checks.')
-elif not Path('test_unit.cjs').is_file():
+elif not project_has('test_unit.cjs'):
     assert route == 'team-a'
     changes = [change('test_unit.cjs', templates['unit'])]
     kind = 'work'
     summary = 'TEST-A-UNIT: B, the unit test now checks winning, score bounds, and reset. Please add real HTTP API and browser tests.'
-elif not Path('test_api.cjs').is_file():
+elif not project_has('test_api.cjs'):
     assert route == 'team-b'
     assert 'TEST-A-UNIT' in context, 'B did not consume A\'s test handoff'
     changes = [change('test_api.cjs', templates['api']), change('test_e2e.cjs', templates['e2e'])]
@@ -343,6 +348,22 @@ async function captureReadableConversation(page, goalId, markers, destination) {
   // complete status to reach this chat, then show both agents' latest messages.
   await page.locator(`#theBigChatSaid [data-goal-id="${goalId}"][data-goal-status="complete"]`).waitFor({timeout:30_000});
   await transcriptContains(page,markers);
+  // Transcript projection and the controller's goal inventory are independent
+  // reads. Wait for the visible controls to catch up with this exact completion
+  // so the evidence cannot show a stale queued/running header above the result.
+  await page.waitForFunction(id=>{
+    const saved=longGoals.find(one=>one.goal_id===id);
+    const panel=document.querySelector("#theBigChatTeamGoal");
+    const work=document.querySelector("#theBigChatWork");
+    return saved?.status==="complete" && panel?.hidden===true && work && !work.hidden
+      && !work.disabled && work.getBoundingClientRect().height>0;
+  },goalId,{timeout:30_000});
+  // A Windows runner may clamp Electron's native window to its smaller virtual
+  // display. Use the same real page viewport as the local desktop layout proof;
+  // screenshot acceptance must not depend on the build worker's display setup.
+  const initialViewport=await page.evaluate(()=>({width:innerWidth,height:innerHeight}));
+  await page.setViewportSize({width:1264,height:775});
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   // The last reply may already be visible above trailing status cards while
   // the preceding agent sits just outside the viewport. Align the first
   // requested agent row so this is deliberate conversation framing, not a
@@ -352,29 +373,47 @@ async function captureReadableConversation(page, goalId, markers, destination) {
     const row=paragraph.closest(".the-big-chat-turn") || paragraph;
     transcript.scrollTop+=row.getBoundingClientRect().top-transcript.getBoundingClientRect().top-12;
   });
-  const layout = await until(async ()=>page.evaluate((wanted)=>{
-    const transcript=document.querySelector('#theBigChatSaid');
-    const bounds=transcript.getBoundingClientRect();
-    const visible=wanted.map(marker=>{
-      const matches=[...transcript.querySelectorAll('.chat-prose')].filter(one=>one.textContent.includes(marker));
-      const paragraph=matches.at(-1);
-      if(!paragraph)return {marker,visible:false};
-      const rect=paragraph.getBoundingClientRect();
-      const visibleHeight=Math.min(rect.bottom,bounds.bottom,innerHeight)-Math.max(rect.top,bounds.top,0);
-      return {marker,visible:visibleHeight>=Math.min(30,rect.height)&&rect.left>=bounds.left&&rect.right<=bounds.right,
-        visibleHeight,height:rect.height};
-    });
-    const result={viewportHeight:innerHeight,transcriptHeight:bounds.height,
-      transcriptScrollTop:transcript.scrollTop,transcriptScrollHeight:transcript.scrollHeight,visible};
-    return bounds.height>=Math.min(240,innerHeight*.35)&&visible.every(one=>one.visible)?result:null;
-  },markers),"a readable chat viewport showing both actual agents' latest messages",30_000);
+  let latestLayout=null;
+  let layout;
+  try {
+    layout=await until(async ()=>{
+      latestLayout=await page.evaluate((wanted)=>{
+        const transcript=document.querySelector('#theBigChatSaid');
+        const bounds=transcript.getBoundingClientRect();
+        const visible=wanted.map(marker=>{
+          const matches=[...transcript.querySelectorAll('.chat-prose')].filter(one=>one.textContent.includes(marker));
+          const paragraph=matches.at(-1);
+          if(!paragraph)return {marker,visible:false};
+          const rect=paragraph.getBoundingClientRect();
+          const visibleHeight=Math.min(rect.bottom,bounds.bottom,innerHeight)-Math.max(rect.top,bounds.top,0);
+          return {marker,visible:visibleHeight>=Math.min(30,rect.height)&&rect.left>=bounds.left&&rect.right<=bounds.right,
+            visibleHeight,height:rect.height,top:rect.top,bottom:rect.bottom,left:rect.left,right:rect.right};
+        });
+        return {viewportWidth:innerWidth,viewportHeight:innerHeight,transcriptHeight:bounds.height,
+          transcriptTop:bounds.top,transcriptBottom:bounds.bottom,transcriptLeft:bounds.left,transcriptRight:bounds.right,
+          transcriptScrollTop:transcript.scrollTop,transcriptScrollHeight:transcript.scrollHeight,
+          teamControllerHidden:document.querySelector("#theBigChatTeamGoal").hidden,visible};
+      },markers);
+      return latestLayout.transcriptHeight>=Math.min(240,latestLayout.viewportHeight*.35)
+        &&latestLayout.visible.every(one=>one.visible)?latestLayout:null;
+    },"a readable chat viewport showing both actual agents' latest messages",30_000);
+  } catch(error) {
+    const diagnostic={initialViewport,...latestLayout};
+    fs.writeFileSync(destination.replace(/\.png$/,"-layout.json"),JSON.stringify(diagnostic,null,2));
+    console.error("info  unreadable conversation geometry: "+JSON.stringify(diagnostic));
+    throw error;
+  }
   await page.screenshot({path:destination});
-  fs.writeFileSync(destination.replace(/\.png$/,"-layout.json"),JSON.stringify(layout,null,2));
+  fs.writeFileSync(destination.replace(/\.png$/,"-layout.json"),JSON.stringify({initialViewport,...layout},null,2));
 }
 
 async function approveDiscoveredChecks(page, projectId) {
   await page.getByRole("button",{name:"Minimise",exact:true}).click();
-  await page.locator(`.swarm-box[data-id="${projectId}"] [data-does="settings"]`).click();
+  const compact=page.locator(`.swarm-chat-card[data-agent="${AGENT_A}"]`);
+  if(await compact.isVisible()) await compact.locator('[data-does="minimise"]').click();
+  const settings=page.locator(`.swarm-box[data-id="${projectId}"] [data-does="settings"]`);
+  await settings.evaluate(button=>button.scrollIntoView({block:"center"}));
+  await settings.click();
   await page.locator("#swarmProjectVerificationRefresh").click();
   await until(async ()=>!(await page.locator("#swarmProjectVerificationApprove").isDisabled()),
     "the exact discovered project checks available for user approval",30_000);

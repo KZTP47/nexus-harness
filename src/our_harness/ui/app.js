@@ -9955,16 +9955,16 @@ function longHorizonAdmissionWords(goal) {
     };
   }
   if (status === "queued") {
-    return {stage: "Goal accepted and queued", detail: `Durable goal ${goalId} is queued in Mission control.`};
+    return {stage: "Goal accepted and queued", detail: `Goal ${goalId} was accepted into the queue. Follow the agents and current status in this chat.`};
   }
   if (status === "running") {
-    return {stage: "Goal accepted and running", detail: `Durable goal ${goalId} is running in Mission control.`};
+    return {stage: "Goal accepted", detail: `Goal ${goalId} was accepted. Follow the agents and current status in this chat.`};
   }
   if (status === "paused") {
     return {stage: "Goal accepted but paused", detail: `Durable goal ${goalId} is paused and is not complete.`};
   }
   if (status === "waiting_for_user") {
-    return {stage: "Goal needs your input", detail: `Durable goal ${goalId} is waiting for you in Mission control.`};
+    return {stage: "Goal needs your input", detail: `Goal ${goalId} was accepted with a question for you. Answer the team's question in this chat.`};
   }
   if (status === "complete") {
     return {stage: "Goal verified complete", detail: `Durable goal ${goalId} already has verified completion evidence.`};

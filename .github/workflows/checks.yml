@@ -307,6 +307,29 @@ jobs:
       - name: Exercise Work together recovery in an ordinary source browser
         working-directory: desktop
         run: npm run smoke:browser-long-horizon
+      - name: Locate desktop smoke evidence
+        if: failure()
+        shell: pwsh
+        run: |
+          $smokeTemporaryDirectory = node -p "require('node:os').tmpdir()"
+          if ($LASTEXITCODE -ne 0 -or -not [IO.Path]::IsPathRooted($smokeTemporaryDirectory)) {
+            throw 'Could not locate the desktop smoke temporary directory.'
+          }
+          "NEXUS_SMOKE_TMPDIR=$smokeTemporaryDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Keep failed desktop conversation evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-conversation-failure
+          if-no-files-found: ignore
+          path: |
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*.png
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*-layout.json
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/failure-goals.json
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus browser source acceptance - */failure-*.png
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus browser source acceptance - */failure-*.json
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus browser source acceptance - */source-server.log
+          retention-days: 7
 
   package:
     name: What we would hand out
