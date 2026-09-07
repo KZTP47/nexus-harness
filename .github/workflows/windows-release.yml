@@ -1,706 +1,46 @@
-name: Windows desktop release
+name: Windows source ZIP diagnostics
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read
 
 jobs:
-  clean-windows-build:
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.11"
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: desktop/package-lock.json
-
-      - name: Test source installer contract
-        run: python -m unittest tests.test_release_installer -v
-
-      - name: Require the release tag to match the app version
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $version = (Get-Content -Raw -LiteralPath desktop/package.json | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag $env:GITHUB_REF_NAME does not match desktop version $version." }
-
-      - name: Prepare Authenticode signing or an explicitly unsigned release
-        shell: pwsh
-        env:
-          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
-        run: |
-          $expectedPublisher = (Get-Content -Raw -LiteralPath release/windows-authenticode-publisher.txt).Trim()
-          $expectedSignerCertificateSha256 = (Get-Content -Raw -LiteralPath release/windows-authenticode-certificate-sha256.txt).Trim().ToLowerInvariant()
-          $publisherConfigured = $expectedPublisher -and -not $expectedPublisher.StartsWith('UNCONFIGURED')
-          $certificatePinConfigured = $expectedSignerCertificateSha256 -cmatch '\A[0-9a-f]{64}\z'
-          $publisherUnconfigured = $expectedPublisher -and $expectedPublisher.StartsWith('UNCONFIGURED')
-          $certificatePinUnconfigured = $expectedSignerCertificateSha256 -and $expectedSignerCertificateSha256.StartsWith('unconfigured')
-          if ([bool]$publisherConfigured -xor [bool]$certificatePinConfigured) {
-            throw 'Authenticode identity pin configuration is partial: configure publisher Subject and signer certificate SHA-256 together.'
-          }
-          if (-not $publisherConfigured -and (-not $publisherUnconfigured -or -not $certificatePinUnconfigured)) {
-            throw 'Authenticode identity pin configuration is malformed: both pin files must be configured together or explicitly UNCONFIGURED.'
-          }
-          if ([bool]$env:WINDOWS_CERTIFICATE_BASE64 -xor [bool]$env:WINDOWS_CERTIFICATE_PASSWORD) {
-            throw 'Authenticode configuration is partial: set both certificate secrets or neither.'
-          }
-          if ($env:WINDOWS_CERTIFICATE_BASE64 -and $env:WINDOWS_CERTIFICATE_PASSWORD) {
-            if (-not $publisherConfigured) {
-              throw 'Set release/windows-authenticode-publisher.txt to the certificate exact Subject before signing.'
-            }
-            $certificate = Join-Path $env:RUNNER_TEMP 'nexus-authenticode.pfx'
-            [IO.File]::WriteAllBytes($certificate, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
-            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
-            $pfx = Get-PfxData -FilePath $certificate -Password $password
-            $endEntityCertificates = @($pfx.EndEntityCertificates)
-            if ($endEntityCertificates.Count -ne 1) {
-              throw "Expected one end-entity Authenticode certificate, found $($endEntityCertificates.Count)."
-            }
-            $sha = [Security.Cryptography.SHA256]::Create()
-            try {
-              $actualSignerCertificateSha256 = -join ($sha.ComputeHash($endEntityCertificates[0].RawData) | ForEach-Object { $_.ToString('x2') })
-            } finally {
-              $sha.Dispose()
-            }
-            if ($endEntityCertificates[0].Subject -cne $expectedPublisher -or
-                $actualSignerCertificateSha256 -cne $expectedSignerCertificateSha256) {
-              throw 'The supplied signing certificate does not match both versioned Authenticode identity pins.'
-            }
-            "CSC_LINK=$certificate" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "CSC_KEY_PASSWORD=$env:WINDOWS_CERTIFICATE_PASSWORD" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "NEXUS_SIGNED_BUILD=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          } elseif ($publisherConfigured) {
-            throw 'A Windows publisher is pinned, so release builds require both Authenticode certificate secrets.'
-          } elseif ($env:GITHUB_REF -like 'refs/tags/v*') {
-            "NEXUS_UNSIGNED_RELEASE=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            "NEXUS_UNSIGNED_DEV=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          } else {
-            "NEXUS_UNSIGNED_DEV=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          }
-
-      - name: Install pinned desktop dependencies
-        working-directory: desktop
-        run: npm ci
-
-      - name: Test desktop ownership, startup, and packaging contracts
-        working-directory: desktop
-        run: npm test
-
-      - name: Build versioned NSIS installer
-        working-directory: desktop
-        run: npm run build -- --win nsis
-
-      - name: Give a signed release its canonical public filename
-        if: env.NEXUS_SIGNED_BUILD == '1'
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED-DEV.exe')
-          if ($installers.Count -ne 1) { throw "Expected one signed release candidate, found $($installers.Count)." }
-          Rename-Item -LiteralPath $installers[0].FullName -NewName ($installers[0].Name -replace '-UNSIGNED-DEV\.exe$', '.exe')
-
-      - name: Give a checksum-only release an honest public filename
-        if: env.NEXUS_UNSIGNED_RELEASE == '1'
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED-DEV.exe')
-          if ($installers.Count -ne 1) { throw "Expected one unsigned release candidate, found $($installers.Count)." }
-          Rename-Item -LiteralPath $installers[0].FullName -NewName ($installers[0].Name -replace '-UNSIGNED-DEV\.exe$', '-UNSIGNED.exe')
-
-      - name: Smoke-test the unpacked clean-machine app
-        working-directory: desktop
-        run: npm run smoke:built
-      - name: Prove cold-start navigation with the bundled browser
-        working-directory: desktop
-        run: |
-          if (-not (Test-Path -LiteralPath 'build-output/win-unpacked/resources/runtime/NEXUS_RUNTIME.json')) {
-            throw 'The cold-start navigation proof requires the built browser runtime.'
-          }
-          node --test ui-navigation.test.js
-
-      - name: Exercise unpacked multi-vendor dispatch and recovery
-        working-directory: desktop
-        run: npm run e2e:multi-vendor
-
-      - name: Exercise Work together recovery in an ordinary source browser
-        working-directory: desktop
-        run: npm run smoke:browser-long-horizon
-
-      - name: Install and smoke-test the real per-user package
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
-          if ($installers.Count -ne 1) { throw "Expected one installer, found $($installers.Count)." }
-          $expectedVersion = (Get-Content -Raw -LiteralPath desktop/package.json | ConvertFrom-Json).version
-          $applicationGuid = 'e52322ab-f15e-5dc0-963b-7588e3739e89'
-          $installed = $null
-
-          function Get-CanonicalPath([string] $Path, [string] $What) {
-            if (-not $Path -or -not [IO.Path]::IsPathRooted($Path)) { throw "$What is not an absolute path: $Path" }
-            $full = [IO.Path]::GetFullPath($Path)
-            $root = [IO.Path]::GetPathRoot($full)
-            if ([StringComparer]::OrdinalIgnoreCase.Equals($full, $root)) { return $root }
-            return $full.TrimEnd(
-              [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar
-            )
-          }
-
-          function Get-InstalledApplication {
-            $installSubkey = "Software\$applicationGuid"
-            $uninstallSubkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$applicationGuid"
-            $baseKey = $null
-            $installKey = $null
-            $uninstallKey = $null
-            try {
-              $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-                [Microsoft.Win32.RegistryHive]::CurrentUser,
-                [Microsoft.Win32.RegistryView]::Registry64
-              )
-              $installKey = $baseKey.OpenSubKey($installSubkey, $false)
-              $uninstallKey = $baseKey.OpenSubKey($uninstallSubkey, $false)
-              if ($null -eq $installKey -or $null -eq $uninstallKey) {
-                throw 'The exact current-user Nexus Harness registry metadata is missing.'
-              }
-              $locationValue = [string]$installKey.GetValue('InstallLocation')
-              $keepShortcuts = [string]$installKey.GetValue('KeepShortcuts')
-              $shortcutName = [string]$installKey.GetValue('ShortcutName')
-              $displayName = [string]$uninstallKey.GetValue('DisplayName')
-              $displayVersion = [string]$uninstallKey.GetValue('DisplayVersion')
-              $publisher = [string]$uninstallKey.GetValue('Publisher')
-              $uninstallString = [string]$uninstallKey.GetValue('UninstallString')
-              $quietUninstallString = [string]$uninstallKey.GetValue('QuietUninstallString')
-            } finally {
-              if ($null -ne $uninstallKey) { $uninstallKey.Dispose() }
-              if ($null -ne $installKey) { $installKey.Dispose() }
-              if ($null -ne $baseKey) { $baseKey.Dispose() }
-            }
-            if ($keepShortcuts -cne 'true' -or $shortcutName -cne 'Nexus Harness' -or
-                $displayName -cne 'Nexus Harness' -or $publisher -cne 'Nexus Harness' -or
-                $displayVersion -cne $expectedVersion) {
-              throw 'The exact current-user Nexus Harness product/version metadata is invalid.'
-            }
-            $location = Get-CanonicalPath $locationValue 'The installed application location'
-            if (-not (Test-Path -LiteralPath $location -PathType Container)) {
-              throw "The installed application location does not exist: $location"
-            }
-            $application = Get-CanonicalPath (Join-Path $location 'Nexus Harness.exe') 'The installed application'
-            $uninstaller = Get-CanonicalPath (Join-Path $location 'Uninstall Nexus Harness.exe') 'The installed uninstaller'
-            if (-not (Test-Path -LiteralPath $application -PathType Leaf) -or
-                -not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
-              throw "The exact installed application or uninstaller is missing below $location."
-            }
-            $uninstallMatch = [Regex]::Match($uninstallString, '\A"(?<path>.+)" /currentuser\z')
-            $quietMatch = [Regex]::Match($quietUninstallString, '\A"(?<path>.+)" /currentuser /S\z')
-            if (-not $uninstallMatch.Success -or -not $quietMatch.Success) {
-              throw 'The installed package metadata is not bound to current-user mode.'
-            }
-            $registeredUninstaller = Get-CanonicalPath $uninstallMatch.Groups['path'].Value 'The registered uninstaller'
-            $registeredQuietUninstaller = Get-CanonicalPath $quietMatch.Groups['path'].Value 'The registered quiet uninstaller'
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($registeredUninstaller, $uninstaller) -or
-                -not [StringComparer]::OrdinalIgnoreCase.Equals($registeredQuietUninstaller, $uninstaller)) {
-              throw 'The installed package metadata points outside its exact install location.'
-            }
-            return $application
-          }
-
-          function Get-DesktopFolders {
-            $candidates = @(
-              [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory),
-              [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)
-            )
-            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            $folders = @()
-            foreach ($candidate in $candidates) {
-              $folder = Get-CanonicalPath $candidate 'A Windows desktop known folder'
-              if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
-                throw "Windows did not provide an existing desktop known folder: $folder"
-              }
-              if ($seen.Add($folder)) { $folders += $folder }
-            }
-            if ($folders.Count -eq 0) { throw 'Windows did not provide any desktop known folders.' }
-            return $folders
-          }
-
-          $desktopFolders = @(Get-DesktopFolders)
-          $desktop = $desktopFolders[0]
-          $shortcut = Join-Path $desktop 'Nexus Harness.lnk'
-
-          function Assert-InstalledShortcut {
-            $installedPath = Get-CanonicalPath $installed 'The installed application'
-            $seenLinks = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            $links = @()
-            foreach ($folder in $desktopFolders) {
-              foreach ($candidate in @(Get-ChildItem -LiteralPath $folder -Filter 'Nexus Harness*.lnk' -File -Force)) {
-                $candidatePath = Get-CanonicalPath $candidate.FullName 'A Nexus Harness desktop shortcut'
-                if ($seenLinks.Add($candidatePath)) { $links += $candidatePath }
-              }
-            }
-            if ($links.Count -ne 1 -or
-                -not [StringComparer]::OrdinalIgnoreCase.Equals($links[0], $shortcut)) {
-              throw "Expected exactly $shortcut and no duplicate visible Nexus Harness links; found $($links -join ', ')."
-            }
-            $shortcutItem = Get-Item -LiteralPath $shortcut -Force
-            $unsafeAttributes = (
-              [int][IO.FileAttributes]::Hidden -bor
-              [int][IO.FileAttributes]::System -bor
-              [int][IO.FileAttributes]::ReparsePoint
-            )
-            if ($shortcutItem.PSIsContainer -or
-                (([int]$shortcutItem.Attributes -band $unsafeAttributes) -ne 0)) {
-              throw "The installed Desktop shortcut is not a visible ordinary file: $shortcut"
-            }
-            $shell = New-Object -ComObject WScript.Shell
-            $link = $null
-            try {
-              $link = $shell.CreateShortcut($shortcut)
-              $target = Get-CanonicalPath ([string]$link.TargetPath) 'The shortcut target'
-              $arguments = [string]$link.Arguments
-              $workingDirectory = Get-CanonicalPath ([string]$link.WorkingDirectory) 'The shortcut working directory'
-              $iconLocation = ([string]$link.IconLocation).Trim()
-              $iconIndex = 0
-              if ($iconLocation -match '^(.*),\s*(-?\d+)$') {
-                $iconLocation = $Matches[1].Trim()
-                $iconIndex = [int]$Matches[2]
-              }
-              $icon = Get-CanonicalPath $iconLocation.Trim('"') 'The shortcut icon source'
-            } finally {
-              if ($null -ne $link -and [Runtime.InteropServices.Marshal]::IsComObject($link)) {
-                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)
-              }
-              if ([Runtime.InteropServices.Marshal]::IsComObject($shell)) {
-                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
-              }
-            }
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($target, $installedPath)) {
-              throw "Shortcut target '$target' does not match '$installedPath'."
-            }
-            if ($arguments -cne '') {
-              throw "Shortcut contains unexpected launch arguments: '$arguments'."
-            }
-            $installedDirectory = Get-CanonicalPath (Split-Path -Parent $installedPath) 'The installed application directory'
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($workingDirectory, $installedDirectory)) {
-              throw "Shortcut working directory '$workingDirectory' does not match '$installedDirectory'."
-            }
-            if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) {
-              throw "Shortcut icon source does not exist: $icon"
-            }
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($icon, $installedPath) -or
-                $iconIndex -ne 0) {
-              throw "Shortcut icon '$icon,$iconIndex' does not use the installed application exactly."
-            }
-            return [pscustomobject]@{
-              ShortcutPath = $shortcut; TargetPath = $target; Arguments = $arguments
-              WorkingDirectory = $workingDirectory; IconPath = $icon; IconIndex = $iconIndex
-            }
-          }
-
-          function Get-InstalledProcesses {
-            return @(Get-CimInstance Win32_Process | Where-Object {
-              $_.ExecutablePath -and [StringComparer]::OrdinalIgnoreCase.Equals(
-                [IO.Path]::GetFullPath($_.ExecutablePath), [IO.Path]::GetFullPath($installed)
-              )
-            })
-          }
-
-          function Stop-InstalledProcessTrees {
-            $deadline = [DateTime]::UtcNow.AddSeconds(20)
-            do {
-              $remaining = @(Get-InstalledProcesses)
-              if ($remaining.Count -eq 0) { return }
-              foreach ($process in $remaining) {
-                try {
-                  [void](Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" `
-                    -ArgumentList @('/PID', [string]$process.ProcessId, '/T', '/F') `
-                    -Wait -PassThru -WindowStyle Hidden)
-                } catch {
-                  # The bounded exact-path readback below remains authoritative.
-                }
-              }
-              if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 250 }
-            } while ([DateTime]::UtcNow -lt $deadline)
-            $remaining = @(Get-InstalledProcesses)
-            if ($remaining.Count -ne 0) {
-              throw "The shortcut-launched installed process tree did not stop: $($remaining.ProcessId -join ', ')."
-            }
-          }
-
-          $process = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) { throw "Installer stopped with code $($process.ExitCode)." }
-          $installed = Get-InstalledApplication
-          [void](Assert-InstalledShortcut)
-          Push-Location desktop
-          try {
-            npm run smoke:built -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed app acceptance failed.' }
-            npm run e2e:multi-vendor -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed multi-vendor acceptance failed.' }
-            npm run smoke:long-horizon -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed long-horizon acceptance failed.' }
-            npm run smoke:team-chat -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed two-agent chat acceptance failed.' }
-          } finally { Pop-Location }
-
-          Remove-Item -LiteralPath $shortcut -Force
-          if (Test-Path -LiteralPath $shortcut) { throw "Could not remove $shortcut for the reinstall check." }
-          $reinstall = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
-          if ($reinstall.ExitCode -ne 0) { throw "Reinstall stopped with code $($reinstall.ExitCode)." }
-          $reinstalled = Get-InstalledApplication
-          if (-not [StringComparer]::OrdinalIgnoreCase.Equals($reinstalled, $installed)) {
-            throw "Reinstall moved the exact current-user application from '$installed' to '$reinstalled'."
-          }
-          [void](Assert-InstalledShortcut)
-
-          # A previous development build can leave a same-name link. NSIS's
-          # KeepShortcuts upgrade path used to preserve that stale target.
-          $shell = New-Object -ComObject WScript.Shell
-          $stale = $null
-          try {
-            $stale = $shell.CreateShortcut($shortcut)
-            $stale.TargetPath = $installers[0].FullName
-            $stale.Arguments = '--stale-development-shortcut'
-            $stale.WorkingDirectory = Split-Path -Parent $installers[0].FullName
-            $stale.IconLocation = "$($installers[0].FullName),7"
-            $stale.Save()
-          } finally {
-            if ($null -ne $stale -and [Runtime.InteropServices.Marshal]::IsComObject($stale)) {
-              [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($stale)
-            }
-            if ([Runtime.InteropServices.Marshal]::IsComObject($shell)) {
-              [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
-            }
-          }
-          $staleReinstall = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
-          if ($staleReinstall.ExitCode -ne 0) { throw "Stale-shortcut reinstall stopped with code $($staleReinstall.ExitCode)." }
-          $verifiedShortcut = Assert-InstalledShortcut
-
-          $alreadyRunning = @(Get-InstalledProcesses)
-          if ($alreadyRunning.Count -ne 0) {
-            throw "A prior package smoke left the installed app running: $($alreadyRunning.ProcessId -join ', ')."
-          }
-          $launched = @()
-          try {
-            [void](Start-Process -FilePath $verifiedShortcut.ShortcutPath -PassThru)
-            $deadline = [DateTime]::UtcNow.AddSeconds(30)
-            do {
-              $launched = @(Get-InstalledProcesses)
-              if ($launched.Count -eq 0) { Start-Sleep -Milliseconds 250 }
-            } while ($launched.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline)
-            if ($launched.Count -eq 0) { throw "The recreated desktop shortcut did not launch the installed app." }
-          } finally {
-            Stop-InstalledProcessTrees
-          }
-
-      - name: Verify the installer Authenticode signature
-        if: env.NEXUS_SIGNED_BUILD == '1'
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
-          if ($installers.Count -ne 1) { throw "Expected one installer, found $($installers.Count)." }
-          $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
-          if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate.Subject) {
-            throw "Installer signature is not valid: $($signature.Status) $($signature.StatusMessage)"
-          }
-          $expectedPublisher = (Get-Content -Raw -LiteralPath release/windows-authenticode-publisher.txt).Trim()
-          $expectedSignerCertificateSha256 = (Get-Content -Raw -LiteralPath release/windows-authenticode-certificate-sha256.txt).Trim().ToLowerInvariant()
-          if ($signature.SignerCertificate.Subject -cne $expectedPublisher) {
-            throw "Installer publisher '$($signature.SignerCertificate.Subject)' does not match pinned publisher '$expectedPublisher'."
-          }
-          $sha = [Security.Cryptography.SHA256]::Create()
-          try {
-            $actualSignerCertificateSha256 = -join ($sha.ComputeHash($signature.SignerCertificate.RawData) | ForEach-Object { $_.ToString('x2') })
-          } finally {
-            $sha.Dispose()
-          }
-          if ($actualSignerCertificateSha256 -cne $expectedSignerCertificateSha256) {
-            throw "Installer signer certificate SHA-256 '$actualSignerCertificateSha256' does not match the versioned pin."
-          }
-
-      - name: Verify an unsigned release is actually unsigned
-        if: env.NEXUS_UNSIGNED_RELEASE == '1'
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED.exe')
-          if ($installers.Count -ne 1) { throw "Expected one explicitly unsigned installer, found $($installers.Count)." }
-          $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
-          if ($signature.Status -ne 'NotSigned' -or $signature.SignerCertificate.Subject) {
-            throw "Explicitly unsigned installer has an unexpected signature state: $($signature.Status)."
-          }
-
-      - name: Write installer SHA-256
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
-          if ($installers.Count -ne 1) { throw "Expected one versioned NSIS installer, found $($installers.Count)." }
-          $installer = $installers[0]
-          $stream = [IO.File]::OpenRead($installer.FullName)
-          $sha = [Security.Cryptography.SHA256]::Create()
-          try {
-            $hash = -join ($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') })
-          } finally {
-            $sha.Dispose()
-            $stream.Dispose()
-          }
-          "$hash  $($installer.Name)" | Set-Content -Encoding ascii -NoNewline -LiteralPath "$($installer.FullName).sha256"
-          $unpackedBytes = (Get-ChildItem -LiteralPath desktop/build-output/win-unpacked -File -Recurse | Measure-Object -Property Length -Sum).Sum
-          if (-not $unpackedBytes) { throw "The unpacked application size could not be measured." }
-          [ordered]@{
-            schema_version = 1
-            installer_bytes = $installer.Length
-            installer_mib = [math]::Round($installer.Length / 1MB, 1)
-            unpacked_bytes = $unpackedBytes
-            unpacked_mib = [math]::Round($unpackedBytes / 1MB, 1)
-          } | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath desktop/build-output/release-metadata.json
-
-      - name: Assemble the product-bound offline installer ZIP
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
-          if ($installers.Count -ne 1) { throw "Expected one stable installer, found $($installers.Count)." }
-          & .\scripts\build_windows_offline_bundle.ps1 `
-            -InstallerPath $installers[0].FullName `
-            -OutputDirectory (Resolve-Path 'desktop/build-output')
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: nexus-harness-windows-${{ github.ref_name }}
-          if-no-files-found: error
-          path: |
-            desktop/build-output/Nexus-Harness-Setup-*.exe
-            desktop/build-output/Nexus-Harness-Setup-*.exe.sha256
-            desktop/build-output/Nexus-Harness-Windows-Offline-*.zip
-            desktop/build-output/release-metadata.json
-
-      - name: Locate failed release smoke evidence
-        if: failure()
-        shell: pwsh
-        run: |
-          $releaseSmokeTemp = node -p "require('node:os').tmpdir()"
-          if ($LASTEXITCODE -ne 0 -or -not [IO.Path]::IsPathRooted($releaseSmokeTemp)) {
-            throw 'Could not locate the release smoke temporary directory.'
-          }
-          "NEXUS_RELEASE_SMOKE_TMPDIR=$releaseSmokeTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Keep failed release conversation evidence
-        if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: release-conversation-failure-${{ github.ref_name }}
-          if-no-files-found: ignore
-          path: |
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.png
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.html
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-long-horizon-ui-*/failure.png
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-long-horizon-ui-*/failure.html
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-long-horizon-ui-*/failure.json
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*.png
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*-layout.json
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/failure-goals.json
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus browser source acceptance - */failure-*.png
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus browser source acceptance - */failure-*.json
-            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus browser source acceptance - */source-server.log
-          retention-days: 7
-
-  publish-release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: clean-windows-build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: nexus-harness-windows-${{ github.ref_name }}
-          path: release
-      - name: Refuse an existing mutable release and publish once
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
-          if [[ "$default_branch" != "master" ]]; then
-            echo "The public source-ZIP contract expects master, not $default_branch." >&2
-            exit 1
-          fi
-          master_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/master" --jq '.sha')"
-          if [[ "$master_sha" != "$GITHUB_SHA" ]]; then
-            echo "Release tag $tag points at $GITHUB_SHA while master points at $master_sha." >&2
-            exit 1
-          fi
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists. Refusing to replace or append assets." >&2
-            exit 1
-          fi
-          mapfile -t assets < <(find release -maxdepth 1 -type f -name 'Nexus-Harness-Setup-*' -print)
-          if [[ ${#assets[@]} -ne 2 ]]; then
-            echo "Expected exactly the installer and checksum, found ${#assets[@]}." >&2
-            exit 1
-          fi
-          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "The release tag is not an exact Nexus Harness version: $tag" >&2
-            exit 1
-          fi
-          version="${BASH_REMATCH[1]}"
-          mapfile -t release_installers < <(printf '%s\n' "${assets[@]}" | grep -E '\.exe$')
-          if [[ ${#release_installers[@]} -ne 1 ]]; then
-            echo "Expected exactly one release installer before publication." >&2
-            exit 1
-          fi
-          release_installer="${release_installers[0]}"
-          release_installer_name="$(basename "$release_installer")"
-          if [[ "$release_installer_name" != "Nexus-Harness-Setup-${version}.exe" \
-              && "$release_installer_name" != "Nexus-Harness-Setup-${version}-UNSIGNED.exe" ]]; then
-            echo "Release tag $tag does not match installer $release_installer_name." >&2
-            exit 1
-          fi
-          if [[ ! -f "${release_installer}.sha256" ]]; then
-            echo "The exact checksum for $release_installer_name is missing before publication." >&2
-            exit 1
-          fi
-          mapfile -t offline_bundles < <(find release -maxdepth 1 -type f -name 'Nexus-Harness-Windows-Offline-*.zip' -print)
-          if [[ ${#offline_bundles[@]} -ne 1 ]]; then
-            echo "Expected exactly one product-built offline ZIP, found ${#offline_bundles[@]}." >&2
-            exit 1
-          fi
-          offline_bundle="${offline_bundles[0]}"
-          offline_bundle_name="$(basename "$offline_bundle")"
-          if [[ "$offline_bundle_name" != "Nexus-Harness-Windows-Offline-${version}.zip" ]]; then
-            echo "Release tag $tag does not match offline bundle $offline_bundle_name." >&2
-            exit 1
-          fi
-          metadata="release/release-metadata.json"
-          if [[ ! -f "$metadata" ]]; then
-            echo "Release size metadata is missing." >&2
-            exit 1
-          fi
-          installer_mib="$(jq -er '.installer_mib | numbers' "$metadata")"
-          unpacked_mib="$(jq -er '.unpacked_mib | numbers' "$metadata")"
-          notes="Windows installer: exact bytes are protected by the accompanying SHA-256. This release is not Authenticode-signed, so Windows may show an unknown-publisher warning."
-          if [[ ! "${assets[*]}" =~ -UNSIGNED\.exe ]]; then
-            notes="Windows installer: SHA-256 plus the pinned Authenticode Subject and signer-certificate SHA-256 are verified by the release workflow."
-          fi
-          notes="$notes The product-bound offline ZIP carries a CMD-pinned bootstrap, installer, checksum, and v2 identity manifest together for computers without GitHub access. The unsigned outer ZIP/CMD still requires trusted transport. Measured download size: ${installer_mib} MiB; unpacked application: ${unpacked_mib} MiB. Allow at least 2 GiB free while installing."
-          gh release create "$tag" "${assets[@]}" "$offline_bundle" --verify-tag --generate-notes --notes "$notes" --title "Nexus Harness $tag"
-
-      - name: Prove the stable release is anonymously installable
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"
-          latest="${RUNNER_TEMP}/nexus-latest-release.json"
-          for attempt in $(seq 1 12); do
-            if curl --fail --silent --show-error --location \
-                --header 'Accept: application/vnd.github+json' \
-                --header 'X-GitHub-Api-Version: 2022-11-28' \
-                --user-agent 'nexus-harness-release-readback' \
-                "$api" --output "$latest" \
-                && jq -e --arg tag "$tag" '.tag_name == $tag' "$latest" >/dev/null; then
-              break
-            fi
-            if [[ $attempt -eq 12 ]]; then
-              echo "The public latest-release API did not expose $tag after publication." >&2
-              exit 1
-            fi
-            sleep 5
-          done
-          mapfile -t names < <(jq -er '.assets[].name' "$latest")
-          if [[ ${#names[@]} -ne 3 ]]; then
-            echo "Expected exactly the public installer, checksum, and offline ZIP assets, found: ${names[*]}" >&2
-            exit 1
-          fi
-          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-            echo "The stable tag is not an exact Nexus Harness version: $tag" >&2
-            exit 1
-          fi
-          version="${BASH_REMATCH[1]}"
-          mapfile -t installers < <(printf '%s\n' "${names[@]}" | grep -E '^Nexus-Harness-Setup-.*\.exe$')
-          if [[ ${#installers[@]} -ne 1 ]]; then
-            echo "Expected one public installer asset, found: ${names[*]}" >&2
-            exit 1
-          fi
-          installer="${installers[0]}"
-          if [[ "$installer" != "Nexus-Harness-Setup-${version}.exe" \
-              && "$installer" != "Nexus-Harness-Setup-${version}-UNSIGNED.exe" ]]; then
-            echo "Stable tag $tag does not match public installer $installer." >&2
-            exit 1
-          fi
-          checksum="${installer}.sha256"
-          if [[ ! " ${names[*]} " =~ " ${checksum} " ]]; then
-            echo "The public release does not expose ${checksum}." >&2
-            exit 1
-          fi
-          offline_bundle="Nexus-Harness-Windows-Offline-${version}.zip"
-          if [[ ! " ${names[*]} " =~ " ${offline_bundle} " ]]; then
-            echo "The public release does not expose ${offline_bundle}." >&2
-            exit 1
-          fi
-          public_assets="${RUNNER_TEMP}/nexus-public-release"
-          mkdir -p "$public_assets"
-          for name in "$installer" "$checksum" "$offline_bundle"; do
-            url="$(jq -er --arg name "$name" '.assets[] | select(.name == $name) | .browser_download_url' "$latest")"
-            curl --fail --silent --show-error --location \
-              --user-agent 'nexus-harness-release-readback' \
-              "$url" --output "${public_assets}/${name}"
-            if [[ ! -s "${public_assets}/${name}" ]]; then
-              echo "The anonymously downloaded public asset is empty: $name" >&2
-              exit 1
-            fi
-            if ! cmp --silent "release/${name}" "${public_assets}/${name}"; then
-              echo "The public release bytes differ from the verified build artifact: $name" >&2
-              exit 1
-            fi
-          done
-          mapfile -t checksum_lines < "${public_assets}/${checksum}"
-          if [[ ${#checksum_lines[@]} -ne 1 ]]; then
-            echo "The public checksum must contain exactly one installer record." >&2
-            exit 1
-          fi
-          checksum_line="${checksum_lines[0]%$'\r'}"
-          if [[ ! "$checksum_line" =~ ^([0-9a-fA-F]{64})[[:space:]]+(\*)?(.+)$ ]]; then
-            echo "The public checksum has an unsupported format." >&2
-            exit 1
-          fi
-          expected_hash="${BASH_REMATCH[1],,}"
-          checksum_name="${BASH_REMATCH[3]}"
-          if [[ "$checksum_name" != "$installer" ]]; then
-            echo "The public checksum names '$checksum_name' instead of '$installer'." >&2
-            exit 1
-          fi
-          actual_hash="$(sha256sum "${public_assets}/${installer}" | awk '{print $1}')"
-          if [[ "$actual_hash" != "$expected_hash" ]]; then
-            echo "The anonymously downloaded public installer does not match its checksum." >&2
-            exit 1
-          fi
-
   prove-public-source-zip:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: publish-release
     runs-on: windows-latest
     timeout-minutes: 25
     permissions:
       contents: read
     steps:
+      - name: Enable temporary runner-only child PowerShell transcription
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $policy = 'HKCU:\Software\Policies\Microsoft\Windows\PowerShell\Transcription'
+          $output = Join-Path $env:RUNNER_TEMP 'nexus-source-zip-transcripts'
+          New-Item -ItemType Directory -Force -Path $output | Out-Null
+          $names = @('EnableTranscripting', 'EnableInvocationHeader', 'OutputDirectory')
+          $before = @{}
+          if (Test-Path -LiteralPath $policy) {
+            $properties = Get-ItemProperty -LiteralPath $policy
+            foreach ($name in $names) {
+              if ($null -ne $properties.PSObject.Properties[$name]) { $before[$name] = $properties.$name }
+            }
+          }
+          $before | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'nexus-transcription-before.json')
+          New-Item -Path $policy -Force | Out-Null
+          New-ItemProperty -LiteralPath $policy -Name EnableTranscripting -Value 1 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -LiteralPath $policy -Name EnableInvocationHeader -Value 1 -PropertyType DWord -Force | Out-Null
+          New-ItemProperty -LiteralPath $policy -Name OutputDirectory -Value $output -PropertyType String -Force | Out-Null
+          Write-Output "Child PowerShell transcription directory: $output"
       - name: Install from the exact public GitHub source ZIP
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
-          $tag = [string]$env:GITHUB_REF_NAME
+          $tag = 'v0.2.8'
+          $expectedReleaseSha = 'e5d88b2b572fd5710ae386de23a85fbe7bb6fb3f'
           if ($tag -cnotmatch '\Av(?<version>[0-9]+(?:\.[0-9]+){2})\z') {
             throw "The source-ZIP acceptance tag is invalid: $tag"
           }
@@ -711,8 +51,8 @@ jobs:
             -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'nexus-source-zip-acceptance' } `
             -OutFile $masterMetadata
           $masterSha = [string](Get-Content -Raw -LiteralPath $masterMetadata | ConvertFrom-Json).sha
-          if ($masterSha -cne [string]$env:GITHUB_SHA) {
-            throw "The release commit is '$env:GITHUB_SHA', but public master is '$masterSha'."
+          if ($masterSha -cne [string]$expectedReleaseSha) {
+            throw "The release commit is '$expectedReleaseSha', but public master is '$masterSha'."
           }
           $probeRoot = Join-Path $env:RUNNER_TEMP "Nexus source ZIP - Åsa & O'Brien (QA)!"
           $archive = Join-Path $probeRoot 'nexus-source.zip'
@@ -824,3 +164,34 @@ jobs:
                 -Wait -PassThru -WindowStyle Hidden)
             }
           }
+
+      - name: Print bounded child installer diagnostics and restore runner policy
+        if: always()
+        shell: pwsh
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP 'nexus-source-zip-transcripts'
+          if (Test-Path -LiteralPath $output) {
+            $logs = @(Get-ChildItem -LiteralPath $output -File -Recurse)
+            Write-Output "Captured $($logs.Count) child PowerShell transcript file(s)."
+            foreach ($log in $logs) {
+              Write-Output "Transcript: $($log.FullName)"
+              Get-Content -LiteralPath $log.FullName -Tail 100
+            }
+          }
+          $policy = 'HKCU:\Software\Policies\Microsoft\Windows\PowerShell\Transcription'
+          $backup = Join-Path $env:RUNNER_TEMP 'nexus-transcription-before.json'
+          if (Test-Path -LiteralPath $backup) {
+            $before = Get-Content -Raw -LiteralPath $backup | ConvertFrom-Json -AsHashtable
+            foreach ($name in @('EnableTranscripting', 'EnableInvocationHeader', 'OutputDirectory')) {
+              if ($before.ContainsKey($name)) { Set-ItemProperty -LiteralPath $policy -Name $name -Value $before[$name] }
+              else { Remove-ItemProperty -LiteralPath $policy -Name $name -ErrorAction SilentlyContinue }
+            }
+          }
+      - name: Preserve child installer error evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: source-zip-child-diagnostics
+          if-no-files-found: warn
+          path: ${{ runner.temp }}/nexus-source-zip-transcripts/**
+          retention-days: 7
