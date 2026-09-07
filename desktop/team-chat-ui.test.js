@@ -16,6 +16,36 @@ const handlers = {
   maximized: section("async function sendFromTheBigChat", "function wireUpTheTray"),
 };
 
+test("only correlated routine Nexus goal transitions use compact status rows", () => {
+  const context = vm.createContext({});
+  vm.runInContext(section("function isNexusChatTurn", "function aChatTurnFace")
+    + section("function normalizedLongHorizonCorrelation", "const PARTICIPANT_OUTCOME_STATUSES"), context);
+  const routine = {
+    who: "them", speaker_id: "nexus", speaker_name: "Nexus", recipient_name: "You",
+    phase: "long_horizon_status", text: "Full original status text.",
+    correlation: {schema_version: 1, kind: "long_horizon_status", goal_id: "portable-goal", goal_status: "running"},
+  };
+  const check = (one) => {
+    context.one = one;
+    return vm.runInContext("isRoutineGoalStatusTurn(one)", context);
+  };
+  for (const status of ["queued", "running", "complete"]) {
+    assert.equal(check({...routine, correlation: {...routine.correlation, goal_status: status}}), true, status);
+  }
+  for (const status of ["paused", "failed", "waiting_for_user", "waiting_for_project", "cancelled", "cancelling", "unknown"]) {
+    assert.equal(check({...routine, correlation: {...routine.correlation, goal_status: status}}), false, status);
+  }
+  for (const changes of [
+    {speaker_id: "agent-a", speaker_name: "Builder", recipient_name: "Reviewer"},
+    {phase: "agent_discussion"}, {phase: "nexus_error"}, {correlation: null},
+    {correlation: {...routine.correlation, schema_version: 2}},
+    {correlation: {...routine.correlation, kind: "ordinary_chat"}},
+    {correlation: {...routine.correlation, goal_id: ""}},
+    {structured_state_unavailable: true}, {participant_outcome: {schema_version: 1}},
+    {questions: [{id: "choice", text: "Choose an option"}]}, {attachments: [{name: "evidence.txt"}]},
+  ]) assert.equal(check({...routine, ...changes}), false, JSON.stringify(changes));
+});
+
 test("an admission receipt points to the shared chat without claiming that the team is still running", () => {
   const context = vm.createContext({});
   vm.runInContext(section("function longHorizonAdmissionWords", "function finishLongHorizonAdmissionActivity"), context);

@@ -1989,6 +1989,20 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
 .the-big-chat-send-actions button { min-height: 36px; padding: 5px 10px; font-size: .84rem; }
 .the-big-chat-send-actions #theBigChatSaidBack:empty { display: none; }
 .chat-turn-details { margin-top: 4px; }
+.the-big-chat-turn.chat-goal-status-row,
+.talk-turn.chat-goal-status-row {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start; gap: 4px 10px; width: 100%; max-width: 100%;
+  padding: 2px 10px; border: 0; border-radius: 0;
+  background: transparent; color: var(--muted); font-size: .78rem;
+}
+.the-big-chat-turn.chat-goal-status-row { margin-block: -6px; padding-block: 0; }
+.chat-goal-status-speaker { font-size: .74rem; line-height: 1.5; white-space: nowrap; }
+.chat-goal-status-text { min-width: 0; line-height: 1.5; }
+.chat-goal-status-text .chat-prose { margin: 0; }
+.chat-goal-status-row .chat-goal-status-details { margin: 0; }
+.chat-goal-status-details[open] { grid-column: 2 / -1; }
+.chat-goal-status-details > .hint { margin: 5px 0; }
 .the-big-chat-what .long-horizon-chat-link { min-height: 0; margin-top: 5px; padding: 2px 0; font-size: .72rem; border: 0; background: transparent; box-shadow: none; color: var(--muted); text-decoration: underline; }
 #theBigChatActions {
   padding: 0;

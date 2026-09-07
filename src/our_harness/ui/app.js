@@ -13169,6 +13169,36 @@ function appendLongHorizonGoalLink(container, correlation) {
   container.append(open);
 }
 
+function isRoutineGoalStatusTurn(one) {
+  const correlation = normalizedLongHorizonCorrelation(one);
+  return isNexusChatTurn(one) && one?.phase === "long_horizon_status"
+    && ["queued", "running", "complete"].includes(correlation?.status)
+    && !one.structured_state_unavailable && !one.participant_outcome
+    && !one.questions?.length && !one.attachments?.length;
+}
+
+function aChatGoalStatusRow(speaker, text, at, correlation, className, metadata = {}) {
+  const row = make("li", `${className} chat-goal-status-row`);
+  row.dataset.goalId = correlation.goalId;
+  row.dataset.goalStatus = correlation.status;
+  row.append(make("strong", "chat-goal-status-speaker", speaker));
+  const words = make("div", "chat-goal-status-text");
+  appendChatText(words, text);
+  row.append(words);
+  const details = make("details", "chat-turn-details chat-goal-status-details");
+  details.append(make("summary", "", "Details"));
+  const under = [];
+  if (at) under.push(at);
+  if (metadata.milliseconds) under.push(prettyTime(metadata.milliseconds));
+  const route = metadata.speaker_route || metadata.route;
+  if (route) under.push(`route ${route}`);
+  if (metadata.model) under.push(metadata.model);
+  if (under.length) details.append(make("p", "hint", under.join(" | ")));
+  appendLongHorizonGoalLink(details, correlation);
+  row.append(details);
+  return row;
+}
+
 const PARTICIPANT_OUTCOME_STATUSES = new Set([
   "answered", "failed", "outcome_unknown",
   "answered_then_failed", "answered_then_outcome_unknown",
@@ -13411,6 +13441,11 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
   let latestUserPrompt = "";
   for (const [turnIndex, one] of said.entries()) {
     if (one.who === "you" && String(one.text || "").trim()) latestUserPrompt = one.text;
+    if (isRoutineGoalStatusTurn(one)) {
+      list.append(aChatGoalStatusRow(chatTurnSpeaker(one, agent), one.text, one.at,
+        normalizedLongHorizonCorrelation(one), "talk-turn nexus-turn", one));
+      continue;
+    }
     const participantOutcome = normalizedParticipantOutcome(one);
     const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
       "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
@@ -17271,6 +17306,7 @@ function renderTheBigChat() {
       milliseconds: Number(one.milliseconds || 0),
       speakerId: one.speaker_id || "",
       nexus: isNexusChatTurn(one),
+      compactGoalStatus: isRoutineGoalStatusTurn(one),
       structuredStateUnavailable: Boolean(one.structured_state_unavailable),
       participantOutcome: normalizedParticipantOutcome(one),
       longHorizonCorrelation: normalizedLongHorizonCorrelation(one),
@@ -17313,6 +17349,11 @@ function renderTheBigChat() {
         + "turns up here too."));
     }
     for (const one of turns) {
+      if (one.compactGoalStatus) {
+        list.append(aChatGoalStatusRow(one.who, one.text, one.at,
+          one.longHorizonCorrelation, "the-big-chat-turn nexus-turn", one));
+        continue;
+      }
       const row = make("li", `the-big-chat-turn from-${one.kind === "you" ? "you" : "them"} `
         + (one.kind === "between" ? "between" : ""));
       row.classList.toggle("nexus-turn", one.nexus);
