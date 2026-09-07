@@ -1398,7 +1398,9 @@ try {
                         str(case / "scripts" / "install_nexus_harness.ps1"),
                         "-LoadFunctionsOnly",
                     ],
-                    text=True, capture_output=True, timeout=20, errors="replace",
+                    # Include cold PowerShell startup on a loaded Windows CI
+                    # runner; the assertions still require actual pin rejection.
+                    text=True, capture_output=True, timeout=60, errors="replace",
                 )
                 with self.subTest(case=name):
                     self.assertNotEqual(result.returncode, 0)

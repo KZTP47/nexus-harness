@@ -10197,6 +10197,10 @@ async function refreshSwarm(quietly, {recoveryOnly = false} = {}) {
     // read completed. Enable its exact-chat action immediately; a second
     // journal read is useful reconciliation, never the hydration authority.
     renderDirectLongGoalBoardRecoveryNotice();
+    // The accepted local board is ready now, even if a quiet startup refresh
+    // won this first read. Auxiliary history must not leave its loading label
+    // on screen or later overwrite a more recent action or running status.
+    if (firstHydration || !quietly) sayInSwarm(whatTheBoardSays());
     // Route/profile and project-path changes are authority changes for an
     // existing chat even when its short agent ids stayed the same. Re-read the
     // small registry snapshots so the protection card and one-click fresh-chat
@@ -10235,7 +10239,6 @@ async function refreshSwarm(quietly, {recoveryOnly = false} = {}) {
       renderWhatTheyAreDoing(doing);
       if (doing && doing.going) watchWhatTheyAreDoing();
     }
-    if (!quietly) sayInSwarm(whatTheBoardSays());
     if (!recoveryOnly && said.provider_status_stale && mine === swarmNewestRefresh) {
       // Do not await this: the durable board is already interactive. This
       // second pass only decorates it with newly discovered provider status.
