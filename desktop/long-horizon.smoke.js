@@ -388,6 +388,7 @@ async function main() {
   trustFixtureSettings(exe, project, environment);
   let running = null;
   let passed = false;
+  const acceptance = {stage: "launch", cutDiscardAdmission: false};
   try {
     running = await launch(exe, profile, project, environment);
     let {app, page} = running;
@@ -569,7 +570,29 @@ async function main() {
     if (!recoveryTranscript.includes(recoveryGoal) || /Answer received/i.test(recoveryTranscript)) {
       throw new Error(`The recovered exact prompt was not shown truthfully: ${recoveryTranscript}`);
     }
+    acceptance.stage = "review the completed recovered goal";
+    // Backend completion can precede the renderer's origin-chat refresh. A
+    // user starts the next goal only after reviewing the completed result and
+    // seeing this exact chat's new-work controls become ready.
+    const completedRecovery = page.locator(
+      `#theBigChatSaid .chat-goal-status-row[data-goal-id="${recoveredGoal.goal_id}"][data-goal-status="complete"]`,
+    );
+    await completedRecovery.waitFor({state: "visible", timeout: 30000});
+    await completedRecovery.scrollIntoViewIfNeeded();
+    await page.waitForFunction(([agentId, chatId, goalId]) => {
+      const context = chatLongGoalContext(agentId);
+      const work = document.getElementById("theBigChatWork");
+      return activeConversationFor(agentId)?.id === chatId
+        && !swarmChatIsHydrating(agentId)
+        && !swarmConversationSwitching.has(agentId)
+        && longGoals.some(goal => goal.goal_id === goalId && goal.status === "complete")
+        && !context.goal && !context.problem
+        && document.getElementById("theBigChatTeamGoal").hidden
+        && work && !work.hidden && !work.disabled && work.getClientRects().length > 0;
+    }, [AGENT_A, chats.chatR, recoveredGoal.goal_id], {timeout: 30000});
+    console.log("pass  the exact completed goal is visible and its chat is ready for a new Work together request");
     console.log("pass  restart recovery admits once and dispatches each required participant once with byte-exact attachment and verified result");
+    acceptance.stage = "discard second unadmitted request";
 
     const discardGoal = "NEXUS-SMOKE-GOAL-DISCARD — Keep this second exact request unadmitted, then discard it without provider dispatch.";
     const unexpectedStarts = [];
@@ -584,6 +607,7 @@ async function main() {
     await page.route(admissionUrl, async (route) => {
       if (!cutDiscardAdmission) {
         cutDiscardAdmission = true;
+        acceptance.cutDiscardAdmission = true;
         await route.abort("failed");
       } else {
         await route.continue();
@@ -632,6 +656,7 @@ async function main() {
       await page.unroute(admissionUrl);
     }
     console.log("pass  both exact discard labels preserve zero admission and zero provider dispatch");
+    acceptance.stage = "independent saved-chat goals";
 
     await openBigChat(page, chats.chatA);
 
@@ -713,6 +738,40 @@ async function main() {
     console.log("pass  closing and reopening the packaged app restores Chat 2 and both goals");
     console.log("\nPackaged Work together acceptance passed from a clean user's perspective.");
     passed = true;
+  } catch (error) {
+    const failure = {acceptance, error: String(error?.stack || error)};
+    if (running?.page && !running.page.isClosed()) {
+      try {
+        failure.ui = await running.page.evaluate((agentId) => {
+          const control = (id) => {
+            const element = document.getElementById(id);
+            return element ? {hidden: element.hidden, disabled: element.disabled,
+              text: element.textContent, value: element.value} : null;
+          };
+          return {
+            url: location.href,
+            activeChat: activeConversationFor(agentId),
+            busy: [...swarmBusy],
+            stopping: [...swarmStopping],
+            activity: swarmChatActivityFor(agentId),
+            recoveries: [...directLongGoalRecoveries.values()],
+            recoveryError: directLongGoalRecoveryError,
+            goals: longGoals.map((goal) => ({id: goal.goal_id || goal.id,
+              conversation_id: goal.conversation_id, status: goal.status})),
+            controls: Object.fromEntries(["theBigChatBox", "theBigChatWork",
+              "theBigChatSend", "theBigChatStop", "theBigChatSaidBack",
+              "theBigChatTeamGoal", "directLongGoalRecoveryBoard"].map(id => [id, control(id)])),
+          };
+        }, AGENT_A);
+        await running.page.screenshot({path: path.join(root, "failure.png"), fullPage: true});
+        fs.writeFileSync(path.join(root, "failure.html"), await running.page.content(), "utf8");
+      } catch (captureError) {
+        failure.captureError = String(captureError);
+      }
+    }
+    fs.writeFileSync(path.join(root, "failure.json"), JSON.stringify(failure, null, 2), "utf8");
+    console.error(`info  failure evidence: ${JSON.stringify(failure)}`);
+    throw error;
   } finally {
     if (running?.app) await running.app.close().catch(() => {});
     if (passed) {

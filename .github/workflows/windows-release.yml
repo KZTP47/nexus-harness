@@ -501,6 +501,9 @@ jobs:
           path: |
             ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.png
             ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.html
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-long-horizon-ui-*/failure.png
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-long-horizon-ui-*/failure.html
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-long-horizon-ui-*/failure.json
             ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*.png
             ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*-layout.json
             ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/failure-goals.json
