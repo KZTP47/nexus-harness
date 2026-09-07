@@ -277,9 +277,11 @@ for (const view of ["compact", "maximized"]) {
 test("active team pause and resume target the chat goal, independent of advanced panel selection", async () => {
   const f = fixture();
   await vm.runInContext("controlChatGoal(state.agent.id)", f.context);
+  assert.equal(f.notices.at(-1), "Pause was accepted. Follow the team's current status in this chat.");
   assert.equal(f.calls.at(-1).body.action, "pause");
   assert.equal(f.calls.at(-1).body.goal_id, f.goal.goal_id);
   await vm.runInContext("controlChatGoal(state.agent.id)", f.context);
+  assert.equal(f.notices.at(-1), "Resume was accepted. Follow the team's current status in this chat.");
   assert.equal(f.calls.at(-1).body.action, "resume");
   assert.equal(f.calls.at(-1).body.payload.chat_id, f.conversation.id);
 });

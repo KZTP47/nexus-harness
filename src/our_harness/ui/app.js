@@ -7431,8 +7431,8 @@ async function controlChatGoal(agentId) {
       }),
     });
     sayInRuntimeChat(runtimeKey, action === "pause"
-      ? "The team is paused. Send a message or press Resume team to continue."
-      : "The team is continuing from its saved work.");
+      ? "Pause was accepted. Follow the team's current status in this chat."
+      : "Resume was accepted. Follow the team's current status in this chat.");
     await refreshChatGoalAfterAction(agentId, result.goal, chatKey);
   } catch (error) {
     sayInRuntimeChat(runtimeKey, String(error.message || error));
