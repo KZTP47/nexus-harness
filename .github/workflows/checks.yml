@@ -301,6 +301,13 @@ jobs:
       - name: Exercise real multi-vendor dispatch and recovery in packaged Electron
         working-directory: desktop
         run: npm run e2e:multi-vendor
+      - name: Prove cold-start navigation with the bundled browser
+        working-directory: desktop
+        run: |
+          if (-not (Test-Path -LiteralPath 'build-output/win-unpacked/resources/runtime/NEXUS_RUNTIME.json')) {
+            throw 'The cold-start navigation proof requires the built browser runtime.'
+          }
+          node --test ui-navigation.test.js
       - name: Exercise two-agent chat, steering, restart, and runnable artifacts
         working-directory: desktop
         run: npm run smoke:team-chat
@@ -323,6 +330,8 @@ jobs:
           name: desktop-conversation-failure
           if-no-files-found: ignore
           path: |
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.png
+            ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.html
             ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*.png
             ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*-layout.json
             ${{ env.NEXUS_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/failure-goals.json

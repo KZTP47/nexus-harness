@@ -4919,9 +4919,12 @@ function bindEvents() {
   applyAgentRunPanelPreference();
   $("agentRunPanel").addEventListener("toggle", rememberAgentRunPanelPreference);
   document.querySelectorAll("[data-node-type]").forEach((button) => { button.addEventListener("click", () => addNode(button.dataset.nodeType, 360, 300, button)); button.addEventListener("dragstart", (event) => event.dataTransfer.setData("application/x-harness-node", button.dataset.nodeType)); });
-  document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener(
-    "click", () => switchView(button.dataset.view, {userInitiated: true}),
-  ));
+  document.querySelectorAll("[data-view]").forEach((button) => {
+    button.addEventListener("click", () => switchView(button.dataset.view, {userInitiated: true}));
+    // The page can be painted before this script arrives. Navigation becomes
+    // interactive only once its handler exists, before slower startup reads.
+    button.disabled = false;
+  });
   $("canvas").addEventListener("dragover", (event) => { if (event.dataTransfer.types.includes("application/x-harness-node")) event.preventDefault(); });
   $("canvas").addEventListener("drop", (event) => { event.preventDefault(); const type = event.dataTransfer.getData("application/x-harness-node"); const rect = $("canvas").getBoundingClientRect(); addNode(type, (event.clientX - rect.left - pan.x) / zoom, (event.clientY - rect.top - pan.y) / zoom); });
   $("canvas").addEventListener("pointerdown", (event) => { if (event.target !== $("canvas") && event.target !== $("viewport") && event.target !== $("nodeLayer")) return; panDrag = {startX: event.clientX, startY: event.clientY, x: pan.x, y: pan.y}; $("canvas").classList.add("panning"); clearSelection(); });

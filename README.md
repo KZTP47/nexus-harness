@@ -244,12 +244,12 @@ process-scoped `GH_TOKEN` or `GITHUB_TOKEN`. The helper never executes
 PATH-resolved `gh`, `git`, or credential helpers, and never writes or echoes the
 explicit token.
 
-For a browser download of a published `0.2.7`, open PowerShell in the download
+For a browser download of a published `0.2.8`, open PowerShell in the download
 folder and run:
 
 ```powershell
-$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.7-UNSIGNED.exe').Hash.ToLowerInvariant()
-$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.7-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath '.\Nexus-Harness-Setup-0.2.8-UNSIGNED.exe').Hash.ToLowerInvariant()
+$expected = ((Get-Content -Raw -LiteralPath '.\Nexus-Harness-Setup-0.2.8-UNSIGNED.exe.sha256') -split '\s+')[0].ToLowerInvariant()
 $actual -eq $expected
 ```
 

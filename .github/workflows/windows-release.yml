@@ -122,6 +122,13 @@ jobs:
       - name: Smoke-test the unpacked clean-machine app
         working-directory: desktop
         run: npm run smoke:built
+      - name: Prove cold-start navigation with the bundled browser
+        working-directory: desktop
+        run: |
+          if (-not (Test-Path -LiteralPath 'build-output/win-unpacked/resources/runtime/NEXUS_RUNTIME.json')) {
+            throw 'The cold-start navigation proof requires the built browser runtime.'
+          }
+          node --test ui-navigation.test.js
 
       - name: Exercise unpacked multi-vendor dispatch and recovery
         working-directory: desktop
@@ -475,6 +482,32 @@ jobs:
             desktop/build-output/Nexus-Harness-Setup-*.exe.sha256
             desktop/build-output/Nexus-Harness-Windows-Offline-*.zip
             desktop/build-output/release-metadata.json
+
+      - name: Locate failed release smoke evidence
+        if: failure()
+        shell: pwsh
+        run: |
+          $releaseSmokeTemp = node -p "require('node:os').tmpdir()"
+          if ($LASTEXITCODE -ne 0 -or -not [IO.Path]::IsPathRooted($releaseSmokeTemp)) {
+            throw 'Could not locate the release smoke temporary directory.'
+          }
+          "NEXUS_RELEASE_SMOKE_TMPDIR=$releaseSmokeTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Keep failed release conversation evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-conversation-failure-${{ github.ref_name }}
+          if-no-files-found: ignore
+          path: |
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.png
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.html
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*.png
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/*-layout.json
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-team-chat-*/scripted provider control/failure-goals.json
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus browser source acceptance - */failure-*.png
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus browser source acceptance - */failure-*.json
+            ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus browser source acceptance - */source-server.log
+          retention-days: 7
 
   publish-release:
     if: startsWith(github.ref, 'refs/tags/v')
