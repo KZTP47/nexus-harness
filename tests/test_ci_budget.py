@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import importlib.util
 import io
 import json
 import subprocess
+import sys
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from scripts import ci_budget as ci
+
+SPEC = importlib.util.spec_from_file_location(
+    "_nexus_ci_budget_test_helper", Path(__file__).resolve().parents[1] / "scripts" / "ci_budget.py"
+)
+assert SPEC and SPEC.loader
+ci = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = ci  # Dataclasses resolve annotations through their module.
+SPEC.loader.exec_module(ci)
 
 
 IDENTITY = ci.Identity("another-owner/portable-project", 1234, 2)
@@ -99,6 +109,44 @@ class WorkflowBudgetTests(unittest.TestCase):
         budget = self.setup_budget(snapshots=[[job()], [job(), job("Publish")]])
         self.assertTrue(budget.watch(["Build", "Publish"]))
         self.assertEqual(self.clock.sleeps, [ci.POLL_SECONDS])
+
+    def test_documented_unfinished_attempt_states_keep_watching_until_jobs_succeed(self):
+        for status in ("queued", "requested", "waiting", "pending", "in_progress"):
+            with self.subTest(status=status):
+                budget = self.setup_budget(6.7, [[job(status="queued", conclusion=None)], [job()]])
+                self.api.attempt_run["status"] = status
+                self.assertTrue(budget.watch(["Build"]))
+                self.assertEqual(self.clock.sleeps, [ci.POLL_SECONDS])
+                self.assertEqual(self.api.posts(), [])
+                self.assertTrue(any(f"status={status!r}" in message for message in self.messages))
+
+    def test_queued_attempt_preserves_original_deadline_with_pending_downstream_job(self):
+        budget = self.setup_budget(839, [[job(), job("Publish", "pending", None)]])
+        self.api.attempt_run["status"] = "queued"
+        self.assertFalse(budget.watch(["Build", "Publish"]))
+        self.assertEqual(self.clock.sleeps, [1, ci.FORCE_GRACE_SECONDS])
+        self.assertTrue(any("/jobs?" in path for _, path, _ in self.api.requests))
+        self.assertTrue(any("budget expired" in message for message in self.messages))
+
+    def test_watch_rejects_completed_and_unknown_attempt_states_with_decisive_diagnostics(self):
+        for status in ("completed", "unexpected", None, "", [], {}):
+            with self.subTest(status=status):
+                budget = self.setup_budget()
+                self.api.attempt_run["status"] = status
+                self.assertFalse(budget.watch(["Build"]))
+                self.assertFalse(any("/jobs?" in path for _, path, _ in self.api.requests))
+                self.assertTrue(any(f"status={status!r}" in message and "queued" in message
+                                    and "in_progress" in message for message in self.messages))
+
+    def test_watch_rejects_any_conclusion_even_with_an_unfinished_status(self):
+        for status in ("queued", "requested", "waiting", "pending", "in_progress"):
+            for conclusion in ("success", "cancelled", "failure", ""):
+                with self.subTest(status=status, conclusion=conclusion):
+                    budget = self.setup_budget()
+                    self.api.attempt_run.update(status=status, conclusion=conclusion)
+                    self.assertFalse(budget.watch(["Build"]))
+                    self.assertFalse(any("/jobs?" in path for _, path, _ in self.api.requests))
+                    self.assertTrue(any(f"conclusion={conclusion!r}" in message for message in self.messages))
 
     def test_clock_starts_at_workflow_attempt_start_not_watchdog_start(self):
         budget = self.setup_budget(839, [[job(status="in_progress", conclusion=None)]])
@@ -247,7 +295,9 @@ class WorkflowBudgetTests(unittest.TestCase):
 
     def test_publication_rejects_completed_cancelled_and_uninitialized_evidence(self):
         for changes in ({"status": "completed", "conclusion": "success"},
-                        {"status": "queued"}, {"conclusion": "cancelled"}):
+                        {"status": "queued"}, {"status": "requested"},
+                        {"status": "waiting"}, {"status": "pending"},
+                        {"status": "unknown"}, {"conclusion": "cancelled"}):
             with self.subTest(changes=changes):
                 budget = self.setup_budget()
                 self.api.attempt_run.update(changes)

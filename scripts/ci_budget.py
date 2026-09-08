@@ -30,6 +30,10 @@ POLL_SECONDS = 10
 API_SECONDS = 5
 FORCE_GRACE_SECONDS = 10
 MAX_JOB_PAGES = 10
+# GitHub's workflow-runs REST API documents these unfinished states. Attempt
+# metadata can still be queued while the first watchdog job is already running.
+# https://docs.github.com/en/rest/actions/workflow-runs
+WATCHABLE_STATUSES = ("in_progress", "queued", "requested", "waiting", "pending")
 
 
 class BudgetError(RuntimeError):
@@ -247,8 +251,13 @@ class WorkflowBudget:
             raise BudgetError("Require distinct, nonempty job names; skipped exceptions must name required jobs.")
         try:
             run = self.load()
-            if run.get("status") != "in_progress" or run.get("conclusion") is not None:
-                raise BudgetError("The workflow attempt is not active; this watchdog cannot certify it.")
+            status, conclusion = run.get("status"), run.get("conclusion")
+            state = f"status={status!r}, conclusion={conclusion!r}"
+            allowed = ", ".join(WATCHABLE_STATUSES)
+            if status not in WATCHABLE_STATUSES or conclusion is not None:
+                raise BudgetError(f"Cannot watch workflow attempt with {state}; "
+                                  f"allowed statuses: {allowed}, with conclusion=None.")
+            self.log(f"Watching workflow attempt with {state}; allowed unfinished statuses: {allowed}.")
             while True:
                 if self.remaining() <= 0:
                     raise BudgetError("The workflow execution budget expired.")
