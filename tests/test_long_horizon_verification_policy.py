@@ -140,7 +140,8 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
     def test_explicit_duplicate_verification_criterion_is_still_required(self):
         goal = self.finish_tasks(self.create(criteria=["Configured deterministic verification passes"]))
         result = self.verify(goal)
-        self.assertEqual(result["status"], "paused", result["note"])
+        self.assertEqual(result["status"], "queued", result["note"])
+        self.assertEqual(result["tasks"][-1]["kind"], "repair")
         self.assertEqual(result["verification"]["status"], "unavailable")
         self.assertIn("required", result["verification"]["reason"].lower())
 
@@ -178,7 +179,8 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
         resumed = self.runtime.store.control(legacy["goal_id"], "resume")
         self.assertNotIn("success_criteria_contract", resumed)
         result = self.verify(self.finish_tasks(resumed))
-        self.assertEqual(result["status"], "paused", result["note"])
+        self.assertEqual(result["status"], "queued", result["note"])
+        self.assertEqual(result["tasks"][-1]["kind"], "repair")
         self.assertEqual(result["verification"]["status"], "unavailable")
 
     def test_real_provider_turns_see_conditional_guidance_and_complete_existing_static_document(self):

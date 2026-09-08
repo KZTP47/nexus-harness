@@ -3837,6 +3837,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 goal = store.public(store.get(goal_id))
                 self.server.project_long_horizon_chat_statuses([goal])
                 self._json({"goal": goal})
+            elif parsed.path == "/api/long-horizon/access":
+                self._require_token()
+                from .goal_verification import goal_command_approval
+                goal_id = urllib.parse.parse_qs(parsed.query).get("goal_id", [""])[0]
+                runtime = self.server.long_horizon
+                document = runtime.store.get(goal_id)
+                runtime._require_goal_authority(document)
+                self._json(goal_command_approval(self.server.config, document, runtime_root=runtime.store.root))
             elif parsed.path == "/api/long-horizon/verification-approval":
                 self._require_token()
                 from .goal_verification import workspace_verification_approval
@@ -5011,6 +5019,21 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     )
                     self.server.decorate_swarm_authority(said)
                 self._json(said)
+            elif self.path == "/api/swarm/chats/reconnect":
+                from . import provider_reconnect
+
+                chat_id = str(body.get("chat") or "")
+                with self.server.project_admission_lock, self.server.swarm_lock:
+                    board = self.server.swarm_standing()["board"]
+                    with self.server.swarm_communication_runs.conversation_turn(
+                        f"chat-reconnect-{uuid.uuid4().hex}", chat_id, timeout=0.0,
+                    ):
+                        result = provider_reconnect.reconnect(
+                            self.server.config, board, str(body.get("agent") or ""),
+                            chat_id, self.server.long_horizon,
+                            confirmation=body.get("confirmation"),
+                        )
+                self._json(result)
             elif self.path in {
                 "/api/swarm/chats/create",
                 "/api/swarm/chats/activate",
@@ -5232,6 +5255,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json({
                     **receipt, "goal": goal, "engine": "long_horizon",
                 }, HTTPStatus.ACCEPTED)
+            elif self.path == "/api/long-horizon/access":
+                goal_id = str(body.get("goal_id") or "")
+                with self.server.project_admission_lock, self.server.swarm_lock:
+                    runtime = self.server.long_horizon
+                    held_goal = runtime.store.get(goal_id)
+                    self.server.require_long_horizon_chat_binding(held_goal, body)
+                    runtime._require_goal_authority(held_goal)
+                    runtime._require_agent_setup(held_goal)
+                    goal = runtime.store.update_access(goal_id,
+                        expected_revision=body.get("expected_revision"), mode=body.get("mode"),
+                        decision=body.get("decision"), command_digest=str(body.get("command_digest") or ""))
+                self._json({"goal": goal})
             elif self.path == "/api/long-horizon/verification-approval":
                 from .goal_verification import workspace_verification_approval
 
@@ -5268,6 +5303,14 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     runtime = self.server.long_horizon
                     if action == "resume":
                         resume_options = {}
+                        if "recovery" in payload:
+                            if not isinstance(payload["recovery"], dict) or type(payload.get("expected_revision")) is not int:
+                                raise HarnessError("Recovery requires the displayed choice and goal revision")
+                            resume_options["recovery"] = payload["recovery"]
+                        if "expected_revision" in payload:
+                            if type(payload["expected_revision"]) is not int:
+                                raise HarnessError("Resume requires the displayed goal revision")
+                            resume_options["expected_revision"] = payload["expected_revision"]
                         if "repair_context" in payload:
                             repair_context = payload.get("repair_context")
                             if not isinstance(repair_context, dict):

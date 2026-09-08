@@ -29,7 +29,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -174,7 +174,8 @@ def what_to_launch(root: Path = ROOT, is_there=None, can_it_open=None) -> Launch
     this_folder: bool | None = None
     # A local build is the source of truth while developing this project. The
     # installed app is a snapshot and can lag behind source changes, so the
-    # desktop icon must point at win-unpacked whenever it exists.
+    # desktop icon selects that build whenever it exists. Before writing the
+    # shortcut, freeze_built_launcher publishes it outside mutable build output.
     for where, what in (
         (_built_app(root), "the newest desktop app built in this folder"),
         (_installed_app(), "the desktop app, already installed on this machine"),
@@ -228,6 +229,20 @@ def what_to_launch(root: Path = ROOT, is_there=None, can_it_open=None) -> Launch
         icon=root / "desktop" / "nexus-harness.ico",
         passed_over=tuple(passed_over),
     )
+
+
+def freeze_built_launcher(launcher: Launcher, root: Path = ROOT) -> Launcher:
+    """Keep a running desktop independent of the next Electron rebuild."""
+    built = _built_app(root)
+    if built is None or launcher.program.resolve() != built.resolve():
+        return launcher
+    try:
+        from .desktop_launch import publish_build
+    except ImportError:
+        from desktop_launch import publish_build
+    executable = publish_build(root)
+    return replace(launcher, program=executable, working_folder=executable.parent,
+                   icon=executable, what_it_is="the newest desktop build in its protected launch folder")
 
 
 def _a_browser_that_can_do_windows():
@@ -783,6 +798,7 @@ def main(argv: list[str] | None = None) -> int:
     # answer to that was a Python traceback rather than the plain sentence every
     # other way of failing here is careful to give.
     try:
+        launcher = freeze_built_launcher(launcher)
         desktop = Path(said.desktop) if said.desktop else where_the_desktop_is()
         where = put_it_there(desktop, launcher)
     except (OSError, RuntimeError) as exc:

@@ -96,10 +96,10 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   hideWebChat: () => ipcRenderer.invoke("harness:webChatHide"),
   removeWebChat: (id) => ipcRenderer.invoke(
     "harness:webChatRemove", String(id || "")),
-  answerWebChat: (route, prompt, attachments, conversationKey, preferExisting) => ipcRenderer.invoke(
+  answerWebChat: (route, prompt, attachments, conversationKey, preferExisting, serviceDeadlineMs) => ipcRenderer.invoke(
     "harness:webChatAnswer", String(route || ""), String(prompt || ""),
     Array.isArray(attachments) ? attachments : [], String(conversationKey || ""),
-    Boolean(preferExisting)),
+    Boolean(preferExisting), Number(serviceDeadlineMs) || 0),
   stopWebChat: (route, conversationKey) => ipcRenderer.invoke(
     "harness:webChatStop", String(route || ""), String(conversationKey || "")),
   resetWebChat: (route, conversationKey) => ipcRenderer.invoke(

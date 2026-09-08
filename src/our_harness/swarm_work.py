@@ -819,9 +819,10 @@ class _ProgressGuard:
         self._checkpoint_last: dict[str, dict[str, str]] = {}
         self._checkpoint_seen_states: dict[str, dict[str, set[str]]] = {}
         self._attested_epochs: dict[str, int] = {}
+        self._observations_seen: dict[str, set[str]] = {}
 
     def _attest(
-        self, state: tuple[tuple[Any, ...], ...],
+        self, state: tuple[tuple[Any, ...], ...], observations: dict[str, set[str]] | None = None,
     ) -> tuple[tuple[Any, ...], ...]:
         """Project provider structure into monotonic engine-observed progress.
 
@@ -847,6 +848,11 @@ class _ProgressGuard:
             first = agent_id not in self._agents_seen
             self._agents_seen.add(agent_id)
             advanced = False
+            observed = (observations or {}).get(agent_id, set())
+            already_seen = self._observations_seen.setdefault(agent_id, set())
+            if observed - already_seen:
+                advanced = not first
+                already_seen.update(observed)
             previous_remaining = self._last_remaining.get(agent_id, frozenset())
             if not first and previous_remaining and remaining < previous_remaining:
                 advanced = True
@@ -884,8 +890,9 @@ class _ProgressGuard:
     def stalled(
         self,
         state: tuple[tuple[Any, ...], ...],
+        *, observations: dict[str, set[str]] | None = None,
     ) -> bool:
-        state = self._attest(state)
+        state = self._attest(state, observations)
         same_as_last = bool(self.recent) and _progress_states_match(self.recent[-1], state)
         self.identical_run = self.identical_run + 1 if same_as_last else 1
         self.recent.append(state)
@@ -2824,7 +2831,8 @@ def _safe_query_paths(root: Path, query: str) -> tuple[list[Path], str]:
         return [], str(exc)
 
 
-def _requested_files(root: Path, plans: list[tuple[dict[str, Any], dict[str, Any]]]) -> str:
+def _requested_files(root: Path, plans: list[tuple[dict[str, Any], dict[str, Any]]],
+                     *, observations: set[str] | None = None) -> str:
     wanted: list[str] = []
     for _agent_row, plan in plans:
         raw = plan.get("needs_files", [])
@@ -2838,6 +2846,8 @@ def _requested_files(root: Path, plans: list[tuple[dict[str, Any], dict[str, Any
         paths, diagnostic = _safe_query_paths(root, relative)
         if diagnostic.startswith("DIR "):
             blocks.append(diagnostic)
+            if observations is not None:
+                observations.add(hashlib.sha256(diagnostic.encode("utf-8")).hexdigest())
         elif diagnostic:
             diagnostics.append(f"{relative}: {diagnostic}")
         for path in paths:
@@ -2863,6 +2873,10 @@ def _requested_files(root: Path, plans: list[tuple[dict[str, Any], dict[str, Any
                 continue
             actual_relative = path.relative_to(root).as_posix()
             blocks.append(f"FILE {actual_relative}\n{content}")
+            if observations is not None:
+                observations.add(hashlib.sha256(
+                    (actual_relative + "\0" + content).encode("utf-8")
+                ).hexdigest())
             used += len(content)
     if len(queries) > 60:
         diagnostics.append(f"{len(queries) - 60} retrieval request(s) omitted after the explicit 60-query limit")
@@ -4598,7 +4612,12 @@ def _contained_snapshot_command_with_engine(
 ) -> dict[str, Any]:
     """Run only commands with a supported fail-closed containment profile."""
 
-    argv = list(command)
+    from .verification_scripts import resolve_package_command
+    try:
+        argv = resolve_package_command(snapshot, list(command))
+    except HarnessError as error:
+        return {"argv": command, "cwd": ".", "exit_code": -2, "stdout": "", "stderr": str(error),
+                "timed_out": False, "output_truncated": False, "containment_unavailable": True}
     name = Path(argv[0]).name.casefold() if argv else ""
     for executable_suffix in (".exe", ".cmd", ".bat"):
         name = name.removesuffix(executable_suffix)
@@ -4649,7 +4668,7 @@ def _contained_snapshot_command_with_engine(
                     "the bundled Playwright runtime belongs to selected-project data"
                 )
             payload = _run_brokered_playwright_specs(
-                snapshot, command,
+                snapshot, argv,
                 timeout=float(timeout or config.get("execution.timeout_seconds")),
                 runtime=brokered_runtime,
             )
@@ -7786,6 +7805,11 @@ def _acceptance_target_decision(
     if not _behavior_acceptance_clauses(goal) or re.search(r"https?://", goal, re.I):
         return {"status": "not_required", "candidates": []}
     candidates = _baseline_behavior_candidates(root, goal, goal_spec)
+    if not candidates:
+        # There is no existing callable for the user to choose. Let the team
+        # inspect/design the deliverable first; downstream acceptance checks
+        # still require actual evidence and cannot treat this as ratification.
+        return {"status": "discovery_required", "candidates": []}
     combined = f"{goal}\n{user_answer}".casefold()
     selected = [
         one for one in candidates
@@ -9049,7 +9073,13 @@ def _run_selected_project_verification(
             "runnable_tests": static, "preflight": preflight,
             "reason": "No deterministic test command is configured or discoverable for the selected project.",
         }
-    if source == "discovered":
+    from .goal_access import command_gate
+    access = command_gate(project, commands, _command_approval_digest(
+        root, commands, declared_path=str(project.get("path") or ""), authority_root=authority_root,
+    ), source) if project.get("_nexus_command_access") else None
+    if isinstance(access, dict):
+        return access
+    if source == "discovered" and access is not True:
         try:
             approval_digest = _command_approval_digest(
                 root,
@@ -10598,6 +10628,7 @@ def work_together(
         everyone_ready = True
         cycle_remaining: list[str] = []
         cycle_state: list[tuple[Any, ...]] = []
+        cycle_observations: dict[str, set[str]] = {}
         ledger.record_state("prompt_context_checkpoint", {
             "stage": "plan_review", "round": round_number,
             **_prompt_summary_state(contributions),
@@ -10609,6 +10640,9 @@ def work_together(
         for one in participants:
             try:
                 failed = False
+                observed: set[str] = set()
+                requested_context = _requested_files(root, list(latest.values()), observations=observed)
+                cycle_observations[str(one.get("id") or "")] = observed
                 answer = chat_lab.ask_once(
                     config, str(one.get("who") or ""),
                     _continuation_turn(
@@ -10618,7 +10652,7 @@ def work_together(
                     context=(
                         context_for(one) + "\n\n" + common
                         + "\n\nON-DEMAND REQUESTED PROJECT CONTENT\n"
-                        + _requested_files(root, list(latest.values()))
+                        + requested_context
                         + "\n\nACTUAL PLAN CONVERSATION SO FAR\n"
                         + _prompt_conversation(contributions)
                         + "\n\nReview the team plan and respond to the other agents. Improve your own contribution, "
@@ -10693,7 +10727,7 @@ def work_together(
         if everyone_ready:
             plan_stopped_because = "complete"
             break
-        if plan_progress_guard.stalled(tuple(cycle_state)):
+        if plan_progress_guard.stalled(tuple(cycle_state), observations=cycle_observations):
             plan_remaining.append(
                 "Nexus stopped a repeated planning cycle because readiness, remaining work, requested files, and provider-failure state did not advance."
             )

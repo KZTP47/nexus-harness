@@ -14,7 +14,7 @@ import unicodedata
 from typing import Any
 
 from . import user_questions
-from .models import HarnessError
+from .models import ContextRequestError, HarnessError
 
 SCHEMA_VERSION = 1
 CONTRACT = "recipient-scoped-decisions-evidence-and-continuations/v2"
@@ -225,18 +225,18 @@ def page(document: dict[str, Any], agent_id: str, *, after: int = 0, limit: int 
          decision_id: str = "", offset: int = 0, character_limit: int = 12000) -> dict[str, Any]:
     values = resolved(document, agent_id)
     if after < 0 or offset < 0 or limit < 1 or character_limit < 1:
-        raise HarnessError("Decision offsets and limits are invalid")
+        raise ContextRequestError("Decision offsets and limits are invalid")
     if decision_id:
         values = [one for one in values if one["decision_id"] == decision_id]
         if not values:
-            raise HarnessError("That decision is not available to this participant")
+            raise ContextRequestError("That decision is not available to this participant")
     elif offset:
-        raise HarnessError("A decision offset requires an exact decision ID")
+        raise ContextRequestError("A decision offset requires an exact decision ID")
     entries, used = [], 0
     for value in values[after:after + min(limit, 20)]:
         raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         if offset > len(raw):
-            raise HarnessError("The decision offset exceeds its exact text")
+            raise ContextRequestError("The decision offset exceeds its exact text")
         if entries and used + len(raw) > character_limit:
             break
         text = raw[offset:offset + min(character_limit, 24000) - used]

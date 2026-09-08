@@ -57,8 +57,14 @@ test("actual chat activity and decision controls fit wide and narrow windows and
       function theChatCardFor() { return $('compactFixture'); }
       function setWhatCanBePressedInSwarm() {}
       async function openChatGoalDetails() {}
+      ${section("function appendGoalAccessControls", "function fillChatGoalPanel")}
+      function chatGoalBinding() { return {}; }
       window.submissions = [];
-      async function request(url, options) { window.submissions.push({url,body:JSON.parse(options.body)}); return {goal:longGoals[0]}; }
+      async function request(url, options) {
+        if (!options) return {goal_id:longGoals[0].goal_id,revision:longGoals[0].revision,project_path:'Portable project',
+          commands:[['npm','run','test']],resolved_commands:[['node','--test','tests/game.test.cjs']],approval_digest:'a'.repeat(64)};
+        window.submissions.push({url,body:JSON.parse(options.body)}); return {goal:longGoals[0]};
+      }
       async function refreshChatGoalAfterAction() {}
       window.setGoal = (changes) => { Object.assign(longGoals[0],changes); fillChatGoalPanel($('theBigChatTeamGoal'),'builder',chatLongGoalContext('builder')); renderSwarmChatActivity('builder'); };
       window.renderFeedback = () => { fillChatGoalPanel($('theBigChatTeamGoal'),'builder',chatLongGoalContext('builder')); renderSwarmChatActivity('builder'); };
@@ -94,7 +100,7 @@ test("actual chat activity and decision controls fit wide and narrow windows and
       assert.deepEqual(activity,{visible:true,belowTranscript:true,overflow:false,documentOverflow:false});
       await page.screenshot({path:path.join(output,`${viewport.width}-active.png`)});
       await page.evaluate(() => setGoal({status:'waiting_for_user',pending_interrupts:[{id:'decision-a',reason:'Choose how to continue',questions:[{
-        id:'approach',prompt:'Which approach should the team use for this project?',allow_other:true,options:[
+        id:'approach',prompt:'Which approach should the team use for this project?',allow_other:false,options:[
           {label:'Continue with the current team',description:'Keep both agents and let them finish their shared work.',recommended:true},
           {label:'Review the saved work first',description:'Inspect the existing result before continuing. '+ 'portable-evidence-'.repeat(8)}]}]}]}));
       assert.equal(await page.locator("#theBigChatActivity .chat-activity-stage").textContent(), "Waiting for your answer");
@@ -120,6 +126,10 @@ test("actual chat activity and decision controls fit wide and narrow windows and
       });
       assert.equal(answersVisible,true);
       await page.screenshot({path:path.join(output,`${viewport.width}-decision-answers.png`)});
+      await page.getByLabel('Your own answer',{exact:true}).fill('Use a different approach for this project.');
+      await page.evaluate(()=>renderFeedback());
+      assert.equal(await page.getByLabel('Your own answer',{exact:true}).inputValue(),
+        'Use a different approach for this project.');
       geometry.push({viewport,activity,options});
       await page.evaluate(()=>setGoal({status:'running',pending_interrupts:[]}));
     }
@@ -154,6 +164,17 @@ test("actual chat activity and decision controls fit wide and narrow windows and
     await page.screenshot({path:path.join(output,'390-expanded-pause.png')});
     await page.evaluate(()=>setGoal({note:'Paused by you.'}));
     assert.equal(await page.locator('#theBigChatActivity .chat-activity-explanation').isVisible(),false);
+    for (const width of [1264,390]) {
+      await page.setViewportSize({width,height:850});
+      await page.evaluate(()=>setGoal({status:'paused',pending_interrupts:[],command_request:{state:'pending'},scheduler_live:false,agent_access:{mode:'ask'}}));
+      await page.getByRole('button',{name:'Run once',exact:true}).waitFor();
+      const visible=await page.getByRole('button',{name:'Run once',exact:true}).evaluate(button=>{
+        const b=button.getBoundingClientRect(),p=document.getElementById('theBigChatTeamGoal').getBoundingClientRect();
+        return b.top>=p.top&&b.bottom<=p.bottom;
+      });
+      assert.equal(visible,true,'Command choice is visible in the full chat without opening advanced details');
+      await page.screenshot({path:path.join(output,width+'-command-permission.png')});
+    }
     await page.evaluate(()=>setGoal({status:'complete',pending_interrupts:[]}));
     assert.equal(await page.locator('#theBigChatActivity').evaluate(one=>one.hidden),true);
     fs.writeFileSync(path.join(output,'geometry.json'),JSON.stringify(geometry,null,2));

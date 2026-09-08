@@ -2412,6 +2412,8 @@ class Element {{
   replaceChildren() {{ this.children = []; this.textContent = ""; }}
 }}
 const activityList = new Element();
+const attentionRefreshes = [];
+function refreshConversationAttention(agentId) {{ attentionRefreshes.push(agentId); }}
 function $(id) {{ return id === "theBigChatDoing" ? activityList : null; }}
 function make(_tag, _className = "", text = "") {{ return new Element(String(text || "")); }}
 function visibleText(element) {{
@@ -2449,6 +2451,7 @@ let longGoals = [{{
 {surface}
 const agent = {{id: "agent-a", ready: true, trouble_last_time: "", how_to_fix_it: ""}};
 renderWhatItHasGoingOn(agent);
+if (attentionRefreshes[0] !== "agent-a") throw new Error("selected agent attention was not refreshed");
 let words = visibleText(activityList);
 for (const expected of [
   "Long-horizon · Portable project",

@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import cancellation
+from . import cancellation, relay_timing
 from .models import HarnessError, ProviderOutcomeUnknown, ProviderRequest, ProviderResponse
 from .redaction import CredentialRedactor, bounded_redacted_text
 
@@ -99,6 +99,11 @@ class WebRequest:
             "attachments": list(self.attachments),
             "conversation_key": self.conversation_key,
             "prefer_existing_conversation": self.prefer_existing_conversation,
+            # Use a wall-clock deadline only across the local IPC boundary;
+            # Python continues enforcing its monotonic service budget.
+            "service_deadline_ms": int((time.time() + max(
+                0.0, self.completion_deadline - time.monotonic(),
+            )) * 1000) if self.completion_deadline else 0,
         }
 
 
@@ -373,7 +378,13 @@ class WebChatBroker:
         return ProviderResponse(
             text=wanted.answer,
             finish_reason="stop",
-            raw={"web_chat": route, "milliseconds": wanted.milliseconds},
+            raw={
+                "web_chat": route, "milliseconds": wanted.milliseconds,
+                "relay_timing": relay_timing.frozen({
+                    **wanted.diagnostics,
+                    "queue_ms": max(0, int((wanted.claimed_at - wanted.queued_at) * 1000)),
+                }),
+            },
         )
 
     def pending(self) -> list[dict[str, Any]]:

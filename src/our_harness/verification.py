@@ -85,7 +85,7 @@ def _text_proof(command: list[str], output: str) -> dict[str, Any] | None:
     lower = output.lower()
     joined = " ".join(str(one).replace("\\", "/").lower() for one in command)
 
-    if words and words[0] in {"node", "nodejs"}:
+    if words and words[0] in {"node", "nodejs", "npm", "pnpm", "yarn"}:
         # Native node:test emits this summary for --test and direct test files.
         # Exit status/truncation are checked separately by analyze_verification.
         summary = {}

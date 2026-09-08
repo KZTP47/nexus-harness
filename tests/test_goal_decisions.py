@@ -113,6 +113,34 @@ class GoalDecisionTests(unittest.TestCase):
         self.assertTrue(self.runtime.store.resolve_interrupts(goal["goal_id"], envelope))
         return self.runtime.store.get(goal["goal_id"]), envelope
 
+    def test_saved_closed_question_accepts_custom_answer_and_preserves_it_after_restart(self):
+        q = {**question(), "allow_other": False}
+        goal = self.create("custom-destination", isolated_workspace=True)
+        task, ids, held = self.ask(goal, q)
+        restarted = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(restarted.close)
+        exact = "  Use a different project folder.\nKeep the existing files.  "
+        envelope = {"expected_revision": held["revision"], "pending_ids": ids,
+                    "answers": {ids[0]: answer(q, exact, "team")}}
+        self.assertTrue(restarted.store.resolve_interrupts(goal["goal_id"], envelope))
+        saved = long_horizon.GoalStore(self.config).get(goal["goal_id"])
+        record = saved["interrupts"][0]["answer_record"]
+        self.assertEqual(record["answers"][0]["text"], exact)
+        self.assertFalse(record["questions"][0]["allow_other"])
+        self.assertEqual(record["answers"][0]["selected_options"], [])
+        self.assertIn(exact.strip(), restarted._agent_context(saved, task))
+
+    def test_custom_answer_does_not_override_engine_risk_choices(self):
+        q = {**question(), "allow_other": False}
+        goal = self.create("risk-choices", isolated_workspace=True)
+        _, ids, _ = self.ask(goal, q)
+        self.runtime.store._mutate(goal["goal_id"],
+            lambda document, db: document["interrupts"][0].update(purpose="risk_review"))
+        held = self.runtime.store.get(goal["goal_id"])
+        with self.assertRaisesRegex(HarnessError, "custom"):
+            self.submit(held, ids, answer(q, "Do something else"))
+        self.assertEqual(self.runtime.store.get(goal["goal_id"])["interrupts"][0]["state"], "pending")
+
     def test_private_and_explicit_team_answers_keep_their_recipient_scope(self):
         for audience in ("requesting_agent", "team"):
             with self.subTest(audience=audience):

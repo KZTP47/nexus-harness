@@ -566,7 +566,8 @@ for (const view of ["compact", "maximized"]) {
 
   test(`${view}: one actual question receives the answer with its revision and pending identity`, async () => {
     const f = fixture(view);
-    f.goal.pending_interrupts = [{id: "decision-portable", questions: [{id: "controls", prompt: "Keyboard or mouse?"}]}];
+    f.goal.pending_interrupts = [{id: "decision-portable", questions: [{id: "controls", prompt: "Keyboard or mouse?",
+      allow_other: false, options: [{label: "Keyboard"}, {label: "Mouse"}]}]}];
     await f.send();
     const post = f.calls.find((one) => one.body);
     assert.equal(post.url, "/api/long-horizon/answer");

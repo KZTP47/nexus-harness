@@ -2049,6 +2049,17 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   background: rgba(0,0,0,.16); border-radius: 6px;
 }
 .chat-tool-time, .chat-tool-attribution { font-size: .72rem; color: var(--muted); }
+.talk-turn.chat-progress-row, .the-big-chat-turn.chat-progress-row {
+  display: block; width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box;
+  padding: 8px 12px; margin-block: 3px; border: 0; border-left: 2px solid var(--cyan);
+  border-radius: 3px; background: rgba(90, 200, 220, .045); color: var(--ink);
+}
+.chat-progress-heading { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; }
+.chat-progress-speaker { font-size: .82rem; color: var(--cyan); }
+.chat-progress-time { font-size: .78rem; color: var(--muted); }
+.chat-progress-text, .chat-tool-summary { margin: 3px 0 0; font-size: .875rem; line-height: 1.5; overflow-wrap: anywhere; }
+.chat-progress-row[data-outcome="failed"] { border-left-color: var(--red); }
+.chat-progress-row[data-outcome="approval_required"], .chat-progress-row[data-outcome="unavailable"] { border-left-color: var(--amber, #edc265); }
 .chat-activity-explanation { min-width: 0; font-size: .78rem; }
 .chat-activity-explanation > summary { cursor: pointer; color: var(--muted); }
 .chat-activity-explanation > p { margin: 6px 0; max-height: 10rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -2496,3 +2507,14 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
    needed. Keep the decision area's height for the actual questions. */
 .the-big-chat-transcript > .chat-team-goal:has(.chat-goal-question-set) > p { display: none; }
 .chat-goal-question-set { min-width: 0; max-width: 100%; margin-top: 12px; overflow-wrap: anywhere; }
+.chat-goal-access { grid-column: 1 / -1; width: 100%; min-width: 0; }
+.chat-goal-recovery { grid-column: 1 / -1; width: 100%; min-width: 0; box-sizing: border-box; }
+.chat-goal-recovery label { display: block; white-space: normal; }
+.chat-goal-recovery input[type="checkbox"] { width: auto; min-width: 0; margin-right: 8px; }
+.chat-goal-recovery button { max-width: 100%; white-space: normal; }
+.chat-goal-access label { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.chat-access-mode { width: auto; max-width: 100%; }
+.chat-command-request { border: 1px solid var(--yellow, #e8bd52); padding: 12px; border-radius: 8px; margin-top: 10px; }
+.chat-command-request pre { white-space: pre-wrap; overflow-wrap: anywhere; min-height: 0; height: auto; max-height: 10rem; overflow: auto; }
+.chat-command-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.chat-command-actions button { white-space: normal; }

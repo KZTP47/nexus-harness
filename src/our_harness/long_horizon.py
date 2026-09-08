@@ -35,7 +35,7 @@ from . import chat as chat_lab
 from . import user_questions
 from .changes import FileTransaction
 from .config import LoadedConfig
-from .models import HarnessError, ProviderOutcomeUnknown, ProviderWorkspaceContext, ResponseFormat
+from .models import ContextRequestError, HarnessError, ProviderOutcomeUnknown, ProviderWorkspaceContext, ResponseFormat
 from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_authority, project_identity
 from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
 from .redaction import CredentialRedactor
@@ -52,6 +52,8 @@ from . import goal_context_progress
 from . import action_protocol
 from . import goal_budget_policy
 from . import goal_workspaces
+from . import goal_access
+from . import goal_recovery
 
 
 SCHEMA_VERSION = 2
@@ -123,7 +125,7 @@ class RequiredParticipantCallReserved(HarnessError):
     """A continuation tried to consume a call promised to an untouched teammate."""
 
 
-class ReviewContextRequestError(HarnessError):
+class ReviewContextRequestError(ContextRequestError):
     """A correctable proposed-content read with no executed side effect."""
 
 
@@ -758,6 +760,7 @@ def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None =
     return {
         "schema_version": 4, "objective_epoch": int(document.get("objective_epoch") or 1),
         "decision_contract": goal_decisions.CONTRACT,
+        "agent_access_sha256": goal_access.context_fingerprint(document),
         "decisions_sha256": goal_decisions.state_fingerprint(document),
         "task_recipients_sha256": goal_decisions.fingerprint({
             task["id"]: task.get("assigned_agent_id") for task in document.get("tasks", [])
@@ -1162,7 +1165,7 @@ def _validate_action_semantics(action: dict[str, Any], task: dict[str, Any]) -> 
         raise action_protocol.ActionProtocolError("duplicate_tool_call_ids")
 
 
-class GoalStore:
+class GoalStore(goal_access.AccessStoreMixin):
     """Authenticated snapshots plus a strictly ordered typed event journal."""
 
     def __init__(
@@ -2878,6 +2881,9 @@ class GoalStore:
         require_all_participants: bool | None = None,
     ) -> None:
         """Run every non-persistent admission check used by goal creation."""
+        access_mode = (policy or {}).get("agent_access_mode", "ask")
+        if not isinstance(access_mode, str) or access_mode not in goal_access.MODES:
+            raise HarnessError("Choose a supported agent access mode")
         _exact_request_id(request_id)
         project = next((
             one for one in board.get("projects", []) if isinstance(one, dict)
@@ -3291,6 +3297,7 @@ class GoalStore:
             "max_context_tool_calls": call_budget["max_context_tool_calls"],
             "review_risk": _short((policy or {}).get("review_risk") or "high", 20),
             "legacy_available": True,
+            "agent_access_mode": (policy or {}).get("agent_access_mode", "ask"),
         }
         execution_contract = _exclusive_project_contract(root, target_authority_id)
         collaboration_contract = _collaboration_contract(require_all)
@@ -3380,6 +3387,8 @@ class GoalStore:
             document["execution_contract"] = self._execution_contract_for(document)
             document["workspace_publication"] = {"state": "pending"}
             document["note"] = "Working in this chat's independent project copy."
+        document["agent_access"] = {"schema_version": 1, "binding": goal_access.binding(document),
+            "mode": runtime_policy["agent_access_mode"], "grants": {}}
         with self.lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -4030,6 +4039,7 @@ class GoalStore:
         if document is None:
             return {}
         value = copy.deepcopy(document)
+        value["agent_access"] = goal_access.state(document)
         if value.get("request_tombstone") is True:
             value["request_id"] = value.get(
                 "client_request_id", value.get("request_id", "")
@@ -4090,7 +4100,76 @@ class GoalStore:
         collaboration = self.collaboration_setup_status(value)
         value["collaboration_contract_changed"] = collaboration["changed"]
         value["collaboration_contract_status"] = collaboration
+        value["resume_recovery"] = self.resume_recovery(document)
         return value
+
+    def reconnect_provider_setup(self, reviewed: dict[str, Any], fingerprint: str) -> dict[str, Any]:
+        from . import provider_reconnect
+
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if document["revision"] != reviewed["revision"] or [
+                one["route_binding"] for one in document["agents"]
+            ] != reviewed["before"]:
+                raise HarnessError("The saved goal changed. Review reconnection again.")
+            current = provider_reconnect.goal_routes(self, document)
+            if current != reviewed["after"]:
+                raise HarnessError("The provider changed. Review reconnection again.")
+            saved_access = goal_access.state(document)
+            for agent, binding in zip(document["agents"], current):
+                agent["route_binding"] = binding
+            # This exact reviewed compatible reconnect changes transport
+            # identity, not the user's access decision. Rebind the already
+            # validated access; a stale prior record stays read-only/no-grants.
+            saved_access["binding"] = goal_access.binding(document)
+            document["agent_access"] = saved_access
+            # Keep task/effect state, evidence, budget, approvals and admission
+            # provenance intact. Resume remains a separate execution decision.
+            document["status"] = "paused"
+            document["note"] = "Provider reconnected after review. Resume this goal when ready."
+            self._event(db, document, "provider_setup_reconnected", payload={
+                "contract": provider_reconnect.CONTRACT, "fingerprint": fingerprint,
+                "before": reviewed["before"], "after": current,
+                "saved_work_preserved": True, "budgets_preserved": True,
+            })
+
+        document, _ = self._mutate(reviewed["goal_id"], change)
+        return self.public(document)
+
+    def resume_recovery(self, document: dict[str, Any]) -> dict[str, Any]:
+        tasks = [one for one in document.get("tasks", [])
+                 if one.get("state") in {"blocked", "failed"} and _task_has_unsettled_effect(one)]
+        settled = document.get("status") in {"paused", "failed"} \
+            and not self._scheduler_live(document) \
+            and not any(one.get("state") == "running" for one in document.get("tasks", []))
+        return goal_recovery.plan(document, tasks, settled=settled,
+            setup_changed=bool(tasks) and not self._protocol_runtime_bound(document))
+
+    def _resume_interrupted_turns(self, document: dict[str, Any], db: sqlite3.Connection,
+                                  choice: object = None) -> None:
+        recovery = self.resume_recovery(document)
+        if choice is not None:
+            if not isinstance(choice, dict) or choice.get("schema_version") != 1 \
+                    or choice.get("decision") != "retry_provider" \
+                    or not hmac.compare_digest(str(choice.get("fingerprint") or ""), recovery["fingerprint"]):
+                raise HarnessError("The interrupted call changed. Refresh this chat before choosing recovery.")
+            if not recovery["can_retry"]:
+                raise HarnessError("This recovery cannot discard saved file work or a live agent call. Inspect the goal details.")
+        if not recovery["items"] or not (recovery["resume_safe"] or choice is not None):
+            return
+        for item in recovery["items"]:
+            task = next(one for one in document["tasks"] if one["id"] == item["task_id"])
+            task.setdefault("superseded_provider_effect_ids", []).append(item["effect_id"])
+            task["superseded_provider_effect_ids"] = task["superseded_provider_effect_ids"][-100:]
+            task.update({"state": "ready", "outcome_unknown": False, "reconciliation_required": False,
+                         "last_error": "", "lease_id": "", "owner_pid": 0, "owner_token": "",
+                         "provider_effect_state": "superseded_for_resume"})
+            self._event(db, document, "interrupted_turn_superseded", task_id=task["id"],
+                        agent_id=task["assigned_agent_id"], payload={
+                            "contract": goal_recovery.CONTRACT, "fingerprint": recovery["fingerprint"],
+                            "effect_id": item["effect_id"], "kind": item["kind"],
+                            "decision": "explicit_retry" if choice is not None else "resume_read_only_reply",
+                            "saved_work_preserved": True, "budgets_preserved": True,
+                        })
 
     def clone_to_project(
         self, source: dict[str, Any], project_id: str, project_name: str,
@@ -4964,9 +5043,12 @@ class GoalStore:
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current.get("lease_id") != task.get("lease_id") or current["state"] != "running":
                 raise HarnessError("The context-tool result belongs to a stale task lease")
+            if call.get("name") == "run_selected_verification" and not error:
+                goal_access.record_block(document, result, current["assigned_agent_id"])
             payload = {
                 "call_id": call.get("call_id"), "name": call.get("name"),
                 "result": _durable_evidence(result), "error": _short(error, 4_000),
+                "at_ms": _now(),
             }
             payload["semantic_result_sha256"] = hashlib.sha256(_canonical({
                 "name": payload["name"], "result": _semantic_tool_result(
@@ -5290,6 +5372,33 @@ class GoalStore:
                         payload={"error": current["last_error"], "retry_requires_user": uncertain})
         self._mutate(goal_id, change)
 
+    def reject_unapplied_proposal(self, goal_id: str, task: dict[str, Any], reason: str) -> None:
+        """Return a known permission denial to its author without changing files."""
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            current = next(one for one in document["tasks"] if one["id"] == task["id"])
+            if current.get("lease_id") != task.get("lease_id") or current["state"] not in {"running", "pending_apply"} \
+                    or current.get("pending_transaction") or current.get("outcome_unknown") \
+                    or not current.get("pending_action"):
+                raise HarnessError("Only an exact unapplied proposal can be returned for correction")
+            if goal_access.state(document)["mode"] != "read_only":
+                raise HarnessError("The saved access decision changed before proposal rejection")
+            binding = hashlib.sha256(_canonical({"contract": "denied-proposal-correction/v1",
+                "task_id": current["id"], "context": _context_binding(document)}).encode()).hexdigest()
+            previous = current.get("proposal_corrections") or {}
+            attempts = int(previous.get("attempts") or 0) + 1 if previous.get("binding") == binding else 1
+            current["proposal_corrections"] = {"schema_version": 1, "binding": binding, "attempts": attempts}
+            current["evidence"].append("Nexus rejected the unapplied proposal: " + reason)
+            current.update({"state": "blocked" if attempts >= MAX_NO_PROGRESS else "ready",
+                "pending_action": {}, "lease_id": "", "owner_pid": 0, "owner_token": "",
+                "provider_effect_state": "proposal_rejected", "reconciliation_required": False,
+                "last_error": reason})
+            if document["status"] in {"running", "queued"}:
+                document["status"] = "queued"
+                document["note"] = "The proposal was not applied. The team can continue within its saved access."
+            self._event(db, document, "proposal_rejected", task_id=current["id"],
+                agent_id=current["assigned_agent_id"], payload={"reason": reason, "attempts": attempts, "applied": False})
+        self._mutate(goal_id, change)
+
     def defer_pending_action(self, goal_id: str, task: dict[str, Any]) -> None:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
@@ -5360,6 +5469,8 @@ class GoalStore:
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if document.get("status") == "cancelling":
                 raise HarnessError("The goal is draining cancellation before file preparation")
+            if changes and goal_access.state(document)["mode"] == "read_only":
+                raise HarnessError("Read only access does not allow project file changes")
             if current.get("lease_id") != task.get("lease_id") or current["state"] not in {"running", "pending_apply"}:
                 raise HarnessError("The task lease changed before its file transaction was prepared")
             current["pending_transaction"] = {
@@ -5562,6 +5673,7 @@ class GoalStore:
             # episode. Claims, scopes and restarts deliberately do not.
             if not action.get("tool_calls"):
                 current.pop("context_progress", None)
+                current.pop("proposal_corrections", None)
             current["pending_action"] = {}
             current["summary"] = _short(action.get("summary"), 8_000)
             evidence = [_short(one, 1_000) for one in action.get("evidence", []) if _short(one, 1_000)]
@@ -5788,12 +5900,55 @@ class GoalStore:
                     if parent and parent["state"] == "waiting_review":
                         parent["state"] = "blocked"
                         parent["last_error"] = "Independent review did not accept the work: " + current["last_error"]
+                        if action.get("review_verdict") == "changes_requested" and not (
+                            parent.get("pending_transaction") or parent.get("outcome_unknown")
+                        ):
+                            # A reviewer requesting corrections has supplied work
+                            # for the author. Discard the unapplied proposal and
+                            # require a fresh review of its replacement.
+                            proposed = parent.get("pending_action") or {}
+                            repair_context = _context_binding(document)
+                            repair_context.pop("task_recipients_sha256", None)
+                            repair_binding = hashlib.sha256(_canonical({
+                                "contract": "review-corrections/v1", "goal_id": goal_id,
+                                "task_id": parent["id"], "author": parent["assigned_agent_id"],
+                                "context": repair_context,
+                            }).encode("utf-8")).hexdigest()
+                            candidate = hashlib.sha256(_canonical({
+                                "action": proposed.get("action"), "changes": proposed.get("changes", []),
+                            }).encode("utf-8")).hexdigest()
+                            previous = parent.get("review_corrections") or {}
+                            repeats = int(previous.get("repeats") or 0) + 1 if (
+                                previous.get("schema_version") == 1
+                                and previous.get("binding") == repair_binding
+                                and previous.get("candidate") == candidate
+                            ) else 0
+                            parent["review_corrections"] = {
+                                "schema_version": 1, "binding": repair_binding,
+                                "candidate": candidate, "repeats": repeats,
+                            }
+                            parent["evidence"].append(
+                                "Independent review requests corrections (" + packet_ref + "): "
+                                + _short(_canonical(action["review_findings"]), 8_000)
+                            )
+                            parent.pop("review_approved_effect_id", None)
+                            if repeats < MAX_NO_PROGRESS:
+                                parent["state"] = "ready"
+                                # Superseded review is retained, not an approval
+                                # or a dependency that blocks the replacement.
+                                current["state"] = "cancelled"
+                                self._event(db, document, "review_corrections_requested", task_id=parent["id"],
+                                            agent_id=parent["assigned_agent_id"], payload={
+                                                "review_id": current["id"], "findings": action["review_findings"],
+                                                "proposal_applied": False, "repeats": repeats,
+                                            })
                         parent.update({
                             "pending_action": {}, "pending_transaction": {}, "lease_id": "",
                             "owner_pid": 0, "owner_token": "",
                         })
-                self._event(db, document, "task_blocked", task_id=current["id"],
-                            agent_id=current["assigned_agent_id"], payload={"reason": current["last_error"]})
+                if current["state"] == "blocked":
+                    self._event(db, document, "task_blocked", task_id=current["id"],
+                                agent_id=current["assigned_agent_id"], payload={"reason": current["last_error"]})
             elif kind == "complete" or (
                 kind == "request_review"
                 and current.get("provider_effect_id")
@@ -5994,7 +6149,13 @@ class GoalStore:
                 answer = supplied.get(item["id"])
                 if answer is None:
                     raise HarnessError("Answer every pending question for this exact goal")
-                record = user_questions.answer_record(item.get("questions"), self.redactor.value(answer))
+                # Agent suggestions must not prevent the user correcting the
+                # premise of an ordinary question, including already saved cards.
+                # Engine-owned risk approvals still require their exact choices.
+                record = user_questions.answer_record(
+                    item.get("questions"), self.redactor.value(answer),
+                    allow_custom=item.get("purpose") != "risk_review",
+                )
                 exact_answer = record["answer_text"]
                 item.update({
                     "state": "resolved", "resolved_ms": _now(),
@@ -6304,7 +6465,15 @@ class GoalStore:
                 authority_root=root,
             )
             if not hmac.compare_digest(approval, current_digest):
-                raise HarnessError("Discovered project checks changed; review and approve the current checks before resuming")
+                access = goal_access.state(document)
+                grant = access.get("grants", {}).get(current_digest, {})
+                if access["mode"] != "full" and not (grant.get("decision") == "always" or (
+                    grant.get("decision") == "once" and grant.get("remaining") == 1
+                )):
+                    raise HarnessError("Discovered project checks changed; review and approve the current checks before resuming")
+                adopted["approved_test_command_digest"] = ""
+                captured = capture_verification_contract(self.config, adopted, root)
+                preserve_goal_approval = False
         elif approval:
             # Explicit commands already have their own user authorization. An
             # old discovery approval must not survive as authority for a later
@@ -6521,12 +6690,13 @@ class GoalStore:
                 self._adopt_legacy_protocol_rejections(document, db)
                 if any((one.get("protocol_recovery") or {}).get("state") == "exhausted" for one in document["tasks"]):
                     raise HarnessError("The bounded action-protocol corrections were exhausted. Inspect the rejected replies before starting new work.")
+                self._resume_interrupted_turns(document, db, payload.get("recovery"))
                 if any(
                     one["state"] in {"blocked", "failed"} and _task_has_unsettled_effect(one)
                     for one in document["tasks"]
                 ):
                     raise HarnessError(
-                        "Reconcile or supersede pending provider/file effects before resuming this goal"
+                        "Reconcile or supersede pending provider/file effects using the recovery card in this chat before resuming."
                     )
                 if project_verification_settings is not None:
                     self._adopt_project_verification_settings(document, db, project_verification_settings)
@@ -7226,6 +7396,7 @@ class GoalStore:
                 missing = [one["criterion"] for one in criteria_results if one["status"] not in {"passed", "not_applicable"}]
                 checked["reason"] = "Success criteria lack authenticated evidence: " + "; ".join(missing)
             document["verification"] = _durable_evidence(checked)
+            goal_access.record_block(document, checked)
             self._event(db, document, "test_result", payload=checked)
             if checked.get("status") == "passed" or (verification_satisfied and checked.get("status") == "not_configured"):
                 if _isolated_execution(document):
@@ -7246,7 +7417,12 @@ class GoalStore:
                 self._event(db, document, "goal_completed", payload={"basis": result.get("basis"), "success_criteria": document["success_criteria"]})
                 return
             reason = _short(checked.get("reason") or "Deterministic verification failed", 4_000)
-            if checked.get("status") == "unavailable":
+            missing_authored_checks = (
+                checked.get("basis") == "required_checks_not_configured"
+                and goal_access.state(document)["mode"] != "read_only"
+                and swarm_work._goal_intent(document["objective"]) != "read_only"
+            )
+            if checked.get("status") == "unavailable" and not missing_authored_checks:
                 # A provider cannot repair a verifier that never launched.
                 # Keep the completed work and exact verification evidence
                 # resumable, but spend no additional provider calls or task
@@ -7898,6 +8074,9 @@ class LongHorizonRuntime:
         )
         return (
             "LONG-HORIZON GOAL\n" + goal["objective"]
+            + "\n\nAGENT ACCESS\n" + goal_access.state(goal)["mode"]
+            + ": read_only permits inspection only; ask permits edits and requests new command approval; full permits project edits and commands. "
+              "Nexus enforces this setting. A command permission block opens a card for the user; do not repeatedly retry it or treat conversational text as an engine grant."
             + "\n\nSUCCESS CRITERIA\n- " + "\n- ".join(goal["success_criteria"])
             + "\n\nCURRENT CONCRETE TASK\n" + task["description"]
             + "\n\nSHARED TASK LEDGER\n" + json.dumps(ledger, ensure_ascii=False)
@@ -8114,7 +8293,7 @@ class LongHorizonRuntime:
                     ).begin(current_goal["objective"], [agent], mode="long_horizon_context_tools")
                     context_tools = swarm_work._ProjectContextTools(
                         self.config, root, ledger,
-                        verification_project(self.config, current_goal),
+                        self.store.access_project(current_goal),
                         current_goal["objective"], changed_paths, None,
                         **({"verification_profile": "shared_goal_v1"}
                            if current_goal.get("require_all_participants") else {}),
@@ -8191,8 +8370,7 @@ class LongHorizonRuntime:
                             )
                     except Exception as exc:
                         self.store.record_context_tool_result(goal_id, task, call, error=str(exc))
-                        if str(call.get("name") or "") == "read_proposed_change" \
-                                and isinstance(exc, ReviewContextRequestError):
+                        if isinstance(exc, ContextRequestError):
                             # A stale or mistaken review tool request has made
                             # no changes and disclosed no proposed contents.
                             # Deliver the actual failure so the agent can use
@@ -8486,6 +8664,11 @@ class LongHorizonRuntime:
                 # behind the decision card violates the pause contract.
                 self.store.defer_pending_action(goal_id, task)
                 continue
+            if action.get("changes") and goal_access.state(current_goal)["mode"] == "read_only":
+                self.store.reject_unapplied_proposal(goal_id, task,
+                    "Read only access permits inspection and discussion, not file changes. "
+                    "Continue without edits or ask a specific question if the objective requires them.")
+                continue
             if (
                 action.get("action") == "request_review"
                 or self.store._needs_review(current_goal, current_task, action, None)
@@ -8526,24 +8709,27 @@ class LongHorizonRuntime:
                             )
                     plans = swarm_work._validated_changes(root, changes)
                     if not plans:
-                        raise HarnessError(
-                            "The proposed file plan makes no effective change to the current project snapshot"
-                        )
-                    transaction_id = str(pending.get("transaction_id") or FileTransaction.new_transaction_id())
-                    if not pending:
-                        self.store.prepare_transaction(goal_id, task, transaction_id, changes)
-                    manifest = FileTransaction(
-                        root, max_files=12,
-                        max_bytes=int(self.config.get("execution.max_changed_bytes")),
-                    ).apply(plans, transaction_id=transaction_id)
-                    artifact = {
-                        "kind": "file_transaction", "transaction_id": transaction_id,
-                        "changes": manifest.get("changes", []),
-                        "patch": _short(manifest.get("patch"), 80_000),
-                        "patch_sha256": manifest.get("patch_sha256", ""),
-                        "tree_merkle": swarm_work._project_tree_merkle(root)[0],
-                    }
-                    self.store.record_transaction_applied(goal_id, task, artifact)
+                        if pending:
+                            raise HarnessError("An unfinished transaction requires exact recovery before a no-change result")
+                        merkle, tree = swarm_work._project_tree_merkle(root)
+                        artifact = {"kind": "verified_no_change", "tree_merkle": merkle,
+                                    "file_count": len(tree), "observed_at_ms": _now()}
+                    else:
+                        transaction_id = str(pending.get("transaction_id") or FileTransaction.new_transaction_id())
+                        if not pending:
+                            self.store.prepare_transaction(goal_id, task, transaction_id, changes)
+                        manifest = FileTransaction(
+                            root, max_files=12,
+                            max_bytes=int(self.config.get("execution.max_changed_bytes")),
+                        ).apply(plans, transaction_id=transaction_id)
+                        artifact = {
+                            "kind": "file_transaction", "transaction_id": transaction_id,
+                            "changes": manifest.get("changes", []),
+                            "patch": _short(manifest.get("patch"), 80_000),
+                            "patch_sha256": manifest.get("patch_sha256", ""),
+                            "tree_merkle": swarm_work._project_tree_merkle(root)[0],
+                        }
+                        self.store.record_transaction_applied(goal_id, task, artifact)
             elif action.get("action") in {"complete", "request_review"}:
                 goal = self.store.get(goal_id)
                 self._require_goal_authority(goal)
@@ -8586,6 +8772,10 @@ class LongHorizonRuntime:
                     message="Checking the combined project before applying this chat's changes.")
                 current = self.store.get(goal["goal_id"])
                 receipt = goal_workspaces.prepare_publish(current, self.store.root)
+                if receipt.get("changed") and goal_access.state(current)["mode"] == "read_only":
+                    self.store.set_workspace_publication(goal["goal_id"], "conflict",
+                        message="Read only access keeps the retained changes in this chat's copy. Change access before applying them.")
+                    return {"route": "end"}
                 if receipt.get("rebased") and self.store.reopen_rebased_workspace(goal["goal_id"]):
                     return {"route": "schedule"}
                 return self._verify_and_publish(state, receipt=receipt)
@@ -8604,7 +8794,7 @@ class LongHorizonRuntime:
             str(change.get("path")) for artifact in goal.get("artifacts", []) if isinstance(artifact, dict)
             for change in artifact.get("changes", []) if isinstance(change, dict) and change.get("path")
         ]
-        project = verification_project(self.config, goal)
+        project = self.store.access_project(goal)
         result = swarm_work._run_selected_project_verification(
             self.config, root, project, goal["objective"], list(dict.fromkeys(changed)), None,
             verification_session_id=goal["goal_id"],
@@ -8613,7 +8803,7 @@ class LongHorizonRuntime:
         )
         updated = self.store.complete_verification(
             goal["goal_id"], result,
-            expected_revision=int(goal["revision"]),
+            expected_revision=project["_nexus_command_access"].revision or int(goal["revision"]),
             expected_objective_epoch=int(goal.get("objective_epoch") or 1),
             publish_workspace=(
                 lambda current: goal_workspaces.publish(current, self.store.root, receipt)
@@ -9072,11 +9262,13 @@ class LongHorizonRuntime:
         self, goal_id: str, answers: dict[str, Any] | None = None, *,
         project_verification_settings: dict[str, Any] | None = None,
         expected_revision: int | None = None,
+        recovery: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if answers is None:
             return self.control(
                 goal_id, "resume",
-                **({"payload": {"expected_revision": expected_revision}} if expected_revision is not None else {}),
+                payload={**({"expected_revision": expected_revision} if expected_revision is not None else {}),
+                         **({"recovery": recovery} if recovery is not None else {})},
                 **({"project_verification_settings": project_verification_settings}
                    if project_verification_settings is not None else {}),
             )

@@ -46,7 +46,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import cancellation, collaboration_outcomes, user_questions
+from . import cancellation, collaboration_outcomes, user_questions, relay_timing
 from .config import LoadedConfig
 from .images import IMAGE_EXTENSIONS, attachment_image_metadata
 from .models import HarnessError, ProviderOutcomeUnknown, ProviderRequest, ProviderWorkspaceContext, ResponseFormat
@@ -345,6 +345,7 @@ class Said:
     # retries and process restarts. Older transcript turns have no such field,
     # so this is deliberately additive and omitted from their JSON projection.
     correlation: dict[str, Any] = field(default_factory=dict)
+    relay_timing: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         value = {
@@ -370,6 +371,9 @@ class Said:
             )
         if self.correlation:
             value["correlation"] = dict(self.correlation)
+        timing = relay_timing.frozen(self.relay_timing)
+        if timing:
+            value["relay_timing"] = timing
         return value
 
 
@@ -748,6 +752,7 @@ def _where_the_noes_are(config: LoadedConfig) -> Path:
 def _route_failure_context(
     config: LoadedConfig, route: str, *,
     effective_dispatch_contract_override: str = "",
+    principal_dispatch_fingerprint_override: str = "",
 ) -> tuple[str, dict[str, Any]]:
     """Return a private, portable identity for one route's dispatch semantics.
 
@@ -756,6 +761,9 @@ def _route_failure_context(
     configuration changes, or when the owning adapter's contract revision is
     bumped.  That makes stale-diagnostic invalidation a product behavior rather
     than a repair performed on one user's data.
+
+    The principal-only override reconstructs a saved CLI principal for reviewed
+    reconnection. It does not override current dispatch or route fingerprints.
     """
 
     named = str(route or "").strip()
@@ -852,7 +860,8 @@ def _route_failure_context(
             # Local/CLI providers have no tenant identifier. Their resolved
             # executable+profile identity is the strongest available principal.
             "local_dispatch_identity": (
-                effective.get("effective_dispatch_fingerprint_sha256")
+                (principal_dispatch_fingerprint_override
+                 or effective.get("effective_dispatch_fingerprint_sha256"))
                 if not endpoint_authority and not profile.get("api_key_env") else ""
             ),
         }
@@ -1297,6 +1306,8 @@ _CORRELATION_TEXT_LIMITS = {
     "goal_status": 80,
     "source_goal_event_id": 32,
     "source_goal_event_type": 100,
+    "progress_contract": 80,
+    "outcome": 40,
     "source_dialogue_id": 160,
     "task_id": 160,
 }
@@ -1425,6 +1436,7 @@ def _said_from_dicts(held: object) -> list[Said]:
             questions=user_questions.frozen(one.get("questions")),
             participant_outcome=participant_outcome,
             correlation=_said_correlation(one.get("correlation"), index + 1),
+            relay_timing=relay_timing.frozen(one.get("relay_timing")),
         ))
     return kept
 
@@ -1624,6 +1636,7 @@ def _correlated_semantics(turn: Said) -> dict[str, Any]:
     # A retry after restart necessarily constructs it at another instant.
     value.pop("at", None)
     value.pop("milliseconds", None)
+    value.pop("relay_timing", None)
     return value
 
 
@@ -2431,6 +2444,7 @@ def _ask_and_keep(
             text=back,
             at=_now(),
             milliseconds=int((time.monotonic() - started) * 1000),
+            relay_timing=relay_timing.from_response(answered),
             model=model,
             speaker_id=str((speaker or {}).get("id") or "")[:120],
             speaker_name=str((speaker or {}).get("name") or "")[:240],
@@ -2581,6 +2595,7 @@ def ask_once(
     return {
         "text": answer,
         "milliseconds": int((time.monotonic() - started) * 1000),
+        "relay_timing": relay_timing.from_response(response),
         "model": (
             f"{(web_chats.active().route(named) or {}).get('provider', 'web')} web chat"
             if named.startswith("web:") else str(routed.get("provider.model") or "")
@@ -3096,6 +3111,9 @@ def keep_long_horizon_events(
     spoken by Nexus and are never misrepresented as agent speech.
     """
 
+    from . import goal_chat_progress
+    from .goal_chat_projection import _timestamp, _later
+
     goal_id = _exact_long_horizon_identity(goal.get("goal_id"), "goal ID")
     request_id = _exact_long_horizon_identity(goal.get("request_id"), "request ID")
     conversation_id = _exact_long_horizon_identity(
@@ -3233,7 +3251,7 @@ def keep_long_horizon_events(
             "goal_auto_start_blocked", "task_handed_off",
             "codex_schema_rejection_recovered",
             "goal_steered", "agent_messaged", "interrupt_resolved",
-        }
+        } | goal_chat_progress.EVENT_TYPES
         if public_dialogue_archived:
             # Public speech has its own lossless archive. Event payloads are
             # bounded telemetry and may have retired or summarized that text.
@@ -3264,8 +3282,23 @@ def keep_long_horizon_events(
                 "goal_event_cursor": sequence,
                 "source_goal_event_id": source_id,
                 "source_goal_event_type": kind,
+                "source_goal_event_seq": sequence,
                 "task_id": str(event.get("task_id") or ""),
             }
+            if kind in goal_chat_progress.EVENT_TYPES:
+                progress = goal_chat_progress.milestone(event, agent_name)
+                # Legacy telemetry without an occurrence time cannot establish
+                # a real chronological milestone. Do not invent its timestamp.
+                if progress and event.get("at_ms"):
+                    text, outcome = progress
+                    additions.append(Said(
+                        "them", _checked_answer(redactor.text(text), "Nexus"),
+                        _timestamp(event["at_ms"]), speaker_id="nexus", speaker_name="Nexus",
+                        recipient_name="You", phase="nexus_progress",
+                        correlation={**correlation, "kind": "long_horizon_progress",
+                                     "progress_contract": "engine-milestones/v1", "outcome": outcome},
+                    ))
+                continue
             if kind in {"goal_steered", "agent_messaged", "interrupt_resolved"}:
                 words = redactor.text(str(payload.get("text") or payload.get("answer") or "")).strip()
                 if words:
@@ -3355,7 +3388,26 @@ def keep_long_horizon_events(
                     },
                 ))
         if additions:
-            _keep_it(config, route, [*turns, *additions], filed_as)
+            # Dialogue is projected first. Insert milestones at their recorded
+            # time so a catch-up poll cannot put all activity after the answer.
+            def merge_activity(current: list[Said]) -> list[Said]:
+                merged = list(current)
+                seen = {one.correlation.get("event_id") for one in merged}
+                for row in additions:
+                    if row.correlation.get("event_id") in seen:
+                        continue
+                    seen.add(row.correlation.get("event_id"))
+                    insertion = len(merged)
+                    if row.phase == "nexus_progress":
+                        insertion = next((index for index, one in enumerate(merged)
+                                          if one.correlation.get("goal_id") == goal_id and (
+                                              int(one.correlation.get("source_goal_event_seq") or 0)
+                                              > int(row.correlation["source_goal_event_seq"])
+                                              or one.at and _later(one.at, row.at)
+                                          )), len(merged))
+                    merged.insert(insertion, row)
+                return merged
+            _keep_it(config, route, [], filed_as, replace_projection=True, transform_projection=merge_activity)
             saved = read_it(config, route, filed_as)
         else:
             saved = turns

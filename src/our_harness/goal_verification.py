@@ -278,11 +278,28 @@ def workspace_verification_approval(
     """Preview one goal's unpublished checks under its canonical project identity."""
     if "execution_workspace" not in goal:
         raise HarnessError("This goal has no isolated workspace; use its selected project's test settings")
+    return goal_command_approval(config, goal, runtime_root=runtime_root)
+
+
+def goal_command_approval(config: LoadedConfig, goal: dict[str, Any], *, runtime_root: Path | None = None) -> dict[str, Any]:
+    """Preview commands for either an owned chat copy or a board goal."""
     from . import swarm_work
 
     project = verification_project(config, goal, runtime_root=runtime_root)
     proposal = swarm_work.verification_command_approval(config, project)
-    settled = goal.get("status") == "paused" and not any(
+    from .verification_scripts import resolve_package_command
+    authority = project.get("_nexus_workspace_verification")
+    execution_root = authority.execution_root if authority else Path(project["path"])
+    try:
+        proposal["resolved_commands"] = [resolve_package_command(execution_root, command) for command in proposal.get("commands", [])]
+    except HarnessError as exc:
+        proposal["runner_note"] = str(exc)
+    if proposal.get("commands") and not proposal.get("approval_digest"):
+        proposal["approval_digest"] = swarm_work._command_approval_digest(
+            execution_root, proposal["commands"], declared_path=project["path"],
+            authority_root=Path(project["path"]),
+        )
+    settled = goal.get("status") in {"paused", "waiting_for_user"} and not any(
         task.get("state") == "running" for task in goal.get("tasks", []) if isinstance(task, dict)
     )
     return {
@@ -398,7 +415,14 @@ def run_configured_goal_verification(
             "Any explicitly required testing still needs real execution evidence.",
             current_tree_merkle=merkle, file_count=len(manifest),
         )
-    if source == "discovered":
+    from .goal_access import command_gate
+    access = command_gate(project, commands, work._command_approval_digest(
+        root, commands, declared_path=str(project.get("path") or ""), authority_root=authority_root,
+    ), source) if project.get("_nexus_command_access") else None
+    if isinstance(access, dict):
+        return outcome(access["status"], access["basis"], access["reason"],
+                       proposed_commands=commands, approval_digest=access["approval_digest"])
+    if source == "discovered" and access is not True:
         try:
             digest = work._command_approval_digest(
                 root, commands, declared_path=str(project.get("path") or ""),

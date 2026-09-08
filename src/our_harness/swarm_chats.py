@@ -941,6 +941,7 @@ def _binding_problem(
             "action_label": "Start fresh with current setup",
         }
     changed_routes: list[dict[str, str]] = []
+    reconnectable = True
     for member_id in raw["pair"]:
         member = agents.get(member_id) or {}
         route = str(member.get("who") or "")
@@ -969,6 +970,11 @@ def _binding_problem(
             )
         )
         if base_changed or effective_changed:
+            reconnectable = reconnectable and not base_changed and all(
+                held.get(key) == current.get(key) for key in (
+                    "effective_dispatch_version", "effective_dispatch_contract",
+                )
+            )
             kind = (
                 "route_changed" if held.get("route") != current.get("route")
                 else "route_settings_changed" if base_changed
@@ -995,11 +1001,15 @@ def _binding_problem(
         owner = f"{names}'s" if len(changed_routes) == 1 else f"the setup for {names}"
         return {
             "code": "agent_binding_changed",
+            "can_review_reconnect": reconnectable,
             "changed_agents": changed_routes,
             "message": (
                 f"This chat is paused because {owner} {detail}. Nexus kept its "
                 "transcript and will not send that history to a different provider "
-                "setup. Start a fresh chat with the current setup."
+                "setup. " + (
+                    "After signing in or updating the provider, review reconnection to continue this saved chat."
+                    if reconnectable else "Start a fresh chat with the current setup."
+                )
             ),
             "action": "start_fresh",
             "action_label": "Start fresh with current setup",

@@ -26,6 +26,7 @@ function fixture() {
   const context = vm.createContext({
     make: node, theSwarmAgent: () => null, openChatGoalDetails() {},
     activeConversationFor: () => context.conversation,
+    appendGoalAccessControls() {}, chatGoalBinding: () => ({}), swarmChatKey: () => 'fixture-chat',
   });
   vm.runInContext(
     section("function chatGoalParticipants", "function chatGoalBinding")

@@ -764,6 +764,13 @@
         <div id="longGoalAgents" class="long-goal-agents"></div>
         <label for="longGoalLead">Lead agent</label>
         <select id="longGoalLead"></select>
+        <label for="longGoalAccess">Agent access</label>
+        <select id="longGoalAccess">
+          <option value="read_only">Read only</option>
+          <option value="ask" selected>Ask before commands</option>
+          <option value="full">Full project access</option>
+        </select>
+        <p class="field-help">Controls every agent in this goal. Read only permits inspection; Ask permits edits and asks before new commands; Full permits project edits and commands within Nexus workspace protections.</p>
         <label for="longGoalParticipation">How they participate</label>
         <select id="longGoalParticipation">
           <option value="every">Every selected agent must make a distinct contribution</option>

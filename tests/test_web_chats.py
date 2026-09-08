@@ -52,6 +52,8 @@ class WebChatBrokerTests(unittest.TestCase):
             pending[0]["conversation_key"], "pair-chat-0123456789abcdef"
         )
         self.assertTrue(pending[0]["prefer_existing_conversation"])
+        self.assertGreater(pending[0]["service_deadline_ms"], time.time() * 1000)
+        self.assertLessEqual(pending[0]["service_deadline_ms"], (time.time() + 5) * 1000)
         self.broker.complete(pending[0]["request_id"], answer="The visible provider reply")
         thread.join(2)
         self.assertEqual(result, ["The visible provider reply"])

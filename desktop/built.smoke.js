@@ -159,6 +159,30 @@ async function main() {
       throw new Error(`The packaged app did not surface its exact commit identity: ${runtime.commit}`);
     }
     console.log("pass  a fresh profile selects the requested project and uses private Python");
+    const access = await page.evaluate(() => ({
+      modes: [...document.querySelectorAll("#longGoalAccess option")].map(option => option.value),
+      selected: document.getElementById("longGoalAccess")?.value,
+      controlsLoaded: typeof appendGoalAccessControls === "function",
+    }));
+    if (JSON.stringify(access.modes) !== JSON.stringify(["read_only", "ask", "full"])
+        || access.selected !== "ask" || !access.controlsLoaded) {
+      throw new Error(`The packaged permission controls are missing or have an unsafe default: ${JSON.stringify(access)}`);
+    }
+    console.log("pass  packaged agent access controls load with Ask before commands selected");
+    const recovery = await page.evaluate(() => {
+      const panel = document.createElement("section"); document.body.append(panel);
+      try {
+        appendGoalRecoveryControls(panel, {goal_id:"packaged-recovery-check",revision:1,
+          resume_recovery:{items:[{agent_name:"Example agent",reason:"Interrupted reply"}],
+            can_retry:true,resume_safe:true,message:"Resume team will request a fresh read-only reply."}}, async()=>{}, {});
+        return {visible:panel.getBoundingClientRect().height>0,
+          button:panel.querySelector("button")?.textContent};
+      } finally {panel.remove();}
+    });
+    if (!recovery.visible || recovery.button !== "Resume interrupted turn") {
+      throw new Error(`The packaged recovery card is unavailable: ${JSON.stringify(recovery)}`);
+    }
+    console.log("pass  packaged interrupted-turn recovery card renders its Resume action");
     verified = true;
     console.log("\nThe app somebody installs opens.");
   } finally {

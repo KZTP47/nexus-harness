@@ -93,7 +93,7 @@ class GoalChatProjectionTests(unittest.TestCase):
 
     def tool_step(self, *, result=False):
         return {"step_id": "portable-step", "agent_id": "builder", "state": "complete" if result else "tools_pending",
-                "created_ms": 1_700_000_001_500, "completed_ms": 1_700_000_002_000 if result else 0,
+                "created_ms": 1_700_000_001_500, "completed_ms": 1_700_000_001_750 if result else 0,
                 "private_provider_reasoning": "THIS MUST NEVER BECOME CHAT CONTENT",
                 "calls": [{"call_id": "portable-call", "name": "read_file",
                            "arguments": {"path": "src/arbitrary.js", "api_key": "argument-secret"}}],
@@ -141,7 +141,7 @@ class GoalChatProjectionTests(unittest.TestCase):
         done = self.tool_rows()[0]
         self.assertEqual(json.loads(done.text)["status"], "failed")
         self.assertEqual(done.correlation["event_id"], pending.correlation["event_id"])
-        self.assertEqual(done.at, pending.at)
+        self.assertGreater(done.at, pending.at)
         self.project(self.page([]), goal=earlier)
         self.assertEqual([one.text for one in self.tool_rows()], [done.text])
 

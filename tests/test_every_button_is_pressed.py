@@ -377,7 +377,10 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
     # runner, so controls exercised there count here too. Generated controls
     # have no stable id; their accessible button name is the user-facing
     # identity and is therefore collected into ``said``.
-    for packaged_name in ("multi-vendor.e2e.js", "long-horizon.smoke.js", "team-chat.smoke.js"):
+    for packaged_name in (
+        "multi-vendor.e2e.js", "long-horizon.smoke.js", "team-chat.smoke.js",
+        "goal-access.test.js", "goal-recovery.test.js", "provider-reconnect.test.js",
+    ):
         packaged_e2e = (ROOT / "desktop" / packaged_name).read_text(encoding="utf-8")
         pressed.update(re.findall(
             r'page\.locator\("#([A-Za-z0-9_]+)"\)\.click\(\)', packaged_e2e

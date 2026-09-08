@@ -846,7 +846,7 @@ ipcMain.handle("harness:webChatRemove", (event, id) => {
   return webChatManager.remove(String(id || ""));
 });
 ipcMain.handle("harness:webChatAnswer", async (
-  event, route, prompt, attachments, conversationKey, preferExisting
+  event, route, prompt, attachments, conversationKey, preferExisting, serviceDeadlineMs
 ) => {
   if (!fromHarnessWindow(event) || !webChatManager) throw new Error("Web chats are not available");
   const found = /^web:([a-z0-9][a-z0-9-]{5,63})$/.exec(String(route || ""));
@@ -866,7 +866,7 @@ ipcMain.handle("harness:webChatAnswer", async (
   try {
     return await webChatManager.ask(
       found[1], String(prompt || ""), safeAttachments,
-      String(conversationKey || ""), Boolean(preferExisting));
+      String(conversationKey || ""), Boolean(preferExisting), Number(serviceDeadlineMs) || 0);
   } catch (error) {
     // Electron does not preserve custom Error properties across invoke().
     // Return the bounded transport receipt explicitly so Python can tell a

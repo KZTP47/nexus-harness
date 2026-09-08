@@ -14,7 +14,7 @@ import json
 import sqlite3
 from typing import Any
 
-from .models import HarnessError
+from .models import ContextRequestError, HarnessError
 from .runtime_integrity import mac
 
 
@@ -310,9 +310,9 @@ def page(
 ) -> dict[str, Any]:
     held = metadata(document)
     if after < 0 or offset < 0 or limit < 1 or character_limit < 1:
-        raise HarnessError("Shared conversation offsets must be nonnegative and limits positive")
+        raise ContextRequestError("Shared conversation offsets must be nonnegative and limits positive")
     if offset and not message_id:
-        raise HarnessError("A shared conversation character offset requires an exact message_id")
+        raise ContextRequestError("A shared conversation character offset requires an exact message_id")
     limit, character_limit = min(100, limit), min(96_000, character_limit)
     # Authenticate the head even for an empty or out-of-range request.
     head = db.execute("SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? ORDER BY sequence DESC LIMIT 1", (document["goal_id"],)).fetchone()
@@ -326,7 +326,7 @@ def page(
     if message_id:
         rows = db.execute("SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? AND message_id=?", (document["goal_id"], message_id)).fetchall()
         if not rows:
-            raise HarnessError("That message is not in this goal's shared conversation")
+            raise ContextRequestError("That message is not in this goal's shared conversation")
     else:
         rows = db.execute("SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? AND sequence>? ORDER BY sequence LIMIT ?", (document["goal_id"], after, limit + 1)).fetchall()
     messages, used, next_sequence = [], 0, after
@@ -343,12 +343,12 @@ def page(
             and (value.get("recipient") or {}).get("agent_id") != viewer_agent_id
         )):
             if message_id:
-                raise HarnessError("That message is not addressed to this participant")
+                raise ContextRequestError("That message is not addressed to this participant")
             next_sequence = int(value["sequence"])
             continue
         body = str(value["summary"])
         if offset > len(body):
-            raise HarnessError("Shared conversation character offset exceeds the message length")
+            raise ContextRequestError("Shared conversation character offset exceeds the message length")
         if messages and used + len(body) > character_limit:
             break
         chunk = body[offset:offset + character_limit - used]

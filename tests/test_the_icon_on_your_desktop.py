@@ -386,6 +386,8 @@ class TheOneThingThatStopsTheIconWorkingTests(unittest.TestCase):
             ), mock.patch.object(
                 installer, "put_it_there",
                 lambda where, launcher, icon=None: where / "Nexus Harness.lnk",
+            ), mock.patch.object(
+                installer, "freeze_built_launcher", lambda launcher: launcher,
             ):
                 held = io.StringIO()
                 with contextlib.redirect_stdout(held):
@@ -405,6 +407,8 @@ class TheOneThingThatStopsTheIconWorkingTests(unittest.TestCase):
             ), mock.patch.object(
                 installer, "put_it_there",
                 lambda where, launcher, icon=None: where / "Nexus Harness.lnk",
+            ), mock.patch.object(
+                installer, "freeze_built_launcher", lambda launcher: launcher,
             ):
                 held = io.StringIO()
                 with contextlib.redirect_stdout(held):
@@ -533,7 +537,8 @@ class WhenAskingWindowsGoesWrongTests(unittest.TestCase):
         def falls_over():
             raise RuntimeError("PowerShell would not run")
 
-        with mock.patch.object(installer, "where_the_desktop_is", falls_over):
+        with mock.patch.object(installer, "where_the_desktop_is", falls_over), \
+                mock.patch.object(installer, "freeze_built_launcher", lambda launcher: launcher):
             self.assertEqual(installer.main([]), 1)
 
 

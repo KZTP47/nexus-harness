@@ -458,6 +458,9 @@ def publish(document: dict[str, Any], runtime_root: Path, receipt: dict[str, Any
     verified = _verify(_key(home), receipt)
     if verified.get("descriptor") != state["descriptor"]:
         raise HarnessError("Goal publication receipt belongs to a different goal")
+    from . import goal_access
+    if verified.get("changed") and goal_access.state(document)["mode"] == "read_only":
+        raise HarnessError("Read only access does not allow applying retained changes to the selected project")
     recovered = _recover_publication(source, home, project.parent, state)
     if recovered:
         if recovered["receipt"] != receipt:

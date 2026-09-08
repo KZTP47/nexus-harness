@@ -39,6 +39,7 @@ function fixture(questions = [{id: "folder", prompt: "Use misspelled PLOQGZ?", o
     crypto: require("node:crypto").webcrypto, longHorizonStateWords: value => value,
     chatLongGoalContext: () => ({goal: f.goal, problem: ""}), swarmChatKey: () => "saved-chat",
     chatGoalBinding: () => ({chat_id: "saved-chat"}),
+    appendGoalAccessControls() {},
     openChatGoalDetails() {}, refreshChatGoalAfterAction(agent, goal) { f.accepted = goal; }, setWhatCanBePressedInSwarm() {},
     rememberChatGoalSnapshot(goal) { f.accepted = goal; return goal; },
     beginGoalSnapshotRead: () => 1,
@@ -103,6 +104,36 @@ test("multiple selected labels and custom text both survive the actual chat form
   await f.submit();
   assert.deepEqual(f.calls[0].body.answers["interrupt-exact"], {schema_version: 1, audience: "team",
     questions: [{question_id: "choices", selected_options: ["Folder A", "Folder B"], text: custom.value}]});
+});
+
+test("saved choices-only team questions accept a typed correction in chat and mission control", async () => {
+  const questions = [{id: "destination", prompt: "Which destination?", allow_other: false,
+    options: [{label: "First folder"}, {label: "Second folder"}]}];
+  for (const surface of ["chat", "mission"]) {
+    const f = fixture(questions);
+    const form = surface === "mission" ? f.mission() : f.panel;
+    const input = form.all().find(one => surface === "mission" ? one.tag === "textarea"
+      : one.tag === "input" && !one.type);
+    assert.ok(input, surface);
+    input.value = `Use ${path.join(os.tmpdir(), "different project", "game")}`;
+    input.emit("input");
+    f.render();
+    assert.equal(input.value.startsWith("Use "), true);
+    if (surface === "mission") await form.emit("submit", {preventDefault() {}});
+    else await f.submit();
+    assert.deepEqual(f.calls[0].body.answers["interrupt-exact"].questions,
+      [{question_id: "destination", selected_options: [], text: input.value}]);
+  }
+});
+
+test("engine risk approvals retain explicit choices on both decision surfaces", () => {
+  const f = fixture([{id: "approval", prompt: "Continue?", allow_other: false,
+    options: [{label: "Continue with checks"}, {label: "Stop this task"}]}]);
+  f.goal.pending_interrupts[0].purpose = "risk_review";
+  f.render();
+  for (const form of [f.panel, f.mission()]) {
+    assert.equal(form.all().some(one => one.tag === "textarea" || one.tag === "input" && !one.type), false);
+  }
 });
 
 test("lost response retry keeps the same logical request while edited answers get another identity", async () => {

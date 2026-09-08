@@ -9,6 +9,14 @@ class HarnessError(RuntimeError):
     """Expected user-facing failure."""
 
 
+class ContextRequestError(HarnessError):
+    """A rejected read-only request the agent can correct without user input.
+
+    No data or effect was accepted. Integrity, persistence, budget and transport
+    failures must retain their own error types and must never use this class.
+    """
+
+
 class ProviderOutcomeUnknown(HarnessError):
     """A provider may have acted, but Nexus cannot prove the terminal outcome.
 

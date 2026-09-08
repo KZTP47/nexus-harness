@@ -186,7 +186,7 @@ def frozen(value: object) -> list[dict[str, Any]]:
     return copy.deepcopy(normalize(value))
 
 
-def answer_record(questions: object, value: object) -> dict[str, Any]:
+def answer_record(questions: object, value: object, *, allow_custom: bool = False) -> dict[str, Any]:
     """Keep user text separate from agent-authored framing and choice labels.
 
     Adapted from t3code apps/web/src/pendingUserInput.ts at eb115063634c416c6362cc407f8572cb0c136ddf:
@@ -231,7 +231,7 @@ def answer_record(questions: object, value: object) -> dict[str, Any]:
         labels = {one["label"] for one in question["options"]}
         if any(one not in labels for one in options) or (len(options) > 1 and not question["multiple"]):
             raise HarnessError("Choose only saved options allowed by this question")
-        if text.strip() and not question["allow_other"]:
+        if text.strip() and not question["allow_other"] and not allow_custom:
             raise HarnessError("This question does not allow a custom answer")
         if not text.strip() and not options:
             raise HarnessError("Answer every saved question before continuing")

@@ -397,9 +397,14 @@ function automationScript(provider, prompt, submittedMarker = "") {
       const after = values(selectors.replies);
       const afterUsers = values(selectors.users);
       const newlyRenderedUsers = afterUsers.slice(beforeUsers.length);
-      const userAdvanced = newlyRenderedUsers.some(promptMatches)
+      // The unique marker survives a provider's collapsed/reformatted bubble.
+      // Only transcript user nodes may acknowledge it; composer validation
+      // above still requires the complete exact draft before Send.
+      const userMatches = (value) => submittedMarker
+        ? normal(value).includes(normal(submittedMarker)) : promptMatches(value);
+      const userAdvanced = newlyRenderedUsers.some(userMatches)
         || Boolean(afterUsers.at(-1) && afterUsers.at(-1) !== beforeUsers.at(-1)
-          && promptMatches(afterUsers.at(-1)));
+          && userMatches(afterUsers.at(-1)));
       const replyAdvanced = after.length > before.length
         || (after.at(-1) && after.at(-1) !== before.at(-1));
       const stoppingNow = selectors.stop.some(
@@ -587,9 +592,11 @@ function submissionScript(provider, prompt, began) {
       const replies = values(selectors.replies);
       const users = values(selectors.users);
       const newlyRenderedUsers = users.slice(began.beforeUserCount);
-      const exactUserTurn = newlyRenderedUsers.some(promptMatches)
+      const userMatches = (value) => began.submittedMarker
+        ? normal(value).includes(normal(began.submittedMarker)) : promptMatches(value);
+      const exactUserTurn = newlyRenderedUsers.some(userMatches)
         || Boolean(users.at(-1) && users.at(-1) !== began.beforeUserLast
-          && promptMatches(users.at(-1)));
+          && userMatches(users.at(-1)));
       const submitted = selectors.pairRepliesToUsers ? exactUserTurn : (replies.length > began.beforeCount
         || (replies.at(-1) && replies.at(-1) !== began.beforeLast)
         || users.length > began.beforeUserCount
@@ -815,8 +822,12 @@ class WebChatManager {
     this.externalBrowserFactory = options.externalBrowserFactory || ((transportOptions) => (
       new ExternalBrowserTransport(transportOptions)
     ));
-    this.answerDeadlineMs = Math.max(1000, Number(options.answerDeadlineMs) || 165000);
+    this.answerDeadlineMs = Math.max(1000, Number(options.answerDeadlineMs) || 420000);
     this.answerPollMs = Math.max(1, Number(options.answerPollMs) || 900);
+    // Faster observation must not shorten the existing 1.8-second quiet-text
+    // window: a provider can pause while reasoning or using tools.
+    this.answerSettleMs = 2 * this.answerPollMs;
+    this.answerPollMs = Math.min(this.answerPollMs, 250);
     this.submitReadyChecks = Math.max(2, Number(options.submitReadyChecks) || 50);
     this.submitAttempts = Math.max(1, Number(options.submitAttempts) || 3);
     this.submitPollMs = Math.max(1, Number(options.submitPollMs) || 100);
@@ -1662,7 +1673,7 @@ class WebChatManager {
   }
 
   ask(
-    id, prompt, attachments = [], conversationKey = "", preferExisting = false
+    id, prompt, attachments = [], conversationKey = "", preferExisting = false, serviceDeadlineMs = 0
   ) {
     if (this.closed) return Promise.reject(controlError(
       "Nexus is closing its web chats.", "NEXUS_WEB_CHAT_CLOSED"));
@@ -1675,7 +1686,7 @@ class WebChatManager {
         "Nexus is closing its web chats.", "NEXUS_WEB_CHAT_CLOSED");
       return this.askNow(
         id, String(prompt || ""), Array.isArray(attachments) ? attachments : [],
-        key, preferExisting);
+        key, preferExisting, serviceDeadlineMs);
     });
     this.queues.set(channel, mine);
     return mine.finally(() => {
@@ -1914,8 +1925,14 @@ class WebChatManager {
   }
 
   async askNow(
-    id, prompt, attachments = [], conversationKey = "", preferExisting = false
+    id, prompt, attachments = [], conversationKey = "", preferExisting = false, serviceDeadlineMs = 0
   ) {
+    const turnStarted = Date.now();
+    // Keep time spent queued/preparing inside the bridge's original budget.
+    // Reserve a short tail for the terminal receipt to reach Python.
+    const serviceDeadlineAt = Number.isFinite(serviceDeadlineMs) && serviceDeadlineMs > 0
+      ? Math.min(turnStarted + 420000, serviceDeadlineMs) - 500 : Infinity;
+    let preparedAt = turnStarted;
     const one = this.connections.get(id);
     if (!one) throw new WebChatTurnError("That web chat is no longer connected", {
       deliveryState: "not_accepted", failureCode: "connection_missing",
@@ -1932,7 +1949,7 @@ class WebChatManager {
       let view;
       let provider;
       let priorUrl;
-      const preSubmitDeadlineAt = Date.now() + this.preSubmitDeadlineMs;
+      const preSubmitDeadlineAt = Math.min(Date.now() + this.preSubmitDeadlineMs, serviceDeadlineAt);
       try {
         view = this.viewFor(id, key, preferExisting);
         provider = PROVIDERS[one.provider];
@@ -1971,6 +1988,7 @@ class WebChatManager {
           diagnostics: {failure_stage: "before_submission"},
         });
       }
+      preparedAt = Date.now();
       const nextSubmission = () => {
         const marker = `NEXUS TRANSPORT TURN ${crypto.randomUUID()}`;
         return {marker, prompt: `[${marker}]\n\n${prompt}`};
@@ -2034,6 +2052,8 @@ class WebChatManager {
       let retriedVisibleError = false;
       let stable = 0;
       let previous = "";
+      let answerChangedAt = started;
+      let firstReplyAt = null;
       let polls = 0;
       let lastState = {};
       let submissionState = began?.submissionState || "acknowledged";
@@ -2042,8 +2062,11 @@ class WebChatManager {
       let markedReplyFound = false;
       const staleStopAtSubmission = Boolean(began?.beforeStopping);
       let stopClearedAfterSubmission = !staleStopAtSubmission;
-      while (Date.now() - started < this.answerDeadlineMs) {
-        await new Promise((resolve) => setTimeout(resolve, this.answerPollMs));
+      while (Date.now() < Math.min(started + this.answerDeadlineMs, serviceDeadlineAt)) {
+        const quietRemaining = this.answerSettleMs - (Date.now() - answerChangedAt);
+        const pollDelay = previous && quietRemaining > 0
+          ? Math.min(this.answerPollMs, quietRemaining) : this.answerPollMs;
+        await new Promise((resolve) => setTimeout(resolve, pollDelay));
         stopped();
         const state = await view.webContents.executeJavaScript(answerScript(provider, began), true);
         polls += 1;
@@ -2080,8 +2103,15 @@ class WebChatManager {
             diagnostics: {submission_state: submissionState, polls},
           });
         }
-        if (!state?.changed || !state.answer) { stable = 0; continue; }
-        if (state.answer === previous) stable += 1; else stable = 0;
+        if (!state?.changed || !state.answer) {
+          stable = 0;
+          previous = "";
+          answerChangedAt = Date.now();
+          continue;
+        }
+        if (firstReplyAt === null) firstReplyAt = Date.now();
+        if (state.answer === previous) stable += 1;
+        else { stable = 0; answerChangedAt = Date.now(); }
         previous = state.answer;
         // A visible Stop control means generation is still in progress. Text
         // stability is not a completion receipt: providers can pause while
@@ -2089,13 +2119,26 @@ class WebChatManager {
         // and commit a partial response merely because its DOM stayed still.
         if (!state.stopping) stopClearedAfterSubmission = true;
         if (state.stopping) continue;
-        if (stable >= 2) {
+        if (stable >= 2 && Date.now() - answerChangedAt >= this.answerSettleMs) {
           // Delivery already happened. A settings-volume failure must stay
           // visible, but must not discard a genuine provider answer.
           try { this.rememberConnectionPage(id, view.webContents, key); } catch (_error) {}
           this.showCreatedConversationInOpenShells(
             id, key, view.webContents, priorUrl);
-          return {answer: state.answer, milliseconds: Date.now() - started, model: `${provider.label} web chat`};
+          const finishedAt = Date.now();
+          return {
+            answer: state.answer, milliseconds: finishedAt - started,
+            model: `${provider.label} web chat`,
+            diagnostics: {
+              timing_version: 1,
+              prepare_ms: preparedAt - turnStarted,
+              submit_ms: started - preparedAt,
+              first_reply_ms: firstReplyAt - started,
+              reply_wait_ms: finishedAt - started,
+              capture_tail_ms: finishedAt - answerChangedAt,
+              browser_total_ms: finishedAt - turnStarted,
+            },
+          };
         }
       }
       // Do not leave a provider generation running after the local broker has
