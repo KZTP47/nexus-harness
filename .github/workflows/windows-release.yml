@@ -390,7 +390,7 @@ jobs:
             notes="Windows installer: SHA-256 plus the pinned Authenticode Subject and signer-certificate SHA-256 are verified by the release workflow."
           fi
           notes="$notes The product-bound offline ZIP carries a CMD-pinned bootstrap, installer, checksum, and v2 identity manifest together for computers without GitHub access. The unsigned outer ZIP/CMD still requires trusted transport. Measured download size: ${installer_mib} MiB; unpacked application: ${unpacked_mib} MiB. Allow at least 2 GiB free while installing."
-          python scripts/ci_budget.py check --reserve-seconds 300
+          python scripts/ci_budget.py check --reserve-seconds 180
           gh release create "$tag" "${assets[@]}" "$offline_bundle" --verify-tag --generate-notes --notes "$notes" --title "Nexus Harness $tag"
 
   public-downloads:
@@ -501,7 +501,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: publish-release
     runs-on: windows-latest
-    timeout-minutes: 3
+    timeout-minutes: 2
     permissions:
       contents: read
     steps:

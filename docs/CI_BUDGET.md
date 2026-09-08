@@ -94,16 +94,20 @@ Immediately before the externally visible publication step, run the read-only
 check with enough reserve for that step and the downstream public readback:
 
 ```text
-python scripts/ci_budget.py check --reserve-seconds 300
+python scripts/ci_budget.py check --reserve-seconds 180
 ```
 
-That command requires more than 300 seconds before the 14-minute cancellation
+That command requires more than 180 seconds before the 14-minute cancellation
 point. The publication job needs `actions: read` to read the attempt, in addition
 to its existing narrowly scoped publication permission. Bound the write step
 with `timeout-minutes` as well. The reserve must cover the write plus the longest
 downstream branch, not merely the time taken by the check. The release reserves
-one minute for publication, three for source ZIP verification, and another minute
-for scheduling and cleanup. Release verification
+one minute for publication and two for the longest public verification job.
+The previous successful public source-ZIP check took 66 seconds; its two-minute
+cap retains that entire check with margin. The initial five-minute reserve
+rejected a fully accepted installer after 10 minutes 20 seconds, despite enough
+time for the measured public checks. The shared 14-minute cancellation point
+and 15-minute execution ceiling remain unchanged. Release verification
 dependencies must still all succeed before publication. A time check does not
 replace product acceptance evidence.
 
