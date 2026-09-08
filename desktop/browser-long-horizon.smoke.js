@@ -469,6 +469,60 @@ async function openBigChat(page, chatId) {
   );
 }
 
+async function startNormalWorkAfterJournalCheck(page, chatId, exactDraft, requests) {
+  const deadline = Date.now() + 30_000;
+  const transient = "Nexus is still checking the saved goal-request journals. "
+    + "Wait for that exact recovery check before starting project work; no request was sent.";
+  const snapshot = () => page.evaluate(([agentId, wanted]) => ({
+    selected: activeConversationFor(agentId)?.id === wanted,
+    hydrating: swarmChatIsHydrating(agentId),
+    ready: directLongGoalRecoveryInventoryReady,
+    error: directLongGoalRecoveryError,
+    preflight: chatGoalRequests.has(swarmChatKey(agentId)),
+    busy: swarmBusy.has(swarmChatRuntimeKey(agentId)),
+    disabled: document.querySelector("#theBigChatWork").disabled,
+    draft: document.querySelector("#theBigChatBox").value,
+    message: document.querySelector("#theBigChatSaidBack").textContent,
+  }), [AGENT_A, chatId]);
+  let attempts = 0;
+  let latest;
+  while (Date.now() < deadline) {
+    latest = await snapshot();
+    assert(!latest.error, `Normal Work recovery authority failed: ${latest.error}`);
+    assert(latest.draft === exactDraft, "Normal Work changed its exact unsent draft.");
+    assert(requests.length === 0, "Normal Work must never retry an admission POST.");
+    if (!latest.selected || latest.hydrating || !latest.ready || latest.disabled) {
+      await sleep(100);
+      continue;
+    }
+    const beforeMessage = latest.message;
+    assert(attempts < 3, "Normal Work was rejected by the journal check three times without sending.");
+    attempts += 1;
+    await page.click("#theBigChatWork", {timeout: Math.max(1, deadline - Date.now())});
+    while (Date.now() < deadline) {
+      if (requests.length) return; // The original exact-order assertions own this send.
+      latest = await snapshot();
+      if (requests.length) return;
+      assert(!latest.error, `Normal Work recovery authority failed: ${latest.error}`);
+      // Work awaits a current goal inventory before its final authority check.
+      // Never retry while that preflight or the actual send still owns the click.
+      if (!latest.preflight && !latest.busy) {
+        if (latest.message === transient) {
+          assert(latest.draft === exactDraft, "A journal-check rejection changed the draft.");
+          assert(requests.length === 0, "A journal-check rejection followed an admission POST.");
+          console.log("info  retrying unsent normal Work after its explicit journal-check rejection");
+          break;
+        }
+        if (latest.message && latest.message !== beforeMessage) {
+          throw new Error(`Normal Work was rejected: ${latest.message}`);
+        }
+      }
+      await sleep(100);
+    }
+  }
+  throw new Error(`Normal Work did not start within 30 seconds (${attempts} clicks): ${JSON.stringify(latest)}`);
+}
+
 async function waitForGoal(page, conversationId, status = "complete") {
   return until(async () => {
     const goals = await page.evaluate(
@@ -562,6 +616,7 @@ async function main() {
   let context = null;
   let server = null;
   let passed = false;
+  const normalRequests = [];
   console.log(`info  isolated source-browser fixture: ${fixture}`);
   try {
     const firstPort = await freePort();
@@ -1168,7 +1223,6 @@ async function main() {
       "Create browser-normal.txt containing exactly browser normal complete. "
       + `${NORMAL_MARKER}.`
     );
-    const normalRequests = [];
     page.on("request", (request) => {
       const pathname = new URL(request.url()).pathname;
       if (request.method() === "POST" && [
@@ -1178,7 +1232,7 @@ async function main() {
       ].includes(pathname)) normalRequests.push(pathname);
     });
     await page.fill("#theBigChatBox", normalGoalText);
-    await page.click("#theBigChatWork");
+    await startNormalWorkAfterJournalCheck(page, chats.normalChat, normalGoalText, normalRequests);
     const normalGoal = await waitForGoal(page, chats.normalChat);
     assertExactTeamGoal(normalGoal);
     assertExactDispatches(coordination, "normal");
@@ -1206,7 +1260,11 @@ async function main() {
         const diagnostic = await failedPage.evaluate(() => ({
           text: document.body.innerText,
           hydrated: typeof swarmBoardHydrated === "undefined" ? null : swarmBoardHydrated,
+          recoveryReady: typeof directLongGoalRecoveryInventoryReady === "undefined" ? null : directLongGoalRecoveryInventoryReady,
+          recoveryError: typeof directLongGoalRecoveryError === "undefined" ? null : directLongGoalRecoveryError,
         })).catch(error => ({error: String(error)}));
+        diagnostic.normalAdmissionRequestCount = normalRequests.length;
+        diagnostic.normalAdmissionRequests = [...normalRequests];
         fs.writeFileSync(path.join(fixture, `failure-${index}.json`), JSON.stringify(diagnostic, null, 2));
       }
     }
