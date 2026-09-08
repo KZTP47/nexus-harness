@@ -40,7 +40,10 @@ from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_auth
 from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
 from .redaction import CredentialRedactor
 from .runtime_integrity import mac, quarantine_marker
-from .goal_verification import CHECK_POLICY, SHARED_GOAL_PROFILE, capture_verification_contract, verification_project
+from .goal_verification import (
+    CHECK_POLICY, SHARED_GOAL_PROFILE, capture_verification_contract,
+    requested_runtime_verification, runtime_verification_paths, verification_project,
+)
 from .swarm_runs import _base
 from . import swarm_work
 from . import goal_dialogue
@@ -713,11 +716,12 @@ def _project_baseline_manifest(root: Path) -> dict[str, str]:
 def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
     manifest = baseline if baseline is not None else _project_baseline_manifest(Path(document["project"]["path"]))
     return {
-        "schema_version": 2, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "schema_version": 3, "objective_epoch": int(document.get("objective_epoch") or 1),
         "artifact_generation": int((document.get("dialogue") or {}).get("artifact_generation") or 0),
         "source_sha256": hashlib.sha256(_canonical(manifest).encode("utf-8")).hexdigest(),
         "verification_contract_sha256": str((document.get("verification_contract") or {}).get("fingerprint_sha256") or ""),
         "success_criteria_contract_sha256": str((document.get("success_criteria_contract") or {}).get("fingerprint_sha256") or ""),
+        "completion_check_policy_sha256": hashlib.sha256(_canonical(CHECK_POLICY).encode("utf-8")).hexdigest(),
     }
 
 
@@ -6749,6 +6753,24 @@ class GoalStore:
                             })
                 if checked.get("status") == "not_configured":
                     current_tree, current_manifest = swarm_work._project_tree_merkle(Path(document["project"]["path"]))
+                    changed_paths = list(dict.fromkeys(
+                        str(change["path"])
+                        for artifact in document.get("artifacts", []) if isinstance(artifact, dict)
+                        for change in artifact.get("changes", [])
+                        if isinstance(change, dict) and change.get("path")
+                    ))
+                    runtime_paths = runtime_verification_paths(
+                        Path(document["project"]["path"]), document["objective"], changed_paths, current_manifest,
+                    )
+                    if runtime_paths or requested_runtime_verification(document["objective"]):
+                        checked.update({
+                            "status": "failed", "basis": "runtime_verification_required",
+                            "runtime_paths": runtime_paths[:100],
+                            "reason": "Executable deliverables need actual execution evidence. Add meaningful "
+                                      "checks for launch and the requested behavior, expose their command at the "
+                                      "selected project root, and run selected verification. An authenticated "
+                                      "snapshot and team agreement alone cannot establish functional completion.",
+                        })
                     contributions = [one for one in document["tasks"] if one.get("required_contributor_id") and one["state"] != "cancelled"]
                     if result.get("current_tree_merkle") != current_tree or not contributions or not all(
                         one["state"] == "complete" and one.get("artifacts")
@@ -7459,8 +7481,14 @@ class LongHorizonRuntime:
         completion_guidance = (
             "The engine-generated criterion 'Configured deterministic verification passes' is conditional for this goal. "
             "If run_selected_verification returns not_configured, no project checks are selected and no tests ran; "
-            "that alone is not a blocker. Inspect the actual deliverables and complete your contribution when the objective "
-            "is fulfilled, with file:<relative-path> or verified-no-change evidence for the current result. "
+            "that can support only in-scope non-executable deliverables. Executable source, games and applications "
+            "need real execution evidence even when the user did not explicitly request tests. If verification returns "
+            "runtime_verification_required, author meaningful checks and expose a discoverable test command at the "
+            "selected project root, including checks for a deliverable created in a new subfolder. Run "
+            "run_selected_verification again after applying the files. Preserve command approval requirements; "
+            "if approval or a runner is missing, report the exact requirement without claiming completion. "
+            "Inspect actual deliverables and complete your contribution only when the objective is fulfilled, "
+            "with file:<relative-path> or verified-no-change evidence for the current result. "
             "Existing finished deliverables do not need artificial edits. Nexus requires every participant's current "
             "authenticated snapshot and agreement before completion. Any explicitly requested testing still needs "
             "real execution evidence. Never claim that tests passed when no tests ran. "
@@ -7481,6 +7509,31 @@ class LongHorizonRuntime:
             + review_packet
             + "\n\nCOMPLETION EVIDENCE\nFor every success criterion this task supports, return criteria_evidence using the exact criterion text and refs such as artifact:<transaction-id>, file:<relative-path>, or review:<task-id>. When inspecting an existing result without edits, use the exact reserved ref verified-no-change; Nexus will bind that declaration to the authenticated snapshot it records after your response. Generic claims or a generic test pass do not prove a custom criterion. "
             + completion_guidance
+            + "\n\nIMPLEMENTATION AND REVIEW QUALITY\n"
+              "Before implementation, derive a concise checklist of independently required outcomes from the whole "
+              "user objective. Keep it in shared task evidence and use it during handoff and final review. "
+              "A teammate's praise, file inventory or claim that code looks complete is not functional evidence. "
+              "The reviewing teammate must seek a concrete failure: inspect the exact launch method and dependency "
+              "loading, exercise representative user interactions, error handling and restart/progression where relevant, "
+              "and compare the observed result with the requested level of detail and polish. For browser games/apps, "
+              "test the launch URL/protocol actually recommended to the user and inspect console/network failures; "
+              "a served page and a file:// page are not equivalent. Checks must exercise production behavior, not just "
+              "assert that source text or files exist. Read every relevant truncated file through its remaining offsets. "
+              "Use the tools exposed for this turn: this structured Nexus route does not itself provide an interactive "
+              "browser or arbitrary shell. Do not imply that reading HTML/JavaScript or run_selected_verification with "
+              "no commands launched the app. Author runnable checks using the approved project-verification mechanism; "
+              "state any remaining visual/runtime observation that the available tools cannot establish. "
+              "For local browser deliverables, Nexus's bundled Chromium can execute a contained Playwright subset "
+              "through selected verification. Author a *.spec.cjs file using literal page.goto('/your-folder/index.html'), "
+              "page.locator('#start').click() or .fill('literal'), and "
+              "await expect(page.locator('#status')).toHaveText('Running') (also toHaveValue/toHaveAttribute). "
+              "Use actual production selectors and expected behavior, with one concrete scenario per file. "
+              "The portable selected command is ['node', 'node_modules/playwright/cli.js', 'test', 'tests/e2e/launch.spec.cjs']; "
+              "Nexus resolves its bundled runtime without a project-local browser installation. Propose it through "
+              "the existing project test-command approval flow, or expose it in the selected root's test script for "
+              "discovery. The local probe serves a disposable project on loopback HTTP; it does not verify file:// "
+              "launch, external CDNs or arbitrary project servers. Keep the user's required launch method, disclose "
+              "unsupported observations and check dependencies; do not silently substitute HTTP evidence for file://. "
             + "\n\nChoose only the next useful action. " + team_guidance
             + "\n\nACTION FIELD RULES\n" + action_protocol.RULES + "\n"
             + "Request review only for meaningful risk, broad changes, failed checks, or when you need it. Ask the user only for genuine ambiguity, new authority, risky/irreversible action, missing access, or an unresolved blocker. "

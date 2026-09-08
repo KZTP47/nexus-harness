@@ -176,21 +176,21 @@ class SharedGoalVerificationTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed", result)
         self.assertIn("escape", result["basis"])
 
-    def test_no_selected_checks_are_reported_without_claiming_test_execution(self):
+    def test_no_selected_checks_for_runtime_source_require_actual_execution(self):
         self.project["test_commands"] = []
         with mock.patch.object(
             swarm_work, "_verification_commands", return_value=([], "discovered"),
         ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
             result = self.verify()
-            self.assertEqual(result["status"], "not_configured", result)
-            self.assertEqual(result["basis"], "no_selected_checks")
+            self.assertEqual(result["status"], "failed", result)
+            self.assertEqual(result["basis"], "runtime_verification_required")
             self.assertEqual(result["commands"], [])
             self.assertIn("no tests ran", result["reason"])
             self.assertEqual(result["current_tree_merkle"], swarm_work._project_tree_merkle(self.root)[0])
             self.assertEqual(result["check_policy"], goal_verification.CHECK_POLICY)
             self.assertNotIn("verification_analysis", result)
             context = self.verify(changed=[], require_changes=False)
-            self.assertEqual(context["status"], "not_configured", context)
+            self.assertEqual(context["status"], "failed", context)
             run.assert_not_called()
             # A changed project must receive fresh snapshot evidence.
             (self.root / "game.py").write_text("def winner(score): return None\n", encoding="utf-8")
@@ -227,7 +227,7 @@ class SharedGoalVerificationTests(unittest.TestCase):
 
     def test_policy_is_versioned_fingerprinted_and_legacy_command_authority_survives(self):
         current = goal_verification.capture_verification_contract(self.config, self.project, self.root)
-        self.assertEqual(current["schema_version"], 3)
+        self.assertEqual(current["schema_version"], 4)
         self.assertEqual(current["check_policy"], goal_verification.CHECK_POLICY)
         saved = {"project": self.project, "objective": "Inspect the game", "verification_contract": current}
         self.assertEqual(goal_verification.verification_project(self.config, saved)["test_commands"], [self.command])

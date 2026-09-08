@@ -225,7 +225,7 @@ class LongHorizonCollaborationRecoveryTests(unittest.TestCase):
         self.runtime.store._mutate(goal["goal_id"], old_verification)
         self.restart()
         resumed = self.runtime.store.control(goal["goal_id"], "resume")
-        self.assertEqual(resumed["verification_contract"]["schema_version"], 3)
+        self.assertEqual(resumed["verification_contract"]["schema_version"], 4)
         self.assertEqual(resumed["verification_contract"]["test_commands"], [command])
         self.assertEqual(resumed["tasks"][1]["context_steps"][0]["state"], "superseded")
         seen = []

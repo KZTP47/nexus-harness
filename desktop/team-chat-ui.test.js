@@ -54,10 +54,10 @@ test("only correlated routine Nexus goal transitions use compact status rows", (
     context.one = one;
     return vm.runInContext("isRoutineGoalStatusTurn(one)", context);
   };
-  for (const status of ["queued", "running", "complete"]) {
+  for (const status of ["queued", "running"]) {
     assert.equal(check({...routine, correlation: {...routine.correlation, goal_status: status}}), true, status);
   }
-  for (const status of ["paused", "failed", "waiting_for_user", "waiting_for_project", "cancelled", "cancelling", "unknown"]) {
+  for (const status of ["complete", "paused", "failed", "waiting_for_user", "waiting_for_project", "cancelled", "cancelling", "unknown"]) {
     assert.equal(check({...routine, correlation: {...routine.correlation, goal_status: status}}), false, status);
   }
   for (const changes of [
@@ -212,6 +212,7 @@ function fixture(view = "maximized") {
     swarmChatKey() { return `${state.agent.id}:${state.conversation.id}`; },
     swarmChatRuntimeKey() { return context.swarmChatKey(); },
     swarmChatIsHydrating() { return false; },
+    swarmChatAttachmentsAreLoading() { return Boolean(state.attachmentLoading); },
     projectWorkPauseForMessage() { return ""; },
     limitsForSwarmChat() { return {input_characters: 200000}; },
     syncChatTeamReadiness() { return []; },
@@ -287,6 +288,82 @@ function fixture(view = "maximized") {
 }
 
 for (const view of ["compact", "maximized"]) {
+  test(`${view}: pending file reads keep the draft and prevent premature send`, async () => {
+    const f = fixture(view);
+    f.attachmentLoading = true;
+    await f.send();
+    assert.equal(f.calls.length, 0);
+    assert.equal(f.box.value, "Use keyboard controls too");
+    const notice = view === "compact" ? f.notices.join(" ") : f.context.$("theBigChatSaidBack").textContent;
+    assert.match(notice, /attached files.*loading/);
+    f.attachmentLoading = false;
+    f.inventory = [];
+    f.context.longGoals = [];
+    const attachment = {name: "copied.txt", type: "text/plain", size: 4, data: "data:text/plain;base64,dGVzdA=="};
+    f.context.swarmChatAttachments.set(f.key, [attachment]);
+    await f.send();
+    const request = f.calls.find(one => one.url === "/api/swarm/say");
+    assert.equal(request.body.chat, f.conversation.id);
+    assert.deepEqual(request.body.attachments, [attachment]);
+  });
+  for (const outcome of ["no goal", "discovered goal", "switched chat"]) {
+    test(`${view}: a paste during delayed goal discovery keeps its draft and files (${outcome})`, async () => {
+      const f = fixture(view);
+      f.inventory = outcome === "discovered goal" ? [f.goal] : [];
+      f.context.longGoals = [];
+      f.context.swarmChatAttachmentLoads = new Map();
+      f.context.renderChatAttachments = () => {};
+      let finishInventory, finishRead;
+      f.inventoryHook = () => new Promise(resolve => { finishInventory = resolve; });
+      f.context.FileReader = class {
+        constructor() { this.listeners = new Map(); }
+        addEventListener(name, callback) { this.listeners.set(name, callback); }
+        readAsDataURL() {
+          finishRead = () => {
+            this.result = "data:text/plain;base64,dGVzdA==";
+            this.listeners.get("load")();
+          };
+        }
+      };
+      vm.runInContext(section("function swarmChatAttachmentsAreLoading", "function swarmChatActivityFor")
+        + section("function readChatAttachment", "function attachmentChip"), f.context);
+      const sending = f.send();
+      assert.equal(typeof finishInventory, "function", "the real send handler must reach the delayed inventory");
+      let prevented = false;
+      f.context.pasteChatAttachments(f.agent.id, {
+        currentTarget: f.box,
+        clipboardData: {files: [{name: "copied.txt", type: "text/plain", size: 4}]},
+        preventDefault() { prevented = true; },
+      });
+      assert.equal(prevented, true);
+      assert.equal(f.context.swarmChatAttachmentLoads.get(f.key), 1);
+      if (outcome === "switched chat") f.conversation = {...f.conversation, id: "other-chat"};
+      finishInventory();
+      await sending;
+      assert.deepEqual(f.calls.map(one => one.url), ["/api/long-horizon/goals"]);
+      assert.equal(f.box.value, "Use keyboard controls too");
+      for (const drafts of [f.context.swarmChatComposerDrafts, f.context.theBigChatComposerDrafts]) {
+        assert.equal(drafts.get(f.key).value, f.box.value);
+      }
+      assert.equal(f.context.swarmBusy.size, 0);
+      if (outcome !== "switched chat") assert.match(f.notices.join(" "), /attached files.*loading/);
+      finishRead();
+      await new Promise(setImmediate);
+      assert.equal(f.context.swarmChatAttachmentLoads.size, 0);
+      const attachment = f.context.swarmChatAttachments.get(f.key)[0];
+      assert.equal(attachment.data, "data:text/plain;base64,dGVzdA==");
+      assert.equal(f.calls.length, 1, "finishing the file read must not silently submit the draft");
+      if (outcome === "no goal") {
+        f.inventoryHook = null;
+        await f.send();
+        const sent = f.calls.find(one => one.url === "/api/swarm/say");
+        assert.equal(sent.body.chat, f.conversation.id);
+        assert.deepEqual(sent.body.attachments, [JSON.parse(JSON.stringify(attachment))]);
+      } else if (outcome === "switched chat") {
+        assert.equal(f.context.swarmChatAttachments.has(f.context.swarmChatKey()), false);
+      }
+    });
+  }
   for (const newerOwner of [false, true]) {
     test(`${view}: collapsed admission releases only its own busy lease after delayed refresh (newer owner: ${newerOwner})`, async () => {
       const f = fixture(view);

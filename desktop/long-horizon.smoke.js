@@ -346,7 +346,8 @@ async function submitGoal(page, chatId, words) {
   );
   await page.fill("#theBigChatBox", words);
   await page.waitForFunction(
-    () => !document.getElementById("theBigChatWork").disabled,
+    () => !document.getElementById("theBigChatWork").disabled
+      && directLongGoalRecoveryInventoryReady,
     null, {timeout: 30000},
   );
   page.once("dialog", (dialog) => dialog.accept());
@@ -425,6 +426,7 @@ async function main() {
       }
     });
     await page.fill("#theBigChatBox", recoveryGoal);
+    await page.waitForFunction(() => directLongGoalRecoveryInventoryReady, null, {timeout: 30000});
     page.once("dialog", (dialog) => dialog.accept());
     await page.click("#theBigChatWork");
     await page.waitForSelector(
@@ -575,10 +577,15 @@ async function main() {
     // user starts the next goal only after reviewing the completed result and
     // seeing this exact chat's new-work controls become ready.
     const completedRecovery = page.locator(
-      `#theBigChatSaid .chat-goal-status-row[data-goal-id="${recoveredGoal.goal_id}"][data-goal-status="complete"]`,
+      `#theBigChatSaid .chat-goal-completion[data-goal-id="${recoveredGoal.goal_id}"][data-goal-status="complete"]`,
     );
     await completedRecovery.waitFor({state: "visible", timeout: 30000});
     await completedRecovery.scrollIntoViewIfNeeded();
+    if (await completedRecovery.count() !== 1
+        || await completedRecovery.locator(".chat-goal-completion-title").textContent() !== "Task completed"
+        || !await completedRecovery.locator(".chat-goal-completion-icon img").isVisible()) {
+      throw new Error("The exact completed goal is missing its distinct Nexus icon message.");
+    }
     await page.waitForFunction(([agentId, chatId, goalId]) => {
       const context = chatLongGoalContext(agentId);
       const work = document.getElementById("theBigChatWork");
@@ -615,6 +622,7 @@ async function main() {
     });
     try {
       await page.fill("#theBigChatBox", discardGoal);
+      await page.waitForFunction(() => directLongGoalRecoveryInventoryReady, null, {timeout: 30000});
       page.once("dialog", (dialog) => dialog.accept());
       await page.click("#theBigChatWork");
       await page.waitForSelector(
@@ -674,7 +682,49 @@ async function main() {
     if (!fs.existsSync(enteredA)) throw new Error("Goal A never reached its real provider process.");
     console.log("pass  Chat 1 shows its durable prompt while Goal A is still running");
 
-    await submitGoal(page, chats.chatB, goalB);
+    // Hold Chat B's history response past the confirmed registry switch.
+    // The second composer must accept a real goal while Chat A is working;
+    // waiting for this optional read used to disable every chat control.
+    // Delay delivery of the real fetch result instead of Chromium's network
+    // interceptor, whose teardown races cancelled polling requests in Electron.
+    await page.evaluate(chatId => {
+      const original = window.fetch;
+      let release;
+      const delayed = new Promise(resolve => { release = resolve; });
+      const barrier = {original, release, held: false};
+      window.__nexusSmokeHistoryBarrier = barrier;
+      window.fetch = function(input, options) {
+        const url = new URL(typeof input === "string" ? input : input.url, location.href);
+        const response = original.call(this, input, options);
+        if (url.pathname !== "/api/swarm/said" || url.searchParams.get("chat") !== chatId) {
+          return response;
+        }
+        barrier.held = true;
+        // Delay rejection too: an aborted older poll must not release the
+        // navigation regression's barrier before the second goal is submitted.
+        return response.then(
+          result => delayed.then(() => result),
+          error => delayed.then(() => { throw error; }),
+        );
+      };
+    }, chats.chatB);
+    try {
+      await submitGoal(page, chats.chatB, goalB);
+      if (!await page.evaluate(() => window.__nexusSmokeHistoryBarrier.held)) {
+        throw new Error("The concurrent-chat check did not hold its history response.");
+      }
+      if (fs.existsSync(path.join(coordination, "release-a.marker"))) {
+        throw new Error("The first goal was released before the second composer check.");
+      }
+      console.log("pass  Chat 2 accepts typing and Work together while Chat 1 runs and Chat 2 history is delayed");
+    } finally {
+      await page.evaluate(() => {
+        const barrier = window.__nexusSmokeHistoryBarrier;
+        window.fetch = barrier.original;
+        barrier.release();
+        delete window.__nexusSmokeHistoryBarrier;
+      });
+    }
     let goals = await waitForGoals(page, (items) => (
       items.some((one) => one.conversation_id && one.status === "waiting_for_project")
       && items.some((one) => one.status === "running" || one.status === "queued")
@@ -726,6 +776,13 @@ async function main() {
     const restored = await running.page.textContent("#theBigChatSaid");
     if (!restored.includes(goalB) || /Answer received/i.test(restored)) {
       throw new Error(`Restart did not restore Chat 2 truthfully: ${restored}`);
+    }
+    const restoredCompletion = running.page.locator(
+      `#theBigChatSaid .chat-goal-completion[data-goal-id="${second.goal_id}"]`,
+    );
+    if (await restoredCompletion.count() !== 1
+        || !await restoredCompletion.locator(".chat-goal-completion-icon img").isVisible()) {
+      throw new Error("Restart lost or duplicated the exact Nexus completion message.");
     }
     const restoredGoals = await running.page.evaluate(
       async () => (await request("/api/long-horizon/goals")).goals || [],

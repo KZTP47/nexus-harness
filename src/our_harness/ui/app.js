@@ -7051,6 +7051,7 @@ let swarmBoardHydrated = false;
 // window and this minute, and two windows should not fight over it.
 let swarmChats = [];
 const swarmChatAttachments = new Map();
+const swarmChatAttachmentLoads = new Map();
 // Compact cards share one DOM composer per lead agent as the selected saved
 // chat changes. Keep the actual draft and caret per exact chat so jumping away
 // from an in-flight turn cannot let its delayed completion erase a sibling's
@@ -7362,6 +7363,11 @@ async function sendToActiveChatGoal(agentId, box) {
     // admission. Never fall through to a one-agent request using stale UI state.
     const inventory = await request("/api/long-horizon/goals");
     if (!stillSelected()) return {handled: true};
+    // A paste can start while this inventory read is pending. Recheck the
+    // confirmed chat before either sending to its goal or falling through.
+    if (swarmChatAttachmentsAreLoading(agentId)) {
+      throw new Error("Wait for the attached files to finish loading before sending.");
+    }
     if (!Array.isArray(inventory.goals)) throw new Error("Nexus could not read the team's saved goals. Your message is still in the composer; try again.");
     const context = chatLongGoalContext(agentId, inventory.goals);
     longGoals = inventory.goals;
@@ -7551,7 +7557,8 @@ function syncChatGoalControls(agentId, card = null) {
     send.title = problem || "Send your message to the agents working on this chat's goal";
     send.disabled = held || Boolean(problem) || goal?.status === "cancelling"
       || swarmChatIsBusy(agentId) || swarmChatIsResetting(agentId)
-      || swarmChatIsHydrating(agentId) || swarmConversationSwitching.has(agentId);
+      || swarmChatIsHydrating(agentId) || swarmConversationSwitching.has(agentId)
+      || swarmChatAttachmentsAreLoading(agentId);
   } else if (send && held) send.disabled = true;
   for (const button of [find(".swarm-chat-collaborate", "theBigChatCollaborate"),
     find(".swarm-chat-work", "theBigChatWork")]) {
@@ -7728,6 +7735,10 @@ function swarmChatIsResetting(agentId, chatId = undefined) {
 
 function swarmChatIsHydrating(agentId) {
   return swarmConversationHydrating.has(agentId);
+}
+
+function swarmChatAttachmentsAreLoading(agentId) {
+  return (swarmChatAttachmentLoads.get(swarmChatKey(agentId)) || 0) > 0;
 }
 
 function swarmChatActivityFor(agentId, chatId = undefined) {
@@ -11562,7 +11573,7 @@ function setWhatCanBePressedInSwarm() {
     const busy = swarmChatIsBusy(theBigOne);
     const identityChanging = swarmChatIsResetting(theBigOne)
       || swarmConversationSwitching.has(theBigOne) || swarmChatIsHydrating(theBigOne);
-    const waiting = busy || identityChanging;
+    const waiting = busy || identityChanging || swarmChatAttachmentsAreLoading(theBigOne);
     const stopping = swarmChatIsStopping(theBigOne);
     const recovery = workRecoveryFor(theBigOne);
     const lone = isLoneAgentChat(theBigOne);
@@ -12104,6 +12115,9 @@ async function loadConversationsFor(agentId, refresh = true) {
     if (controller.signal.aborted || !swarmChats.includes(held)
         || swarmConversationListRevisions.get(agentId) !== revision) return false;
     const identityChanged = applyConversationList(agentId, said);
+    // The saved identity is now known. History may be slow while another
+    // goal appends evidence, but it must not keep a new composer disabled.
+    setWhatCanBePressedInSwarm();
     // A metadata-only request may have superseded a full request while both
     // were in flight. The winning request inherits the pending transcript
     // intent instead of leaving a correctly selected chat visibly empty.
@@ -12148,21 +12162,25 @@ async function createConversationFor(agentId, peerId, scope = "") {
   swarmConversationSwitching.add(agentId);
   nextConversationListRevision(agentId);
   setWhatCanBePressedInSwarm();
+  let createdChatId = "";
   try {
     const said = await request("/api/swarm/chats/create", {
       method: "POST", body: JSON.stringify({agent: agentId, peer: peerId, scope}),
     });
     applyConversationList(agentId, said);
+    createdChatId = activeConversationIdFor(agentId);
     keepWhatWasSaidTo(agentId, []);
-    await refreshTheChatFor(agentId);
+    // Only the registry mutation owns the navigation lock. Transcript reads
+    // carry their own chat/revision guards and report failures independently.
+    void refreshTheChatFor(agentId);
     sayInBigChatConversationFor(agentId,
       scope === "single" ? "New direct chat created." : "New pair chat created.");
-    if (bigChatShows(agentId)) $("theBigChatBox").focus();
   } catch (error) {
     sayInBigChatConversationFor(agentId, error.message);
   } finally {
     finishConversationSwitch(agentId);
   }
+  if (createdChatId && bigChatShows(agentId, createdChatId)) $("theBigChatBox").focus();
 }
 
 async function activateConversationFor(agentId, chatId) {
@@ -12194,7 +12212,7 @@ async function activateConversationFor(agentId, chatId) {
     if (!swarmChats.includes(held) || held.conversation !== chatId) return;
     applyConversationList(agentId, said);
     if (bigChatShows(agentId, chatId)) $("theBigChatSaidBack").textContent = "Switched chat.";
-    await refreshTheChatFor(agentId);
+    void refreshTheChatFor(agentId);
   } catch (error) {
     failed = error;
   } finally {
@@ -12229,7 +12247,7 @@ async function archiveConversationFor(agentId, chatId) {
     });
     applyConversationList(agentId, said);
     keepWhatWasSaidTo(agentId, []);
-    if (activeConversationFor(agentId)) await refreshTheChatFor(agentId);
+    if (activeConversationFor(agentId)) void refreshTheChatFor(agentId);
     sayInBigChatConversationFor(agentId, "Chat archived. Its history is still saved.");
   } catch (error) {
     sayInBigChatConversationFor(agentId, error.message);
@@ -12251,14 +12269,14 @@ async function restoreConversationFor(agentId, chatId) {
       method: "POST", body: JSON.stringify({agent: agentId, chat: chatId}),
     });
     applyConversationList(agentId, said);
-    await refreshTheChatFor(agentId);
+    void refreshTheChatFor(agentId);
     sayInBigChatConversationFor(agentId, "Chat restored with its saved history.");
-    if (bigChatShows(agentId)) $("theBigChatBox").focus();
   } catch (error) {
     sayInBigChatConversationFor(agentId, error.message);
   } finally {
     finishConversationSwitch(agentId);
   }
+  if (bigChatShows(agentId, chatId)) $("theBigChatBox").focus();
 }
 
 async function selectConversationProject(agentId, projectId) {
@@ -12725,27 +12743,68 @@ function readChatAttachment(file) {
 
 async function addChatAttachments(agentId, files) {
   const key = swarmChatKey(agentId);
-  const existing = swarmChatAttachments.get(key) || [];
   const selected = [...files];
-  if (existing.length + selected.length > 6) {
+  if (!selected.length) return;
+  if (selected.length > 6) {
     showError("Attach at most 6 files at once.");
     return;
   }
+  swarmChatAttachmentLoads.set(key, (swarmChatAttachmentLoads.get(key) || 0) + 1);
+  setWhatCanBePressedInSwarm();
   try {
     const added = await Promise.all(selected.map(readChatAttachment));
-    if ([...existing, ...added].reduce((sum, one) => sum + one.size, 0) > 8000000) {
+    // Re-read after asynchronous FileReaders finish: another paste or removal
+    // may have changed this exact chat while the bytes were loading.
+    const combined = [...(swarmChatAttachments.get(key) || [])];
+    for (const one of added) {
+      if (!combined.some(kept => kept.name === one.name && kept.type === one.type
+          && kept.data === one.data)) combined.push(one);
+    }
+    if (combined.length > 6) throw new Error("Attach at most 6 files at once.");
+    if (combined.reduce((sum, one) => sum + one.size, 0) > 8000000) {
       throw new Error("The attachments together are larger than 8 MB.");
     }
-    swarmChatAttachments.set(key, [...existing, ...added]);
+    swarmChatAttachments.set(key, combined);
     renderChatAttachments(agentId);
   } catch (error) {
     showError(String(error.message || error));
+  } finally {
+    const remaining = (swarmChatAttachmentLoads.get(key) || 1) - 1;
+    if (remaining) swarmChatAttachmentLoads.set(key, remaining);
+    else swarmChatAttachmentLoads.delete(key);
+    setWhatCanBePressedInSwarm();
   }
 }
 
-function removeChatAttachment(agentId, index) {
-  const key = swarmChatKey(agentId);
+function pasteChatAttachments(agentId, event) {
+  if (!agentId || event.currentTarget?.disabled) return false;
+  const clipboard = event.clipboardData;
+  const files = [...(clipboard?.files || [])];
+  // Chromium can expose the same copied file through both views. Prefer its
+  // FileList and use file-kind items only when that list is empty.
+  if (!files.length) {
+    for (const item of clipboard?.items || []) {
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  if (!files.length) return false; // Ordinary text paste retains browser behavior.
+  event.preventDefault();
+  const attach = event.currentTarget === $("theBigChatBox") ? $("theBigChatAttach")
+    : theChatCardFor(agentId)?.querySelector(".swarm-chat-attach");
+  if (attach?.disabled) {
+    showError("Wait until this chat's Attach button is available before pasting files.");
+    return true;
+  }
+  void addChatAttachments(agentId, files);
+  return true;
+}
+
+function removeChatAttachment(agentId, index, key = swarmChatKey(agentId), attachment = null) {
   const kept = [...(swarmChatAttachments.get(key) || [])];
+  if (attachment) index = kept.indexOf(attachment);
+  if (index < 0 || index >= kept.length) return;
   kept.splice(index, 1);
   if (kept.length) swarmChatAttachments.set(key, kept);
   else swarmChatAttachments.delete(key);
@@ -12753,6 +12812,7 @@ function removeChatAttachment(agentId, index) {
 }
 
 function attachmentChip(agentId, one, index) {
+  const key = swarmChatKey(agentId);
   const chip = make("span", "chat-attachment");
   if (String(one.type || "").startsWith("image/") && one.data) {
     const preview = document.createElement("img");
@@ -12764,7 +12824,8 @@ function attachmentChip(agentId, one, index) {
   const remove = make("button", "chat-attachment-remove", "×");
   remove.type = "button";
   remove.title = `Remove ${one.name}`;
-  remove.addEventListener("click", () => removeChatAttachment(agentId, index));
+  remove.setAttribute("aria-label", `Remove ${one.name}`);
+  remove.addEventListener("click", () => removeChatAttachment(agentId, index, key, one));
   chip.append(remove);
   return chip;
 }
@@ -12852,6 +12913,7 @@ function oneSwarmChatCard(held) {
   );
   swarmChatComposerKeys.set(held.agent, composerKey);
   form.append(box);
+  box.addEventListener("paste", event => pasteChatAttachments(held.agent, event));
   const attachments = make("div", "chat-attachments");
   form.append(attachments);
   const files = document.createElement("input");
@@ -13028,7 +13090,7 @@ function setWhatCanBePressedInAChat(card) {
   const identityChanging = swarmChatIsResetting(card.dataset.agent)
     || swarmConversationSwitching.has(card.dataset.agent)
     || swarmChatIsHydrating(card.dataset.agent);
-  const waiting = busy || identityChanging;
+  const waiting = busy || identityChanging || swarmChatAttachmentsAreLoading(card.dataset.agent);
   const lone = isLoneAgentChat(card.dataset.agent);
   const conversation = activeConversationFor(card.dataset.agent);
   const bindingProblem = conversation?.binding_problem;
@@ -13261,7 +13323,7 @@ function normalizedLongHorizonCorrelation(one) {
 function appendLongHorizonGoalLink(container, correlation) {
   if (!correlation?.goalId) return;
   const open = make("button", "compact long-horizon-chat-link",
-    correlation.status === "complete" ? "Open verified goal" : "Open goal in Mission control");
+    correlation.status === "complete" ? "Open goal details" : "Open goal in Mission control");
   open.type = "button";
   open.dataset.goalId = correlation.goalId;
   open.dataset.goalStatus = correlation.status;
@@ -13274,7 +13336,7 @@ function appendLongHorizonGoalLink(container, correlation) {
 function isRoutineGoalStatusTurn(one) {
   const correlation = normalizedLongHorizonCorrelation(one);
   return isNexusChatTurn(one) && one?.phase === "long_horizon_status"
-    && ["queued", "running", "complete"].includes(correlation?.status)
+    && ["queued", "running"].includes(correlation?.status)
     && !one.structured_state_unavailable && !one.participant_outcome
     && !one.questions?.length && !one.attachments?.length;
 }
@@ -13298,6 +13360,52 @@ function aChatGoalStatusRow(speaker, text, at, correlation, className, metadata 
   if (under.length) details.append(make("p", "hint", under.join(" | ")));
   appendLongHorizonGoalLink(details, correlation);
   row.append(details);
+  return row;
+}
+
+function chatGoalCompletion(one) {
+  const correlation = normalizedLongHorizonCorrelation(one);
+  return isNexusChatTurn(one) && one?.phase === "long_horizon_status"
+    && correlation?.status === "complete" && !one.structured_state_unavailable
+    && !one.participant_outcome && !one.questions?.length && !one.attachments?.length
+    ? correlation : null;
+}
+
+function uniqueChatCompletionTurns(turns) {
+  const latest = new Map();
+  turns.forEach((one, index) => {
+    const completion = chatGoalCompletion(one);
+    if (completion) latest.set(completion.goalId, index);
+  });
+  return turns.filter((one, index) => {
+    const completion = chatGoalCompletion(one);
+    return !completion || latest.get(completion.goalId) === index;
+  });
+}
+
+function aChatGoalCompletionRow(text, at, correlation, className) {
+  const row = make("li", `${className} nexus-turn chat-goal-completion`);
+  row.dataset.goalId = correlation.goalId;
+  row.dataset.goalStatus = "complete";
+  row.setAttribute("aria-label", "Nexus Harness task completion");
+  const heading = make("div", "chat-goal-completion-heading");
+  heading.append(aChatTurnFace({speaker_id: "nexus"}, null, "chat-goal-completion-icon", 32));
+  const title = make("div", "chat-goal-completion-titles");
+  title.append(make("span", "chat-goal-completion-speaker", "Nexus Harness"));
+  title.append(make("strong", "chat-goal-completion-title", "Task completed"));
+  heading.append(title);
+  row.append(heading);
+  row.append(make("p", "chat-goal-completion-text",
+    "This goal is marked complete. Open its details to review the result and verification evidence."));
+  appendLongHorizonGoalLink(row, correlation);
+  // A historical completion status alone is not proof that checks passed.
+  // Preserve its exact original wording as a saved record, without upgrading
+  // that wording into a new verification claim in the completion heading.
+  const record = make("details", "chat-turn-details chat-goal-completion-record");
+  record.append(make("summary", "", "Saved status record"));
+  appendChatText(record, text);
+  if (at) record.append(make("p", "hint", at));
+  row.append(record);
   return row;
 }
 
@@ -13596,6 +13704,7 @@ function appendInlineUserQuestions(row, agent, rawQuestions, alreadyAnswered) {
 }
 
 function putTheChatTurnsIn(list, agent, said, scroll = true) {
+  said = uniqueChatCompletionTurns(said);
   list.replaceChildren();
   if (!said.length) {
     list.append(make("li", "hint",
@@ -13609,6 +13718,11 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
     const activity = normalizedChatToolActivity(one);
     if (activity) {
       list.append(aChatToolActivityRow(chatTurnSpeaker(one, agent), activity, one.at, "talk-turn"));
+      continue;
+    }
+    const completion = chatGoalCompletion(one);
+    if (completion) {
+      list.append(aChatGoalCompletionRow(one.text, one.at, completion, "talk-turn"));
       continue;
     }
     if (isRoutineGoalStatusTurn(one)) {
@@ -14391,6 +14505,10 @@ async function sendWhatIsTypedTo(agentId) {
   }
   if (swarmConversationSwitching.has(agentId)) {
     sayInTheChatFor(agentId, "Finishing the chat switch first.");
+    return;
+  }
+  if (swarmChatAttachmentsAreLoading(agentId)) {
+    sayInTheChatFor(agentId, "Wait for the attached files to finish loading before sending.");
     return;
   }
   if (!goalQueueItem) {
@@ -17468,7 +17586,7 @@ function renderTheBigChat() {
 
   const turns = [];
   let latestUserPrompt = "";
-  for (const one of chatTurnsWhileWorking(theBigOne, keptTranscriptFor(theBigOne))) {
+  for (const one of uniqueChatCompletionTurns(chatTurnsWhileWorking(theBigOne, keptTranscriptFor(theBigOne)))) {
     if (one.who === "you" && String(one.text || "").trim()) latestUserPrompt = one.text;
     const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
       "agent_discussion", "agent_progress", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
@@ -17486,6 +17604,7 @@ function renderTheBigChat() {
       speakerId: one.speaker_id || "",
       nexus: isNexusChatTurn(one),
       compactGoalStatus: isRoutineGoalStatusTurn(one),
+      completion: chatGoalCompletion(one),
       toolActivity: normalizedChatToolActivity(one),
       structuredStateUnavailable: Boolean(one.structured_state_unavailable),
       participantOutcome: normalizedParticipantOutcome(one),
@@ -17529,6 +17648,10 @@ function renderTheBigChat() {
         + "turns up here too."));
     }
     for (const one of turns) {
+      if (one.completion) {
+        list.append(aChatGoalCompletionRow(one.text, one.at, one.completion, "the-big-chat-turn"));
+        continue;
+      }
       if (one.toolActivity) {
         list.append(aChatToolActivityRow(one.who, one.toolActivity, one.at, "the-big-chat-turn"));
         continue;
@@ -18216,6 +18339,10 @@ async function sendFromTheBigChat(mode = "chat") {
     $("theBigChatSaidBack").textContent = "Finishing the chat switch first.";
     return;
   }
+  if (swarmChatAttachmentsAreLoading(agentId)) {
+    $("theBigChatSaidBack").textContent = "Wait for the attached files to finish loading before sending.";
+    return;
+  }
   const teamMessage = await sendToActiveChatGoal(agentId, box);
   if (teamMessage.handled) return teamMessage.result;
   if (["collaborate", "work"].includes(mode) && isLoneAgentChat(agentId)) {
@@ -18433,6 +18560,7 @@ function wireUpTheTray() {
   $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("chat"));
   $("theBigChatStop").addEventListener("click", () => stopChatFor(theBigOne));
   $("theBigChatAttach").addEventListener("click", () => $("theBigChatFiles").click());
+  $("theBigChatBox").addEventListener("paste", event => pasteChatAttachments(theBigOne, event));
   $("theBigChatFiles").addEventListener("change", async () => {
     await addChatAttachments(theBigOne, $("theBigChatFiles").files || []);
     $("theBigChatFiles").value = "";

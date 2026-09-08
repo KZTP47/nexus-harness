@@ -20,7 +20,7 @@ from .config import LoadedConfig
 from .models import HarnessError
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SHARED_GOAL_PROFILE = "shared_goal_v1"
 LEGACY_CHECK_POLICY = {
     "schema_version": 1,
@@ -28,11 +28,112 @@ LEGACY_CHECK_POLICY = {
     "no_selected_checks": "report_not_configured_require_task_evidence",
     "existing_artifacts": "require_authenticated_current_snapshot",
 }
-CHECK_POLICY = {
+PREVIOUS_CHECK_POLICY = {
     **LEGACY_CHECK_POLICY,
     "schema_version": 2,
     "request_intent_contract": "polite-and-plural-action-requests/v2",
 }
+CHECK_POLICY = {
+    **PREVIOUS_CHECK_POLICY,
+    "schema_version": 3,
+    "runtime_deliverables": "executed-checks-required/v1",
+}
+
+# This identifies an executable deliverable, not an English-to-test compiler.
+# Its behavior still needs task-specific checks authored and inspected by the
+# team. Static prose/data retain the authenticated no-change completion path.
+_RUNTIME_SUFFIXES = frozenset({
+    ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".vue", ".svelte",
+    ".py", ".rb", ".go", ".rs", ".c", ".cc", ".cpp", ".cxx", ".cs",
+    ".java", ".kt", ".swift", ".php", ".lua", ".sh", ".ps1", ".bat", ".cmd",
+})
+_HTML_RUNTIME = re.compile(r"<script\b|\bon[a-z]+\s*=|javascript\s*:", re.I)
+_REQUEST_ACTION = re.compile(r"\b(?:create|build|make|implement|fix|repair|improve|update|add|write)\b", re.I)
+_RUNTIME_OBJECT = re.compile(r"\b(?:game|application|app|website|web\s+site|api|script|program|service|server|plugin)\b", re.I)
+_DOCUMENT_OBJECT = re.compile(r"\b(?:documentation|docs|readme|guide|report|instructions|notes|plan)\b|\.(?:md|txt)\b", re.I)
+
+
+def _request_objects(goal: str) -> list[str]:
+    """Keep complete object phrases, rather than stopping at a runtime noun.
+
+    In 'create an app user guide', app modifies the guide. In 'create an app
+    and a guide', those are separate objects and the app still needs execution.
+    Qualifiers such as 'for the app' do not change a guide into an application.
+    """
+    actions = list(_REQUEST_ACTION.finditer(goal))
+    objects = []
+    for index, action in enumerate(actions):
+        end = actions[index + 1].start() if index + 1 < len(actions) else len(goal)
+        scope = re.split(r"[;\n]|[.!?](?:\s|$)", goal[action.end():end], maxsplit=1)[0]
+        # Reference modifiers describe an object; they do not replace its
+        # type. A 'game described in README.md' is still a game, while an
+        # 'app user guide based on the plan' is still a guide.
+        direct = re.split(
+            r"(?<!-)\b(?:for|about|with|using|where|that|which|in|on|from|by|following|according\s+to)\b(?!-)",
+            scope, maxsplit=1, flags=re.I,
+        )[0]
+        objects.extend(re.split(r"\b(?:and|plus)\b|,", direct, flags=re.I))
+    return [one.strip() for one in objects if one.strip()]
+
+
+def requested_runtime_verification(goal: str) -> bool:
+    """Reject obvious runtime requests satisfied only by placeholder files.
+
+    This deliberately does not invent gameplay rules or tests from prose. It
+    only recognizes direct runtime creation/repair requests; the task ledger
+    and meaningful executed checks still own their detailed acceptance.
+    """
+    from . import swarm_work as work
+
+    if work._goal_intent(goal) == "read_only":
+        return False
+    return any(_RUNTIME_OBJECT.search(one) and not _DOCUMENT_OBJECT.search(one)
+               for one in _request_objects(goal))
+
+
+def runtime_verification_paths(
+    root: Path, goal: str, changed: list[str], manifest: dict[str, Any],
+) -> list[str]:
+    """Find in-scope runtime files that snapshots cannot functionally verify.
+
+    Applied paths bound an edit's scope. For an existing-result/no-op claim,
+    use the named deliverable if present, otherwise inspect the project tree.
+    Never follow project paths outside the existing confined file boundary.
+    """
+    from . import swarm_work as work
+
+    if work._goal_intent(goal) == "read_only":
+        return []
+    named = work._goal_named_paths(goal)
+    named_candidates = [
+        path for path in manifest
+        if any(work._paths_overlap(path, one) for one in named)
+    ]
+    candidates = list(dict.fromkeys([*changed, *named_candidates]))
+    if not candidates:
+        objects = _request_objects(goal)
+        documentation_only = bool(objects) and all(_DOCUMENT_OBJECT.search(one) for one in objects)
+        # A library name such as Three.js is not necessarily a project path.
+        # Unresolved existing-runtime claims still inspect the project, whereas
+        # prose-only work must not absorb unrelated code into its changed scope.
+        candidates = [] if documentation_only else list(manifest)
+    answer = []
+    for relative in sorted(candidates):
+        suffix = Path(relative).suffix.lower()
+        if suffix in _RUNTIME_SUFFIXES:
+            answer.append(relative)
+        elif suffix in {".html", ".htm", ".xhtml"}:
+            try:
+                path = work.confined_path(root, relative, allow_missing=True)
+                # A removed entry point or oversized/unreadable document must
+                # not turn executable changes into a no-check completion.
+                if not path.is_file() or path.stat().st_size > 1_000_000:
+                    answer.append(relative)
+                elif _HTML_RUNTIME.search(path.read_text(encoding="utf-8", errors="replace")):
+                    answer.append(relative)
+            except (HarnessError, OSError):
+                answer.append(relative)
+    return answer
 
 
 def _root_key(root: Path) -> str:
@@ -91,10 +192,11 @@ def verification_project(config: LoadedConfig, goal: dict[str, Any]) -> dict[str
     # Legacy contracts retain their exact saved command authority. Resume
     # captures the current contract and invalidates context-tool results through the new
     # contract fingerprint; reading legacy state must not fabricate approval.
-    if contract.get("schema_version") not in {1, 2, SCHEMA_VERSION} or contract.get("verification_profile") != SHARED_GOAL_PROFILE or (
+    if contract.get("schema_version") not in {1, 2, 3, SCHEMA_VERSION} or contract.get("verification_profile") != SHARED_GOAL_PROFILE or (
         contract.get("fingerprint_sha256") != _fingerprint(unsigned)
         or contract.get("project_root") != _root_key(Path(project["path"]))
         or (contract.get("schema_version") == 2 and contract.get("check_policy") != LEGACY_CHECK_POLICY)
+        or (contract.get("schema_version") == 3 and contract.get("check_policy") != PREVIOUS_CHECK_POLICY)
         or (contract.get("schema_version") == SCHEMA_VERSION and contract.get("check_policy") != CHECK_POLICY)
     ):
         raise HarnessError("The saved project verification contract changed; start a new goal")
@@ -191,10 +293,26 @@ def run_configured_goal_verification(
                 "Restore or explicitly refresh the selected checks before completing this goal.",
             )
         merkle, manifest = work._project_tree_merkle(root)
+        runtime_paths = runtime_verification_paths(root, goal, changed, manifest)
+        runtime_requested = requested_runtime_verification(goal)
+        if runtime_paths or runtime_requested:
+            return outcome(
+                "failed", "runtime_verification_required",
+                "Executable deliverables have no selected or discoverable checks; no tests ran. "
+                "File existence, code review, team agreement and an unchanged snapshot cannot prove that "
+                "the result launches or works. Add meaningful automated checks for the requested behavior "
+                "and launch method, expose a test command at the selected project root (including tests "
+                "in a new subfolder), then call run_selected_verification. If discovered commands need "
+                "approval, report the exact proposed command through the existing verification flow. "
+                "Do not fabricate a test pass or change files solely to obtain an artifact.",
+                current_tree_merkle=merkle, runtime_paths=runtime_paths[:100],
+                runtime_requested=runtime_requested,
+                file_count=len(manifest),
+            )
         return outcome(
             "not_configured", "no_selected_checks",
             "No deterministic project checks are configured or discoverable; no tests ran. "
-            "This is not a missing-runner failure. Complete the task only when its actual "
+            "The in-scope deliverables contain no executable source. Complete the task only when its actual "
             "requirements are supported by inspected artifacts and team agreement. "
             "Any explicitly required testing still needs real execution evidence.",
             current_tree_merkle=merkle, file_count=len(manifest),

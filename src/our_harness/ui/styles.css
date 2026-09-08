@@ -2044,6 +2044,24 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
 .chat-goal-status-row .chat-goal-status-details { margin: 0; }
 .chat-goal-status-details[open] { grid-column: 2 / -1; }
 .chat-goal-status-details > .hint { margin: 5px 0; }
+.the-big-chat-turn.chat-goal-completion,
+.talk-turn.chat-goal-completion {
+  display: flex; flex-direction: column; align-items: stretch; gap: 10px;
+  width: 100%; max-width: 100%; margin-block: 10px; padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 55%, var(--line));
+  border-radius: 12px; background: color-mix(in srgb, var(--panel) 93%, var(--cyan));
+  color: var(--ink); font-size: .95rem;
+}
+.chat-goal-completion-heading { display: flex; align-items: center; gap: 12px; }
+.chat-goal-completion-icon { width: 36px; height: 36px; flex: 0 0 36px; background: transparent; }
+.chat-goal-completion-icon img { width: 100%; height: 100%; object-fit: contain; }
+.chat-goal-completion-titles { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.chat-goal-completion-speaker { color: var(--muted); font-size: .78rem; }
+.chat-goal-completion-title { font-size: 1.1rem; line-height: 1.35; }
+.chat-goal-completion-text { margin: 0; line-height: 1.5; overflow-wrap: anywhere; }
+.chat-goal-completion > .long-horizon-chat-link { align-self: flex-start; }
+.chat-goal-completion-record { margin: 0; }
+.chat-goal-completion-record .chat-prose { margin-top: 8px; }
 .the-big-chat-what .long-horizon-chat-link { min-height: 0; margin-top: 5px; padding: 2px 0; font-size: .72rem; border: 0; background: transparent; box-shadow: none; color: var(--muted); text-decoration: underline; }
 #theBigChatActions {
   padding: 0;

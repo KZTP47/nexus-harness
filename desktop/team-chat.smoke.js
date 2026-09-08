@@ -421,7 +421,7 @@ async function delayAdmissionRefreshUntilCollapse(page, chatId) {
 async function captureReadableConversation(page, goalId, markers, destination) {
   // API completion alone is not UI evidence. Wait for the actual persisted
   // complete status to reach this chat, then show both agents' latest messages.
-  await page.locator(`#theBigChatSaid .chat-goal-status-row[data-goal-id="${goalId}"][data-goal-status="complete"]`).waitFor({timeout:30_000});
+  await page.locator(`#theBigChatSaid .chat-goal-completion[data-goal-id="${goalId}"][data-goal-status="complete"]`).waitFor({timeout:30_000});
   await transcriptContains(page,markers);
   // Transcript projection and the controller's goal inventory are independent
   // reads. Wait for the visible controls to catch up with this exact completion

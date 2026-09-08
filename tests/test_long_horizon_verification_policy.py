@@ -30,7 +30,7 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
         self.authority = self.base / "portable installation"
         self.project.mkdir()
         self.authority.mkdir()
-        (self.project / "index.html").write_text("<!doctype html><button onclick='this.textContent=42'>Play</button>", encoding="utf-8")
+        (self.project / "index.html").write_text("<!doctype html><main>An illustrated field guide.</main>", encoding="utf-8")
         data = copy.deepcopy(DEFAULT_CONFIG)
         data["providers"] = {
             "creator-route": {"kind": "openai", "model": "fixture", "endpoint": "http://127.0.0.1/a", "api_key_env": "FIXTURE_KEY"},
@@ -56,7 +56,7 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
             "lead_id": "creator", "participant_ids": ["creator", "reviewer"],
             "conversation_id": "chat-" + request, "success_criteria": criteria,
         }
-        objective = ["Make a small game together and agree on the finished result"]
+        objective = ["Make an illustrated field guide together and agree on the finished result"]
         admitted = self.runtime.store.inspect_runtime_admission(self.board, "tiny-game", objective, request, **options)
         return self.runtime.store.create(
             self.board, "tiny-game", objective, request,
@@ -101,7 +101,7 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
             }]
         return self.runtime.store._mutate(goal["goal_id"], downgrade)[0]
 
-    def test_existing_game_can_complete_with_current_agreement_without_claiming_tests_ran(self):
+    def test_existing_static_document_can_complete_with_current_agreement_without_claiming_tests_ran(self):
         goal = self.finish_tasks(self.create())
         result = self.verify(goal)
         self.assertEqual(result["status"], "complete", result["note"])
@@ -181,7 +181,7 @@ class LongHorizonVerificationPolicyTests(unittest.TestCase):
         self.assertEqual(result["status"], "paused", result["note"])
         self.assertEqual(result["verification"]["status"], "unavailable")
 
-    def test_real_provider_turns_see_conditional_guidance_and_complete_existing_game(self):
+    def test_real_provider_turns_see_conditional_guidance_and_complete_existing_static_document(self):
         goal = self.create()
         contexts = []
         def ask(_config, _route, _text, **kwargs):

@@ -811,7 +811,8 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         return None
 
     def _project_long_horizon_dialogue(
-        self, goal: dict[str, Any], conversation: dict[str, Any],
+        self, goal: dict[str, Any], conversation: dict[str, Any], *,
+        config: LoadedConfig, store: long_horizon.GoalStore,
     ) -> bool:
         """Recover every public message independently of bounded event telemetry."""
 
@@ -822,10 +823,10 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         goal_id = str(goal.get("goal_id") or "")
         route = str(conversation.get("transcript_route") or "")
         filed_as = str(conversation.get("filed_as") or "")
-        after = goal_chat_projection.cursor(self.config, route, goal_id, filed_as=filed_as)
+        after = goal_chat_projection.cursor(config, route, goal_id, filed_as=filed_as)
         expected_events = int(goal.get("event_seq") or 0)
         while True:
-            page = self.long_horizon.store.dialogue_history(
+            page = store.dialogue_history(
                 goal_id, after=after, limit=100, character_limit=96_000,
             )
             if not isinstance(page, dict) or page.get("schema_version") != 1 \
@@ -848,7 +849,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 if int(full.get("offset") or 0) or total < len(text) or total > chat_lab.LONGEST_ANSWER:
                     raise HarnessError("The archived conversation message has invalid text boundaries")
                 while len(text) < total:
-                    extra = self.long_horizon.store.dialogue_history(
+                    extra = store.dialogue_history(
                         goal_id, message_id=str(full.get("id") or ""),
                         offset=len(text), character_limit=96_000,
                     )
@@ -870,7 +871,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                              "has_more_characters": False})
                 bounded.append(full)
             projected = goal_chat_projection.keep_page(
-                self.config, route, goal, {**page, "messages": bounded}, filed_as=filed_as,
+                config, route, goal, {**page, "messages": bounded}, filed_as=filed_as,
             )
             if projected.get("binding_missing"):
                 return True
@@ -892,106 +893,112 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         ]
         if not chat_goals:
             return
+        # Freeze the configuration and board together, then release topology
+        # ownership before reading or projecting potentially long histories.
+        # Every saved chat needs the board lock for navigation; only this exact
+        # chat's cross-process lease belongs around its transcript catch-up.
         with self.swarm_lock:
-            standing = self.swarm_standing()
-            board = standing["board"]
-            for goal in chat_goals:
-                chat_id = str(goal.get("conversation_id") or "")
-                try:
-                    with self.swarm_communication_runs.conversation_turn(
-                        f"long-goal-projection-{uuid.uuid4().hex}", chat_id,
-                        timeout=0.0,
-                    ):
-                        conversation = self._long_horizon_chat(
-                            self.config, board, goal,
+            config = self.config
+            board = copy.deepcopy(self.swarm_standing()["board"])
+            communication_runs = self.swarm_communication_runs
+            store = self.long_horizon.store
+        for goal in chat_goals:
+            chat_id = str(goal.get("conversation_id") or "")
+            try:
+                with communication_runs.conversation_turn(
+                    f"long-goal-projection-{uuid.uuid4().hex}", chat_id,
+                    timeout=0.0,
+                ):
+                    conversation = self._long_horizon_chat(
+                        config, board, goal,
+                    )
+                    if conversation is None:
+                        continue
+                    transcript_route = str(
+                        conversation.get("transcript_route") or ""
+                    )
+                    filed_as = str(conversation.get("filed_as") or "")
+                    public_dialogue_archived = HarnessHTTPServer._project_long_horizon_dialogue(
+                        self, goal, conversation, config=config, store=store,
+                    )
+                    cursor = chat_lab.long_horizon_event_cursor(
+                        config, transcript_route,
+                        str(goal.get("goal_id") or ""), filed_as=filed_as,
+                    )
+                    expected = int(goal.get("event_seq") or 0)
+                    binding_missing = False
+                    while cursor < expected:
+                        page = store.events(
+                            str(goal.get("goal_id") or ""), after=cursor,
+                            limit=200,
                         )
-                        if conversation is None:
-                            continue
-                        transcript_route = str(
-                            conversation.get("transcript_route") or ""
-                        )
-                        filed_as = str(conversation.get("filed_as") or "")
-                        public_dialogue_archived = HarnessHTTPServer._project_long_horizon_dialogue(
-                            self, goal, conversation,
-                        )
-                        cursor = chat_lab.long_horizon_event_cursor(
-                            self.config, transcript_route,
-                            str(goal.get("goal_id") or ""), filed_as=filed_as,
-                        )
-                        expected = int(goal.get("event_seq") or 0)
-                        binding_missing = False
-                        while cursor < expected:
-                            page = self.long_horizon.store.events(
-                                str(goal.get("goal_id") or ""), after=cursor,
-                                limit=200,
-                            )
-                            page_events = list(page.get("events") or [])
-                            bounded_events = [
-                                event for event in page_events
-                                if isinstance(event, dict)
-                                and int(event.get("seq") or 0) <= expected
-                            ]
-                            oldest_available = int(page.get("oldest_available") or 0)
-                            bounded_oldest = min(oldest_available, expected + 1)
-                            next_cursor = max([
-                                cursor,
-                                *[
-                                    int(event.get("seq") or 0)
-                                    for event in bounded_events
-                                ],
-                                *(
-                                    [bounded_oldest - 1]
-                                    if page.get("truncated") else []
-                                ),
-                            ])
-                            if next_cursor <= cursor:
-                                break
-                            projection = chat_lab.keep_long_horizon_events(
-                                self.config, transcript_route, goal,
-                                bounded_events,
-                                filed_as=filed_as, chat_id=chat_id,
-                                project_id=str(
-                                    (goal.get("project") or {}).get("id") or ""
-                                ),
-                                lead_id=str(goal.get("lead_agent_id") or ""),
-                                truncated_after=(cursor if page.get("truncated") else 0),
-                                oldest_available=(
-                                    bounded_oldest
-                                    if page.get("truncated") else 0
-                                ),
-                                public_dialogue_archived=public_dialogue_archived,
-                            )
-                            if projection.get("binding_missing"):
-                                binding_missing = True
-                                break
-                            cursor = min(expected, max(
-                                next_cursor,
-                                int(projection.get("projected_event_cursor") or 0),
-                            ))
-                            if not page.get("has_more") and cursor < expected:
-                                break
-                        if binding_missing:
-                            continue
-                        status_projection = chat_lab.keep_long_horizon_status(
-                            self.config,
-                            transcript_route,
-                            goal,
-                            filed_as=filed_as,
-                            chat_id=chat_id,
+                        page_events = list(page.get("events") or [])
+                        bounded_events = [
+                            event for event in page_events
+                            if isinstance(event, dict)
+                            and int(event.get("seq") or 0) <= expected
+                        ]
+                        oldest_available = int(page.get("oldest_available") or 0)
+                        bounded_oldest = min(oldest_available, expected + 1)
+                        next_cursor = max([
+                            cursor,
+                            *[
+                                int(event.get("seq") or 0)
+                                for event in bounded_events
+                            ],
+                            *(
+                                [bounded_oldest - 1]
+                                if page.get("truncated") else []
+                            ),
+                        ])
+                        if next_cursor <= cursor:
+                            break
+                        projection = chat_lab.keep_long_horizon_events(
+                            config, transcript_route, goal,
+                            bounded_events,
+                            filed_as=filed_as, chat_id=chat_id,
                             project_id=str(
                                 (goal.get("project") or {}).get("id") or ""
                             ),
                             lead_id=str(goal.get("lead_agent_id") or ""),
+                            truncated_after=(cursor if page.get("truncated") else 0),
+                            oldest_available=(
+                                bounded_oldest
+                                if page.get("truncated") else 0
+                            ),
+                            public_dialogue_archived=public_dialogue_archived,
                         )
-                        if status_projection.get("binding_missing"):
-                            continue
-                except HarnessError as exc:
-                    # A normal chat turn owns this exact transcript briefly.
-                    # Its next goal poll will reconcile the status; unrelated
-                    # registry/integrity errors remain visible to the caller.
-                    if "already working on another request" in str(exc):
+                        if projection.get("binding_missing"):
+                            binding_missing = True
+                            break
+                        cursor = min(expected, max(
+                            next_cursor,
+                            int(projection.get("projected_event_cursor") or 0),
+                        ))
+                        if not page.get("has_more") and cursor < expected:
+                            break
+                    if binding_missing:
                         continue
-                    raise
+                    status_projection = chat_lab.keep_long_horizon_status(
+                        config,
+                        transcript_route,
+                        goal,
+                        filed_as=filed_as,
+                        chat_id=chat_id,
+                        project_id=str(
+                            (goal.get("project") or {}).get("id") or ""
+                        ),
+                        lead_id=str(goal.get("lead_agent_id") or ""),
+                    )
+                    if status_projection.get("binding_missing"):
+                        continue
+            except HarnessError as exc:
+                # A normal chat turn owns this exact transcript briefly.
+                # Its next goal poll will reconcile the status; unrelated
+                # registry/integrity errors remain visible to the caller.
+                if "already working on another request" in str(exc):
+                    continue
+                raise
 
     @staticmethod
     def require_long_horizon_chat_binding(

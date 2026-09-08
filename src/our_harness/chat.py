@@ -29,6 +29,7 @@ Its boundaries, on purpose:
 from __future__ import annotations
 
 import hashlib
+import hmac
 import base64
 import json
 import mimetypes
@@ -1416,11 +1417,13 @@ def _transcript_anchor_path(path: Path) -> Path:
     return runtime_root() / "transcript-anchors" / f"{identity}.json"
 
 
-def _transcript_event_integrity(event: dict[str, Any]) -> str:
-    from .runtime_integrity import mac
+def _transcript_event_integrity(event: dict[str, Any], *, key: bytes | None = None) -> str:
+    from .runtime_integrity import _mac_with_key, integrity_key
 
-    unsigned = {key: value for key, value in event.items() if key != "integrity_mac"}
-    return mac("conversation-transcript-event-v1", unsigned)
+    unsigned = {field: value for field, value in event.items() if field != "integrity_mac"}
+    return _mac_with_key(
+        integrity_key() if key is None else key, "conversation-transcript-event-v1", unsigned,
+    )
 
 
 def _write_transcript_anchor(path: Path, records: list[dict[str, Any]]) -> None:
@@ -1476,10 +1479,14 @@ def _read_transcript_event_records(path: Path) -> list[dict[str, Any]]:
         previous = str(event["hash"])
     if len(records) != len([line for line in lines if line.strip()]):
         raise ChatError("The append-only conversation record is damaged; Nexus refused to hide or extend its suffix.")
+    # Resolve the external authority once per locked read. Every journal byte,
+    # public hash and keyed event is still checked afresh; no timestamp or
+    # previously verified projection can hide a rewrite or key replacement.
+    from .runtime_integrity import _mac_with_key, integrity_key
+
+    key = integrity_key()
     anchor_path = _transcript_anchor_path(path)
     if anchor_path.exists():
-        from .runtime_integrity import compare
-
         try:
             anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1492,11 +1499,14 @@ def _read_transcript_event_records(path: Path) -> list[dict[str, Any]]:
             or not isinstance(value["count"], int)
             or value["count"] < 0
             or value["count"] > len(records)
-            or not compare("conversation-transcript-anchor-v1", value, anchor.get("integrity_mac"))
+            or not hmac.compare_digest(
+                str(anchor.get("integrity_mac") or ""),
+                _mac_with_key(key, "conversation-transcript-anchor-v1", value),
+            )
         ):
             _transcript_integrity_failure(path, "The transcript no longer matches its external anchor.")
         for event in records:
-            if event.get("integrity_mac") != _transcript_event_integrity(event):
+            if event.get("integrity_mac") != _transcript_event_integrity(event, key=key):
                 _transcript_integrity_failure(path, f"Transcript event {event.get('seq')} was rewritten.")
         anchored_count = int(value["count"])
         anchored_head = (
@@ -1522,11 +1532,11 @@ def _read_transcript_event_records(path: Path) -> list[dict[str, Any]]:
             _transcript_integrity_failure(path, "The transcript has a partial keyed chain.")
         if all(have):
             for event in records:
-                if event.get("integrity_mac") != _transcript_event_integrity(event):
+                if event.get("integrity_mac") != _transcript_event_integrity(event, key=key):
                     _transcript_integrity_failure(path, "A keyed transcript event is invalid.")
         else:
             for event in records:
-                event["integrity_mac"] = _transcript_event_integrity(event)
+                event["integrity_mac"] = _transcript_event_integrity(event, key=key)
             from .runtime_integrity import atomic_text
 
             atomic_text(path, "".join(
@@ -1537,9 +1547,9 @@ def _read_transcript_event_records(path: Path) -> list[dict[str, Any]]:
     return records
 
 
-def _read_transcript_events(path: Path) -> list[Said]:
+def _project_transcript_records(records: list[dict[str, Any]]) -> list[Said]:
     projection: list[Said] = []
-    for event in _read_transcript_event_records(path):
+    for event in records:
         payload = event.get("turns")
         turns = _said_from_dicts(payload)
         if event.get("kind") == "snapshot":
@@ -1547,6 +1557,10 @@ def _read_transcript_events(path: Path) -> list[Said]:
         elif event.get("kind") == "append":
             projection.extend(turns)
     return projection
+
+
+def _read_transcript_events(path: Path) -> list[Said]:
+    return _project_transcript_records(_read_transcript_event_records(path))
 
 
 def _append_transcript_event(
@@ -1741,7 +1755,7 @@ def _keep_it(
 
     with ProjectTransactionLock(config.project_root).held(30.0):
         records = _read_transcript_event_records(event_path) if event_path.exists() else []
-        existing = _read_transcript_events(event_path) if records else []
+        existing = _project_transcript_records(records)
         if transform_projection is not None:
             # Recovery can insert authenticated historical rows. Calculate
             # against the final cross-process-locked projection, so a writer
@@ -1774,6 +1788,14 @@ def _keep_it(
             # than rewriting canonical history.
             _append_transcript_event(event_path, records, "snapshot", turns)
         written = json.dumps(requested, indent=2) + "\n"
+        # Repeated goal polls often reproduce the same projection. Preserve a
+        # matching compatibility snapshot without another replace, but repair
+        # a missing/stale snapshot from the freshly authenticated journal.
+        try:
+            if where.read_text(encoding="utf-8") == written:
+                return
+        except (OSError, UnicodeDecodeError):
+            pass
     # Written beside and moved into place, so a panel reading it never sees
     # half a conversation.
         beside = where.with_name(f"{where.name}.{os.getpid()}-{threading.get_ident()}.part")

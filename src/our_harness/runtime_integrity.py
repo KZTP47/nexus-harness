@@ -75,12 +75,18 @@ def integrity_key() -> bytes:
             return loaded
 
 
-def mac(kind: str, value: Any) -> str:
+def _mac_with_key(key: bytes, kind: str, value: Any) -> str:
+    """Use one freshly resolved key throughout a bounded integrity transaction."""
+
     encoded = json.dumps(
         {"kind": str(kind), "value": value}, ensure_ascii=False,
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
-    return hmac.new(integrity_key(), encoded, hashlib.sha256).hexdigest()
+    return hmac.new(key, encoded, hashlib.sha256).hexdigest()
+
+
+def mac(kind: str, value: Any) -> str:
+    return _mac_with_key(integrity_key(), kind, value)
 
 
 def compare(kind: str, value: Any, claimed: object) -> bool:

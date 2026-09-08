@@ -7,6 +7,20 @@ in the same composer to steer them. **Pause team** retains the work and
 **Resume team** continues it. Questions, errors, and progress appear inline;
 Mission control provides optional detail.
 
+You can open another saved chat and start **Work together on project files**
+while the first chat continues. Each goal keeps its own conversation, progress,
+and pause/cancel controls, including when the chats share an agent. Goals for
+separate project folders can run concurrently, subject to provider capacity.
+Goals whose project folders overlap wait for the current owner to release the
+project; their requests remain saved. A confirmed chat switch enables its
+composer and controls while history loads in the background.
+
+A completed goal appears as a distinct **Task completed** message with the
+Nexus Harness icon and a link to its saved result and verification details.
+Pasted files and images use the same attachment tray as files added with
+**Attach files or screenshots**. Images show previews, and you can remove any
+attachment before sending. Plain text paste still inserts text into the composer.
+
 Chat includes public progress messages and tool activity with expandable input,
 output, and error details. The saved history retains these entries across
 restart. These are provider-supplied public summaries and observed tool calls;
@@ -148,12 +162,25 @@ both agents' completion, and task evidence for the user's criteria. It does not
 turn arbitrary wording into a fixed set of inferred test scenarios. Configured
 commands retain their execution scope; discovered commands still require the
 user's approval and run in a disposable, protected copy of the project.
-If there are no configured or discoverable checks, Nexus reports that no tests
-ran and requires inspected current artifacts and team agreement. Explicitly
-requested testing still needs actual execution evidence. If discovered checks
+Executable deliverables such as games, apps and scripts require executed,
+meaningful checks. If none are configured or discoverable, Nexus reports the
+missing evidence and gives the team a bounded repair task to author checks and
+expose a test command at the selected project root. File existence, an unchanged
+snapshot and agreement between agents cannot prove that an application works.
+Static document work and read-only inspection can still complete from relevant
+artifact evidence without inventing tests or unnecessary edits. Explicitly
+requested testing always needs actual execution evidence. If discovered checks
 need approval, approve them in the project's settings and press **Resume team**. Resume
 adopts the current settings for that exact project, records their new fingerprint,
 and clears obsolete test observations while retaining the agents' work and chat.
+
+For browser work, the agents receive a supported recipe for the bundled,
+contained Playwright runner: navigate a project route, perform a concrete
+click/fill action and assert the resulting DOM state. Checks must exercise the
+requested launch method and behavior. A passing HTTP-route check is not proof
+that an ES-module application can be opened directly through a `file:` URL.
+See [orchestration quality and verification](ORCHESTRATION_QUALITY.md) for the
+capability boundaries and regression examples.
 
 No-progress fingerprints include public discussion, semantic evidence, and
 before/after content. New discussion can continue without artificial file edits.

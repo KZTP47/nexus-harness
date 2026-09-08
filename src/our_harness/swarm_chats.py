@@ -925,7 +925,8 @@ def _adopt_legacy_registry(
 
 def _binding_problem(
     config: LoadedConfig, board: dict[str, Any], raw: dict[str, Any],
-    agents: dict[str, dict[str, Any]],
+    agents: dict[str, dict[str, Any]], *,
+    route_bindings: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     binding = raw.get("binding")
     if not binding:
@@ -942,7 +943,13 @@ def _binding_problem(
     changed_routes: list[dict[str, str]] = []
     for member_id in raw["pair"]:
         member = agents.get(member_id) or {}
-        current = _route_binding(config, member)
+        route = str(member.get("who") or "")
+        if route_bindings is None:
+            current = _route_binding(config, member)
+        else:
+            if route not in route_bindings:
+                route_bindings[route] = _route_binding(config, member)
+            current = route_bindings[route]
         held = binding["agent_routes"].get(member_id) or {}
         common_fields = (
             "route", "failure_context_version", "route_fingerprint_sha256",
@@ -1778,24 +1785,36 @@ def _recover_direct_legacy_chats(
 
 def _present(
     config: LoadedConfig, board: dict[str, Any], agent_id: str,
-    raw: dict[str, Any], agents: dict[str, dict[str, Any]],
+    raw: dict[str, Any], agents: dict[str, dict[str, Any]], *,
+    route_bindings: dict[str, dict[str, Any]] | None = None,
+    work_authorities: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     pair_agents = [agents[one] for one in raw["pair"] if one in agents]
     projects = _shared_projects(board, raw["pair"])
     project_ids = {str(one.get("id")) for one in projects}
     project_id = raw["project"] if raw["project"] in project_ids else ""
+    def project_authority(project: dict[str, Any]) -> dict[str, Any]:
+        if work_authorities is None:
+            return _project_work_authority(project)
+        key = (str(project.get("id") or ""), str(project.get("path") or ""))
+        if key not in work_authorities:
+            work_authorities[key] = _project_work_authority(project)
+        return dict(work_authorities[key])
+
     presented_projects = [{
         "id": str(one.get("id") or ""),
         "name": str(one.get("name") or Path(str(one.get("path") or "")).name),
         "path": str(one.get("path") or ""),
         "is_there": bool(one.get("is_there", Path(str(one.get("path") or "")).is_dir())),
-        "work_authority": _project_work_authority(one),
+        "work_authority": project_authority(one),
     } for one in projects]
     active_project = next((
         one for one in presented_projects if one["id"] == project_id
     ), None)
     current = agents[agent_id]
-    binding_problem = _binding_problem(config, board, raw, agents)
+    binding_problem = _binding_problem(
+        config, board, raw, agents, route_bindings=route_bindings,
+    )
     bound_route = str(
         ((raw.get("binding") or {}).get("agent_routes") or {})
         .get(agent_id, {}).get("route") or current.get("who") or ""
@@ -2023,12 +2042,20 @@ def list_for_agent(
             changed = True
         if changed:
             _write(config, registry)
+        # One inventory is a read snapshot, not one provider/setup probe per
+        # saved conversation. Reuse observations only within this response;
+        # every later inventory, migration and exact admission rechecks them.
+        route_bindings: dict[str, dict[str, Any]] = {}
+        work_authorities: dict[tuple[str, str], dict[str, Any]] = {}
         return {
             "agent": agent_id,
             "workspace_id": workspace_id,
             "active": active,
             "registry_recovered_from": recovered_from,
-            "chats": [_present(config, board, agent_id, one, agents) for one in visible],
+            "chats": [_present(
+                config, board, agent_id, one, agents,
+                route_bindings=route_bindings, work_authorities=work_authorities,
+            ) for one in visible],
         }
 
 
