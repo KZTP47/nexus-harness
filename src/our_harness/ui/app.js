@@ -7040,6 +7040,7 @@ let swarmNewestRefresh = 0;  // so a slow look cannot overwrite a newer one
 // redraws must not erase a diagnosis or a successful live verification, and a
 // delayed answer for an old route must never decorate the newly selected one.
 const swarmAgentRepairPlans = new Map();
+const swarmAgentRepairChecks = new Map();
 const swarmAgentRepairTests = new Map();
 // The value above is deliberately an empty placeholder until /api/swarm has
 // answered.  Startup also starts the web-chat heartbeat.  That heartbeat may
@@ -12309,7 +12310,12 @@ function applyConversationList(agentId, said) {
   swarmConversationHydrating.delete(agentId);
   const before = held.conversation;
   rememberSwarmChatComposer(agentId);
-  held.conversations = Array.isArray(said?.chats) ? said.chats : [];
+  const previous = new Map((held.conversations || []).map(one => [one.id, one]));
+  held.conversations = (Array.isArray(said?.chats) ? said.chats : []).map(one => (
+    one.collaboration_checked === false && previous.has(one.id)
+      ? {...one, collaboration_problem: previous.get(one.id).collaboration_problem}
+      : one
+  ));
   const ids = new Set(held.conversations.map((one) => one.id));
   held.conversation = ids.has(said?.active) ? said.active
     : ids.has(held.conversation) ? held.conversation
@@ -12835,7 +12841,8 @@ async function showTheSharedLedger(destination, button) {
 }
 
 async function resetCollaborationRecord(agent, conversation, button) {
-  if (!agent?.id || !conversation?.id || !conversation?.collaboration_problem) return;
+  if (!agent?.id || !conversation?.id
+      || conversation?.collaboration_problem?.action !== "reset_collaboration_record") return;
   if (!window.confirm(
     "Reset only this chat's damaged collaboration record?\n\n"
     + "The saved transcript, attachments, and provider conversations are preserved. "
@@ -12948,7 +12955,7 @@ function aChatDestination(agent, {offerFullChat = false, conversation = null} = 
     shared.addEventListener("click", () => showTheSharedLedger(destination, shared));
     actions.append(shared);
   }
-  if (collaborationProblem && agent && conversation) {
+  if (collaborationProblem?.action === "reset_collaboration_record" && agent && conversation) {
     const reset = make("button", "danger collaboration-record-reset",
       String(collaborationProblem.action_label || "Reset collaboration record"));
     reset.type = "button";
@@ -13452,6 +13459,19 @@ async function refreshTheChatFor(agentId) {
         || swarmChatRevisions.get(revisionKey) !== revision) return;
     if (said.limits && typeof said.limits === "object") {
       swarmChatLimits.set(String(agentId), said.limits);
+    }
+    if (said.conversation?.id === conversationId) {
+      const held = swarmChats.find(one => one.agent === agentId);
+      const saved = held?.conversations?.find(one => one.id === conversationId);
+      if (saved) {
+        saved.collaboration_problem = said.conversation.collaboration_problem;
+        saved.collaboration_checked = said.conversation.collaboration_checked;
+        const card = theChatCardFor(agentId);
+        card?.querySelector(".chat-destination")?.replaceWith(
+          aChatDestination(agent, {offerFullChat: true, conversation: saved}),
+        );
+        if (theBigOne === agentId) renderTheBigChat();
+      }
     }
     keepWhatWasSaidTo(agentId, said.said || [], conversationId);
     countWhatIsTypedTo(agentId);
@@ -17692,8 +17712,9 @@ function renderTheConversationSidebar(agentId) {
     const items = make("div", "the-big-chat-conversation-items");
     const chats = conversations.filter((one) => pairKey(one.pair || []) === pairKey(pair));
     if (!chats.length) items.append(make(
-      "p", "hint", singleAgentGroup
-        ? "No saved chats for this agent." : "No saved chats for this pair."
+      "p", "hint", swarmChatIsHydrating(agentId)
+        ? "Loading saved chats…"
+        : singleAgentGroup ? "No saved chats for this agent." : "No saved chats for this pair."
     ));
     for (const conversation of chats) {
       const row = make("div", "the-big-chat-conversation-item");
@@ -18252,6 +18273,7 @@ function renderAgentRepairPanel(agent, route, plan = null) {
     button.disabled = false;
     button.onclick = null;
   }
+  start.textContent = "Repair connection";
   action.removeAttribute("data-action");
   choices.replaceChildren();
   choices.hidden = true;
@@ -18277,6 +18299,20 @@ function renderAgentRepairPanel(agent, route, plan = null) {
     note.textContent = "This uses one model request. No project files were supplied to the provider.";
     stop.hidden = false;
     stop.onclick = () => stopAgentRouteTest(agent.id, route);
+    return;
+  }
+
+  const diagnosis = swarmAgentRepairChecks.get(agent.id);
+  if (diagnosis?.route === route) {
+    panel.dataset.tone = diagnosis.error ? "error" : "attention";
+    title.textContent = "Connection";
+    badge.textContent = diagnosis.error ? "Check failed" : "Checking";
+    status.textContent = diagnosis.error
+      || "Checking the exact route without sending a model prompt. This takes at most 30 seconds…";
+    start.hidden = false;
+    start.disabled = !diagnosis.error;
+    start.textContent = diagnosis.error ? "Check again" : "Diagnosing…";
+    start.onclick = () => loadAgentRepairPlan(agent.id, route, start);
     return;
   }
 
@@ -18335,34 +18371,59 @@ function renderAgentRepairPanel(agent, route, plan = null) {
 
 async function loadAgentRepairPlan(agentId, route, button = null) {
   if (!route) return null;
-  const was = button?.textContent || "";
-  if (button) {
-    button.disabled = true;
-    button.textContent = "Diagnosing…";
-  }
-  $("swarmAgentRepair").dataset.tone = "attention";
-  $("swarmAgentRepairBadge").textContent = "Checking";
-  $("swarmAgentSessionStatus").textContent = "Checking the exact route without sending a model prompt…";
+  const previous = swarmAgentRepairChecks.get(agentId);
+  if (previous?.route === route && !previous.error) return null;
+  // A changed route supersedes the old read without replaying either request.
+  previous?.controller.abort();
+  const controller = new AbortController();
+  const check = {route, controller, error: ""};
+  swarmAgentRepairChecks.set(agentId, check);
+  const was = button?.textContent || "Repair connection";
+  const visible = () => swarmPicked?.kind === "agent" && swarmPicked.id === agentId
+    && agentStillUsesRoute(agentId, route);
+  const redraw = () => {
+    if (visible()) renderAgentRepairPanel(theSwarmAgent(agentId), route,
+      swarmAgentRepairPlans.get(agentId)?.route === route
+        ? swarmAgentRepairPlans.get(agentId).plan : null);
+  };
+  let timer;
   try {
-    const plan = await request("/api/team/repair-plan", {
-      method: "POST", body: JSON.stringify({route, ...agentRepairContext(agentId)}),
-    });
-    swarmAgentRepairPlans.set(agentId, {route, plan});
-    if (agentStillUsesRoute(agentId, route)) {
-      renderAgentRepairPanel(theSwarmAgent(agentId), route, plan);
+    if (button) {
+      button.disabled = true;
+      button.textContent = "Diagnosing…";
     }
+    redraw();
+    // Race the whole request, including session bootstrap and response parsing.
+    // Abort fetch too; a stalled local server must never hold this button forever.
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error("The connection check did not finish within 30 seconds. No model prompt was sent. Press Check again to retry."));
+        controller.abort();
+      }, 30000);
+    });
+    const plan = await Promise.race([request("/api/team/repair-plan", {
+      method: "POST", body: JSON.stringify({route, ...agentRepairContext(agentId)}),
+      signal: controller.signal,
+    }), deadline]);
+    if (swarmAgentRepairChecks.get(agentId) !== check) return null;
+    if (agentStillUsesRoute(agentId, route)) {
+      swarmAgentRepairPlans.set(agentId, {route, plan});
+    }
+    swarmAgentRepairChecks.delete(agentId);
     return plan;
   } catch (error) {
-    if (agentStillUsesRoute(agentId, route)) {
-      $("swarmAgentRepair").dataset.tone = "error";
-      $("swarmAgentRepairBadge").textContent = "Check failed";
-      $("swarmAgentSessionStatus").textContent = String(error.message || error);
+    if (swarmAgentRepairChecks.get(agentId) === check) {
+      check.error = String(error.message || error);
     }
     return null;
   } finally {
-    if (button?.isConnected) {
-      button.disabled = false;
-      button.textContent = was;
+    clearTimeout(timer);
+    if (swarmAgentRepairChecks.get(agentId) === check || !swarmAgentRepairChecks.has(agentId)) {
+      if (button?.isConnected && visible()) {
+        button.disabled = false;
+        button.textContent = was;
+      }
+      redraw();
     }
   }
 }

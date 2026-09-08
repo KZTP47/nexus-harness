@@ -8679,6 +8679,8 @@ class LongHorizonRuntime:
     ) -> dict[str, Any]:
         self._enable_auto_start_watcher()
         with self.lock:
+            if self._watcher_stop.is_set():
+                raise HarnessError("This long-horizon runtime is closed; reopen the current runtime before starting work.")
             self._auto_start_attempted[goal_id] = time.monotonic()
             existing = self.workers.get(goal_id)
             if existing is not None and existing.is_alive():

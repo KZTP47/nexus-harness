@@ -24,7 +24,9 @@ from .pipeline_runs import _owner_is_alive, _process_token, project_identity
 from .redaction import CredentialRedactor, bounded_redacted_text
 from . import cancellation, user_questions
 from .providers.registry import ProviderRegistry
-from .runtime_integrity import atomic_text, mac, quarantine_marker
+from .runtime_integrity import (
+    atomic_text, integrity_key, _mac_with_key, mac, quarantine_marker,
+)
 
 
 ACTIVE = {"accepted", "running", "stopping"}
@@ -922,10 +924,13 @@ class SwarmRunStore:
             (mac("swarm-provider-effect-v1", self._effect_material(row)), effect_id),
         )
 
-    def _verify_effect(self, row: sqlite3.Row | None) -> None:
+    def _verify_effect(self, row: sqlite3.Row | None, *, key: bytes | None = None) -> None:
         if row is None:
             return
-        expected = mac("swarm-provider-effect-v1", self._effect_material(row))
+        expected = _mac_with_key(
+            integrity_key() if key is None else key,
+            "swarm-provider-effect-v1", self._effect_material(row),
+        )
         if not row["integrity_mac"] or not hmac.compare_digest(
             str(row["integrity_mac"]), expected
         ):
@@ -953,8 +958,11 @@ class SwarmRunStore:
             (mac("swarm-board-authority-v1", self._board_material(row)),),
         )
 
-    def _verify_event(self, row: sqlite3.Row) -> None:
-        expected = mac("swarm-event-v1", self._event_material(row))
+    def _verify_event(self, row: sqlite3.Row, *, key: bytes | None = None) -> None:
+        expected = _mac_with_key(
+            integrity_key() if key is None else key,
+            "swarm-event-v1", self._event_material(row),
+        )
         if not row["integrity_mac"] or not hmac.compare_digest(
             str(row["integrity_mac"]), expected
         ):
@@ -962,10 +970,16 @@ class SwarmRunStore:
                 "The durable Swarm event journal failed keyed integrity."
             )
 
-    def _verify_run(self, db: sqlite3.Connection, row: sqlite3.Row | None) -> None:
+    def _verify_run(
+        self, db: sqlite3.Connection, row: sqlite3.Row | None,
+        *, key: bytes | None = None,
+    ) -> None:
         if row is None:
             return
-        expected = mac("swarm-run-v1", self._run_material(row))
+        expected = _mac_with_key(
+            integrity_key() if key is None else key,
+            "swarm-run-v1", self._run_material(row),
+        )
         if not row["integrity_mac"] or not hmac.compare_digest(
             str(row["integrity_mac"]), expected
         ):
@@ -991,10 +1005,13 @@ class SwarmRunStore:
                 "The durable Swarm event history was truncated or reordered."
             )
 
-    def _verify_board(self, row: sqlite3.Row | None) -> None:
+    def _verify_board(self, row: sqlite3.Row | None, *, key: bytes | None = None) -> None:
         if row is None:
             raise HarnessError("The global Swarm board authority is missing.")
-        expected = mac("swarm-board-authority-v1", self._board_material(row))
+        expected = _mac_with_key(
+            integrity_key() if key is None else key,
+            "swarm-board-authority-v1", self._board_material(row),
+        )
         if not row["integrity_mac"] or not hmac.compare_digest(
             str(row["integrity_mac"]), expected
         ):
@@ -1031,15 +1048,19 @@ class SwarmRunStore:
         self._seal_board(db)
 
     def _verify_all(self, db: sqlite3.Connection) -> None:
+        # One bounded database snapshot uses one freshly read key. Re-reading
+        # its path, permissions and bytes for every event made startup scale
+        # with thousands of filesystem operations while board authority waited.
+        key = integrity_key()
         self._verify_board(db.execute(
             "SELECT * FROM board_authority WHERE singleton=1"
-        ).fetchone())
+        ).fetchone(), key=key)
         for run in db.execute("SELECT * FROM runs").fetchall():
-            self._verify_run(db, run)
+            self._verify_run(db, run, key=key)
         previous_by_run: dict[str, str] = {}
         expected_by_run: dict[str, int] = {}
         for event in db.execute("SELECT * FROM events ORDER BY run_id,seq").fetchall():
-            self._verify_event(event)
+            self._verify_event(event, key=key)
             run_id = str(event["run_id"])
             expected = expected_by_run.get(run_id, 0) + 1
             if (
@@ -1054,7 +1075,11 @@ class SwarmRunStore:
         for effect in db.execute(
             "SELECT * FROM provider_effects ORDER BY run_id,ordinal"
         ).fetchall():
-            self._verify_effect(effect)
+            self._verify_effect(effect, key=key)
+        if not hmac.compare_digest(key, integrity_key()):
+            self._integrity_failure(
+                "The Swarm integrity key changed during journal verification."
+            )
 
     @staticmethod
     def _row(row: sqlite3.Row) -> dict[str, Any]:

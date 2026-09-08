@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -157,6 +158,68 @@ class SavedChatInventoryPerformanceTests(unittest.TestCase):
         swarm_chats.list_for_agent(self.config, self.board, "agent-1")
         for _ in range(15):
             swarm_chats.create(self.config, self.board, "agent-1", "agent-2")
+
+    def test_inventory_never_opens_collaboration_history(self):
+        with mock.patch(
+            "our_harness.collaboration_ledger.collaboration_problem",
+            side_effect=AssertionError("Inventory replayed a collaboration ledger"),
+        ):
+            listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        self.assertEqual(len(listed["chats"]), 17)
+        self.assertTrue(all(one["collaboration_checked"] is False for one in listed["chats"]))
+
+    def test_inventory_and_selected_metadata_survive_an_active_project_writer(self):
+        from our_harness.collaboration_ledger import CollaborationLedger
+        from our_harness.safety import ProjectTransactionLock
+
+        listed = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+        selected = next(one for one in listed["chats"] if one["id"] == listed["active"])
+        route, filed_as = selected["transcript_route"], selected["filed_as"]
+        CollaborationLedger(self.config, route, filed_as).begin(
+            "Portable saved history", self.board["agents"], mode="project_work",
+        )
+        chat.keep_exchange(self.config, route, "Saved question", "Saved answer", filed_as=filed_as)
+        locked, release, finished = threading.Event(), threading.Event(), threading.Event()
+        failures = []
+        results = {}
+
+        def writer():
+            with ProjectTransactionLock(self.config.project_root).held(1):
+                locked.set()
+                release.wait(8)
+
+        def reader():
+            try:
+                results["list"] = swarm_chats.list_for_agent(self.config, self.board, "agent-1")
+                results["chat"] = swarm_chats.resolve(
+                    self.config, self.board, "agent-1", selected["id"], allow_binding_drift=True,
+                )
+            except Exception as exc:
+                failures.append(exc)
+            finally:
+                finished.set()
+
+        writing = threading.Thread(target=writer)
+        reading = threading.Thread(target=reader)
+        writing.start()
+        try:
+            self.assertTrue(locked.wait(2))
+            reading.start()
+            self.assertTrue(finished.wait(2), "Opening saved chats waited for an unrelated project writer")
+        finally:
+            release.set()
+            writing.join(10)
+            if reading.ident is not None:
+                reading.join(10)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results["list"]["chats"]), 17)
+        self.assertEqual([one.text for one in chat.read_it(self.config, route, filed_as)],
+                         ["Saved question", "Saved answer"])
+        problem = results["chat"]["collaboration_problem"]
+        self.assertEqual(problem["code"], "collaboration_record_busy")
+        self.assertFalse(problem["action"], "A busy writer must never offer destructive reset")
+        reopened = swarm_chats.resolve(self.config, self.board, "agent-1", selected["id"])
+        self.assertIsNone(reopened["collaboration_problem"])
 
     def test_inventory_checks_each_route_and_project_once_per_request(self):
         with mock.patch.object(swarm_chats, "_route_binding", wraps=swarm_chats._route_binding) as routes, mock.patch.object(

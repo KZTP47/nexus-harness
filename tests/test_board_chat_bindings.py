@@ -989,10 +989,8 @@ class BoardChatBindingTests(unittest.TestCase):
             "our_harness.collaboration_ledger.collaboration_problem",
             return_value=problem,
         ) as inspect:
-            presented = next(
-                one for one in swarm_chats.list_for_agent(
-                    self.config, board, "agent-1",
-                )["chats"] if one["id"] == original["id"]
+            presented = swarm_chats.resolve(
+                self.config, board, "agent-1", original["id"],
             )
 
         self.assertEqual(presented["collaboration_problem"], problem)

@@ -171,3 +171,73 @@ test("first chat hydration enables the confirmed identity before its history arr
   await loading;
   assert.equal(f.held.said[0].text, "saved history");
 });
+
+
+test("selected history installs diagnostics and metadata refresh preserves them", async () => {
+  const f = fixture();
+  const problem = {code: "collaboration_record_untrusted", action: "reset_collaboration_record"};
+  const loading = f.run("loadConversationsFor(lead.id)");
+  f.requests[0].resolve(f.selection("blue"));
+  await tick();
+  f.requests[1].resolve({said: [{text: "Saved blue"}], conversation: {
+    id: "blue", collaboration_checked: true, collaboration_problem: problem,
+  }});
+  await loading;
+  assert.equal(f.held.conversations.find(one => one.id === "blue").collaboration_problem, problem);
+  const refresh = f.run("loadConversationsFor(lead.id, false)");
+  f.requests[2].resolve({active: "blue", chats: f.chats.map(one => ({
+    ...one, collaboration_checked: false, collaboration_problem: null,
+  }))});
+  await refresh;
+  assert.equal(f.held.conversations.find(one => one.id === "blue").collaboration_problem, problem);
+  assert.equal(f.held.said[0].text, "Saved blue");
+});
+
+test("late history diagnostics cannot contaminate the next selected conversation", async () => {
+  const f = fixture();
+  const first = f.run("activateConversationFor(lead.id, 'blue')");
+  f.requests[0].resolve(f.selection("blue"));
+  await tick();
+  await first;
+  const second = f.run("activateConversationFor(lead.id, 'third')");
+  f.requests[1].resolve({said: [{text: "Late blue"}], conversation: {
+    id: "blue", collaboration_problem: {code: "collaboration_record_untrusted"},
+  }});
+  await tick();
+  assert.equal(f.held.conversations.find(one => one.id === "third").collaboration_problem, undefined);
+  f.requests[2].resolve(f.selection("third"));
+  await tick();
+  await second;
+  f.requests[3].resolve({said: []});
+  await tick();
+});
+
+test("sidebar distinguishes initial loading from a verified empty inventory", () => {
+  const f = fixture();
+  const made = [];
+  f.context.make = (_tag, _class, text = "") => {
+    const node = {textContent: text, children: [], dataset: {},
+      append(...children) { this.children.push(...children); },
+      addEventListener() {}, classList: {toggle() {}}, setAttribute() {},
+    };
+    made.push(node);
+    return node;
+  };
+  f.context.anAgentFace = () => ({});
+  f.context.conversationPairsFor = () => [[f.held.agent]];
+  f.context.connectedPairsFor = () => [];
+  f.context.pairKey = pair => pair.join("|");
+  const list = f.node("theBigChatConversationList");
+  list.replaceChildren = () => {};
+  list.append = () => { list.childElementCount = 1; };
+  f.held.conversations = [];
+  f.context.swarmConversationHydrating.add(f.held.agent);
+  vm.runInContext(section("function renderTheConversationSidebar", "function renderTheConversationProject"), f.context);
+  f.run("renderTheConversationSidebar(held.agent)");
+  assert.ok(made.some(one => one.textContent === "Loading saved chats…"));
+  assert.ok(!made.some(one => one.textContent.startsWith("No saved chats")));
+  made.length = 0;
+  f.context.swarmConversationHydrating.clear();
+  f.run("renderTheConversationSidebar(held.agent)");
+  assert.ok(made.some(one => one.textContent === "No saved chats for this agent."));
+});

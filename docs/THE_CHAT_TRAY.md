@@ -34,6 +34,13 @@ one-agent chats remain one-agent conversations even after peers are connected:
 automatic routing stays direct, team/project-work actions stay unavailable,
 and connected non-members are not added to the provider context.
 
+The switcher shows **Loading saved chats…** until its initial inventory arrives.
+Listing chats does not replay collaboration histories. The selected chat checks
+its own collaboration record when its transcript arrives; if another writer
+holds that record, the check reports that it is busy without offering a reset.
+A later reopen rechecks it. Transcript reads and dispatch retain their normal
+integrity and transaction checks.
+
 ### Resize it to fit the work
 
 The maximised chat is not a fixed dashboard. Five visible resize controls let

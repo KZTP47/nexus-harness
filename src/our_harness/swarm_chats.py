@@ -1788,6 +1788,7 @@ def _present(
     raw: dict[str, Any], agents: dict[str, dict[str, Any]], *,
     route_bindings: dict[str, dict[str, Any]] | None = None,
     work_authorities: dict[tuple[str, str], dict[str, Any]] | None = None,
+    inspect_collaboration: bool = True,
 ) -> dict[str, Any]:
     pair_agents = [agents[one] for one in raw["pair"] if one in agents]
     projects = _shared_projects(board, raw["pair"])
@@ -1827,7 +1828,7 @@ def _present(
         prefer_existing_conversation=bool(raw.get("web_legacy_candidate")),
     )
     collaboration_problem = None
-    if not raw.get("archived_at"):
+    if inspect_collaboration and not raw.get("archived_at"):
         from .collaboration_ledger import collaboration_problem as inspect_ledger
 
         collaboration_problem = inspect_ledger(
@@ -1856,6 +1857,7 @@ def _present(
         ),
         "binding_problem": binding_problem,
         "collaboration_problem": collaboration_problem,
+        "collaboration_checked": inspect_collaboration,
         # A legacy path-only binding remains usable for compatibility, but the
         # API says so explicitly instead of presenting it as filesystem-verified.
         "project_binding_strength": str(
@@ -2055,6 +2057,10 @@ def list_for_agent(
             "chats": [_present(
                 config, board, agent_id, one, agents,
                 route_bindings=route_bindings, work_authorities=work_authorities,
+                # History diagnostics belong to the selected conversation.
+                # Replaying every ledger here held the registry lock behind
+                # unrelated project writers and hid the entire saved list.
+                inspect_collaboration=False,
             ) for one in visible],
         }
 

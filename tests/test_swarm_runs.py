@@ -136,6 +136,44 @@ class SwarmRunStoreTests(unittest.TestCase):
         else:
             os.environ["OUR_HARNESS_PIPELINE_RUN_DIR"] = self.prior_authority_override
 
+    def test_large_journal_verification_has_bounded_key_reads_and_checks_every_event(self):
+        from our_harness import swarm_runs as runs_module
+        store = SwarmRunStore(self.config)
+        accepted, _ = store.accept("large-history", {"kind": "chat"})
+        for index in range(120):
+            store.event(accepted["run_id"], "progress", {"index": index})
+        with closing(store._connect()) as db:
+            with mock.patch.object(runs_module, "integrity_key", wraps=runs_module.integrity_key) as key:
+                store._verify_all(db)
+            self.assertEqual(key.call_count, 2, "Key filesystem work grew with journal size")
+            db.execute("UPDATE events SET payload_json=? WHERE run_id=? AND seq=99",
+                       ('{"index":"rewritten"}', accepted["run_id"]))
+            with self.assertRaisesRegex(HarnessError, "event journal failed keyed integrity"):
+                store._verify_all(db)
+
+    def test_journal_verification_rejects_key_change_during_batch(self):
+        from our_harness import swarm_runs as runs_module
+        store = SwarmRunStore(self.config)
+        key = runs_module.integrity_key()
+        with closing(store._connect()) as db, mock.patch.object(
+            runs_module, "integrity_key", side_effect=[key, bytes(one ^ 255 for one in key)],
+        ):
+            with self.assertRaisesRegex(HarnessError, "key changed during"):
+                store._verify_all(db)
+
+    def test_reopened_journal_rechecks_replaced_key(self):
+        store = SwarmRunStore(self.config)
+        accepted, _ = store.accept("key-replacement", {"kind": "chat"})
+        store.start(accepted["run_id"])
+        store.finish(accepted["run_id"], {"answer": "preserved"})
+        key_path = self.runtime / "integrity.key"
+        key = key_path.read_bytes()
+        key_path.write_bytes(bytes(one ^ 255 for one in key))
+        with self.assertRaisesRegex(HarnessError, "integrity|anchor"):
+            SwarmRunStore(self.config)
+        key_path.write_bytes(key)
+        self.assertEqual(SwarmRunStore(self.config).get("key-replacement")["result"]["answer"], "preserved")
+
     def test_communication_journal_is_durable_without_granting_project_authority(self) -> None:
         descriptor = self.root / ".harness" / "project-authority.json"
         store = SwarmRunStore.for_communication(self.config)

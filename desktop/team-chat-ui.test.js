@@ -147,7 +147,8 @@ test("goal repair retains its authenticated goal diagnosis after a successful co
   const goal = {goal_id: "goal-portable", conversation_id: "chat-portable", project: {id: "project-portable"}, requested_agent_ids: ["agent-a", "agent-b"]};
   const plan = {repair: {state: "goal-action-invalid", goal_issue: {goal_id: goal.goal_id}, actions: []}};
   const nodes = new Map();
-  const context = vm.createContext({state, goal, plan, AbortController,
+  const context = vm.createContext({state, goal, plan, AbortController, setTimeout, clearTimeout,
+    swarmPicked: {kind: "agent", id: "agent-a"}, swarmAgentRepairChecks: new Map(),
     swarmAgentRepairTests: new Map(), swarmAgentRepairPlans: new Map(),
     $(id) { if (!nodes.has(id)) nodes.set(id, {dataset: {}, textContent: ""}); return nodes.get(id); },
     theSwarmAgent() { return {id: "agent-a", name: "Builder"}; },

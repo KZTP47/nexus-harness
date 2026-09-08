@@ -346,18 +346,33 @@ def collaboration_problem(
         and _regular_file_state(_ledger_anchor_path(ledger.paths.jsonl)) is None
     ):
         return None
+    # Diagnostics are advisory navigation data, never dispatch authority. A
+    # writer owns the project for potentially long periods; waiting here used
+    # to hide saved transcripts and mislabel lock contention as corruption.
+    busy = {
+        "schema_version": 1,
+        "code": "collaboration_record_busy",
+        "message": "This chat's collaboration record is being updated. Reopen the chat to check it again.",
+        "action": "",
+    }
+    if not _lock.acquire(blocking=False):
+        return busy
+    entered = False
     try:
-        with _lock, _authority_lock(config).held(30.0):
+        with _authority_lock(config).held(0.0):
+            entered = True
             ledger._read()  # noqa: SLF001 - this is the module's public health boundary
     except CollaborationLedgerIntegrityError:
         pass
     except HarnessError:
-        # An unreadable or unsafe ledger is equally unusable for dispatch. The
-        # reset action below remains narrow and explicit; it does not reinterpret
-        # the damaged record or touch the conversation transcript.
+        if not entered:
+            return busy
+        # Unreadable ledger data remains a scoped manual-recovery problem.
         pass
     else:
         return None
+    finally:
+        _lock.release()
     return {
         "schema_version": 1,
         "code": "collaboration_record_untrusted",

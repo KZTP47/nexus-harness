@@ -3649,7 +3649,7 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
             self.script.index("function aChatDestination"):
             self.script.index("function readChatAttachment")
         ]
-        self.assertIn("if (collaborationProblem && agent && conversation)", destination)
+        self.assertIn('if (collaborationProblem?.action === "reset_collaboration_record" && agent && conversation)', destination)
         self.assertIn('"Reset collaboration record"', destination)
 
     def test_chat_round_policy_is_visible_and_sent_with_both_chat_views(self) -> None:
@@ -8800,17 +8800,25 @@ class WhatThePanelIsTold(BoardTestCase):
         collaboration_ledger._ledger_anchor_path(ledger.paths.jsonl).unlink()
 
         problem_status, with_problem = self.ask(
-            "/api/swarm/chats?agent=agent-1"
+            f"/api/swarm/said?agent=agent-1&chat={conversation['id']}"
         )
         self.assertEqual(problem_status, 200, with_problem)
-        protected = next(
-            one for one in with_problem["chats"]
-            if one["id"] == conversation["id"]
-        )
+        protected = with_problem["conversation"]
         self.assertEqual(
             protected["collaboration_problem"]["action"],
             "reset_collaboration_record",
         )
+
+        before_busy = ledger.paths.jsonl.read_bytes()
+        with mock.patch.object(collaboration_ledger, "collaboration_problem", return_value={
+            "code": "collaboration_record_busy", "action": "",
+        }):
+            busy_status, busy = self.ask("/api/swarm/collaboration/reset", {
+                "agent": "agent-1", "chat": conversation["id"],
+            })
+        self.assertEqual(busy_status, 400, busy)
+        self.assertIn("busy", busy["error"])
+        self.assertEqual(ledger.paths.jsonl.read_bytes(), before_busy)
 
         reset_status, reset = self.ask("/api/swarm/collaboration/reset", {
             "agent": "agent-1", "chat": conversation["id"],

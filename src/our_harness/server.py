@@ -365,7 +365,11 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         self._swarm_runner: swarm_lab.Running | None = None
         self._swarm_goal_queue: swarm_goal_queue.SwarmGoalQueueStore | None = None
         self._long_horizon: long_horizon.LongHorizonRuntime | None = None
+        self._long_horizon_recovering: long_horizon.LongHorizonRuntime | None = None
         self.authority_lock = threading.Lock()
+        # Runtime recovery/close may call back into server authority. Serialize
+        # its lifetime separately; never hold authority_lock across either.
+        self._long_horizon_lifecycle_lock = threading.Lock()
         # Provider discovery is an in-memory acceleration only.  Bind it to an
         # exact runtime-config revision so a slow refresh from the old project
         # or old provider map can never publish after a settings reload.
@@ -489,7 +493,9 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         """
 
         with self.authority_lock:
-            if self._long_horizon_has_live_effect(self._long_horizon):
+            if any(self._long_horizon_has_live_effect(runtime) for runtime in (
+                self._long_horizon, self._long_horizon_recovering,
+            )):
                 raise HarnessError(
                     "An AI goal is in the middle of a provider or apply step. "
                     "Wait for that step to finish or pause, then change the settings."
@@ -519,61 +525,74 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         check_kinds_for_config = dict(registry.check_kinds)
         event_redactor = CredentialRedactor(config)
 
-        with self.authority_lock:
-            old_long_horizon = self._long_horizon
-            live_long_horizon = self._long_horizon_has_live_effect(old_long_horizon)
-            if live_long_horizon:
-                raise HarnessError(
-                    "An AI goal is in the middle of a provider or apply step. "
-                    "Wait for that step to finish or pause, then change the settings."
-                )
+        with self._long_horizon_lifecycle_lock:
+            self._drain_failed_long_horizon_recovery()
+            with self.authority_lock:
+                old_long_horizon = self._long_horizon
+                if self._long_horizon_has_live_effect(old_long_horizon):
+                    raise HarnessError(
+                        "An AI goal is in the middle of a provider or apply step. "
+                        "Wait for that step to finish or pause, then change the settings."
+                    )
             if reset_project_state and old_long_horizon is not None:
-                active_goals = old_long_horizon.store.active_authority_goals()
-                if active_goals:
+                if old_long_horizon.store.active_authority_goals():
                     raise HarnessError(
                         "Long-horizon project work is unfinished. Complete or cancel it "
                         "before moving projects."
                     )
             if old_long_horizon is not None:
-                # No worker can be using this checkpointer now. Paused and
-                # waiting goals remain durable; the next access reconstructs
-                # the runtime with the new config and recovers them there.
+                with self.authority_lock:
+                    # Once closed, this instance must never be returned as the
+                    # active runtime, even if reload is rejected after a racing
+                    # worker starts. Retain it in the draining slot until access
+                    # can safely recreate it with the still-current config.
+                    self._long_horizon = None
+                    self._long_horizon_recovering = old_long_horizon
                 old_long_horizon.close()
+            with self.authority_lock:
+                # An automatic start may have won the first live-worker check.
+                # close stops new starts, but a blocked provider may still be
+                # draining. Its config/checkpointer must remain owned until done.
+                if self._long_horizon_has_live_effect(old_long_horizon):
+                    raise HarnessError(
+                        "An AI goal is still finishing its provider or apply step. "
+                        "Wait for that step to finish before changing settings."
+                    )
+                self._long_horizon_recovering = None
+                if reset_project_state:
+                    self._pipeline_store = None
+                    self._swarm_runs = None
+                    self._swarm_communication_runs = None
+                    self._swarm_runner = None
+                    self._swarm_goal_queue = None
+                    self.pipeline_active_run_id = ""
+                    self.qa_result = None
+                    self.pipeline_run = None
+                    self.seats_before = None
+                    self.seats_were_set_up = False
+                else:
+                    # These stores are project-authority caches, so they can stay
+                    # open for a same-project settings change. Their only
+                    # config-derived state is the policy used to redact future
+                    # records; refresh it without replacing a durable coordinator.
+                    if self._pipeline_store is not None:
+                        self._pipeline_store.config = config
+                        self._pipeline_store.redactor = CredentialRedactor(config)
+                    if self._swarm_runs is not None:
+                        self._swarm_runs.redactor = CredentialRedactor(config)
+                    if self._swarm_communication_runs is not None:
+                        self._swarm_communication_runs.redactor = CredentialRedactor(config)
 
-            if reset_project_state:
-                self._pipeline_store = None
-                self._swarm_runs = None
-                self._swarm_communication_runs = None
-                self._swarm_runner = None
-                self._swarm_goal_queue = None
-                self.pipeline_active_run_id = ""
-                self.qa_result = None
-                self.pipeline_run = None
-                self.seats_before = None
-                self.seats_were_set_up = False
-            else:
-                # These stores are project-authority caches, so they can stay
-                # open for a same-project settings change. Their only
-                # config-derived state is the policy used to redact future
-                # records; refresh it without replacing a durable coordinator.
-                if self._pipeline_store is not None:
-                    self._pipeline_store.config = config
-                    self._pipeline_store.redactor = CredentialRedactor(config)
-                if self._swarm_runs is not None:
-                    self._swarm_runs.redactor = CredentialRedactor(config)
-                if self._swarm_communication_runs is not None:
-                    self._swarm_communication_runs.redactor = CredentialRedactor(config)
-
-            self._long_horizon = None
-            self.workflow_policy = workflow_policy
-            self.check_kinds = check_kinds_for_config
-            # Replace the redactor before publishing config. EventBus uses its
-            # own lock, so no event can be cleaned across this hand-off.
-            self.events.replace_redactor(event_redactor)
-            self.config = config
-            self._config_revision += 1
-            self._swarm_known_routes = None
-            self._swarm_known_routes_revision = 0
+                self._long_horizon = None
+                self.workflow_policy = workflow_policy
+                self.check_kinds = check_kinds_for_config
+                # Replace the redactor before publishing config. EventBus uses its
+                # own lock, so no event can be cleaned across this hand-off.
+                self.events.replace_redactor(event_redactor)
+                self.config = config
+                self._config_revision += 1
+                self._swarm_known_routes = None
+                self._swarm_known_routes_revision = 0
         return config
 
     @property
@@ -698,15 +717,45 @@ class HarnessHTTPServer(ThreadingHTTPServer):
 
     @property
     def long_horizon(self) -> long_horizon.LongHorizonRuntime:
-        with self.authority_lock:
-            held = self._long_horizon
+        with self._long_horizon_lifecycle_lock:
+            self._drain_failed_long_horizon_recovery()
+            with self.authority_lock:
+                held = self._long_horizon
+                config = self.config
             if held is None:
                 held = _long_horizon_module().LongHorizonRuntime(
-                    self.config, external_project_conflicts=self.legacy_project_conflicts,
+                    config, external_project_conflicts=self.legacy_project_conflicts,
                 )
-                held.recover_all()
-                self._long_horizon = held
+                with self.authority_lock:
+                    self._long_horizon_recovering = held
+                try:
+                    # Recovery starts the scheduler watcher, which calls back
+                    # into authority-protected legacy ownership. Holding that
+                    # lock here deadlocks the watcher and every board/chat read.
+                    held.recover_all()
+                except BaseException:
+                    # close may return while a provider is still draining. Keep
+                    # ownership visible so retry/settings cannot orphan it.
+                    held.close()
+                    raise
+                with self.authority_lock:
+                    self._long_horizon = held
+                    self._long_horizon_recovering = None
             return held
+
+    def _drain_failed_long_horizon_recovery(self) -> None:
+        """Caller holds lifecycle lock; cleanup must not hold callback authority."""
+        with self.authority_lock:
+            candidate = self._long_horizon_recovering
+            if self._long_horizon_has_live_effect(candidate):
+                raise HarnessError(
+                    "The previous saved-work runtime has an agent step still draining. "
+                    "Wait for that step to finish before reopening work or changing settings."
+                )
+        if candidate is not None:
+            candidate.close()
+            with self.authority_lock:
+                self._long_horizon_recovering = None
 
     def team_repair_plan(
         self, route: str, *, agent_id: str = "", goal_id: str = "",
@@ -2914,9 +2963,14 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         return self.require_no_long_horizon_path(root)
 
     def server_close(self) -> None:
-        held = self._long_horizon
-        if held is not None:
-            held.close()
+        with self._long_horizon_lifecycle_lock:
+            with self.authority_lock:
+                held = self._long_horizon
+                recovering = self._long_horizon_recovering
+            if held is not None:
+                held.close()
+            if recovering is not None and recovering is not held:
+                recovering.close()
         super().server_close()
 
     def swarm_goal_queue_status(self) -> dict[str, Any] | None:
@@ -5025,6 +5079,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             raise swarm_lab.SwarmError(
                                 "This chat's collaboration record passes its integrity checks. "
                                 "Nothing was reset."
+                            )
+                        if problem.get("action") != "reset_collaboration_record":
+                            raise swarm_lab.SwarmError(
+                                "This chat's collaboration record is busy. Nothing was reset; retry shortly."
                             )
                         remove_ledger(self.server.config, route, filed_as)
                         said = swarm_chats.list_for_agent(
