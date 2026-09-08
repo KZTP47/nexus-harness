@@ -167,8 +167,21 @@ class WorkflowCoverageContractsTests(unittest.TestCase):
         self.assertCountEqual(skipped, allowed_skips)
         self.assertTrue(set(skipped) <= set(required), "Skip exceptions must still name required jobs")
 
-    def test_checks_guard_matches_all_thirteen_work_jobs(self):
-        self.assert_guard_covers(self.load("checks.yml"), tag=False, count=13)
+    def test_checks_guard_matches_all_twelve_work_jobs(self):
+        self.assert_guard_covers(self.load("checks.yml"), tag=False, count=12)
+
+    def test_checks_removes_the_extra_panel_job_and_keeps_owning_acceptance(self):
+        jobs = self.load("checks.yml")
+        self.assertNotIn("panel", jobs)
+        self.assertNotIn("Panel checks", expanded_names(jobs))
+        self.assertEqual(scalar(jobs["project-checks"], "name"), "The project's own suite")
+        self.assertEqual(scalar(jobs["desktop"], "name"), "Desktop app")
+        self.assertEqual(scalar(jobs["package"], "name"), "What we would hand out")
+        for owner in ("project-checks", "desktop", "package"):
+            self.assertNotIn("continue-on-error:", jobs[owner])
+        self.assertIn("python -m our_harness qa run --workers 4", jobs["project-checks"])
+        self.assertIn("npm run smoke:browser-long-horizon", jobs["desktop"])
+        self.assertIn("python scripts/verify_dist.py", jobs["package"])
 
     def test_checks_runs_the_complete_python313_suite_in_exactly_eight_parts(self):
         jobs = self.load("checks.yml")

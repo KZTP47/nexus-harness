@@ -89,8 +89,11 @@ full Python 3.13 suite once across eight `Tests, part N of 8` jobs. Python 3.11
 receives one short compatibility check instead of another complete eight-part
 suite. The user explicitly requested this reduction after the duplicate Python
 3.11 run held up otherwise completed CI. This does not claim exhaustive Python
-3.11 coverage. `Panel checks`, `The project's own suite`, `Desktop app`, and
-`What we would hand out` retain their own checks. The Windows release manifest requires:
+3.11 coverage. The separate broad `Panel checks` browser job is also removed
+from routine CI. Its suite remains available through `our-harness qa run` for
+manual investigations. The desktop job retains its source-browser and packaged
+UI checks, alongside `The project's own suite` and `What we would hand out`.
+Normal Checks has thirteen jobs including its deadline guard. The Windows release manifest requires:
 
 - `Build installer`
 - `Installed app`

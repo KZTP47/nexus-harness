@@ -119,32 +119,27 @@ class SplittingTheTestsTests(unittest.TestCase):
         covered = [name for part in range(1, 9) for name in self.split.files_for((part, 8))]
         self.assertCountEqual(covered, self.split.every_test_file())
         self.assertEqual(len(covered), len(set(covered)))
-        compatibility = workflow[workflow.index("  python-compatibility:\n"):workflow.index("  panel:\n")]
+        compatibility = workflow[workflow.index("  python-compatibility:\n"):workflow.index("  project-checks:\n")]
         self.assertIn('python-version: "3.11"', compatibility)
         self.assertNotIn("scripts/run_tests.py", compatibility)
         self.assertNotIn("matrix:", compatibility)
 
-    def test_the_source_panel_lane_installs_declared_runtime_dependencies(self) -> None:
+    def test_the_project_qa_lane_keeps_runtime_and_failure_checks(self) -> None:
         # PYTHONPATH makes Nexus's own modules importable, but it does not
         # install LangGraph or make child commands independent of that one CI
-        # environment variable. The panel lane is meant to model a supported
+        # environment variable. The project lane is meant to model a supported
         # source installation, so require that installation before it starts.
         workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
-        panel = workflow[workflow.index("  panel:\n"):workflow.index("  project-checks:\n")]
-        install = panel.index("python -m pip install -e .")
-        start = panel.index("Start the panel and run the selected checks")
+        project = workflow[workflow.index("  project-checks:\n"):workflow.index("  desktop:\n")]
+        install = project.index("python -m pip install -e .")
+        start = project.index("Start the panel and run the suite")
         self.assertLess(install, start)
-
-    def test_consolidating_panel_setup_preserves_every_selected_case_serially(self) -> None:
-        workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
-        panel = workflow[workflow.index("  panel:\n"):workflow.index("  project-checks:\n")]
-        self.assertNotIn("matrix:", panel)
-        self.assertNotIn("--part", panel, "A single panel lane must not keep an obsolete shard filter")
-        self.assertIn("--suite .harness/qa/workflows.json", panel)
-        self.assertIn("--tag swarm --tag pipelines", panel)
-        self.assertIn("--workers 1", panel, "Panel cases share mutable boards and pipelines")
-        self.assertIn("$counts.skipped -gt 0", panel)
-        self.assertIn("$counts.total -lt 1", panel)
+        self.assertIn("python -m our_harness qa run --workers 4", project)
+        self.assertIn("$report.counts.skipped -gt 0", project)
+        self.assertIn("if (-not $report.passed)", project)
+        self.assertNotIn("  panel:\n", workflow)
+        self.assertTrue((ROOT / ".harness" / "qa" / "workflows.json").is_file(),
+                        "The removed routine panel job must not remove its manual QA suite")
 
     def test_desktop_keeps_one_packaging_test_and_real_runtime_acceptance(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
