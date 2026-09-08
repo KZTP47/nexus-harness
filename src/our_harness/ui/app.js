@@ -14049,6 +14049,18 @@ function renderTheChatThreadFor(agentId, said) {
 
 function keepWhatWasSaidTo(agentId, said, conversationId = activeConversationIdFor(agentId)) {
   const held = swarmChats.find((one) => one.agent === agentId);
+  // Retain only a derived input flag for background replies; transcript ownership
+  // below still prevents an old chat from replacing the selected chat's history.
+  const requested = held?.conversations?.find(one => one.id === conversationId);
+  if (requested && Array.isArray(said)) {
+    let pending = false;
+    for (const turn of said) {
+      if (turn.who === "you") pending = false;
+      else if (turn.questions?.length && !turn.correlation?.goal_id) pending = true;
+    }
+    held.inputRequests ||= {};
+    held.inputRequests[conversationId] = {project: requested.project, pending};
+  }
   // Network answers and reads carry the conversation they were requested for.
   // If the user has moved elsewhere, save/display belongs to that old request,
   // never to the conversation now named by the header.
@@ -14068,7 +14080,9 @@ function keepWhatWasSaidToRuntime(
 ) {
   let kept = false;
   for (const held of swarmChats) {
-    if (swarmChatRuntimeKey(held.agent) !== chatKey) continue;
+    if (swarmChatRuntimeKey(held.agent) !== chatKey
+        && !(chatKey === `chat:${conversationId}`
+          && held.conversations?.some(one => one.id === conversationId))) continue;
     kept = keepWhatWasSaidTo(held.agent, said, conversationId) || kept;
   }
   return kept;
@@ -17803,6 +17817,46 @@ function renderTheConversationSidebar(agentId) {
   if (!list.childElementCount) {
     list.append(make("p", "hint", "Connect this agent to another AI with a green line."));
   }
+  refreshConversationAttention(agentId);
+}
+
+function conversationAttentionReason(conversation) {
+  if (!conversation?.id || conversation.archived_at) return "";
+  // Use structured requests, never punctuation or ordinary unread messages.
+  // Match the saved conversation and project, not the agent currently selected.
+  const goals = longGoals.filter(goal => goal.conversation_id === conversation.id
+    && goal.project?.id === conversation.project
+    && !["complete", "cancelled", "cancelling", "failed"].includes(goal.status));
+  if (goals.some(goal => goal.pending_interrupts?.length
+      || goal.status === "waiting_for_user")) return "Needs your input";
+  const recovery = swarmWorkRecoveries.get(`chat:${conversation.id}`);
+  if (recovery?.status === "paused_for_user"
+      && recovery.projectId === conversation.project) return "Needs your input";
+  if (!conversation.binding_problem && swarmChats.some(held => {
+    const request = held.inputRequests?.[conversation.id];
+    return request?.pending && request.project === conversation.project;
+  })) return "Needs your input";
+  return "";
+}
+
+function refreshConversationAttention(agentId) {
+  const conversations = swarmChats.find(one => one.agent === agentId)?.conversations || [];
+  const list = $("theBigChatConversationList");
+  if (!list) return;
+  for (const pick of list.querySelectorAll(".the-big-chat-conversation-pick")) {
+    const conversation = conversations.find(one => one.id === pick.dataset.chatId);
+    if (!conversation) continue;
+    const reason = conversationAttentionReason(conversation);
+    const active = Boolean(reason);
+    if (pick.classList.contains("needs-user-input") !== active) {
+      pick.classList.toggle("needs-user-input", active);
+      // Preserve the pulse phase when navigation rebuilds these buttons.
+      pick.style.animationDelay = active ? `-${Date.now() % 2400}ms` : "";
+    }
+    const marker = pick.querySelector(".chat-input-needed");
+    if (active && !marker) pick.append(make("span", "chat-input-needed", reason));
+    if (!active && marker) marker.remove();
+  }
 }
 
 function renderTheConversationProject(agentId) {
@@ -17858,6 +17912,7 @@ function renderTheBigChat() {
     : `${agent.name} — Nexus chat`;
   if (bigChatPartChanged("sidebar", {
     conversations: held?.conversations || [],
+    inputRequests: (held?.conversations || []).map(conversationAttentionReason),
     agents: (theSwarmBoard().agents || []).map((one) => ({
       id: one.id, name: one.name, icon: one.icon, colour: one.colour,
       bubble_colour: one.bubble_colour,
@@ -18110,6 +18165,7 @@ function longHorizonActivitySnapshotForAgent(agentId) {
 }
 
 function renderWhatItHasGoingOn(agent) {
+  refreshConversationAttention(theBigOne);
   const list = $("theBigChatDoing");
   if (!list) return;
   list.replaceChildren();

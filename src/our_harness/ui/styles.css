@@ -1898,6 +1898,28 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   border-color: var(--amber, #ffc65a);
   box-shadow: inset 3px 0 0 var(--amber, #ffc65a);
 }
+/* Pending user decisions need attention even while a sibling chat is open.
+   Use an inset glow so the narrow, scrollable sidebar cannot clip the cue. */
+.the-big-chat-conversation-pick.needs-user-input {
+  border-color: var(--amber, #ffc65a);
+  background: #49391f;
+  box-shadow: inset 0 0 0 1px #ffc65a, inset 0 0 14px #ffc65a55;
+  animation: chat-input-glow 2.4s ease-in-out infinite;
+}
+.the-big-chat-conversation-pick.needs-user-input .chat-input-needed {
+  color: #ffe4a3;
+  font-weight: 700;
+}
+@keyframes chat-input-glow {
+  0%, 100% { background-color: #263238; border-color: #b58c44;
+    box-shadow: inset 0 0 0 1px #ffc65a33, inset 0 0 3px #ffc65a11; }
+  50% { background-color: #664819; border-color: #ffd479;
+    box-shadow: inset 0 0 0 1px #ffd479, inset 0 0 18px #ffc65a77; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .the-big-chat-conversation-pick.needs-user-input { animation: none; }
+}
+
 .the-big-chat-binding-repair {
   grid-column: 1 / -1;
   display: grid;
