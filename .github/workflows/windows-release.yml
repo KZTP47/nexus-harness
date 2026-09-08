@@ -219,16 +219,6 @@ jobs:
             unpacked_mib = [math]::Round($unpackedBytes / 1MB, 1)
           } | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath desktop/build-output/release-metadata.json
 
-      - name: Assemble the product-bound offline installer ZIP
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
-          if ($installers.Count -ne 1) { throw "Expected one stable installer, found $($installers.Count)." }
-          & .\scripts\build_windows_offline_bundle.ps1 `
-            -InstallerPath $installers[0].FullName `
-            -OutputDirectory (Resolve-Path 'desktop/build-output')
-
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: nexus-harness-windows-${{ github.ref_name }}
@@ -237,13 +227,6 @@ jobs:
             desktop/build-output/Nexus-Harness-Setup-*.exe
             desktop/build-output/Nexus-Harness-Setup-*.exe.sha256
             desktop/build-output/release-metadata.json
-          compression-level: 0
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: startsWith(github.ref, 'refs/tags/v')
-        with:
-          name: nexus-harness-offline-${{ github.ref_name }}
-          if-no-files-found: error
-          path: desktop/build-output/Nexus-Harness-Windows-Offline-*.zip
           compression-level: 0
 
   installed-acceptance:
@@ -273,6 +256,22 @@ jobs:
       - name: Verify the installed artifact
         shell: pwsh
         run: ./scripts/release_installed_acceptance.ps1 -Mode '${{ matrix.mode }}' -ArtifactDirectory release-candidate
+      - name: Assemble the product-bound offline installer ZIP
+        if: matrix.mode == 'shortcuts' && startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath release-candidate -Filter 'Nexus-Harness-Setup-*.exe')
+          if ($installers.Count -ne 1) { throw "Expected one stable installer, found $($installers.Count)." }
+          & .\scripts\build_windows_offline_bundle.ps1 `
+            -InstallerPath $installers[0].FullName `
+            -OutputDirectory (Resolve-Path 'release-candidate')
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.mode == 'shortcuts' && startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: nexus-harness-offline-${{ github.ref_name }}
+          if-no-files-found: error
+          path: release-candidate/Nexus-Harness-Windows-Offline-*.zip
+          compression-level: 0
       - name: Locate failed release smoke evidence
         if: failure()
         shell: pwsh

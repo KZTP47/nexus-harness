@@ -237,6 +237,124 @@ class WorkflowBudgetTests(unittest.TestCase):
         self.assertLessEqual(len(self.api.requests), 6)
         self.assertTrue(all(timeout <= ci.API_SECONDS for _, _, timeout in self.api.requests))
 
+    def test_one_polling_transport_timeout_recovers_without_cancelling(self):
+        budget = self.setup_budget(270)
+        polls = []
+
+        def timeout_once(method, path):
+            if "/jobs?" in path:
+                polls.append(path)
+                self.clock.elapsed += 5
+                if len(polls) == 1:
+                    raise ci.ReadTimeout("GitHub read transport timeout")
+
+        self.api.callback = timeout_once
+        self.assertTrue(budget.watch(["Build"]))
+        self.assertEqual(len(polls), 2)
+        self.assertEqual(polls[0], polls[1])
+        self.assertEqual(self.clock.elapsed, 280)
+        self.assertEqual(budget.deadline, ci.WORK_SECONDS)
+        self.assertEqual(self.api.posts(), [])
+        self.assertEqual(self.clock.sleeps, [], "A retry must not add a backoff wait")
+
+    def test_persistent_polling_timeouts_fail_after_one_retry_then_cancel(self):
+        budget = self.setup_budget(270)
+
+        def timeout(method, path):
+            if "/jobs?" in path:
+                self.clock.elapsed += 5
+                raise ci.ReadTimeout("GitHub read transport timeout")
+
+        self.api.callback = timeout
+        self.assertFalse(budget.watch(["Build"]))
+        self.assertEqual(sum("/jobs?" in path for _, path, _ in self.api.requests), 2)
+        self.assertEqual(self.api.posts(), [IDENTITY.path + "/cancel", IDENTITY.path + "/force-cancel"])
+        self.assertEqual(self.clock.elapsed, 290)
+
+    def test_poll_retry_is_refused_without_a_full_call_before_the_deadline(self):
+        budget = self.setup_budget(833)
+        cancellation_times = []
+
+        def timeout(method, path):
+            if "/jobs?" in path:
+                self.clock.elapsed += 5
+                raise ci.ReadTimeout("GitHub read transport timeout")
+            if method == "POST" and path.endswith("/cancel"):
+                cancellation_times.append(self.clock.elapsed)
+
+        self.api.callback = timeout
+        self.assertFalse(budget.watch(["Build"]))
+        self.assertEqual(sum("/jobs?" in path for _, path, _ in self.api.requests), 1)
+        self.assertEqual(cancellation_times, [838])
+        self.assertLess(cancellation_times[0], ci.WORK_SECONDS)
+
+    def test_last_poll_timeout_uses_only_the_remaining_fractional_budget(self):
+        budget = self.setup_budget(839.95)
+
+        def timeout(method, path):
+            if "/jobs?" in path:
+                self.clock.elapsed += self.api.requests[-1][2]
+                raise ci.ReadTimeout("GitHub read transport timeout")
+
+        self.api.callback = timeout
+        self.assertFalse(budget.watch(["Build"]))
+        polls = [(path, timeout) for _, path, timeout in self.api.requests if "/jobs?" in path]
+        self.assertEqual(len(polls), 1)
+        self.assertAlmostEqual(polls[0][1], 0.05, places=4)
+        self.assertEqual(self.api.posts(), [IDENTITY.path + "/cancel", IDENTITY.path + "/force-cancel"])
+
+    def test_successful_near_deadline_retry_does_not_reset_the_clock(self):
+        budget = self.setup_budget(829)
+        calls = []
+
+        def timeout_once(method, path):
+            if "/jobs?" in path:
+                calls.append(path)
+                self.clock.elapsed += 5
+                if len(calls) == 1:
+                    raise ci.ReadTimeout("GitHub read transport timeout")
+
+        self.api.callback = timeout_once
+        self.assertTrue(budget.watch(["Build"]))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.clock.elapsed, 839)
+        self.assertEqual(budget.remaining(), 1)
+
+    def test_polling_authentication_malformed_and_other_failures_are_not_retried(self):
+        for reason in ("HTTP 401", "HTTP 403", "Malformed response", "HTTP 503", "OSError"):
+            with self.subTest(reason=reason):
+                budget = self.setup_budget()
+                self.api.errors["/jobs?per_page=100&page=1"] = ci.BudgetError(reason)
+                self.assertFalse(budget.watch(["Build"]))
+                self.assertEqual(sum("/jobs?" in path for _, path, _ in self.api.requests), 1)
+
+    def test_recovered_poll_still_rejects_invalid_or_incomplete_job_evidence(self):
+        for snapshot in ({"total_count": 1, "jobs": ["malformed"]},
+                         [job(run_id=99)], [job("Unknown job")], [job(conclusion="skipped")]):
+            with self.subTest(snapshot=snapshot):
+                budget = self.setup_budget(snapshots=[snapshot])
+                calls = []
+
+                def timeout_once(method, path):
+                    if "/jobs?" in path:
+                        calls.append(path)
+                        if len(calls) == 1:
+                            self.clock.elapsed += 5
+                            raise ci.ReadTimeout("GitHub read transport timeout")
+
+                self.api.callback = timeout_once
+                self.assertFalse(budget.watch(["Build"]))
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(len(self.api.posts()), 2)
+
+    def test_bootstrap_and_cancellation_identity_timeouts_remain_single_call(self):
+        budget = self.setup_budget()
+        self.api.errors["/attempts/2"] = ci.ReadTimeout("Bootstrap timeout")
+        self.api.errors[IDENTITY.path] = ci.ReadTimeout("Cancellation identity timeout")
+        self.assertFalse(budget.watch(["Build"]))
+        self.assertEqual(len(self.api.requests), 2)
+        self.assertEqual(self.api.posts(), [])
+
     def test_authentication_or_api_outage_never_becomes_an_unverified_success(self):
         budget = self.setup_budget()
         self.api.errors["/attempts/2"] = ci.BudgetError("HTTP 403")
@@ -326,6 +444,28 @@ class TransportAndInterfaceTests(unittest.TestCase):
         self.assertNotIn(token, " ".join(request.call_args.args[0]))
         self.assertEqual(request.call_args.kwargs["timeout"], 1)
         self.assertTrue(request.call_args.kwargs["capture_output"])
+
+    def test_transport_marks_only_read_timeouts_retryable_without_retrying_itself(self):
+        api = ci.GitHubAPI({"GH_TOKEN": "test-only"})
+        for method in ("GET", "POST"):
+            with self.subTest(method=method), mock.patch.object(ci.subprocess, "run",
+                    side_effect=subprocess.TimeoutExpired(["worker"], 5)) as request:
+                with self.assertRaises(ci.BudgetError) as caught:
+                    api.request(method, "/some/path")
+                self.assertEqual(isinstance(caught.exception, ci.ReadTimeout), method == "GET")
+                self.assertEqual(request.call_count, 1)
+
+    def test_transport_never_rounds_a_subsecond_budget_up_or_starts_after_expiry(self):
+        api = ci.GitHubAPI({"GH_TOKEN": "test-only"})
+        response = subprocess.CompletedProcess([], 0, json.dumps({"status": 200, "body": {}}), "")
+        with mock.patch.object(ci.subprocess, "run", return_value=response) as request:
+            api.request("GET", "/some/path", timeout=0.025)
+            self.assertEqual(request.call_args.kwargs["timeout"], 0.025)
+        with mock.patch.object(ci.subprocess, "run") as request:
+            for timeout in (0, -1):
+                with self.assertRaises(ci.BudgetError):
+                    api.request("GET", "/some/path", timeout=timeout)
+            request.assert_not_called()
 
     def test_http_errors_malformed_bodies_and_secret_output_fail_closed(self):
         token = "unprintable-test-secret"

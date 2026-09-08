@@ -40,6 +40,10 @@ class BudgetError(RuntimeError):
     """A budget or its evidence could not be verified; never a successful skip."""
 
 
+class ReadTimeout(BudgetError):
+    """One GET exceeded its transport wall-time bound; its evidence is unknown."""
+
+
 def log(message: str) -> None:
     print(message, flush=True)
 
@@ -95,14 +99,19 @@ class GitHubAPI:
             raise BudgetError("GITHUB_API_URL must be an HTTPS API origin without credentials.")
 
     def request(self, method: str, path: str, timeout: float = API_SECONDS) -> dict:
+        if timeout <= 0:
+            raise BudgetError("No time remains for the GitHub API request.")
         try:
             result = subprocess.run(
                 [sys.executable, str(Path(__file__).resolve()), "_request"],
                 input=json.dumps({"method": method, "url": self.base + path, "token": self.token}),
-                text=True, capture_output=True, timeout=max(0.1, min(API_SECONDS, timeout)),
+                text=True, capture_output=True, timeout=min(API_SECONDS, timeout),
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except subprocess.TimeoutExpired:
+            error_type = ReadTimeout if method == "GET" else BudgetError
+            raise error_type("GitHub API request did not complete (TimeoutExpired).") from None
+        except OSError as error:
             raise BudgetError(f"GitHub API request did not complete ({type(error).__name__}).") from None
         if result.returncode:
             # Neither a response body nor arbitrary subprocess output is safe
@@ -199,14 +208,32 @@ class WorkflowBudget:
             raise BudgetError(f"Not enough workflow time remains for a {reserve_seconds}s publication step.")
         self.finish(f"publication check passed (reserved {reserve_seconds}s)")
 
+    def read_jobs_page(self, path: str) -> dict:
+        # Only attempt-job polling may retry, after a verified timestamp has
+        # anchored the shared monotonic deadline. Bootstrap/cancellation reads
+        # and every POST retain their single-call semantics. No backoff sleeps,
+        # HTTP/auth/malformed retries, or new clock are introduced.
+        for attempt in range(2):
+            remaining = self.remaining()
+            if remaining <= 0:
+                raise BudgetError("The workflow execution budget expired.")
+            try:
+                return self.api.request("GET", path, timeout=min(API_SECONDS, remaining))
+            except ReadTimeout:
+                if attempt:
+                    raise
+                if self.remaining() <= API_SECONDS:
+                    raise BudgetError("GitHub polling timed out without room for one full retry before cancellation.") from None
+                self.log("GitHub polling read timed out; retrying once within the existing workflow deadline.")
+        raise AssertionError("The bounded polling retry must return or raise.")
+
     def jobs(self) -> list[dict]:
         jobs: list[dict] = []
         for page in range(1, MAX_JOB_PAGES + 1):
             if self.remaining() <= 0:
                 raise BudgetError("The workflow execution budget expired.")
-            result = self.api.request(
-                "GET", f"{self.identity.path}/attempts/{self.identity.attempt}/jobs?per_page=100&page={page}",
-                timeout=min(API_SECONDS, self.remaining()),
+            result = self.read_jobs_page(
+                f"{self.identity.path}/attempts/{self.identity.attempt}/jobs?per_page=100&page={page}",
             )
             batch, count = result.get("jobs"), result.get("total_count")
             if (not isinstance(batch, list) or not isinstance(count, int) or count < 0

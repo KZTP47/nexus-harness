@@ -26,8 +26,8 @@ The watchdog polls every 10 seconds and exits as soon as all expected jobs have
 completed successfully. It does not hold an otherwise completed workflow open
 until the deadline. Its explicit job manifest includes every matrix expansion
 and downstream release job. Missing jobs remain pending; unknown jobs, duplicate
-names, failures, neutral results, unexpected skips, malformed evidence, and API
-errors fail the guard. A failed guard requests cancellation and never reports a
+names, failures, neutral results, unexpected skips, malformed evidence, and
+persistent API errors fail the guard. A failed guard requests cancellation and never reports a
 successful skip. This policy favors a clear failed run over an unverified green
 one; it may cancel peer jobs before they finish after a confirmed failure.
 
@@ -37,6 +37,15 @@ stdin, not command arguments; API response bodies and subprocess error output
 are never copied into diagnostics. Pagination is bounded and must supply a
 complete set of jobs. Final messages report the measured workflow elapsed time,
 or explicitly say that it could not be verified.
+
+A transient timeout while polling attempt jobs receives one bounded retry on
+the same workflow clock. It cannot restart the clock or postpone the cancellation point. A second
+failure still cancels the workflow; malformed evidence, identity mismatches,
+permission failures, and failed checks remain immediate failures. Initial
+timestamp reads and cancellation identity reads remain single calls, and
+cancellation requests are not automatically retried. This handles the observed
+single slow GitHub read that otherwise cancelled a healthy release after less
+than five minutes.
 
 The repository, run ID, and attempt come from `GITHUB_REPOSITORY`,
 `GITHUB_RUN_ID`, and `GITHUB_RUN_ATTEMPT`. API responses must match that identity.
@@ -88,6 +97,14 @@ out`. The Windows release manifest requires:
 - `Publish release`
 - `Public downloads`
 - `Public source ZIP`
+
+The build uploads the verified installer, checksum, and size metadata first.
+The installed-shortcut lane assembles and uploads the offline ZIP after its
+acceptance checks, while the longer installed long-horizon lane runs in
+parallel. This removes the measured 31 seconds of ZIP assembly/upload from the
+path that delayed every installed lane. The ZIP still uses the exact downloaded
+installer and checksum and the existing product identity validation. Publication
+waits for every installed lane, including the completed offline ZIP upload.
 
 Only manual `workflow_dispatch` releases may explicitly allow the last three
 publication jobs to be skipped, by adding an `--allow-skipped-job` argument for

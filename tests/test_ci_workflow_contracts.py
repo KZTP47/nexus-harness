@@ -140,6 +140,18 @@ def dependencies(job: str) -> list[str]:
     return inline_list(value) if value.startswith("[") else [value]
 
 
+def steps_in(job: str) -> list[str]:
+    starts = list(re.finditer(r"(?m)^      - (?:name|uses):", job))
+    if not starts:
+        raise AssertionError("No workflow steps were found")
+    steps = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(job)
+        # Normalize the list item's first field to the other step fields' indent.
+        steps.append("        " + job[start.start() + 8:end])
+    return steps
+
+
 class WorkflowCoverageContractsTests(unittest.TestCase):
     def load(self, filename: str) -> dict[str, str]:
         return jobs_in((WORKFLOWS / filename).read_text(encoding="utf-8"))
@@ -183,6 +195,70 @@ class WorkflowCoverageContractsTests(unittest.TestCase):
         self.assertNotIn("continue-on-error:", acceptance)
         for owner in ("public-downloads", "prove-public-source-zip"):
             self.assertEqual(dependencies(jobs[owner]), ["publish-release"])
+
+    def test_offline_bundle_runs_once_after_shortcut_acceptance_for_tag_refs(self):
+        jobs = self.load("windows-release.yml")
+        build = jobs["clean-windows-build"]
+        acceptance = jobs["installed-acceptance"]
+        self.assertNotIn("build_windows_offline_bundle.ps1", build)
+        self.assertNotIn("nexus-harness-offline-", build)
+        steps = steps_in(acceptance)
+        verify = [step for step in steps if "name: Verify the installed artifact\n" in step]
+        assemble = [step for step in steps if "build_windows_offline_bundle.ps1" in step]
+        upload = [step for step in steps if "name: nexus-harness-offline-" in step]
+        self.assertEqual((len(verify), len(assemble), len(upload)), (1, 1, 1))
+        self.assertLess(steps.index(verify[0]), steps.index(assemble[0]))
+        self.assertLess(steps.index(assemble[0]), steps.index(upload[0]))
+        # A tag selected through workflow_dispatch must retain the same bundle
+        # behavior as a pushed tag; branch dispatches still omit the bundle.
+        condition = "matrix.mode == 'shortcuts' && startsWith(github.ref, 'refs/tags/v')"
+        for step in (assemble[0], upload[0]):
+            self.assertEqual(scalar(step, "if", 8), condition)
+            self.assertNotIn("continue-on-error:", step)
+        self.assertNotRegex(verify[0], r"(?m)^        if:")
+        self.assertNotIn("continue-on-error:", acceptance)
+        self.assertIn("Get-ChildItem -LiteralPath release-candidate", assemble[0])
+        self.assertIn("if ($installers.Count -ne 1)", assemble[0])
+        self.assertIn("-InstallerPath $installers[0].FullName", assemble[0])
+        self.assertIn("-OutputDirectory (Resolve-Path 'release-candidate')", assemble[0])
+        self.assertEqual(scalar(upload[0], "name", 10),
+                         "nexus-harness-offline-${{ github.ref_name }}")
+        self.assertEqual(scalar(upload[0], "path", 10),
+                         "release-candidate/Nexus-Harness-Windows-Offline-*.zip")
+        self.assertEqual(scalar(upload[0], "compression-level", 10), "0")
+        self.assertEqual(scalar(upload[0], "if-no-files-found", 10), "error")
+
+    def test_installer_artifact_still_serves_manual_and_tag_acceptance(self):
+        jobs = self.load("windows-release.yml")
+        build = jobs["clean-windows-build"]
+        acceptance = jobs["installed-acceptance"]
+        for job in (build, acceptance):
+            self.assertNotRegex(job, r"(?m)^    if:")
+        uploads = [step for step in steps_in(build) if "uses: actions/upload-artifact@" in step]
+        self.assertEqual(len(uploads), 1)
+        installer = uploads[0]
+        self.assertNotRegex(installer, r"(?m)^        if:")
+        self.assertEqual(scalar(installer, "name", 10),
+                         "nexus-harness-windows-${{ github.ref_name }}")
+        self.assertEqual([line.strip() for line in block(installer, "path", 10).splitlines()], [
+            "desktop/build-output/Nexus-Harness-Setup-*.exe",
+            "desktop/build-output/Nexus-Harness-Setup-*.exe.sha256",
+            "desktop/build-output/release-metadata.json",
+        ])
+        self.assertEqual(scalar(installer, "compression-level", 10), "0")
+        self.assertEqual(scalar(installer, "if-no-files-found", 10), "error")
+        downloads = [step for step in steps_in(acceptance)
+                     if "uses: actions/download-artifact@" in step]
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(scalar(downloads[0], "name", 10), scalar(installer, "name", 10))
+        self.assertEqual(scalar(downloads[0], "path", 10), "release-candidate")
+        self.assertNotRegex(downloads[0], r"(?m)^        if:")
+        publisher_download = [step for step in steps_in(jobs["publish-release"])
+                              if "uses: actions/download-artifact@" in step]
+        self.assertEqual(len(publisher_download), 1)
+        self.assertEqual(scalar(publisher_download[0], "pattern", 10),
+                         "nexus-harness-*-${{ github.ref_name }}")
+        self.assertEqual(scalar(publisher_download[0], "merge-multiple", 10), "true")
 
     def test_publication_reserve_covers_write_and_longest_downstream_job(self):
         jobs = self.load("windows-release.yml")
