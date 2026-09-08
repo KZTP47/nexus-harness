@@ -10941,6 +10941,10 @@ assert.equal(desktopDeletes, 2);
             script.index("function projectWorkPauseForMessage"):
             script.index("function directLongGoalCanonicalValue")
         ]
+        attachment_loading_helper = script[
+            script.index("function swarmChatAttachmentsAreLoading"):
+            script.index("function swarmChatActivityFor")
+        ]
         handlers = {
             "compact": script[
                 script.index("async function sendWhatIsTypedTo"):
@@ -10988,6 +10992,7 @@ const swarmStopping = new Set();
 const swarmChatResetting = new Set();
 const swarmConversationSwitching = new Set();
 const swarmChatAttachments = new Map();
+const swarmChatAttachmentLoads = new Map();
 const swarmChatComposerDrafts = new Map();
 const theBigChatComposerDrafts = new Map();
 const markerStorage = new Map();
@@ -11316,7 +11321,8 @@ for (const ackLossMode of ["lost-ack-before", "lost-ack-after"]) {
                 probe.write_text(
                     "\"use strict\";\n(async () => {\n" + shared + "\n"
                     + outbox_helpers + "\n" + receipt_helpers + "\n"
-                    + prepare_helper + "\n" + pause_helper + "\n" + handler + "\n"
+                    + prepare_helper + "\n" + pause_helper + "\n"
+                    + attachment_loading_helper + "\n" + handler + "\n"
                     + invocations[name] + "\n" + assertions
                     + "\n" + negative
                     + "\n})().catch((error) => {\n"
