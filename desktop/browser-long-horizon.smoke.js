@@ -153,8 +153,8 @@ with (coordination / f"{stem}-dispatch.log").open("a", encoding="utf-8") as stre
 
 target = f"browser-{stem}.txt"
 changes = []
-# The provider's transport cwd is not this chat's independent working copy.
-# Nexus supplies that exact copy's current file inventory in every turn.
+# The provider transport cwd differs from the independent chat working copy.
+# Nexus supplies its current file inventory in every turn.
 if target not in project_tree.splitlines():
     changes.append({
         "path": target,
