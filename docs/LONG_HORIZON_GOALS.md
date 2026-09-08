@@ -9,11 +9,36 @@ Mission control provides optional detail.
 
 You can open another saved chat and start **Work together on project files**
 while the first chat continues. Each goal keeps its own conversation, progress,
-and pause/cancel controls, including when the chats share an agent. Goals for
-separate project folders can run concurrently, subject to provider capacity.
-Goals whose project folders overlap wait for the current owner to release the
-project; their requests remain saved. A confirmed chat switch enables its
-composer and controls while history loads in the background.
+and pause/cancel controls, including when the chats share an agent and select
+the same project folder. Each saved chat works in an independent copy of the
+selected project, including its uncommitted files. This works without Git.
+Provider account capacity still limits simultaneous requests. A confirmed chat
+switch enables its composer and controls while history loads in the background.
+
+Nexus synchronizes unrelated project changes into the copy before final checks.
+If this changes the files the team agreed on, the team inspects them again.
+Only the final check-and-apply step is serialized; other chats keep working.
+Changes are applied back to the selected project with exact baseline checks
+and rollback backups. A conflicting edit pauses that chat and names the paths;
+it never silently replaces the other chat's result. Goal details show the
+retained working-copy folder. Reconcile the conflicting files in the selected
+project, then Resume. A completion message appears only after verification
+and successful application to the selected project.
+
+If the team creates a new test command in its copy, open goal details and choose
+**Review this chat's test commands**. Approval names the exact command and is
+bound to this goal, selected project and test manifest. It does not approve
+another chat's checks. Resume runs the approved checks. Changes to the command
+or its discovery manifest require another review.
+
+After upgrade, settled saved chats can adopt an independent copy while keeping
+their files, questions, history and spent budgets. An active provider call,
+unknown outcome or unfinished file transaction must settle before migration.
+Legacy board-only and legacy paired work still own the original project
+exclusively. Working copies are retained for inspection and recovery; they
+require disk space for the project (up to 100,000 files and 2 GB). Git metadata
+and Nexus control folders are excluded. Linked paths and substituted folders
+are rejected rather than copied outside their authority.
 
 A completed goal appears as a distinct **Task completed** message with the
 Nexus Harness icon and a link to its saved result and verification details.
@@ -141,8 +166,11 @@ and late results are rejected.
 Decision submissions are bound to the exact displayed goal revision and full
 set of pending question IDs, so a stale card cannot answer a changed goal.
 Cancel voids pending cards, and a goal with a pending decision cannot be forked.
-A paused goal deliberately continues to own its project; cancel or finish it
-before starting another project-writing workflow on the same tree.
+A paused isolated chat retains its own working copy; other isolated chats can
+continue on the same selected project. A paused legacy goal still owns the
+original project exclusively until it finishes or is cancelled. Forking requires
+a settled checkpoint and a clean Git source; unpublished working-copy changes
+must be retained in the original chat rather than silently omitted from a fork.
 
 ## Completion and review
 

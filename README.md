@@ -531,8 +531,10 @@ options and a custom-answer field, then continue the same conversation after
 you answer. In the full board chat, a left
 pane keeps multiple durable chats for each exact two-agent pair, and each chat
 has its own active-project dropdown. **Work together on project files** starts
-the pair's shared goal and applies validated, baseline-checked changes only to
-the selected shared project, with rollback backups. While that goal is active,
+the pair's shared goal in an independent working copy. Multiple saved chats can
+work on the same selected project concurrently. Nexus verifies and applies
+nonconflicting results back to that project with baseline checks and rollback
+backups; conflicting edits pause for reconciliation. While that goal is active,
 **Send to team** updates its instructions, including during an agent turn.
 Replies for superseded instructions cannot overwrite the new direction.
 Fenced code replies have a per-block **Copy code** control.

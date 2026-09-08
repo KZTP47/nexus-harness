@@ -7,9 +7,9 @@
 // connected as a real pair. First, the backend admission request is cut after
 // Electron has durably saved an exact prompt and binary attachment. The app is
 // restarted and that request is reconciled through the visible recovery UI.
-// Goal A then deliberately waits inside its provider so Goal B can be submitted
-// from another saved chat against the same project. The check releases A,
-// observes B promote and finish, restarts again, and reopens Chat 2 to prove the
+// Goals A and B then wait inside their providers after being submitted from
+// separate saved chats against the same project. Both must enter before either
+// is released. The check publishes B before A, restarts, and reopens Chat 2 to prove the
 // prompts, attachment, outcomes, and verified lifecycle are durable.
 
 const fs = require("node:fs");
@@ -86,16 +86,18 @@ if ($isR) {
 } else {
   [IO.File]::WriteAllText((Join-Path $Coordination "entered-$suffix.marker"), 'entered')
 }
-if ($isA) {
+if ($isA -or $isB) {
   $deadline = [DateTime]::UtcNow.AddSeconds(90)
-  while (-not (Test-Path -LiteralPath (Join-Path $Coordination 'release-a.marker'))) {
+  while (-not (Test-Path -LiteralPath (Join-Path $Coordination "release-$suffix.marker"))) {
     if ([DateTime]::UtcNow -ge $deadline) { throw 'Timed out waiting for the E2E release marker.' }
     [Threading.Thread]::Sleep(50)
   }
 }
 $changes = @()
-if (-not (Test-Path -LiteralPath $target)) {
+$emitted = Join-Path $Coordination "changes-emitted-$suffix.marker"
+if (-not (Test-Path -LiteralPath $emitted)) {
   $changes = @(@{path=$target; content=($wanted + [Environment]::NewLine); delete=$false; reason='fulfil the exact saved goal'})
+  [IO.File]::WriteAllText($emitted, 'proposed once; subsequent participants inspect the engine-owned working copy')
 }
 $refs = @("file:$target")
 $criteria = @(
@@ -146,11 +148,11 @@ if __name__ == "__main__":
     providers: {
       "smoke-a": {
         kind: "local", model: "deterministic-smoke-a", command: command("smoke-a"),
-        endpoint: "http://127.0.0.1:1", max_concurrency: 1,
+        endpoint: "http://127.0.0.1:1", max_concurrency: 2,
       },
       "smoke-b": {
         kind: "local", model: "deterministic-smoke-b", command: command("smoke-b"),
-        endpoint: "http://127.0.0.1:1", max_concurrency: 1,
+        endpoint: "http://127.0.0.1:1", max_concurrency: 2,
       },
     },
     project: {
@@ -725,46 +727,75 @@ async function main() {
         delete window.__nexusSmokeHistoryBarrier;
       });
     }
-    let goals = await waitForGoals(page, (items) => (
-      items.some((one) => one.conversation_id && one.status === "waiting_for_project")
-      && items.some((one) => one.status === "running" || one.status === "queued")
-    ));
+    let goals = await waitForGoals(page, (items) => {
+      if (["a", "b"].some(suffix => fs.existsSync(path.join(coordination, `release-${suffix}.marker`)))) {
+        throw new Error("A provider was released before both exact goals entered their provider phases.");
+      }
+      // The durable dispatch record precedes process startup. Wait for both
+      // workers' barriers as well as their current running dispatch records.
+      return ["a", "b"].every(suffix => fs.existsSync(path.join(coordination, `entered-${suffix}.marker`)))
+        && [chats.chatA, chats.chatB].every(chatId => (
+          items.some(one => one.conversation_id === chatId && one.status === "running"
+            && one.execution_workspace && one.tasks?.some(task => task.provider_effect_state === "dispatched"))
+        ));
+    }, 60000);
+    const first = goals.find((one) => one.conversation_id === chats.chatA);
     const second = goals.find((one) => one.conversation_id === chats.chatB);
-    if (!second || second.status !== "waiting_for_project") {
-      throw new Error(`Chat 2 did not keep a waiting goal: ${JSON.stringify(goals)}`);
+    if (!fs.existsSync(path.join(coordination, "entered-a.marker"))
+        || !fs.existsSync(path.join(coordination, "entered-b.marker"))
+        || fs.existsSync(path.join(coordination, "release-a.marker"))
+        || fs.existsSync(path.join(coordination, "release-b.marker"))) {
+      throw new Error("Both exact goal providers must enter before either is released.");
     }
-    await page.waitForSelector(
-      `#theBigChatSaid [data-goal-id="${second.goal_id}"][data-goal-status="waiting_for_project"]`,
-      {timeout: 30000},
-    );
-    const waitingWords = await page.textContent("#theBigChatSaid");
-    if (!waitingWords.includes(goalB)
-        || !/waiting|queued behind|project work ahead/i.test(waitingWords)
-        || /Answer received/i.test(waitingWords)) {
-      throw new Error(`Chat 2 did not show a truthful durable wait: ${waitingWords}`);
+    if (first.project.id !== PROJECT_ID || second.project.id !== PROJECT_ID
+        || !first.execution_workspace.path || !second.execution_workspace.path
+        || first.execution_workspace.path === second.execution_workspace.path) {
+      throw new Error("The two same-project goals did not retain separate execution workspaces.");
     }
-    if (fs.existsSync(path.join(coordination, "entered-b.marker"))) {
-      throw new Error("The waiting goal dispatched its provider before promotion.");
+    if (fs.existsSync(path.join(project, "goal-a.txt")) || fs.existsSync(path.join(project, "goal-b.txt"))) {
+      throw new Error("A held provider changed the canonical project before its result was checked.");
     }
-    console.log("pass  Chat 2 persists the exact prompt and visibly waits without dispatching");
+    await page.waitForFunction(() => document.getElementById("theBigChatTeamGoal").textContent
+      .includes("independent working copy"), null, {timeout: 30000});
+    const concurrentWords = await page.textContent("#theBigChatSaid");
+    if (!concurrentWords.includes(goalB) || /Answer received/i.test(concurrentWords)) {
+      throw new Error(`Chat 2 lost its exact concurrent goal prompt: ${concurrentWords}`);
+    }
+    fs.mkdirSync(OUTPUT, {recursive: true});
+    await page.screenshot({path: path.join(OUTPUT, "same-project-concurrent-chats.png"), fullPage: true});
+    fs.writeFileSync(path.join(OUTPUT, "same-project-concurrency-evidence.json"), JSON.stringify({
+      overlapping: [first, second].map(one => ({goal_id: one.goal_id, status: one.status,
+        project_id: one.project.id, conversation_id: one.conversation_id,
+        workspace: one.execution_workspace.path,
+        dispatched: one.tasks.some(task => task.provider_effect_state === "dispatched")})),
+      bothProvidersEnteredBeforeRelease: true,
+    }, null, 2));
+    console.log("pass  both same-project chats enter real provider phases in separate working copies before release");
+
+    fs.writeFileSync(path.join(coordination, "release-b.marker"), "release", "utf8");
+    goals = await waitForGoals(page, (items) => items.some(one => one.goal_id === second.goal_id
+      && one.status === "complete" && one.workspace_publication?.state === "published"));
+    if (fs.existsSync(path.join(project, "goal-a.txt"))
+        || fs.readFileSync(path.join(project, "goal-b.txt"), "utf8").trim() !== "beta complete"
+        || !goals.some(one => one.goal_id === first.goal_id && one.status === "running")) {
+      throw new Error("Goal B did not publish its own exact result while Goal A remained held.");
+    }
+    console.log("pass  the second goal publishes its checked result while the first goal still runs");
 
     fs.writeFileSync(path.join(coordination, "release-a.marker"), "release", "utf8");
     goals = await waitForGoals(page, (items) => (
-      items.filter((one) => one.conversation_id).length >= 2
-      && items.filter((one) => one.conversation_id).every((one) => one.status === "complete")
+      [first.goal_id, second.goal_id].every(goalId => items.some(one => one.goal_id === goalId
+        && one.status === "complete" && one.workspace_publication?.state === "published"))
     ));
-    if (!fs.existsSync(path.join(coordination, "entered-b.marker"))) {
-      throw new Error("Goal B was never promoted into its provider process.");
-    }
     if (fs.readFileSync(path.join(project, "goal-a.txt"), "utf8").trim() !== "alpha complete"
         || fs.readFileSync(path.join(project, "goal-b.txt"), "utf8").trim() !== "beta complete") {
-      throw new Error("The promoted goals did not achieve their exact file objectives.");
+      throw new Error("Publishing both independent goals did not preserve their exact file objectives.");
     }
     await page.waitForSelector(
       `#theBigChatSaid [data-goal-id="${second.goal_id}"][data-goal-status="complete"]`,
       {timeout: 30000},
     );
-    console.log("pass  terminal ownership promotes once and both exact goals verify complete");
+    console.log("pass  both exact goals publish and verify complete without overwriting each other's results");
 
     await app.close();
     running = await launch(exe, profile, project, environment);
@@ -789,7 +820,7 @@ async function main() {
     );
     if (restoredGoals.filter((one) => one.conversation_id).length < 2
         || restoredGoals.filter((one) => one.conversation_id)
-          .some((one) => one.status !== "complete")) {
+          .some((one) => one.status !== "complete" || one.workspace_publication?.state !== "published")) {
       throw new Error(`Restart lost durable goal state: ${JSON.stringify(restoredGoals)}`);
     }
     console.log("pass  closing and reopening the packaged app restores Chat 2 and both goals");

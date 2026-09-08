@@ -2947,7 +2947,7 @@ class LongHorizonTests(unittest.TestCase):
             with self.assertRaisesRegex(HarnessError, "different .*objective"):
                 runtime.start_board(board, "stable-board-request")
 
-    def test_overlap_is_persisted_as_waiter_without_dispatch(self):
+    def test_saved_chat_admissions_own_independent_workspaces(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
         with mock.patch.object(runtime, "_enable_auto_start_watcher"), mock.patch.object(
@@ -2962,16 +2962,17 @@ class LongHorizonTests(unittest.TestCase):
                 self.board, "project", ["Second exact objective"], "second-waiting",
                 conversation_id="chat-second",
             )
-        self.assertEqual(start.call_count, 1)
-        self.assertEqual(waiter["status"], "waiting_for_project")
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(waiter["status"], "queued")
         self.assertEqual(waiter["conversation_id"], "chat-second")
         self.assertEqual(waiter["objective"], "Second exact objective")
-        self.assertEqual(waiter["project_queue"]["state"], "waiting")
-        self.assertEqual(waiter["project_queue"]["blocked_by_goal_id"], owner["goal_id"])
+        self.assertEqual(waiter["project_queue"]["state"], "owner")
+        self.assertFalse(waiter["project_queue"].get("blocked_by_goal_id"))
         self.assertEqual(waiter["execution_contract"]["schema_version"], 1)
-        self.assertEqual(waiter["execution_contract"]["mode"], "exclusive_project")
+        self.assertEqual(waiter["execution_contract"]["mode"], "isolated_project")
         self.assertRegex(waiter["execution_contract"]["fingerprint_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(runtime.store.claim_ready(waiter["goal_id"], "must-not-run"), [])
+        self.assertNotEqual(long_horizon._execution_root(waiter), long_horizon._execution_root(owner))
+        self.assertEqual(runtime.store.active_overlapping_project(self.project, except_goal_id=waiter["goal_id"]), [])
         self.assertEqual(len(runtime.store.list(100)), 2)
 
     def test_waiting_goal_controls_cannot_bypass_project_owner(self):

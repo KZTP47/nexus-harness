@@ -5069,9 +5069,15 @@ def _run_disposable_verification_command(
     command: list[str],
     *,
     timeout: float | None = None,
+    command_root: Path | None = None,
 ) -> dict[str, Any]:
     """Run one approved command in a fresh project copy, never in-place."""
 
+    # Isolated goals retain the selected project's approved argv. Its absolute
+    # operands must follow the owned copy before the ordinary disposable-copy
+    # mapping; otherwise they still address unpublished/stale source files.
+    # Callers obtain command_root from verification_authority, not board input.
+    execution_command = _snapshot_command(command, command_root, root) if command_root is not None else command
     with tempfile.TemporaryDirectory(prefix="nexus-verification-") as temporary:
         frozen = Path(temporary) / "frozen-project"
         snapshot = Path(temporary) / "project"
@@ -5084,7 +5090,7 @@ def _run_disposable_verification_command(
         )
         try:
             payload = _contained_snapshot_command(
-                snapshot_config, snapshot, _snapshot_command(command, root, snapshot),
+                snapshot_config, snapshot, _snapshot_command(execution_command, root, snapshot),
                 timeout=timeout, denied_root=root,
             )
         except OSError as error:
@@ -5770,12 +5776,15 @@ def _verification_commands(
     root: Path,
     project: dict[str, Any],
 ) -> tuple[list[list[str]], str]:
+    from .goal_verification import verification_authority
+
+    authority_config, authority_root = verification_authority(config, root, project)
     explicit = project.get("test_commands")
     if isinstance(explicit, list) and explicit:
         commands = [list(one) for one in explicit if isinstance(one, list)]
         return commands, "selected_project"
-    if config.project_root.resolve() == root.resolve():
-        configured = config.get("project.test_commands", [])
+    if authority_config.project_root.resolve() == authority_root.resolve():
+        configured = authority_config.get("project.test_commands", [])
         if isinstance(configured, list) and configured:
             return [list(one) for one in configured if isinstance(one, list)], "project_config"
     discovered = combined_commands(detect_project(root), "test")
@@ -5787,6 +5796,7 @@ def _command_approval_digest(
     commands: list[list[str]],
     *,
     declared_path: str = "",
+    authority_root: Path | None = None,
 ) -> str:
     """Bind approval to path, argv, and the project files that selected it.
 
@@ -5794,7 +5804,8 @@ def _command_approval_digest(
     goal's expanded path name identify the same project. Moving to a different
     directory still invalidates approval even with byte-identical manifests.
     Internal execution receipts omit ``declared_path`` and remain bound to the
-    canonical snapshot root.
+    canonical snapshot root. An engine-authenticated goal copy may supply its
+    original approval root while manifest evidence is still read from ``root``.
     """
 
     evidence: list[tuple[str, str | None]] = []
@@ -5807,7 +5818,7 @@ def _command_approval_digest(
         if path.is_file() and not path.is_symlink():
             evidence.append((name, file_sha256(path)))
     payload: dict[str, Any] = {
-        "project_root": os.path.normcase(str(root.resolve())),
+        "project_root": os.path.normcase(str((authority_root or root).resolve())),
         "commands": commands,
         "evidence": evidence,
     }
@@ -5853,10 +5864,16 @@ def verification_command_approval(
     if not declared_path:
         return dict(base, reason="This project has no folder path to verify.")
     try:
+        from .goal_verification import _WorkspaceVerificationAuthority, verification_authority
+
         root = Path(declared_path).expanduser().resolve()
+        authority = project.get("_nexus_workspace_verification")
+        if isinstance(authority, _WorkspaceVerificationAuthority):
+            root = authority.execution_root
+        _authority_config, authority_root = verification_authority(config, root, project)
     except (OSError, RuntimeError) as exc:
         return dict(base, reason=f"The project folder cannot be resolved: {exc}")
-    base["canonical_path"] = str(root)
+    base["canonical_path"] = str(authority_root)
     if not root.is_dir():
         return dict(base, reason="The project folder is not available on this machine.")
     try:
@@ -5881,7 +5898,7 @@ def verification_command_approval(
         )
     try:
         digest = _command_approval_digest(
-            root, shown, declared_path=declared_path,
+            root, shown, declared_path=declared_path, authority_root=authority_root,
         )
     except (OSError, RuntimeError) as exc:
         return dict(
@@ -8916,6 +8933,9 @@ def _run_selected_project_verification(
     if verification_profile != "legacy":
         raise HarnessError("Unknown project verification profile")
 
+    from .goal_verification import verification_authority
+
+    authority_config, authority_root = verification_authority(config, root, project)
     commands, source = _verification_commands(config, root, project)
     requirement_contract = requirement_contract or _derive_requirement_contract(
         root, goal, required_effect_paths
@@ -9029,6 +9049,7 @@ def _run_selected_project_verification(
                 root,
                 commands,
                 declared_path=str(project.get("path") or ""),
+                authority_root=authority_root,
             )
         except (OSError, RuntimeError) as exc:
             return {
@@ -9087,8 +9108,8 @@ def _run_selected_project_verification(
             commands.extend([list(probe), list(probe)])
 
     command_config = LoadedConfig(
-        copy.deepcopy(config.data), root.resolve(), list(config.sources),
-        dict(config.provenance), copy.deepcopy(config.trusted_floor),
+        copy.deepcopy(authority_config.data), root.resolve(), list(authority_config.sources),
+        dict(authority_config.provenance), copy.deepcopy(authority_config.trusted_floor),
     )
     verification_origin_merkle, _verification_origin_manifest = _project_tree_merkle(root)
     results: list[dict[str, Any]] = []
@@ -9130,7 +9151,7 @@ def _run_selected_project_verification(
                     else remaining <= configured_timeout
                 )
             payload = _run_disposable_verification_command(
-                command_config, root, command, timeout=timeout,
+                command_config, root, command, timeout=timeout, command_root=authority_root,
             )
             if payload.get("timed_out") and deadline_limited:
                 raise ContextToolBudgetExhausted(
@@ -9222,8 +9243,8 @@ def _run_selected_project_verification(
     contracts = project.get("test_evidence_contracts", [])
     if not isinstance(contracts, list):
         contracts = []
-    if not contracts and config.project_root.resolve() == root.resolve():
-        configured_contracts = config.get("project.test_evidence_contracts", [])
+    if not contracts and authority_config.project_root.resolve() == authority_root.resolve():
+        configured_contracts = authority_config.get("project.test_evidence_contracts", [])
         if isinstance(configured_contracts, list):
             contracts = configured_contracts
     positive = analyze_verification(

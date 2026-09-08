@@ -7461,13 +7461,54 @@ async function controlChatGoal(agentId) {
   }
 }
 
+async function reviewGoalVerificationCommands(goal, button) {
+  const goalId = String(goal?.goal_id || "");
+  if (!goalId) return;
+  button.disabled = true;
+  try {
+    const approval = await request(`/api/long-horizon/verification-approval?goal_id=${encodeURIComponent(goalId)}`);
+    if (approval.goal_id !== goalId || !Number.isInteger(approval.revision)) {
+      throw new Error("Nexus could not confirm this exact goal's test-command preview. Nothing was approved.");
+    }
+    if (approval.approved) {
+      button.textContent = "Test commands already approved · use Resume team";
+      return;
+    }
+    if (!approval.can_approve) throw new Error(approval.reason || "This goal has no test commands available to approve.");
+    if (!/^[a-f0-9]{64}$/i.test(String(approval.approval_digest || ""))
+        || !Array.isArray(approval.commands) || !approval.commands.length
+        || approval.commands.some(command => !Array.isArray(command) || !command.length
+          || command.some(part => typeof part !== "string"))) {
+      throw new Error("The exact test-command preview is incomplete. Nothing was approved.");
+    }
+    const commands = approval.commands.map(command => JSON.stringify(command)).join("\n");
+    if (!window.confirm(`Allow Nexus to run these exact test commands for goal ${goalId}?\n\n`
+        + `Project: ${approval.project_path || goal.project?.path || "Selected project"}\n\n${commands}\n\n`
+        + `Approval fingerprint: ${approval.approval_digest}\n\n`
+        + "This approval belongs only to this chat's goal. Use Resume team afterward to continue.")) return;
+    const result = await request("/api/long-horizon/verification-approval", {
+      method: "POST", body: JSON.stringify({goal_id: goalId, expected_revision: approval.revision,
+        command_digest: approval.approval_digest, approved: true}),
+    });
+    if (result.goal?.goal_id !== goalId) throw new Error("Nexus could not confirm the exact goal after approval. Refresh its details before continuing.");
+    rememberChatGoalSnapshot(result.goal);
+    await refreshLongGoals(true);
+    button.textContent = "Test commands approved · use Resume team";
+  } catch (error) {
+    showError(String(error.message || error));
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function fillChatGoalPanel(panel, agentId, context) {
   if (!panel) return;
   const {goal, problem} = context;
   panel.hidden = !goal && !problem;
   const pending = goal?.pending_interrupts || [];
   // Keep in-progress answers intact during the background status polls.
-  const signature = JSON.stringify([goal?.goal_id, goal?.status, problem, pending]);
+  const signature = JSON.stringify([goal?.goal_id, goal?.status, problem, pending,
+    goal?.execution_workspace, goal?.workspace_publication, goal?.workspace_path]);
   if (panel.dataset.snapshot === signature) return;
   panel.dataset.snapshot = signature;
   panel.replaceChildren();
@@ -7477,6 +7518,10 @@ function fillChatGoalPanel(panel, agentId, context) {
   panel.append(make("p", "hint", problem || (pending.length
     ? "The team needs your answers before it can continue."
     : "Send a message below to steer both agents. Their replies and progress stay in this chat.")));
+  if (!problem && goal?.execution_workspace) {
+    const activity = chatGoalActivity({goal, problem: ""});
+    panel.append(make("p", "hint chat-workspace-status", `${activity.stage}. ${activity.detail}`));
+  }
   const details = make("button", "compact chat-goal-details", "Advanced goal details");
   details.type = "button";
   details.addEventListener("click", () => void openChatGoalDetails(goal));
@@ -9784,8 +9829,24 @@ function showActivityInPanel(panel, activity) {
 
 function chatGoalActivity({goal, problem}) {
   if (!goal && !problem) return null;
-  const status = (state, stage, detail) => ({state, stage, detail, elapsedLabel: "Team status"});
+  const isolated = Boolean(goal?.execution_workspace);
+  const publication = goal?.workspace_publication || {};
+  const status = (state, stage, detail) => ({state, stage,
+    detail: isolated && ["working", "waiting"].includes(state)
+      && publication.state !== "published" && publication.state !== "publishing"
+      ? `${detail} This team uses an independent working copy. Its results reach the project after checks and conflict review.`
+      : detail,
+    elapsedLabel: "Team status"});
   if (problem) return status("attention", "Team needs attention", problem);
+  if (isolated && publication.state === "conflict") {
+    const paths = (Array.isArray(publication.conflicts) ? publication.conflicts : [])
+      .map(one => String(typeof one === "string" ? one : one?.path || "")).filter(Boolean);
+    return status("attention", "Project changes need reconciliation",
+      `${publication.message || "The project changed while this team worked. Its independent result is retained."}`
+      + (paths.length ? ` Conflicting paths: ${paths.join(", ")}.` : "")
+      + (goal.workspace_path ? ` Retained working copy: ${goal.workspace_path}.` : "")
+      + " Reconcile those changes in the project, then use Resume team to retry applying this result.");
+  }
   const tasks = Array.isArray(goal.tasks) ? goal.tasks : [];
   const agentName = (task) => (goal.agents || []).find(
     (one) => one.id === task.assigned_agent_id)?.name
@@ -9803,6 +9864,12 @@ function chatGoalActivity({goal, problem}) {
     "Nexus is waiting for the current work to stop safely.");
   if (goal.status === "waiting_for_project") return status("waiting", "Waiting for project access",
     "Another saved goal is using this project. This team will continue when access is available.");
+  if (isolated && publication.state === "publishing") return status("working", "Applying checked results",
+    "Nexus is applying this team's checked changes to the project. Other teams keep their independent working copies.");
+  if (isolated && goal.status === "complete" && publication.state !== "published") {
+    return status("attention", "Result awaiting publication",
+      "The independent result has not been applied to the project. Open goal details to inspect its publication status.");
+  }
   const correcting = tasks.find((one) => ["running", "ready"].includes(one.state)
     && [1, 2].includes(one.protocol_recovery?.schema_version)
     && ["pending", "dispatched"].includes(one.protocol_recovery.state));
@@ -10062,10 +10129,12 @@ function longHorizonAdmissionWords(goal) {
     };
   }
   if (status === "queued") {
-    return {stage: "Goal accepted and queued", detail: `Goal ${goalId} was accepted into the queue. Follow the agents and current status in this chat.`};
+    return {stage: "Goal accepted and queued", detail: `Goal ${goalId} was accepted into the queue. Follow the agents and current status in this chat.`
+      + (goal?.execution_workspace ? " This team has an independent working copy; checked results will be applied to the project." : "")};
   }
   if (status === "running") {
-    return {stage: "Goal accepted", detail: `Goal ${goalId} was accepted. Follow the agents and current status in this chat.`};
+    return {stage: "Goal accepted", detail: `Goal ${goalId} was accepted. Follow the agents and current status in this chat.`
+      + (goal?.execution_workspace ? " This team has an independent working copy; checked results will be applied to the project." : "")};
   }
   if (status === "paused") {
     return {stage: "Goal accepted but paused", detail: `Durable goal ${goalId} is paused and is not complete.`};
@@ -10074,6 +10143,9 @@ function longHorizonAdmissionWords(goal) {
     return {stage: "Goal needs your input", detail: `Goal ${goalId} was accepted with a question for you. Answer the team's question in this chat.`};
   }
   if (status === "complete") {
+    if (goal?.execution_workspace && goal.workspace_publication?.state !== "published") {
+      return {stage: "Result awaiting publication", detail: `Goal ${goalId} has not published its independent result to the project. Open its goal details to inspect the saved status.`};
+    }
     return {stage: "Goal verified complete", detail: `Durable goal ${goalId} already has verified completion evidence.`};
   }
   if (status === "failed") {
@@ -15490,6 +15562,19 @@ function renderMissionControl() {
 
   const evidence = $("missionEvidence");
   evidence.replaceChildren();
+  if (longGoal?.workspace_path) {
+    evidence.append(make("h3", "", "Retained working copy"),
+      make("p", "hint", String(longGoal.workspace_path)));
+    if (longGoal.workspace_publication?.state) evidence.append(make("p", "hint",
+      `Result publication: ${longGoal.workspace_publication.state}`));
+    if (!["complete", "cancelled", "cancelling"].includes(longGoal.status)) {
+      const approval = make("button", "compact", "Review this chat's test commands");
+      approval.type = "button";
+      const exactGoal = longGoal;
+      approval.addEventListener("click", () => void reviewGoalVerificationCommands(exactGoal, approval));
+      evidence.append(approval);
+    }
+  }
   if (longGoal?.verification) {
     const pre = make("pre");
     pre.textContent = JSON.stringify(longGoal.verification, null, 2);

@@ -42,7 +42,7 @@ from .redaction import CredentialRedactor
 from .runtime_integrity import mac, quarantine_marker
 from .goal_verification import (
     CHECK_POLICY, SHARED_GOAL_PROFILE, capture_verification_contract,
-    requested_runtime_verification, runtime_verification_paths, verification_project,
+    requested_runtime_verification, runtime_verification_paths, verification_project as _saved_verification_project,
 )
 from .swarm_runs import _base
 from . import swarm_work
@@ -50,6 +50,7 @@ from . import goal_dialogue
 from . import goal_context_progress
 from . import action_protocol
 from . import goal_budget_policy
+from . import goal_workspaces
 
 
 SCHEMA_VERSION = 2
@@ -464,6 +465,35 @@ def _exclusive_project_contract(project_path: Path, project_authority_id: str) -
     }
 
 
+def verification_project(config: LoadedConfig, document: dict[str, Any]) -> dict[str, Any]:
+    return _saved_verification_project(config, document, runtime_root=_base())
+
+
+def _execution_root(document: dict[str, Any]) -> Path:
+    """Resolve file effects separately from the selected project's authority."""
+    return goal_workspaces.root(document, _base())
+
+
+def _isolated_execution(document: dict[str, Any]) -> bool:
+    return bool(document.get("execution_workspace"))
+
+
+def _goal_execution_contract(document: dict[str, Any]) -> dict[str, Any]:
+    contract = _exclusive_project_contract(
+        Path(document["project"]["path"]), str(document.get("project_authority_id") or ""),
+    )
+    if _isolated_execution(document):
+        contract.update({
+            "mode": "isolated_project",
+            "workspace_contract_sha256": hashlib.sha256(
+                _canonical(document["execution_workspace"]).encode("utf-8")
+            ).hexdigest(),
+        })
+        contract.pop("fingerprint_sha256")
+        contract["fingerprint_sha256"] = hashlib.sha256(_canonical(contract).encode("utf-8")).hexdigest()
+    return contract
+
+
 def _collaboration_contract(require_all_participants: bool) -> dict[str, Any]:
     """Version and fingerprint the scheduler/prompt semantics admitted by a goal."""
 
@@ -714,7 +744,7 @@ def _project_baseline_manifest(root: Path) -> dict[str, str]:
 
 
 def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
-    manifest = baseline if baseline is not None else _project_baseline_manifest(Path(document["project"]["path"]))
+    manifest = baseline if baseline is not None else _project_baseline_manifest(_execution_root(document))
     return {
         "schema_version": 3, "objective_epoch": int(document.get("objective_epoch") or 1),
         "artifact_generation": int((document.get("dialogue") or {}).get("artifact_generation") or 0),
@@ -722,6 +752,7 @@ def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None =
         "verification_contract_sha256": str((document.get("verification_contract") or {}).get("fingerprint_sha256") or ""),
         "success_criteria_contract_sha256": str((document.get("success_criteria_contract") or {}).get("fingerprint_sha256") or ""),
         "completion_check_policy_sha256": hashlib.sha256(_canonical(CHECK_POLICY).encode("utf-8")).hexdigest(),
+        "workspace_contract_sha256": hashlib.sha256(_canonical(document.get("execution_workspace") or {}).encode("utf-8")).hexdigest(),
     }
 
 
@@ -1453,6 +1484,8 @@ class GoalStore:
 
     @classmethod
     def _goals_overlap(cls, left: dict[str, Any], right: dict[str, Any]) -> bool:
+        if _isolated_execution(left) and _isolated_execution(right):
+            return False
         left_authority = str(left.get("project_authority_id") or "")
         right_authority = str(right.get("project_authority_id") or "")
         if left_authority and right_authority and hmac.compare_digest(
@@ -1538,17 +1571,14 @@ class GoalStore:
             or cls._codex_schema_auto_start_safe(document)
 
     def _execution_contract_for(self, document: dict[str, Any]) -> dict[str, Any]:
-        return _exclusive_project_contract(
-            Path(str(document.get("project", {}).get("path") or "")),
-            str(document.get("project_authority_id") or ""),
-        )
+        return _goal_execution_contract(document)
 
     def _validate_execution_metadata(self, document: dict[str, Any]) -> None:
         contract = document.get("execution_contract")
         expected = self._execution_contract_for(document)
         if not isinstance(contract, dict) or contract.get(
             "schema_version"
-        ) != EXECUTION_CONTRACT_SCHEMA_VERSION or contract.get("mode") != "exclusive_project" \
+        ) != EXECUTION_CONTRACT_SCHEMA_VERSION or contract.get("mode") != expected["mode"] \
                 or not hmac.compare_digest(
                     str(contract.get("project_authority_id") or ""),
                     str(expected["project_authority_id"]),
@@ -1560,6 +1590,8 @@ class GoalStore:
                     str(expected["fingerprint_sha256"]),
                 ):
             raise HarnessError("Long-horizon execution ownership metadata is invalid")
+        if _isolated_execution(document) and not isinstance(document["execution_workspace"], dict):
+            raise HarnessError("Long-horizon workspace metadata is invalid")
         queue = document.get("project_queue")
         if not isinstance(queue, dict) or queue.get(
             "schema_version"
@@ -1647,10 +1679,14 @@ class GoalStore:
         self, db: sqlite3.Connection, project_path: Path, project_authority_id: str,
         *, except_goal_id: str = "",
     ) -> list[dict[str, Any]]:
+        candidate = self._decode_shared(db.execute(
+            "SELECT * FROM long_goals WHERE goal_id=?", (except_goal_id,),
+        ).fetchone()) if except_goal_id else None
         return [
             goal for goal in self._shared_documents(db, PROJECT_OWNER_GOALS)
             if goal["goal_id"] != except_goal_id and self._is_project_owner(goal)
             and self._goal_overlaps_target(goal, project_path, project_authority_id)
+            and not (candidate and _isolated_execution(candidate) and _isolated_execution(goal))
         ]
 
     def _promote_eligible_waiters(
@@ -3062,6 +3098,7 @@ class GoalStore:
         admission_digest: str = "", expected_project_authority_id: str = "",
         expected_agents: list[dict[str, Any]] | None = None,
         require_all_participants: bool | None = None,
+        isolated_workspace: bool = False,
     ) -> dict[str, Any]:
         exact_conversation_id = _exact_conversation_id(conversation_id)
         require_all = bool(participant_ids) if require_all_participants is None \
@@ -3114,7 +3151,8 @@ class GoalStore:
                 "exceed the explicit task budget"
             )
         now = _now()
-        goal_id = uuid.uuid4().hex
+        goal_id = (hashlib.sha256(("isolated-goal-v1\0" + request_id).encode("utf-8")).hexdigest()[:32]
+                   if isolated_workspace else uuid.uuid4().hex)
         tasks: list[dict[str, Any]] = []
         collaboration_order = [lead, *[one for one in agents if one["id"] != lead["id"]]]
         initial_ids: list[str] = []
@@ -3322,6 +3360,11 @@ class GoalStore:
             "parent_goal_id": "",
             "fork_checkpoint": 0,
         }
+        if isolated_workspace:
+            document["execution_workspace"] = goal_workspaces.create(document, self.root)
+            document["execution_contract"] = self._execution_contract_for(document)
+            document["workspace_publication"] = {"state": "pending"}
+            document["note"] = "Working in this chat's independent project copy."
         with self.lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -3364,6 +3407,8 @@ class GoalStore:
                 blockers = self._shared_project_owners(
                     db, root, target_authority_id,
                 )
+                if _isolated_execution(document):
+                    blockers = [one for one in blockers if not _isolated_execution(one)]
                 blockers.sort(key=lambda one: (
                     int(one.get("created_ms") or 0), str(one["goal_id"]),
                 ))
@@ -3393,7 +3438,7 @@ class GoalStore:
                 self._event(db, document, "goal_created", agent_id=lead["id"], payload={
                     "objective": objective, "success_criteria": criteria,
                     "task_ids": [one["id"] for one in tasks], "policy": runtime_policy,
-                    "execution_contract": execution_contract,
+                    "execution_contract": document["execution_contract"],
                     "collaboration_contract": collaboration_contract,
                     "project_queue_state": document["project_queue"]["state"],
                 })
@@ -3608,6 +3653,167 @@ class GoalStore:
             )
         return [self.public(goal) for goal in owners]
 
+    def adopt_isolated_workspace(self, goal_id: str) -> dict[str, Any]:
+        """Upgrade settled saved chats without replaying or moving an in-flight effect."""
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if _isolated_execution(document) or not document.get("conversation_id") \
+                    or document.get("status") in TERMINAL_GOALS | {"cancelling"} \
+                    or self._scheduler_live(document) or any(
+                        task.get("state") == "running" or task.get("pending_transaction")
+                        or task.get("pending_action") or _task_has_unsettled_effect(task)
+                        for task in document.get("tasks", [])
+                    ):
+                return _NO_MUTATION
+            # A pre-upgrade process still mutating the selected tree must drain
+            # before it can be snapshotted. Never migrate its lease underneath it.
+            blockers = self._shared_project_owners(
+                db, Path(document["project"]["path"]), document["project_authority_id"],
+                except_goal_id=goal_id,
+            )
+            if any(not _isolated_execution(one) and self._scheduler_live(one) for one in blockers):
+                return _NO_MUTATION
+            source = Path(document["project"]["path"])
+            authority = inspect_project_authority(source)
+            if not authority.get("can_run") or not hmac.compare_digest(
+                str(document.get("project_authority_id") or ""), project_identity(source),
+            ):
+                raise HarnessError("This saved chat's selected project authority is unavailable or changed")
+            pristine = self._pristine_for_queue_migration(document)
+            # Legacy rollback takes DB -> source lock. An upgrade must not
+            # hold source -> DB or wait for publication while holding DB.
+            # Try the source/publication lease without waiting; a later
+            # recovery/Resume can adopt after another transaction settles.
+            try:
+                with goal_workspaces.publication(document, self.root, timeout_seconds=0):
+                    workspace = goal_workspaces.create(document, self.root, publication_locked=True)
+            except HarnessError as exc:
+                if "Another harness process holds the project transaction lock" in str(exc):
+                    return _NO_MUTATION
+                raise
+            document["execution_workspace"] = workspace
+            document.pop("workspace_migration", None)
+            document["execution_contract"] = self._execution_contract_for(document)
+            document["workspace_publication"] = {"state": "pending", "migrated": True}
+            document["verification"] = {
+                "status": "not_run", "commands": [],
+                "reason": "The saved chat now runs in an independent working copy; final checks will run there.",
+            }
+            for task in document["tasks"]:
+                for step in task.get("context_steps", []):
+                    step["state"] = "superseded"
+            if document["status"] == "waiting_for_project":
+                document["status"] = "queued"
+                document["project_queue"] = self._queue_record(
+                    "owner", _now(), auto_start_pending=pristine and not _automatic_recovery_suppressed(document),
+                )
+                document["note"] = "This chat can now work independently alongside other chats on the project."
+            self._event(db, document, "goal_workspace_adopted", payload={
+                "execution_contract": document["execution_contract"],
+                "original_files_preserved": True, "budgets_preserved": True,
+            })
+        candidate = self.get(goal_id)
+        if _isolated_execution(candidate) or not candidate.get("conversation_id"):
+            return self.public(candidate)
+        return self.public(self._mutate(goal_id, change)[0])
+
+    def record_workspace_migration_failure(self, goal_id: str, error: str) -> dict[str, Any]:
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if _isolated_execution(document) or self._scheduler_live(document) or document["status"] in TERMINAL_GOALS | {"cancelling"}:
+                return _NO_MUTATION
+            message = _short(self.redactor.text(error), 4_000)
+            if (document.get("workspace_migration") or {}).get("error") == message:
+                return _NO_MUTATION
+            document["workspace_migration"] = {"schema_version": 1, "state": "unavailable", "error": message}
+            if document["status"] not in {"waiting_for_project", "waiting_for_user"}:
+                document["status"] = "paused"
+            queue = document["project_queue"]
+            queue.update(auto_start_pending=False, auto_start_arm_id="")
+            document["note"] = "Independent workspace could not be prepared: " + message
+            self._event(db, document, "goal_workspace_migration_unavailable", payload=document["workspace_migration"])
+        return self.public(self._mutate(goal_id, change)[0])
+
+    def approve_workspace_verification(self, goal_id: str, *, expected_revision: int,
+                                       command_digest: str) -> dict[str, Any]:
+        """Explicit approval belongs to one exact chat copy and command snapshot."""
+        from .goal_verification import workspace_verification_approval
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if not _isolated_execution(document) or document["status"] not in {"paused", "waiting_for_user"}:
+                raise HarnessError("Pause this chat before approving its test commands")
+            if int(document["revision"]) != expected_revision or self._scheduler_live(document) or any(
+                task.get("state") == "running" or task.get("pending_transaction")
+                or _task_has_unsettled_effect(task) for task in document["tasks"]
+            ):
+                raise HarnessError("This chat changed or still has an unsettled turn; refresh before approving its commands")
+            preview = workspace_verification_approval(self.config, document, runtime_root=self.root)
+            if not preview.get("can_approve") or not re.fullmatch(r"[0-9a-f]{64}", command_digest) \
+                    or not hmac.compare_digest(str(preview.get("approval_digest") or ""), command_digest):
+                raise HarnessError("This chat's test commands changed; review the current commands before approving")
+            previous = document.get("verification_contract") or {}
+            previous_approval = document.get("workspace_command_approval") or {}
+            # Remember the last admitted/adopted project settings, separately
+            # from this chat's unpublished approval. Reapproving this same
+            # copy must not replace that baseline with its preceding approval.
+            board_contract = previous_approval.get("board_verification_contract") if (
+                previous_approval.get("schema_version") == 2
+                and previous_approval.get("approval_digest") == previous.get("approved_test_command_digest")
+            ) else previous
+            selected = verification_project(self.config, document)
+            selected["approved_test_command_digest"] = command_digest
+            document["verification_contract"] = capture_verification_contract(
+                self.config, selected, Path(document["project"]["path"]),
+            )
+            document["workspace_command_approval"] = {
+                "schema_version": 2, "approval_digest": command_digest,
+                "board_verification_contract": copy.deepcopy(board_contract),
+            }
+            document["verification_settings_revision"] = int(document.get("verification_settings_revision") or 1) + 1
+            document["verification"] = {"status": "not_run", "commands": [],
+                "reason": "You approved this chat's exact test command. Resume to run it."}
+            for task in document["tasks"]:
+                for step in task.get("context_steps", []):
+                    if any(call.get("name") == "run_selected_verification" for call in step.get("calls", [])):
+                        step["state"] = "superseded"
+            self._event(db, document, "workspace_test_command_approved", payload={
+                "commands": preview["commands"], "approval_digest": command_digest,
+            })
+        return self.public(self._mutate(goal_id, change)[0])
+
+    def reopen_rebased_workspace(self, goal_id: str) -> bool:
+        """Team agreement describes exact files, including synchronized sibling work."""
+        reopened: list[str] = []
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if not document.get("require_all_participants") or document["status"] in TERMINAL_GOALS | {"paused", "waiting_for_user", "cancelling"}:
+                return _NO_MUTATION
+            for task in document["tasks"]:
+                if task.get("required_contributor_id") and task["state"] == "complete":
+                    task.update(state="ready", agreed_artifact_generation=-1)
+                    task["evidence"].append("Other project changes were synchronized into this chat's copy. Inspect the combined files and rerun relevant checks before agreeing to completion.")
+                    reopened.append(task["id"])
+            if not reopened:
+                return _NO_MUTATION
+            dialogue = document.get("dialogue") or {}
+            dialogue["artifact_generation"] = int(dialogue.get("artifact_generation") or 0) + 1
+            document["status"] = "queued"
+            document["workspace_publication"] = {"state": "pending", "message": "The team is checking synchronized project changes."}
+            self._event(db, document, "workspace_rebased", payload={"reopened_task_ids": reopened})
+        self._mutate(goal_id, change)
+        return bool(reopened)
+
+    def set_workspace_publication(self, goal_id: str, state: str, *,
+                                  message: str = "", conflicts: list[str] | None = None) -> dict[str, Any]:
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if document["status"] in TERMINAL_GOALS | {"cancelling"}:
+                return _NO_MUTATION
+            document["workspace_publication"] = {
+                "state": state, "message": self.redactor.text(message), "conflicts": list(conflicts or []),
+            }
+            if state == "conflict":
+                document["status"] = "paused"
+                document["note"] = self.redactor.text(message)
+            self._event(db, document, "workspace_publication_" + state,
+                        payload=document["workspace_publication"])
+        return self.public(self._mutate(goal_id, change)[0])
+
     def reconcile_project_queue(self) -> list[dict[str, Any]]:
         """Promote every globally eligible waiter without dispatching provider work."""
 
@@ -3809,6 +4015,10 @@ class GoalStore:
                 "recovery_action": "",
             }
             return value
+        if _isolated_execution(document):
+            # Expose the deterministic folder for inspecting retained/conflicting
+            # work. Loading chat status does not scan mutable source files.
+            value["workspace_path"] = str(self.root / document["execution_workspace"]["path"])
         value["promoted_goal_ids"] = list(value.pop("_promoted_goal_ids", []))
         value.pop("input_provider_attachments", None)
         value["request_id"] = value.get("client_request_id", value.get("request_id", ""))
@@ -3845,6 +4055,8 @@ class GoalStore:
         stored_request_id = f"{self.authority_key}:{client_request_id}"
         now = _now()
         document = copy.deepcopy(source)
+        document.pop("execution_workspace", None)
+        document.pop("workspace_publication", None)
         old_goal_id = str(source["goal_id"])
         target_authority_id = project_identity(project_path)
         document.update({
@@ -4467,6 +4679,11 @@ class GoalStore:
         if self.provider_setup_status(document).get("changed") or self.collaboration_setup_status(document).get("changed"):
             return False
         root = Path(document["project"]["path"])
+        if _isolated_execution(document):
+            try:
+                goal_workspaces.validate(document, self.root)
+            except (HarnessError, OSError):
+                return False
         return bool(root.is_dir() and inspect_project_authority(root).get("reason_code") == "registered"
                     and _read_descriptor(root / AUTHORITY_DESCRIPTOR) == document.get("project_authority_id"))
 
@@ -5874,7 +6091,7 @@ class GoalStore:
             raise HarnessError("Wait for the paused turn to settle before updating completion evidence")
         root = Path(document["project"]["path"])
         project = verification_project(self.config, document)
-        commands, _source = swarm_work._verification_commands(self.config, root, project)
+        commands, _source = swarm_work._verification_commands(self.config, _execution_root(document), project)
         if commands:
             return False
         document["success_criteria_contract"] = _success_criteria_contract(
@@ -5924,12 +6141,25 @@ class GoalStore:
         if not isinstance(evidence_contracts, list) or any(not isinstance(one, dict) for one in evidence_contracts):
             raise HarnessError("Project test evidence contracts must be a list of contract objects")
         adopted = copy.deepcopy(selected)
+        previous = document.get("verification_contract") or {}
+        goal_approval = document.get("workspace_command_approval") or {}
         captured = capture_verification_contract(self.config, adopted, root)
-        commands, source = swarm_work._verification_commands(self.config, root, adopted)
+        preserve_goal_approval = _isolated_execution(document) and goal_approval.get("schema_version") == 2 \
+                and goal_approval.get("approval_digest") \
+                and goal_approval.get("approval_digest") == previous.get("approved_test_command_digest") \
+                and captured == goal_approval.get("board_verification_contract")
+        if preserve_goal_approval:
+            adopted["approved_test_command_digest"] = goal_approval["approval_digest"]
+            captured = capture_verification_contract(self.config, adopted, root)
+        candidate = {**document, "verification_contract": captured}
+        command_project = verification_project(self.config, candidate)
+        execution_root = _execution_root(document)
+        commands, source = swarm_work._verification_commands(self.config, execution_root, command_project)
         approval = str(captured.get("approved_test_command_digest") or "")
         if approval and source == "discovered":
             current_digest = swarm_work._command_approval_digest(
-                root, commands, declared_path=str(adopted.get("path") or ""),
+                execution_root, commands, declared_path=str(adopted.get("path") or ""),
+                authority_root=root,
             )
             if not hmac.compare_digest(approval, current_digest):
                 raise HarnessError("Discovered project checks changed; review and approve the current checks before resuming")
@@ -5947,6 +6177,8 @@ class GoalStore:
         ):
             raise HarnessError("Wait for the current turn to finish pausing before refreshing project checks")
         document["verification_contract"] = captured
+        if not preserve_goal_approval:
+            document.pop("workspace_command_approval", None)
         document["verification_settings_revision"] = int(document.get("verification_settings_revision") or 1) + 1
         document["verification"] = {
             "status": "not_run", "reason": "Project checks were refreshed by explicit Resume.", "commands": [],
@@ -6028,7 +6260,7 @@ class GoalStore:
                     raise HarnessError(
                         f"{task.get('title') or task['id']} has an unrecognized file transaction state"
                     )
-                root = Path(str(document["project"]["path"])).resolve(strict=True)
+                root = _execution_root(document).resolve(strict=True)
                 transaction = FileTransaction(root)
                 try:
                     manifest = transaction.load_manifest(transaction_id)
@@ -6452,7 +6684,7 @@ class GoalStore:
                             continue
                         pending = candidate.get("pending_transaction") or {}
                         if pending.get("state") == "prepared" and pending.get("transaction_id"):
-                            FileTransaction(Path(document["project"]["path"])).rollback(
+                            FileTransaction(_execution_root(document)).rollback(
                                 str(pending["transaction_id"])
                             )
                             self._event(db, document, "transaction_superseded",
@@ -6692,10 +6924,11 @@ class GoalStore:
     def complete_verification(
         self, goal_id: str, result: dict[str, Any], *,
         expected_revision: int | None = None, expected_objective_epoch: int | None = None,
+        publish_workspace: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         def change(document: dict[str, Any], db: sqlite3.Connection):
-            if document["status"] in TERMINAL_GOALS | {"cancelling"}:
-                return
+            if document["status"] in TERMINAL_GOALS:
+                return _NO_MUTATION
             if (expected_revision is not None and int(document["revision"]) != int(expected_revision)) \
                     or (expected_objective_epoch is not None and int(document.get("objective_epoch") or 1)
                         != int(expected_objective_epoch)):
@@ -6716,6 +6949,10 @@ class GoalStore:
                     "current_objective_epoch": document.get("objective_epoch", 1),
                 })
                 return
+            if document["status"] in {"paused", "waiting_for_user", "cancelling"}:
+                return _NO_MUTATION
+            if any(_task_has_unsettled_effect(task) for task in document["tasks"]):
+                raise HarnessError("Unsettled provider or file effects cannot support goal completion")
             checked = copy.deepcopy(result)
             unconfigured = result.get("status") == "not_configured"
             current_tree = ""
@@ -6737,7 +6974,7 @@ class GoalStore:
                     try:
                         selected = verification_project(self.config, document)
                         current_commands, _source = swarm_work._verification_commands(
-                            self.config, Path(document["project"]["path"]), selected,
+                            self.config, _execution_root(document), selected,
                         )
                     except (HarnessError, OSError) as exc:
                         checked.update({
@@ -6752,7 +6989,7 @@ class GoalStore:
                                           "Run the current selected checks before completing the goal.",
                             })
                 if checked.get("status") == "not_configured":
-                    current_tree, current_manifest = swarm_work._project_tree_merkle(Path(document["project"]["path"]))
+                    current_tree, current_manifest = swarm_work._project_tree_merkle(_execution_root(document))
                     changed_paths = list(dict.fromkeys(
                         str(change["path"])
                         for artifact in document.get("artifacts", []) if isinstance(artifact, dict)
@@ -6760,7 +6997,7 @@ class GoalStore:
                         if isinstance(change, dict) and change.get("path")
                     ))
                     runtime_paths = runtime_verification_paths(
-                        Path(document["project"]["path"]), document["objective"], changed_paths, current_manifest,
+                        _execution_root(document), document["objective"], changed_paths, current_manifest,
                     )
                     if runtime_paths or requested_runtime_verification(document["objective"]):
                         checked.update({
@@ -6845,6 +7082,16 @@ class GoalStore:
             document["verification"] = _durable_evidence(checked)
             self._event(db, document, "test_result", payload=checked)
             if checked.get("status") == "passed" or (verification_satisfied and checked.get("status") == "not_configured"):
+                if _isolated_execution(document):
+                    if publish_workspace is None:
+                        raise HarnessError("An isolated goal cannot complete before its changes are safely applied to the selected project")
+                    publication = publish_workspace(document)
+                    document["workspace_publication"] = {
+                        "state": "published", "transaction_id": publication.get("transaction_id", ""),
+                        "changes": publication.get("changes", []),
+                        "message": "Verified changes applied to the selected project.",
+                    }
+                    self._event(db, document, "workspace_published", payload=document["workspace_publication"])
                 document["status"] = "complete"
                 document["note"] = (
                     "All required tasks have current artifact evidence and team agreement. No project tests were configured; no tests ran."
@@ -6973,7 +7220,7 @@ class GoalStore:
                     elif effect == "acknowledged" and task.get("pending_action"):
                         pending = task.get("pending_transaction") or {}
                         if pending.get("state") == "prepared":
-                            transaction = FileTransaction(Path(document["project"]["path"]))
+                            transaction = FileTransaction(_execution_root(document))
                             try:
                                 manifest = transaction.load_manifest(str(pending.get("transaction_id") or ""))
                             except HarnessError:
@@ -7172,6 +7419,8 @@ class LongHorizonRuntime:
             raise HarnessError(
                 "The selected project's execution authority changed after this goal was admitted."
             )
+        if _isolated_execution(goal):
+            goal_workspaces.validate(goal, _base())
         return actual
 
     def close(self) -> None:
@@ -7300,6 +7549,10 @@ class LongHorizonRuntime:
         pending = [one["id"] for one in goal["tasks"] if one["state"] == "pending_apply" and one.get("pending_action")]
         if pending:
             return {"task_ids": pending, "actions": [], "route": "apply"}
+        # Verification needs no provider dispatch. Do not let claim_ready's
+        # exhausted-call-budget pause hide an otherwise finished task graph.
+        if all(one["state"] in {"complete", "cancelled"} for one in goal["tasks"]):
+            return {"route": "verify", "task_ids": []}
         with self.lock:
             scheduler_id = self.scheduler_ids.get(goal["goal_id"], "")
         tasks = self.store.claim_ready(
@@ -7326,7 +7579,7 @@ class LongHorizonRuntime:
         return {"route": "end", "task_ids": []}
 
     def _agent_context(self, goal: dict[str, Any], task: dict[str, Any], extra_files: list[str] | None = None) -> str:
-        root = Path(goal["project"]["path"])
+        root = _execution_root(goal)
         ledger = [{"id": one["id"], "title": one["title"], "state": one["state"],
                    "owner": one["assigned_agent_id"], "depends_on": one["depends_on"],
                    "summary": _short(one.get("summary"), 1_000)} for one in goal["tasks"]]
@@ -7500,6 +7753,12 @@ class LongHorizonRuntime:
             + "\n\nSUCCESS CRITERIA\n- " + "\n- ".join(goal["success_criteria"])
             + "\n\nCURRENT CONCRETE TASK\n" + task["description"]
             + "\n\nSHARED TASK LEDGER\n" + json.dumps(ledger, ensure_ascii=False)
+            + "\n\nPROJECT LOCATION\nSelected project: " + str(goal["project"]["path"])
+            + ("\nThis chat uses an independent working copy. All Nexus file/context tools and relative "
+               "change paths refer to that copy. Nexus applies verified changes to the selected project "
+               "with collision checks. Your CLI transport's current directory is a temporary transport "
+               "sandbox, not the deliverable location; do not ask the user to choose it or move files there."
+               if _isolated_execution(goal) else "")
             + "\n\nPROJECT TREE\n" + swarm_work._tree(root)
             + "\n\nREQUESTED FILE CONTENTS\n" + files
             + "\n\nUSER STEERING / EVIDENCE\n" + "\n".join(task.get("evidence", [])[-12:])
@@ -7545,7 +7804,7 @@ class LongHorizonRuntime:
         self._require_agent_setup(goal)
         task = next(one for one in goal["tasks"] if one["id"] == task_id)
         agent = next(one for one in goal["agents"] if one["id"] == task["assigned_agent_id"])
-        root = Path(goal["project"]["path"])
+        root = _execution_root(goal)
         conversation_key = f"long-goal-{goal_id}-{task_id}"
         dispatched = False
         provider_attempt_started = False
@@ -8070,7 +8329,7 @@ class LongHorizonRuntime:
             if changes:
                 goal = self.store.get(goal_id)
                 self._require_goal_authority(goal)
-                root = Path(goal["project"]["path"])
+                root = _execution_root(goal)
                 current_task = next(one for one in goal["tasks"] if one["id"] == task["id"])
                 pending = current_task.get("pending_transaction") or {}
                 if pending.get("state") == "applied" and pending.get("artifact"):
@@ -8116,7 +8375,7 @@ class LongHorizonRuntime:
             elif action.get("action") in {"complete", "request_review"}:
                 goal = self.store.get(goal_id)
                 self._require_goal_authority(goal)
-                root = Path(goal["project"]["path"])
+                root = _execution_root(goal)
                 merkle, manifest = swarm_work._project_tree_merkle(root)
                 artifact = {
                     "kind": "verified_no_change", "tree_merkle": merkle,
@@ -8143,7 +8402,32 @@ class LongHorizonRuntime:
     def _verify_node(self, state: GoalGraphState) -> GoalGraphState:
         goal = self.store.get(state["goal_id"])
         self._require_goal_authority(goal)
-        root = Path(goal["project"]["path"])
+        if not _isolated_execution(goal):
+            return self._verify_and_publish(state)
+        try:
+            with goal_workspaces.publication(goal, self.store.root):
+                current = self.store.get(goal["goal_id"])
+                if current["status"] in TERMINAL_GOALS | {"paused", "waiting_for_user", "cancelling"}:
+                    return {"route": "end"}
+                self._require_goal_authority(current)
+                self.store.set_workspace_publication(goal["goal_id"], "publishing",
+                    message="Checking the combined project before applying this chat's changes.")
+                current = self.store.get(goal["goal_id"])
+                receipt = goal_workspaces.prepare_publish(current, self.store.root)
+                if receipt.get("rebased") and self.store.reopen_rebased_workspace(goal["goal_id"]):
+                    return {"route": "schedule"}
+                return self._verify_and_publish(state, receipt=receipt)
+        except goal_workspaces.WorkspaceConflict as exc:
+            self.store.set_workspace_publication(goal["goal_id"], "conflict",
+                message=str(exc), conflicts=exc.conflicts)
+            return {"route": "end"}
+
+    def _verify_and_publish(self, state: GoalGraphState, *, receipt: dict[str, Any] | None = None) -> GoalGraphState:
+        goal = self.store.get(state["goal_id"])
+        if goal["status"] in TERMINAL_GOALS | {"paused", "waiting_for_user", "cancelling"}:
+            return {"route": "end"}
+        self._require_goal_authority(goal)
+        root = _execution_root(goal)
         changed = [
             str(change.get("path")) for artifact in goal.get("artifacts", []) if isinstance(artifact, dict)
             for change in artifact.get("changes", []) if isinstance(change, dict) and change.get("path")
@@ -8159,8 +8443,12 @@ class LongHorizonRuntime:
             goal["goal_id"], result,
             expected_revision=int(goal["revision"]),
             expected_objective_epoch=int(goal.get("objective_epoch") or 1),
+            publish_workspace=(
+                lambda current: goal_workspaces.publish(current, self.store.root, receipt)
+            ) if receipt is not None else None,
         )
-        self._start_promoted_goals(updated.get("promoted_goal_ids", []))
+        if receipt is None:
+            self._start_promoted_goals(updated.get("promoted_goal_ids", []))
         return {
             "route": "end" if updated["status"] in TERMINAL_GOALS | {
                 "paused", "cancelling",
@@ -8389,6 +8677,20 @@ class LongHorizonRuntime:
             return goals
 
     def recover_all(self) -> list[dict[str, Any]]:
+        # Normalize dead leases before adopting a saved chat. A live older
+        # process keeps its original exclusive authority until it has drained.
+        for saved in self.store.active_authority_goals():
+            if not self.store._scheduler_live(saved) and any(
+                task.get("state") == "running" for task in saved.get("tasks", [])
+            ):
+                self.store.recover_dead(saved["goal_id"])
+        for saved in self.store.active_authority_goals():
+            try:
+                self.store.adopt_isolated_workspace(saved["goal_id"])
+            except (HarnessError, OSError) as exc:
+                # One disconnected or substituted legacy project must not
+                # prevent independent available chats from initializing.
+                self.store.record_workspace_migration_failure(saved["goal_id"], str(exc))
         self._enable_auto_start_watcher()
         recovered: list[dict[str, Any]] = list(self.store.reconcile_project_queue())
         for goal in self.store.active_authority_goals():
@@ -8562,6 +8864,7 @@ class LongHorizonRuntime:
                             admission_digest=admission_digest,
                             expected_project_authority_id=actual_authority_id,
                             expected_agents=admitted_agents,
+                            isolated_workspace=bool(conversation_id),
                         )
                     except Exception:
                         if attachment_root.exists() and expected_parent in attachment_root.parents:
@@ -8578,6 +8881,7 @@ class LongHorizonRuntime:
                         admission_digest=admission_digest,
                         expected_project_authority_id=actual_authority_id,
                         expected_agents=admitted_agents,
+                        isolated_workspace=bool(conversation_id),
                     )
             if goal.get("request_tombstone") is True:
                 # Detailed terminal history is intentionally bounded, but a
@@ -8630,6 +8934,28 @@ class LongHorizonRuntime:
         if any(one.get("state") == "pending" for one in source.get("interrupts", [])):
             raise HarnessError("Answer or cancel the pending decision before forking this goal")
         root = Path(source["project"]["path"])
+        isolated = _isolated_execution(source)
+        if isolated:
+            if source["status"] not in {"paused", "failed"} or self.store._scheduler_live(source) or any(
+                task.get("state") == "running" or _task_has_unsettled_effect(task)
+                for task in source.get("tasks", [])
+            ):
+                raise HarnessError("Pause this isolated goal and wait for its current work to settle before forking. Its working copy is retained.")
+            private_root = _execution_root(source)
+            # Only file reads occur under these locks. GoalStore operations can
+            # hold SQLite while settling a file effect, so reading or cloning
+            # the goal here would invert that lock order.
+            with goal_workspaces.publication(source, self.store.root, timeout_seconds=0), \
+                    FileTransaction(private_root).locked(timeout_seconds=0):
+                different = goal_workspaces.differing_files(source, self.store.root)
+            if different:
+                raise HarnessError(
+                    "This goal's independent working copy differs from the selected project: "
+                    + ", ".join(different[:20])
+                    + ". Publish or reconcile its private result before forking; the saved working copy is retained."
+                )
+            if self.store.get(goal_id)["revision"] != source["revision"]:
+                raise HarnessError("This goal changed while its fork snapshot was checked. Pause it and retry; its working copy is retained.")
         if subprocess.run(["git", "-C", str(root), "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
             raise HarnessError("Forking project work requires a clean Git worktree so branches cannot silently lose changes")
         fork_id = hashlib.sha256(
@@ -8644,6 +8970,12 @@ class LongHorizonRuntime:
             )
             if probe.returncode != 0 or Path(probe.stdout.strip()).resolve() != target.resolve():
                 raise HarnessError("The deterministic fork path exists but is not the expected Git worktree")
+            if isolated:
+                with goal_workspaces.publication(source, self.store.root, timeout_seconds=0), \
+                        FileTransaction(private_root).locked(timeout_seconds=0):
+                    different = goal_workspaces.differing_files(source, self.store.root, target)
+                if different:
+                    raise HarnessError("The saved fork worktree differs from this goal's independent working copy. Its private result is retained; use a fresh fork request after publication or reconciliation.")
         else:
             result = subprocess.run(
                 ["git", "-C", str(root), "worktree", "add", "--detach", str(target), "HEAD"],
@@ -8651,6 +8983,8 @@ class LongHorizonRuntime:
             )
             if result.returncode != 0:
                 raise HarnessError("Git could not create an isolated goal fork: " + _short(result.stderr, 2_000))
+        if isolated and self.store.get(goal_id)["revision"] != source["revision"]:
+            raise HarnessError("This goal changed before its fork checkpoint was saved. Pause it and retry; its working copy is retained.")
         return self.store.clone_to_project(
             source, source["project"]["id"] + "-fork",
             source["project"]["name"] + " fork", target, request_id,

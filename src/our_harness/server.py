@@ -3783,6 +3783,18 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 goal = store.public(store.get(goal_id))
                 self.server.project_long_horizon_chat_statuses([goal])
                 self._json({"goal": goal})
+            elif parsed.path == "/api/long-horizon/verification-approval":
+                self._require_token()
+                from .goal_verification import workspace_verification_approval
+
+                query = urllib.parse.parse_qs(parsed.query)
+                goal_id = str(query.get("goal_id", [""])[0])
+                runtime = self.server.long_horizon
+                goal = runtime.store.get(goal_id)
+                runtime._require_goal_authority(goal)
+                self._json(workspace_verification_approval(
+                    self.server.config, goal, runtime_root=runtime.store.root,
+                ))
             elif parsed.path == "/api/long-horizon/events":
                 self._require_token()
                 query = urllib.parse.parse_qs(parsed.query)
@@ -5162,6 +5174,28 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json({
                     **receipt, "goal": goal, "engine": "long_horizon",
                 }, HTTPStatus.ACCEPTED)
+            elif self.path == "/api/long-horizon/verification-approval":
+                from .goal_verification import workspace_verification_approval
+
+                goal_id = str(body.get("goal_id") or "")
+                expected_revision = body.get("expected_revision")
+                command_digest = str(body.get("command_digest") or "").strip().lower()
+                if body.get("approved") is not True or type(expected_revision) is not int \
+                        or expected_revision < 1 or re.fullmatch(r"[0-9a-f]{64}", command_digest) is None:
+                    raise HarnessError("Approve the exact displayed goal revision and command fingerprint")
+                with self.server.project_admission_lock, self.server.swarm_lock:
+                    runtime = self.server.long_horizon
+                    held_goal = runtime.store.get(goal_id)
+                    self.server.require_long_horizon_chat_binding(held_goal, body)
+                    runtime._require_goal_authority(held_goal)
+                    runtime._require_agent_setup(held_goal)
+                    goal = runtime.store.approve_workspace_verification(
+                        goal_id, expected_revision=expected_revision, command_digest=command_digest,
+                    )
+                    approval = workspace_verification_approval(
+                        self.server.config, runtime.store.get(goal_id), runtime_root=runtime.store.root,
+                    )
+                self._json({"goal": goal, "approval": approval})
             elif self.path == "/api/long-horizon/control":
                 goal_id = str(body.get("goal_id") or "")
                 action = str(body.get("action") or "")

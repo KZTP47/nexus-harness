@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +180,7 @@ def capture_verification_contract(
     return {**contract, "fingerprint_sha256": _fingerprint(contract)}
 
 
-def verification_project(config: LoadedConfig, goal: dict[str, Any]) -> dict[str, Any]:
+def _selected_verification_project(config: LoadedConfig, goal: dict[str, Any]) -> dict[str, Any]:
     project = copy.deepcopy(goal["project"])
     project["tasks"] = [goal["objective"]]
     contract = goal.get("verification_contract")
@@ -215,6 +216,85 @@ def verification_project(config: LoadedConfig, goal: dict[str, Any]) -> dict[str
     return project
 
 
+@dataclass(frozen=True)
+class _WorkspaceVerificationAuthority:
+    """In-process authority; JSON supplied by a project cannot construct it."""
+
+    config: LoadedConfig
+    goal: dict[str, Any]
+    runtime_root: Path
+    execution_root: Path
+
+
+def verification_project(
+    config: LoadedConfig, goal: dict[str, Any], *, runtime_root: Path | None = None,
+) -> dict[str, Any]:
+    project = _selected_verification_project(config, goal)
+    if "execution_workspace" in goal:
+        from . import goal_workspaces
+        from .swarm_runs import _base
+
+        runtime_root = runtime_root if runtime_root is not None else _base()
+        execution_root = goal_workspaces.root(goal, runtime_root)
+        binding = copy.deepcopy({key: goal[key] for key in (
+            "goal_id", "project", "project_authority_id", "execution_workspace",
+            "verification_contract", "objective",
+        ) if key in goal})
+        project["_nexus_workspace_verification"] = _WorkspaceVerificationAuthority(
+            config, binding, runtime_root, execution_root,
+        )
+    return project
+
+
+def verification_authority(
+    config: LoadedConfig, root: Path, project: dict[str, Any],
+) -> tuple[LoadedConfig, Path]:
+    """Validate an owned copy while retaining its selected command authority.
+
+    Discovery still reads the execution copy. Only its approval identity and
+    selected configuration come from the original project, never from a path
+    field supplied by the board or an agent.
+    """
+    authority = project.get("_nexus_workspace_verification")
+    if authority is None:
+        return config, root
+    if not isinstance(authority, _WorkspaceVerificationAuthority):
+        raise HarnessError("Workspace verification authority is not an engine-issued binding")
+    from . import goal_workspaces
+
+    expected_root = goal_workspaces.root(authority.goal, authority.runtime_root)
+    if root.resolve() != expected_root or authority.execution_root != expected_root:
+        raise HarnessError("Workspace verification was redirected to a different execution root")
+    selected = _selected_verification_project(authority.config, authority.goal)
+    fields = ("path", "test_commands", "test_evidence_contracts", "approved_test_command_digest")
+    if any(project.get(field) != selected.get(field) for field in fields):
+        raise HarnessError("Workspace verification commands or selected project authority changed")
+    return authority.config, Path(selected["path"])
+
+
+def workspace_verification_approval(
+    config: LoadedConfig, goal: dict[str, Any], *, runtime_root: Path | None = None,
+) -> dict[str, Any]:
+    """Preview one goal's unpublished checks under its canonical project identity."""
+    if "execution_workspace" not in goal:
+        raise HarnessError("This goal has no isolated workspace; use its selected project's test settings")
+    from . import swarm_work
+
+    project = verification_project(config, goal, runtime_root=runtime_root)
+    proposal = swarm_work.verification_command_approval(config, project)
+    settled = goal.get("status") == "paused" and not any(
+        task.get("state") == "running" for task in goal.get("tasks", []) if isinstance(task, dict)
+    )
+    return {
+        **proposal,
+        "goal_id": str(goal.get("goal_id") or ""),
+        "revision": int(goal.get("revision") or 0),
+        "can_approve": bool(proposal.get("can_approve") and settled),
+        **({"reason": "Pause this goal and let its current turn settle before approving its checks."}
+           if not settled else {}),
+    }
+
+
 def run_configured_goal_verification(
     config: LoadedConfig, root: Path, project: dict[str, Any], goal: str,
     changed: list[str], progress=None, *, deadline=None, verification_session_id: str = "",
@@ -230,6 +310,7 @@ def run_configured_goal_verification(
     from .models import DeadlineExpired
     from .verification import analyze_verification
 
+    authority_config, authority_root = verification_authority(config, root, project)
     results: list[dict[str, Any]] = []
 
     def outcome(status: str, basis: str, reason: str, **extra):
@@ -319,15 +400,18 @@ def run_configured_goal_verification(
         )
     if source == "discovered":
         try:
-            digest = work._command_approval_digest(root, commands, declared_path=str(project.get("path") or ""))
+            digest = work._command_approval_digest(
+                root, commands, declared_path=str(project.get("path") or ""),
+                authority_root=authority_root,
+            )
         except (OSError, RuntimeError) as exc:
             return outcome("unavailable", "command_approval_fingerprint_unavailable", str(exc), proposed_commands=commands)
         if str(project.get("approved_test_command_digest") or "") != digest:
             return outcome("unavailable", "discovered_command_approval_required",
                            "Review and approve Project test commands before Nexus runs them.",
                            proposed_commands=commands, approval_digest=digest)
-    command_config = LoadedConfig(copy.deepcopy(config.data), root.resolve(), list(config.sources),
-                                  dict(config.provenance), copy.deepcopy(config.trusted_floor))
+    command_config = LoadedConfig(copy.deepcopy(authority_config.data), root.resolve(), list(authority_config.sources),
+                                  dict(authority_config.provenance), copy.deepcopy(authority_config.trusted_floor))
     before, _ = work._project_tree_merkle(root)
     for command in commands:
         executable = str(command[0]) if command else ""
@@ -345,7 +429,9 @@ def run_configured_goal_verification(
             timeout = deadline.remaining_seconds("before a selected-project verification command", configured)
             limited = deadline.limits(configured) if isinstance(deadline, work._SwarmToolExecutionBudget) else timeout <= configured
         try:
-            payload = work._run_disposable_verification_command(command_config, root, command, timeout=timeout)
+            payload = work._run_disposable_verification_command(
+                command_config, root, command, timeout=timeout, command_root=authority_root,
+            )
             if payload.get("timed_out") and limited:
                 raise work.ContextToolBudgetExhausted("Project context-tool execution budget exhausted during verification")
             if deadline is not None:
@@ -370,8 +456,8 @@ def run_configured_goal_verification(
         if payload.get("exit_code") != 0 or payload.get("timed_out") or work._EMPTY_TEST_OUTPUT.search(combined):
             return outcome("failed", source, "A project check failed, timed out, or ran zero tests.")
     contracts = project.get("test_evidence_contracts", [])
-    if not contracts and config.project_root.resolve() == root.resolve():
-        contracts = config.get("project.test_evidence_contracts", [])
+    if not contracts and authority_config.project_root.resolve() == authority_root.resolve():
+        contracts = authority_config.get("project.test_evidence_contracts", [])
     analysis = analyze_verification(commands, results, evidence_contracts=contracts if isinstance(contracts, list) else [])
     if not analysis["passed"]:
         return outcome("failed", "positive_test_evidence", "Checks did not provide complete positive evidence that tests executed.", verification_analysis=analysis)
