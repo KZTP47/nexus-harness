@@ -11,10 +11,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import cancellation
+from .bounded_file_read import (
+    FileReadOutputLimit, READ_FILE_DESCRIPTION, READ_FILE_INPUT_SCHEMA,
+    read_file_page, validate_read_file_arguments,
+)
 from .config import LoadedConfig
 from .ignore_policy import IgnorePolicy
 from .mcp import MCPClient, configured_server
-from .memory import MemoryHit, MemoryStore
+from .memory import AgentToolCallBindingConflict, MemoryHit, MemoryStore
 from .messaging import EVERYONE, MessageBoard
 from .models import Deadline, DeadlineExpired, HarnessError
 from .programmatic_workspace import (
@@ -32,6 +36,11 @@ from .staged_coding import StagedCandidate, StagedCodingWorkspace, TextReplaceme
 
 
 EventEmitter = Callable[[str, str, dict[str, Any]], None]
+
+# Provider call IDs belong to an agent response. The engine supplies a stable
+# response scope when it can replay that response across process restarts.
+TOOL_IDENTITY_CONTRACT = "agent-tool-identity-v2:node,execution-scope,provider-call-id"
+TOOL_IDENTITY_FINGERPRINT = hashlib.sha256(TOOL_IDENTITY_CONTRACT.encode("utf-8")).hexdigest()
 
 
 def _how_many_calls(how_many: int) -> str:
@@ -59,16 +68,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "read_file",
-        "description": "Read a bounded line range from one project-relative regular file.",
-        "input_schema": _object_schema(
-            {
-                "path": {"type": "string"},
-                "start_line": {"type": "integer", "minimum": 1},
-                "end_line": {"type": "integer", "minimum": 1},
-                "max_bytes": {"type": "integer", "minimum": 1},
-            },
-            ["path", "start_line", "end_line", "max_bytes"],
-        ),
+        "description": READ_FILE_DESCRIPTION,
+        "input_schema": READ_FILE_INPUT_SCHEMA,
     },
     {
         "name": "search_workspace",
@@ -378,6 +379,7 @@ class AgentToolSession:
         self.ignore_policy = IgnorePolicy(self.root, set(config.get("project.ignore", [])))
         self.max_calls = int(config.get("workflow.max_tool_calls"))
         self.per_call_bytes = int(config.get("workflow.max_tool_output_bytes"))
+        self.read_file_output_bytes = self.per_call_bytes
         self.total_bytes_limit = int(config.get("workflow.max_tool_total_bytes"))
         self.calls = 0
         self.total_bytes = 0
@@ -389,6 +391,7 @@ class AgentToolSession:
         self.cache_status: dict[str, str] = {}
         self.call_ids: dict[str, str] = {}
         self.restored_call_ids: dict[str, str] = {}
+        self.legacy_call_ids: dict[str, str] = {}
         self.completed_cache_keys: set[str] = set()
         self._staged_workspace: StagedCodingWorkspace | PersistentProgrammaticWorkspace | None = None
         self._staged_node: str | None = None
@@ -455,7 +458,8 @@ class AgentToolSession:
 
     def budget_state(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
+            "identity_contract_sha256": TOOL_IDENTITY_FINGERPRINT,
             "calls": self.calls,
             "total_bytes": self.total_bytes,
             "call_ids_sha256": {
@@ -463,6 +467,7 @@ class AgentToolSession:
                 for call_id, cache_key in self.call_ids.items()
             }
             | dict(self.restored_call_ids),
+            "legacy_call_ids_sha256": dict(self.legacy_call_ids),
             "completed_cache_keys": sorted(set(self.cache) | self.completed_cache_keys),
             # Kept with the rest of the budget. Left out, a run picked up after
             # an approval or a restart forgot it had been round in circles, and
@@ -471,11 +476,15 @@ class AgentToolSession:
         }
 
     def restore_budget_state(self, state: dict[str, Any]) -> None:
-        if not isinstance(state, dict) or state.get("schema_version") != 1:
+        if not isinstance(state, dict) or state.get("schema_version") not in {1, 2}:
             raise HarnessError("Run checkpoint agent tool budget has an unsupported schema")
+        legacy = state["schema_version"] == 1
+        if not legacy and state.get("identity_contract_sha256") != TOOL_IDENTITY_FINGERPRINT:
+            raise HarnessError("Run checkpoint agent tool identity contract is incompatible")
         calls = state.get("calls")
         total_bytes = state.get("total_bytes")
         call_ids = state.get("call_ids_sha256")
+        legacy_call_ids = call_ids if legacy else state.get("legacy_call_ids_sha256", {})
         cache_keys = state.get("completed_cache_keys")
         # A checkpoint written before this was kept simply has none.
         how_often = state.get("how_often", {})
@@ -492,6 +501,12 @@ class AgentToolSession:
             for key, value in call_ids.items()
         ):
             raise HarnessError("Run checkpoint agent tool call bindings are invalid")
+        if not isinstance(legacy_call_ids, dict) or not all(
+            isinstance(key, str) and digest.fullmatch(key)
+            and isinstance(value, str) and digest.fullmatch(value)
+            for key, value in legacy_call_ids.items()
+        ):
+            raise HarnessError("Run checkpoint legacy agent tool call bindings are invalid")
         if not isinstance(cache_keys, list) or not all(isinstance(value, str) and digest.fullmatch(value) for value in cache_keys):
             raise HarnessError("Run checkpoint agent tool cache keys are invalid")
         if not isinstance(how_often, dict) or not all(
@@ -499,13 +514,19 @@ class AgentToolSession:
             and digest.fullmatch(key)
             and isinstance(value, int)
             and not isinstance(value, bool)
-            and 0 <= value <= self.max_calls
+            # Repeat observations span durable response scopes, each with its
+            # own allowance. This advisory count is not a per-response budget.
+            and value >= 0
             for key, value in how_often.items()
         ):
             raise HarnessError("Run checkpoint agent tool repeat counts are invalid")
         self.calls = calls
         self.total_bytes = total_bytes
-        self.restored_call_ids = dict(call_ids)
+        self.restored_call_ids = {} if legacy else dict(call_ids)
+        # Legacy bindings have no agent/response owner. Keep their conservative
+        # replay protection for legacy callers; new engine-owned scopes cannot
+        # accidentally inherit another response's calls or cached output.
+        self.legacy_call_ids = dict(legacy_call_ids)
         self.completed_cache_keys = set(cache_keys)
         self.how_often = {key: int(value) for key, value in how_often.items()}
 
@@ -549,7 +570,12 @@ class AgentToolSession:
             definitions.extend(dict(item) for item in MY_LIST_TOOL_DEFINITIONS)
         return definitions
 
-    def execute(self, node: str, call_id: str, name: str, arguments: object) -> dict[str, Any]:
+    def execute(
+        self, node: str, call_id: str, name: str, arguments: object,
+        *, execution_scope: str = "",
+    ) -> dict[str, Any]:
+        if not isinstance(execution_scope, str) or len(execution_scope) > 512:
+            raise HarnessError("Agent tool execution scope must be a bounded engine-owned string")
         self.deadline.check("before an agent tool call")
         if self.calls >= self.max_calls:
             raise HarnessError(f"Agent tool call limit reached: {self.max_calls}")
@@ -570,17 +596,27 @@ class AgentToolSession:
         nonce = self._staged_nonce if staged_tool else ""
         capability_node = node if volatile else ""
         volatile_call_id = call_id if volatile else ""
+        scope_prefix = canonical_json([TOOL_IDENTITY_CONTRACT, node, execution_scope]) + "\n" if execution_scope else ""
         cache_key = hashlib.sha256(
-            f"{nonce}\n{capability_node}\n{volatile_call_id}\n{name}\n{canonical_arguments}".encode("utf-8")
+            f"{scope_prefix}{nonce}\n{capability_node}\n{volatile_call_id}\n{name}\n{canonical_arguments}".encode("utf-8")
         ).hexdigest()
-        call_id_digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()
+        binding_key = canonical_json([node, execution_scope, call_id])
+        binding_digest = hashlib.sha256(binding_key.encode("utf-8")).hexdigest()
+        legacy_call_id_digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()
+        # Keep old unscoped journal entries replayable. Explicit scopes use the
+        # versioned engine identity and never look up an unrelated legacy entry.
+        call_id_digest = hashlib.sha256(
+            canonical_json([TOOL_IDENTITY_CONTRACT, node, execution_scope, call_id]).encode("utf-8")
+        ).hexdigest() if execution_scope else legacy_call_id_digest
         arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
         call_id_collision = (
-            call_id in self.call_ids and self.call_ids[call_id] != cache_key
+            binding_key in self.call_ids and self.call_ids[binding_key] != cache_key
         ) or (
-            call_id_digest in self.restored_call_ids and self.restored_call_ids[call_id_digest] != cache_key
+            binding_digest in self.restored_call_ids and self.restored_call_ids[binding_digest] != cache_key
+        ) or (
+            not execution_scope and legacy_call_id_digest in self.legacy_call_ids
+            and self.legacy_call_ids[legacy_call_id_digest] != cache_key
         )
-        self.call_ids.setdefault(call_id, cache_key)
         # Counted on what was asked, not on what came back, so the count is the
         # same whether the answer came fresh or out of the cache. And counted
         # per agent: without the node in here, two agents asking the same
@@ -604,13 +640,18 @@ class AgentToolSession:
         )
         retained = None
         if self.run_id is not None and not call_id_collision and not volatile:
-            retained = self.memory.load_agent_tool_result(
-                run_id=self.run_id,
-                node_id=node,
-                call_id_sha256=call_id_digest,
-                tool_name=name,
-                arguments_sha256=arguments_sha256,
-            )
+            try:
+                retained = self.memory.load_agent_tool_result(
+                    run_id=self.run_id,
+                    node_id=node,
+                    call_id_sha256=call_id_digest,
+                    tool_name=name,
+                    arguments_sha256=arguments_sha256,
+                )
+            except AgentToolCallBindingConflict:
+                call_id_collision = True
+        if not call_id_collision:
+            self.call_ids.setdefault(binding_key, cache_key)
         if retained is not None:
             byte_count = int(retained["content_bytes"])
             if self.total_bytes + byte_count > self.total_bytes_limit:
@@ -631,7 +672,12 @@ class AgentToolSession:
             return self._with_a_word_in_the_ear(result, same_thing, name, node)
         duplicate = (cache_key in self.cache or cache_key in self.completed_cache_keys) and not call_id_collision
         if call_id_collision:
-            content = {"error": "Tool call_id was reused with different arguments"}
+            content = {
+                "error": "Tool call_id was reused with different arguments in the same agent response scope",
+                "code": "tool_call_id_conflict",
+                "retryable": True,
+                "recovery": "Send the corrected call with a new call_id. The original call and its result were preserved.",
+            }
             status = "error"
         elif cache_key in self.cache:
             content = dict(self.cache[cache_key])
@@ -643,12 +689,17 @@ class AgentToolSession:
             try:
                 if self._prepare_tool is not None:
                     self._prepare_tool(name, arguments, self.deadline)
-                content = self._dispatch(name, arguments, node=node, call_id=call_id)
+                content = self._dispatch(
+                    name, arguments, node=node,
+                    call_id=call_id_digest if execution_scope and staged_tool else call_id,
+                )
                 status = "ok"
             except (cancellation.ChatCancelled, DeadlineExpired):
                 raise
             except HarnessError as exc:
                 content = {"error": str(exc)}
+                if isinstance(exc, FileReadOutputLimit):
+                    content["code"] = "output_budget_exhausted"
                 status = "error"
             except (OSError, UnicodeError) as exc:
                 content = {"error": f"Tool operation failed: {type(exc).__name__}"}
@@ -664,6 +715,16 @@ class AgentToolSession:
             content = {"error": str(exc)}
             status = "error"
             deadline_error = exc
+        if name == "read_file" and status == "ok" and len(canonical_json(content).encode("utf-8")) > min(
+            self.per_call_bytes, max(0, self.total_bytes_limit - self.total_bytes),
+        ):
+            # A cached page was sized for an earlier, larger allowance. Never
+            # clip its serialized JSON or lose the cursor while reporting OK.
+            content = {
+                "error": "The remaining tool-output budget cannot retain this complete file page. No partial page was returned.",
+                "code": "output_budget_exhausted",
+            }
+            status = "error"
         mcp_classification = content.get("classification") if isinstance(content, dict) else None
         content, byte_count, truncated = self._bound_content(content)
         if byte_count == 0:
@@ -693,7 +754,7 @@ class AgentToolSession:
             "replayed": False,
             "provenance": provenance,
         }
-        if self.run_id is not None and not volatile:
+        if self.run_id is not None and not volatile and not call_id_collision:
             result = self.memory.record_agent_tool_result(
                 run_id=self.run_id,
                 node_id=node,
@@ -1109,32 +1170,15 @@ class AgentToolSession:
         return content
 
     def _read_file(self, arguments: object) -> dict[str, Any]:
-        value = _require_object(arguments, {"path", "start_line", "end_line", "max_bytes"}, {"path", "start_line", "end_line", "max_bytes"})
-        relative = _require_string(value["path"], "path")
-        start_line = _require_int(value["start_line"], "start_line", 1, 10_000_000)
-        end_line = _require_int(value["end_line"], "end_line", start_line, 10_000_000)
-        requested_bytes = _require_int(value["max_bytes"], "max_bytes", 1, self.per_call_bytes)
-        raw = self._stable_regular_bytes(relative)
-        try:
-            text = raw.decode("utf-8", errors="strict")
-        except UnicodeDecodeError as exc:
-            raise HarnessError(
-                "read_file target is not valid UTF-8 text; Nexus did not replace or corrupt bytes"
-            ) from exc
-        lines = text.splitlines(keepends=True)
-        selected = "".join(lines[start_line - 1 : end_line])
-        selected_raw = selected.encode("utf-8")
-        truncated = len(selected_raw) > requested_bytes
-        content = _truncate_utf8(selected, requested_bytes) if truncated else selected
-        return {
-            "path": relative.replace("\\", "/"),
-            "start_line": start_line,
-            "end_line": min(end_line, len(lines)),
-            "total_lines": len(lines),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-            "content": content,
-            "truncated": truncated,
-        }
+        value = validate_read_file_arguments(arguments)
+        raw = self._stable_regular_bytes(value["path"])
+        configured_limit = min(self.per_call_bytes, self.read_file_output_bytes)
+        return read_file_page(
+            raw, value,
+            output_limit=min(configured_limit, max(0, self.total_bytes_limit - self.total_bytes)),
+            configured_output_limit=configured_limit,
+            max_file_bytes=int(self.config.get("project.max_file_bytes")),
+        )
 
     def _search_workspace(self, arguments: object) -> dict[str, Any]:
         value = _require_object(arguments, {"query", "max_results"}, {"query", "max_results"})

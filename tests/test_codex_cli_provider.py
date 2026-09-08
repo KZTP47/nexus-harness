@@ -216,6 +216,8 @@ class CodexCLIProviderTests(unittest.TestCase):
         contracts = (
             swarm_work.WORK_FORMAT.schema,
             long_horizon.AGENT_ACTION_FORMAT.schema,
+            long_horizon._agent_action_format({"kind": "work"}).schema,
+            long_horizon._agent_action_format({"kind": "review", "review_of": "exact-task"}).schema,
         )
 
         def assert_every_object_is_strict(value: object, path: str = "result") -> None:
@@ -242,12 +244,21 @@ class CodexCLIProviderTests(unittest.TestCase):
                 assert_every_object_is_strict(native)
                 self.assertEqual(contract, before)
 
-        review_arguments = long_horizon.AGENT_ACTION_FORMAT.schema[
-            "properties"
-        ]["tool_calls"]["items"]["anyOf"][-1]["properties"]["arguments"]
-        native_review_arguments = codex_cli._codex_output_schema(
-            long_horizon.AGENT_ACTION_FORMAT.schema
-        )["properties"]["tool_calls"]["items"]["anyOf"][-1]["properties"]["arguments"]
+        def review_arguments_for(schema):
+            matches = [
+                variant["properties"]["arguments"]
+                for variant in schema["properties"]["tool_calls"]["items"]["anyOf"]
+                if variant["properties"]["name"]["enum"] == ["read_proposed_change"]
+            ]
+            self.assertEqual(len(matches), 1)
+            return matches[0]
+
+        # Tools are identified by contract name, not their append order. The
+        # shared-conversation reader is now the final schema variant.
+        review_arguments = review_arguments_for(long_horizon.AGENT_ACTION_FORMAT.schema)
+        native_review_arguments = review_arguments_for(codex_cli._codex_output_schema(
+            long_horizon.AGENT_ACTION_FORMAT.schema,
+        ))
         self.assertEqual(review_arguments["required"], ["path"])
         self.assertEqual(
             native_review_arguments["required"], ["path", "offset", "limit"],

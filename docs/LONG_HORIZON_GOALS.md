@@ -7,6 +7,11 @@ in the same composer to steer them. **Pause team** retains the work and
 **Resume team** continues it. Questions, errors, and progress appear inline;
 Mission control provides optional detail.
 
+Chat includes public progress messages and tool activity with expandable input,
+output, and error details. The saved history retains these entries across
+restart. These are provider-supplied public summaries and observed tool calls;
+private model reasoning is not available.
+
 ## Default behavior
 
 **Work on project files** and **Work until the goals are achieved** use the
@@ -20,6 +25,13 @@ can inspect the latest work. **Send to team** steers this exact active goal;
 before work starts, **Send** is ordinary direct chat. The older paired
 plan/review/execute workflow is available only through **Use legacy paired
 workflow**.
+
+New shared goals have no cumulative provider-call or tool-call ceiling by
+default. An explicitly supplied `max_provider_calls` or
+`max_context_tool_calls` is honored exactly; zero means no cumulative limit.
+Older saved goals retain their recorded finite limits because those records
+cannot distinguish a default from a user's choice. Pause and cancellation
+remain available throughout the conversation.
 
 An agent can return one structured next action:
 
@@ -43,7 +55,7 @@ in parallel when their resource paths and provider identities do not conflict.
 ## Durable state and restart behavior
 
 Each goal has a stable ID, immutable original objective, revisioned active
-steering, explicit success criteria, bounded budgets, a dependency-aware task
+steering, explicit success criteria, recorded call usage and user budgets, a dependency-aware task
 ledger, agent ownership, evidence, artifacts, verification, and structured
 interrupts. State and an HMAC-authenticated, hash-chained typed event journal
 are stored outside project mutation authority. LangGraph SQLite checkpoints
@@ -121,8 +133,8 @@ before starting another project-writing workflow on the same tree.
 ## Completion and review
 
 Agent prose alone cannot complete a task. Completion needs an artifact or a
-concrete evidence marker, and the goal still remains incomplete until
-deterministic project verification passes. Each success criterion receives a
+concrete evidence marker, and configured or discovered deterministic checks
+must pass. Each success criterion receives a
 recorded result and basis. Verification failure creates one bounded repair
 task; repeated no-progress or exhausted budgets pause the goal instead of
 manufacturing progress. Verification infrastructure that is unavailable
@@ -131,18 +143,21 @@ it does not spend provider calls asking an agent to repair the Windows sandbox
 or a missing runner.
 
 Work together runs the selected project's real test commands and retains their
-results. Its shared verification profile requires positive test evidence plus
-both agents' completion and task evidence for the user's criteria. It does not
+results. Its shared verification profile requires evidence for configured tests,
+both agents' completion, and task evidence for the user's criteria. It does not
 turn arbitrary wording into a fixed set of inferred test scenarios. Configured
 commands retain their execution scope; discovered commands still require the
 user's approval and run in a disposable, protected copy of the project.
-If a goal pauses because its new project has no approved checks, configure or
-approve the checks in that project's settings and press **Resume team**. Resume
+If there are no configured or discoverable checks, Nexus reports that no tests
+ran and requires inspected current artifacts and team agreement. Explicitly
+requested testing still needs actual execution evidence. If discovered checks
+need approval, approve them in the project's settings and press **Resume team**. Resume
 adopts the current settings for that exact project, records their new fingerprint,
 and clears obsolete test observations while retaining the agents' work and chat.
 
-No-progress fingerprints compare semantic evidence and before/after content,
-not fresh transaction IDs or timestamps. Repeated identical questions,
+No-progress fingerprints include public discussion, semantic evidence, and
+before/after content. New discussion can continue without artificial file edits.
+Fresh transaction IDs or timestamps alone are not progress. Repeated identical questions,
 handoffs, delegations, verification failures, and unchanged work are bounded,
 while genuinely changed proposals reset the relevant counter.
 

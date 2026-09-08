@@ -1267,6 +1267,7 @@ _CORRELATION_TEXT_LIMITS = {
     "goal_status": 80,
     "source_goal_event_id": 32,
     "source_goal_event_type": 100,
+    "source_dialogue_id": 160,
     "task_id": 160,
 }
 
@@ -1321,9 +1322,11 @@ def _said_correlation(value: object, turn_number: int = 0) -> dict[str, Any]:
                 f"Saved conversation{label} has an out-of-range goal revision."
             )
         kept["goal_revision"] = revision
-    if value.get("goal_event_cursor") is not None:
+    for cursor_key in ("goal_event_cursor", "goal_dialogue_cursor", "source_goal_event_seq", "goal_status_event_cursor"):
+        if value.get(cursor_key) is None:
+            continue
         try:
-            cursor = int(value.get("goal_event_cursor"))
+            cursor = int(value.get(cursor_key))
         except (TypeError, ValueError) as exc:
             raise ChatError(
                 f"Saved conversation{label} has an invalid goal-event cursor."
@@ -1332,7 +1335,7 @@ def _said_correlation(value: object, turn_number: int = 0) -> dict[str, Any]:
             raise ChatError(
                 f"Saved conversation{label} has an out-of-range goal-event cursor."
             )
-        kept["goal_event_cursor"] = cursor
+        kept[cursor_key] = cursor
     return kept
 
 
@@ -1729,6 +1732,7 @@ def _deduplicate_correlated_delta(
 def _keep_it(
     config: LoadedConfig, route: str, turns: list[Said], filed_as: str = "",
     *, replace_projection: bool = False,
+    transform_projection: Callable[[list[Said]], list[Said]] | None = None,
 ) -> None:
     where = where_it_is_kept(config, route, filed_as)
     where.parent.mkdir(parents=True, exist_ok=True)
@@ -1738,6 +1742,11 @@ def _keep_it(
     with ProjectTransactionLock(config.project_root).held(30.0):
         records = _read_transcript_event_records(event_path) if event_path.exists() else []
         existing = _read_transcript_events(event_path) if records else []
+        if transform_projection is not None:
+            # Recovery can insert authenticated historical rows. Calculate
+            # against the final cross-process-locked projection, so a writer
+            # arriving between an earlier read and this lock is preserved.
+            turns = transform_projection(existing)
         existing_dicts = [one.to_dict() for one in existing]
         requested = [one.to_dict() for one in turns]
         if requested[:len(existing_dicts)] == existing_dicts:
@@ -2271,7 +2280,8 @@ def _ask_and_keep(
         one for one in so_far
         if one.phase not in {
             "agent_reply", "lead_draft", "agent_plan", "lead_plan",
-            "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution",
+            "agent_discussion", "agent_progress", "agent_tool",
+            "agent_plan_review", "lead_execution", "agent_execution",
             "agent_verification", "participant_outcome", "long_horizon_checkpoint",
         }
     ]
@@ -2799,7 +2809,21 @@ def _long_horizon_status_text(goal: dict[str, Any]) -> str:
     if status == "running":
         return f"Durable goal {short_id} is running. Mission control shows its current task and evidence."
     if status == "paused":
-        return f"Durable goal {short_id} is paused. It has not been reported as complete."
+        reason = str(goal.get("note") or "").strip()
+        if not reason:
+            reason = next((str(one.get("last_error") or "").strip()
+                           for one in goal.get("tasks", []) if isinstance(one, dict)
+                           and one.get("state") == "blocked"
+                           and str(one.get("last_error") or "").strip()), "")
+        next_step = goal.get("next_step")
+        next_step = str(next_step).strip() if isinstance(next_step, str) else ""
+        return (
+            f"Durable goal {short_id} is paused. It has not been reported as complete."
+            + (" Reason: " + reason[:4_000] if reason else "")
+            + (" Next step: " + next_step[:2_000] if next_step else
+               " Use Resume team when you are ready to continue." if not reason else
+               " Address this reason, then use Resume team to continue.")
+        )
     if status == "waiting_for_user":
         return f"Durable goal {short_id} is waiting for your input in Mission control."
     if status == "failed":
@@ -2935,9 +2959,11 @@ def keep_long_horizon_status(
                 "Nexus preserved the verified transcript projection."
             )
 
+        status_text = CredentialRedactor(config).text(_long_horizon_status_text(goal))
         same_status = bool(
             latest_status_turn
             and latest_status_turn.correlation.get("goal_status") == status
+            and (status != "paused" or latest_status_turn.text == status_text)
         )
         if same_status and not has_revision:
             return unchanged()
@@ -2958,10 +2984,12 @@ def keep_long_horizon_status(
         }
         if has_revision:
             correlation["goal_revision"] = revision
+        if goal.get("event_seq") is not None:
+            correlation["goal_status_event_cursor"] = int(goal["event_seq"])
         if bound_intent:
             correlation["intent_sha256"] = bound_intent
         turn = Said(
-            "them", _long_horizon_status_text(goal), _now(),
+            "them", status_text, _now(),
             model="nexus/long-horizon-status-v1", speaker_id="nexus",
             speaker_name="Nexus", recipient_name="You",
             phase=(
@@ -3003,6 +3031,7 @@ def keep_long_horizon_events(
     config: LoadedConfig, route: str, goal: dict[str, Any], events: list[dict[str, Any]],
     *, filed_as: str, chat_id: str = "", project_id: str = "", lead_id: str = "",
     truncated_after: int = 0, oldest_available: int = 0,
+    public_dialogue_archived: bool = False,
 ) -> dict[str, Any]:
     """Project real long-horizon agent replies and failures into the origin chat.
 
@@ -3125,8 +3154,13 @@ def keep_long_horizon_events(
                 (
                     f"Nexus could not reconstruct goal events {gap_after + 1}–{gap_floor - 1} "
                     "because the bounded durable goal journal has already retired them. "
-                    "No missing text was invented; Mission Control still shows the current "
-                    "authenticated goal state."
+                    + (
+                        "The team's public messages are recovered separately from the shared "
+                        "conversation archive. Mission Control still shows the current goal state."
+                        if public_dialogue_archived else
+                        "No missing text was invented; Mission Control still shows the current "
+                        "authenticated goal state."
+                    )
                 ),
                 _now(), model="nexus/long-horizon-agent-event-v1",
                 speaker_id="nexus", speaker_name="Nexus", recipient_name="You",
@@ -3145,6 +3179,12 @@ def keep_long_horizon_events(
             "codex_schema_rejection_recovered",
             "goal_steered", "agent_messaged", "interrupt_resolved",
         }
+        if public_dialogue_archived:
+            # Public speech has its own lossless archive. Event payloads are
+            # bounded telemetry and may have retired or summarized that text.
+            visible_types -= {
+                "provider_acknowledged", "goal_steered", "agent_messaged", "interrupt_resolved",
+            }
         for event in accepted:
             kind = str(event.get("type") or "")
             if kind not in visible_types:

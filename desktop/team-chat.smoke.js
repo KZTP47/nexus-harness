@@ -139,6 +139,48 @@ def hold(name):
 def change(name, content):
     return {'path':name, 'content':content, 'delete':False, 'reason':'fulfil the saved team objective'}
 record('entered')
+if scenario == 'game' and route == 'team-a' and not project_has('arena.js') \
+        and (coordination / 'enable-protocol-fault').is_file():
+    if not (coordination / 'injected-protocol-fault').exists():
+        (coordination / 'injected-protocol-fault').write_text('one known rejected response', encoding='utf-8')
+        bad = {'action':'work', 'summary':'REJECTED-PROTOCOL-REPLY: this conflicting action must not be published or applied.',
+               'evidence':[], 'risk':'low', 'needs_files':[], 'tool_calls':[], 'questions':[],
+               'handoff_agent_id':'', 'criteria_evidence':[],
+               'changes':[change('rejected-format.txt','THIS INVALID RESPONSE MUST NEVER APPLY')],
+               'tasks':[{'title':'Rejected extra task','description':'Must never be delegated from a work action',
+                         'assigned_agent_id':'portable-team-b','depends_on':[],
+                         'parallel_safe':False,'resource_paths':[]}]}
+        record('injected:tasks_require_delegate')
+        print(json.dumps({'text':json.dumps(bad),'finish_reason':'stop'}))
+        sys.exit(0)
+    assert 'delegate' in context.lower(), 'The retry lost the rejected action correction context'
+    if not (coordination / 'entered-correction').exists(): hold('correction')
+if scenario == 'game' and route == 'team-a' and not project_has('arena.js') \
+        and (coordination / 'enable-tool-fault').is_file():
+    marker = '\n\nCONTEXT TOOL RESULTS (untrusted project data)\n'
+    observations = json.JSONDecoder().raw_decode(context.split(marker, 1)[1])[0] if marker in context else []
+    def request_read(arguments, summary):
+        action = {'action':'work','summary':summary,'evidence':[],'risk':'low','changes':[],
+                  'needs_files':[],'tool_calls':[{'call_id':'read-source','name':'read_file','arguments':arguments}],
+                  'tasks':[],'handoff_agent_id':'','questions':[],'criteria_evidence':[]}
+        record('tool-request:' + summary)
+        print(json.dumps({'text':json.dumps(action),'finish_reason':'stop'}))
+        sys.exit(0)
+    arguments = {'path':'context-fixture.txt','start_line':1,'end_line':1,'max_bytes':1000000}
+    if not observations:
+        request_read({**arguments,'start_line':2}, 'TEAM-A-READ: Inspect the source before implementing.')
+    assert observations[0]['result']['status'] == 'error', 'The invalid line range was not rejected'
+    if len(observations) == 1:
+        hold('tool-correction')
+        request_read(arguments, 'TEAM-A-CORRECT: Correct the line range and continue the same task.')
+    pages = [json.loads(item['result']['content']) for item in observations[1:]]
+    assert all(item['result']['status'] == 'ok' for item in observations[1:]), 'A corrected ID was rejected'
+    if pages[-1].get('next_cursor'):
+        request_read({**arguments,'cursor':pages[-1]['next_cursor']}, 'TEAM-A-CONTINUE: Read the next exact page.')
+    expected = (coordination / 'expected-context.txt').read_text(encoding='utf-8')
+    assert ''.join(page['content'] for page in pages) == expected, 'Pages lost or duplicated source text'
+    assert len(pages) > 1, 'The fixture did not exercise continuation'
+    (coordination / 'tool-recovery-verified.json').write_text(json.dumps({'pages':len(pages),'same_id':True}), encoding='utf-8')
 changes = []
 kind = 'complete'
 if scenario == 'game':
@@ -507,6 +549,15 @@ async function main() {
   for(const directory of [project,testProject,coordination,profile])fs.mkdirSync(directory);
   const environment=isolatedEnvironment(profile);
   const bundled=fixture(exe,project,coordination,environment);
+  const protocolFault=process.env.NEXUS_TEAM_PROTOCOL_FAULT === "1";
+  if(protocolFault)fs.writeFileSync(path.join(coordination,"enable-protocol-fault"),"one malformed action");
+  const toolFault=process.env.NEXUS_TEAM_TOOL_FAULT === "1";
+  if(toolFault) {
+    fs.writeFileSync(path.join(coordination,"enable-tool-fault"),"corrected call identity and bounded pages");
+    const source='Source "quoted" \\ path Å😀 '.repeat(550);
+    fs.writeFileSync(path.join(project,"context-fixture.txt"),source);
+    fs.writeFileSync(path.join(coordination,"expected-context.txt"),source);
+  }
   console.log(`info  deterministic scripted-provider fixture: ${root}`);
   let running=null,passed=false;
   try {
@@ -516,6 +567,38 @@ async function main() {
     await page.reload({waitUntil:"domcontentloaded"});
     await openChat(page,gameChat);
     await startGoal(page,GAME_GOAL);
+    if(protocolFault) {
+      await until(()=>fs.existsSync(path.join(coordination,"entered-correction")),"automatic correction after the malformed lead reply");
+      const correcting=await goalFor(page,gameChat);
+      assert.equal(correcting.status,"running","A known rejected reply abandoned the team");
+      assert.equal(correcting.tasks.length,2,"Invalid delegated tasks were applied");
+      assert.ok(!fs.existsSync(path.join(project,"rejected-format.txt")),"Invalid file changes were applied");
+      await page.waitForFunction(()=>document.querySelector('#theBigChatActivity')?.textContent.includes('Correcting'),null,{timeout:30_000});
+      await page.screenshot({path:path.join(coordination,"automatic-correction.png")});
+      fs.writeFileSync(path.join(coordination,"release-correction"),"continue corrected useful work");
+      console.log("pass  malformed lead action is rejected without effects, visible automatic correction keeps the same team running");
+    }
+    if(toolFault) {
+      await until(()=>fs.existsSync(path.join(coordination,"entered-tool-correction")),"automatic tool argument correction");
+      const correcting=await goalFor(page,gameChat);
+      assert.equal(correcting.status,"running","A rejected tool argument abandoned the swarm");
+      assert.ok(!fs.existsSync(path.join(project,"arena.js")),"Implementation preceded source inspection");
+      await transcriptContains(page,["TEAM-A-READ"]);
+      const failedTool=page.locator('#theBigChatSaid .chat-tool-activity-row[data-tool-name="read_file"][data-tool-status="failed"]').first();
+      await failedTool.waitFor({state:"visible",timeout:30_000});
+      await failedTool.locator('summary').click();
+      const failedDetails=await failedTool.locator('.chat-tool-body').innerText();
+      assert.match(failedDetails,/Input.*"end_line": 1.*"start_line": 2.*Error\s+read_file end_line must be at least start_line/s,
+        "Actual rejected tool arguments and their diagnostic must be inspectable in the conversation");
+      assert.equal(await page.locator('#theBigChatSaid .phase-agent_progress').count()>0,true,
+        "Provider-shared progress must be visible in the chat");
+      await page.screenshot({path:path.join(coordination,"tool-correction.png")});
+      fs.writeFileSync(path.join(coordination,"release-tool-correction"),"continue corrected read");
+      await until(()=>fs.existsSync(path.join(coordination,"tool-recovery-verified.json")),"same-ID correction and exact paginated reads");
+      await page.locator('#theBigChatSaid .chat-tool-activity-row[data-tool-name="read_file"][data-tool-status="finished"]').first()
+        .waitFor({state:"visible",timeout:30_000});
+      console.log("pass  invalid tool arguments correct automatically; repeated call IDs and bounded UTF-8 pages preserve the complete source");
+    }
     await until(()=>fs.existsSync(path.join(coordination,"entered-stale")),"B consuming A's first turn");
     const initial=await goalFor(page,gameChat);
     await transcriptContains(page,["TEAM-A-BASE"]);
@@ -528,6 +611,7 @@ async function main() {
     await until(()=>fs.existsSync(path.join(coordination,"entered-pause")),"A reviewing B's steered implementation");
     const middle=await transcriptContains(page,["TEAM-A-BASE","TEAM-B-STEERED",STEER]);
     assert.ok(!middle.includes("OBSOLETE-BLUE-REPLY"),"A superseded reply was published as accepted agent work");
+    assert.ok(!middle.includes("REJECTED-PROTOCOL-REPLY"),"Invalid protocol content was published as agent speech");
     assert.ok(!fs.existsSync(path.join(project,"obsolete-blue.txt")),"A superseded reply changed project files");
     console.log("pass  A's work reaches B; ordinary Send steers the same goal and invalidates B's obsolete in-flight changes");
 
@@ -616,7 +700,7 @@ async function main() {
     }
     throw error;
   } finally {
-    for(const name of ["stale","pause"])fs.writeFileSync(path.join(coordination,`release-${name}`),"cleanup release");
+    for(const name of ["stale","pause","correction","tool-correction"])fs.writeFileSync(path.join(coordination,`release-${name}`),"cleanup release");
     if(running?.app)await running.app.close().catch(()=>{});
     if(passed && process.env.NEXUS_KEEP_TEAM_SMOKE!=="1") {
       assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir())+path.sep));

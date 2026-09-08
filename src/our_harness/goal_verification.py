@@ -20,8 +20,19 @@ from .config import LoadedConfig
 from .models import HarnessError
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 SHARED_GOAL_PROFILE = "shared_goal_v1"
+LEGACY_CHECK_POLICY = {
+    "schema_version": 1,
+    "configured_or_discovered_checks": "required",
+    "no_selected_checks": "report_not_configured_require_task_evidence",
+    "existing_artifacts": "require_authenticated_current_snapshot",
+}
+CHECK_POLICY = {
+    **LEGACY_CHECK_POLICY,
+    "schema_version": 2,
+    "request_intent_contract": "polite-and-plural-action-requests/v2",
+}
 
 
 def _root_key(root: Path) -> str:
@@ -53,6 +64,7 @@ def capture_verification_contract(
     contract = {
         "schema_version": SCHEMA_VERSION,
         "verification_profile": SHARED_GOAL_PROFILE,
+        "check_policy": copy.deepcopy(CHECK_POLICY),
         "project_root": _root_key(root),
         "test_commands": _commands(project.get("test_commands", [])),
         "test_evidence_contracts": copy.deepcopy(project.get("test_evidence_contracts", [])),
@@ -76,9 +88,14 @@ def verification_project(config: LoadedConfig, goal: dict[str, Any]) -> dict[str
     if not isinstance(contract, dict):
         raise HarnessError("The saved project verification settings are malformed")
     unsigned = {key: value for key, value in contract.items() if key != "fingerprint_sha256"}
-    if contract.get("schema_version") != SCHEMA_VERSION or contract.get("verification_profile") != SHARED_GOAL_PROFILE or (
+    # Legacy contracts retain their exact saved command authority. Resume
+    # captures the current contract and invalidates context-tool results through the new
+    # contract fingerprint; reading legacy state must not fabricate approval.
+    if contract.get("schema_version") not in {1, 2, SCHEMA_VERSION} or contract.get("verification_profile") != SHARED_GOAL_PROFILE or (
         contract.get("fingerprint_sha256") != _fingerprint(unsigned)
         or contract.get("project_root") != _root_key(Path(project["path"]))
+        or (contract.get("schema_version") == 2 and contract.get("check_policy") != LEGACY_CHECK_POLICY)
+        or (contract.get("schema_version") == SCHEMA_VERSION and contract.get("check_policy") != CHECK_POLICY)
     ):
         raise HarnessError("The saved project verification contract changed; start a new goal")
     same_root = config.project_root.resolve() == Path(project["path"]).resolve()
@@ -116,6 +133,7 @@ def run_configured_goal_verification(
     def outcome(status: str, basis: str, reason: str, **extra):
         return {"status": status, "basis": basis, "reason": reason,
                 "commands": results, "verification_profile": SHARED_GOAL_PROFILE,
+                "check_policy": copy.deepcopy(CHECK_POLICY),
                 "verification_session_id": verification_session_id, **extra}
 
     # Retain explicit read-only and protected-file constraints. They are path
@@ -166,7 +184,21 @@ def run_configured_goal_verification(
         return outcome("failed", "goal_effect", "The requested project work has not produced a recorded file change.")
     commands, source = work._verification_commands(config, root, project)
     if not commands:
-        return outcome("unavailable", source, "No test command is configured or discoverable. Set Project test commands, then resume this goal.")
+        if str(project.get("approved_test_command_digest") or ""):
+            return outcome(
+                "unavailable", "approved_checks_unavailable",
+                "Previously approved project checks are no longer discoverable. "
+                "Restore or explicitly refresh the selected checks before completing this goal.",
+            )
+        merkle, manifest = work._project_tree_merkle(root)
+        return outcome(
+            "not_configured", "no_selected_checks",
+            "No deterministic project checks are configured or discoverable; no tests ran. "
+            "This is not a missing-runner failure. Complete the task only when its actual "
+            "requirements are supported by inspected artifacts and team agreement. "
+            "Any explicitly required testing still needs real execution evidence.",
+            current_tree_merkle=merkle, file_count=len(manifest),
+        )
     if source == "discovered":
         try:
             digest = work._command_approval_digest(root, commands, declared_path=str(project.get("path") or ""))

@@ -348,6 +348,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Installed multi-vendor acceptance failed.' }
             npm run smoke:long-horizon -- "$installed"
             if ($LASTEXITCODE -ne 0) { throw 'Installed long-horizon acceptance failed.' }
+            $env:NEXUS_TEAM_PROTOCOL_FAULT = '1'
+            $env:NEXUS_TEAM_TOOL_FAULT = '1'
             npm run smoke:team-chat -- "$installed"
             if ($LASTEXITCODE -ne 0) { throw 'Installed two-agent chat acceptance failed.' }
           } finally { Pop-Location }

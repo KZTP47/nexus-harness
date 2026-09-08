@@ -147,8 +147,8 @@ contacts one provider or the team:
   then continues sequential discussion rounds in which every later agent sees
   the full real conversation. It ends when every participant marks the goal
   complete, or reports honestly that progress stalled or reached its safety
-  ceiling. New chats default to a finite three-round ceiling; **Unlimited** is
-  an explicit opt-in for a user who intentionally wants an open-ended run.
+  user-set ceiling. New chats continue while progress continues; set a maximum
+  relay round count when you want a finite discussion budget.
 - **Work on project files** is explicit mutation authority. It starts one
   durable long-horizon goal bound to the exact saved-chat participants. In a
   two-agent chat both named agents receive a serialized contribution attempt;

@@ -32,6 +32,7 @@ from . import chat as chat_lab
 from . import cancellation, collaboration_outcomes, swarm_runs, user_questions
 from .changes import FileTransaction, atomic_write, file_sha256, sha256_bytes
 from .agent_tools import AgentToolSession
+from .bounded_file_read import READ_FILE_INPUT_SCHEMA
 from .collaboration_ledger import CollaborationLedger
 from .config import LoadedConfig
 from .detect import combined_commands, detect_project
@@ -441,12 +442,10 @@ WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
                         "max_depth": {"type": "integer", "minimum": 0, "maximum": 8},
                         "max_entries": {"type": "integer", "minimum": 1, "maximum": 500},
                     }, ["path", "max_depth", "max_entries"]),
-                    _context_tool_call_schema("read_file", {
-                        "path": {"type": "string"},
-                        "start_line": {"type": "integer", "minimum": 1},
-                        "end_line": {"type": "integer", "minimum": 1},
-                        "max_bytes": {"type": "integer", "minimum": 1},
-                    }, ["path", "start_line", "end_line", "max_bytes"]),
+                    _context_tool_call_schema(
+                        "read_file", copy.deepcopy(READ_FILE_INPUT_SCHEMA["properties"]),
+                        list(READ_FILE_INPUT_SCHEMA["required"]),
+                    ),
                     _context_tool_call_schema("search_workspace", {
                         "query": {"type": "string"},
                         "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
@@ -6729,15 +6728,21 @@ def _requested_action_goal(goal: str) -> bool:
         r"(?:updated|fixed|repaired|modified|edited|changed|implemented|created|"
         r"added|deleted|renamed|moved|copied|replaced|built|generated|written|refactored)"
     )
+    # Addressing the team does not change an action request into a capability
+    # question. Keep the address attached to second-person requests so that
+    # "can the agents add ..." and "can you explain how to add ..." remain
+    # informational. Do not normalize away negation or intervening verbs.
+    addressee = r"(?:you(?:\s+(?:guys|folks|all|both|two|agents|team))?|we)"
     return bool(
         re.match(
-            rf"^(?:can|could|would|will)\s+(?:you|we)\s+(?:(?:please|kindly)\s+)?"
-            rf"(?:(?:be\s+able\s+to|help\s+(?:me|us)\s+to?)\s+)?{base}\b",
+            rf"^(?:(?:please|kindly)\s+)?(?:can|could|would|will)\s+{addressee}\s+"
+            rf"(?:(?:please|kindly)\s+)?"
+            rf"(?:(?:be\s+able\s+to|help(?:\s+(?:me|us))?(?:\s+to)?)\s+)?{base}\b",
             text, re.I,
         )
-        or re.match(rf"^would\s+you\s+mind\s+{gerund}\b", text, re.I)
+        or re.match(rf"^would\s+{addressee}\s+mind\s+{gerund}\b", text, re.I)
         or re.match(rf"^(?:can|could|would)\s+PROJECT_FILE\s+be\s+{participle}\b", _mask_goal_files(text), re.I)
-        or re.match(rf"^would\s+it\s+be\s+possible\s+for\s+you\s+to\s+{base}\b", text, re.I)
+        or re.match(rf"^would\s+it\s+be\s+possible\s+for\s+{addressee}\s+to\s+{base}\b", text, re.I)
         or re.match(rf"^could\s+i\s+get\s+PROJECT_FILE\s+{participle}\b", _mask_goal_files(text), re.I)
         or re.match(rf"^i\s+was\s+hoping\s+PROJECT_FILE\s+could\s+be\s+{participle}\b", _mask_goal_files(text), re.I)
         or re.search(rf"\b(?:i\s+(?:need|want|would\s+like)|please\s+have)\b[^;!?]*\b{participle}\b", text, re.I)
@@ -9597,15 +9602,12 @@ class _ProjectContextTools:
             # into authority to execute them against a different project.
             data.setdefault("project", {})["test_commands"] = []
             data["project"]["test_evidence_contracts"] = []
-        # Long-horizon exploration gets a useful epoch rather than the generic
-        # twelve-call conversational default.  Epochs remain bounded and are
-        # renewable only by an engine-owned durable project-state transition.
+        # Defaults live in config.py. Preserve explicit values even when they
+        # happen to equal an older release's default.
         configured_calls = int(data.setdefault("workflow", {}).get("max_tool_calls", 48))
         configured_bytes = int(data["workflow"].get("max_tool_total_bytes", 512_000))
-        data["workflow"]["max_tool_calls"] = 48 if configured_calls == 12 else configured_calls
-        data["workflow"]["max_tool_total_bytes"] = (
-            512_000 if configured_bytes == 128_000 else configured_bytes
-        )
+        data["workflow"]["max_tool_calls"] = configured_calls
+        data["workflow"]["max_tool_total_bytes"] = configured_bytes
         data.setdefault("memory", {})["enabled"] = True
         data["memory"]["embedding_provider"] = ""
         data["memory"]["embedding_model"] = ""
@@ -9657,7 +9659,16 @@ class _ProjectContextTools:
             },
             prepare_tool=self._prepare_tool,
         )
+        # Long-horizon prompt projections retain 12,000 characters per string.
+        # Size each file page before serializing so that projection cannot cut
+        # off source text or its continuation cursor.
+        self.session.read_file_output_bytes = min(self.session.per_call_bytes, 12_000)
         self.epoch_byte_limit = self.session.total_bytes_limit
+        # Shared goal tools are paged across durable provider responses. A
+        # read-only investigation must not need a file edit to keep reading.
+        # Scope is supplied by the engine, never from tool arguments.
+        self.response_scope = ""
+        self.response_scopes: dict[str, dict[str, int]] = {}
         prior_state = next((
             event.get("state", {})
             for event in reversed(ledger._read())
@@ -9665,7 +9676,20 @@ class _ProjectContextTools:
             and event.get("phase") == "context_tool_budget"
         ), None)
         if isinstance(prior_state, dict) and isinstance(prior_state.get("budget"), dict):
-            self.session.restore_budget_state(prior_state["budget"])
+            saved_budget = prior_state["budget"]
+            if verification_profile == "shared_goal_v1":
+                # Lowered configuration limits never erase consumed usage.
+                # Restore valid counters first, then enforce today's limits
+                # before the next call in that response.
+                saved_calls, saved_bytes = saved_budget.get("calls"), saved_budget.get("total_bytes")
+                if type(saved_calls) is int and saved_calls >= 0 and type(saved_bytes) is int and saved_bytes >= 0:
+                    self.session.max_calls = max(self.session.max_calls, saved_calls)
+                    self.session.total_bytes_limit = max(self.session.total_bytes_limit, saved_bytes)
+            try:
+                self.session.restore_budget_state(saved_budget)
+            finally:
+                self.session.max_calls = int(data["workflow"]["max_tool_calls"])
+                self.session.total_bytes_limit = self.epoch_byte_limit
             execution_budget = prior_state.get("tool_execution_budget")
             if isinstance(execution_budget, dict):
                 self.execution_budget.restore_budget_state(execution_budget)
@@ -9700,6 +9724,28 @@ class _ProjectContextTools:
                         str(one) for one in state_history
                         if re.fullmatch(r"[0-9a-f]{64}", str(one))
                     ]
+            response_budget = prior_state.get("response_budget")
+            if response_budget is not None:
+                if not isinstance(response_budget, dict) or response_budget.get("schema_version") != 1 \
+                        or response_budget.get("contract") != "shared-goal-context-response:v1":
+                    raise HarnessError("Saved context response budget has an unsupported contract")
+                unsigned = {key: value for key, value in response_budget.items() if key != "fingerprint_sha256"}
+                if response_budget.get("fingerprint_sha256") != hashlib.sha256(
+                    json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest():
+                    raise HarnessError("Saved context response budget fingerprint is invalid")
+                if response_budget.get("project_root") != os.path.normcase(str(self.config.project_root.resolve())):
+                    raise HarnessError("Saved context response budget belongs to another project")
+                scopes = response_budget.get("scopes")
+                active = response_budget.get("active_scope")
+                if not isinstance(scopes, dict) or not isinstance(active, str) or (active and active not in scopes) \
+                        or any(not re.fullmatch(r"[0-9a-f]{64}", key) or not isinstance(value, dict)
+                               or set(value) != {"calls", "bytes"}
+                               or any(type(count) is not int or count < 0 for count in value.values())
+                               for key, value in scopes.items()):
+                    raise HarnessError("Saved context response budgets are invalid")
+                self.response_scope = active
+                self.response_scopes = copy.deepcopy(scopes)
         if reset_execution_budget:
             self.execution_budget.reset_by_user()
             self.ledger.record_state("context_tool_budget_reset", {
@@ -9738,10 +9784,13 @@ class _ProjectContextTools:
             WorkspaceIndexer(self.config, self.memory).scan(deadline)
             self.indexed = True
 
-    def execute(self, node: str, call: dict[str, Any]) -> dict[str, Any]:
+    def execute(
+        self, node: str, call: dict[str, Any], *, execution_scope: str = "",
+    ) -> dict[str, Any]:
         call_id = str(call.get("call_id") or "")
         name = str(call.get("name") or "")
         arguments = call.get("arguments", {})
+        self._select_response_scope(node, execution_scope)
         if (
             self.absolute_call_limit > 0
             and self.lifetime_calls_before_epoch + self.session.calls >= self.absolute_call_limit
@@ -9764,16 +9813,28 @@ class _ProjectContextTools:
             self.session.total_bytes_limit = min(
                 self.epoch_byte_limit, absolute_epoch_cap
             )
+            effective_call_limit = self.session.per_call_bytes
+            if name == "read_file":
+                effective_call_limit = min(effective_call_limit, self.session.read_file_output_bytes)
             lifetime_limited_this_result = (
-                absolute_remaining_before <= self.session.per_call_bytes
+                absolute_remaining_before <= effective_call_limit
             )
         else:
             self.session.total_bytes_limit = self.epoch_byte_limit
             lifetime_limited_this_result = False
         self.execution_budget.begin_tool_execution()
         try:
-            result = self.session.execute(node, call_id, name, arguments)
-            if lifetime_limited_this_result and result.get("truncated"):
+            result = self.session.execute(
+                node, call_id, name, arguments, execution_scope=execution_scope,
+            )
+            page_incomplete = False
+            if lifetime_limited_this_result and name == "read_file" and not result.get("truncated"):
+                page = json.loads(result["content"])
+                # A page may be intentionally short because of max_bytes or
+                # the prompt transport. Consume useful pages until the actual
+                # lifetime allowance cannot carry a complete result.
+                page_incomplete = page.get("code") == "output_budget_exhausted"
+            if lifetime_limited_this_result and (result.get("truncated") or page_incomplete):
                 self.ledger.record_state("context_tool_absolute_limit_rejected", {
                     "call_id": call_id,
                     "name": name,
@@ -9807,9 +9868,23 @@ class _ProjectContextTools:
         return result
 
     def _record_budget(self) -> None:
+        if self.response_scope:
+            self.response_scopes[self.response_scope] = {
+                "calls": self.session.calls, "bytes": self.session.total_bytes,
+            }
+        response_budget = {
+            "schema_version": 1, "contract": "shared-goal-context-response:v1",
+            "project_root": os.path.normcase(str(self.config.project_root.resolve())),
+            "call_limit": self.session.max_calls, "byte_limit": self.epoch_byte_limit,
+            "active_scope": self.response_scope, "scopes": self.response_scopes,
+        }
+        response_budget["fingerprint_sha256"] = hashlib.sha256(
+            json.dumps(response_budget, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         self.ledger.record_state("context_tool_budget", {
             "budget": self.session.budget_state(),
             "tool_execution_budget": self.execution_budget.budget_state(),
+            "response_budget": response_budget,
             "epoch": {
                 "number": self.epoch,
                 "prior_calls": self.lifetime_calls_before_epoch,
@@ -9822,6 +9897,35 @@ class _ProjectContextTools:
                 "absolute_byte_limit": self.absolute_byte_limit,
             },
         })
+
+    def _select_response_scope(self, node: str, execution_scope: str) -> None:
+        if self.verification_profile != "shared_goal_v1" or not execution_scope:
+            return
+        if not isinstance(execution_scope, str) or len(execution_scope) > 512:
+            raise HarnessError("Agent tool execution scope must be a bounded engine-owned string")
+        scope = hashlib.sha256(json.dumps(
+            [node, execution_scope], separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if scope == self.response_scope:
+            return
+        if not self.response_scope:
+            # An upgrade's first scoped response inherits its consumed legacy
+            # allowance; merely reopening the app cannot renew that response.
+            self.response_scope = scope
+        else:
+            self.response_scopes[self.response_scope] = {
+                "calls": self.session.calls, "bytes": self.session.total_bytes,
+            }
+            target = self.response_scopes.get(scope, {"calls": 0, "bytes": 0})
+            self.lifetime_calls_before_epoch += self.session.calls - target["calls"]
+            self.lifetime_bytes_before_epoch += self.session.total_bytes - target["bytes"]
+            self.session.calls = target["calls"]
+            self.session.total_bytes = target["bytes"]
+            self.response_scope = scope
+            self.epoch += 1
+        # Persist the transition before a tool effect. Old scope receipts and
+        # counters remain intact if a later process resumes that exact scope.
+        self._record_budget()
 
     @staticmethod
     def _semantic_state_digest(state: dict[str, str | None]) -> str:
@@ -9962,6 +10066,12 @@ class _ProjectContextTools:
             if self.absolute_call_limit == 0 else
             f"{lifetime} of {self.absolute_call_limit} absolute calls used"
         )
+        renewal = (
+            "Each durable agent response has its own call/output allowance; returning to a saved response "
+            "retains its usage. Restart/resume alone never renews it."
+            if self.verification_profile == "shared_goal_v1" else
+            "Renews only after Nexus records durable semantic project progress; restart/resume alone never renews it."
+        )
         return {
             "epoch": self.epoch,
             "epoch_call_limit": self.session.max_calls,
@@ -9984,11 +10094,10 @@ class _ProjectContextTools:
                 "Use the saved run's Reset tool time and resume action, or change Context "
                 "tool execution seconds in Settings; zero means unlimited."
             ),
-            "renewal_policy": "Renews only after Nexus records durable semantic project progress; restart/resume alone never renews it.",
+            "renewal_policy": renewal,
             "summary": (
                 f"Exploration epoch {self.epoch}: {remaining} of {self.session.max_calls} calls remain; "
-                f"{lifetime_words}. {time_words}. The call/output epoch renews only after durable semantic "
-                "project progress, never merely on restart or resume."
+                f"{lifetime_words}. {time_words}. {renewal}"
             ),
         }
 
@@ -10822,10 +10931,23 @@ def work_together(
                             requirement_contract,
                             reset_execution_budget=reset_context_tool_execution_budget,
                         )
+                    # Scope provider-local IDs to this accepted response. The
+                    # durable event identity is created once before any tool;
+                    # repeating an ID in a later response is fresh work.
+                    tool_step = ledger.record_state("context_tool_step", {
+                        "schema_version": 1,
+                        "identity_contract": "swarm-response-tool-scope-v1",
+                        "agent_id": str(executor.get("id") or "agent"),
+                        "pass": pass_number, "calls": calls,
+                    })
+                    tool_scope = "swarm-context-v1:" + str(tool_step["hash"])
                     for call in calls:
                         if not isinstance(call, dict):
                             raise HarnessError("A context tool call is malformed")
-                        result = context_tools.execute(str(executor.get("id") or "agent"), call)
+                        result = context_tools.execute(
+                            str(executor.get("id") or "agent"), call,
+                            execution_scope=tool_scope,
+                        )
                         executor_tool_results.append({
                             "call_id": call.get("call_id"), "name": call.get("name"),
                             "result": result,

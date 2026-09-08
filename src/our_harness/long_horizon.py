@@ -40,9 +40,13 @@ from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_auth
 from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
 from .redaction import CredentialRedactor
 from .runtime_integrity import mac, quarantine_marker
-from .goal_verification import capture_verification_contract, verification_project
+from .goal_verification import CHECK_POLICY, SHARED_GOAL_PROFILE, capture_verification_contract, verification_project
 from .swarm_runs import _base
 from . import swarm_work
+from . import goal_dialogue
+from . import goal_context_progress
+from . import action_protocol
+from . import goal_budget_policy
 
 
 SCHEMA_VERSION = 2
@@ -60,6 +64,11 @@ MAX_DIALOGUE_CHARACTERS = 96_000
 DIALOGUE_SCHEMA_VERSION = 1
 MAX_NO_PROGRESS = 4
 MAX_CRITERIA = 32
+BASELINE_CRITERIA = [
+    "Original objective is satisfied",
+    "Every required task is complete",
+    "Configured deterministic verification passes",
+]
 MAX_OBJECTIVE_CHARACTERS = 240_000
 MAX_PENDING_ACTION_BYTES = 8_000_000
 MAX_REQUEST_ID_CHARACTERS = 160
@@ -107,6 +116,10 @@ INTERRUPT_REASONS = {
 
 class RequiredParticipantCallReserved(HarnessError):
     """A continuation tried to consume a call promised to an untouched teammate."""
+
+
+class ReviewContextRequestError(HarnessError):
+    """A correctable proposed-content read with no executed side effect."""
 
 
 AGENT_ACTION_FORMAT = ResponseFormat("nexus_long_horizon_action_v1", {
@@ -180,6 +193,40 @@ AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
         "limit": {"type": "integer", "minimum": 1, "maximum": 20_000},
     }, ["path"])
 )
+
+for _field, _description in {
+    "tasks": "Executable new delegations, populated only when action=delegate; otherwise return []. Do not put plans or existing teammates here.",
+    "questions": "Questions for the user, populated only when action=ask_user; otherwise return [].",
+    "handoff_agent_id": "Populated only when action=handoff; otherwise return an empty string.",
+    "changes": "File proposals allowed only with work, complete, or request_review; never combine with tool_calls.",
+}.items():
+    AGENT_ACTION_FORMAT.schema["properties"][_field]["description"] = _description
+
+AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
+    swarm_work._context_tool_call_schema("read_shared_conversation", {
+        "after": {"type": "integer", "minimum": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        "message_id": {"type": "string", "maxLength": 160},
+        "offset": {"type": "integer", "minimum": 0},
+        "character_limit": {"type": "integer", "minimum": 1, "maximum": 12_000},
+    }, ["after", "limit", "message_id", "offset", "character_limit"])
+)
+
+
+def _agent_action_format(task: dict[str, Any]) -> ResponseFormat:
+    """Advertise only tools available to this task's actual review authority.
+
+    Keep the durable superset decoder for older conversations: an unavailable
+    review read is a correctable observation, not a failed collaboration task.
+    Runtime checks below remain the authority for every proposed-content read.
+    """
+    if task.get("kind") == "review" and task.get("review_of"):
+        return AGENT_ACTION_FORMAT
+    schema = copy.deepcopy(AGENT_ACTION_FORMAT.schema)
+    variants = schema["properties"]["tool_calls"]["items"]["anyOf"]
+    variants[:] = [one for one in variants if
+                   one["properties"]["name"]["enum"] != ["read_proposed_change"]]
+    return ResponseFormat(AGENT_ACTION_FORMAT.name, schema, strict=AGENT_ACTION_FORMAT.strict)
 
 
 class GoalGraphState(TypedDict, total=False):
@@ -524,6 +571,70 @@ def _goal_admission_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _success_criteria_contract(
+    explicit: list[str], criteria: list[str], *, provenance: str = "user_request",
+    admission_digest: str = "",
+) -> dict[str, Any]:
+    basis = {
+        "schema_version": 1, "profile": "task_evidence_and_selected_checks_v1",
+        "explicit_criteria": list(explicit), "generated_criteria": list(BASELINE_CRITERIA),
+        "criteria_sha256": hashlib.sha256(_canonical(criteria).encode("utf-8")).hexdigest(),
+        "provenance": provenance, "admission_digest": admission_digest,
+    }
+    return {**basis, "fingerprint_sha256": hashlib.sha256(_canonical(basis).encode("utf-8")).hexdigest()}
+
+
+def _allows_unconfigured_checks(document: dict[str, Any]) -> bool:
+    held = document.get("success_criteria_contract")
+    if not document.get("require_all_participants") or not isinstance(held, dict):
+        return False
+    explicit = held.get("explicit_criteria")
+    if not isinstance(explicit, list) or any(not isinstance(one, str) for one in explicit):
+        return False
+    expected = _success_criteria_contract(
+        explicit, document["success_criteria"],
+        provenance=str(held.get("provenance") or ""),
+        admission_digest=str(held.get("admission_digest") or ""),
+    )
+    return held == expected and held["provenance"] in {
+        "user_request", "legacy_admission_digest_no_custom_criteria",
+    } and BASELINE_CRITERIA[2] not in explicit
+
+
+def _legacy_default_criteria_proven(document: dict[str, Any]) -> bool:
+    """Prove an attachment-free default request from its admitted SHA preimage.
+
+    Legacy rows lost duplicate criterion origins when adding the three engine
+    defaults. Equality with this exact candidate proves the user supplied no
+    custom criteria; wording and provider summaries are never migration proof.
+    Unknown input shapes retain the old required-verification semantics.
+    """
+    if not document.get("require_all_participants") or document.get("success_criteria") != BASELINE_CRITERIA \
+            or int(document.get("objective_epoch") or 1) != 1 \
+            or document.get("input_attachments") or document.get("input_provider_attachments") \
+            or document.get("objective") != document.get("original_objective") \
+            or any(one.get("reason") != "original" for one in document.get("objective_revisions", [])):
+        return False
+    contract = document.get("verification_contract") or {}
+    if contract.get("test_commands") or contract.get("approved_test_command_digest"):
+        return False
+    payload = {
+        "project_id": str(document["project"]["id"]),
+        "project_path": str(Path(document["project"]["path"]).resolve()),
+        "project_authority_id": str(document.get("project_authority_id") or ""),
+        "conversation_id": str(document.get("conversation_id") or ""),
+        "participant_ids": list(document.get("requested_agent_ids") or []),
+        "lead_id": str(document.get("lead_agent_id") or ""),
+        "agent_bindings": [copy.deepcopy(one.get("route_binding")) for one in document["agents"]],
+        "collaboration_contract": copy.deepcopy(document.get("collaboration_contract")),
+        "execution_contract": copy.deepcopy(document.get("execution_contract")),
+        "objectives": [str(document.get("original_objective") or "")],
+        "success_criteria": [], "policy": {}, "attachments": [],
+    }
+    candidate = hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
+    return hmac.compare_digest(candidate, str(document.get("admission_digest") or ""))
+
+
 def _binding_sha256(binding: object) -> str:
     """Return the stable, non-secret identity of one persisted route binding."""
 
@@ -606,7 +717,33 @@ def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None =
         "artifact_generation": int((document.get("dialogue") or {}).get("artifact_generation") or 0),
         "source_sha256": hashlib.sha256(_canonical(manifest).encode("utf-8")).hexdigest(),
         "verification_contract_sha256": str((document.get("verification_contract") or {}).get("fingerprint_sha256") or ""),
+        "success_criteria_contract_sha256": str((document.get("success_criteria_contract") or {}).get("fingerprint_sha256") or ""),
     }
+
+
+def _context_tool_execution_contract() -> str:
+    return hashlib.sha256(_canonical({
+        "schema_version": 1, "scope": "persisted-context-step-id",
+        "session": "preserve-original-context-continuation-session",
+        "ledger": "derive-from-persisted-tool-session-id",
+        "binding": "authenticated-context-binding",
+    }).encode("utf-8")).hexdigest()
+
+
+def _context_tool_execution(step: dict[str, Any]) -> dict[str, Any]:
+    """Read scoped execution identity without changing legacy in-flight calls."""
+    execution = step.get("tool_execution")
+    if execution is None:
+        return {}
+    if not isinstance(execution, dict) or execution.get("schema_version") != 1 \
+            or execution.get("contract_fingerprint_sha256") != _context_tool_execution_contract() \
+            or execution.get("scope") != step.get("step_id") \
+            or execution.get("context_binding_sha256") != hashlib.sha256(
+                _canonical(step.get("context_binding") or {}).encode("utf-8")
+            ).hexdigest() \
+            or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", str(execution.get("session_id") or "")):
+        raise HarnessError("The saved context-tool execution contract changed; it cannot be replayed")
+    return execution
 
 
 def _bounded_json(value: object, limit: int = 32_000) -> object:
@@ -815,13 +952,42 @@ def _schema_recovery_artifacts_are_published(document: dict[str, Any]) -> bool:
     return True
 
 
+def _applied_action_receipt(
+    task: dict[str, Any], action_kind: str, evidence_sha256: str, *,
+    provenance: str = "atomic_apply", event_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    basis = {
+        "schema_version": 1, "contract": "atomic_action_application_and_publication_v1",
+        "task_id": str(task["id"]), "provider_effect_id": str(task.get("provider_effect_id") or ""),
+        "action": action_kind, "evidence_sha256": evidence_sha256,
+        "artifacts_sha256": hashlib.sha256(_canonical(task.get("artifacts") or []).encode("utf-8")).hexdigest(),
+        "provenance": provenance, "event_ids": list(event_ids or []),
+    }
+    return {**basis, "fingerprint_sha256": hashlib.sha256(_canonical(basis).encode("utf-8")).hexdigest()}
+
+
+def _has_applied_action_receipt(task: dict[str, Any]) -> bool:
+    held = task.get("applied_action_receipt")
+    if not isinstance(held, dict) or not task.get("provider_effect_id") \
+            or held.get("provenance") not in {"atomic_apply", "authenticated_legacy_terminal_events"} \
+            or not re.fullmatch(r"[0-9a-f]{64}", str(held.get("evidence_sha256") or "")):
+        return False
+    return held == _applied_action_receipt(
+        task, str(held.get("action") or ""), str(held["evidence_sha256"]),
+        provenance=str(held["provenance"]), event_ids=held.get("event_ids"),
+    )
+
+
 def _task_has_unsettled_effect(task: dict[str, Any]) -> bool:
-    return bool(
+    if bool(
         task.get("pending_action") or task.get("pending_transaction")
-        or task.get("reconciliation_required")
-    ) or str(
-        task.get("provider_effect_state") or ""
-    ) in {
+        or task.get("reconciliation_required") or task.get("outcome_unknown")
+    ):
+        return True
+    state = str(task.get("provider_effect_state") or "")
+    if state == "acknowledged" and _has_applied_action_receipt(task):
+        return False
+    return state in {
         "dispatched", "acknowledged", "outcome_unknown", "context_step_acknowledged",
         "reply_received", "reply_received_reconciliation_required",
     }
@@ -923,23 +1089,27 @@ def _validate_action_semantics(action: dict[str, Any], task: dict[str, Any]) -> 
     questions = action.get("questions") or []
     delegated = action.get("tasks") or []
     handoff = str(action.get("handoff_agent_id") or "")
-    if changes and kind not in {"work", "complete", "request_review"}:
-        raise HarnessError(f"The {kind or 'unknown'} action cannot also change project files")
-    if questions and kind != "ask_user":
-        raise HarnessError("Structured questions are allowed only in an ask_user action")
-    if delegated and kind != "delegate":
-        raise HarnessError("Delegated tasks are allowed only in a delegate action")
-    if handoff and kind != "handoff":
-        raise HarnessError("A handoff target is allowed only in a handoff action")
+    if task.get("kind") == "review" and changes:
+        raise HarnessError("Independent review is read-only and cannot change project files")
     if kind == "handoff" and task.get("required_contributor_id"):
-        raise HarnessError(
-            "A named Work Together contribution cannot be handed off to another agent"
-        )
+        raise HarnessError("A named Work Together contribution cannot be handed off to another agent")
+    if changes and kind not in {"work", "complete", "request_review"}:
+        raise action_protocol.ActionProtocolError("changes_require_work", f"The {kind or 'unknown'} action cannot also change project files")
+    if questions and kind != "ask_user":
+        raise action_protocol.ActionProtocolError("questions_require_ask_user")
+    if delegated and kind != "delegate":
+        raise action_protocol.ActionProtocolError("tasks_require_delegate")
+    if handoff and kind != "handoff":
+        raise action_protocol.ActionProtocolError("target_requires_handoff")
     if task.get("kind") == "review":
-        if changes:
-            raise HarnessError("Independent review is read-only and cannot change project files")
-        if kind not in {"complete", "blocked"}:
+        reading = kind == "work" and not changes and bool(action.get("tool_calls") or action.get("needs_files"))
+        if kind not in {"complete", "blocked"} and not reading:
             raise HarnessError("A review task must return a read-only approve or reject verdict")
+    if action.get("tool_calls") and changes:
+        raise action_protocol.ActionProtocolError("tools_and_changes_conflict")
+    call_ids = [str(one.get("call_id") or "") for one in action.get("tool_calls") or [] if isinstance(one, dict)]
+    if any(not one.strip() for one in call_ids) or len(set(call_ids)) != len(call_ids):
+        raise action_protocol.ActionProtocolError("duplicate_tool_call_ids")
 
 
 class GoalStore:
@@ -997,6 +1167,7 @@ class GoalStore:
                 CREATE INDEX IF NOT EXISTS long_goals_status_created
                   ON long_goals(status,created_ms,goal_id);
             """)
+            goal_dialogue.ensure_schema(db)
         if migrate_execution_metadata:
             self._migrate_execution_metadata()
 
@@ -1354,8 +1525,7 @@ class GoalStore:
         budget = document.get("budget") or {}
         return bool(
             recovered_ready
-            and int(budget.get("provider_calls") or 0)
-            < int(budget.get("max_provider_calls") or 0)
+            and not goal_budget_policy.exhausted(budget, "provider_calls")
         )
 
     @classmethod
@@ -1567,9 +1737,7 @@ class GoalStore:
         ):
             return False
         budget = document.get("budget") or {}
-        if int(budget.get("provider_calls") or 0) >= int(
-            budget.get("max_provider_calls") or 0
-        ):
+        if goal_budget_policy.exhausted(budget, "provider_calls"):
             return False
 
         # The strict-schema serializer is itself versioned dispatch semantics.
@@ -1753,9 +1921,7 @@ class GoalStore:
         ):
             return False
         budget = document.get("budget") or {}
-        if int(budget.get("provider_calls") or 0) >= int(
-            budget.get("max_provider_calls") or 0
-        ):
+        if goal_budget_policy.exhausted(budget, "provider_calls"):
             return False
 
         for task in interrupted:
@@ -2166,6 +2332,8 @@ class GoalStore:
             )
             document["event_floor_seq"] = cutoff + 1
             document["event_floor_previous_sha256"] = str(deleted["event_sha256"] if deleted else "")
+        if kind in {"agent_messaged", "interrupt_resolved"}:
+            goal_dialogue.record_user_event(db, document, event, self.redactor.value(payload or {}))
         return event
 
     def _mutate(
@@ -2178,6 +2346,7 @@ class GoalStore:
                 document = self._decode(row)
                 if document is None:
                     raise HarnessError("That long-horizon goal does not exist")
+                goal_dialogue.migrate(db, document)
                 was_owner = self._is_project_owner(document)
                 result = change(document, db)
                 if result is _NO_MUTATION:
@@ -2678,24 +2847,14 @@ class GoalStore:
         required_initial_tasks = max(
             len(clean_objectives), len(admitted_agents) if require_all else 0,
         )
-        raw_provider_budget = (policy or {}).get("max_provider_calls")
-        requested_max_provider_calls = min(
-            MAX_PROVIDER_CALLS,
-            max(1, int(raw_provider_budget if raw_provider_budget is not None
-                       else MAX_PROVIDER_CALLS)),
-        )
-        if require_all and raw_provider_budget is not None \
-                and int(raw_provider_budget) < required_initial_tasks:
+        call_budget = goal_budget_policy.create_budget(policy, shared=require_all)
+        available_calls = goal_budget_policy.remaining(call_budget, "provider_calls")
+        if require_all and available_calls is not None and available_calls < required_initial_tasks:
             raise HarnessError(
                 "The explicit provider-call budget is smaller than the required "
                 "chat-participant contribution count. Increase max_provider_calls, "
                 "reduce the initial objectives, or choose adaptive collaboration; "
                 "Nexus did not silently reduce the named team."
-            )
-        if require_all and requested_max_provider_calls < required_initial_tasks:
-            raise HarnessError(
-                "The provider-call budget cannot give every required chat participant "
-                "one terminal contribution attempt."
             )
         if required_initial_tasks > requested_max_tasks:
             raise HarnessError(
@@ -3062,22 +3221,17 @@ class GoalStore:
         criteria = list(dict.fromkeys(
             _short(self.redactor.text(one), 1_000) for one in raw_criteria if _short(one, 1_000)
         ))
-        baseline_criteria = [
-            "Original objective is satisfied",
-            "Every required task is complete",
-            "Configured deterministic verification passes",
-        ]
+        explicit_criteria = list(criteria)
+        baseline_criteria = list(BASELINE_CRITERIA)
         criteria = list(dict.fromkeys([*baseline_criteria, *criteria]))
         if len(criteria) > MAX_CRITERIA:
             raise HarnessError(f"Use at most {MAX_CRITERIA - len(baseline_criteria)} custom success criteria")
+        call_budget = goal_budget_policy.create_budget(policy, shared=require_all)
         runtime_policy = {
             "max_tasks": requested_max_tasks,
-            "max_provider_calls": min(MAX_PROVIDER_CALLS, max(1, int((policy or {}).get("max_provider_calls") or MAX_PROVIDER_CALLS))),
+            "max_provider_calls": call_budget["max_provider_calls"],
             "max_parallel": min(MAX_PARALLEL, max(1, int((policy or {}).get("max_parallel") or MAX_PARALLEL))),
-            "max_context_tool_calls": min(
-                MAX_CONTEXT_TOOL_CALLS,
-                max(1, int((policy or {}).get("max_context_tool_calls") or MAX_CONTEXT_TOOL_CALLS)),
-            ),
+            "max_context_tool_calls": call_budget["max_context_tool_calls"],
             "review_risk": _short((policy or {}).get("review_risk") or "high", 20),
             "legacy_available": True,
         }
@@ -3139,6 +3293,7 @@ class GoalStore:
             "objective_epoch": 1,
             "objective_revisions": [{"revision": 1, "at_ms": now, "text": objective, "reason": "original"}],
             "success_criteria": criteria,
+            "success_criteria_contract": _success_criteria_contract(explicit_criteria, criteria),
             "agents": agents,
             "lead_agent_id": lead["id"],
             "tasks": tasks,
@@ -3147,9 +3302,7 @@ class GoalStore:
             "input_attachments": public_inputs,
             "input_provider_attachments": provider_inputs,
             "verification": {"status": "not_run", "reason": "Work has not finished yet", "commands": []},
-            "budget": {"provider_calls": 0, "max_provider_calls": runtime_policy["max_provider_calls"],
-                       "context_tool_calls": 0,
-                       "max_context_tool_calls": runtime_policy["max_context_tool_calls"],
+            "budget": {**call_budget,
                        "tasks_created": len(tasks), "max_tasks": runtime_policy["max_tasks"]},
             "policy": runtime_policy,
             "worker": {
@@ -3220,6 +3373,7 @@ class GoalStore:
                         "Waiting for long-horizon goal " + blocker_id[:8]
                         + " to release this project."
                     )
+                document["dialogue_archive"] = goal_dialogue.empty(document)
                 raw = _canonical(document)
                 digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
                 material = [
@@ -3262,9 +3416,44 @@ class GoalStore:
     def get(self, goal_id: str) -> dict[str, Any]:
         with self.lock, self._connect() as db:
             document = self._decode(db.execute("SELECT * FROM long_goals WHERE goal_id=?", (goal_id,)).fetchone())
+            if document is not None and "dialogue_archive" not in document:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    document = self._decode(db.execute("SELECT * FROM long_goals WHERE goal_id=?", (goal_id,)).fetchone())
+                    if document is not None and goal_dialogue.migrate(db, document):
+                        self._write(db, document)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
         if document is None:
             raise HarnessError("That long-horizon goal does not exist")
         return document
+
+    def dialogue_history(
+        self, goal_id: str, after: int = 0, limit: int = 100, *,
+        message_id: str = "", offset: int = 0, character_limit: int = 96_000,
+        viewer_agent_id: str = "",
+    ) -> dict[str, Any]:
+        self.get(goal_id)  # validate authority and migrate surviving legacy speech
+        with self.lock, self._connect() as db:
+            db.execute("BEGIN")
+            try:
+                document = self._decode(db.execute(
+                    "SELECT * FROM long_goals WHERE goal_id=?", (goal_id,),
+                ).fetchone())
+                if document is None:
+                    raise HarnessError("That long-horizon goal does not exist")
+                if viewer_agent_id and viewer_agent_id not in {one["id"] for one in document["agents"]}:
+                    raise HarnessError("That participant is not authorized for this goal's conversation")
+                result = goal_dialogue.page(db, document, after, limit, message_id=message_id,
+                                           offset=offset, character_limit=character_limit,
+                                           viewer_agent_id=viewer_agent_id)
+                db.commit()
+                return result
+            except Exception:
+                db.rollback()
+                raise
 
     def get_by_request(self, request_id: str) -> dict[str, Any] | None:
         stored = f"{self.authority_key}:{_exact_request_id(request_id)}"
@@ -3644,6 +3833,8 @@ class GoalStore:
     ) -> dict[str, Any]:
         if str(source.get("authority_key") or "") != self.authority_key:
             raise HarnessError("That long-horizon goal belongs to a different Nexus project authority")
+        if "dialogue_archive" not in source:
+            source = self.get(str(source["goal_id"]))
         if any(one.get("state") == "pending" for one in source.get("interrupts", [])):
             raise HarnessError("Answer or cancel the pending decision before forking this goal")
         client_request_id = _exact_request_id(request_id, what="fork request")
@@ -3679,6 +3870,7 @@ class GoalStore:
             "fork_checkpoint": int(source.get("event_seq") or 0),
             "note": "Forked from the saved task/evidence checkpoint into an isolated Git worktree. Resume when ready.",
         })
+        document["dialogue_archive"] = goal_dialogue.empty(document)
         if source.get("verification_contract") is not None:
             source_verification = verification_project(self.config, source)
             commands = source_verification.get("test_commands") or (
@@ -3741,6 +3933,7 @@ class GoalStore:
                     (document["goal_id"], stored_request_id, document["project_key"], "paused", 1,
                      raw, digest, mac("long-horizon-goal-v1", material), now, now),
                 )
+                goal_dialogue.clone(db, source, document)
                 self._event(db, document, "goal_forked", payload={
                     "parent_goal_id": old_goal_id,
                     "checkpoint": document["fork_checkpoint"],
@@ -4035,15 +4228,14 @@ class GoalStore:
                     return []
                 document["worker"] = self._scheduler_record(worker_id, kind="claim")
             self._refresh_waiting(document)
-            if document["budget"]["provider_calls"] >= document["budget"]["max_provider_calls"]:
+            if goal_budget_policy.exhausted(document["budget"], "provider_calls"):
                 document["status"] = "paused"
                 document["note"] = "The explicit provider-call budget was reached."
                 self._event(db, document, "goal_paused", payload={"reason": "provider_budget"})
                 return []
-            available_calls = (
-                int(document["budget"]["max_provider_calls"])
-                - int(document["budget"]["provider_calls"])
-            )
+            available_calls = goal_budget_policy.remaining(document["budget"], "provider_calls")
+            parallel_limit = int(document["policy"]["max_parallel"])
+            batch_limit = parallel_limit if available_calls is None else min(parallel_limit, available_calls)
             chosen: list[dict[str, Any]] = []
             agents = {one["id"]: one for one in document["agents"]}
             turn_order = [document["lead_agent_id"], *[
@@ -4073,9 +4265,7 @@ class GoalStore:
                 ) for one in chosen):
                     continue
                 chosen.append(task)
-                if document.get("require_all_participants") or len(chosen) >= min(
-                    int(document["policy"]["max_parallel"]), available_calls,
-                ):
+                if document.get("require_all_participants") or len(chosen) >= batch_limit:
                     break
             for task in chosen:
                 task.update({
@@ -4108,7 +4298,7 @@ class GoalStore:
                     or int(current.get("claim_objective_epoch") or 0) \
                     != int(document.get("objective_epoch") or 1):
                 raise HarnessError("The goal changed or paused before this provider continuation")
-            if document["budget"]["provider_calls"] >= document["budget"]["max_provider_calls"]:
+            if goal_budget_policy.exhausted(document["budget"], "provider_calls"):
                 raise HarnessError("The explicit provider-call budget was reached before dispatch")
             if document.get("require_all_participants"):
                 # A context continuation or schema-repair turn for one member
@@ -4125,16 +4315,23 @@ class GoalStore:
                     and one.get("id") != current.get("id")
                     and not _task_has_recorded_provider_dispatch(one)
                 ]
-                remaining_after_dispatch = (
-                    int(document["budget"]["max_provider_calls"])
-                    - int(document["budget"]["provider_calls"])
-                    - 1
-                )
-                if remaining_after_dispatch < len(unattempted_required):
+                available_calls = goal_budget_policy.remaining(document["budget"], "provider_calls")
+                if available_calls is not None and available_calls - 1 < len(unattempted_required):
                     raise RequiredParticipantCallReserved(
                         "The remaining provider-call budget is reserved for required "
                         "chat participants who have not received a terminal attempt."
                     )
+            if phase == "protocol_correction":
+                recovery = current.get("protocol_recovery") or {}
+                self._validate_protocol_recovery(document, current, recovery)
+                if recovery.get("state") != "pending" or int(recovery.get("attempts") or 0) >= action_protocol.MAX_CORRECTIONS:
+                    raise HarnessError("The bounded action-protocol correction is not pending")
+                if not self._protocol_runtime_bound(document) or recovery.get("binding") != self._protocol_binding(document, current):
+                    raise HarnessError("The project or provider changed before action-protocol correction")
+                action_protocol.upgrade_record(recovery, AGENT_ACTION_FORMAT.schema)
+                recovery["state"] = "dispatched"
+                recovery["attempts"] = int(recovery.get("attempts") or 0) + 1
+                recovery["cumulative_attempts"] += 1
             document["budget"]["provider_calls"] += 1
             queue = document.get("project_queue") or {}
             if queue.get("auto_start_pending") is True:
@@ -4147,6 +4344,7 @@ class GoalStore:
                     "task_id": current["id"],
                 })
             current["provider_effect_state"] = "dispatched"
+            current.pop("applied_action_receipt", None)
             current["provider_effect_id"] = _stable_id(
                 "effect", goal_id, current["id"], current["attempts"],
                 document["budget"]["provider_calls"], prompt_digest,
@@ -4157,8 +4355,163 @@ class GoalStore:
                             "phase": phase,
                             "provider_call": document["budget"]["provider_calls"],
                             "effect_id": current["provider_effect_id"],
+                            **({"protocol_correction_attempt": recovery["attempts"],
+                                "protocol_correction_cumulative_attempts": recovery["cumulative_attempts"]}
+                               if phase == "protocol_correction" else {}),
                         }, run_id=goal_id)
         self._mutate(goal_id, change)
+
+    def _protocol_binding(self, document: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+        agent = next(one for one in document["agents"] if one["id"] == task["assigned_agent_id"])
+        return {
+            "goal_id": document["goal_id"], "task_id": task["id"], "agent_id": task["assigned_agent_id"],
+            "project_authority_id": document.get("project_authority_id", ""),
+            "route_binding_sha256": hashlib.sha256(_canonical(agent.get("route_binding") or {}).encode()).hexdigest(),
+            "collaboration_contract_sha256": str((document.get("collaboration_contract") or {}).get("fingerprint_sha256") or ""),
+            "context": _context_binding(document),
+        }
+
+    @staticmethod
+    def _validate_protocol_recovery(document: dict[str, Any], task: dict[str, Any], recovery: object) -> None:
+        version = recovery.get("schema_version") if isinstance(recovery, dict) else None
+        if type(version) is not int or version not in {1, action_protocol.SCHEMA_VERSION}:
+            raise HarnessError("The saved action-protocol correction contract changed; it cannot be replayed")
+        expected = action_protocol.contract(AGENT_ACTION_FORMAT.schema, schema_version=version)
+        if recovery.get("contract_fingerprint_sha256") != expected["fingerprint_sha256"] \
+                or recovery.get("max_attempts") != action_protocol.MAX_CORRECTIONS \
+                or type(recovery.get("attempts")) is not int \
+                or not 0 <= recovery["attempts"] <= action_protocol.MAX_CORRECTIONS \
+                or (version == 2 and (type(recovery.get("cumulative_attempts")) is not int \
+                    or recovery["cumulative_attempts"] < recovery["attempts"])) \
+                or (recovery.get("binding") or {}).get("goal_id") != document["goal_id"] \
+                or (recovery.get("binding") or {}).get("task_id") != task["id"]:
+            raise HarnessError("The saved action-protocol correction contract changed; it cannot be replayed")
+
+    def record_protocol_rejection(
+        self, goal_id: str, task: dict[str, Any], action: dict[str, Any], error: action_protocol.ActionProtocolError,
+    ) -> dict[str, Any]:
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            current = next(one for one in document["tasks"] if one["id"] == task["id"])
+            if current.get("lease_id") != task.get("lease_id") or current.get("state") != "running" \
+                    or current.get("provider_effect_state") != "reply_received" \
+                    or current.get("pending_action") or current.get("pending_transaction") or current.get("outcome_unknown"):
+                raise HarnessError("Only a received, unapplied action can enter protocol correction")
+            if int(current.get("claim_objective_epoch") or 0) != int(document.get("objective_epoch") or 1):
+                return {"state": "superseded"}
+            try:
+                _validate_action_semantics(action, current)
+            except action_protocol.ActionProtocolError as actual:
+                if actual.code != error.code:
+                    raise HarnessError("The action-protocol rejection changed before acknowledgement")
+            else:
+                raise HarnessError("A valid action cannot be retried as a protocol rejection")
+            previous = current.get("protocol_recovery") or {}
+            if previous:
+                self._validate_protocol_recovery(document, current, previous)
+                previous = copy.deepcopy(previous)
+                action_protocol.upgrade_record(previous, AGENT_ACTION_FORMAT.schema)
+            # A valid correction ends an episode. Successful work between two
+            # independent mistakes must not consume the later episode's limit.
+            attempts = 0 if previous.get("state") == "corrected" else int(previous.get("attempts") or 0)
+            cumulative_attempts = int(previous.get("cumulative_attempts") or 0)
+            recovery = {
+                "schema_version": action_protocol.SCHEMA_VERSION,
+                "contract_fingerprint_sha256": action_protocol.contract(AGENT_ACTION_FORMAT.schema)["fingerprint_sha256"],
+                "state": "pending" if attempts < action_protocol.MAX_CORRECTIONS else "exhausted",
+                "attempts": attempts, "max_attempts": action_protocol.MAX_CORRECTIONS,
+                "cumulative_attempts": cumulative_attempts,
+                "error_code": error.code, "error": str(error),
+                "previous_effect_id": current.get("provider_effect_id", ""),
+                "rejected_action_sha256": hashlib.sha256(_canonical(action).encode()).hexdigest(),
+                "rejected_summary": _short(self.redactor.text(action.get("summary") or ""), 8_000),
+                "rejected_action": str(action.get("action") or ""),
+                "populated_fields": [key for key in ("tasks", "questions", "handoff_agent_id", "changes", "tool_calls") if action.get(key)],
+                "binding": self._protocol_binding(document, current),
+                **{key: previous[key] for key in ("counter_migration", "legacy_proof_event_ids") if key in previous},
+            }
+            current.update({"protocol_recovery": recovery, "provider_effect_state": "protocol_rejected",
+                            "reconciliation_required": False, "outcome_unknown": False})
+            self._event(db, document, "action_protocol_rejected", task_id=current["id"], agent_id=current["assigned_agent_id"], payload={
+                "error_code": error.code, "error": str(error), "correction_state": recovery["state"],
+                "effect_id": recovery["previous_effect_id"], "rejected_action_sha256": recovery["rejected_action_sha256"],
+                "attempts": attempts, "max_attempts": action_protocol.MAX_CORRECTIONS, "applied": False,
+                "cumulative_attempts": cumulative_attempts, "protocol_schema_version": action_protocol.SCHEMA_VERSION,
+            })
+            return copy.deepcopy(recovery)
+        return self._mutate(goal_id, change)[1]
+
+    def settle_protocol_correction(self, goal_id: str, task: dict[str, Any], *, superseded: bool = False) -> None:
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            current = next(one for one in document["tasks"] if one["id"] == task["id"])
+            if current.get("lease_id") != task.get("lease_id"):
+                return
+            recovery = current.get("protocol_recovery") or {}
+            if recovery.get("state") not in {"pending", "dispatched"}:
+                return
+            self._validate_protocol_recovery(document, current, recovery)
+            recovery["state"] = "superseded" if superseded else "corrected"
+            self._event(db, document, "action_protocol_correction_superseded" if superseded else "action_protocol_corrected",
+                        task_id=current["id"], agent_id=current["assigned_agent_id"], payload={
+                            "effect_id": current.get("provider_effect_id", ""), "attempts": recovery["attempts"],
+                            "cumulative_attempts": recovery.get("cumulative_attempts", recovery["attempts"]),
+                        })
+        self._mutate(goal_id, change)
+
+    def _protocol_runtime_bound(self, document: dict[str, Any]) -> bool:
+        from .pipeline_runs import AUTHORITY_DESCRIPTOR, _read_descriptor
+
+        if self.provider_setup_status(document).get("changed") or self.collaboration_setup_status(document).get("changed"):
+            return False
+        root = Path(document["project"]["path"])
+        return bool(root.is_dir() and inspect_project_authority(root).get("reason_code") == "registered"
+                    and _read_descriptor(root / AUTHORITY_DESCRIPTOR) == document.get("project_authority_id"))
+
+    def _legacy_protocol_candidates(self, db: sqlite3.Connection, document: dict[str, Any]) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        if not self._protocol_runtime_bound(document):
+            return []
+        events = action_protocol.authenticated_events(db, document)
+        return [(task, proof) for task in document["tasks"]
+                if (proof := action_protocol.legacy_rejection(task, document, events)) is not None]
+
+    def protocol_recovery_status(self, document: dict[str, Any]) -> dict[str, Any]:
+        result = {"schema_version": 1, "goal_id": document.get("goal_id", ""), "goal_revision": document.get("revision", 0),
+                  "eligible": False, "task_ids": [], "code": "none", "reason": "No safe action-protocol correction is available.", "action": ""}
+        with self.lock, self._connect() as db:
+            db.execute("BEGIN")  # one immutable snapshot for the verdict and its event proof
+            current = self._decode(db.execute("SELECT * FROM long_goals WHERE goal_id=?", (document.get("goal_id"),)).fetchone())
+            if current is None or current.get("revision") != document.get("revision"):
+                return {**result, "code": "stale_snapshot"}
+            if current["status"] not in {"paused", "failed"} or any(one.get("state") == "pending" for one in current.get("interrupts", [])) \
+                    or goal_budget_policy.exhausted(current["budget"], "provider_calls") \
+                    or not self._protocol_runtime_bound(current) \
+                    or any((one.get("protocol_recovery") or {}).get("state") == "exhausted" for one in current["tasks"]):
+                return result
+            candidates = self._legacy_protocol_candidates(db, current)
+            task_ids = [task["id"] for task, _proof in candidates]
+            for task in current["tasks"]:
+                recovery = task.get("protocol_recovery") or {}
+                if recovery.get("state") == "pending" and not _task_has_unsettled_effect(task):
+                    self._validate_protocol_recovery(current, task, recovery)
+                    if recovery.get("binding") == self._protocol_binding(current, task):
+                        task_ids.append(task["id"])
+            if task_ids and not any(_task_has_unsettled_effect(one) and one["id"] not in task_ids for one in current["tasks"]):
+                result.update({"eligible": True, "task_ids": task_ids,
+                               "code": "legacy_semantic_rejection" if candidates else "pending_protocol_correction",
+                               "reason": "The known invalid reply was rejected before Nexus applied any action; Resume can request a bounded correction.",
+                               "action": "resume"})
+        return result
+
+    def _adopt_legacy_protocol_rejections(self, document: dict[str, Any], db: sqlite3.Connection) -> None:
+        for task, proof in self._legacy_protocol_candidates(db, document):
+            task["protocol_recovery"] = {
+                "schema_version": action_protocol.SCHEMA_VERSION,
+                "contract_fingerprint_sha256": action_protocol.contract(AGENT_ACTION_FORMAT.schema)["fingerprint_sha256"],
+                "state": "pending", "attempts": 0, "max_attempts": action_protocol.MAX_CORRECTIONS, "cumulative_attempts": 0,
+                "binding": self._protocol_binding(document, task), "rejected_summary": "",
+                "rejected_action_sha256": "", "populated_fields": [], **proof,
+            }
+            task.update({"provider_effect_state": "protocol_rejected", "reconciliation_required": False, "outcome_unknown": False})
+            self._event(db, document, "action_protocol_legacy_rejection_recovered", task_id=task["id"], agent_id=task["assigned_agent_id"], payload=proof)
 
     def record_provider_reply(
         self, goal_id: str, task: dict[str, Any], *, phase: str
@@ -4239,8 +4592,7 @@ class GoalStore:
             if steps and call_id in set(steps[-1].get("reserved_call_ids") or []):
                 return False
             used = int(document["budget"].get("context_tool_calls") or 0)
-            maximum = int(document["budget"].get("max_context_tool_calls") or MAX_CONTEXT_TOOL_CALLS)
-            if used >= maximum:
+            if goal_budget_policy.exhausted(document["budget"], "context_tool_calls"):
                 raise HarnessError("The explicit context-tool call budget was reached")
             document["budget"]["context_tool_calls"] = used + 1
             if steps:
@@ -4259,7 +4611,8 @@ class GoalStore:
     def acknowledge_context_step(
         self, goal_id: str, task: dict[str, Any], action: dict[str, Any], phase: str,
         context_binding: dict[str, Any] | None = None,
-    ) -> None:
+        *, tool_session_id: str = "",
+    ) -> dict[str, Any]:
         def change(document: dict[str, Any], db: sqlite3.Connection):
             current = next(one for one in document["tasks"] if one["id"] == task["id"])
             if current.get("lease_id") != task.get("lease_id") or current["state"] != "running":
@@ -4277,10 +4630,19 @@ class GoalStore:
                     current.get("provider_effect_id"), _canonical(calls),
                 ),
                 "phase": _short(phase, 100), "calls": calls, "results": [],
+                "agent_id": current["assigned_agent_id"],
                 "provider_effect_id": current.get("provider_effect_id", ""),
                 "context_binding": context_binding or _context_binding(document),
                 "state": "tools_pending", "created_ms": _now(),
             }
+            step["tool_execution"] = {
+                "schema_version": 1,
+                "contract_fingerprint_sha256": _context_tool_execution_contract(),
+                "scope": step["step_id"],
+                "session_id": tool_session_id or _stable_id("lh-tools", goal_id, current["id"], current.get("attempts", 0)),
+                "context_binding_sha256": hashlib.sha256(_canonical(step["context_binding"]).encode("utf-8")).hexdigest(),
+            }
+            _context_tool_execution(step)
             history = current.setdefault("context_steps", [])
             if not history or history[-1].get("step_id") != step["step_id"]:
                 history.append(step)
@@ -4292,7 +4654,8 @@ class GoalStore:
                         }, run_id=goal_id)
             if document.get("require_all_participants"):
                 self._record_dialogue_message(db, document, current, action, phase=phase)
-        self._mutate(goal_id, change)
+            return copy.deepcopy(history[-1])
+        return self._mutate(goal_id, change)[1]
 
     def supersede_stale_context_steps(
         self, goal_id: str, task: dict[str, Any], context_binding: dict[str, Any],
@@ -4342,13 +4705,46 @@ class GoalStore:
                 if requested_ids and requested_ids <= completed_ids:
                     step["state"] = "complete"
                     step["completed_ms"] = _now()
+                    agent = next(one for one in document["agents"] if one["id"] == current["assigned_agent_id"])
+                    previous_progress = current.get("context_progress") or {}
+                    progress = goal_context_progress.observe(
+                        previous_progress, step,
+                        binding={
+                            "goal_id": document["goal_id"], "task_id": current["id"],
+                            "project_authority_id": document.get("project_authority_id", ""),
+                            "context": step.get("context_binding") or _context_binding(document),
+                            "route_binding_sha256": hashlib.sha256(_canonical(agent.get("route_binding") or {}).encode("utf-8")).hexdigest(),
+                            # Targeted messages and decision replies are scoped
+                            # to this task's authenticated evidence; they are
+                            # archived but absent from the public projection.
+                            "user_input_sha256": hashlib.sha256(_canonical([
+                                one for one in current.get("evidence", [])
+                                if str(one).startswith(("User steering: ", "User decision: "))
+                            ]).encode("utf-8")).hexdigest(),
+                        },
+                        speaker_id=current["assigned_agent_id"],
+                        messages=(document.get("dialogue") or {}).get("messages", []),
+                        normalize=_semantic_tool_result,
+                    )
+                    current["context_progress"] = progress
+                    if progress.get("state") == "paused" and progress != previous_progress \
+                            and document["status"] not in {"cancelled", "cancelling", "waiting_for_user"}:
+                        document["status"] = "paused"
+                        document["note"] = progress["reason"]
+                        self._event(db, document, "context_progress_paused", task_id=current["id"],
+                                    agent_id=current["assigned_agent_id"], payload=progress)
             if not error and str(call.get("name") or "") == "read_proposed_change":
                 arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                 relative = str(arguments.get("path") or "").replace("\\", "/").strip()
-                if relative and isinstance(result, dict):
-                    offset = int(result.get("offset") or 0)
-                    length = len(str(result.get("content") or ""))
-                    total = int(result.get("total_characters") or 0)
+                if relative and isinstance(result, dict) and result.get("status") != "error" \
+                        and type(result.get("offset")) is int and result["offset"] >= 0 \
+                        and isinstance(result.get("content"), str) \
+                        and type(result.get("total_characters")) is int \
+                        and 0 <= result["offset"] <= result["total_characters"] \
+                        and result["offset"] + len(result["content"]) <= result["total_characters"]:
+                    offset = result["offset"]
+                    length = len(result["content"])
+                    total = result["total_characters"]
                     ranges = current.setdefault("review_path_ranges", {}).setdefault(relative, [])
                     ranges.append([offset, offset + length])
                     covered = 0
@@ -4360,6 +4756,7 @@ class GoalStore:
                     if covered >= total and relative not in inspected:
                         inspected.append(relative)
             elif not error and str(call.get("name") or "") == "read_file" \
+                    and isinstance(result, dict) and result.get("status") == "ok" \
                     and current.get("kind") == "review" and current.get("review_of"):
                 parent = next((
                     one for one in document["tasks"] if one["id"] == current["review_of"]
@@ -4390,29 +4787,38 @@ class GoalStore:
             "message", document["goal_id"], task["id"],
             task.get("provider_effect_id") or task.get("lease_id"), phase, summary,
         )
-        if isinstance(dialogue, dict):
-            if any(one.get("id") == message_id for one in dialogue.get("messages", [])):
-                return
-            dialogue["sequence"] = int(dialogue.get("sequence") or 0) + 1
-            dialogue.setdefault("messages", []).append({
-                "id": message_id, "sequence": dialogue["sequence"],
-                "agent_id": task["assigned_agent_id"], "task_id": task["id"],
-                "objective_epoch": int(document.get("objective_epoch") or 1),
-                "action": str(action.get("action") or "work"), "phase": phase,
-                "summary": summary, "recipient": delivery, "at_ms": _now(),
-            })
-            messages = dialogue["messages"][-MAX_DIALOGUE_MESSAGES:]
-            while len(messages) > 1 and sum(len(one["summary"]) for one in messages) > MAX_DIALOGUE_CHARACTERS:
-                messages.pop(0)
-            dialogue["messages"] = messages
-        self._event(
+        goal_dialogue.migrate(db, document)
+        if db.execute(
+            "SELECT 1 FROM long_goal_dialogue_messages WHERE goal_id=? AND message_id=?",
+            (document["goal_id"], message_id),
+        ).fetchone():
+            return
+        message = {
+            "id": message_id,
+            "sequence": int(document["dialogue_archive"]["latest_sequence"]) + 1,
+            "agent_id": task["assigned_agent_id"], "task_id": task["id"],
+            "objective_epoch": int(document.get("objective_epoch") or 1),
+            "action": str(action.get("action") or "work"), "phase": phase,
+            "summary": summary, "recipient": delivery, "at_ms": _now(),
+        }
+        event = self._event(
             db, document, "provider_acknowledged", task_id=task["id"],
             agent_id=task["assigned_agent_id"], payload={
                 "action": str(action.get("action") or "work"), "summary": summary,
                 "effect_id": task.get("provider_effect_id", ""),
-                "summary_delivery": delivery, "phase": phase,
+                "summary_delivery": delivery, "phase": phase, "dialogue_message_id": message_id,
             }, run_id=document["goal_id"],
         )
+        message.update({"source_goal_event_id": event["event_id"],
+                        "source_goal_event_seq": event["seq"], "source_goal_event_type": event["type"]})
+        goal_dialogue.append(db, document, message)
+        if isinstance(dialogue, dict):
+            dialogue["sequence"] = message["sequence"]
+            dialogue.setdefault("messages", []).append(message)
+            messages = dialogue["messages"][-MAX_DIALOGUE_MESSAGES:]
+            while len(messages) > 1 and sum(len(one["summary"]) for one in messages) > MAX_DIALOGUE_CHARACTERS:
+                messages.pop(0)
+            dialogue["messages"] = messages
 
     def record_action(self, goal_id: str, task: dict[str, Any], action: dict[str, Any]) -> bool:
         action = self.sanitize_action(action)
@@ -4480,6 +4886,7 @@ class GoalStore:
             previous_identity = _provider_identity(previous_record)
             reply_was_received = str(current.get("provider_effect_state") or "") \
                 in {"reply_received", "reply_received_reconciliation_required"}
+            protocol_rejected = current.get("provider_effect_state") == "protocol_rejected"
             current.update({"state": "blocked", "last_error": _short(error, 4_000),
                             "owner_pid": 0, "owner_token": "", "lease_id": ""})
             current["outcome_unknown"] = bool(uncertain)
@@ -4488,6 +4895,7 @@ class GoalStore:
             )
             current["provider_effect_state"] = (
                 "outcome_unknown" if uncertain else
+                "protocol_rejected" if protocol_rejected else
                 "known_reply_failed" if reply_was_received else "failed_before_effect"
             )
             failed_ids = list(dict.fromkeys([
@@ -4647,6 +5055,7 @@ class GoalStore:
                     current.get("provider_effect_id"), *paths,
                 ),
                 "phase": _short(phase, 100), "calls": [], "results": [],
+                "agent_id": current["assigned_agent_id"],
                 "requested_files": list(paths), "provider_effect_id": current.get("provider_effect_id", ""),
                 "context_binding": context_binding or _context_binding(document),
                 "state": "complete", "created_ms": _now(), "completed_ms": _now(),
@@ -4869,6 +5278,10 @@ class GoalStore:
                     "The goal was cancelled or is draining before this result could be applied"
                 )
             _validate_action_semantics(action, current)
+            # A successfully accepted non-tool action ends its context-only
+            # episode. Claims, scopes and restarts deliberately do not.
+            if not action.get("tool_calls"):
+                current.pop("context_progress", None)
             current["pending_action"] = {}
             current["summary"] = _short(action.get("summary"), 8_000)
             evidence = [_short(one, 1_000) for one in action.get("evidence", []) if _short(one, 1_000)]
@@ -4904,6 +5317,12 @@ class GoalStore:
                 self._event(db, document, "artifact_changed", task_id=current["id"],
                             agent_id=current["assigned_agent_id"], payload=artifact)
             kind = str(action["action"])
+            # This receipt commits in the same database transaction as the
+            # action's task state and artifact publication. A later failure
+            # rolls it back; pending/uncertain effects always override it.
+            current["applied_action_receipt"] = _applied_action_receipt(
+                current, kind, hashlib.sha256(_canonical(action).encode("utf-8")).hexdigest(),
+            )
             dialogue = document.get("dialogue") if document.get("require_all_participants") else None
             if isinstance(dialogue, dict):
                 dialogue["last_turn_agent_id"] = current["assigned_agent_id"]
@@ -5113,8 +5532,14 @@ class GoalStore:
                         )
             else:
                 fingerprint = hashlib.sha256(_canonical({
-                    # Rephrasing a stalled conversation is not fresh progress.
-                    "summary": "" if current.get("required_contributor_id") else current["summary"],
+                    # Public discussion can be the useful work itself. Exact
+                    # repetitions remain bounded; Nexus cannot decide whether
+                    # distinct design/reasoning messages are valuable from the
+                    # absence of file writes. Versioning invalidates the old
+                    # counter naturally on the next authenticated action.
+                    "schema_version": 2,
+                    "progress_contract": "public-message-evidence-artifact-tool-observation/v2",
+                    "summary": " ".join(current["summary"].split()),
                     "evidence": evidence,
                     "artifact": _semantic_artifact(artifact or {}),
                     "tool_observations": sorted({
@@ -5130,7 +5555,7 @@ class GoalStore:
                 current["progress_fingerprint"] = fingerprint
                 if current["no_progress"] >= MAX_NO_PROGRESS:
                     current["state"] = "blocked"
-                    current["last_error"] = "Repeated agent turns produced no new evidence or artifact."
+                    current["last_error"] = "Repeated agent turns produced no new evidence, artifact, or public message."
                     document["status"] = "paused"
                     document["note"] = current["last_error"]
                 else:
@@ -5265,9 +5690,12 @@ class GoalStore:
                 answer = supplied.get(item["id"])
                 if answer is None:
                     raise HarnessError("Answer every pending question for this exact goal")
+                exact_answer = self.redactor.text(answer).strip()
+                if len(exact_answer) > 20_000:
+                    raise HarnessError("A decision answer supports at most 20,000 characters. No answers were saved or truncated.")
                 item.update({
                     "state": "resolved", "resolved_ms": _now(),
-                    "answer": _short(self.redactor.text(answer), 20_000),
+                    "answer": exact_answer,
                 })
                 task = next(one for one in document["tasks"] if one["id"] == item["task_id"])
                 task["evidence"].append("User decision: " + item["answer"])
@@ -5360,6 +5788,115 @@ class GoalStore:
 
         self._mutate(goal_id, change)
 
+    def _settle_legacy_applied_actions(
+        self, document: dict[str, Any], db: sqlite3.Connection,
+    ) -> None:
+        candidates = [task for task in document["tasks"] if (
+            task.get("state") in {"blocked", "complete"}
+            and task.get("provider_effect_state") == "acknowledged"
+            and not task.get("applied_action_receipt")
+            and task.get("provider_effect_id") and task.get("summary")
+            and not task.get("pending_action") and not task.get("pending_transaction")
+            and not task.get("outcome_unknown") and not task.get("reconciliation_required")
+            and not task.get("lease_id") and not task.get("owner_pid")
+        )]
+        if not candidates:
+            return
+        # Verify the retained chain inside this same transaction before using
+        # terminal telemetry as migration evidence. Missing/pruned proof never
+        # becomes an inferred acknowledgement of an unknown provider effect.
+        previous = str(document.get("event_floor_previous_sha256") or "")
+        expected = int(document.get("event_floor_seq") or 1)
+        events = []
+        for row in db.execute("SELECT * FROM long_goal_events WHERE goal_id=? ORDER BY seq", (document["goal_id"],)):
+            raw = str(row["event_json"])
+            digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            event = json.loads(raw)
+            material = [document["goal_id"], int(row["seq"]), str(row["event_id"]), str(row["type"]), raw, digest]
+            if digest != row["event_sha256"] or not hmac.compare_digest(str(row["integrity_mac"]), mac("long-horizon-event-v1", material)) \
+                    or event.get("previous_sha256") != previous or event.get("seq") != expected:
+                raise HarnessError("Legacy provider settlement evidence failed event integrity verification")
+            events.append(event)
+            previous, expected = digest, expected + 1
+        if expected - 1 != int(document.get("event_seq") or 0) or previous != str(document.get("event_head_sha256") or ""):
+            raise HarnessError("Legacy provider settlement evidence does not match its authenticated goal")
+        for task in candidates:
+            task_events = [one for one in events if one.get("task_id") == task["id"]]
+            if not task_events:
+                continue
+            terminal = task_events[-1]
+            kind = "blocked" if task["state"] == "blocked" else "complete"
+            if terminal.get("type") != ("task_blocked" if kind == "blocked" else "task_completed"):
+                continue
+            acknowledgements = [one for one in task_events[:-1] if one.get("type") == "provider_acknowledged"]
+            if not acknowledgements:
+                continue
+            acknowledgement = acknowledgements[-1]
+            payload = acknowledgement.get("payload") or {}
+            terminal_payload = terminal.get("payload") or {}
+            if payload.get("action") != kind or payload.get("effect_id") != task["provider_effect_id"] \
+                    or payload.get("summary") != task["summary"] \
+                    or acknowledgement.get("agent_id") != task.get("assigned_agent_id") \
+                    or terminal.get("agent_id") != task.get("assigned_agent_id"):
+                continue
+            if kind == "blocked" and (terminal_payload.get("reason") != task.get("last_error") or task.get("last_error") != task["summary"]):
+                continue
+            if kind == "complete" and terminal_payload.get("artifacts") != task.get("artifacts"):
+                continue
+            published = [{key: value for key, value in one.items() if key != "task_id"}
+                         for one in document.get("artifacts", []) if one.get("task_id") == task["id"]]
+            if sorted(_canonical(one) for one in published) != sorted(_canonical(one) for one in task.get("artifacts", [])):
+                continue
+            task["applied_action_receipt"] = _applied_action_receipt(
+                task, kind, hashlib.sha256(_canonical([acknowledgement, terminal]).encode("utf-8")).hexdigest(),
+                provenance="authenticated_legacy_terminal_events",
+                event_ids=[acknowledgement["event_id"], terminal["event_id"]],
+            )
+            self._event(db, document, "provider_effect_settled", task_id=task["id"],
+                        agent_id=task["assigned_agent_id"], payload={
+                            "schema_version": 1, "trigger": "explicit_control",
+                            "provider_effect_id": task["provider_effect_id"],
+                            "receipt": task["applied_action_receipt"],
+                        })
+
+    def _migrate_default_success_criteria(
+        self, document: dict[str, Any], db: sqlite3.Connection,
+    ) -> bool:
+        if document.get("success_criteria_contract") is not None \
+                or document.get("status") != "paused" \
+                or not _legacy_default_criteria_proven(document):
+            return False
+        if self._scheduler_live(document) or any(one.get("state") == "running" for one in document["tasks"]):
+            raise HarnessError("Wait for the paused turn to settle before updating completion evidence")
+        root = Path(document["project"]["path"])
+        project = verification_project(self.config, document)
+        commands, _source = swarm_work._verification_commands(self.config, root, project)
+        if commands:
+            return False
+        document["success_criteria_contract"] = _success_criteria_contract(
+            [], document["success_criteria"], provenance="legacy_admission_digest_no_custom_criteria",
+            admission_digest=str(document["admission_digest"]),
+        )
+        previous = document.get("verification_contract")
+        document["verification_contract"] = capture_verification_contract(self.config, project, root)
+        if document["verification_contract"] != previous:
+            document["verification_settings_revision"] = int(document.get("verification_settings_revision") or 1) + 1
+        document["verification"] = {
+            "status": "not_run", "reason": "Default completion criteria were restored from the authenticated original request on Resume.",
+            "commands": [],
+        }
+        for task in document["tasks"]:
+            for step in task.get("context_steps", []):
+                if any(one.get("name") == "run_selected_verification" for one in step.get("calls", [])):
+                    step["state"] = "superseded"
+        self._event(db, document, "success_criteria_contract_migrated", payload={
+            "schema_version": 1, "trigger": "explicit_resume",
+            "admission_digest": document["admission_digest"],
+            "fingerprint_sha256": document["success_criteria_contract"]["fingerprint_sha256"],
+            "provider_calls_preserved": True,
+        })
+        return True
+
     def _adopt_project_verification_settings(
         self, document: dict[str, Any], db: sqlite3.Connection, selected: dict[str, Any],
     ) -> bool:
@@ -5430,6 +5967,9 @@ class GoalStore:
         cancellation_error: list[str] = []
 
         def change(document: dict[str, Any], db: sqlite3.Connection):
+            if action == "resume" and "expected_revision" in payload \
+                    and int(payload["expected_revision"]) != int(document["revision"]):
+                raise HarnessError("This goal changed after the repair was offered; refresh before resuming.")
             if document["status"] == "waiting_for_project" and action != "cancel":
                 raise HarnessError(
                     "This goal is waiting for the current project owner and cannot dispatch or change yet"
@@ -5566,6 +6106,8 @@ class GoalStore:
 
             if document["status"] in {"complete", "cancelled"} and action != "cancel":
                 raise HarnessError("A terminal goal is immutable; fork it to continue with new work")
+            if action in {"resume", "retry", "message"}:
+                self._settle_legacy_applied_actions(document, db)
             if action in {"resume", "retry", "reassign", "steer", "message", "criteria", "request_review"} \
                     and any(one.get("state") == "pending" for one in document.get("interrupts", [])):
                 raise HarnessError(
@@ -5598,6 +6140,9 @@ class GoalStore:
                     raise HarnessError("Only a paused or failed goal can resume")
                 released_failed = document["status"] == "failed" \
                     and self._project_queue_state(document) == "released"
+                self._adopt_legacy_protocol_rejections(document, db)
+                if any((one.get("protocol_recovery") or {}).get("state") == "exhausted" for one in document["tasks"]):
+                    raise HarnessError("The bounded action-protocol corrections were exhausted. Inspect the rejected replies before starting new work.")
                 if any(
                     one["state"] in {"blocked", "failed"} and _task_has_unsettled_effect(one)
                     for one in document["tasks"]
@@ -5607,6 +6152,15 @@ class GoalStore:
                     )
                 if project_verification_settings is not None:
                     self._adopt_project_verification_settings(document, db, project_verification_settings)
+                elif document.get("require_all_participants") and document.get("status") == "paused":
+                    # CLI and restarted-runtime Resume also refresh obsolete
+                    # engine semantics. Use only the authenticated saved checks;
+                    # current config drift still fails verification_project.
+                    # No newly discovered command or approval is fabricated.
+                    saved_checks = verification_project(self.config, document)
+                    saved_checks["is_there"] = Path(str(saved_checks["path"])).is_dir()
+                    self._adopt_project_verification_settings(document, db, saved_checks)
+                self._migrate_default_success_criteria(document, db)
                 document["automatic_recovery_control"] = _automatic_recovery_control(
                     False,
                 )
@@ -5881,7 +6435,9 @@ class GoalStore:
                 self._event(db, document, "task_reassigned", task_id=task_id, agent_id=agent_id,
                             payload={"from_agent_id": previous, "to_agent_id": agent_id})
             elif action in {"steer", "message"}:
-                words = _short(self.redactor.text(payload.get("text")), 20_000)
+                words = self.redactor.text(payload.get("text") or "").strip()
+                if len(words) > 20_000:
+                    raise HarnessError("User steering and agent messages support at most 20,000 characters. Nothing was saved or truncated.")
                 if not words:
                     raise HarnessError("Write the steering instruction first")
                 if action == "steer":
@@ -6021,22 +6577,33 @@ class GoalStore:
                         "running" if any(one["state"] == "running" for one in document["tasks"])
                         else "queued"
                     )
-                self._event(db, document, "goal_steered" if action == "steer" else "agent_messaged",
-                            task_id=task_id, agent_id=str(payload.get("agent_id") or ""), payload={"text": words})
+                event = self._event(db, document, "goal_steered" if action == "steer" else "agent_messaged",
+                                    task_id=task_id, agent_id=str(payload.get("agent_id") or ""), payload={"text": words})
+                if action == "steer":
+                    if document.get("require_all_participants"):
+                        message = document["dialogue"]["messages"][-1]
+                    else:
+                        message = {
+                            "id": _stable_id("steer", goal_id, document["objective_epoch"]),
+                            "sequence": int(document["dialogue_archive"]["latest_sequence"]) + 1,
+                            "agent_id": "", "task_id": "", "objective_epoch": document["objective_epoch"],
+                            "action": "steer", "phase": "user", "summary": words,
+                            "recipient": {"kind": "team", "name": "the team"}, "at_ms": event["at_ms"],
+                        }
+                    message.update({"source_goal_event_id": event["event_id"],
+                                    "source_goal_event_seq": event["seq"], "source_goal_event_type": event["type"]})
+                    goal_dialogue.append(db, document, message)
             elif action == "criteria":
                 criteria = [
                     _short(self.redactor.text(one), 1_000)
                     for one in payload.get("success_criteria", []) if _short(one, 1_000)
                 ]
-                criteria = list(dict.fromkeys([
-                    "Original objective is satisfied",
-                    "Every required task is complete",
-                    "Configured deterministic verification passes",
-                    *criteria,
-                ]))
+                explicit_criteria = list(criteria)
+                criteria = list(dict.fromkeys([*BASELINE_CRITERIA, *criteria]))
                 if len(criteria) > MAX_CRITERIA:
                     raise HarnessError(f"Use at most {MAX_CRITERIA} total success criteria")
                 document["success_criteria"] = criteria
+                document["success_criteria_contract"] = _success_criteria_contract(explicit_criteria, criteria)
                 document["objective_revisions"].append({
                     "revision": int(document["revision"]) + 1, "at_ms": _now(),
                     "text": "\n".join(criteria), "reason": "success_criteria",
@@ -6146,8 +6713,66 @@ class GoalStore:
                 })
                 return
             checked = copy.deepcopy(result)
+            unconfigured = result.get("status") == "not_configured"
+            current_tree = ""
+            current_manifest: dict[str, str] = {}
+            if unconfigured:
+                if not _allows_unconfigured_checks(document):
+                    checked.update({
+                        "status": "unavailable", "basis": "required_checks_not_configured",
+                        "reason": "Required deterministic verification has no configured or discoverable command. "
+                                  "Explicit verification requirements and unproven legacy criterion origins remain required.",
+                    })
+                elif result.get("basis") != "no_selected_checks" \
+                        or result.get("verification_profile") != SHARED_GOAL_PROFILE \
+                        or result.get("check_policy") != CHECK_POLICY \
+                        or result.get("verification_session_id") != document["goal_id"] \
+                        or result.get("commands") != []:
+                    checked.update({"status": "failed", "reason": "No-check completion lacks the current engine policy and exact goal verification evidence."})
+                else:
+                    try:
+                        selected = verification_project(self.config, document)
+                        current_commands, _source = swarm_work._verification_commands(
+                            self.config, Path(document["project"]["path"]), selected,
+                        )
+                    except (HarnessError, OSError) as exc:
+                        checked.update({
+                            "status": "unavailable", "basis": "verification_contract_changed",
+                            "reason": "Project verification settings changed before completion: " + str(exc),
+                        })
+                    else:
+                        if current_commands or selected.get("approved_test_command_digest"):
+                            checked.update({
+                                "status": "unavailable", "basis": "verification_checks_changed",
+                                "reason": "Project checks appeared or changed after the no-check result. "
+                                          "Run the current selected checks before completing the goal.",
+                            })
+                if checked.get("status") == "not_configured":
+                    current_tree, current_manifest = swarm_work._project_tree_merkle(Path(document["project"]["path"]))
+                    contributions = [one for one in document["tasks"] if one.get("required_contributor_id") and one["state"] != "cancelled"]
+                    if result.get("current_tree_merkle") != current_tree or not contributions or not all(
+                        one["state"] == "complete" and one.get("artifacts")
+                        and one["artifacts"][-1].get("tree_merkle") == current_tree
+                        for one in contributions
+                    ):
+                        checked.update({
+                            "status": "failed",
+                            "reason": "No-check completion requires every participant's authenticated current snapshot; "
+                                      "the project changed or the current result has not been inspected by the whole team.",
+                        })
+            verification_satisfied = checked.get("status") == "passed" or (
+                unconfigured and checked.get("status") == "not_configured"
+            )
             known_refs: set[str] = set()
+            if unconfigured and verification_satisfied:
+                # Existing deliverables need not be rewritten to acquire a
+                # file reference. Their paths come from the authenticated tree
+                # shared by every completed contribution, not provider prose.
+                known_refs.update("file:" + path for path in current_manifest)
+                known_refs.add("snapshot:" + current_tree)
             for artifact in document.get("artifacts", []):
+                if unconfigured and artifact.get("tree_merkle") != current_tree:
+                    continue
                 if artifact.get("transaction_id"):
                     known_refs.add("artifact:" + str(artifact["transaction_id"]))
                 for changed in artifact.get("changes", []):
@@ -6171,7 +6796,7 @@ class GoalStore:
                         )
                     refs = ["task-ledger"]
                 elif criterion == "Configured deterministic verification passes":
-                    passed = result.get("status") == "passed"
+                    passed = verification_satisfied
                     refs = ["verification"] if passed else []
                 else:
                     declared = [
@@ -6180,22 +6805,29 @@ class GoalStore:
                         for ref in mapping.get("evidence_refs", [])
                     ]
                     refs = [ref for ref in declared if ref in known_refs]
-                    passed = result.get("status") == "passed" and bool(refs)
+                    passed = verification_satisfied and bool(refs)
                 criteria_results.append({
-                    "criterion": criterion, "status": "passed" if passed else "failed",
+                    "criterion": criterion, "status": (
+                        "not_applicable" if passed and unconfigured and criterion == BASELINE_CRITERIA[2]
+                        else "passed" if passed else "failed"
+                    ),
                     "evidence_refs": refs,
-                    "basis": "Authenticated task/artifact evidence plus deterministic verification",
+                    "basis": "Authenticated current task/artifact evidence; no project tests were configured" if unconfigured
+                             else "Authenticated task/artifact evidence plus deterministic verification",
                 })
             checked["criteria_results"] = criteria_results
-            if result.get("status") == "passed" and not all(one["status"] == "passed" for one in criteria_results):
+            if verification_satisfied and not all(one["status"] in {"passed", "not_applicable"} for one in criteria_results):
                 checked["status"] = "failed"
-                missing = [one["criterion"] for one in criteria_results if one["status"] != "passed"]
+                missing = [one["criterion"] for one in criteria_results if one["status"] not in {"passed", "not_applicable"}]
                 checked["reason"] = "Success criteria lack authenticated evidence: " + "; ".join(missing)
             document["verification"] = _durable_evidence(checked)
             self._event(db, document, "test_result", payload=checked)
-            if checked.get("status") == "passed":
+            if checked.get("status") == "passed" or (verification_satisfied and checked.get("status") == "not_configured"):
                 document["status"] = "complete"
-                document["note"] = "All required tasks and deterministic verification are complete."
+                document["note"] = (
+                    "All required tasks have current artifact evidence and team agreement. No project tests were configured; no tests ran."
+                    if unconfigured else "All required tasks and deterministic verification are complete."
+                )
                 self._event(db, document, "goal_completed", payload={"basis": result.get("basis"), "success_criteria": document["success_criteria"]})
                 return
             reason = _short(checked.get("reason") or "Deterministic verification failed", 4_000)
@@ -6301,6 +6933,10 @@ class GoalStore:
                         task["last_error"] = ""
                         task["outcome_unknown"] = False
                         task.update({"lease_id": "", "owner_pid": 0, "owner_token": ""})
+                    elif effect == "protocol_rejected" and (task.get("protocol_recovery") or {}).get("state") == "pending":
+                        self._validate_protocol_recovery(document, task, task["protocol_recovery"])
+                        task.update({"state": "ready", "last_error": "", "outcome_unknown": False,
+                                     "reconciliation_required": False, "lease_id": "", "owner_pid": 0, "owner_token": ""})
                     elif effect == "reply_received":
                         task["state"] = "blocked"
                         task["outcome_unknown"] = False
@@ -6693,7 +7329,11 @@ class LongHorizonRuntime:
                     "provider_effect_state": one.get("provider_effect_state", ""),
                     "summary": _short(one.get("summary"), 8_000),
                     "last_error": _short(one.get("last_error"), 4_000),
-                    "evidence": one.get("evidence", [])[-24:],
+                    "evidence": [
+                        evidence for evidence in one.get("evidence", [])[-24:]
+                        if one.get("assigned_agent_id") == task.get("assigned_agent_id")
+                        or not str(evidence).startswith(("User steering: ", "User decision: "))
+                    ],
                     "artifacts": one.get("artifacts", [])[-12:],
                 }
                 for one in goal["tasks"] if one.get("required_contributor_id")
@@ -6713,12 +7353,16 @@ class LongHorizonRuntime:
             dialogue = goal.get("dialogue") or {}
             messages = [
                 {
+                    "id": one["id"],
                     "sequence": one["sequence"],
                     "speaker": agent_names.get(str(one.get("agent_id") or ""), "You"),
                     "action": one.get("action"), "message": one.get("summary", ""),
                     "objective_epoch": one.get("objective_epoch"),
+                    "recipient": one.get("recipient", {}), "phase": one.get("phase", "action"),
                 }
                 for one in dialogue.get("messages", [])
+                if one.get("visibility") != "agent_only"
+                or (one.get("recipient") or {}).get("agent_id") == task["assigned_agent_id"]
             ]
             contribution_packet += (
                 "\n\nSHARED CONVERSATION (actual messages in order)\n"
@@ -6726,6 +7370,22 @@ class LongHorizonRuntime:
                 + "\nCurrent shared artifact generation: "
                 + str(int(dialogue.get("artifact_generation") or 0))
             )
+            archive = goal.get("dialogue_archive") or {}
+            omitted = max(0, int(archive.get("count") or len(messages)) - len(messages))
+            contribution_packet += (
+                "\nSHARED CONVERSATION PROJECTION: " + str(len(messages))
+                + " newest complete messages are included; " + str(omitted)
+                + " earlier archived messages are omitted from this prompt. "
+                "The full public messages remain in the authenticated goal archive; agent-directed user messages "
+                "are available only to their addressed participant. "
+                "Use read_shared_conversation(after=0,limit=20,message_id='',offset=0,character_limit=12000) "
+                "to read earlier messages for this exact goal, then use the returned next sequence as after. "
+                "For a message with has_more_characters, use its id as message_id and its next_offset "
+                "to retrieve the rest before moving to the next message. No private model reasoning is part of this public chat."
+            )
+            coverage = archive.get("coverage") or {}
+            if coverage.get("status") == "partial_legacy":
+                contribution_packet += "\nLEGACY HISTORY GAP: " + str(coverage.get("reason") or "") + " " + _canonical(coverage)
             teammate_names = ", ".join(
                 name for agent_id, name in agent_names.items()
                 if agent_id != task["assigned_agent_id"]
@@ -6796,6 +7456,17 @@ class LongHorizonRuntime:
             "Work alone when you can. Delegate only a concrete bounded subtask that another authorized "
             "agent can do independently. "
         )
+        completion_guidance = (
+            "The engine-generated criterion 'Configured deterministic verification passes' is conditional for this goal. "
+            "If run_selected_verification returns not_configured, no project checks are selected and no tests ran; "
+            "that alone is not a blocker. Inspect the actual deliverables and complete your contribution when the objective "
+            "is fulfilled, with file:<relative-path> or verified-no-change evidence for the current result. "
+            "Existing finished deliverables do not need artificial edits. Nexus requires every participant's current "
+            "authenticated snapshot and agreement before completion. Any explicitly requested testing still needs "
+            "real execution evidence. Never claim that tests passed when no tests ran. "
+            if _allows_unconfigured_checks(goal) else
+            "Nexus still requires deterministic project verification before completing this goal. "
+        )
         return (
             "LONG-HORIZON GOAL\n" + goal["objective"]
             + "\n\nSUCCESS CRITERIA\n- " + "\n- ".join(goal["success_criteria"])
@@ -6808,8 +7479,10 @@ class LongHorizonRuntime:
             + _canonical(_durable_evidence(goal.get("verification", {}), string_limit=8_000, list_limit=60))
             + contribution_packet
             + review_packet
-            + "\n\nCOMPLETION EVIDENCE\nFor every success criterion this task supports, return criteria_evidence using the exact criterion text and refs such as artifact:<transaction-id>, file:<relative-path>, or review:<task-id>. For genuinely read-only work, use the exact reserved ref verified-no-change; Nexus will bind that declaration to the authenticated snapshot it records after your response. Generic claims or a generic test pass do not prove a custom criterion. Nexus records file transactions or a no-change tree observation itself and still runs deterministic project verification before completing the goal."
+            + "\n\nCOMPLETION EVIDENCE\nFor every success criterion this task supports, return criteria_evidence using the exact criterion text and refs such as artifact:<transaction-id>, file:<relative-path>, or review:<task-id>. When inspecting an existing result without edits, use the exact reserved ref verified-no-change; Nexus will bind that declaration to the authenticated snapshot it records after your response. Generic claims or a generic test pass do not prove a custom criterion. "
+            + completion_guidance
             + "\n\nChoose only the next useful action. " + team_guidance
+            + "\n\nACTION FIELD RULES\n" + action_protocol.RULES + "\n"
             + "Request review only for meaningful risk, broad changes, failed checks, or when you need it. Ask the user only for genuine ambiguity, new authority, risky/irreversible action, missing access, or an unresolved blocker. "
               "Keep the conversation grounded in useful actions and evidence."
         )
@@ -6828,6 +7501,7 @@ class LongHorizonRuntime:
         context_tools = None
         tool_results: list[dict[str, Any]] = []
         requested_files: list[str] = []
+        stale_conversation_observations = False
 
         def account_dispatch(prefix: str, request_text: str, request_context: str):
             def before_dispatch(phase: str) -> None:
@@ -6868,7 +7542,7 @@ class LongHorizonRuntime:
             answer = chat_lab.ask_once(
                 self.config, agent["who"], request_text, context=request_context,
                 provider_attachments=provider_attachments,
-                response_format=AGENT_ACTION_FORMAT,
+                response_format=_agent_action_format(task),
                 conversation_key=conversation_key,
                 before_provider_dispatch=account_dispatch(phase, request_text, request_context),
                 after_provider_response=account_reply(phase),
@@ -6889,7 +7563,7 @@ class LongHorizonRuntime:
                 corrected = chat_lab.ask_once(
                     self.config, agent["who"], correction_prompt,
                     context=correction_context, provider_attachments=provider_attachments,
-                    response_format=AGENT_ACTION_FORMAT,
+                    response_format=_agent_action_format(task),
                     conversation_key=conversation_key,
                     prefer_existing_conversation=True,
                     before_provider_dispatch=account_dispatch(
@@ -6919,6 +7593,16 @@ class LongHorizonRuntime:
                 self.store.supersede_stale_context_steps(goal_id, task, current_context_binding)
                 task = next(one for one in self.store.get(goal_id)["tasks"] if one["id"] == task_id)
             phase = "initial"
+            tool_session_id = _stable_id("lh-tools", goal_id, task_id, task.get("attempts", 0))
+            # A receipt can be complete while its provider continuation is still
+            # pending. Resume must retain that session's consumed tool budget too.
+            for prior_step in reversed(task.get("context_steps", [])):
+                if prior_step.get("state") != "superseded" \
+                        and prior_step.get("context_binding") == current_context_binding:
+                    execution = _context_tool_execution(prior_step)
+                    if execution:
+                        tool_session_id = execution["session_id"]
+                        break
 
             def continuation_route() -> str:
                 current_goal = self.store.get(goal_id)
@@ -6947,8 +7631,8 @@ class LongHorizonRuntime:
                     ))
                     ledger = swarm_work.CollaborationLedger(
                         self.config, str(agent.get("who") or ""),
-                        _stable_id("lh-context", goal_id, task_id, task.get("attempts", 0)),
-                        session_id=_stable_id("lh-tools", goal_id, task_id, task.get("attempts", 0)),
+                        _stable_id("lh-context", tool_session_id),
+                        session_id=tool_session_id,
                     ).begin(current_goal["objective"], [agent], mode="long_horizon_context_tools")
                     context_tools = swarm_work._ProjectContextTools(
                         self.config, root, ledger,
@@ -6959,7 +7643,9 @@ class LongHorizonRuntime:
                     )
                 return context_tools
 
-            def run_context_calls(calls: list[dict[str, Any]], completed_ids: set[str]) -> bool:
+            def run_context_calls(step: dict[str, Any], completed_ids: set[str]) -> bool:
+                execution = _context_tool_execution(step)
+                calls = list(step.get("calls") or [])
                 for call in calls:
                     if not isinstance(call, dict):
                         raise HarnessError("A context-tool call is malformed")
@@ -6970,17 +7656,28 @@ class LongHorizonRuntime:
                         return False
                     self.store.reserve_context_tool(goal_id, task, call)
                     try:
-                        if str(call.get("name") or "") == "read_proposed_change":
+                        if str(call.get("name") or "") == "read_shared_conversation":
+                            arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                            result = self.store.dialogue_history(
+                                goal_id, after=int(arguments.get("after") or 0),
+                                limit=min(20, int(arguments.get("limit") or 20)),
+                                message_id=str(arguments.get("message_id") or ""),
+                                offset=int(arguments.get("offset") or 0),
+                                character_limit=min(12_000, int(arguments.get("character_limit") or 12_000)),
+                                viewer_agent_id=task["assigned_agent_id"],
+                            )
+                        elif str(call.get("name") or "") == "read_proposed_change":
                             if task.get("kind") != "review" or not task.get("review_of"):
-                                raise HarnessError(
-                                    "read_proposed_change is available only to a targeted review task"
+                                raise ReviewContextRequestError(
+                                    "read_proposed_change is available only to a targeted review task. "
+                                    "Use read_file to inspect the current applied project files."
                                 )
                             arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                             relative = str(arguments.get("path") or "").replace("\\", "/").strip()
                             offset = int(arguments.get("offset") or 0)
                             limit = min(20_000, max(1, int(arguments.get("limit") or 20_000)))
                             if offset < 0:
-                                raise HarnessError("A proposed-change offset cannot be negative")
+                                raise ReviewContextRequestError("A proposed-change offset cannot be negative")
                             latest = self.store.get(goal_id)
                             parent = next(
                                 one for one in latest["tasks"] if one["id"] == task["review_of"]
@@ -6991,8 +7688,10 @@ class LongHorizonRuntime:
                                 and str(one.get("path") or "").replace("\\", "/").strip() == relative
                             ), None)
                             if proposed is None:
-                                raise HarnessError("That path is not in the exact proposed review packet")
+                                raise ReviewContextRequestError("That path is not in the exact proposed review packet")
                             content = str(proposed.get("content") or "")
+                            if offset > len(content):
+                                raise ReviewContextRequestError("A proposed-change offset exceeds the exact proposed file length")
                             result = {
                                 "path": relative, "delete": proposed.get("delete") is True,
                                 "reason": _short(proposed.get("reason"), 1_000),
@@ -7002,9 +7701,24 @@ class LongHorizonRuntime:
                                 "has_more": offset + limit < len(content),
                             }
                         else:
-                            result = ensure_project_tools().execute(task["assigned_agent_id"], call)
+                            result = ensure_project_tools().execute(
+                                task["assigned_agent_id"], call,
+                                **({"execution_scope": execution["scope"]} if execution else {}),
+                            )
                     except Exception as exc:
                         self.store.record_context_tool_result(goal_id, task, call, error=str(exc))
+                        if str(call.get("name") or "") == "read_proposed_change" \
+                                and isinstance(exc, ReviewContextRequestError):
+                            # A stale or mistaken review tool request has made
+                            # no changes and disclosed no proposed contents.
+                            # Deliver the actual failure so the agent can use
+                            # read_file or correct its exact packet path. All
+                            # retries still consume the user's durable budgets.
+                            tool_results.append({
+                                "call_id": call.get("call_id"), "name": call.get("name"),
+                                "result": None, "error": str(exc),
+                            })
+                            continue
                         raise
                     self.store.record_context_tool_result(goal_id, task, call, result)
                     tool_results.append({
@@ -7026,6 +7740,15 @@ class LongHorizonRuntime:
                                 requested_files.append(path)
                     continue
                 for held in prior_step.get("results", []):
+                    if held.get("name") == "read_shared_conversation" and int(
+                        (held.get("result") or {}).get("latest_sequence") or 0
+                    ) != int((goal.get("dialogue_archive") or {}).get("latest_sequence") or 0):
+                        # Conversation observations expire independently of project
+                        # tools. The requesting public summary itself advances the
+                        # archive, so adding its head to the whole context binding
+                        # would needlessly replay already settled project tools.
+                        stale_conversation_observations = True
+                        continue
                     tool_results.append({
                         "call_id": held.get("call_id"), "name": held.get("name"),
                         "result": held.get("result"), "error": held.get("error"),
@@ -7036,10 +7759,11 @@ class LongHorizonRuntime:
                 and one.get("context_binding") == current_context_binding
             ), None)
             if pending_step:
+                tool_session_id = str(_context_tool_execution(pending_step).get("session_id") or tool_session_id)
                 completed_ids = {
                     str(one.get("call_id") or "") for one in pending_step.get("results", [])
                 }
-                if not run_context_calls(list(pending_step.get("calls") or []), completed_ids):
+                if not run_context_calls(pending_step, completed_ids):
                     return task, {"action": "deferred", "summary": "Paused at a context-tool boundary", "changes": []}
                 effect_acknowledged = True
                 phase = "context_tools_resume"
@@ -7051,6 +7775,12 @@ class LongHorizonRuntime:
                 latest_goal = self.store.get(goal_id)
                 latest_task = next(one for one in latest_goal["tasks"] if one["id"] == task_id)
                 context = self._agent_context(latest_goal, latest_task, requested_files)
+                if stale_conversation_observations:
+                    context += (
+                        "\n\nCONVERSATION FRESHNESS\nEarlier read_shared_conversation results were "
+                        "removed because new public messages arrived. Read the archive again when "
+                        "earlier messages matter; the shared conversation above includes the latest messages."
+                    )
                 if any(step.get("state") == "superseded" for step in latest_task.get("context_steps", [])):
                     context += (
                         "\n\nCONTEXT FRESHNESS\nEarlier tool observations were invalidated because the "
@@ -7067,19 +7797,54 @@ class LongHorizonRuntime:
                     "repository evidence or a targeted check is needed. Request tools or propose changes, "
                     "never both in one response. Return the structured action only."
                 )
+                recovery = latest_task.get("protocol_recovery") or {}
+                if recovery.get("state") == "pending":
+                    self.store._validate_protocol_recovery(latest_goal, latest_task, recovery)
+                    if recovery.get("binding") != self.store._protocol_binding(latest_goal, latest_task):
+                        self.store.settle_protocol_correction(goal_id, task, superseded=True)
+                        context += "\n\nAn earlier invalid proposal was discarded because its project context changed. Choose a fresh action from the current evidence."
+                        phase = "initial"
+                    else:
+                        phase = "protocol_correction"
+                        prompt = (
+                            "Correct the action protocol for this same task. Nexus rejected your preceding "
+                            "structured response and applied none of its proposed files, tools, delegations, "
+                            "questions, or handoffs. Select one valid next action using the current evidence; "
+                            "do not claim the rejected proposal was executed. Return only the action schema."
+                        )
+                        context += "\n\nACTION PROTOCOL CORRECTION\n" + _canonical({
+                            "error": recovery.get("error"), "error_code": recovery.get("error_code"),
+                            "rejected_summary": recovery.get("rejected_summary", ""),
+                            "rejected_action": recovery.get("rejected_action", ""),
+                            "populated_fields": recovery.get("populated_fields", []),
+                            "correction_attempt": int(recovery.get("attempts") or 0) + 1,
+                            "max_attempts": action_protocol.MAX_CORRECTIONS,
+                        }) + "\n" + action_protocol.RULES
                 action = ask_action(prompt, context, phase)
-                _validate_action_semantics(action, task)
+                try:
+                    _validate_action_semantics(action, latest_task)
+                except action_protocol.ActionProtocolError as error:
+                    recovery = self.store.record_protocol_rejection(goal_id, task, action, error)
+                    effect_acknowledged = True
+                    if recovery.get("state") == "superseded":
+                        return task, {"action": "superseded", "summary": "The rejected proposal was superseded by user steering.", "changes": []}
+                    if recovery.get("state") == "exhausted":
+                        raise HarnessError("The bounded action-protocol corrections were exhausted: " + str(error))
+                    continue
+                if phase == "protocol_correction":
+                    self.store.settle_protocol_correction(goal_id, task)
                 calls = action.get("tool_calls") or []
                 if calls:
                     if action.get("changes"):
                         raise HarnessError(
                             "An agent response may request context tools or propose changes, not both atomically"
                         )
-                    self.store.acknowledge_context_step(
+                    step = self.store.acknowledge_context_step(
                         goal_id, task, action, phase, current_context_binding,
+                        tool_session_id=tool_session_id,
                     )
                     effect_acknowledged = True
-                    if not run_context_calls(calls, set()):
+                    if not run_context_calls(step, set()):
                         return task, {"action": "deferred", "summary": "Paused at a context-tool boundary", "changes": []}
                     phase = "context_tools"
                     continue
@@ -7141,7 +7906,7 @@ class LongHorizonRuntime:
                     }
                 if isinstance(exc, RequiredParticipantCallReserved) and str(
                     current_task.get("provider_effect_state") or ""
-                ) == "context_step_acknowledged":
+                ) in {"context_step_acknowledged", "protocol_rejected"}:
                     # The prior response and its requested file/tool context
                     # are already durable. Yield this continuation without
                     # losing or replaying it; claim ordering now gives every
@@ -7292,6 +8057,7 @@ class LongHorizonRuntime:
                         "changes": manifest.get("changes", []),
                         "patch": _short(manifest.get("patch"), 80_000),
                         "patch_sha256": manifest.get("patch_sha256", ""),
+                        "tree_merkle": swarm_work._project_tree_merkle(root)[0],
                     }
                     self.store.record_transaction_applied(goal_id, task, artifact)
             elif action.get("action") in {"complete", "request_review"}:
@@ -7333,7 +8099,7 @@ class LongHorizonRuntime:
         result = swarm_work._run_selected_project_verification(
             self.config, root, project, goal["objective"], list(dict.fromkeys(changed)), None,
             verification_session_id=goal["goal_id"],
-            **({"verification_profile": "shared_goal_v1"}
+            **({"verification_profile": "shared_goal_v1", "context_check": True}
                if goal.get("require_all_participants") else {}),
         )
         updated = self.store.complete_verification(
@@ -7774,10 +8540,12 @@ class LongHorizonRuntime:
     def resume(
         self, goal_id: str, answers: dict[str, Any] | None = None, *,
         project_verification_settings: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
         if answers is None:
             return self.control(
                 goal_id, "resume",
+                **({"payload": {"expected_revision": expected_revision}} if expected_revision is not None else {}),
                 **({"project_verification_settings": project_verification_settings}
                    if project_verification_settings is not None else {}),
             )

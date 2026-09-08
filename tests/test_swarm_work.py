@@ -3553,8 +3553,10 @@ os._exit(23)
                 value = {"contribution": "review", "message_to_lead": "ready", "needs_files": [], "ready_to_execute": True, "remaining": []}
             elif response_format is swarm_work.WORK_FORMAT:
                 work_calls += 1
-                if work_calls == 1:
-                    value = {"reply": "need context", "changes": [], "tool_calls": [{"call_id": "read-1", "name": "read_file", "arguments": {"path": "source.txt", "start_line": 1, "end_line": 20, "max_bytes": 2000}}]}
+                if work_calls <= 2:
+                    # A provider-local ID may name a corrected request in the
+                    # next response without colliding with its earlier error.
+                    value = {"reply": "need context", "changes": [], "tool_calls": [{"call_id": "read-1", "name": "read_file", "arguments": {"path": "missing.txt" if work_calls == 1 else "source.txt", "start_line": 1, "end_line": 20, "max_bytes": 60_000}}]}
                 else:
                     saw_result = saw_result or "needed evidence" in kwargs.get("context", "")
                     value = {"reply": "created", "changes": [{"path": "from-context.txt", "content": "done\n", "reason": "requested"}], "tool_calls": []}
@@ -3808,9 +3810,12 @@ os._exit(23)
                     "end_line": 2, "max_bytes": 32_000,
                 },
             })
-            self.assertTrue(bounded["truncated"], bounded)
+            self.assertFalse(bounded["truncated"], bounded)
             self.assertEqual(bounded["status"], "ok", bounded)
-            self.assertEqual(bounded["content_bytes"], 32_000)
+            self.assertLessEqual(bounded["content_bytes"], 12_000)
+            page = json.loads(bounded["content"])
+            self.assertTrue(page["truncated"])
+            self.assertTrue(page["next_cursor"])
             self.assertFalse(any(
                 event.get("phase") == "context_tool_absolute_limit_rejected"
                 for event in per_call_ledger._read()
@@ -3818,17 +3823,59 @@ os._exit(23)
         finally:
             per_call.close()
 
+        # A 12k prompt page is transport pagination, even when the explicit
+        # remaining lifetime allowance is smaller than the generic 32k cap.
+        (self.project / "paged.txt").write_text("p" * 15_000, encoding="utf-8")
+        _, paged = opened("byte-pages")
+        paged.absolute_byte_limit = 20_000
+        page_call = {"call_id": "page", "name": "read_file", "arguments": {
+            "path": "paged.txt", "start_line": 1, "end_line": 1, "max_bytes": 60_000,
+        }}
+        try:
+            first = json.loads(paged.execute("agent-1", page_call, execution_scope="page-one")["content"])
+            self.assertTrue(first["next_cursor"])
+            page_call["arguments"]["cursor"] = first["next_cursor"]
+            second = json.loads(paged.execute("agent-1", page_call, execution_scope="page-two")["content"])
+            self.assertIsNone(second["next_cursor"])
+            self.assertEqual(first["content"] + second["content"], "p" * 15_000)
+            self.assertLess(paged.session.total_bytes, 20_000)
+        finally:
+            paged.close()
+
+        (self.project / "requested-pages.txt").write_text("r" * 6_000, encoding="utf-8")
+        _, requested = opened("byte-requested-pages")
+        requested.absolute_byte_limit = 8_000
+        page_call = {"call_id": "page", "name": "read_file", "arguments": {
+            "path": "requested-pages.txt", "start_line": 1, "end_line": 1, "max_bytes": 4_000,
+        }}
+        try:
+            first = json.loads(requested.execute("agent-1", page_call, execution_scope="requested-one")["content"])
+            page_call["arguments"]["cursor"] = first["next_cursor"]
+            second = json.loads(requested.execute("agent-1", page_call, execution_scope="requested-two")["content"])
+            self.assertIsNone(second["next_cursor"])
+            self.assertEqual(first["content"] + second["content"], "r" * 6_000)
+            self.assertLess(requested.session.total_bytes, 8_000)
+        finally:
+            requested.close()
+
         over_ledger, over = opened("byte-over")
         over.absolute_byte_limit = expected - 1
         try:
+            first = over.execute("agent-1", call, execution_scope="bounded-first")
+            self.assertEqual(first["status"], "ok")
+            self.assertFalse(first["truncated"])
+            page = json.loads(first["content"])
+            self.assertTrue(page["next_cursor"])
+            next_call = copy.deepcopy(call)
+            next_call["arguments"]["cursor"] = page["next_cursor"]
             with self.assertRaisesRegex(HarnessError, "during this result"):
-                over.execute("agent-1", call)
+                over.execute("agent-1", next_call, execution_scope="bounded-second")
             budget = next(
                 event["state"] for event in reversed(over_ledger._read())
                 if event.get("phase") == "context_tool_budget"
             )
-            self.assertEqual(budget["budget"]["calls"], 1)
-            self.assertEqual(budget["budget"]["total_bytes"], expected - 1)
+            self.assertEqual(budget["budget"]["calls"], 2)
+            self.assertLessEqual(budget["budget"]["total_bytes"], expected - 1)
             self.assertTrue(any(
                 event.get("phase") == "context_tool_absolute_limit_rejected"
                 for event in over_ledger._read()
@@ -4122,6 +4169,13 @@ os._exit(23)
     def test_goal_spec_speech_acts_compile_action_and_information_authority(self) -> None:
         actions = (
             "Can you update parser.py?", "Could you fix parser.py?",
+            "Can you guys update parser.py?", "Could you both fix parser.py?",
+            "Would you folks please repair parser.py?", "Will you all update parser.py?",
+            "Please could you two modify parser.py?", "Can you agents edit parser.py?",
+            "Could you team please fix parser.py?", "Can you help us fix parser.py?",
+            "Can you guys help me to update parser.py?", "Could you help repair parser.py?",
+            "Would you both mind fixing parser.py?",
+            "Would it be possible for you folks to update parser.py?",
             "Would you please fix parser.py?", "Would you mind fixing parser.py?",
             "Can you create report.md?", "Parser.py needs updating",
             "I need parser.py updated", "I want parser.py fixed",
@@ -4130,6 +4184,9 @@ os._exit(23)
         )
         information = (
             "Can the tool update parser.py?", "How do I update parser.py?",
+            "Can the agents update parser.py?", "Can you guys explain how to fix parser.py?",
+            "Could you both describe how to update parser.py?",
+            "Can you guys avoid modifying parser.py?", "Could you both not edit parser.py?",
             "Explain how to update parser.py", "Should I update parser.py?",
             "Should parser.py be refactored?", "What would updating parser.py change?",
             "Is it necessary to update parser.py?", "Do we need to update parser.py?",

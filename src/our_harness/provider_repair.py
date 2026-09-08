@@ -8,12 +8,13 @@ only renders the actions it is given.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
 from typing import Any
 
-from . import chat
+from . import action_protocol, chat
 from .config import LoadedConfig
 from .providers.connection import connection_status
 from .providers.subscription_cli import recipe_for, responding_command
@@ -21,6 +22,7 @@ from .seats import ROUTE_NAMES
 
 
 DIAGNOSIS_SCHEMA_VERSION = 1
+GOAL_ISSUE_SCHEMA_VERSION = 1
 
 
 def _action(
@@ -319,6 +321,8 @@ def _diagnosis_fingerprint(
             "source": diagnosis.get("source"),
             "category": diagnosis.get("category"),
             "summary": diagnosis.get("summary"),
+            **({key: diagnosis.get(key) for key in ("goal_id", "goal_revision", "task_ids")}
+               if diagnosis.get("source") == "authenticated-goal-task" else {}),
         },
     }
     encoded = json.dumps(
@@ -657,10 +661,13 @@ def repair_plan(
 
 
 def verified_plan(plan: dict[str, Any], milliseconds: int) -> dict[str, Any]:
-    """Return the same contract after a real provider answer proves recovery."""
+    """Verify the connection without claiming a stopped goal was repaired."""
 
     verified = {key: value for key, value in plan.items() if key != "repair"}
     repair = dict(plan.get("repair") or {})
+    goal_issue = repair.pop("goal_issue", None)
+    if isinstance(repair.get("connection_repair"), dict):
+        repair = dict(repair["connection_repair"])
     diagnosis = {
         "schema_version": DIAGNOSIS_SCHEMA_VERSION,
         "source": "live-model-answer",
@@ -675,9 +682,128 @@ def verified_plan(plan: dict[str, Any], milliseconds: int) -> dict[str, Any]:
         "summary": f"This exact route answered a live Nexus test in {max(0, int(milliseconds)) / 1000:.1f} seconds.",
         "steps": [
             "The route, provider session, and model answer path all worked.",
-            "This agent is reachable again.",
+            "This tests the connection only; it does not resume or repair a stopped goal.",
         ],
         "actions": [LIVE_TEST, CHECK],
         "verified_with_model_request": True,
     })
-    return _finish_plan(verified, repair, diagnosis)
+    result = _finish_plan(verified, repair, diagnosis)
+    return _present_goal_issue(result, goal_issue) if isinstance(goal_issue, dict) else result
+
+
+def _present_goal_issue(plan: dict[str, Any], issue: dict[str, Any]) -> dict[str, Any]:
+    """Keep connection evidence and goal recovery visibly separate."""
+
+    result = copy.deepcopy(plan)
+    connection = dict(result.get("repair") or {})
+    connection.pop("goal_issue", None)
+    connection.pop("connection_repair", None)
+    connection["actions"] = [one for one in connection.get("actions", [])
+                             if one.get("id") not in {"open-goal", "resume-goal"}]
+    binding = {key: issue[key] for key in (
+        "goal_id", "goal_revision", "conversation_id", "task_ids", "project_id", "participant_ids", "agent_id",
+    )}
+    open_goal = {**_action("open-goal", "Open saved goal", "Shows this exact goal and its saved failure."),
+                 **binding, "goal_issue_fingerprint": issue["fingerprint_sha256"]}
+    repair = {**connection, "goal_issue": copy.deepcopy(issue)}
+    if connection.get("state") in {"ready", "needs-verification", "verified"}:
+        actions = []
+        if issue["can_resume"]:
+            actions.append({
+                **_action("resume-goal", "Resume team", "Continues this saved goal using its bounded reply correction.", primary=True),
+                **binding, "goal_issue_fingerprint": issue["fingerprint_sha256"],
+            })
+        actions.append(open_goal)
+        actions.extend({**one, "label": "Test connection only"} if one.get("id") == "live-test" else dict(one)
+                       for one in connection.get("actions", []) if one.get("id") in {"live-test", "check"})
+        repair.update({
+            "state": "goal-action-invalid", "tone": "attention",
+            "title": "The saved goal needs a corrected agent reply",
+            "summary": "The provider answered, but Nexus could not use its action in this goal. " + issue["summary"],
+            "steps": [
+                "Signing in again or testing a READY response does not correct this saved agent action.",
+                "Resume this team to request the bounded correction." if issue["can_resume"] else issue["recovery_reason"],
+            ],
+            "actions": actions, "connection_repair": copy.deepcopy(connection),
+        })
+        diagnosis = {"schema_version": DIAGNOSIS_SCHEMA_VERSION, "source": "authenticated-goal-task",
+                     "category": "action-protocol", "retryable": issue["can_resume"],
+                     "summary": issue["summary"], **binding}
+    else:
+        # A current missing login, route, or uncertain delivery still has its
+        # own repair boundary. An unrelated goal error must never waive it.
+        repair["actions"] = [*connection.get("actions", []), open_goal]
+        diagnosis = dict(connection.get("diagnosis") or {})
+    return _finish_plan({key: value for key, value in result.items() if key != "repair"}, repair, diagnosis)
+
+
+def with_goal_failure(
+    plan: dict[str, Any], goal: dict[str, Any], recovery: dict[str, Any] | None = None,
+    *, agent_id: str = "",
+) -> dict[str, Any]:
+    """Join a route plan to an authenticated current GoalStore document.
+
+    Callers must obtain both arguments from GoalStore, never an HTTP-supplied
+    task document. Only its read-only protocol_recovery_status verdict can
+    offer Resume; this function cannot authorize, mutate, or retry a goal.
+    """
+
+    result = copy.deepcopy(plan)
+    repair = dict(result.get("repair") or {})
+    if isinstance(repair.get("connection_repair"), dict):
+        repair = dict(repair["connection_repair"])
+    repair.pop("goal_issue", None)
+    repair["actions"] = [one for one in repair.get("actions", [])
+                         if one.get("id") not in {"open-goal", "resume-goal"}]
+    result["repair"] = repair
+    route = str(result.get("route") or "")
+    if not route or goal.get("status") not in {"paused", "failed"}:
+        return result
+    agent_ids = {str(one.get("id") or "") for one in goal.get("agents", [])
+                 if isinstance(one, dict) and str(one.get("who") or "") == route}
+    if agent_id:
+        agent_ids &= {agent_id}
+    def action_error(task: dict[str, Any]) -> str:
+        held = task.get("protocol_recovery")
+        if task.get("provider_effect_state") == "protocol_rejected" and isinstance(held, dict) \
+                and held.get("schema_version") in {1, action_protocol.SCHEMA_VERSION} \
+                and held.get("state") in {"pending", "exhausted"}:
+            error = str(held.get("error") or "")
+            return error if action_protocol.error_code(error) == held.get("error_code") and held.get("error_code") else ""
+        error = str(task.get("last_error") or "")
+        return error if task.get("provider_effect_state") == "known_reply_failed" and action_protocol.error_code(error) else ""
+
+    # Only exact known validator errors or typed rejections belong here.
+    # Other engine errors and peer summaries quoting an error cannot become
+    # claims that this provider's action protocol failed.
+    tasks = [one for one in goal.get("tasks", []) if isinstance(one, dict)
+             and one.get("assigned_agent_id") in agent_ids
+             and one.get("state") in {"blocked", "failed"}
+             and not one.get("outcome_unknown") and action_error(one)]
+    if not tasks:
+        return result
+    task_ids = [str(one["id"]) for one in tasks]
+    verdict = recovery if isinstance(recovery, dict) else {}
+    can_resume = bool(
+        verdict.get("schema_version") == 1 and verdict.get("eligible") is True
+        and verdict.get("action") == "resume" and verdict.get("goal_id") == goal.get("goal_id")
+        and verdict.get("goal_revision") == goal.get("revision")
+        and isinstance(verdict.get("task_ids"), list) and set(task_ids) <= set(verdict["task_ids"])
+        and all(not one.get("pending_action") and not one.get("pending_transaction") for one in tasks)
+    )
+    issue = {
+        "schema_version": GOAL_ISSUE_SCHEMA_VERSION, "source": "authenticated-goal-task",
+        "goal_id": str(goal.get("goal_id") or ""), "goal_revision": int(goal.get("revision") or 0),
+        "conversation_id": str(goal.get("conversation_id") or ""), "route": route,
+        "project_id": str((goal.get("project") or {}).get("id") or ""),
+        "participant_ids": list(goal.get("requested_agent_ids") or [str(one.get("id") or "") for one in goal.get("agents", [])]),
+        "agent_id": agent_id or str(tasks[0].get("assigned_agent_id") or ""),
+        "task_ids": task_ids, "category": "action-protocol",
+        "summary": _normalise_failure("; ".join(action_error(one) for one in tasks)),
+        "can_resume": can_resume, "recovery_code": str(verdict.get("code") or "none"),
+        "recovery_reason": str(verdict.get("reason") or "Open the saved goal to inspect its recovery state before retrying."),
+    }
+    issue["fingerprint_sha256"] = hashlib.sha256(json.dumps(
+        issue, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    return _present_goal_issue(result, issue)

@@ -464,15 +464,38 @@ class LongHorizonDialogueTests(unittest.TestCase):
         self.assertIn("Fixture provider unavailable", seen[1][1])
         self.assertEqual([one["agent_id"] for one in result["dialogue"]["messages"]], ["peer"])
 
-    def test_rephrased_no_progress_conversation_stops_before_global_budget(self):
-        goal = self.create()
+    def test_identical_no_progress_conversation_stops_before_global_budget(self):
+        goal = self.create(policy={"max_provider_calls": 80})
         result, seen = self.run_replies(goal, lambda number, _route, _kwargs: reply(
-            "work", f"Planning comment number {number}; no new file or evidence.",
+            "work", "I am still planning the same unchanged step.",
         ))
         self.assertEqual(result["status"], "paused")
         self.assertLessEqual(len(seen), 2 * (long_horizon.MAX_NO_PROGRESS + 1))
         self.assertLess(result["budget"]["provider_calls"], result["budget"]["max_provider_calls"])
         self.assertIn("no new evidence", result["note"])
+
+    def test_distinct_public_discussion_continues_without_artificial_file_edits(self):
+        goal = self.create("useful-design-conversation")
+        discussion = [
+            "We should persist reward balance so purchases survive reload.",
+            "The inventory should also survive reload; equipment refers to owned item IDs.",
+            "Purchase validation must reject already owned items before charging balance.",
+            "Agreed. Failed purchases should retain the existing inventory and balance.",
+            "Equipment must be validated against ownership before applying an effect.",
+            "Effects should derive from the equipped item to avoid stacking on reload.",
+            "An unequip action should restore base movement and score multipliers.",
+            "A changed catalog needs to tolerate saved item IDs that are no longer present.",
+            "We can retain ownership history while ignoring unavailable effects.",
+            "The UI should state the missing item clearly when restoring equipment.",
+            "The purchase button can show the exact missing balance without disabling inspection.",
+            "The selected architecture now covers persistence and catalog migration.",
+        ]
+        result, seen = self.run_replies(goal, [
+            *(reply("work", message) for message in discussion), reply(), reply(),
+        ])
+        self.assertEqual(result["status"], "complete", result["note"])
+        self.assertEqual(len(seen), len(discussion) + 2)
+        self.assertFalse(any(one.get("kind") == "file_transaction" for one in result["artifacts"]))
 
     def test_new_tool_observations_extend_work_but_new_envelopes_do_not(self):
         for distinct in (True, False):
@@ -480,7 +503,7 @@ class LongHorizonDialogueTests(unittest.TestCase):
                 goal = self.create("observations-" + str(distinct))
                 observed = []
                 fake_tools = mock.Mock()
-                def tool_result(_agent, call):
+                def tool_result(_agent, call, *, execution_scope=""):
                     observed.append(call["call_id"])
                     number = len(observed)
                     return {

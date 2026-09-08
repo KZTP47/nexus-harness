@@ -345,17 +345,161 @@ class AgentToolBoundaryTests(unittest.TestCase):
                     "read_file",
                     {"path": "note.txt", "start_line": 1, "end_line": 1, "max_bytes": 100},
                 )
-                with self.assertRaisesRegex(HarnessError, "already bound"):
-                    resumed_session.execute(
-                        "planner",
-                        "stable-call",
-                        "read_file",
-                        {"path": "note.txt", "start_line": 1, "end_line": 2, "max_bytes": 100},
-                    )
+                rejected = resumed_session.execute(
+                    "planner",
+                    "stable-call",
+                    "read_file",
+                    {"path": "note.txt", "start_line": 1, "end_line": 2, "max_bytes": 100},
+                )
+                self.assertEqual(rejected["status"], "error")
+                self.assertEqual(json.loads(rejected["content"])["code"], "tool_call_id_conflict")
             self.assertTrue(resumed["replayed"])
             self.assertTrue(resumed["duplicate"])
             self.assertEqual(resumed["content"], first["content"])
             self.assertIn("first version", resumed["content"])
+
+    def test_cached_file_page_never_returns_truncated_success_when_budget_shrinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "source.txt").write_text("x" * 6000, encoding="utf-8")
+            write_config(root, {"workflow": {"max_tool_output_bytes": 1024, "max_tool_total_bytes": 1500}})
+            config = load_config(root)
+            with MemoryStore(config) as memory:
+                session = AgentToolSession(config, memory, WorkflowDeadline.start(5), lambda *_: None)
+                args = {"path": "source.txt", "start_line": 1, "end_line": 1, "max_bytes": 1_000_000}
+                first = session.execute("reader", "one", "read_file", args, execution_scope="same-response")
+                self.assertEqual(first["status"], "ok")
+                self.assertTrue(json.loads(first["content"])["next_cursor"])
+                with patch.object(session, "_dispatch", side_effect=AssertionError("A cache hit must not reexecute")):
+                    second = session.execute("reader", "two", "read_file", args, execution_scope="same-response")
+                self.assertTrue(second["duplicate"])
+                self.assertEqual(second["status"], "error")
+                self.assertEqual(json.loads(second["content"])["code"], "output_budget_exhausted")
+                self.assertLessEqual(session.total_bytes, 1500)
+
+    def test_call_id_conflict_returns_repair_feedback_and_preserves_original_journal(self) -> None:
+        for restore_budget in (None, False, True):
+            with self.subTest(restore_budget=restore_budget), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "note.txt").write_text("one\ntwo\n", encoding="utf-8")
+                config = load_config(root)
+                events = []
+                with MemoryStore(config) as memory:
+                    run_id = memory.start_run("recoverable identity conflict")
+                    session = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *event: events.append(event), run_id=run_id)
+                    arguments = {"path": "note.txt", "start_line": 1, "end_line": 1, "max_bytes": 100}
+                    first = session.execute("worker", "read-1", "read_file", arguments)
+                    prior_journal = [tuple(row) for row in memory.connection.execute("SELECT * FROM agent_tool_journal")]
+                    if restore_budget is not None:
+                        budget = session.budget_state()
+                        session = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *event: events.append(event), run_id=run_id)
+                        if restore_budget:
+                            session.restore_budget_state(budget)
+                    with patch.object(session, "_dispatch", wraps=session._dispatch) as dispatch:
+                        rejected = session.execute("worker", "read-1", "read_file", {**arguments, "end_line": 2})
+                        self.assertEqual(rejected["status"], "error")
+                        self.assertTrue(json.loads(rejected["content"])["retryable"])
+                        dispatch.assert_not_called()
+                        replayed = session.execute("worker", "read-1", "read_file", arguments)
+                        dispatch.assert_not_called()
+                    self.assertEqual(first["content"], replayed["content"])
+                    self.assertTrue(replayed["replayed"])
+                    self.assertEqual(prior_journal, [tuple(row) for row in memory.connection.execute("SELECT * FROM agent_tool_journal")])
+                    corrected = session.execute("worker", "read-2", "read_file", {**arguments, "end_line": 2})
+                    self.assertEqual(corrected["status"], "ok")
+                    self.assertIn("two", corrected["content"])
+                    starts = [event for event in events if event[0] == "tool_start"]
+                    results = [event for event in events if event[0] == "tool_result"]
+                    self.assertEqual(len(starts), len(results))
+
+    def test_provider_call_ids_are_independent_between_agents_and_response_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "note.txt"
+            target.write_text("first\nsecond\n", encoding="utf-8")
+            config = load_config(root)
+            with MemoryStore(config) as memory:
+                run_id = memory.start_run("independent provider call IDs")
+                session = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *_: None, run_id=run_id)
+                arguments = {"path": "note.txt", "start_line": 1, "end_line": 1, "max_bytes": 100}
+                session.execute("worker-a", "read", "read_file", arguments)
+                other = session.execute("worker-b", "read", "read_file", {**arguments, "start_line": 2, "end_line": 2})
+                self.assertEqual(other["status"], "ok")
+                self.assertIn("second", other["content"])
+                first = session.execute("worker-a", "read", "read_file", arguments, execution_scope="response-1")
+                budget = session.budget_state()
+                target.write_text("new project content\n", encoding="utf-8")
+                resumed = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *_: None, run_id=run_id)
+                resumed.restore_budget_state(budget)
+                replayed = resumed.execute("worker-a", "read", "read_file", arguments, execution_scope="response-1")
+                fresh = resumed.execute("worker-a", "read", "read_file", arguments, execution_scope="response-2")
+                self.assertEqual(first["content"], replayed["content"])
+                self.assertTrue(replayed["replayed"])
+                self.assertFalse(fresh["duplicate"])
+                self.assertEqual(fresh["call_id"], "read")
+                self.assertIn("new project content", fresh["content"])
+
+    def test_scoped_id_rebinding_cannot_repeat_an_external_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = load_config(Path(temporary))
+            with MemoryStore(config) as memory:
+                run_id = memory.start_run("strict scoped operation identity")
+                session = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *_: None, run_id=run_id)
+                with patch.object(session, "_dispatch", return_value={"classification": "idempotent", "effect": "recorded"}) as dispatch:
+                    first = session.execute("worker", "operation", "mcp_call", {"value": 1}, execution_scope="response-1")
+                    exact = session.execute("worker", "operation", "mcp_call", {"value": 1}, execution_scope="response-1")
+                    rejected = session.execute("worker", "operation", "mcp_call", {"value": 2}, execution_scope="response-1")
+                    dispatch.assert_called_once()
+                self.assertEqual(first["content"], exact["content"])
+                self.assertEqual(rejected["status"], "error")
+                self.assertEqual(memory.connection.execute("SELECT count(*) FROM agent_tool_journal").fetchone()[0], 1)
+
+    def test_identity_migration_preserves_budget_legacy_replay_and_new_scope_freshness(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "note.txt").write_text("first\nsecond\n", encoding="utf-8")
+            config = load_config(root)
+            with MemoryStore(config) as memory:
+                run_id = memory.start_run("legacy identity migration")
+                session = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *_: None, run_id=run_id)
+                arguments = {"path": "note.txt", "start_line": 1, "end_line": 1, "max_bytes": 100}
+                first = session.execute("worker", "read", "read_file", arguments)
+                legacy_budget = session.budget_state()
+                legacy_budget["schema_version"] = 1
+                legacy_budget.pop("identity_contract_sha256")
+                legacy_budget.pop("legacy_call_ids_sha256")
+                legacy_budget["call_ids_sha256"] = {hashlib.sha256(b"read").hexdigest(): next(iter(session.call_ids.values()))}
+                resumed = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *_: None, run_id=run_id)
+                resumed.restore_budget_state(legacy_budget)
+                self.assertEqual(resumed.calls, 1)
+                self.assertEqual(resumed.total_bytes, first["content_bytes"])
+                self.assertEqual(resumed.budget_state()["schema_version"], 2)
+                replayed = resumed.execute("worker", "read", "read_file", arguments)
+                rejected = resumed.execute("worker", "read", "read_file", {**arguments, "end_line": 2})
+                corrected = resumed.execute("worker", "read", "read_file", {**arguments, "end_line": 2}, execution_scope="new-response")
+                self.assertTrue(replayed["replayed"])
+                self.assertEqual(rejected["status"], "error")
+                self.assertEqual(corrected["status"], "ok")
+                self.assertIn("second", corrected["content"])
+                incompatible = resumed.budget_state()
+                incompatible["identity_contract_sha256"] = "0" * 64
+                with self.assertRaisesRegex(HarnessError, "identity contract"):
+                    resumed.restore_budget_state(incompatible)
+
+    def test_corrupt_journal_is_not_downgraded_to_a_repairable_call_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "note.txt").write_text("unchanged", encoding="utf-8")
+            config = load_config(root)
+            with MemoryStore(config) as memory:
+                run_id = memory.start_run("journal integrity remains enforced")
+                session = AgentToolSession(config, memory, WorkflowDeadline.start(30), lambda *_: None, run_id=run_id)
+                arguments = {"path": "note.txt", "start_line": 1, "end_line": 1, "max_bytes": 100}
+                session.execute("worker", "read", "read_file", arguments)
+                memory.connection.execute("UPDATE agent_tool_journal SET result_sha256=?", ("0" * 64,))
+                memory.connection.commit()
+                with self.assertRaisesRegex(HarnessError, "integrity validation"):
+                    session.execute("worker", "read", "read_file", arguments)
 
     def test_openai_adapter_translates_and_returns_complete_native_calls(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

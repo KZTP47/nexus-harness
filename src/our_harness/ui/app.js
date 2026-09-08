@@ -6502,9 +6502,16 @@ let chatLimits = {
   overflow_policy: "reject_without_truncation",
 };
 const swarmChatLimits = new Map();
+const TEAM_FOLLOW_UP_CHARACTERS = 20000;
 
 function limitsForSwarmChat(agentId) {
-  return swarmChatLimits.get(String(agentId || "")) || chatLimits;
+  const limits = swarmChatLimits.get(String(agentId || "")) || chatLimits;
+  const goal = chatLongGoalContext(agentId).goal;
+  return goal ? {
+    ...limits,
+    input_characters: Math.min(Number(limits.input_characters || 200000), TEAM_FOLLOW_UP_CHARACTERS),
+    shared_goal_context: goal.require_all_participants === true,
+  } : limits;
 }
 
 function outputBudgetFact(limits) {
@@ -6528,6 +6535,9 @@ function captureBudgetFact(limits) {
 }
 
 function longHorizonContextFact(limits) {
+  if (limits?.shared_goal_context) {
+    return "Up to 64 recent team messages (96,000 characters) are included automatically; agents can retrieve the full saved history.";
+  }
   const policy = limits?.long_horizon_context;
   if (!policy) return "";
   return `${Number(policy.prompt_transcript_characters || 120000).toLocaleString()}-character conversation-history projection per long-horizon phase with deterministic older-turn semantic summaries; surrounding goal, project, and turn instructions are additional; full history stays in the paged ledger`;
@@ -7053,8 +7063,8 @@ const swarmChatComposerKeys = new Map();
 const theBigChatComposerDrafts = new Map();
 let theBigChatComposerKey = "";
 // Round policy belongs to the exact saved pair chat, just like attachments.
-// New chats stop the legacy relay after three rounds. Unlimited remains an
-// explicit advanced opt-in; the engine's no-progress guard still applies.
+// New chats continue while making progress. A finite relay budget is an
+// explicit user choice; the engine's no-progress guard still applies.
 const swarmChatRoundPolicies = new Map();
 const DEFAULT_FINITE_TEAM_ROUNDS = 3;
 // A paused or not-yet-verified project run belongs to one exact saved pair
@@ -7361,7 +7371,7 @@ async function sendToActiveChatGoal(agentId, box) {
     if (!goal) return {handled: false};
     if (goal.status === "cancelling") throw new Error("The team is stopping. Your draft is kept until this goal has stopped.");
     if (!text) throw new Error("Type a message to the team first.");
-    if (text.length > 20000) throw new Error("Team follow-up messages can contain up to 20,000 characters. Your complete draft is kept; split the message before sending.");
+    if (text.length > TEAM_FOLLOW_UP_CHARACTERS) throw new Error("Team follow-up messages can contain up to 20,000 characters. Your complete draft is kept; split the message before sending.");
     if ((swarmChatAttachments.get(chatKey) || []).length) {
       throw new Error("This goal's follow-up messages accept text. Remove the attached files before sending; your files and draft have been kept.");
     }
@@ -7565,6 +7575,10 @@ function syncChatGoalControls(agentId, card = null) {
   if (active && project) project.disabled = true;
   const reset = find(".swarm-chat-again", "unused");
   if (active && reset) reset.disabled = true;
+  // Goal polling can change the composer contract without a keystroke.
+  if (card?.querySelector(".swarm-chat-box")) countWhatIsTypedTo(agentId);
+  else if (inBig) countWhatIsTypedInBigChat();
+  renderSwarmChatActivity(agentId);
 }
 
 function chatRecipientWords(agentId) {
@@ -9544,7 +9558,7 @@ function renderWorkRecovery(agentId) {
 function chatRoundPolicyFor(agentId) {
   const key = swarmChatKey(agentId);
   if (!swarmChatRoundPolicies.has(key)) {
-    swarmChatRoundPolicies.set(key, {unlimited: false, maximum: DEFAULT_FINITE_TEAM_ROUNDS});
+    swarmChatRoundPolicies.set(key, {unlimited: true, maximum: DEFAULT_FINITE_TEAM_ROUNDS});
   }
   return swarmChatRoundPolicies.get(key);
 }
@@ -9609,10 +9623,10 @@ function aChatRoundPolicy(agentId) {
     updateChatRoundPolicy(agentId, unlimited.checked, maximum.value)
   ));
   unlimitedLabel.append(unlimited, document.createTextNode(
-    " Unlimited while progress continues (advanced opt-in)"));
+    " Continue while progress continues"));
   panel.append(maximumLabel, unlimitedLabel);
   panel.append(make("span", "hint chat-round-help",
-    "Ask connected agents stops after 3 relay rounds by default. Unlimited is an explicit opt-in. Project-file Work uses the separate goal engine."));
+    "The team continues while it makes progress. Set a maximum here when you want a round budget. Project-file Work uses its saved goal budget."));
   return panel;
 }
 
@@ -9722,6 +9736,7 @@ function aChatActivityPanel(extraClass = "") {
 }
 
 function activityWords(activity) {
+  if (activity.elapsedLabel) return activity.elapsedLabel;
   const seconds = Math.max(0, Math.floor((Date.now() - activity.startedAt) / 1000));
   if (activity.settled && activity.state === "attention") return `Needs attention after ${seconds}s`;
   if (activity.terminalState === "admitted") return `Accepted in ${seconds}s`;
@@ -9733,14 +9748,90 @@ function activityWords(activity) {
 function showActivityInPanel(panel, activity) {
   panel.hidden = !activity;
   if (!activity) return;
+  const elapsed = activityWords(activity);
+  const snapshot = JSON.stringify([activity.state, activity.stage, activity.detail, elapsed]);
+  if (panel.dataset.activitySnapshot === snapshot) return;
+  panel.dataset.activitySnapshot = snapshot;
   panel.dataset.state = activity.state;
   panel.querySelector(".chat-activity-stage").textContent = activity.stage;
-  panel.querySelector(".chat-activity-detail").textContent = activity.detail;
-  panel.querySelector(".chat-activity-elapsed").textContent = activityWords(activity);
+  const detail = String(activity.detail || "");
+  const lengthy = detail.length > 360;
+  panel.querySelector(".chat-activity-detail").textContent = lengthy
+    ? (detail.match(/^.{1,360}?[.!?](?:\s|$)/s)?.[0]?.trim() || `${detail.slice(0, 320).trimEnd()}…`) : detail;
+  let explanation = panel.querySelector(".chat-activity-explanation");
+  if (lengthy && !explanation) {
+    explanation = make("details", "chat-activity-explanation");
+    explanation.append(make("summary", "", "Full status details"), make("p"));
+    panel.append(explanation);
+  }
+  if (explanation) {
+    explanation.hidden = !lengthy;
+    explanation.querySelector("p").textContent = lengthy ? detail : "";
+  }
+  panel.querySelector(".chat-activity-elapsed").textContent = elapsed;
+}
+
+function chatGoalActivity({goal, problem}) {
+  if (!goal && !problem) return null;
+  const status = (state, stage, detail) => ({state, stage, detail, elapsedLabel: "Team status"});
+  if (problem) return status("attention", "Team needs attention", problem);
+  const tasks = Array.isArray(goal.tasks) ? goal.tasks : [];
+  const agentName = (task) => (goal.agents || []).find(
+    (one) => one.id === task.assigned_agent_id)?.name
+    || theSwarmAgent(task.assigned_agent_id)?.name || "The agent";
+  const note = String(goal.note || "").trim();
+  if (goal.pending_interrupts?.length || goal.status === "waiting_for_user") {
+    return status("attention", "Waiting for your answer",
+      "The team has paused for a decision. Choose your answers in the decision cards above.");
+  }
+  if (["paused", "failed"].includes(goal.status)) {
+    return status("attention", goal.status === "failed" ? "Team stopped" : "Team paused",
+      note || tasks.find((one) => one.last_error)?.last_error || "Use Resume team when you are ready to continue.");
+  }
+  if (goal.status === "cancelling") return status("waiting", "Stopping the team",
+    "Nexus is waiting for the current work to stop safely.");
+  if (goal.status === "waiting_for_project") return status("waiting", "Waiting for project access",
+    "Another saved goal is using this project. This team will continue when access is available.");
+  const correcting = tasks.find((one) => ["running", "ready"].includes(one.state)
+    && [1, 2].includes(one.protocol_recovery?.schema_version)
+    && ["pending", "dispatched"].includes(one.protocol_recovery.state));
+  if (correcting) return status(correcting.state === "running" ? "working" : "waiting",
+    `Correcting ${agentName(correcting)}’s response`,
+    `Nexus is retrying the response format (${correcting.protocol_recovery.attempts || 0} of ${correcting.protocol_recovery.max_attempts || 2} attempts). The team’s saved work is kept.`);
+  const running = tasks.filter((one) => one.state === "running");
+  const responding = running.filter((one) => one.provider_effect_state === "dispatched");
+  if (responding.length) return status("working", responding.length === 1
+    ? `${agentName(responding[0])} is responding` : "The agents are responding",
+    "A reply has been requested. Their next message will appear in this chat when it arrives.");
+  if (running.some((one) => ["reply_received", "acknowledged", "context_step_acknowledged"].includes(one.provider_effect_state))) {
+    return status("working", "Processing the team’s reply",
+      "Nexus is checking the response and saving the team’s next step.");
+  }
+  if (tasks.some((one) => one.state === "waiting_review")) {
+    return status("waiting", "Waiting for review", "The team’s changes are saved and waiting for review.");
+  }
+  if (tasks.some((one) => one.state === "pending_apply")) {
+    return status("waiting", "Waiting to apply reviewed changes", "Nexus has saved the proposed changes and will apply them when their checks allow it.");
+  }
+  if (goal.automatic_start_failure?.retry_automatically === true
+      && goal.project_queue?.auto_start_pending === true && !goal.worker?.worker_id) {
+    return status("waiting", "Waiting to retry team startup", goal.automatic_start_failure.error
+      || "Nexus will retry starting this saved goal automatically.");
+  }
+  if (goal.status === "queued") return status("waiting", "Team queued",
+    "Your request is saved. Nexus is waiting to start the team’s next turn.");
+  if (goal.status === "running") return status("working", running.length === 1
+    ? `Preparing ${agentName(running[0])}’s next turn` : "Team is working",
+    "Nexus is coordinating the next step. New replies will appear here.");
+  return status("waiting", `Team · ${longHorizonStateWords(goal.status)}`, note || "The saved goal’s current status is shown here.");
 }
 
 function renderSwarmChatActivity(agentId, chatKey = swarmChatRuntimeKey(agentId)) {
-  const activity = visibleSwarmChatActivity(swarmChatActivity.get(chatKey));
+  // An old request can settle after its initiating card switches chats. Resolve
+  // the goal through a view still bound to this exact runtime key.
+  const owner = swarmChats.find((held) => swarmChatRuntimeKey(held.agent) === chatKey)?.agent;
+  const activity = (owner ? chatGoalActivity(chatLongGoalContext(owner)) : null)
+    || visibleSwarmChatActivity(swarmChatActivity.get(chatKey));
   const panels = [];
   for (const held of swarmChats) {
     if (swarmChatRuntimeKey(held.agent) !== chatKey) continue;
@@ -13139,6 +13230,9 @@ const chatPhaseNames = {
   agent_plan: "Connected-agent plan",
   lead_plan: "Lead agent's plan",
   agent_discussion: "Team discussion",
+  agent_progress: "Progress update",
+  agent_tool: "Tool activity",
+  recovered_history: "Recovered history · original chat match unconfirmed",
   agent_plan_review: "Plan review",
   lead_execution: "Provisional execution pass",
   agent_execution: "Connected-agent provisional execution",
@@ -13203,6 +13297,69 @@ function aChatGoalStatusRow(speaker, text, at, correlation, className, metadata 
   if (metadata.model) under.push(metadata.model);
   if (under.length) details.append(make("p", "hint", under.join(" | ")));
   appendLongHorizonGoalLink(details, correlation);
+  row.append(details);
+  return row;
+}
+
+// Only the engine's authenticated tool projection opts into this rendering.
+// A model's reply containing JSON stays an ordinary reply. These are public
+// tool records and provider-written updates, never private model reasoning.
+const expandedChatToolActivity = new Set();
+
+function normalizedChatToolActivity(one) {
+  const correlation = one?.correlation;
+  if (one?.phase !== "agent_tool" || Number(correlation?.schema_version) !== 1
+      || correlation.kind !== "long_horizon_tool_activity" || !correlation.event_id) return null;
+  try {
+    const value = JSON.parse(one.text);
+    if (value?.schema_version !== 1 || value.kind !== "nexus_tool_activity"
+        || typeof value.name !== "string"
+        || !["requested", "finished", "failed", "superseded"].includes(value.status)) return null;
+    return {...value, eventId: correlation.event_id};
+  } catch { return null; }
+}
+
+function aChatToolActivityRow(speaker, activity, at, className) {
+  const row = make("li", `${className} chat-tool-activity-row`);
+  row.dataset.activityId = activity.eventId;
+  row.dataset.toolName = activity.name;
+  row.dataset.toolStatus = activity.status;
+  const details = make("details", "chat-tool-activity");
+  details.open = expandedChatToolActivity.has(activity.eventId);
+  const heading = make("summary", "chat-tool-heading");
+  const name = ({read_file: "Read file", request_file_context: "Read project files",
+    search_workspace: "Search project", list_directory: "List files",
+    run_selected_verification: "Run verification", read_proposed_change: "Read proposed changes",
+    read_shared_conversation: "Read earlier conversation"})[activity.name] || activity.name.replaceAll("_", " ");
+  const target = activity.arguments?.path || activity.arguments?.query || "";
+  heading.append(make("span", "chat-tool-speaker", speaker));
+  heading.append(make("strong", "chat-tool-name", name));
+  if (target) heading.append(make("span", "chat-tool-target", String(target)));
+  heading.append(make("span", "chat-tool-state", ({requested: "Requested", finished: "Finished",
+    failed: "Failed", superseded: "Superseded"})[activity.status]));
+  details.append(heading);
+  const body = make("div", "chat-tool-body");
+  const attribution = make("p", "hint chat-tool-attribution",
+    "Recorded tool activity. Progress updates in the chat are the explanations shared by the provider.");
+  if (at) {
+    const time = make("time", "chat-tool-time", new Date(at).toLocaleTimeString());
+    time.dateTime = at;
+    time.title = at;
+    body.append(time);
+  }
+  for (const [key, label] of [["arguments", "Input"], ["error", "Error"], ["result", "Output"]]) {
+    if (!Object.hasOwn(activity, key)) continue;
+    body.append(make("h4", "chat-tool-detail-label", label));
+    const value = typeof activity[key] === "string" ? activity[key] : JSON.stringify(activity[key], null, 2);
+    body.append(make("pre", "chat-tool-output", value));
+  }
+  body.append(attribution);
+  details.append(body);
+  details.addEventListener("toggle", () => {
+    if (!details.isConnected) return;
+    if (details.open) expandedChatToolActivity.add(activity.eventId);
+    else expandedChatToolActivity.delete(activity.eventId);
+  });
   row.append(details);
   return row;
 }
@@ -13449,6 +13606,11 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
   let latestUserPrompt = "";
   for (const [turnIndex, one] of said.entries()) {
     if (one.who === "you" && String(one.text || "").trim()) latestUserPrompt = one.text;
+    const activity = normalizedChatToolActivity(one);
+    if (activity) {
+      list.append(aChatToolActivityRow(chatTurnSpeaker(one, agent), activity, one.at, "talk-turn"));
+      continue;
+    }
     if (isRoutineGoalStatusTurn(one)) {
       list.append(aChatGoalStatusRow(chatTurnSpeaker(one, agent), one.text, one.at,
         normalizedLongHorizonCorrelation(one), "talk-turn nexus-turn", one));
@@ -13456,7 +13618,7 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
     }
     const participantOutcome = normalizedParticipantOutcome(one);
     const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
-      "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
+      "agent_discussion", "agent_progress", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
       .includes(one.phase);
     const row = make("li", `talk-turn ${one.who} ${collaboration ? "between" : ""}`);
     row.classList.toggle("nexus-turn", isNexusChatTurn(one));
@@ -14919,8 +15081,14 @@ function missionSelectedGoalId() {
 function missionStatusWords(goal) {
   if (!goal) return "No long-horizon goal selected.";
   const progress = goal.progress || {complete: 0, total: 0};
+  const budget = goal.budget || {};
+  const policy = budget.call_limit_policy;
+  const unlimited = policy?.schema_version === 1 && budget.max_provider_calls === 0
+    && policy.limits?.max_provider_calls === 0;
+  const calls = unlimited ? `${budget.provider_calls || 0} provider calls · no total call limit`
+    : `${budget.provider_calls || 0}/${budget.max_provider_calls || 0} provider calls`;
   return `${goal.status} · ${progress.complete}/${progress.total} tasks · `
-    + `${goal.budget?.provider_calls || 0}/${goal.budget?.max_provider_calls || 0} provider calls`;
+    + calls;
 }
 
 function missionProviderSetupChanged(goal = longGoal) {
@@ -15150,13 +15318,16 @@ function renderMissionControl() {
         fieldset.append(make("strong", "", question.prompt));
       const name = `${item.id}-${question.id}`;
       for (const option of question.options || []) {
-        const label = make("label", "mission-option");
+        const label = make("label", `mission-option agent-question-option${option.recommended ? " recommended" : ""}`);
         const input = make("input");
         input.type = question.multiple ? "checkbox" : "radio";
         input.name = name;
         input.value = option.label;
-        label.append(input, document.createTextNode(` ${option.label}${option.recommended ? " (recommended)" : ""}`));
-        if (option.description) label.append(make("small", "", option.description));
+        const words = make("span", "agent-question-option-words");
+        words.append(make("strong", "", option.label));
+        if (option.recommended) words.append(make("span", "agent-question-recommended", "Recommended"));
+        if (option.description) words.append(make("small", "", option.description));
+        label.append(input, words);
           fieldset.append(label);
       }
       if (question.allow_other || !(question.options || []).length) {
@@ -17300,7 +17471,7 @@ function renderTheBigChat() {
   for (const one of chatTurnsWhileWorking(theBigOne, keptTranscriptFor(theBigOne))) {
     if (one.who === "you" && String(one.text || "").trim()) latestUserPrompt = one.text;
     const collaboration = ["agent_reply", "lead_draft", "agent_plan", "lead_plan",
-      "agent_discussion", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
+      "agent_discussion", "agent_progress", "agent_plan_review", "lead_execution", "agent_execution", "agent_verification"]
       .includes(one.phase);
     turns.push({
       kind: one.who === "you" ? "you" : (collaboration ? "between" : "them"),
@@ -17315,6 +17486,7 @@ function renderTheBigChat() {
       speakerId: one.speaker_id || "",
       nexus: isNexusChatTurn(one),
       compactGoalStatus: isRoutineGoalStatusTurn(one),
+      toolActivity: normalizedChatToolActivity(one),
       structuredStateUnavailable: Boolean(one.structured_state_unavailable),
       participantOutcome: normalizedParticipantOutcome(one),
       longHorizonCorrelation: normalizedLongHorizonCorrelation(one),
@@ -17357,6 +17529,10 @@ function renderTheBigChat() {
         + "turns up here too."));
     }
     for (const one of turns) {
+      if (one.toolActivity) {
+        list.append(aChatToolActivityRow(one.who, one.toolActivity, one.at, "the-big-chat-turn"));
+        continue;
+      }
       if (one.compactGoalStatus) {
         list.append(aChatGoalStatusRow(one.who, one.text, one.at,
           one.longHorizonCorrelation, "the-big-chat-turn nexus-turn", one));
@@ -17637,6 +17813,11 @@ function agentStillUsesRoute(agentId, route) {
   return Boolean(agent) && String(draft?.values?.who ?? agent.who ?? "") === String(route || "");
 }
 
+function agentRepairContext(agentId) {
+  const goal = chatLongGoalContext(agentId).goal;
+  return {agent_id: agentId, ...(goal?.goal_id ? {goal_id: goal.goal_id} : {})};
+}
+
 function renderAgentRepairPanel(agent, route, plan = null) {
   const panel = $("swarmAgentRepair");
   const badge = $("swarmAgentRepairBadge");
@@ -17751,7 +17932,7 @@ async function loadAgentRepairPlan(agentId, route, button = null) {
   $("swarmAgentSessionStatus").textContent = "Checking the exact route without sending a model prompt…";
   try {
     const plan = await request("/api/team/repair-plan", {
-      method: "POST", body: JSON.stringify({route}),
+      method: "POST", body: JSON.stringify({route, ...agentRepairContext(agentId)}),
     });
     swarmAgentRepairPlans.set(agentId, {route, plan});
     if (agentStillUsesRoute(agentId, route)) {
@@ -17824,7 +18005,39 @@ async function repairGeminiRoute(agentId, route, button) {
 
 async function performAgentRepairAction(agentId, route, offered, button) {
   const actionId = String(offered?.id || offered || "");
-  if (actionId === "connect-assistant") {
+  if (["open-goal", "resume-goal"].includes(actionId)) {
+    const originalLabel = button.textContent;
+    button.disabled = true;
+    try {
+      const goalId = String(offered?.goal_id || "");
+      if (!goalId || !agentStillUsesRoute(agentId, route)) throw new Error("The selected goal or route changed. Check the connection again.");
+      const {goal} = await request(`/api/long-horizon/goal?id=${encodeURIComponent(goalId)}`);
+      if (goal?.goal_id !== goalId || goal.conversation_id !== offered.conversation_id) {
+        throw new Error("This saved goal's chat changed. Check the connection again before continuing.");
+      }
+      if (actionId === "open-goal") {
+        await openChatGoalDetails(goal);
+        return;
+      }
+      button.textContent = "Resuming…";
+      const result = await request("/api/long-horizon/control", {
+        method: "POST", body: JSON.stringify({goal_id: goalId, action: "resume", payload: {
+          chat_id: goal.conversation_id, project_id: goal.project?.id,
+          participant_ids: goal.requested_agent_ids || (goal.agents || []).map((one) => one.id),
+          repair_context: {route, agent_id: agentId, goal_id: goalId,
+            diagnosis_fingerprint: offered.diagnosis_fingerprint},
+        }}),
+      });
+      rememberChatGoalSnapshot(result.goal);
+      await refreshLongGoals(true);
+      await loadAgentRepairPlan(agentId, route);
+      sayInSwarm("The saved goal is resuming. Follow the response correction and current status in its chat.");
+    } catch (error) {
+      $("swarmAgentSessionStatus").textContent = String(error.message || error);
+    } finally {
+      if (button.isConnected) { button.disabled = false; button.textContent = originalLabel; }
+    }
+  } else if (actionId === "connect-assistant") {
     const connected = await connectThisAssistant(String(offered?.kind || ""), button);
     if (connected && agentStillUsesRoute(agentId, route)) {
       await loadAgentRepairPlan(agentId, route);
@@ -17901,11 +18114,13 @@ async function runAgentRouteTest(agentId, route) {
   try {
     const said = await request("/api/team/test-route", {
       method: "POST",
-      body: JSON.stringify({route}),
+      body: JSON.stringify({route, ...agentRepairContext(agentId)}),
       signal: controller.signal,
     });
     if (said.plan) swarmAgentRepairPlans.set(agentId, {route, plan: said.plan});
-    sayInSwarm(`${(theSwarmAgent(agentId) || {}).name || agentId}: connection verified.`);
+    sayInSwarm(said.test_superseded ? String(said.note || "The route changed during this test; check the current route again.")
+      : `${(theSwarmAgent(agentId) || {}).name || agentId}: connection verified.`
+        + (said.plan?.repair?.goal_issue ? " The saved goal still needs a corrected agent reply; use its goal recovery action." : ""));
     await refreshSwarm(true);
   } catch (error) {
     if (error.name !== "AbortError") {

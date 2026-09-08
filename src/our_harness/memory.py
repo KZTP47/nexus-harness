@@ -32,6 +32,10 @@ MAX_CHUNK_CHARS = 6_000
 MAX_AGENT_TOOL_RESULT_BYTES = 262_144
 
 
+class AgentToolCallBindingConflict(HarnessError):
+    """A known call identity has different arguments; its result stays immutable."""
+
+
 @dataclass(frozen=True)
 class MemoryHit:
     source: str
@@ -697,7 +701,7 @@ class MemoryStore:
         if row is None:
             return None
         if row["tool_name"] != tool_name or row["arguments_sha256"] != arguments_sha256:
-            raise HarnessError("Agent tool call ID was already bound to different tool arguments")
+            raise AgentToolCallBindingConflict("Agent tool call ID was already bound to different tool arguments")
         try:
             result = json.loads(row["result_json"])
         except json.JSONDecodeError as exc:

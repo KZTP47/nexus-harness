@@ -83,6 +83,29 @@ class SharedGoalVerificationTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed", result)
         self.assertNotEqual(result["commands"][0]["exit_code"], 0)
 
+    def test_plural_collaboration_requests_verify_real_applied_changes(self):
+        for objective in (
+            "can you guys add a shop where one can use scores to buy themed items xDDD",
+            "Could you both implement an amber reward shop?",
+            "Please can you folks update the rewards and verify the scoring?",
+        ):
+            with self.subTest(objective=objective):
+                result = self.verify(goal=objective)
+                self.assertEqual(result["status"], "passed", result)
+                self.assertTrue(result["verification_analysis"]["passed"])
+                self.assertEqual(len(result["commands"]), 1)
+
+    def test_plural_read_only_requests_cannot_inherit_mutation_authority(self):
+        with mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            for objective in (
+                "Can you guys explain how the rewards work? Do not change any files.",
+                "Could you both inspect game.py and report whether a shop is needed?",
+            ):
+                with self.subTest(objective=objective):
+                    result = self.verify(goal=objective)
+                    self.assertEqual(result["status"], "failed", result)
+            run.assert_not_called()
+
     def test_real_native_node_tests_execute_in_disposable_project_and_reject_bad_game(self):
         node = shutil.which("node")
         if not node:
@@ -153,16 +176,80 @@ class SharedGoalVerificationTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed", result)
         self.assertIn("escape", result["basis"])
 
-    def test_no_command_and_unapproved_discovery_never_execute(self):
-        for commands in ([], [self.command]):
-            with self.subTest(commands=commands), mock.patch.object(
-                swarm_work, "_verification_commands", return_value=(commands, "discovered"),
-            ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
-                result = self.verify()
-                self.assertEqual(result["status"], "unavailable", result)
-                run.assert_not_called()
-                if commands:
-                    self.assertEqual(result["basis"], "discovered_command_approval_required")
+    def test_no_selected_checks_are_reported_without_claiming_test_execution(self):
+        self.project["test_commands"] = []
+        with mock.patch.object(
+            swarm_work, "_verification_commands", return_value=([], "discovered"),
+        ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            result = self.verify()
+            self.assertEqual(result["status"], "not_configured", result)
+            self.assertEqual(result["basis"], "no_selected_checks")
+            self.assertEqual(result["commands"], [])
+            self.assertIn("no tests ran", result["reason"])
+            self.assertEqual(result["current_tree_merkle"], swarm_work._project_tree_merkle(self.root)[0])
+            self.assertEqual(result["check_policy"], goal_verification.CHECK_POLICY)
+            self.assertNotIn("verification_analysis", result)
+            context = self.verify(changed=[], require_changes=False)
+            self.assertEqual(context["status"], "not_configured", context)
+            run.assert_not_called()
+            # A changed project must receive fresh snapshot evidence.
+            (self.root / "game.py").write_text("def winner(score): return None\n", encoding="utf-8")
+            changed = self.verify(changed=[], require_changes=False)
+            self.assertNotEqual(result["current_tree_merkle"], changed["current_tree_merkle"])
+
+    def test_unapproved_discovery_still_requires_approval(self):
+        with mock.patch.object(
+            swarm_work, "_verification_commands", return_value=([self.command], "discovered"),
+        ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            result = self.verify()
+        self.assertEqual(result["status"], "unavailable", result)
+        self.assertEqual(result["basis"], "discovered_command_approval_required")
+        run.assert_not_called()
+
+    def test_disappeared_approved_checks_cannot_become_optional(self):
+        self.project["test_commands"] = []
+        self.project["approved_test_command_digest"] = "a" * 64
+        with mock.patch.object(
+            swarm_work, "_verification_commands", return_value=([], "discovered"),
+        ), mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            result = self.verify()
+        self.assertEqual(result["status"], "unavailable", result)
+        self.assertEqual(result["basis"], "approved_checks_unavailable")
+        run.assert_not_called()
+
+    def test_missing_selected_runner_is_not_unconfigured(self):
+        self.project["test_commands"] = [[str(self.base / "unavailable-runner")]]
+        with mock.patch.object(swarm_work, "_run_disposable_verification_command") as run:
+            result = self.verify()
+        self.assertEqual(result["status"], "unavailable", result)
+        self.assertEqual(result["basis"], "missing_runner")
+        run.assert_not_called()
+
+    def test_policy_is_versioned_fingerprinted_and_legacy_command_authority_survives(self):
+        current = goal_verification.capture_verification_contract(self.config, self.project, self.root)
+        self.assertEqual(current["schema_version"], 3)
+        self.assertEqual(current["check_policy"], goal_verification.CHECK_POLICY)
+        saved = {"project": self.project, "objective": "Inspect the game", "verification_contract": current}
+        self.assertEqual(goal_verification.verification_project(self.config, saved)["test_commands"], [self.command])
+        legacy = {key: copy.deepcopy(value) for key, value in current.items() if key not in {"check_policy", "fingerprint_sha256"}}
+        legacy["schema_version"] = 1
+        legacy["fingerprint_sha256"] = goal_verification._fingerprint(legacy)
+        self.assertNotEqual(current["fingerprint_sha256"], legacy["fingerprint_sha256"])
+        saved["verification_contract"] = legacy
+        self.assertEqual(goal_verification.verification_project(self.config, saved)["test_commands"], [self.command])
+        legacy_v2 = copy.deepcopy(legacy)
+        legacy_v2.pop("fingerprint_sha256")
+        legacy_v2.update({"schema_version": 2, "check_policy": goal_verification.LEGACY_CHECK_POLICY})
+        legacy_v2["fingerprint_sha256"] = goal_verification._fingerprint(legacy_v2)
+        saved["verification_contract"] = legacy_v2
+        self.assertEqual(goal_verification.verification_project(self.config, saved)["test_commands"], [self.command])
+        self.assertNotEqual(current["fingerprint_sha256"], legacy_v2["fingerprint_sha256"])
+        altered = copy.deepcopy(current)
+        altered["check_policy"]["configured_or_discovered_checks"] = "optional"
+        altered["fingerprint_sha256"] = goal_verification._fingerprint({key: value for key, value in altered.items() if key != "fingerprint_sha256"})
+        saved["verification_contract"] = altered
+        with self.assertRaisesRegex(HarnessError, "verification contract changed"):
+            goal_verification.verification_project(self.config, saved)
 
     def test_exact_approved_discovery_runs_but_manifest_change_invalidates_approval(self):
         manifest = self.root / "pyproject.toml"

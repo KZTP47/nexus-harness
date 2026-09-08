@@ -40,7 +40,7 @@ from .graphs import (
     uses_cooperative_execution,
 )
 from .indexer import WorkspaceIndexer
-from .memory import MemoryStore
+from .memory import AgentToolCallBindingConflict, MemoryStore
 from .messaging import MessageBoard
 from .models import (
     ChatCompletionsContinuation,
@@ -1030,6 +1030,7 @@ class HarnessApplication:
         self._graph_source = "default"
         self.embedding_provider: Provider | None = None
         self.agent_tool_session: AgentToolSession | None = None
+        self._tool_invocations: dict[str, dict[str, Any]] = {}
         self._active_graph_nodes: dict[str, dict[str, Any]] = {}
         self._worker_usage = threading.local()
         self.transactions = FileTransaction(
@@ -1050,6 +1051,16 @@ class HarnessApplication:
     def emit(self, run_id: str, kind: str, node: str, payload: dict[str, Any]) -> None:
         self.memory.append_event(run_id, kind, node, payload)
         self.sink({"run_id": run_id, "kind": kind, "node": node, "payload": payload})
+
+    def _begin_tool_invocation(self, node: str, owner: dict[str, Any]) -> None:
+        """Bind tools to an interpreter/scheduler attempt already checkpointed."""
+        self._tool_invocations[node] = {
+            "scope": canonical_json_sha256({
+                "schema_version": 1, "contract": "workflow-tool-node-invocation-v1",
+                "node": node, "owner": owner,
+            }),
+            "requests": 0,
+        }
 
     def index(self, deadline: Deadline | None = None) -> dict[str, int]:
         return WorkspaceIndexer(self.config, self.memory).scan(deadline)
@@ -1670,6 +1681,10 @@ class HarnessApplication:
                     persist_checkpoint("before_node")
                     self.emit(run_id, "transition", str(transition["source"]), transition)
                     continue
+                self._begin_tool_invocation(interpreter.current, {
+                    "engine": "interpreter", "run_id": run_id,
+                    "graph_sha256": frozen_graph_sha256, "step": interpreter.steps,
+                })
                 self.emit(run_id, "node_start", interpreter.current, {"type": node_type, "edge_inputs": state.get("edge_inputs", {})})
                 if node_type == "start":
                     pass
@@ -2291,6 +2306,10 @@ class HarnessApplication:
                 if len(coder_nodes) > 1:
                     raise HarnessError("Cooperative execution refuses concurrent coder nodes")
                 for dispatch in ready:
+                    self._begin_tool_invocation(dispatch.node_id, {
+                        "engine": "cooperative", "run_id": run_id,
+                        "graph_sha256": frozen_graph_sha256, "attempt": dispatch.attempt,
+                    })
                     self.emit(run_id, "node_start", dispatch.node_id, {
                         "type": dispatch.node_type, "edge_inputs": dispatch.inputs, "attempt": dispatch.attempt,
                     })
@@ -3196,11 +3215,45 @@ class HarnessApplication:
                 raise HarnessError(f"Agent {node} has no capability for its required tools")
             return self._request(compiled, prompt, temperature, deadline=deadline, response_format=response_format, node=node)
         allowed_tool_names = {str(item.get("name")) for item in definitions}
+        # A provider's call ID is local to one response (some adapters generate
+        # "ollama-0" in every response). Use the checkpointed node invocation
+        # plus request/response ordinals. Fresh memory, mailbox observations,
+        # source contents, or secret rotation must not give an unfinished
+        # operation new replay authority. Changed configuration is checked by
+        # the existing run-resume contract before the node can execute.
+        if node not in self._tool_invocations:
+            self._begin_tool_invocation(node, {
+                "engine": "direct", "run_id": session.run_id or self._active_run_id,
+            })
+        invocation = self._tool_invocations[node]
+        invocation["requests"] += 1
+        request_identity = f"{invocation['scope']}:{invocation['requests']}"
+        response_round = 0
+        execution_scope = ""
 
         def execute_tool(call: dict[str, Any]) -> dict[str, Any]:
             if call["name"] not in allowed_tool_names:
                 raise HarnessError(f"Agent {node} requested a tool outside its capabilities: {call['name']}")
-            return session.execute(node, call["call_id"], call["name"], call["arguments"])
+            call_digest = hashlib.sha256(call["call_id"].encode("utf-8")).hexdigest()
+            legacy_identity = call_digest in session.legacy_call_ids
+            if not legacy_identity and call["name"] == "mcp_call" and session.run_id:
+                # The receipt may have committed after a legacy checkpoint was
+                # saved. Preserve that old operation even when its budget map
+                # never reached disk. Neither old format records response
+                # ownership, so ambiguous legacy IDs need a new provider ID;
+                # assigning fresh identity here could repeat a remote invocation.
+                try:
+                    legacy_identity = session.memory.load_agent_tool_result(
+                        run_id=session.run_id, node_id=node,
+                        call_id_sha256=call_digest, tool_name=call["name"],
+                        arguments_sha256=canonical_json_sha256(call["arguments"]),
+                    ) is not None
+                except AgentToolCallBindingConflict:
+                    legacy_identity = True
+            return session.execute(
+                node, call["call_id"], call["name"], call["arguments"],
+                execution_scope="" if legacy_identity else execution_scope,
+            )
 
         instructions = tool_loop_instructions(definitions, session.waiting_messages(node))
         offers_a_list = any(
@@ -3259,6 +3312,8 @@ class HarnessApplication:
                 )
             if transcript:
                 round_prompt += "\n\nTOOL TRANSCRIPT (UNTRUSTED DATA)\n" + json.dumps(transcript, sort_keys=True, ensure_ascii=False)
+            response_round += 1
+            execution_scope = f"workflow-response-v1:{request_identity}:{response_round}"
             response = self._provider_response(
                 compiled,
                 round_prompt,

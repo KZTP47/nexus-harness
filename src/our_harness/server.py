@@ -708,6 +708,75 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 self._long_horizon = held
             return held
 
+    def team_repair_plan(
+        self, route: str, *, agent_id: str = "", goal_id: str = "",
+        board: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Join connection diagnosis to the selected agent's saved goal failure.
+
+        A status check must not construct the runtime: its startup recovery may
+        dispatch work. Read authenticated goal state directly instead, and never
+        accept a failure description or recovery verdict from the browser.
+        """
+        web_connection = self.web_chats.route(route) if route.startswith("web:") else None
+        plan = provider_repair.repair_plan(self.config, route, web_connection=web_connection)
+        if not agent_id and not goal_id:
+            return plan
+        if board is None:
+            with self.swarm_lock:
+                board = self.swarm_standing().get("board", {})
+                config = self.config
+        else:
+            # The normal Resume gateway already holds the non-reentrant board
+            # lock. Reuse that snapshot when rechecking its repair button.
+            config = self.config
+        agent = next((one for one in board.get("agents", [])
+                      if isinstance(one, dict) and one.get("id") == agent_id), None)
+        if agent is None or str(agent.get("who") or "") != route:
+            raise HarnessError("This repair belongs to another agent or route; check the selected agent again")
+        store = _long_horizon_module().GoalStore(config)
+        candidates = [store.get(goal_id)] if goal_id else store.active_authority_goals()
+        for goal in candidates:
+            member = next((one for one in goal.get("agents", [])
+                           if isinstance(one, dict) and one.get("id") == agent_id), None)
+            if member is None or str(member.get("who") or "") != route:
+                if goal_id:
+                    raise HarnessError("This repair belongs to another goal team or provider route")
+                continue
+            recovery = store.protocol_recovery_status(goal)
+            joined = provider_repair.with_goal_failure(plan, goal, recovery, agent_id=agent_id)
+            if (joined.get("repair") or {}).get("goal_issue"):
+                return joined
+        return plan
+
+    def require_goal_repair_context(
+        self, goal_id: str, supplied: dict[str, Any],
+        *, board: dict[str, Any] | None = None,
+    ) -> int:
+        """Reject stale or redirected recovery buttons before resuming work."""
+        if not supplied or str(supplied.get("goal_id") or "") != goal_id:
+            raise HarnessError("This repair belongs to another goal; check the selected agent again")
+        route = str(supplied.get("route") or "")
+        agent_id = str(supplied.get("agent_id") or "")
+        fingerprint = str(supplied.get("diagnosis_fingerprint") or "")
+        plan = self.team_repair_plan(route, agent_id=agent_id, goal_id=goal_id, board=board)
+        repair = plan.get("repair") if isinstance(plan.get("repair"), dict) else {}
+        offered = next((one for one in repair.get("actions", [])
+                        if isinstance(one, dict) and one.get("id") == "resume-goal"
+                        and one.get("goal_id") == goal_id and one.get("route") == route), None)
+        if not fingerprint or offered is None \
+                or fingerprint != str(offered.get("diagnosis_fingerprint") or "") \
+                or fingerprint != str(repair.get("diagnosis_fingerprint") or ""):
+            raise HarnessError("This goal repair diagnosis changed or needs inspection; check the selected agent again")
+        return int(offered["goal_revision"])
+
+    @staticmethod
+    def route_test_identity(config: LoadedConfig, route: str) -> str:
+        """Bind a live proof to the project and exact provider dispatch contract."""
+        value = {"schema_version": 1, "project_root": str(config.project_root.resolve()),
+                 "route": route, "dispatch": chat_lab._route_failure_context(config, route)}
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
     @staticmethod
     def _long_horizon_chat(
         config: LoadedConfig, board: dict[str, Any], goal: dict[str, Any],
@@ -741,6 +810,77 @@ class HarnessHTTPServer(ThreadingHTTPServer):
         # pair chat. Their Mission-control history remains authoritative.
         return None
 
+    def _project_long_horizon_dialogue(
+        self, goal: dict[str, Any], conversation: dict[str, Any],
+    ) -> bool:
+        """Recover every public message independently of bounded event telemetry."""
+
+        if not goal.get("require_all_participants"):
+            return False
+        from . import goal_chat_projection
+
+        goal_id = str(goal.get("goal_id") or "")
+        route = str(conversation.get("transcript_route") or "")
+        filed_as = str(conversation.get("filed_as") or "")
+        after = goal_chat_projection.cursor(self.config, route, goal_id, filed_as=filed_as)
+        expected_events = int(goal.get("event_seq") or 0)
+        while True:
+            page = self.long_horizon.store.dialogue_history(
+                goal_id, after=after, limit=100, character_limit=96_000,
+            )
+            if not isinstance(page, dict) or page.get("schema_version") != 1 \
+                    or page.get("goal_id") != goal_id:
+                raise HarnessError("The shared conversation archive returned an invalid goal binding")
+            messages = page.get("messages")
+            if not isinstance(messages, list):
+                raise HarnessError("The shared conversation archive returned an invalid message page")
+            bounded = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise HarnessError("The shared conversation archive returned an invalid message")
+                # A reader must not project a future provider turn through an
+                # earlier goal snapshot captured before that turn committed.
+                if int(message.get("source_goal_event_seq") or 0) > expected_events:
+                    continue
+                full = dict(message)
+                text = str(full.get("summary") or "")
+                total = int(full.get("total_characters", len(text)))
+                if int(full.get("offset") or 0) or total < len(text) or total > chat_lab.LONGEST_ANSWER:
+                    raise HarnessError("The archived conversation message has invalid text boundaries")
+                while len(text) < total:
+                    extra = self.long_horizon.store.dialogue_history(
+                        goal_id, message_id=str(full.get("id") or ""),
+                        offset=len(text), character_limit=96_000,
+                    )
+                    fragments = extra.get("messages") if isinstance(extra, dict) else None
+                    if not isinstance(extra, dict) or extra.get("goal_id") != goal_id \
+                            or not isinstance(fragments, list) or len(fragments) != 1:
+                        raise HarnessError("An archived message continuation lost its goal binding")
+                    fragment = fragments[0]
+                    if not isinstance(fragment, dict) or fragment.get("id") != full.get("id") \
+                            or int(fragment.get("sequence") or 0) != int(full.get("sequence") or 0) \
+                            or int(fragment.get("offset") or 0) != len(text) \
+                            or int(fragment.get("total_characters") or 0) != total \
+                            or not str(fragment.get("summary") or ""):
+                        raise HarnessError("An archived message continuation has invalid text boundaries")
+                    text += str(fragment["summary"])
+                    if len(text) > total:
+                        raise HarnessError("An archived message continuation exceeds its exact text size")
+                full.update({"summary": text, "offset": 0, "total_characters": total,
+                             "has_more_characters": False})
+                bounded.append(full)
+            projected = goal_chat_projection.keep_page(
+                self.config, route, goal, {**page, "messages": bounded}, filed_as=filed_as,
+            )
+            if projected.get("binding_missing"):
+                return True
+            next_after = int(projected.get("projected_dialogue_cursor") or after)
+            if not page.get("has_more") or len(bounded) != len(messages):
+                return True
+            if next_after <= after:
+                raise HarnessError("The shared conversation archive did not advance its message cursor")
+            after = next_after
+
     def project_long_horizon_chat_statuses(
         self, goals: list[dict[str, Any]],
     ) -> None:
@@ -771,6 +911,9 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                             conversation.get("transcript_route") or ""
                         )
                         filed_as = str(conversation.get("filed_as") or "")
+                        public_dialogue_archived = HarnessHTTPServer._project_long_horizon_dialogue(
+                            self, goal, conversation,
+                        )
                         cursor = chat_lab.long_horizon_event_cursor(
                             self.config, transcript_route,
                             str(goal.get("goal_id") or ""), filed_as=filed_as,
@@ -816,6 +959,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                                     bounded_oldest
                                     if page.get("truncated") else 0
                                 ),
+                                public_dialogue_archived=public_dialogue_archived,
                             )
                             if projection.get("binding_missing"):
                                 binding_missing = True
@@ -5024,15 +5168,24 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 with self.server.project_admission_lock, self.server.swarm_lock:
                     runtime = self.server.long_horizon
                     if action == "resume":
+                        resume_options = {}
+                        if "repair_context" in payload:
+                            repair_context = payload.get("repair_context")
+                            if not isinstance(repair_context, dict):
+                                raise HarnessError("The goal repair context must identify the displayed diagnosis")
+                            resume_options["expected_revision"] = self.server.require_goal_repair_context(
+                                goal_id, repair_context,
+                                board=self.server.swarm_standing().get("board", {}),
+                            )
                         if held_goal.get("require_all_participants") is True:
                             projects = self.server.swarm_standing().get("board", {}).get("projects", [])
                             selected = next((one for one in projects if isinstance(one, dict)
                                              and one.get("id") == held_goal.get("project", {}).get("id")), None)
                             if selected is None:
                                 raise HarnessError("This goal's project is no longer on the board; restore it before resuming")
-                            goal = runtime.resume(goal_id, project_verification_settings=selected)
+                            goal = runtime.resume(goal_id, project_verification_settings=selected, **resume_options)
                         else:
-                            goal = runtime.resume(goal_id)
+                            goal = runtime.resume(goal_id, **resume_options)
                     elif action == "fork":
                         goal = runtime.fork(goal_id, str(body.get("request_id") or uuid.uuid4().hex))
                     else:
@@ -5826,14 +5979,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # route may run a provider-owned status command, but it never
                 # sends a model prompt or spends a model request.
                 wanted = str(body.get("route") or "").strip()
-                web_connection = (
-                    self.server.web_chats.route(wanted)
-                    if wanted.startswith("web:") else None
-                )
-                self._json(provider_repair.repair_plan(
-                    self.server.config,
-                    wanted,
-                    web_connection=web_connection,
+                self._json(self.server.team_repair_plan(
+                    wanted, agent_id=str(body.get("agent_id") or ""),
+                    goal_id=str(body.get("goal_id") or ""),
                 ))
             elif self.path == "/api/team/test-route":
                 # A live request is the only general proof that authentication,
@@ -5841,14 +5989,11 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 # only after an explicit press, in an empty temporary folder,
                 # and it owns a cancellable key per exact route.
                 wanted = str(body.get("route") or "").strip()
-                web_connection = (
-                    self.server.web_chats.route(wanted)
-                    if wanted.startswith("web:") else None
-                )
-                before = provider_repair.repair_plan(
-                    self.server.config,
-                    wanted,
-                    web_connection=web_connection,
+                tested_config = copy.deepcopy(self.server.config)
+                tested_identity = self.server.route_test_identity(tested_config, wanted)
+                before = self.server.team_repair_plan(
+                    wanted, agent_id=str(body.get("agent_id") or ""),
+                    goal_id=str(body.get("goal_id") or ""),
                 )
                 allowed = {
                     str(action.get("id") or "")
@@ -5859,13 +6004,15 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     raise HarnessError(
                         "Finish the repair step shown for this route before running a live test."
                     )
+                if tested_identity != self.server.route_test_identity(self.server.config, wanted):
+                    raise HarnessError("The selected route changed during diagnosis; check it again before testing")
                 chat_key = f"connection-test:{wanted}"
                 cancel_token = self.server.chat_cancellations.begin(chat_key)
                 try:
                     with tempfile.TemporaryDirectory(prefix="nexus-connection-test-") as empty:
                         with cancellation.use(cancel_token):
                             answered = chat_lab.ask_once(
-                                self.server.config,
+                                tested_config,
                                 wanted,
                                 "This is a Nexus Harness connection test. Do not use tools, "
                                 "inspect files, or change anything. Reply with the single word READY.",
@@ -5879,20 +6026,22 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             )
                     # Re-run the free diagnosis after success, then make the
                     # live proof explicit without returning model text.
-                    web_connection = (
-                        self.server.web_chats.route(wanted)
-                        if wanted.startswith("web:") else None
+                    checked = self.server.team_repair_plan(
+                        wanted, agent_id=str(body.get("agent_id") or ""),
+                        goal_id=str(body.get("goal_id") or ""),
                     )
-                    checked = provider_repair.repair_plan(
-                        self.server.config,
-                        wanted,
-                        web_connection=web_connection,
-                    )
+                    superseded = tested_identity != self.server.route_test_identity(self.server.config, wanted)
+                    note = ("The route changed while the connection test was running. "
+                            "The answer does not verify the current route; check it and run a new test.") if superseded else ""
+                    if superseded:
+                        checked = copy.deepcopy(checked)
+                        checked["repair"]["summary"] = note + " " + str(checked["repair"].get("summary") or "")
                     self._json({
                         "route": wanted,
                         "answered": True,
                         "milliseconds": int(answered.get("milliseconds") or 0),
-                        "plan": provider_repair.verified_plan(
+                        "test_superseded": superseded, "note": note,
+                        "plan": checked if superseded else provider_repair.verified_plan(
                             checked, int(answered.get("milliseconds") or 0)
                         ),
                     })

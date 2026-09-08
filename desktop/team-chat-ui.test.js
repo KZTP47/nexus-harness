@@ -10,11 +10,36 @@ const source = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/app.j
 function section(start, end) {
   return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 }
-const helpers = section("const chatGoalRequests =", "function chatRecipientWords");
+const helpers = source.match(/^const TEAM_FOLLOW_UP_CHARACTERS = .*;$/m)[0] + "\n"
+  + section("const chatGoalRequests =", "function chatRecipientWords");
 const handlers = {
   compact: section("async function sendWhatIsTypedTo", "async function startTheChatAgainFor"),
   maximized: section("async function sendFromTheBigChat", "function wireUpTheTray"),
 };
+
+test("new relay chats continue by default while explicit finite choices remain local to their chat", () => {
+  const context = vm.createContext({swarmChatRoundPolicies: new Map(), DEFAULT_FINITE_TEAM_ROUNDS: 3,
+    swarmChatKey(id) { return `chat:${id}`; }, syncChatRoundPolicy() {}});
+  vm.runInContext(section("function chatRoundPolicyFor", "function syncChatRoundPolicy"), context);
+  assert.equal(vm.runInContext("selectedChatRoundLimit('one')", context), null);
+  vm.runInContext("updateChatRoundPolicy('one', false, 17)", context);
+  assert.equal(vm.runInContext("selectedChatRoundLimit('one')", context), 17);
+  assert.equal(vm.runInContext("selectedChatRoundLimit('two')", context), null);
+  vm.runInContext("updateChatRoundPolicy('two', false, 4)", context);
+  assert.equal(vm.runInContext("selectedChatRoundLimit('one')", context), 17);
+});
+
+test("goal status distinguishes versioned unlimited calls from finite and legacy exhausted budgets", () => {
+  const context = vm.createContext({goal: {status: "running", progress: {complete: 1, total: 3},
+    budget: {provider_calls: 1200, max_provider_calls: 0,
+      call_limit_policy: {schema_version: 1, limits: {max_provider_calls: 0}}}}});
+  vm.runInContext(section("function missionStatusWords", "function missionProviderSetupChanged"), context);
+  assert.match(vm.runInContext("missionStatusWords(goal)", context), /1200 provider calls · no total call limit/);
+  vm.runInContext("delete goal.budget.call_limit_policy", context);
+  assert.match(vm.runInContext("missionStatusWords(goal)", context), /1200\/0 provider calls/);
+  vm.runInContext("goal.budget.max_provider_calls = 3000", context);
+  assert.match(vm.runInContext("missionStatusWords(goal)", context), /1200\/3000 provider calls/);
+});
 
 test("only correlated routine Nexus goal transitions use compact status rows", () => {
   const context = vm.createContext({});
@@ -56,6 +81,104 @@ test("an admission receipt points to the shared chat without claiming that the t
     assert.match(words.detail, /this chat/);
     assert.doesNotMatch(words.detail, /is running|Mission control/);
   }
+});
+
+test("saved team activity survives admission collapse and reports actual waiting, retry and response states", () => {
+  const goal = {status: "running", tasks: [], agents: [{id: "arbitrary-a", name: "Builder"}]};
+  const context = vm.createContext({goal, theSwarmAgent() { return null; }, longHorizonStateWords(value) { return value; }});
+  vm.runInContext(section("function chatGoalActivity", "function renderSwarmChatActivity"), context);
+  const read = (problem = "") => {
+    context.problem = problem;
+    return vm.runInContext("chatGoalActivity({goal, problem})", context);
+  };
+  assert.equal(read().stage, "Team is working");
+  assert.equal(read().elapsedLabel, "Team status");
+  goal.tasks = [{assigned_agent_id: "arbitrary-a", state: "running", provider_effect_state: "dispatched"}];
+  assert.equal(read().stage, "Builder is responding");
+  goal.tasks[0].protocol_recovery = {schema_version: 1, state: "dispatched", attempts: 1, max_attempts: 2};
+  assert.match(read().stage, /Correcting Builder/);
+  assert.match(read().detail, /1 of 2/);
+  goal.tasks[0].protocol_recovery.schema_version = 2;
+  goal.tasks[0].protocol_recovery.cumulative_attempts = 3;
+  assert.match(read().stage, /Correcting Builder/);
+  assert.match(read().detail, /1 of 2/);
+  goal.tasks[0].protocol_recovery.state = "corrected";
+  assert.equal(read().stage, "Builder is responding");
+  goal.tasks[0].provider_effect_state = "reply_received";
+  assert.equal(read().stage, "Processing the team’s reply");
+  goal.status = "paused";
+  goal.note = "The saved response requires review.";
+  assert.equal(read().state, "attention");
+  assert.equal(read().detail, goal.note);
+  assert.doesNotMatch(read().stage, /responding|retrying|working/);
+  goal.pending_interrupts = [{id: "decision"}];
+  assert.equal(read().stage, "Waiting for your answer");
+  assert.equal(read("The chat belongs to a changed team.").stage, "Team needs attention");
+  delete goal.pending_interrupts;
+  goal.status = "waiting_for_project";
+  assert.equal(read().state, "waiting");
+  goal.status = "queued";
+  goal.tasks = [];
+  assert.equal(read().stage, "Team queued");
+  goal.automatic_start_failure = {retry_automatically: true, error: "Worker temporarily unavailable"};
+  goal.project_queue = {auto_start_pending: true};
+  assert.equal(read().stage, "Waiting to retry team startup");
+  assert.equal(vm.runInContext("chatGoalActivity({goal: null, problem: ''})", context), null);
+});
+
+test("a late activity update uses the goal still bound to that chat, not the initiating agent's new chat", () => {
+  const rendered = [];
+  const context = vm.createContext({
+    swarmChats: [{agent: "switched-agent"}, {agent: "remaining-peer"}], swarmChatActivity: new Map(), theBigOne: "remaining-peer",
+    swarmChatRuntimeKey(id) { return id === "switched-agent" ? "chat:new" : "chat:original"; },
+    chatLongGoalContext(id) { return {stage: id === "remaining-peer" ? "Original goal working" : "Different goal paused"}; },
+    chatGoalActivity(value) { return value; }, visibleSwarmChatActivity() { return null; },
+    theChatCardFor(id) { return {querySelector() { return id; }}; }, $(id) { return id; },
+    showActivityInPanel(panel, activity) { rendered.push({panel, stage: activity.stage}); },
+  });
+  vm.runInContext(section("function renderSwarmChatActivity", "async function pollSwarmChatActivity"), context);
+  vm.runInContext("renderSwarmChatActivity('switched-agent', 'chat:original')", context);
+  assert.deepEqual(rendered, [{panel: "remaining-peer", stage: "Original goal working"},
+    {panel: "theBigChatActivity", stage: "Original goal working"}]);
+});
+
+test("goal repair retains its authenticated goal diagnosis after a successful connection test", async () => {
+  const state = {calls: [], notices: [], rendered: null};
+  const goal = {goal_id: "goal-portable", conversation_id: "chat-portable", project: {id: "project-portable"}, requested_agent_ids: ["agent-a", "agent-b"]};
+  const plan = {repair: {state: "goal-action-invalid", goal_issue: {goal_id: goal.goal_id}, actions: []}};
+  const nodes = new Map();
+  const context = vm.createContext({state, goal, plan, AbortController,
+    swarmAgentRepairTests: new Map(), swarmAgentRepairPlans: new Map(),
+    $(id) { if (!nodes.has(id)) nodes.set(id, {dataset: {}, textContent: ""}); return nodes.get(id); },
+    theSwarmAgent() { return {id: "agent-a", name: "Builder"}; },
+    agentStillUsesRoute() { return true; }, chatLongGoalContext() { return {goal}; },
+    renderAgentRepairPanel(agent, route, value) { state.rendered = value; },
+    sayInSwarm(words) { state.notices.push(words); }, refreshSwarm: async () => {},
+    async request(url, options) { state.calls.push({url, body: options ? JSON.parse(options.body) : null}); return {plan, goal}; },
+    rememberChatGoalSnapshot() {}, refreshLongGoals: async () => {}, openChatGoalDetails: async () => {},
+  });
+  vm.runInContext(section("function agentRepairContext", "function renderAgentRepairPanel")
+    + section("async function loadAgentRepairPlan", "async function checkAgentLogin")
+    + section("async function performAgentRepairAction", "async function stopAgentRouteTest"), context);
+  await vm.runInContext("loadAgentRepairPlan('agent-a','arbitrary-route')", context);
+  assert.deepEqual(state.calls[0].body, {route: "arbitrary-route", agent_id: "agent-a", goal_id: "goal-portable"});
+  await vm.runInContext("runAgentRouteTest('agent-a','arbitrary-route')", context);
+  assert.deepEqual(state.calls[1].body, state.calls[0].body);
+  assert.equal(state.rendered.repair.state, "goal-action-invalid");
+  assert.match(state.notices.at(-1), /connection verified.*saved goal still needs/);
+  context.offered = {id: "resume-goal", goal_id: goal.goal_id, conversation_id: goal.conversation_id, diagnosis_fingerprint: "diagnosis-bound-to-goal"};
+  context.button = {textContent: "Resume saved goal", isConnected: true};
+  await vm.runInContext("performAgentRepairAction('agent-a','arbitrary-route',offered,button)", context);
+  const resumed = state.calls.find(one => one.url === "/api/long-horizon/control").body;
+  assert.deepEqual(resumed, {goal_id: goal.goal_id, action: "resume", payload: {
+    chat_id: goal.conversation_id, project_id: goal.project.id, participant_ids: goal.requested_agent_ids,
+    repair_context: {route: "arbitrary-route", agent_id: "agent-a", goal_id: goal.goal_id, diagnosis_fingerprint: "diagnosis-bound-to-goal"},
+  }});
+  state.calls.length = 0;
+  context.offered.conversation_id = "stale-other-chat";
+  await vm.runInContext("performAgentRepairAction('agent-a','arbitrary-route',offered,button)", context);
+  assert.equal(state.calls.some(one => one.url === "/api/long-horizon/control"), false);
+  assert.match(nodes.get("swarmAgentSessionStatus").textContent, /chat changed/);
 });
 
 function fixture(view = "maximized") {

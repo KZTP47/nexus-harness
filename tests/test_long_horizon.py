@@ -6836,6 +6836,49 @@ class LongHorizonTests(unittest.TestCase):
         self.assertIn("read_proposed_change", context)
         self.assertNotIn('"truncated":true,"summary"', context)
 
+    def test_targeted_review_reader_corrects_wrong_path_and_preserves_exact_packet_evidence(self):
+        store = self.store()
+        goal = store.create(self.board, "project", ["Review the proposed module"], "recover-targeted-read")
+        task = store.claim_ready(goal["goal_id"], "worker")[0]
+        content = "proposed implementation\n" * 250
+        self.stage_review(store, goal, task, action("request_review", risk="high", changes=[{
+            "path": "src/result.txt", "content": content, "delete": False, "reason": "Implement the requested module",
+        }]))
+        review = store.claim_ready(goal["goal_id"], "worker")[0]
+        self.assertEqual(review["kind"], "review")
+        packet_ref = "review-packet:" + review["review_packet_sha256"]
+        responses = [
+            action("work", tool_calls=[{"call_id": "wrong-path", "name": "read_proposed_change", "arguments": {"path": "src/missing.txt"}}]),
+            action("work", tool_calls=[{"call_id": "wrong-offset", "name": "read_proposed_change", "arguments": {"path": "src/result.txt", "offset": len(content) + 1}}]),
+            action("work", tool_calls=[{"call_id": "exact-path", "name": "read_proposed_change", "arguments": {"path": "src/result.txt"}}]),
+            action("complete", evidence=[packet_ref], review_verdict="approve", review_findings=["Inspected the complete exact proposed file."]),
+        ]
+        contexts = []
+        def ask(_config, _route, _prompt, **kwargs):
+            self.assertIn("read_proposed_change", json.dumps(kwargs["response_format"].schema))
+            contexts.append(kwargs["context"])
+            if len(contexts) in {2, 3}:
+                current_review = next(one for one in store.get(goal["goal_id"])["tasks"] if one["id"] == review["id"])
+                self.assertNotIn("src/result.txt", current_review.get("review_paths_inspected", []))
+            kwargs["before_provider_dispatch"]("initial")
+            kwargs["after_provider_response"]("initial")
+            return {"text": json.dumps(responses[len(contexts) - 1])}
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
+            executed, answer = runtime._execute_one(goal["goal_id"], review["id"])
+        self.assertEqual(answer["action"], "complete", answer)
+        self.assertIn("not in the exact proposed review packet", contexts[1])
+        self.assertIn("offset exceeds the exact proposed file length", contexts[2])
+        held = next(one for one in runtime.store.get(goal["goal_id"])["tasks"] if one["id"] == review["id"])
+        self.assertEqual(held["review_paths_inspected"], ["src/result.txt"])
+        self.assertEqual(held["context_steps"][2]["results"][0]["result"]["content"], content)
+        self.assertNotIn("src/missing.txt", held["review_path_ranges"])
+        runtime._apply_node({"goal_id": goal["goal_id"], "actions": [{"task": executed, "action": answer}]})
+        current = runtime.store.get(goal["goal_id"])
+        self.assertEqual(next(one for one in current["tasks"] if one["id"] == review["id"])["state"], "complete")
+        self.assertFalse((self.project / "src" / "result.txt").exists())
+
     def test_review_reader_schema_is_closed_with_provider_neutral_optional_bounds(self):
         variants = long_horizon.AGENT_ACTION_FORMAT.schema[
             "properties"
@@ -6886,9 +6929,10 @@ class LongHorizonTests(unittest.TestCase):
         release = threading.Event()
         original_ack = runtime.store.acknowledge_context_step
         def delayed_ack(*args, **kwargs):
-            original_ack(*args, **kwargs)
+            step = original_ack(*args, **kwargs)
             entered.set()
             self.assertTrue(release.wait(5))
+            return step
         fake_tools = mock.Mock()
         result = {}
         with mock.patch.object(runtime.store, "acknowledge_context_step", side_effect=delayed_ack), \
