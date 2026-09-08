@@ -6,8 +6,9 @@
 
 CI runs eight independent parts for each supported Python version. Each part
 runs serially in its own interpreter so tests cannot race shared process state.
-The parts are dealt out like cards rather than cut into blocks; increasing the
-number of parts reduces work per machine without changing suite coverage.
+The parts are dealt out like cards rather than cut into blocks. Eight-way CI
+also places a measured slow module in a less busy part. Increasing the number
+of parts reduces work per machine without changing suite coverage.
 
 Every part together is every test file. Nothing falls between two parts, and
 nothing runs twice. tests/test_the_parts_cover_every_test.py holds that down.
@@ -23,6 +24,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
+
+# A complete part-8 timing profile found the swarm suite dominates its runtime.
+# Move the whole module to a less busy CI part without reshuffling other files.
+EIGHT_PART_ASSIGNMENTS = {"test_swarm_work": 3}
 
 
 def every_test_file() -> list[str]:
@@ -55,6 +60,11 @@ def files_for(part: tuple[int, int], files: list[str] | None = None) -> list[str
     number, of = part
     if not of:
         return names
+    if of == 8:
+        return [
+            name for index, name in enumerate(names)
+            if EIGHT_PART_ASSIGNMENTS.get(name, index % of + 1) == number
+        ]
     return names[number - 1::of]
 
 

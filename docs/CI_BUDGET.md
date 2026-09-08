@@ -90,6 +90,15 @@ each. Tag releases require their success. An exception never permits a failed
 job or bypasses the remaining required jobs. Update the manifest whenever jobs
 or display names change.
 
+The eight-way Python split keeps `test_swarm_work` in part 3. Profiling the
+overloaded part 8 measured that module at 259 seconds, with every other module
+under 40 seconds. In the affected hosted run, part 3 finished in 156 seconds on
+Python 3.13 and 197 seconds on Python 3.11, leaving room for this module. The
+placement changes no tests and creates no extra job or timeout allowance.
+Other partition counts retain their ordinary assignment; exact-once coverage
+tests protect both paths. These measurements guide placement, not a promise
+that hosted machines always run at the same speed.
+
 Immediately before the externally visible publication step, run the read-only
 check with enough reserve for that step and the downstream public readback:
 

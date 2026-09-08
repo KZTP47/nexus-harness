@@ -58,6 +58,47 @@ class SplittingTheTestsTests(unittest.TestCase):
             self.split.files_for((1, 4), made_up), ["test_a", "test_e"]
         )
 
+    def test_eight_way_balancing_moves_the_slow_module_without_moving_others(self) -> None:
+        names = self.split.every_test_file()
+        self.assertIn("test_swarm_work", names, "The timed module must still exist")
+        owners = {
+            name: number
+            for number in range(1, 9)
+            for name in self.split.files_for((number, 8), names)
+        }
+        self.assertEqual(owners["test_swarm_work"], 3)
+        for index, name in enumerate(names):
+            if name != "test_swarm_work":
+                with self.subTest(name=name):
+                    self.assertEqual(owners[name], index % 8 + 1)
+
+    def test_absent_timed_module_leaves_the_normal_eight_way_split(self) -> None:
+        names = [f"test_{letter}" for letter in "abcdefghijklmnopq"]
+        for number in range(1, 9):
+            with self.subTest(number=number):
+                self.assertEqual(
+                    self.split.files_for((number, 8), names), names[number - 1::8]
+                )
+
+    def test_runtime_balancing_does_not_change_other_partition_sizes(self) -> None:
+        names = self.split.every_test_file()
+        for of in (1, 2, 3, 4, 6, 7, 9, 100):
+            for number in range(1, of + 1):
+                with self.subTest(of=of, number=number):
+                    self.assertEqual(
+                        self.split.files_for((number, of), names), names[number - 1::of]
+                    )
+
+    def test_balancing_is_repeatable_and_keeps_the_supplied_module_order(self) -> None:
+        names = list(reversed(self.split.every_test_file()))
+        original = list(names)
+        for number in range(1, 9):
+            with self.subTest(number=number):
+                selected = self.split.files_for((number, 8), names)
+                self.assertEqual(self.split.files_for((number, 8), names), selected)
+                self.assertEqual(selected, [name for name in original if name in selected])
+        self.assertEqual(names, original, "Selecting a part must not mutate its input")
+
     def test_nonsense_is_refused(self) -> None:
         for bad in ("half", "2", "0/4", "5/4", "2/0", "a/b"):
             with self.subTest(bad=bad):
