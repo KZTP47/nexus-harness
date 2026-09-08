@@ -1,7 +1,7 @@
 """Splitting the tests across machines must not drop any of them.
 
-The build server runs the complete suite in eight parts on both supported
-Python versions. If one test file fell between two parts, nobody
+The build server runs the complete suite in eight parts on Python 3.13 and a
+focused compatibility check on Python 3.11. If one test file fell between two parts, nobody
 would run it and nobody would notice: the build would still be green, and the
 file would rot.
 """
@@ -110,20 +110,19 @@ class SplittingTheTestsTests(unittest.TestCase):
         # parts there are. If somebody raises one and not the other, some tests
         # stop running and the build stays green.
         workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
-        for owner, following, version in (
-            ("tests", "tests-on-the-oldest-python", "3.13"),
-            ("tests-on-the-oldest-python", "panel", "3.11"),
-        ):
-            with self.subTest(version=version):
-                job = workflow[workflow.index(f"  {owner}:\n"):workflow.index(f"  {following}:\n")]
-                self.assertIn(f'python-version: "{version}"', job)
-                self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/8 --quiet", job)
-                self.assertIn("part: [1, 2, 3, 4, 5, 6, 7, 8]", job)
-                self.assertIn("max-parallel: 8", job)
-                self.assertNotIn("needs:", job, "Python compatibility must not wait on another lane")
-                covered = [name for part in range(1, 9) for name in self.split.files_for((part, 8))]
-                self.assertCountEqual(covered, self.split.every_test_file())
-                self.assertEqual(len(covered), len(set(covered)))
+        job = workflow[workflow.index("  tests:\n"):workflow.index("  python-compatibility:\n")]
+        self.assertIn('python-version: "3.13"', job)
+        self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/8 --quiet", job)
+        self.assertIn("part: [1, 2, 3, 4, 5, 6, 7, 8]", job)
+        self.assertIn("max-parallel: 8", job)
+        self.assertNotIn("needs:", job, "Complete Python coverage must not wait on another lane")
+        covered = [name for part in range(1, 9) for name in self.split.files_for((part, 8))]
+        self.assertCountEqual(covered, self.split.every_test_file())
+        self.assertEqual(len(covered), len(set(covered)))
+        compatibility = workflow[workflow.index("  python-compatibility:\n"):workflow.index("  panel:\n")]
+        self.assertIn('python-version: "3.11"', compatibility)
+        self.assertNotIn("scripts/run_tests.py", compatibility)
+        self.assertNotIn("matrix:", compatibility)
 
     def test_the_source_panel_lane_installs_declared_runtime_dependencies(self) -> None:
         # PYTHONPATH makes Nexus's own modules importable, but it does not

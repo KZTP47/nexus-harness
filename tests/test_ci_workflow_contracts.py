@@ -167,8 +167,46 @@ class WorkflowCoverageContractsTests(unittest.TestCase):
         self.assertCountEqual(skipped, allowed_skips)
         self.assertTrue(set(skipped) <= set(required), "Skip exceptions must still name required jobs")
 
-    def test_checks_guard_matches_all_twenty_expanded_jobs(self):
-        self.assert_guard_covers(self.load("checks.yml"), tag=False, count=20)
+    def test_checks_guard_matches_all_thirteen_work_jobs(self):
+        self.assert_guard_covers(self.load("checks.yml"), tag=False, count=13)
+
+    def test_checks_runs_the_complete_python313_suite_in_exactly_eight_parts(self):
+        jobs = self.load("checks.yml")
+        full_suite_jobs = [(owner, job) for owner, job in jobs.items()
+                           if "python scripts/run_tests.py" in job]
+        self.assertEqual([owner for owner, _ in full_suite_jobs], ["tests"])
+        full_suite = full_suite_jobs[0][1]
+        self.assertEqual(scalar(full_suite, "python-version", 10), "3.13")
+        self.assertEqual(matrix_axes(full_suite), {"part": [str(part) for part in range(1, 9)]})
+        self.assertEqual(full_suite.count("python scripts/run_tests.py --part ${{ matrix.part }}/8 --quiet"), 1)
+        self.assertNotIn("continue-on-error:", full_suite)
+
+    def test_python311_compatibility_is_one_bounded_explicit_contract_run(self):
+        jobs = self.load("checks.yml")
+        compatibility = jobs["python-compatibility"]
+        self.assertEqual(scalar(compatibility, "name"), "Python 3.11 compatibility")
+        self.assertEqual(scalar(compatibility, "python-version", 10), "3.11")
+        self.assertEqual(scalar(compatibility, "timeout-minutes"), "3")
+        self.assertEqual(matrix_axes(compatibility), {})
+        self.assertEqual(dependencies(compatibility), [])
+        self.assertNotIn("continue-on-error:", compatibility)
+        self.assertNotIn("scripts/run_tests.py", compatibility)
+        self.assertIn("python -m pip install -e .", compatibility)
+        self.assertIn("python -m compileall -q src scripts", compatibility)
+        self.assertIn("import our_harness.long_horizon", compatibility)
+        self.assertIn("from our_harness.providers import codex_cli, subscription_cli", compatibility)
+        focused = [step for step in steps_in(compatibility) if "python -m unittest" in step]
+        self.assertEqual(len(focused), 1)
+        command = " ".join(line.strip() for line in block(focused[0], "run", 8).splitlines())
+        self.assertEqual(command.split(), [
+            "python", "-m", "unittest", "tests.test_native_input_context",
+            "tests.test_provider_connections", "tests.test_ci_budget",
+            "tests.test_ci_workflow_contracts", "-q",
+        ])
+        self.assertCountEqual(
+            [owner for owner, job in jobs.items() if 'python-version: "3.11"' in job],
+            ["python-compatibility"],
+        )
 
     def test_release_tag_requires_all_eight_jobs_to_succeed(self):
         self.assert_guard_covers(self.load("windows-release.yml"), tag=True, count=8)

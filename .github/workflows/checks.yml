@@ -2,8 +2,8 @@ name: Checks
 
 # Everything that has to pass before a change is trusted. The jobs below do not
 # wait for each other, so the wait is as long as the slowest one rather than the
-# sum of all of them. Both supported Python versions run the complete suite
-# in eight parts.
+# sum of all of them. Python 3.13 runs the complete suite in eight parts.
+# Python 3.11 has a short compatibility check, not a duplicate full suite.
 # The two four-part 3.13 stragglers previously spent over thirteen minutes
 # executing tests; setup was under a minute. Target ten minutes, allow hosted
 # variance within twelve per Python job, and enforce the shared fifteen-minute cap.
@@ -49,14 +49,7 @@ jobs:
           --required-job "Tests, part 6 of 8"
           --required-job "Tests, part 7 of 8"
           --required-job "Tests, part 8 of 8"
-          --required-job "Tests on Python 3.11, part 1 of 8"
-          --required-job "Tests on Python 3.11, part 2 of 8"
-          --required-job "Tests on Python 3.11, part 3 of 8"
-          --required-job "Tests on Python 3.11, part 4 of 8"
-          --required-job "Tests on Python 3.11, part 5 of 8"
-          --required-job "Tests on Python 3.11, part 6 of 8"
-          --required-job "Tests on Python 3.11, part 7 of 8"
-          --required-job "Tests on Python 3.11, part 8 of 8"
+          --required-job "Python 3.11 compatibility"
           --required-job "Panel checks"
           --required-job "The project's own suite"
           --required-job "Desktop app"
@@ -85,33 +78,38 @@ jobs:
       - name: Run this part of the tests
         run: python scripts/run_tests.py --part ${{ matrix.part }}/8 --quiet
 
-  tests-on-the-oldest-python:
-    name: Tests on Python 3.11, part ${{ matrix.part }} of 8
+  python-compatibility:
+    name: Python 3.11 compatibility
     runs-on: windows-latest
-    timeout-minutes: 12
-    strategy:
-      fail-fast: false
-      max-parallel: 8
-      matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8]
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install the test-only runtime dependencies
-        run: python -m pip install "langgraph>=1.2.11,<2" "langgraph-checkpoint-sqlite>=3.1.1,<4"
-      - name: Run this part of the tests
-        # All eight parts together still cover the whole suite on the oldest
-        # Python we promise to support. Matrix jobs run beside one another, so
-        # compatibility coverage no longer turns into one 20-minute wait.
-        run: python scripts/run_tests.py --part ${{ matrix.part }}/8 --quiet
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install the declared runtime
+        run: python -m pip install -e .
+      - name: Compile the supported source on the minimum Python version
+        run: python -m compileall -q src scripts
+      - name: Import the core runtime and transport adapters
+        run: python -c "import our_harness; import our_harness.config; import our_harness.long_horizon; from our_harness.providers import codex_cli, subscription_cli; print('Python 3.11 imports passed')"
+      - name: Check focused transport and CI contracts
+        # The complete suite runs on 3.13 above. This deliberately narrower
+        # minimum-version lane checks only the named compatibility contracts.
+        run: >-
+          python -m unittest
+          tests.test_native_input_context
+          tests.test_provider_connections
+          tests.test_ci_budget
+          tests.test_ci_workflow_contracts
+          -q
 
   panel:
     # These checks spend under three minutes in the browser in total. One
     # serial lane avoids four copies of installation and browser setup and
-    # keeps the workflow at twenty Windows jobs, with room for both complete
-    # Python matrices to start promptly. Each case still runs exactly once.
+    # leaves room for the complete Python matrix. Each case runs exactly once.
     name: Panel checks
     runs-on: windows-latest
     timeout-minutes: 10

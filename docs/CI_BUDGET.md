@@ -3,7 +3,7 @@
 Checks and Windows desktop release target **10 minutes** and have a **15-minute
 workflow execution budget**. This is one clock for a workflow attempt, including
 serial dependencies. Adding a new job does not give the workflow a new budget.
-Python jobs have a twelve-minute local timeout to allow hosted-runner variation
+Primary Python jobs have a twelve-minute local timeout to allow hosted-runner variation
 inside that shared budget. The ten-minute target is not a second, earlier kill
 switch: two measured runs otherwise cancelled different unfinished partitions at
 their local ten-minute limits. The fourteen-minute workflow cancellation point
@@ -84,10 +84,13 @@ workflow-deadline:
         --required-job "Verify"
 ```
 
-Use the exact display names from the attempt-jobs API. Checks currently requires
-eight `Tests, part N of 8` jobs, eight `Tests on Python 3.11, part N of 8` jobs,
-`Panel checks`, `The project's own suite`, `Desktop app`, and `What we would hand
-out`. The Windows release manifest requires:
+Use the exact display names from the attempt-jobs API. Normal Checks runs the
+full Python 3.13 suite once across eight `Tests, part N of 8` jobs. Python 3.11
+receives one short compatibility check instead of another complete eight-part
+suite. The user explicitly requested this reduction after the duplicate Python
+3.11 run held up otherwise completed CI. This does not claim exhaustive Python
+3.11 coverage. `Panel checks`, `The project's own suite`, `Desktop app`, and
+`What we would hand out` retain their own checks. The Windows release manifest requires:
 
 - `Build installer`
 - `Installed app`

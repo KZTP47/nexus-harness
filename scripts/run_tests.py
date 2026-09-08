@@ -4,7 +4,8 @@
     python scripts/run_tests.py --part 2/8     # the second part of eight
     python scripts/run_tests.py --list         # just say which files would run
 
-CI runs eight independent parts for each supported Python version. Each part
+CI runs eight independent parts on Python 3.13, with a separate short Python
+3.11 compatibility check instead of another full suite. Each full-suite part
 runs serially in its own interpreter so tests cannot race shared process state.
 The parts are dealt out like cards rather than cut into blocks. Eight-way CI
 also places a measured slow module in a less busy part. Increasing the number

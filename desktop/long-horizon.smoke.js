@@ -236,6 +236,14 @@ function trustFixtureSettings(exe, project, environment) {
   }
 }
 
+async function waitForPanelRuntime(page) {
+  await page.waitForFunction(() => location.protocol === "http:"
+    && document.readyState !== "loading"
+    && typeof request === "function"
+    && typeof activeConversationFor === "function"
+    && typeof swarmChatIsHydrating === "function", null, {timeout: 120000});
+}
+
 async function launch(exe, profile, project, environment) {
   const app = await electron.launch({
     executablePath: exe,
@@ -253,8 +261,8 @@ async function launch(exe, profile, project, environment) {
     ]);
     if (first === "repair") {
       await page.click("#repair");
-      await page.waitForFunction(() => location.protocol === "http:", null, {timeout: 120000});
     }
+    await waitForPanelRuntime(page);
     return {app, page};
   } catch (error) {
     await app.close().catch(() => {});
@@ -399,7 +407,7 @@ async function main() {
     // Reload exactly as a user reopening the panel would. The product must
     // hydrate the saved board and chat list through its visible UI path.
     await page.reload({waitUntil: "domcontentloaded", timeout: 120000});
-    await page.waitForFunction(() => location.protocol === "http:", null, {timeout: 120000});
+    await waitForPanelRuntime(page);
     await openBigChat(page, chats.chatR);
     console.log("pass  a clean packaged profile opens three real saved pair chats");
 
@@ -874,7 +882,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+if (require.main === module) main().catch((error) => {
   console.error(`\n${error && error.stack ? error.stack : error}`);
   process.exit(1);
 });
+
+module.exports = {waitForPanelRuntime};

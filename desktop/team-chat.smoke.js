@@ -341,6 +341,14 @@ async function until(read, description, timeout = TIMEOUT) {
   throw new Error(`Timed out waiting for ${description}`);
 }
 
+async function waitForPanelRuntime(page) {
+  await page.waitForFunction(() => location.protocol === "http:"
+    && document.readyState !== "loading"
+    && typeof request === "function"
+    && typeof activeConversationFor === "function"
+    && typeof swarmChatIsHydrating === "function", null, {timeout: TIMEOUT});
+}
+
 async function launch(exe, profile, project, environment) {
   const app = await electron.launch({executablePath:exe,
     args:[`--user-data-dir=${path.join(profile, "Electron")}`, "--project", project],
@@ -352,7 +360,7 @@ async function launch(exe, profile, project, environment) {
       page.waitForFunction(()=>location.protocol === "http:", null, {timeout:TIMEOUT}).then(()=>"panel"),
       page.locator("#repair").waitFor({state:"visible", timeout:TIMEOUT}).then(()=>"repair")]);
     if (first === "repair") await page.locator("#repair").click();
-    await page.waitForFunction(()=>location.protocol === "http:", null, {timeout:TIMEOUT});
+    await waitForPanelRuntime(page);
     return {app, page};
   } catch (error) { await app.close(); throw error; }
 }
@@ -694,6 +702,7 @@ async function main() {
     let page=running.page;
     const [gameChat,testChat]=await setupBoard(page,project,testProject);
     await page.reload({waitUntil:"domcontentloaded"});
+    await waitForPanelRuntime(page);
     await openChat(page,gameChat);
     await startGoal(page,GAME_GOAL);
     await answerAndReconsiderFolder(page,gameChat,exactAnswer,coordination);
@@ -862,4 +871,4 @@ async function main() {
 
 if(require.main===module)main().catch(error=>{console.error(error.stack || error);process.exitCode=1;});
 
-module.exports={GAME_ENGINE,GAME_HTML,SERVER,UNIT_TESTS,API_TESTS,E2E_TESTS,PROVIDER};
+module.exports={GAME_ENGINE,GAME_HTML,SERVER,UNIT_TESTS,API_TESTS,E2E_TESTS,PROVIDER,waitForPanelRuntime};
