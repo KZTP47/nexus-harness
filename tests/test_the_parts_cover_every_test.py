@@ -1,7 +1,7 @@
 """Splitting the tests across machines must not drop any of them.
 
-The build server runs the current Python suite in four parts and the slower
-oldest-Python suite in eight. If one test file fell between two parts, nobody
+The build server runs the complete suite in eight parts on both supported
+Python versions. If one test file fell between two parts, nobody
 would run it and nobody would notice: the build would still be green, and the
 file would rot.
 """
@@ -69,11 +69,20 @@ class SplittingTheTestsTests(unittest.TestCase):
         # parts there are. If somebody raises one and not the other, some tests
         # stop running and the build stays green.
         workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
-        self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/4", workflow)
-        self.assertIn("part: [1, 2, 3, 4]", workflow)
-        self.assertIn("Tests on Python 3.11, part ${{ matrix.part }} of 8", workflow)
-        self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/8", workflow)
-        self.assertIn("part: [1, 2, 3, 4, 5, 6, 7, 8]", workflow)
+        for owner, following, version in (
+            ("tests", "tests-on-the-oldest-python", "3.13"),
+            ("tests-on-the-oldest-python", "panel", "3.11"),
+        ):
+            with self.subTest(version=version):
+                job = workflow[workflow.index(f"  {owner}:\n"):workflow.index(f"  {following}:\n")]
+                self.assertIn(f'python-version: "{version}"', job)
+                self.assertIn("scripts/run_tests.py --part ${{ matrix.part }}/8 --quiet", job)
+                self.assertIn("part: [1, 2, 3, 4, 5, 6, 7, 8]", job)
+                self.assertIn("max-parallel: 8", job)
+                self.assertNotIn("needs:", job, "Python compatibility must not wait on another lane")
+                covered = [name for part in range(1, 9) for name in self.split.files_for((part, 8))]
+                self.assertCountEqual(covered, self.split.every_test_file())
+                self.assertEqual(len(covered), len(set(covered)))
 
     def test_the_source_panel_lane_installs_declared_runtime_dependencies(self) -> None:
         # PYTHONPATH makes Nexus's own modules importable, but it does not
@@ -83,8 +92,34 @@ class SplittingTheTestsTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
         panel = workflow[workflow.index("  panel:\n"):workflow.index("  project-checks:\n")]
         install = panel.index("python -m pip install -e .")
-        start = panel.index("Start the panel and run this part of the checks")
+        start = panel.index("Start the panel and run the selected checks")
         self.assertLess(install, start)
+
+    def test_consolidating_panel_setup_preserves_every_selected_case_serially(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
+        panel = workflow[workflow.index("  panel:\n"):workflow.index("  project-checks:\n")]
+        self.assertNotIn("matrix:", panel)
+        self.assertNotIn("--part", panel, "A single panel lane must not keep an obsolete shard filter")
+        self.assertIn("--suite .harness/qa/workflows.json", panel)
+        self.assertIn("--tag swarm --tag pipelines", panel)
+        self.assertIn("--workers 1", panel, "Panel cases share mutable boards and pipelines")
+        self.assertIn("$counts.skipped -gt 0", panel)
+        self.assertIn("$counts.total -lt 1", panel)
+
+    def test_desktop_keeps_one_packaging_test_and_real_runtime_acceptance(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "checks.yml").read_text(encoding="utf-8")
+        desktop = workflow[workflow.index("  desktop:\n"):workflow.index("  package:\n")]
+        self.assertEqual(desktop.count("run: npm test"), 1)
+        self.assertNotIn("run: node packaging.test.js", desktop)
+        build = desktop.index("npm run build -- --win dir")
+        for command in (
+            "npm run e2e:multi-vendor",
+            "node --test ui-navigation.test.js",
+            "npm run smoke:team-chat",
+            "npm run smoke:browser-long-horizon",
+        ):
+            with self.subTest(command=command):
+                self.assertGreater(desktop.index(command), build)
 
 
 if __name__ == "__main__":

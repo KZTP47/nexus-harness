@@ -6,6 +6,23 @@ from `requirements-runtime.lock` into it, builds NSIS, exercises a genuinely
 fresh first run with `--project`, silently installs the package, and exercises
 that installed executable too.
 
+## Execution budget and verification ownership
+
+CI and release runs target ten minutes and have a fifteen-minute total budget.
+The shared guard requests cancellation at fourteen minutes and force-cancels
+remaining work after a short grace period. Publication checks the remaining
+budget before uploading. An over-budget or incomplete run fails and cannot
+count as a verified release. See [CI budget](CI_BUDGET.md).
+
+The latest **Checks** run for the exact tag commit must pass before packaging.
+It owns the complete source suites, desktop tests, and unpacked/browser
+workflows. Release builds the installer once, then checks the installed app,
+long-horizon work, fault-injected team chat, and shortcut/reinstall behavior
+on four independent Windows runners. All four must pass before publication.
+Anonymous byte readback and source-ZIP installation then run in parallel.
+Compressed installers and offline ZIPs use uncompressed Actions uploads;
+installed-app jobs download only the installer and its checksum.
+
 ## Release trust modes
 
 The repository cannot manufacture a trustworthy publisher identity. When the

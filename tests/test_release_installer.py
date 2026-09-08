@@ -2033,6 +2033,10 @@ $verified = Assert-NexusDesktopShortcut $installed $desktop $desktop
 
     def test_clean_machine_release_and_first_run_contracts_are_wired(self):
         workflow = (ROOT / ".github" / "workflows" / "windows-release.yml").read_text(encoding="utf-8")
+        self.assertIn("./scripts/release_installed_acceptance.ps1", workflow)
+        self.assertIn("mode: [app, long-horizon, team-chat, shortcuts]", workflow)
+        self.assertIn("needs: [clean-windows-build, installed-acceptance]", workflow)
+        workflow += "\n" + (ROOT / "scripts" / "release_installed_acceptance.ps1").read_text(encoding="utf-8")
         panel = (ROOT / "src" / "our_harness" / "ui" / "app.js").read_text(encoding="utf-8")
         desktop = (ROOT / "desktop" / "main.js").read_text(encoding="utf-8")
         package = json.loads((ROOT / "desktop" / "package.json").read_text(encoding="utf-8"))

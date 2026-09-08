@@ -6,13 +6,46 @@ on:
     tags:
       - "v*"
 
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
+  workflow-deadline:
+    name: Workflow deadline
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Enforce the complete workflow budget
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          args=(--required-job "Build installer" --required-job "Installed app"
+                --required-job "Installed long-horizon" --required-job "Installed team-chat"
+                --required-job "Installed shortcuts" --required-job "Publish release"
+                --required-job "Public downloads" --required-job "Public source ZIP")
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            args+=(--allow-skipped-job "Publish release" --allow-skipped-job "Public downloads" --allow-skipped-job "Public source ZIP")
+          fi
+          python scripts/ci_budget.py watch "${args[@]}"
+
   clean-windows-build:
+    name: Build installer
+    permissions:
+      contents: read
+      actions: read
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -26,8 +59,18 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
-      - name: Test source installer contract
-        run: python -m unittest tests.test_release_installer -v
+      - name: Require successful Checks for this exact release commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runs = @(gh run list --workflow checks.yml --commit "$env:GITHUB_SHA" --limit 1 --json headSha,status,conclusion | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0 -or $runs.Count -ne 1 -or
+              $runs[0].headSha -cne $env:GITHUB_SHA -or
+              $runs[0].status -cne 'completed' -or $runs[0].conclusion -cne 'success') {
+            throw 'The latest Checks run for this exact commit must pass before packaging a release.'
+          }
 
       - name: Require the release tag to match the app version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -95,10 +138,6 @@ jobs:
         working-directory: desktop
         run: npm ci
 
-      - name: Test desktop ownership, startup, and packaging contracts
-        working-directory: desktop
-        run: npm test
-
       - name: Build versioned NSIS installer
         working-directory: desktop
         run: npm run build -- --win nsis
@@ -118,291 +157,6 @@ jobs:
           $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*-UNSIGNED-DEV.exe')
           if ($installers.Count -ne 1) { throw "Expected one unsigned release candidate, found $($installers.Count)." }
           Rename-Item -LiteralPath $installers[0].FullName -NewName ($installers[0].Name -replace '-UNSIGNED-DEV\.exe$', '-UNSIGNED.exe')
-
-      - name: Smoke-test the unpacked clean-machine app
-        working-directory: desktop
-        run: npm run smoke:built
-      - name: Prove cold-start navigation with the bundled browser
-        working-directory: desktop
-        run: |
-          if (-not (Test-Path -LiteralPath 'build-output/win-unpacked/resources/runtime/NEXUS_RUNTIME.json')) {
-            throw 'The cold-start navigation proof requires the built browser runtime.'
-          }
-          node --test ui-navigation.test.js
-
-      - name: Exercise unpacked multi-vendor dispatch and recovery
-        working-directory: desktop
-        run: npm run e2e:multi-vendor
-
-      - name: Exercise Work together recovery in an ordinary source browser
-        working-directory: desktop
-        run: npm run smoke:browser-long-horizon
-
-      - name: Install and smoke-test the real per-user package
-        shell: pwsh
-        run: |
-          $installers = @(Get-ChildItem -LiteralPath desktop/build-output -Filter 'Nexus-Harness-Setup-*.exe')
-          if ($installers.Count -ne 1) { throw "Expected one installer, found $($installers.Count)." }
-          $expectedVersion = (Get-Content -Raw -LiteralPath desktop/package.json | ConvertFrom-Json).version
-          $applicationGuid = 'e52322ab-f15e-5dc0-963b-7588e3739e89'
-          $installed = $null
-
-          function Get-CanonicalPath([string] $Path, [string] $What) {
-            if (-not $Path -or -not [IO.Path]::IsPathRooted($Path)) { throw "$What is not an absolute path: $Path" }
-            $full = [IO.Path]::GetFullPath($Path)
-            $root = [IO.Path]::GetPathRoot($full)
-            if ([StringComparer]::OrdinalIgnoreCase.Equals($full, $root)) { return $root }
-            return $full.TrimEnd(
-              [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar
-            )
-          }
-
-          function Get-InstalledApplication {
-            $installSubkey = "Software\$applicationGuid"
-            $uninstallSubkey = "Software\Microsoft\Windows\CurrentVersion\Uninstall\$applicationGuid"
-            $baseKey = $null
-            $installKey = $null
-            $uninstallKey = $null
-            try {
-              $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-                [Microsoft.Win32.RegistryHive]::CurrentUser,
-                [Microsoft.Win32.RegistryView]::Registry64
-              )
-              $installKey = $baseKey.OpenSubKey($installSubkey, $false)
-              $uninstallKey = $baseKey.OpenSubKey($uninstallSubkey, $false)
-              if ($null -eq $installKey -or $null -eq $uninstallKey) {
-                throw 'The exact current-user Nexus Harness registry metadata is missing.'
-              }
-              $locationValue = [string]$installKey.GetValue('InstallLocation')
-              $keepShortcuts = [string]$installKey.GetValue('KeepShortcuts')
-              $shortcutName = [string]$installKey.GetValue('ShortcutName')
-              $displayName = [string]$uninstallKey.GetValue('DisplayName')
-              $displayVersion = [string]$uninstallKey.GetValue('DisplayVersion')
-              $publisher = [string]$uninstallKey.GetValue('Publisher')
-              $uninstallString = [string]$uninstallKey.GetValue('UninstallString')
-              $quietUninstallString = [string]$uninstallKey.GetValue('QuietUninstallString')
-            } finally {
-              if ($null -ne $uninstallKey) { $uninstallKey.Dispose() }
-              if ($null -ne $installKey) { $installKey.Dispose() }
-              if ($null -ne $baseKey) { $baseKey.Dispose() }
-            }
-            if ($keepShortcuts -cne 'true' -or $shortcutName -cne 'Nexus Harness' -or
-                $displayName -cne 'Nexus Harness' -or $publisher -cne 'Nexus Harness' -or
-                $displayVersion -cne $expectedVersion) {
-              throw 'The exact current-user Nexus Harness product/version metadata is invalid.'
-            }
-            $location = Get-CanonicalPath $locationValue 'The installed application location'
-            if (-not (Test-Path -LiteralPath $location -PathType Container)) {
-              throw "The installed application location does not exist: $location"
-            }
-            $application = Get-CanonicalPath (Join-Path $location 'Nexus Harness.exe') 'The installed application'
-            $uninstaller = Get-CanonicalPath (Join-Path $location 'Uninstall Nexus Harness.exe') 'The installed uninstaller'
-            if (-not (Test-Path -LiteralPath $application -PathType Leaf) -or
-                -not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
-              throw "The exact installed application or uninstaller is missing below $location."
-            }
-            $uninstallMatch = [Regex]::Match($uninstallString, '\A"(?<path>.+)" /currentuser\z')
-            $quietMatch = [Regex]::Match($quietUninstallString, '\A"(?<path>.+)" /currentuser /S\z')
-            if (-not $uninstallMatch.Success -or -not $quietMatch.Success) {
-              throw 'The installed package metadata is not bound to current-user mode.'
-            }
-            $registeredUninstaller = Get-CanonicalPath $uninstallMatch.Groups['path'].Value 'The registered uninstaller'
-            $registeredQuietUninstaller = Get-CanonicalPath $quietMatch.Groups['path'].Value 'The registered quiet uninstaller'
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($registeredUninstaller, $uninstaller) -or
-                -not [StringComparer]::OrdinalIgnoreCase.Equals($registeredQuietUninstaller, $uninstaller)) {
-              throw 'The installed package metadata points outside its exact install location.'
-            }
-            return $application
-          }
-
-          function Get-DesktopFolders {
-            $candidates = @(
-              [Environment]::GetFolderPath([Environment+SpecialFolder]::DesktopDirectory),
-              [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonDesktopDirectory)
-            )
-            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            $folders = @()
-            foreach ($candidate in $candidates) {
-              $folder = Get-CanonicalPath $candidate 'A Windows desktop known folder'
-              if (-not (Test-Path -LiteralPath $folder -PathType Container)) {
-                throw "Windows did not provide an existing desktop known folder: $folder"
-              }
-              if ($seen.Add($folder)) { $folders += $folder }
-            }
-            if ($folders.Count -eq 0) { throw 'Windows did not provide any desktop known folders.' }
-            return $folders
-          }
-
-          $desktopFolders = @(Get-DesktopFolders)
-          $desktop = $desktopFolders[0]
-          $shortcut = Join-Path $desktop 'Nexus Harness.lnk'
-
-          function Assert-InstalledShortcut {
-            $installedPath = Get-CanonicalPath $installed 'The installed application'
-            $seenLinks = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-            $links = @()
-            foreach ($folder in $desktopFolders) {
-              foreach ($candidate in @(Get-ChildItem -LiteralPath $folder -Filter 'Nexus Harness*.lnk' -File -Force)) {
-                $candidatePath = Get-CanonicalPath $candidate.FullName 'A Nexus Harness desktop shortcut'
-                if ($seenLinks.Add($candidatePath)) { $links += $candidatePath }
-              }
-            }
-            if ($links.Count -ne 1 -or
-                -not [StringComparer]::OrdinalIgnoreCase.Equals($links[0], $shortcut)) {
-              throw "Expected exactly $shortcut and no duplicate visible Nexus Harness links; found $($links -join ', ')."
-            }
-            $shortcutItem = Get-Item -LiteralPath $shortcut -Force
-            $unsafeAttributes = (
-              [int][IO.FileAttributes]::Hidden -bor
-              [int][IO.FileAttributes]::System -bor
-              [int][IO.FileAttributes]::ReparsePoint
-            )
-            if ($shortcutItem.PSIsContainer -or
-                (([int]$shortcutItem.Attributes -band $unsafeAttributes) -ne 0)) {
-              throw "The installed Desktop shortcut is not a visible ordinary file: $shortcut"
-            }
-            $shell = New-Object -ComObject WScript.Shell
-            $link = $null
-            try {
-              $link = $shell.CreateShortcut($shortcut)
-              $target = Get-CanonicalPath ([string]$link.TargetPath) 'The shortcut target'
-              $arguments = [string]$link.Arguments
-              $workingDirectory = Get-CanonicalPath ([string]$link.WorkingDirectory) 'The shortcut working directory'
-              $iconLocation = ([string]$link.IconLocation).Trim()
-              $iconIndex = 0
-              if ($iconLocation -match '^(.*),\s*(-?\d+)$') {
-                $iconLocation = $Matches[1].Trim()
-                $iconIndex = [int]$Matches[2]
-              }
-              $icon = Get-CanonicalPath $iconLocation.Trim('"') 'The shortcut icon source'
-            } finally {
-              if ($null -ne $link -and [Runtime.InteropServices.Marshal]::IsComObject($link)) {
-                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)
-              }
-              if ([Runtime.InteropServices.Marshal]::IsComObject($shell)) {
-                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
-              }
-            }
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($target, $installedPath)) {
-              throw "Shortcut target '$target' does not match '$installedPath'."
-            }
-            if ($arguments -cne '') {
-              throw "Shortcut contains unexpected launch arguments: '$arguments'."
-            }
-            $installedDirectory = Get-CanonicalPath (Split-Path -Parent $installedPath) 'The installed application directory'
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($workingDirectory, $installedDirectory)) {
-              throw "Shortcut working directory '$workingDirectory' does not match '$installedDirectory'."
-            }
-            if (-not (Test-Path -LiteralPath $icon -PathType Leaf)) {
-              throw "Shortcut icon source does not exist: $icon"
-            }
-            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($icon, $installedPath) -or
-                $iconIndex -ne 0) {
-              throw "Shortcut icon '$icon,$iconIndex' does not use the installed application exactly."
-            }
-            return [pscustomobject]@{
-              ShortcutPath = $shortcut; TargetPath = $target; Arguments = $arguments
-              WorkingDirectory = $workingDirectory; IconPath = $icon; IconIndex = $iconIndex
-            }
-          }
-
-          function Get-InstalledProcesses {
-            return @(Get-CimInstance Win32_Process | Where-Object {
-              $_.ExecutablePath -and [StringComparer]::OrdinalIgnoreCase.Equals(
-                [IO.Path]::GetFullPath($_.ExecutablePath), [IO.Path]::GetFullPath($installed)
-              )
-            })
-          }
-
-          function Stop-InstalledProcessTrees {
-            $deadline = [DateTime]::UtcNow.AddSeconds(20)
-            do {
-              $remaining = @(Get-InstalledProcesses)
-              if ($remaining.Count -eq 0) { return }
-              foreach ($process in $remaining) {
-                try {
-                  [void](Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" `
-                    -ArgumentList @('/PID', [string]$process.ProcessId, '/T', '/F') `
-                    -Wait -PassThru -WindowStyle Hidden)
-                } catch {
-                  # The bounded exact-path readback below remains authoritative.
-                }
-              }
-              if ([DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 250 }
-            } while ([DateTime]::UtcNow -lt $deadline)
-            $remaining = @(Get-InstalledProcesses)
-            if ($remaining.Count -ne 0) {
-              throw "The shortcut-launched installed process tree did not stop: $($remaining.ProcessId -join ', ')."
-            }
-          }
-
-          $process = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
-          if ($process.ExitCode -ne 0) { throw "Installer stopped with code $($process.ExitCode)." }
-          $installed = Get-InstalledApplication
-          [void](Assert-InstalledShortcut)
-          Push-Location desktop
-          try {
-            npm run smoke:built -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed app acceptance failed.' }
-            npm run e2e:multi-vendor -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed multi-vendor acceptance failed.' }
-            npm run smoke:long-horizon -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed long-horizon acceptance failed.' }
-            $env:NEXUS_TEAM_PROTOCOL_FAULT = '1'
-            $env:NEXUS_TEAM_TOOL_FAULT = '1'
-            npm run smoke:team-chat -- "$installed"
-            if ($LASTEXITCODE -ne 0) { throw 'Installed two-agent chat acceptance failed.' }
-          } finally { Pop-Location }
-
-          Remove-Item -LiteralPath $shortcut -Force
-          if (Test-Path -LiteralPath $shortcut) { throw "Could not remove $shortcut for the reinstall check." }
-          $reinstall = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
-          if ($reinstall.ExitCode -ne 0) { throw "Reinstall stopped with code $($reinstall.ExitCode)." }
-          $reinstalled = Get-InstalledApplication
-          if (-not [StringComparer]::OrdinalIgnoreCase.Equals($reinstalled, $installed)) {
-            throw "Reinstall moved the exact current-user application from '$installed' to '$reinstalled'."
-          }
-          [void](Assert-InstalledShortcut)
-
-          # A previous development build can leave a same-name link. NSIS's
-          # KeepShortcuts upgrade path used to preserve that stale target.
-          $shell = New-Object -ComObject WScript.Shell
-          $stale = $null
-          try {
-            $stale = $shell.CreateShortcut($shortcut)
-            $stale.TargetPath = $installers[0].FullName
-            $stale.Arguments = '--stale-development-shortcut'
-            $stale.WorkingDirectory = Split-Path -Parent $installers[0].FullName
-            $stale.IconLocation = "$($installers[0].FullName),7"
-            $stale.Save()
-          } finally {
-            if ($null -ne $stale -and [Runtime.InteropServices.Marshal]::IsComObject($stale)) {
-              [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($stale)
-            }
-            if ([Runtime.InteropServices.Marshal]::IsComObject($shell)) {
-              [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)
-            }
-          }
-          $staleReinstall = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', '/currentuser') -Wait -PassThru -WindowStyle Hidden
-          if ($staleReinstall.ExitCode -ne 0) { throw "Stale-shortcut reinstall stopped with code $($staleReinstall.ExitCode)." }
-          $verifiedShortcut = Assert-InstalledShortcut
-
-          $alreadyRunning = @(Get-InstalledProcesses)
-          if ($alreadyRunning.Count -ne 0) {
-            throw "A prior package smoke left the installed app running: $($alreadyRunning.ProcessId -join ', ')."
-          }
-          $launched = @()
-          try {
-            [void](Start-Process -FilePath $verifiedShortcut.ShortcutPath -PassThru)
-            $deadline = [DateTime]::UtcNow.AddSeconds(30)
-            do {
-              $launched = @(Get-InstalledProcesses)
-              if ($launched.Count -eq 0) { Start-Sleep -Milliseconds 250 }
-            } while ($launched.Count -eq 0 -and [DateTime]::UtcNow -lt $deadline)
-            if ($launched.Count -eq 0) { throw "The recreated desktop shortcut did not launch the installed app." }
-          } finally {
-            Stop-InstalledProcessTrees
-          }
 
       - name: Verify the installer Authenticode signature
         if: env.NEXUS_SIGNED_BUILD == '1'
@@ -482,9 +236,43 @@ jobs:
           path: |
             desktop/build-output/Nexus-Harness-Setup-*.exe
             desktop/build-output/Nexus-Harness-Setup-*.exe.sha256
-            desktop/build-output/Nexus-Harness-Windows-Offline-*.zip
             desktop/build-output/release-metadata.json
+          compression-level: 0
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: nexus-harness-offline-${{ github.ref_name }}
+          if-no-files-found: error
+          path: desktop/build-output/Nexus-Harness-Windows-Offline-*.zip
+          compression-level: 0
 
+  installed-acceptance:
+    name: Installed ${{ matrix.mode }}
+    needs: clean-windows-build
+    runs-on: windows-latest
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [app, long-horizon, team-chat, shortcuts]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nexus-harness-windows-${{ github.ref_name }}
+          path: release-candidate
+      - name: Install smoke driver dependencies
+        if: matrix.mode != 'shortcuts'
+        working-directory: desktop
+        run: npm ci
+      - name: Verify the installed artifact
+        shell: pwsh
+        run: ./scripts/release_installed_acceptance.ps1 -Mode '${{ matrix.mode }}' -ArtifactDirectory release-candidate
       - name: Locate failed release smoke evidence
         if: failure()
         shell: pwsh
@@ -498,7 +286,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: release-conversation-failure-${{ github.ref_name }}
+          name: release-conversation-failure-${{ matrix.mode }}-${{ github.ref_name }}
           if-no-files-found: ignore
           path: |
             ${{ env.NEXUS_RELEASE_SMOKE_TMPDIR }}/nexus-multivendor-e2e-*/failure.png
@@ -515,17 +303,23 @@ jobs:
           retention-days: 7
 
   publish-release:
+    name: Publish release
+    timeout-minutes: 2
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: clean-windows-build
+    needs: [clean-windows-build, installed-acceptance]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: nexus-harness-windows-${{ github.ref_name }}
+          pattern: nexus-harness-*-${{ github.ref_name }}
+          merge-multiple: true
           path: release
       - name: Refuse an existing mutable release and publish once
+        timeout-minutes: 1
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -596,8 +390,21 @@ jobs:
             notes="Windows installer: SHA-256 plus the pinned Authenticode Subject and signer-certificate SHA-256 are verified by the release workflow."
           fi
           notes="$notes The product-bound offline ZIP carries a CMD-pinned bootstrap, installer, checksum, and v2 identity manifest together for computers without GitHub access. The unsigned outer ZIP/CMD still requires trusted transport. Measured download size: ${installer_mib} MiB; unpacked application: ${unpacked_mib} MiB. Allow at least 2 GiB free while installing."
+          python scripts/ci_budget.py check --reserve-seconds 300
           gh release create "$tag" "${assets[@]}" "$offline_bundle" --verify-tag --generate-notes --notes "$notes" --title "Nexus Harness $tag"
 
+  public-downloads:
+    name: Public downloads
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: nexus-harness-*-${{ github.ref_name }}
+          merge-multiple: true
+          path: release
       - name: Prove the stable release is anonymously installable
         shell: bash
         run: |
@@ -690,10 +497,11 @@ jobs:
           fi
 
   prove-public-source-zip:
+    name: Public source ZIP
     if: startsWith(github.ref, 'refs/tags/v')
     needs: publish-release
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 3
     permissions:
       contents: read
     steps:

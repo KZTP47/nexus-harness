@@ -147,9 +147,15 @@ test("unpacked and installed acceptance lanes are release gates", () => {
   );
   assert.match(checks, /npm run build -- --win dir/);
   assert.match(checks, /npm run e2e:multi-vendor/);
-  assert.ok(
-    release.indexOf("npm run e2e:multi-vendor") > release.indexOf("npm run build -- --win nsis"),
+  const installedAcceptance = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "release_installed_acceptance.ps1"), "utf8",
   );
-  assert.match(release, /npm run e2e:multi-vendor -- "\$installed"/);
-  assert.ok((release.match(/npm run e2e:multi-vendor/g) || []).length >= 2);
+  assert.match(release, /gh run list --workflow checks.yml --commit "\$env:GITHUB_SHA"/);
+  assert.match(release, /needs: clean-windows-build/);
+  assert.match(release, /needs: \[clean-windows-build, installed-acceptance\]/);
+  assert.match(release, /release_installed_acceptance.ps1 -Mode '\$\{\{ matrix.mode \}\}'/);
+  assert.match(installedAcceptance, /npm run e2e:multi-vendor -- "\$installed"/);
+  assert.equal((installedAcceptance.match(/npm run e2e:multi-vendor/g) || []).length, 1);
+  assert.ok(installedAcceptance.indexOf("$installed = Get-InstalledApplication")
+    < installedAcceptance.indexOf("npm run e2e:multi-vendor"));
 });
