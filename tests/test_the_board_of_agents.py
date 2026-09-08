@@ -2948,6 +2948,11 @@ run().then(() => process.stdout.write("drained"))
             self.script.index("function beginLongGoalLoad"):
             self.script.index("async function readSwarmBoardRun")
         ]
+        # Exercise the real monotonic projection dependency, not a fixture stub.
+        helpers += self.script[
+            self.script.index("let goalSnapshotClock ="):
+            self.script.index("async function openChatGoalDetails")
+        ]
         loaders = self.script[
             self.script.index("async function refreshLongGoalOriginChats"):
             self.script.index("function savedLongGoalComposer")
@@ -3082,6 +3087,11 @@ run().then(() => process.stdout.write("fenced"))
         helpers = self.script[
             self.script.index("function beginLongGoalLoad"):
             self.script.index("async function readSwarmBoardRun")
+        ]
+        # Exercise the real monotonic projection dependency, not a fixture stub.
+        helpers += self.script[
+            self.script.index("let goalSnapshotClock ="):
+            self.script.index("async function openChatGoalDetails")
         ]
         loaders = self.script[
             self.script.index("async function refreshLongGoalOriginChats"):
@@ -10277,8 +10287,9 @@ class WhatThePanelIsTold(BoardTestCase):
             script.index("async function refreshLongGoalOriginChats"):
             script.index("function savedLongGoalComposer")
         ]
-        self.assertIn("await refreshLongGoalOriginChats(nextGoal)", polling)
-        self.assertIn("await refreshLongGoalOriginChats(nextGoals)", polling)
+        self.assertIn("const accepted = rememberChatGoalSnapshot(nextGoal, readTicket)", polling)
+        self.assertIn("const accepted = rememberGoalSnapshotInventory(nextGoals, readTicket)", polling)
+        self.assertEqual(polling.count("await refreshLongGoalOriginChats(accepted)"), 2)
         self.assertIn(
             "const loadRevision = inheritedRevision || beginLongGoalLoad()",
             polling,
@@ -10287,7 +10298,7 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assertIn("let nextEvents = resetsHistory ? [] : [...longGoalEvents]", polling)
         self.assertLess(
             polling.index("if (!isCurrent()) return;", polling.index("const goalAnswer")),
-            polling.index("longGoal = nextGoal"),
+            polling.index("longGoal = rememberChatGoalSnapshot(nextGoal, readTicket)"),
         )
         self.assertIn('"waiting_for_project", "queued", "running"', polling)
         self.assertIn('"queued", "running", "cancelling"', polling)
