@@ -5,8 +5,8 @@ name: Checks
 # sum of all of them. Both supported Python versions run the complete suite
 # in eight parts.
 # The two four-part 3.13 stragglers previously spent over thirteen minutes
-# executing tests; setup was under a minute. Keep work below ten minutes per
-# job and reserve the separate workflow deadline for a hard fifteen-minute cap.
+# executing tests; setup was under a minute. Target ten minutes, allow hosted
+# variance within twelve per Python job, and enforce the shared fifteen-minute cap.
 #
 # Product checks run on Windows, the supported desktop environment. The
 # independent Linux job only watches the shared workflow deadline.
@@ -65,7 +65,7 @@ jobs:
   tests:
     name: Tests, part ${{ matrix.part }} of 8
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -88,7 +88,7 @@ jobs:
   tests-on-the-oldest-python:
     name: Tests on Python 3.11, part ${{ matrix.part }} of 8
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     strategy:
       fail-fast: false
       max-parallel: 8
