@@ -4481,18 +4481,21 @@ def _run_brokered_playwright_specs(
             },
             "broker": observation.get("broker"),
         }
+        broker = observation.get("broker") or {}
+        unavailable = bool(broker.get("containment_unavailable"))
         runner = observation.get("broker", {}).get("runner") or {}
         return {
             "argv": list(command), "cwd": ".",
-            "exit_code": 0 if observation.get("passed") else 1,
+            "exit_code": -2 if unavailable else 0 if observation.get("passed") else 1,
+            "containment_unavailable": unavailable,
             "stdout": str(runner.get("stdout", "")),
-            "stderr": str(runner.get("stderr", "")),
+            "stderr": str(broker.get("error") or runner.get("stderr", "")),
             "timed_out": bool(runner.get("timed_out", False)),
             "output_truncated": False,
             "brokered_e2e_receipts": [receipt],
             "containment_profile": "windows-appcontainer-job-v1",
             "disposable_snapshot": True,
-            "ordinary_suite_executed": True,
+            "ordinary_suite_executed": bool(runner) and not runner.get("containment_unavailable", False),
         }
     scenarios: list[tuple[Path, dict[str, Any]]] = []
     for path, source in sources:
@@ -4528,9 +4531,12 @@ def _run_brokered_playwright_specs(
         observation["test_file"] = path.relative_to(snapshot).as_posix()
         observations.append(observation)
         if not observation.get("passed"):
+            broker = observation.get("broker") or {}
+            unavailable = bool(broker.get("containment_unavailable"))
             return {
-                "argv": list(command), "cwd": ".", "exit_code": 1,
-                "stdout": "", "stderr": "Engine-owned Playwright browser scenario failed",
+                "argv": list(command), "cwd": ".", "exit_code": -2 if unavailable else 1,
+                "containment_unavailable": unavailable,
+                "stdout": "", "stderr": str(broker.get("error") or "Engine-owned Playwright browser scenario failed"),
                 "timed_out": False, "output_truncated": False,
                 "brokered_e2e_receipts": observations,
                 "containment_profile": "windows-appcontainer-job-v1",

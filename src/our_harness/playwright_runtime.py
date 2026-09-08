@@ -1149,6 +1149,26 @@ def discover_bundled_playwright_runtime(*, required: bool = False) -> BundledPla
     return None
 
 
+def _failed_broker_process(error: BaseException) -> dict[str, Any]:
+    """Transfer a worker failure as data, never as a live exception object.
+
+    Broker results cross JSON tool, journal and UI boundaries. Retain the
+    native diagnostic and error codes without serializing exception internals.
+    """
+
+    result = {
+        "exit_code": -2, "stdout": "", "stderr": str(error),
+        "error_type": type(error).__name__,
+        "timed_out": isinstance(error, TimeoutError),
+        "output_truncated": False, "containment_unavailable": True,
+    }
+    for name in ("errno", "winerror"):
+        value = getattr(error, name, None)
+        if type(value) is int:
+            result[name] = value
+    return result
+
+
 def run_brokered_playwright_appcontainer(
     snapshot: Path,
     runner_script: Path,
@@ -1362,6 +1382,7 @@ const { chromium } = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT
                 nested_mapped_cwd=runner_nested_workspace,
             )
         except BaseException as error:
+            runner_payload = _failed_broker_process(error)
             broker_error = "Contained Playwright runner failed to launch: " + str(error)
         # Browser.close is engine-owned and independent of project test code.
         if browser_thread.is_alive():
@@ -1376,6 +1397,7 @@ const { chromium } = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT
                     map_authorized_roots=True,
                 )
             except BaseException as error:
+                closer_payload = _failed_broker_process(error)
                 broker_error = broker_error or "Contained Chromium closer failed to launch: " + str(error)
     else:
         broker_error = (
@@ -1397,7 +1419,8 @@ const { chromium } = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT
     else:
         browser_payload = browser_results.get_nowait()
     if isinstance(browser_payload, BaseException):
-        broker_error = broker_error or str(browser_payload)
+        browser_payload = _failed_broker_process(browser_payload)
+        broker_error = ": ".join(filter(None, [broker_error, "Contained Chromium: " + browser_payload["stderr"]]))
 
     if proxy_thread is not None and proxy_thread.is_alive():
         proxy_control = control / "playwright-origin-proxy-control"
@@ -1417,6 +1440,7 @@ const { chromium } = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT
                 capability_sids=(PRIVATE_NETWORK_CLIENT_SERVER,),
             )
         except BaseException as error:
+            proxy_closer_payload = _failed_broker_process(error)
             broker_error = broker_error or "Exact-origin proxy closer failed: " + str(error)
     if proxy_thread is not None:
         proxy_thread.join(timeout=timeout + 30.0)
@@ -1430,8 +1454,9 @@ const { chromium } = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT
         broker_error = broker_error or str(proxy_payload)
     else:
         proxy_payload = proxy_results.get_nowait()
-        if isinstance(proxy_payload, BaseException):
-            broker_error = broker_error or str(proxy_payload)
+    if isinstance(proxy_payload, BaseException):
+        proxy_payload = _failed_broker_process(proxy_payload)
+        broker_error = ": ".join(filter(None, [broker_error, "Exact-origin proxy: " + proxy_payload["stderr"]]))
     route_receipts: list[dict[str, Any]] = []
     if isinstance(proxy_payload, dict):
         for line in str(proxy_payload.get("stdout", "")).splitlines():
@@ -1487,6 +1512,9 @@ const { chromium } = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT
             ready and proxy_ready and browser_ok and runner_ok and closer_ok
             and proxy_ok and proxy_closer_ok and exact_route_ok
             and boundary_inheritance_attested and not broker_error
+        ),
+        "containment_unavailable": not ready or any(
+            one.get("containment_unavailable") for one in contained_processes
         ),
         "endpoint_scope": "same-profile-appcontainer-loopback",
         "profile": profile,
