@@ -22,15 +22,17 @@ import shutil
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
 from ..models import HarnessError, ProviderRequest, ProviderResponse
 from ..redaction import CredentialRedactor, bounded_redacted_text
 from .base import Provider
+from . import claude_input
+from .input_context import CLI_WORKSPACE_RULES
 from .codex_cli import (
-    _minimal_codex_environment, _provider_capture_limit, _remaining, _run_bounded,
+    _minimal_codex_environment, _private_workspace, _provider_capture_limit, _remaining, _run_bounded,
     codex_config_load_error,
 )
 
@@ -783,8 +785,8 @@ def _where_else_it_might_be(patterns: tuple[str, ...]) -> list[Path]:
     return sorted(found, key=lambda one: one.stat().st_mtime, reverse=True)
 
 
-def _prompt(request: ProviderRequest) -> str:
-    """One plain prompt, because a command line tool takes text and nothing else."""
+def _prompt(request: ProviderRequest, *, native_images: bool = False) -> str:
+    """Build the text portion without confusing native images with file tools."""
 
     sections = [
         "SYSTEM INSTRUCTIONS\n" + request.system_prefix,
@@ -799,7 +801,13 @@ def _prompt(request: ProviderRequest) -> str:
         and str(one.get("type") or "").startswith("image/")
         and str(one.get("path") or "")
     ]
-    if images:
+    if native_images:
+        sections.append(
+            "USER-SELECTED IMAGE ATTACHMENTS\n"
+            "The original images are included as native image content blocks in this message. "
+            "Inspect those blocks directly; no file-reading tool or directory access is required."
+        )
+    elif images:
         sections.append(
             "USER-SELECTED IMAGE ATTACHMENTS\n"
             "Inspect these exact files as part of the user's message:\n"
@@ -1057,6 +1065,14 @@ class SubscriptionCLIProvider(Provider):
             )
 
     def complete(self, request: ProviderRequest) -> ProviderResponse:
+        # A saved goal's file operations belong to Nexus, not this process's
+        # inherited cwd. Do not load an unrelated project's CLI context.
+        if request.workspace_context is not None and not request.working_directory:
+            with _private_workspace("our-harness-provider-") as cwd:
+                return self._complete_in_workspace(replace(request, working_directory=str(cwd)))
+        return self._complete_in_workspace(request)
+
+    def _complete_in_workspace(self, request: ProviderRequest) -> ProviderResponse:
         self._reject_native_contract(request)
         recipe = self._arguments()
         command = self._command()
@@ -1081,21 +1097,25 @@ class SubscriptionCLIProvider(Provider):
             request.response_format.schema if request.response_format is not None else None,
         )
         argv = recipe.argv(command, str(request.model or ""))
+        image_attachments = [one for one in request.attachments if isinstance(one, dict)
+                             and str(one.get("type") or "").startswith("image/")]
         image_paths = [
             str(one.get("path") or "") for one in request.attachments
             if isinstance(one, dict)
             and str(one.get("type") or "").startswith("image/")
             and str(one.get("path") or "")
         ]
-        if image_paths and recipe.id not in {"claude-cli", "gemini-cli", "copilot-cli"}:
+        if image_attachments and recipe.id not in {"claude-cli", "gemini-cli"}:
             raise HarnessError(
                 f"{recipe.label} has no declared screenshot-input contract. "
-                "Use a Claude, Codex, Gemini, Copilot, API, or vision-capable Ollama route."
+                "Use a Claude, Codex, Gemini, API, or vision-capable Ollama route."
             )
-        if image_paths and recipe.id == "claude-cli":
-            argv.extend(["--tools", "Read", "--allowedTools", "Read"])
-            for folder in sorted({str(Path(path).parent) for path in image_paths}):
-                argv.extend(["--add-dir", folder])
+        claude_images = bool(image_attachments and recipe.id == "claude-cli")
+        if claude_images:
+            if self.settings.get("arguments") is not None:
+                raise HarnessError("Claude image inputs require the standard CLI arguments; remove the route's custom arguments")
+            argv[argv.index("--output-format") + 1] = "stream-json"
+            argv.extend(["--input-format", "stream-json", "--verbose", "--tools", ""])
         elif image_paths and recipe.id == "gemini-cli":
             argv.extend(["--allowed-tools", "read_file"])
             for folder in sorted({str(Path(path).parent) for path in image_paths}):
@@ -1104,12 +1124,20 @@ class SubscriptionCLIProvider(Provider):
             # Claude Code otherwise inherits its normal tool set even in -p
             # mode. Empty --tools makes this an answer-only provider call.
             argv.extend(["--tools", ""])
+        if recipe.id == "claude-cli" and self.settings.get("arguments") is None:
+            argv.extend(["--no-session-persistence"])
+            if request.workspace_context is not None:
+                # Only static instructions enter argv. User-selected paths and
+                # multiline context stay in stdin, including for .cmd launchers.
+                argv.extend(["--append-system-prompt", CLI_WORKSPACE_RULES])
         # Gemini's --allowed-tools is an approval allow-list, not a tool
         # discovery disable switch. Non-interactive default mode is safer than
         # yolo, but machine/user policy can still authorize tools; consequently
         # Gemini is deliberately not marked retry-safe above.
-        prompt = self._redactor.text(_prompt(request))
+        prompt = self._redactor.text(_prompt(request, native_images=claude_images))
         stdin_text: str | None = prompt
+        if claude_images:
+            stdin_text = claude_input.build_user_message(request, prompt)
         if recipe.id == "copilot-cli" and self.settings.get("arguments") is None:
             # GitHub's current programmatic contract is `-p PROMPT -s`. Keep
             # tools out of model discovery, deny every documented permission
@@ -1177,7 +1205,8 @@ class SubscriptionCLIProvider(Provider):
                 f"{self._and_what_it_says_about_itself(recipe, deadline_at, asked)}"
                 f" It printed: {self._just_a_glimpse(result.stderr or result.stdout)}"
             )
-        return self._read_answer(recipe, result.stdout, result.stderr, started)
+        stdout = claude_input.terminal_result(result.stdout) if claude_images else result.stdout
+        return self._read_answer(recipe, stdout, result.stderr, started)
 
     def _why_it_would_not(self, recipe: CliRecipe, stdout: str, stderr: str = "") -> str:
         """The reason the tool gave, if it gave one anywhere in what it printed.
@@ -1583,6 +1612,14 @@ def _that_went_wrong(recipe: CliRecipe, body: dict[str, Any]) -> bool:
 
     if recipe.error_when_present and _dotted(body, recipe.error_when_present) is not None:
         return True
+    if recipe.id == "claude-cli":
+        # t3code also checks api_error_status: Claude can emit a success subtype
+        # with is_error=false while the service actually returned an overload.
+        status = body.get("api_error_status")
+        if isinstance(status, int) and status >= 400:
+            return True
+        if body.get("subtype") and body["subtype"] != "success":
+            return True
     return bool(recipe.error_field) and _dotted(body, recipe.error_field) is True
 
 

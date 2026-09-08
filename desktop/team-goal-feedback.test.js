@@ -37,6 +37,7 @@ test("actual chat activity and decision controls fit wide and narrow windows and
       function saveTheBigChatLayout() {}
       ${section("function boundedBigChatSize", "function rememberTheBigChatComposer")}
       ${section("function make(tag", "function migrateGraph")}
+      ${section("const chatGoalRequests =", "function chatGoalParticipants")}
       ${section("function chatGoalParticipants", "function rememberChatGoalSnapshot")}
       ${section("function fillChatGoalPanel", "function syncChatGoalControls")}
       ${section("function normalizedUserQuestions", "function frozenWorkRecovery")}
@@ -46,7 +47,6 @@ test("actual chat activity and decision controls fit wide and narrow windows and
       const agents = [{id:'builder',name:'Builder'},{id:'reviewer',name:'Reviewer'}];
       const swarmChats = [{agent:'builder'}];
       const swarmChatActivity = new Map([['chat:portable-chat',{collapsed:true,state:'complete',stage:'Old admission receipt'}]]);
-      const chatGoalRequests = new Set();
       let longGoals = [{goal_id:'portable-goal',conversation_id:conversation.id,project:{id:conversation.project},lead_agent_id:'builder',
         requested_agent_ids:conversation.pair,agents,status:'running',revision:4,pending_interrupts:[],tasks:[]}];
       function activeConversationFor() { return conversation; }
@@ -134,7 +134,8 @@ test("actual chat activity and decision controls fit wide and narrow windows and
     const submission=await page.evaluate(()=>window.submissions.at(-1));
     assert.equal(submission.url,'/api/long-horizon/answer');
     assert.deepEqual(submission.body.pending_ids,['decision-b']);
-    assert.equal(submission.body.answers['decision-b'],'Keyboard or mouse?: Keyboard');
+    assert.deepEqual(submission.body.answers['decision-b'], {schema_version:1,audience:'team',
+      questions:[{question_id:'controls',selected_options:['Keyboard'],text:''}]});
     assert.equal(submission.body.expected_revision,4);
     // The same question control remains usable in the Mission control style.
     await page.evaluate(()=>{

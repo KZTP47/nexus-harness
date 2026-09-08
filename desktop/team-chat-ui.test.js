@@ -501,6 +501,9 @@ for (const view of ["compact", "maximized"]) {
 
   test(`${view}: real composer steers exact active team and clears only accepted draft`, async () => {
     const f = fixture(view);
+    // The complete inventory still contains the unrelated detail selection.
+    f.inventory = [f.goal, f.context.longGoal];
+    f.context.longGoals = [...f.inventory];
     await f.send();
     const posts = f.calls.filter((one) => one.body);
     assert.equal(posts.length, 1);
@@ -568,7 +571,9 @@ for (const view of ["compact", "maximized"]) {
     assert.equal(post.url, "/api/long-horizon/answer");
     assert.equal(post.body.expected_revision, 12);
     assert.deepEqual(post.body.pending_ids, ["decision-portable"]);
-    assert.deepEqual(post.body.answers, {"decision-portable": "Use keyboard controls too"});
+    assert.deepEqual(post.body.answers, {"decision-portable": {schema_version: 1, audience: "team",
+      questions: [{question_id: "controls", selected_options: [], text: "Use keyboard controls too"}]}});
+    assert.match(post.body.request_id, /^[a-f0-9-]{36}$/);
   });
 
   test(`${view}: a newer draft and chat switch survive a delayed accepted steering response`, async () => {

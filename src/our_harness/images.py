@@ -31,6 +31,8 @@ SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # page screenshot produces, and it keeps a broken file from eating the machine.
 MAX_PIXELS = 40_000_000
 MAX_SIDE = 20_000
+IMAGE_HEADER_BYTES = 256 * 1024
+IMAGE_EXTENSIONS = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
 _CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
 # Turns a brightness into the pale grey used for the unchanged parts of a
 # difference picture. Kept as a table so a whole row can be washed out at once.
@@ -39,6 +41,96 @@ _GHOST = bytes(255 - (255 - value) // 4 for value in range(256))
 
 class ImageError(HarnessError):
     """A picture problem the user can understand and fix."""
+
+
+def attachment_image_metadata(data: bytes) -> dict[str, str | int] | None:
+    """Identify original image bytes and bounded display dimensions without resizing.
+
+    Header parsing adapted from KZTP47/t3code packages/shared/src/imageDimensions.ts
+    at eb115063634c416c6362cc407f8572cb0c136ddf, including EXIF orientation and
+    all three WebP frame forms. Nexus additionally requires exact file signatures.
+    This inspects headers; the provider's image decoder still validates the image.
+    """
+
+    header = data[:IMAGE_HEADER_BYTES]
+    mime = ""
+    dimensions: tuple[int, int] | None = None
+    if header.startswith(SIGNATURE):
+        mime = "image/png"
+        if len(header) >= 24 and header[8:16] == b"\x00\x00\x00\rIHDR":
+            dimensions = (int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big"))
+    elif header[:6] in {b"GIF87a", b"GIF89a"}:
+        mime = "image/gif"
+        if len(header) >= 10:
+            dimensions = (int.from_bytes(header[6:8], "little"), int.from_bytes(header[8:10], "little"))
+    elif len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        mime = "image/webp"
+        chunk = header[12:16]
+        if chunk == b"VP8 " and len(header) >= 30 and header[23:26] == b"\x9d\x01\x2a":
+            dimensions = (int.from_bytes(header[26:28], "little") & 0x3fff,
+                          int.from_bytes(header[28:30], "little") & 0x3fff)
+        elif chunk == b"VP8L" and len(header) >= 25 and header[20] == 0x2f:
+            packed = int.from_bytes(header[21:25], "little")
+            dimensions = ((packed & 0x3fff) + 1, ((packed >> 14) & 0x3fff) + 1)
+        elif chunk == b"VP8X" and len(header) >= 30:
+            dimensions = (int.from_bytes(header[24:27], "little") + 1,
+                          int.from_bytes(header[27:30], "little") + 1)
+    elif header.startswith(b"\xff\xd8\xff"):
+        mime = "image/jpeg"
+        offset, rotated = 2, False
+        while offset + 4 <= len(header):
+            if header[offset] != 0xff:
+                break
+            marker = header[offset + 1]
+            if marker == 0xff:
+                offset += 1
+                continue
+            if marker in {0xd9, 0xda}:
+                break
+            if marker == 0x01 or 0xd0 <= marker <= 0xd7:
+                offset += 2
+                continue
+            length = int.from_bytes(header[offset + 2:offset + 4], "big")
+            end = offset + 2 + length
+            if length < 2 or end > len(header):
+                break
+            if 0xc0 <= marker <= 0xcf and marker not in {0xc4, 0xc8, 0xcc} and length >= 8:
+                width = int.from_bytes(header[offset + 7:offset + 9], "big")
+                height = int.from_bytes(header[offset + 5:offset + 7], "big")
+                dimensions = (height, width) if rotated else (width, height)
+                break
+            if marker == 0xe1:
+                rotated = rotated or _attachment_exif_rotates(header[offset + 4:end])
+            offset = end
+    if not mime:
+        return None
+    result: dict[str, str | int] = {"type": mime}
+    if dimensions and dimensions[0] > 0 and dimensions[1] > 0:
+        result.update(width=dimensions[0], height=dimensions[1])
+    return result
+
+
+def _attachment_exif_rotates(data: bytes) -> bool:
+    if len(data) < 14 or not data.startswith(b"Exif\x00\x00"):
+        return False
+    tiff = data[6:]
+    endian = "little" if tiff[:2] == b"II" else "big" if tiff[:2] == b"MM" else ""
+    if not endian or int.from_bytes(tiff[2:4], endian) != 42:
+        return False
+    offset = int.from_bytes(tiff[4:8], endian)
+    if offset < 8 or offset + 2 > len(tiff):
+        return False
+    count = int.from_bytes(tiff[offset:offset + 2], endian)
+    for index in range(count):
+        entry = offset + 2 + index * 12
+        if entry + 12 > len(tiff):
+            return False
+        if int.from_bytes(tiff[entry:entry + 2], endian) == 0x0112:
+            if int.from_bytes(tiff[entry + 2:entry + 4], endian) != 3 \
+                    or int.from_bytes(tiff[entry + 4:entry + 8], endian) != 1:
+                return False
+            return 5 <= int.from_bytes(tiff[entry + 8:entry + 10], endian) <= 8
+    return False
 
 
 @dataclass(frozen=True)

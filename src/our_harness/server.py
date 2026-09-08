@@ -5243,9 +5243,23 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 with self.server.project_admission_lock, self.server.swarm_lock:
                     goal = self.server.long_horizon.resume(goal_id, {
                         "answers": answers,
-                        "expected_revision": int(body.get("expected_revision") or 0),
+                        "request_id": body.get("request_id", ""),
+                        "expected_revision": body.get("expected_revision"),
                         "pending_ids": body.get("pending_ids") if isinstance(body.get("pending_ids"), list) else [],
                     })
+                self._json({"goal": goal})
+            elif self.path == "/api/long-horizon/reconsider":
+                goal_id = str(body.get("goal_id") or "")
+                held_goal = self.server.long_horizon.store.get(goal_id)
+                self.server.require_long_horizon_chat_binding(held_goal, body)
+                self.server.require_project_execution_authority(
+                    Path(str(held_goal.get("project", {}).get("path") or ""))
+                )
+                with self.server.project_admission_lock, self.server.swarm_lock:
+                    goal = self.server.long_horizon.reconsider(
+                        goal_id, expected_revision=body.get("expected_revision"),
+                        pending_ids=body.get("pending_ids"),
+                    )
                 self._json({"goal": goal})
             elif self.path == "/api/swarm/goal-queue/cancel":
                 queue = self.server.swarm_goal_queue.cancel(

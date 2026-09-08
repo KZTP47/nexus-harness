@@ -14,6 +14,8 @@ import json
 import re
 from typing import Any
 
+from .models import HarnessError
+
 
 MAX_QUESTIONS = 6
 MAX_OPTIONS = 8
@@ -182,3 +184,62 @@ def frozen(value: object) -> list[dict[str, Any]]:
     """Return an isolated JSON-safe copy for transcripts and run journals."""
 
     return copy.deepcopy(normalize(value))
+
+
+def answer_record(questions: object, value: object) -> dict[str, Any]:
+    """Keep user text separate from agent-authored framing and choice labels.
+
+    Adapted from t3code apps/web/src/pendingUserInput.ts at eb115063634c416c6362cc407f8572cb0c136ddf:
+    exact question keys, selected options and custom answers remain distinct.
+    Nexus additionally validates the saved question and retains legacy input.
+    """
+    saved = frozen(questions)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or len(value) > 20_000:
+            raise HarnessError("A decision answer needs 1 to 20,000 characters. No answers were saved or truncated.")
+        # Old Nexus cards prefixed a single answer with the exact saved prompt.
+        # Preserve original bytes separately; do not infer or split other prose.
+        prefix = str(saved[0]["prompt"]) + ": " if len(saved) == 1 else ""
+        body = text[len(prefix):] if prefix and text.startswith(prefix) else text
+        if not body.strip():
+            raise HarnessError("Answer every saved question before continuing")
+        return {"schema_version": 1, "audience": "requesting_agent", "raw_answer": value,
+                "questions": saved, "answers": [{"question_id": saved[0]["id"] if len(saved) == 1 else "",
+                    "selected_options": [], "text": body}], "answer_text": body, "legacy": True}
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value.get("schema_version") != 1 \
+            or set(value) != {"schema_version", "audience", "questions"} \
+            or value.get("audience") not in {"team", "requesting_agent"}:
+        raise HarnessError("The decision answer format or audience is invalid")
+    entries = value.get("questions")
+    if not isinstance(entries, list) or not saved or len(entries) != len(saved):
+        raise HarnessError("Answer every exact saved question once")
+    expected = {one["id"]: one for one in saved}
+    result, seen, characters = [], set(), 0
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"question_id", "selected_options", "text"}:
+            raise HarnessError("Each answer needs its exact question ID, selected options and raw text")
+        identity = entry.get("question_id")
+        if not isinstance(identity, str) or identity not in expected or identity in seen:
+            raise HarnessError("The decision contains an unknown or duplicate question ID")
+        seen.add(identity)
+        question = expected[identity]
+        options, text = entry.get("selected_options"), entry.get("text")
+        if not isinstance(options, list) or any(not isinstance(one, str) for one in options) \
+                or len(set(options)) != len(options) or not isinstance(text, str):
+            raise HarnessError("Selected options and custom answer text are malformed")
+        labels = {one["label"] for one in question["options"]}
+        if any(one not in labels for one in options) or (len(options) > 1 and not question["multiple"]):
+            raise HarnessError("Choose only saved options allowed by this question")
+        if text.strip() and not question["allow_other"]:
+            raise HarnessError("This question does not allow a custom answer")
+        if not text.strip() and not options:
+            raise HarnessError("Answer every saved question before continuing")
+        characters += len(text) + sum(len(one) for one in options)
+        result.append({"question_id": identity, "selected_options": list(options), "text": text})
+    if characters > 20_000:
+        raise HarnessError("A decision answer supports at most 20,000 characters. No answers were saved or truncated.")
+    return {"schema_version": 1, "audience": value["audience"], "raw_answer": copy.deepcopy(value),
+            "questions": saved, "answers": result,
+            "answer_text": "\n".join(one["text"].strip() or ", ".join(one["selected_options"]) for one in result),
+            "legacy": False}

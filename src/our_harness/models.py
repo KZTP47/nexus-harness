@@ -128,6 +128,19 @@ class NativeToolContinuation:
 
 
 @dataclass(frozen=True)
+class ProviderWorkspaceContext:
+    """Engine-owned workspace identity, separate from untrusted task content.
+
+    Paths describe where Nexus owns effects. They never grant a provider native
+    filesystem authority or change a CLI transport sandbox into a deliverable.
+    """
+
+    project_id: str
+    project_path: str
+    execution_path: str
+
+
+@dataclass(frozen=True)
 class ProviderRequest:
     system_prefix: str
     dynamic_context: str
@@ -163,6 +176,7 @@ class ProviderRequest:
     # or alter the user's project merely because the CLI normally inherits the
     # harness process's current directory.
     working_directory: str = ""
+    workspace_context: ProviderWorkspaceContext | None = None
 
 
 @dataclass(frozen=True)

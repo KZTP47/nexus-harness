@@ -5827,16 +5827,19 @@ for executable in (project_child,nested_child):
             self.assertEqual([], execution.get("causal_receipts", []), result)
 
     def test_attachment_is_persisted_but_only_metadata_enters_the_transcript(self) -> None:
+        from our_harness.images import Image, write_png
+        original = write_png(Image(2, 1, b"\x00\x00\x00\xff" * 2))
         payload = [{
             "name": "screen.png", "type": "image/png",
-            "data": "data:image/png;base64," + base64.b64encode(b"not-really-a-png").decode(),
+            "data": "data:image/png;base64," + base64.b64encode(original).decode(),
         }]
         public, provider, text = chat.keep_attachments(
             self.config, "claude", payload, "Claude"
         )
-        self.assertEqual(text, "")
+        self.assertIn('"width": 2', text)
+        self.assertNotIn(base64.b64encode(original).decode(), text)
         self.assertNotIn("data", public[0])
-        self.assertEqual(provider[0]["data"], base64.b64encode(b"not-really-a-png").decode())
+        self.assertEqual(provider[0]["data"], base64.b64encode(original).decode())
         path = Path(provider[0]["path"])
         self.assertTrue(path.is_file())
 

@@ -2465,6 +2465,10 @@ class LongHorizonTests(unittest.TestCase):
             current = store.get(goal["goal_id"])
             if current["tasks"][0]["state"] == "blocked":
                 break
+            if turn:
+                self.assertEqual(interrupt_ids, [])
+                self.assertFalse(any(one["state"] == "pending" for one in current["interrupts"]))
+                continue
             self.assertEqual(len(interrupt_ids), 1)
             store.resolve_interrupts(goal["goal_id"], {
                 "answers": {interrupt_ids[0]: "A"},

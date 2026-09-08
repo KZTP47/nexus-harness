@@ -627,7 +627,7 @@ class RunningTests(unittest.TestCase):
         answer = self.provider("claude-cli", tool).complete(self.request())
         self.assertEqual(
             json.loads(answer.text),
-            ["-p", "--output-format", "json", "--model", "fake-model", "--tools", ""],
+            ["-p", "--output-format", "json", "--model", "fake-model", "--tools", "", "--no-session-persistence"],
         )
 
     def test_an_argument_shape_that_cannot_be_dropped_is_refused(self) -> None:

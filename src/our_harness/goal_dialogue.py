@@ -276,6 +276,8 @@ def _user_message(
     # Historical task ownership can change. A stored event's explicit recipient
     # wins; only a new authenticated write may resolve its current task owner.
     recipient_id = str(event.get("agent_id") or (target_task.get("assigned_agent_id") if current_recipient else "") or "")
+    if event.get("type") == "interrupt_resolved" and payload.get("answer_audience") == "team":
+        recipient_id = ""
     unresolved = bool(not recipient_id and event.get("task_id") and not current_recipient)
     recipient = next((one for one in document.get("agents", []) if one["id"] == recipient_id), {})
     return {

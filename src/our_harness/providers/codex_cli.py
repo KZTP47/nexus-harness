@@ -684,6 +684,18 @@ class CodexCLIProvider(Provider):
             self._preflight_complete = True
         schema = _codex_output_schema(contract_schema)
         with _private_workspace("our-harness-codex-") as cwd:
+            # Copy the exact admitted bytes into this turn's private transport
+            # folder. A mutable original path or a data-only input cannot be
+            # silently substituted or omitted by the native --image adapter.
+            from .image_inputs import read_image_inputs
+            image_paths = []
+            extensions = {"image/png": ".png", "image/jpeg": ".jpg",
+                          "image/gif": ".gif", "image/webp": ".webp"}
+            for index, (mime_type, raw) in enumerate(read_image_inputs(request.attachments)):
+                image_path = cwd / f"attachment-{index}{extensions[mime_type]}"
+                with image_path.open("xb") as stream:
+                    stream.write(raw)
+                image_paths.append(image_path)
             schema_path = cwd / "response.schema.json"
             result_path = cwd / "response.json"
             catalog_path = cwd / "models.catalog.json"
@@ -720,11 +732,8 @@ class CodexCLIProvider(Provider):
                 "--model", request.model,
                 *[
                     part
-                    for one in request.attachments
-                    if isinstance(one, dict)
-                    and str(one.get("type") or "").startswith("image/")
-                    and str(one.get("path") or "")
-                    for part in ("--image", str(one.get("path")))
+                    for image_path in image_paths
+                    for part in ("--image", str(image_path))
                 ],
                 "-",
             ]
@@ -788,6 +797,8 @@ class CodexCLIProvider(Provider):
                         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                             raise HarnessError(f"Codex CLI usage {present[0]} must be a non-negative integer")
                         usage[target] = value
+            if not completed_seen:
+                raise HarnessError("Codex CLI stopped without a terminal turn.completed event")
             try:
                 size = result_path.stat().st_size
             except OSError as exc:

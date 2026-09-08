@@ -35,7 +35,7 @@ from . import chat as chat_lab
 from . import user_questions
 from .changes import FileTransaction
 from .config import LoadedConfig
-from .models import HarnessError, ProviderOutcomeUnknown, ResponseFormat
+from .models import HarnessError, ProviderOutcomeUnknown, ProviderWorkspaceContext, ResponseFormat
 from .pipeline_runs import _owner_is_alive, _process_token, inspect_project_authority, project_identity
 from .providers.base import STRICT_OUTPUT_SCHEMA_CONTRACT, _strict_output_schema
 from .redaction import CredentialRedactor
@@ -47,6 +47,7 @@ from .goal_verification import (
 from .swarm_runs import _base
 from . import swarm_work
 from . import goal_dialogue
+from . import goal_decisions
 from . import goal_context_progress
 from . import action_protocol
 from . import goal_budget_policy
@@ -214,6 +215,15 @@ AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
         "offset": {"type": "integer", "minimum": 0},
         "character_limit": {"type": "integer", "minimum": 1, "maximum": 12_000},
     }, ["after", "limit", "message_id", "offset", "character_limit"])
+)
+
+
+AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
+    swarm_work._context_tool_call_schema("read_user_decisions", {
+        "after": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        "decision_id": {"type": "string", "maxLength": 160}, "offset": {"type": "integer", "minimum": 0},
+        "character_limit": {"type": "integer", "minimum": 1, "maximum": 12000},
+    }, ["after", "limit", "decision_id", "offset", "character_limit"])
 )
 
 
@@ -746,7 +756,12 @@ def _project_baseline_manifest(root: Path) -> dict[str, str]:
 def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
     manifest = baseline if baseline is not None else _project_baseline_manifest(_execution_root(document))
     return {
-        "schema_version": 3, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "schema_version": 4, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "decision_contract": goal_decisions.CONTRACT,
+        "decisions_sha256": goal_decisions.state_fingerprint(document),
+        "task_recipients_sha256": goal_decisions.fingerprint({
+            task["id"]: task.get("assigned_agent_id") for task in document.get("tasks", [])
+        }),
         "artifact_generation": int((document.get("dialogue") or {}).get("artifact_generation") or 0),
         "source_sha256": hashlib.sha256(_canonical(manifest).encode("utf-8")).hexdigest(),
         "verification_contract_sha256": str((document.get("verification_contract") or {}).get("fingerprint_sha256") or ""),
@@ -3254,7 +3269,7 @@ class GoalStore:
             raise HarnessError("The goal plus extracted attachment text is too large for one bounded goal")
         public_inputs = _bounded_json((input_bundle or {}).get("public_files") or [], 40_000)
         provider_inputs = [
-            {key: one.get(key) for key in ("id", "name", "type", "size", "path")}
+            {key: one.get(key) for key in ("id", "name", "type", "size", "path", "sha256", "width", "height")}
             for one in ((input_bundle or {}).get("provider_files") or []) if isinstance(one, dict)
         ]
         raw_criteria = list(success_criteria or [])
@@ -3503,6 +3518,36 @@ class GoalStore:
             except Exception:
                 db.rollback()
                 raise
+
+    def legacy_user_evidence_visibility(self, goal_id: str, agent_id: str,
+                                       candidates: set[tuple[str, str]]) -> set[tuple[str, str]]:
+        """Recover old steering recipients from authenticated speech, not task ownership."""
+        if not candidates:
+            return set()
+        visible: set[tuple[str, str]] = set()
+        with self.lock, self._connect() as db:
+            db.execute("BEGIN")
+            document = self._decode(db.execute("SELECT * FROM long_goals WHERE goal_id=?", (goal_id,)).fetchone())
+            if document is None or agent_id not in {one["id"] for one in document["agents"]}:
+                raise HarnessError("That participant is not authorized for this goal's evidence")
+            # Match bounded task evidence to user-message rows only. Page reads
+            # validate the exact row, its chain and the goal's authenticated head.
+            for row in db.execute(
+                "SELECT * FROM long_goal_dialogue_messages WHERE goal_id=? AND message_id LIKE 'user-event-%'",
+                (goal_id,),
+            ):
+                message = goal_dialogue._decode(row, document)
+                key = (str(message.get("task_id") or ""), "User steering: " + str(message.get("summary") or ""))
+                if key not in candidates or message.get("source_goal_event_type") != "agent_messaged":
+                    continue
+                if message.get("visibility") == "operator_only" or (
+                        message.get("visibility") == "agent_only"
+                        and (message.get("recipient") or {}).get("agent_id") != agent_id):
+                    continue
+                goal_dialogue.page(db, document, message_id=message["id"], viewer_agent_id=agent_id)
+                visible.add(key)
+            db.commit()
+        return visible
 
     def get_by_request(self, request_id: str) -> dict[str, Any] | None:
         stored = f"{self.authority_key}:{_exact_request_id(request_id)}"
@@ -4030,6 +4075,12 @@ class GoalStore:
         value["pending_interrupts"] = [
             one for one in value.get("interrupts", []) if one.get("state") == "pending"
         ]
+        reconsider = self._decision_reconsideration_sources(document)
+        value["scheduler_live"] = self._scheduler_live(document)
+        value["decision_reconsideration"] = {
+            "available": bool(reconsider) and not value["scheduler_live"],
+            "pending_ids": list(reconsider),
+        }
         for agent in value.get("agents", []):
             if isinstance(agent, dict):
                 agent["provider_identity_sha256"] = _provider_identity(agent)
@@ -4055,6 +4106,7 @@ class GoalStore:
         stored_request_id = f"{self.authority_key}:{client_request_id}"
         now = _now()
         document = copy.deepcopy(source)
+        document.pop("decision_submission_receipts", None)
         document.pop("execution_workspace", None)
         document.pop("workspace_publication", None)
         old_goal_id = str(source["goal_id"])
@@ -4465,6 +4517,12 @@ class GoalStore:
             ordered_tasks = sorted(
                 enumerate(document["tasks"]),
                 key=lambda held: (
+                    0 if held[1].get("answered_decision_pending") and (
+                        available_calls is None or available_calls > sum(
+                            1 for one in document["tasks"] if one.get("required_contributor_id")
+                            and one["id"] != held[1]["id"] and not _task_has_recorded_provider_dispatch(one)
+                        )
+                    ) else 1,
                     0 if held[1].get("required_contributor_id")
                     and not _task_has_recorded_provider_dispatch(held[1]) else 1,
                     turn_rank.get(held[1].get("assigned_agent_id"), 0)
@@ -4484,6 +4542,7 @@ class GoalStore:
                 if document.get("require_all_participants") or len(chosen) >= batch_limit:
                     break
             for task in chosen:
+                task.pop("answered_decision_pending", None)
                 task.update({
                     "state": "running", "attempts": int(task["attempts"]) + 1,
                     "lease_id": uuid.uuid4().hex, "owner_pid": os.getpid(),
@@ -5576,14 +5635,34 @@ class GoalStore:
                 questions = user_questions.frozen(action.get("questions"))
                 if not questions:
                     raise HarnessError("A user interrupt must contain a structured question")
+                answered = goal_decisions.repeated(document, current, reason, questions)
+                if answered is not None:
+                    attempts = int(current.get("answered_question_retries") or 0) + 1
+                    current["answered_question_retries"] = attempts
+                    current["state"] = "blocked" if attempts >= MAX_NO_PROGRESS else "ready"
+                    current["answered_decision_pending"] = answered["id"]
+                    current["last_error"] = (
+                        "The agent kept repeating an answered decision without new verified evidence."
+                        if current["state"] == "blocked" else ""
+                    )
+                    document["status"] = "paused" if current["state"] == "blocked" else "queued"
+                    document["note"] = current["last_error"] or "The user's saved answer remains available; the team is continuing from it."
+                    self._event(db, document, "answered_question_reused", task_id=current["id"],
+                                agent_id=current["assigned_agent_id"], payload={"decision_id": answered["id"], "attempt": attempts})
+                    current.update({"lease_id": "", "owner_pid": 0, "owner_token": "", "pending_transaction": {}, "updated_ms": _now()})
+                    return []
+                current.pop("answered_question_retries", None)
                 question_fingerprint = hashlib.sha256(
                     _canonical({"reason": reason, "questions": questions}).encode("utf-8")
                 ).hexdigest()
-                if question_fingerprint == current.get("question_fingerprint"):
+                question_progress = goal_decisions.progress(document, current)
+                if question_fingerprint == current.get("question_fingerprint") \
+                        and question_progress == current.get("question_progress"):
                     current["question_repeat_count"] = int(current.get("question_repeat_count") or 0) + 1
                 else:
                     current["question_fingerprint"] = question_fingerprint
                     current["question_repeat_count"] = 0
+                current["question_progress"] = question_progress
                 if int(current.get("question_repeat_count") or 0) >= MAX_NO_PROGRESS:
                     current["state"] = "blocked"
                     current["last_error"] = (
@@ -5600,7 +5679,7 @@ class GoalStore:
                         "lease_id": "", "owner_pid": 0, "owner_token": "",
                         "pending_transaction": {}, "updated_ms": _now(),
                     })
-                    return
+                    return []
                 interrupt_id = uuid.uuid4().hex
                 request = {
                     "id": interrupt_id, "state": "pending", "reason": reason,
@@ -5609,6 +5688,7 @@ class GoalStore:
                     "created_ms": _now(), "resolved_ms": 0,
                     "goal_revision": int(document["revision"]) + 1,
                     "questions": questions, "answer": "",
+                    "decision_progress": goal_decisions.progress(document, current),
                     "actions": ["respond"],
                 }
                 document["interrupts"].append(request)
@@ -5888,14 +5968,15 @@ class GoalStore:
                         payload={"parent_id": parent["id"], "dependencies": dependencies, "parallel_safe": task["parallel_safe"]})
         return created
 
-    def resolve_interrupts(self, goal_id: str, answers: object) -> None:
-        envelope = answers if isinstance(answers, dict) else {}
-        supplied = envelope.get("answers") if isinstance(envelope.get("answers"), dict) else {}
-        expected_revision = int(envelope.get("expected_revision") or 0)
-        expected_pending_ids = {
-            str(one) for one in envelope.get("pending_ids", []) if str(one)
-        } if isinstance(envelope.get("pending_ids"), list) else set()
+    def resolve_interrupts(self, goal_id: str, answers: object) -> bool:
         def change(document: dict[str, Any], db: sqlite3.Connection):
+            request_id, submission_digest = goal_decisions.submission(answers)
+            envelope = answers
+            supplied = envelope["answers"]
+            expected_revision = envelope["expected_revision"]
+            expected_pending_ids = set(envelope["pending_ids"])
+            if goal_decisions.receipted(document, envelope):
+                return _NO_MUTATION
             if document["status"] in TERMINAL_GOALS | {"cancelling"}:
                 raise HarnessError("A terminal goal is immutable; its old decision cards cannot be answered")
             risk_rejected = False
@@ -5907,19 +5988,22 @@ class GoalStore:
                 raise HarnessError(
                     "The goal or its pending questions changed after this decision card was shown; refresh before answering"
                 )
+            if set(supplied) != actual_pending_ids:
+                raise HarnessError("Answer only every pending question for this exact goal")
             for item in pending:
                 answer = supplied.get(item["id"])
                 if answer is None:
                     raise HarnessError("Answer every pending question for this exact goal")
-                exact_answer = self.redactor.text(answer).strip()
-                if len(exact_answer) > 20_000:
-                    raise HarnessError("A decision answer supports at most 20,000 characters. No answers were saved or truncated.")
+                record = user_questions.answer_record(item.get("questions"), self.redactor.value(answer))
+                exact_answer = record["answer_text"]
                 item.update({
                     "state": "resolved", "resolved_ms": _now(),
-                    "answer": exact_answer,
+                    "answer": exact_answer, "answer_record": record,
+                    "decision_scope": goal_decisions.scope(document),
                 })
                 task = next(one for one in document["tasks"] if one["id"] == item["task_id"])
-                task["evidence"].append("User decision: " + item["answer"])
+                goal_decisions.append_user_evidence(task, "User decision: " + item["answer"],
+                    audience=record["audience"], agent_id=str(item["agent_id"]))
                 if item.get("purpose") == "risk_review":
                     normalized_answer = item["answer"].strip().casefold()
                     labels = [
@@ -5958,8 +6042,17 @@ class GoalStore:
                         raise HarnessError("Choose Continue with checks or Stop this task from the decision card")
                 else:
                     task["state"] = "ready"
+                    task["answered_decision_pending"] = item["id"]
+                    item["decision_progress"] = goal_decisions.progress(document, task)
                 self._event(db, document, "interrupt_resolved", task_id=task["id"],
-                            agent_id=item["agent_id"], payload={"interrupt_id": item["id"], "answer": item["answer"]})
+                            agent_id=item["agent_id"], payload={"interrupt_id": item["id"], "answer": item["answer"],
+                                "answer_audience": record["audience"], "answer_record": record})
+            if request_id:
+                document.setdefault("decision_submission_receipts", []).append({
+                    "schema_version": 1, "goal_id": goal_id, "request_id": request_id, "submission_sha256": submission_digest,
+                    "interrupt_ids": sorted(actual_pending_ids), "resolved_ms": _now(),
+                })
+                document["decision_submission_receipts"] = document["decision_submission_receipts"][-128:]
             if risk_rejected:
                 document["status"] = "paused"
                 document["note"] = "The user rejected a risky proposal; no project file was changed."
@@ -5976,7 +6069,56 @@ class GoalStore:
                         "automatic_recovery_suppression_cleared": True,
                     },
                 )
-        self._mutate(goal_id, change)
+            return True
+        return self._mutate(goal_id, change)[1] is True
+
+    @staticmethod
+    def _decision_reconsideration_sources(document: dict[str, Any]) -> dict[str, str]:
+        sources = goal_decisions.reconsideration_sources(document)
+        asking_ids = {one["task_id"] for one in document.get("interrupts", []) if one.get("id") in sources}
+        if any(task.get("state") != "waiting" or task.get("lease_id") or task.get("owner_pid")
+               or _task_has_unsettled_effect(task)
+               for task in document.get("tasks", []) if task["id"] in asking_ids):
+            return {}
+        if len(asking_ids) != len({task["id"] for task in document.get("tasks", []) if task["id"] in asking_ids}):
+            return {}
+        return sources
+
+    def reconsider_interrupts(self, goal_id: str, *, expected_revision: int,
+                              pending_ids: object) -> dict[str, Any]:
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if type(expected_revision) is not int or not isinstance(pending_ids, list) or not pending_ids \
+                    or any(not isinstance(one, str) or not one for one in pending_ids) \
+                    or len(set(pending_ids)) != len(pending_ids):
+                raise HarnessError("The exact reconsideration request is malformed")
+            actual_ids = {one["id"] for one in document.get("interrupts", []) if one.get("state") == "pending"}
+            if expected_revision != int(document["revision"]) or set(pending_ids) != actual_ids:
+                raise HarnessError("This goal or its pending questions changed; refresh before reconsidering")
+            sources = self._decision_reconsideration_sources(document)
+            if set(sources) != actual_ids or self._scheduler_live(document):
+                raise HarnessError("These questions cannot be reconsidered from saved answers; their decisions remain pending")
+            for item in document["interrupts"]:
+                if item["id"] not in sources:
+                    continue
+                item.update({"state": "superseded", "superseded_ms": _now(),
+                             "superseded_by_decision_id": sources[item["id"]],
+                             "superseded_reason": "user_requested_reconsideration"})
+                task = next(one for one in document["tasks"] if one["id"] == item["task_id"])
+                task.update({"state": "ready", "answered_decision_pending": sources[item["id"]],
+                             "updated_ms": _now(), "last_error": ""})
+                task["evidence"].append(
+                    "Nexus: The user requested reconsidering this question using the saved answers. "
+                    "Reread your visible decision history and inspect current facts. No new answer or approval was supplied."
+                )
+                for step in task.get("context_steps", []):
+                    step["state"] = "superseded"
+                self._event(db, document, "interrupt_reconsidered", task_id=task["id"], agent_id=item["agent_id"],
+                            payload={"interrupt_id": item["id"], "saved_decision_id": sources[item["id"]],
+                                     "new_answer_supplied": False})
+            document["automatic_recovery_control"] = _automatic_recovery_control(False)
+            document["status"] = "queued"
+            document["note"] = "The team is rereading saved answers and checking whether further clarification is needed."
+        return self.public(self._mutate(goal_id, change)[0])
 
     def pause_deadlock(self, goal_id: str, reason: str) -> None:
         def change(document: dict[str, Any], db: sqlite3.Connection):
@@ -6782,7 +6924,9 @@ class GoalStore:
                         raise HarnessError(
                             "Reconcile or supersede the pending provider/file effect before continuing this task"
                         )
-                    task["evidence"].append("User steering: " + words)
+                    goal_decisions.append_user_evidence(task, "User steering: " + words,
+                        audience="team" if action == "steer" else "requesting_agent",
+                        agent_id=str(payload.get("agent_id") or task["assigned_agent_id"]))
                     if task["state"] in {"blocked", "failed", "waiting"}:
                         task["state"] = "ready"
                 if needs_steering_task:
@@ -6796,12 +6940,14 @@ class GoalStore:
                         "parallel_safe": False, "resource_paths": [], "attempts": 0,
                         "no_progress": 0, "lease_id": "", "owner_pid": 0, "owner_token": "",
                         "created_ms": _now(), "updated_ms": _now(), "summary": "",
-                        "last_error": "", "evidence": ["User steering: " + words],
+                        "last_error": "", "evidence": [],
                         "artifacts": [], "criteria_evidence": [],
                         "provider_effect_state": "never_dispatched", "provider_effect_id": "",
                         "claim_objective_epoch": 0, "outcome_unknown": False,
                         "pending_action": {}, "pending_transaction": {},
                     })
+                    goal_decisions.append_user_evidence(document["tasks"][-1], "User steering: " + words,
+                        audience="team", agent_id=owner_id)
                     document["budget"]["tasks_created"] += 1
                     self._event(db, document, "task_created", task_id=steering_id,
                                 agent_id=owner_id, payload={"kind": "steering", "reason": "user_steering"})
@@ -7580,6 +7726,12 @@ class LongHorizonRuntime:
 
     def _agent_context(self, goal: dict[str, Any], task: dict[str, Any], extra_files: list[str] | None = None) -> str:
         root = _execution_root(goal)
+        legacy_visible = self.store.legacy_user_evidence_visibility(
+            goal["goal_id"], task["assigned_agent_id"], goal_decisions.legacy_steering_candidates(goal),
+        )
+        evidence_by_task = {one["id"]: goal_decisions.project_evidence(
+            goal, one, task["assigned_agent_id"], legacy_visible=legacy_visible,
+        ) for one in goal["tasks"]}
         ledger = [{"id": one["id"], "title": one["title"], "state": one["state"],
                    "owner": one["assigned_agent_id"], "depends_on": one["depends_on"],
                    "summary": _short(one.get("summary"), 1_000)} for one in goal["tasks"]]
@@ -7604,11 +7756,7 @@ class LongHorizonRuntime:
                     "provider_effect_state": one.get("provider_effect_state", ""),
                     "summary": _short(one.get("summary"), 8_000),
                     "last_error": _short(one.get("last_error"), 4_000),
-                    "evidence": [
-                        evidence for evidence in one.get("evidence", [])[-24:]
-                        if one.get("assigned_agent_id") == task.get("assigned_agent_id")
-                        or not str(evidence).startswith(("User steering: ", "User decision: "))
-                    ],
+                    "evidence": evidence_by_task[one["id"]][-24:],
                     "artifacts": one.get("artifacts", [])[-12:],
                 }
                 for one in goal["tasks"] if one.get("required_contributor_id")
@@ -7709,7 +7857,7 @@ class LongHorizonRuntime:
                             for one in proposed.get("changes", []) if isinstance(one, dict)
                         ],
                     },
-                    "target_evidence": target.get("evidence", [])[-24:],
+                    "target_evidence": evidence_by_task[target["id"]][-24:],
                     "target_artifacts": target.get("artifacts", [])[-12:],
                     "verification": goal.get("verification", {}),
                 }
@@ -7756,12 +7904,18 @@ class LongHorizonRuntime:
             + "\n\nPROJECT LOCATION\nSelected project: " + str(goal["project"]["path"])
             + ("\nThis chat uses an independent working copy. All Nexus file/context tools and relative "
                "change paths refer to that copy. Nexus applies verified changes to the selected project "
-               "with collision checks. Your CLI transport's current directory is a temporary transport "
-               "sandbox, not the deliverable location; do not ask the user to choose it or move files there."
+               "with collision checks."
                if _isolated_execution(goal) else "")
+            + "\nThe selected project above is the engine-validated destination. A provider's temporary transport "
+              "directory or the Nexus host's startup project is not a competing destination. Relative Nexus "
+              "file tools refer to this goal's execution root. Use those tools to inspect access; native CLI cwd "
+              "cannot establish that project access is missing. Explicit user text outranks a path guessed from "
+              "a screenshot or an earlier question. Never ask to reconfirm the saved destination merely because "
+              "those paths differ. New authority must still use the existing project/access controls."
+            + goal_decisions.prompt(goal, task["assigned_agent_id"])
             + "\n\nPROJECT TREE\n" + swarm_work._tree(root)
             + "\n\nREQUESTED FILE CONTENTS\n" + files
-            + "\n\nUSER STEERING / EVIDENCE\n" + "\n".join(task.get("evidence", [])[-12:])
+            + "\n\nUSER STEERING / EVIDENCE\n" + "\n".join(evidence_by_task[task["id"]][-12:])
             + "\n\nLATEST PROJECT VERIFICATION (actual executed results)\n"
             + _canonical(_durable_evidence(goal.get("verification", {}), string_limit=8_000, list_limit=60))
             + contribution_packet
@@ -7805,7 +7959,9 @@ class LongHorizonRuntime:
         task = next(one for one in goal["tasks"] if one["id"] == task_id)
         agent = next(one for one in goal["agents"] if one["id"] == task["assigned_agent_id"])
         root = _execution_root(goal)
-        conversation_key = f"long-goal-{goal_id}-{task_id}"
+        # A browser connection can serve multiple agents. Its native history
+        # must stay with this exact recipient even when the task is handed off.
+        conversation_key = _stable_id("long-goal-v2", goal_id, task_id, task["assigned_agent_id"])
         dispatched = False
         provider_attempt_started = False
         dispatch_admission_failed = False
@@ -7853,6 +8009,8 @@ class LongHorizonRuntime:
             provider_attempt_started = True
             answer = chat_lab.ask_once(
                 self.config, agent["who"], request_text, context=request_context,
+                workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
+                    project_path=str(goal["project"]["path"]), execution_path=str(root)),
                 provider_attachments=provider_attachments,
                 response_format=_agent_action_format(task),
                 conversation_key=conversation_key,
@@ -7875,9 +8033,11 @@ class LongHorizonRuntime:
                 corrected = chat_lab.ask_once(
                     self.config, agent["who"], correction_prompt,
                     context=correction_context, provider_attachments=provider_attachments,
+                    workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
+                        project_path=str(goal["project"]["path"]), execution_path=str(root)),
                     response_format=_agent_action_format(task),
                     conversation_key=conversation_key,
-                    prefer_existing_conversation=True,
+                    prefer_existing_conversation=False,
                     before_provider_dispatch=account_dispatch(
                         f"{phase}_format_repair", correction_prompt, correction_context,
                     ),
@@ -7891,10 +8051,16 @@ class LongHorizonRuntime:
             provider_attachments = []
             for descriptor in goal.get("input_provider_attachments", []):
                 path = Path(str(descriptor.get("path") or ""))
-                if path.is_file():
-                    provider_attachments.append({
-                        **descriptor, "data": base64.b64encode(path.read_bytes()).decode("ascii"),
-                    })
+                name = str(descriptor.get("name") or path.name or "unnamed attachment")
+                if not path.is_file():
+                    raise HarnessError(f"Saved attachment {name!r} is missing; restore it before this goal continues.")
+                content = path.read_bytes()
+                expected_hash = str(descriptor.get("sha256") or "")
+                if expected_hash and not hmac.compare_digest(expected_hash, hashlib.sha256(content).hexdigest()):
+                    raise HarnessError(f"Saved attachment {name!r} changed after it was attached; restore the original before continuing.")
+                provider_attachments.append({
+                    **descriptor, "data": base64.b64encode(content).decode("ascii"),
+                })
             baseline_manifest = _project_baseline_manifest(root)
             current_context_binding = _context_binding(goal, baseline_manifest)
             if any(
@@ -7968,7 +8134,13 @@ class LongHorizonRuntime:
                         return False
                     self.store.reserve_context_tool(goal_id, task, call)
                     try:
-                        if str(call.get("name") or "") == "read_shared_conversation":
+                        if str(call.get("name") or "") == "read_user_decisions":
+                            arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                            result = goal_decisions.page(self.store.get(goal_id), task["assigned_agent_id"],
+                                after=int(arguments.get("after") or 0), limit=int(arguments.get("limit") or 10),
+                                decision_id=str(arguments.get("decision_id") or ""), offset=int(arguments.get("offset") or 0),
+                                character_limit=int(arguments.get("character_limit") or 12000))
+                        elif str(call.get("name") or "") == "read_shared_conversation":
                             arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                             result = self.store.dialogue_history(
                                 goal_id, after=int(arguments.get("after") or 0),
@@ -8096,7 +8268,7 @@ class LongHorizonRuntime:
                 if any(step.get("state") == "superseded" for step in latest_task.get("context_steps", [])):
                     context += (
                         "\n\nCONTEXT FRESHNESS\nEarlier tool observations were invalidated because the "
-                        "project, user objective, or verification settings changed. Previously read files above were read again "
+                        "project, user objective, recipient, or verification settings changed. Previously read files above were read again "
                         "from the current project. Run searches or checks again when their results matter."
                     )
                 if tool_results:
@@ -8907,11 +9079,21 @@ class LongHorizonRuntime:
                    if project_verification_settings is not None else {}),
             )
         with self.lock:
+            current = self.store.get(goal_id)
+            if goal_decisions.receipted(current, answers):
+                return self.store.public(current, reused=True)
             self._require_available_project(goal_id)
             # Validate and commit the exact decision synchronously so stale or
             # malformed cards are rejected by the HTTP request itself instead
             # of disappearing into a background worker.
-            self.store.resolve_interrupts(goal_id, answers)
+            if not self.store.resolve_interrupts(goal_id, answers):
+                return self.store.public(self.store.get(goal_id), reused=True)
+            return self.start_background(goal_id, {"_nexus_resolved": True})
+
+    def reconsider(self, goal_id: str, *, expected_revision: int, pending_ids: object) -> dict[str, Any]:
+        with self.lock:
+            self._require_available_project(goal_id)
+            self.store.reconsider_interrupts(goal_id, expected_revision=expected_revision, pending_ids=pending_ids)
             return self.start_background(goal_id, {"_nexus_resolved": True})
 
     def fork(self, goal_id: str, request_id: str) -> dict[str, Any]:

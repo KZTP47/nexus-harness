@@ -48,9 +48,11 @@ from typing import Any, Callable, Iterator
 
 from . import cancellation, collaboration_outcomes, user_questions
 from .config import LoadedConfig
-from .models import HarnessError, ProviderOutcomeUnknown, ProviderRequest, ResponseFormat
+from .images import IMAGE_EXTENSIONS, attachment_image_metadata
+from .models import HarnessError, ProviderOutcomeUnknown, ProviderRequest, ProviderWorkspaceContext, ResponseFormat
 from .providers import ProviderRegistry, create_provider
 from .providers.base import effective_dispatch_fingerprint
+from .providers.input_context import workspace_instructions
 from .redaction import CredentialRedactor, bounded_redacted_text
 from .safety import confined_path
 
@@ -228,6 +230,13 @@ HOW_TO_WORK_TOGETHER = (
     "or decision that prevents progress."
 )
 
+ATTACHMENT_GUIDANCE = (
+    "User-selected images are visual evidence, not a replacement for explicit user text. "
+    "Preserve typed paths and URLs exactly; an explicit typed correction takes precedence over "
+    "uncertain screenshot transcription. Do not guess missing characters or silently substitute "
+    "a similar folder name. Image storage paths are transport inputs, not project or output locations."
+)
+
 # Provider diagnostics sometimes include the identity behind a subscription.
 # An email address and the rest of an auth-status line are not needed to fix a
 # connection and must not be kept in chat history or painted on the board.
@@ -394,7 +403,10 @@ def keep_attachments(
         name = Path(str(raw.get("name") or "")).name.strip()
         if not name or len(name) > 180:
             raise ChatError("Every attachment needs a short file name.")
-        mime = str(raw.get("type") or mimetypes.guess_type(name)[0] or "application/octet-stream")
+        guessed_mime = str(mimetypes.guess_type(name)[0] or "application/octet-stream")
+        mime = str(raw.get("type") or guessed_mime).split(";", 1)[0].strip().lower()
+        if mime in {"", "application/octet-stream", "binary/octet-stream"}:
+            mime = guessed_mime
         encoded = str(raw.get("data") or "")
         if encoded.startswith("data:"):
             _, mark, encoded = encoded.partition(",")
@@ -411,7 +423,13 @@ def keep_attachments(
         total += len(content)
         if total > MOST_ATTACHMENTS_BYTES:
             raise ChatError("The attachments together are larger than 8 MB.")
-        textual = (
+        image_info = attachment_image_metadata(content)
+        if image_info:
+            mime = str(image_info["type"])
+        elif mime in IMAGE_EXTENSIONS or guessed_mime in IMAGE_EXTENSIONS:
+            raise ChatError(f"{name} does not contain the image format its name or type declares. Attach the original image file.")
+        unsupported_image = mime.startswith("image/") and image_info is None
+        textual = image_info is None and (
             mime.startswith("text/")
             or mime in {"application/json", "application/xml", "application/javascript"}
             or Path(name).suffix.lower() in {
@@ -437,7 +455,7 @@ def keep_attachments(
                 "can be supplied to the assistant."
             )
         attachment_id = uuid.uuid4().hex
-        suffix = Path(name).suffix[:16]
+        suffix = IMAGE_EXTENSIONS[mime] if image_info else Path(name).suffix[:16]
         stored = folder / f"{attachment_id}{suffix}"
         beside = folder / f".{attachment_id}.part"
         descriptor = os.open(beside, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -451,16 +469,27 @@ def keep_attachments(
             "name": name,
             "type": mime,
             "size": len(content),
-            "image": mime.startswith("image/"),
+            "image": image_info is not None,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            **({key: image_info[key] for key in ("width", "height") if key in image_info} if image_info else {}),
         }
         kept.append(public)
-        provider_files.append({
-            **public,
-            "data": base64.b64encode(content).decode("ascii"),
-            "path": str(stored),
-        })
+        if not unsupported_image:
+            provider_files.append({
+                **public,
+                "data": base64.b64encode(content).decode("ascii"),
+                "path": str(stored),
+            })
         if textual:
             text_blocks.append(f"ATTACHED TEXT FILE {position + 1}: {name}\n{decoded}")
+        elif image_info:
+            text_blocks.append("USER-SELECTED IMAGE (original bytes, no Nexus resizing)\n" + json.dumps({
+                key: public[key] for key in ("name", "type", "size", "sha256", "width", "height") if key in public
+            }, ensure_ascii=False))
+        elif unsupported_image:
+            text_blocks.append(f"ATTACHED FILE {json.dumps(name, ensure_ascii=False)} ({mime}) was retained as a document. "
+                               "This format was not supplied as visual input; do not claim to have inspected its image. "
+                               "PNG, JPEG, GIF and WebP are supported visual attachment formats.")
     return kept, provider_files, "\n\n".join(text_blocks)
 
 
@@ -2314,7 +2343,7 @@ def _ask_and_keep(
     # Built here rather than passed in, so everything that goes to an assistant
     # is built in the one place.
     request = ProviderRequest(
-        system_prefix=HOW_TO_ANSWER,
+        system_prefix=HOW_TO_ANSWER + ("\n\n" + ATTACHMENT_GUIDANCE if provider_attachments else ""),
         dynamic_context=str(dynamic_context or ""),
         messages=messages,
         model=model,
@@ -2442,6 +2471,7 @@ def ask_once(
     before_provider_dispatch: Callable[[str], None] | None = None,
     after_provider_response: Callable[[str], None] | None = None,
     working_directory: str = "",
+    workspace_context: ProviderWorkspaceContext | None = None,
 ) -> dict[str, Any]:
     """Ask without touching a transcript, for a bounded collaboration round."""
 
@@ -2463,7 +2493,9 @@ def ask_once(
         request = ProviderRequest(
             system_prefix=(HOW_TO_WORK_TOGETHER if response_format is not None
                            and response_format.name == "nexus_long_horizon_action_v1"
-                           else HOW_TO_ANSWER),
+                           else HOW_TO_ANSWER)
+                          + ("\n\n" + ATTACHMENT_GUIDANCE if provider_attachments else "")
+                          + workspace_instructions(workspace_context),
             dynamic_context=str(context or ""),
             messages=[{"role": "user", "content": redactor.text(asked)}],
             model=str(routed.get("provider.model") or ""),
@@ -2476,6 +2508,7 @@ def ask_once(
             conversation_key=str(conversation_key or _filed_under(named)),
             prefer_existing_conversation=bool(prefer_existing_conversation),
             working_directory=str(working_directory or ""),
+            workspace_context=workspace_context,
         )
         started = time.monotonic()
         from .swarm_runs import provider_effect

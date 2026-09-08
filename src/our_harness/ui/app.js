@@ -7275,6 +7275,90 @@ function isLoneAgentChat(agentId) {
 // A project goal belongs to its saved conversation, regardless of which goal
 // happens to be selected in the advanced board panel.
 const chatGoalRequests = new Set();
+const chatGoalAnswerSubmissionIds = new Map();
+
+function goalAnswerRequestId(goalId, pending, answers) {
+  // A network retry or a poll that remounts the form must retain the same
+  // logical answer identity. Different values or audiences get a new identity.
+  const key = JSON.stringify([goalId, pending.map(one => one.id), answers]);
+  if (!chatGoalAnswerSubmissionIds.has(key)) {
+    const id = globalThis.crypto?.randomUUID?.() || "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,
+      character => { const value = Math.floor(Math.random() * 16); return (character === "x" ? value : (value & 3) | 8).toString(16); });
+    chatGoalAnswerSubmissionIds.set(key, id);
+    if (chatGoalAnswerSubmissionIds.size > 100) chatGoalAnswerSubmissionIds.delete(chatGoalAnswerSubmissionIds.keys().next().value);
+  }
+  return chatGoalAnswerSubmissionIds.get(key);
+}
+
+function goalAnswerAudience(parent) {
+  const label = make("label", "chat-goal-answer-audience", "Share these answers with");
+  const select = make("select");
+  select.setAttribute("aria-label", "Answer audience");
+  for (const [value, words] of [["team", "All agents on this goal"], ["requesting_agent", "Only the agent asking each question"]]) {
+    const option = make("option", "", words);
+    option.value = value;
+    select.append(option);
+  }
+  select.value = "team";
+  label.append(select);
+  parent.append(label);
+  return select;
+}
+
+function goalQuestionAnswer(question, current = {}) {
+  const selected = Array.isArray(current.selected) ? [...current.selected] : [];
+  const text = String(question.options?.length ? current.other || "" : current.text || "");
+  if (!selected.length && !text.trim()) throw new Error("Answer every question before sending.");
+  return {question_id: question.id, selected_options: selected, text};
+}
+
+function addGoalReconsideration(parent, goal, currentGoal, afterAction, binding = {}) {
+  const pending = goal?.pending_interrupts || [];
+  const pendingIds = pending.map(one => one.id);
+  const eligible = candidate => candidate?.decision_reconsideration?.available === true
+    && JSON.stringify(candidate.decision_reconsideration.pending_ids) === JSON.stringify(pendingIds);
+  if (!pending.length || !eligible(goal)) return;
+  const identity = goalSnapshotIdentity(goal);
+  const pendingSignature = JSON.stringify(pending);
+  const savedAnswers = candidate => JSON.stringify((candidate?.interrupts || []).filter(one => one.state === "resolved"));
+  const answerSignature = savedAnswers(goal);
+  const sameDecision = candidate => goalSnapshotIdentity(candidate) === identity && eligible(candidate)
+    && JSON.stringify(candidate.pending_interrupts || []) === pendingSignature
+    && savedAnswers(candidate) === answerSignature;
+  const changed = "The goal, its questions, or saved answers changed. Read the current decision cards before reconsidering.";
+  const button = make("button", "compact chat-goal-reconsider", "Reconsider using saved answers");
+  button.type = "button";
+  const status = make("div", "hint chat-goal-reconsider-status",
+    "Ask the agent to reread your earlier answers and inspect changed facts. This sends no new answer or approval.");
+  button.addEventListener("click", async () => {
+    if (button.disabled) return;
+    if (!sameDecision(currentGoal())) {
+      status.textContent = changed;
+      return;
+    }
+    button.disabled = true;
+    try {
+      // Releasing the scheduler advances the revision after a question becomes
+      // visible. Read immediately before the explicit action, while freezing
+      // the displayed questions, prior answers and project/chat authority.
+      const readTicket = beginGoalSnapshotRead();
+      const fresh = (await request(`/api/long-horizon/goal?id=${encodeURIComponent(goal.goal_id)}`)).goal;
+      if (!sameDecision(fresh) || !sameDecision(currentGoal())) throw new Error(changed);
+      const current = rememberChatGoalSnapshot(fresh, readTicket);
+      if (!sameDecision(current) || !sameDecision(currentGoal())) throw new Error(changed);
+      const result = await request("/api/long-horizon/reconsider", {method: "POST", body: JSON.stringify({
+        goal_id: goal.goal_id, ...binding, expected_revision: current.revision, pending_ids: pendingIds,
+      })});
+      if (result.goal?.goal_id !== goal.goal_id) throw new Error("Nexus could not confirm the exact goal after reconsideration. Refresh before continuing.");
+      await afterAction(result.goal);
+    } catch (error) {
+      status.textContent = String(error.message || error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  parent.append(button, status);
+}
 
 function chatGoalParticipants(conversation) {
   const pair = conversation?.pair_agents?.length
@@ -7325,10 +7409,74 @@ function chatGoalBinding(agentId, goal) {
   };
 }
 
-function rememberChatGoalSnapshot(goal) {
-  if (!goal?.goal_id) return;
-  longGoals = [goal, ...longGoals.filter((one) => one.goal_id !== goal.goal_id)];
+// Adapted from t3code eb115063634c416c6362cc407f8572cb0c136ddf,
+// packages/client-runtime/src/state/threads.ts: commit state and its cursor
+// together. Nexus uses server goal revisions and local read tickets.
+let goalSnapshotClock = 0;
+let goalInventoryReadTicket = 0;
+const goalSnapshotObservations = new Map();
+
+function beginGoalSnapshotRead() {
+  return ++goalSnapshotClock;
+}
+
+function goalSnapshotIdentity(goal) {
+  return JSON.stringify([String(goal?.goal_id || ""), String(goal?.conversation_id || ""),
+    String(goal?.project?.id || ""), String(goal?.project?.path || ""),
+    String(goal?.project_authority_id || "")]);
+}
+
+function rememberChatGoalSnapshot(goal, readTicket = beginGoalSnapshotRead()) {
+  if (!goal?.goal_id) return null;
+  const existing = longGoals.find(one => one.goal_id === goal.goal_id)
+    || (longGoal?.goal_id === goal.goal_id ? longGoal : null);
+  if (existing && goalSnapshotIdentity(existing) !== goalSnapshotIdentity(goal)) return existing;
+  const observed = goalSnapshotObservations.get(goal.goal_id);
+  const beforeRevision = existing?.revision;
+  const nextRevision = goal.revision;
+  const comparable = Number.isSafeInteger(beforeRevision) && Number.isSafeInteger(nextRevision);
+  if (existing && Number.isSafeInteger(beforeRevision)
+      && (!Number.isSafeInteger(nextRevision) || nextRevision < 0)) return existing;
+  if (existing && comparable && nextRevision < beforeRevision) return existing;
+  // Equal revisions can carry fresh derived provider policy. A request begun
+  // before a newer observation cannot undo it, even at the same revision.
+  if (existing && (!comparable || nextRevision === beforeRevision)
+      && observed && readTicket < observed.readTicket) return existing;
+  if (!existing && readTicket < goalInventoryReadTicket) return null;
+  goalSnapshotObservations.set(goal.goal_id, {
+    readTicket: Math.max(readTicket, observed?.readTicket || 0),
+    observedAt: ++goalSnapshotClock,
+  });
+  longGoals = [goal, ...longGoals.filter(one => one.goal_id !== goal.goal_id)];
   if (longGoal?.goal_id === goal.goal_id) longGoal = goal;
+  return goal;
+}
+
+function rememberGoalSnapshotInventory(goals, readTicket) {
+  if (!Array.isArray(goals) || readTicket < goalInventoryReadTicket) return longGoals;
+  const previous = [...longGoals];
+  const next = [], included = new Set();
+  for (const goal of goals) {
+    if (!goal?.goal_id || included.has(goal.goal_id)) continue;
+    const accepted = rememberChatGoalSnapshot(goal, readTicket);
+    if (!accepted) continue;
+    included.add(accepted.goal_id);
+    next.push(accepted);
+  }
+  for (const goal of previous) {
+    if (!included.has(goal.goal_id)
+        && (goalSnapshotObservations.get(goal.goal_id)?.observedAt || 0) > readTicket) {
+      next.push(goal);
+      included.add(goal.goal_id);
+    }
+  }
+  longGoals = next;
+  goalInventoryReadTicket = readTicket;
+  for (const goalId of goalSnapshotObservations.keys()) {
+    if (!included.has(goalId)) goalSnapshotObservations.delete(goalId);
+  }
+  if (longGoal && !next.some(goal => goalSnapshotIdentity(goal) === goalSnapshotIdentity(longGoal))) longGoal = null;
+  return longGoals;
 }
 
 async function openChatGoalDetails(goal) {
@@ -7361,6 +7509,7 @@ async function sendToActiveChatGoal(agentId, box) {
   try {
     // Read the current durable set even after restart or a second window's
     // admission. Never fall through to a one-agent request using stale UI state.
+    const readTicket = beginGoalSnapshotRead();
     const inventory = await request("/api/long-horizon/goals");
     if (!stillSelected()) return {handled: true};
     // A paste can start while this inventory read is pending. Recheck the
@@ -7369,8 +7518,8 @@ async function sendToActiveChatGoal(agentId, box) {
       throw new Error("Wait for the attached files to finish loading before sending.");
     }
     if (!Array.isArray(inventory.goals)) throw new Error("Nexus could not read the team's saved goals. Your message is still in the composer; try again.");
-    const context = chatLongGoalContext(agentId, inventory.goals);
-    longGoals = inventory.goals;
+    const accepted = rememberGoalSnapshotInventory(inventory.goals, readTicket);
+    const context = chatLongGoalContext(agentId, accepted);
     if (context.problem) throw new Error(context.problem);
     const goal = context.goal;
     if (!goal && priorGoal) throw new Error("The team's goal just finished or stopped. Your draft is kept; review the result before sending a new request.");
@@ -7389,11 +7538,19 @@ async function sendToActiveChatGoal(agentId, box) {
           || pending[0].purpose === "risk_review") {
         throw new Error("Answer the team's decision cards above the composer so each answer reaches its exact question. Your draft is kept.");
       }
+      const question = pending[0].questions[0];
+      const closedChoice = question.allow_other === false && question.options?.length;
+      const selected = closedChoice ? question.options.find(option => option.label === text) : null;
+      if (closedChoice && !selected) throw new Error("Choose an answer on the team's decision card above. Your draft is kept.");
+      const answers = {[pending[0].id]: {schema_version: 1, audience: "team", questions: [{
+        question_id: question.id, selected_options: selected ? [selected.label] : [], text: selected ? "" : typed,
+      }]}};
       result = await request("/api/long-horizon/answer", {
         method: "POST", body: JSON.stringify({
           goal_id: goal.goal_id, ...binding,
           expected_revision: goal.revision,
-          pending_ids: [pending[0].id], answers: {[pending[0].id]: text},
+          pending_ids: [pending[0].id], answers,
+          request_id: goalAnswerRequestId(goal.goal_id, pending, answers),
         }),
       });
     } else {
@@ -7508,7 +7665,7 @@ function fillChatGoalPanel(panel, agentId, context) {
   const pending = goal?.pending_interrupts || [];
   // Keep in-progress answers intact during the background status polls.
   const signature = JSON.stringify([goal?.goal_id, goal?.status, problem, pending,
-    goal?.execution_workspace, goal?.workspace_publication, goal?.workspace_path]);
+    goal?.execution_workspace, goal?.workspace_publication, goal?.workspace_path, goal?.decision_reconsideration]);
   if (panel.dataset.snapshot === signature) return;
   panel.dataset.snapshot = signature;
   panel.replaceChildren();
@@ -7527,6 +7684,11 @@ function fillChatGoalPanel(panel, agentId, context) {
   details.addEventListener("click", () => void openChatGoalDetails(goal));
   panel.append(details);
   if (problem || !pending.length) return;
+  const originalChatKey = swarmChatKey(agentId);
+  addGoalReconsideration(panel, goal, () => {
+    const current = chatLongGoalContext(agentId);
+    return current.problem ? null : current.goal;
+  }, result => refreshChatGoalAfterAction(agentId, result, originalChatKey), chatGoalBinding(agentId, goal));
   const answerState = {};
   for (const item of pending) {
     const group = make("section", "chat-goal-question-set");
@@ -7539,9 +7701,13 @@ function fillChatGoalPanel(panel, agentId, context) {
     }
     panel.append(group);
   }
+  const audience = goalAnswerAudience(panel);
   const status = make("p", "hint chat-goal-answer-status");
   const submit = make("button", "primary chat-goal-answer", "Send answers to the team");
   submit.type = "button";
+  audience.addEventListener("change", () => {
+    submit.textContent = audience.value === "team" ? "Send answers to the team" : "Send answers to the asking agents";
+  });
   submit.addEventListener("click", async () => {
     const current = chatLongGoalContext(agentId);
     if (current.problem || current.goal?.goal_id !== goal.goal_id) {
@@ -7553,15 +7719,16 @@ function fillChatGoalPanel(panel, agentId, context) {
       return;
     }
     const answers = {};
-    for (const item of pending) {
-      const words = [];
-      for (const question of normalizedUserQuestions(item.questions)) {
-        const answer = answerState[item.id][question.id] || {};
-        const value = String(answer.other || answer.text || (answer.selected || []).join(", ")).trim();
-        if (!value) { status.textContent = "Answer every question before sending."; return; }
-        words.push(item.purpose === "risk_review" ? value : `${question.prompt}: ${value}`);
+    try {
+      for (const item of pending) {
+        answers[item.id] = {schema_version: 1, audience: audience.value,
+          questions: normalizedUserQuestions(item.questions).map(question =>
+            goalQuestionAnswer(question, answerState[item.id][question.id])),
+        };
       }
-      answers[item.id] = words.join("\n");
+    } catch (error) {
+      status.textContent = String(error.message || error);
+      return;
     }
     const chatKey = swarmChatKey(agentId);
     if (chatGoalRequests.has(chatKey)) return;
@@ -7573,6 +7740,7 @@ function fillChatGoalPanel(panel, agentId, context) {
           goal_id: goal.goal_id, ...chatGoalBinding(agentId, goal),
           expected_revision: current.goal.revision,
           pending_ids: pending.map((one) => one.id), answers,
+          request_id: goalAnswerRequestId(goal.goal_id, pending, answers),
         }),
       });
       await refreshChatGoalAfterAction(agentId, result.goal, chatKey);
@@ -15000,8 +15168,8 @@ function beginLongGoalLoad() {
 
 function selectLongGoalSnapshot(goal) {
   beginLongGoalLoad();
-  longGoal = goal;
-  if (goal?.goal_id) localStorage.setItem(LONG_GOAL_SELECTED_KEY, goal.goal_id);
+  longGoal = goal ? rememberChatGoalSnapshot(goal) : null;
+  if (longGoal?.goal_id) localStorage.setItem(LONG_GOAL_SELECTED_KEY, longGoal.goal_id);
 }
 
 async function readSwarmBoardRun(runId, after = 0) {
@@ -15496,10 +15664,16 @@ function renderMissionControl() {
   inbox.replaceChildren();
   if (!pending.length) inbox.append(make("p", "hint", "No agent is waiting for you."));
   if (pending.length) {
+    const answeringGoal = longGoal;
+    if (!immutable && !providerSetupChanged) addGoalReconsideration(inbox, answeringGoal, () => longGoal, async result => {
+      rememberChatGoalSnapshot(result);
+      await refreshLongGoals(true);
+    });
     const form = make("form", "mission-question");
     if (immutable || providerSetupChanged) form.setAttribute("aria-disabled", "true");
     form.append(make("p", "hint",
       "Answer the complete decision set shown here. Nexus rejects this submission if the goal or pending questions change before you send it."));
+    const audience = goalAnswerAudience(form);
     for (const item of pending) {
       const fieldset = make("fieldset", "mission-question-set");
       fieldset.append(make("legend", "", `${item.reason} · task ${item.task_id}`));
@@ -15536,25 +15710,31 @@ function renderMissionControl() {
     form.append(submit);
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (longGoal?.goal_id !== answeringGoal.goal_id
+          || JSON.stringify(longGoal.pending_interrupts || []) !== JSON.stringify(pending)) {
+        showError("The goal or its questions changed. Read the current decision cards before answering.");
+        return;
+      }
       const answers = {};
       for (const item of pending) {
-        const parts = [];
+        const questions = [];
         for (const question of item.questions || []) {
           const name = `${item.id}-${question.id}`;
           const chosen = [...form.querySelectorAll(`input[name="${CSS.escape(name)}"]:checked`)].map((one) => one.value);
-          const other = form.querySelector(`[data-question-name="${CSS.escape(name)}"]`)?.value.trim();
-          const answer = other || chosen.join(", ");
-          if (!answer) { showError("Answer every question before resuming."); return; }
-          parts.push(`${question.prompt}: ${answer}`);
+          const text = String(form.querySelector(`[data-question-name="${CSS.escape(name)}"]`)?.value || "");
+          if (!text.trim() && !chosen.length) { showError("Answer every question before resuming."); return; }
+          questions.push({question_id: question.id, selected_options: chosen, text});
         }
-        answers[item.id] = parts.join("\n");
+        answers[item.id] = {schema_version: 1, audience: audience.value, questions};
       }
-      await request("/api/long-horizon/answer", {method: "POST", body: JSON.stringify({
-        goal_id: longGoal.goal_id,
+      const result = await request("/api/long-horizon/answer", {method: "POST", body: JSON.stringify({
+        goal_id: answeringGoal.goal_id,
         expected_revision: longGoal.revision,
         pending_ids: pending.map((one) => one.id),
         answers,
+        request_id: goalAnswerRequestId(answeringGoal.goal_id, pending, answers),
       })});
+      rememberChatGoalSnapshot(result.goal);
       await refreshLongGoals(true);
     });
     inbox.append(form);
@@ -15620,8 +15800,27 @@ async function refreshLongGoalOriginChats(goals) {
 }
 
 function longGoalNeedsWatching(goal) {
-  return ["waiting_for_project", "queued", "running", "cancelling"]
-    .includes(String(goal?.status || ""));
+  if (["waiting_for_project", "queued", "running", "cancelling"]
+    .includes(String(goal?.status || ""))) return true;
+  if (["waiting_for_user", "paused"].includes(goal?.status) && goal.scheduler_live === true) return true;
+  if (goal?.status !== "complete" || !goal.conversation_id || !goal.request_id) return false;
+  // Goal and transcript reads are separate. A busy projection lease can let
+  // terminal state arrive before its saved chat record. Keep the normal poll
+  // until the open, admitted chat actually receives that exact completion.
+  return swarmChats.some(held => {
+    const conversation = activeConversationFor(held.agent);
+    if (conversation?.id !== goal.conversation_id || conversation.project !== goal.project?.id) return false;
+    const turns = keptTranscriptFor(held.agent);
+    const admitted = turns.some(one => one.phase === "long_horizon_prompt"
+      && one.correlation?.kind === "long_horizon_prompt"
+      && one.correlation.request_id === goal.request_id
+      && one.correlation.chat_id === goal.conversation_id
+      && one.correlation.project_id === goal.project.id);
+    return admitted && !turns.some(one => chatGoalCompletion(one)?.goalId === goal.goal_id
+      && one.correlation.chat_id === goal.conversation_id
+      && one.correlation.project_id === goal.project.id
+      && one.correlation.request_id === goal.request_id);
+  });
 }
 
 function anyLongGoalNeedsWatching() {
@@ -15630,6 +15829,7 @@ function anyLongGoalNeedsWatching() {
 
 async function loadLongGoal(goalId, resetEvents = false, inheritedRevision = 0) {
   const loadRevision = inheritedRevision || beginLongGoalLoad();
+  const readTicket = beginGoalSnapshotRead();
   const isCurrent = () => loadRevision === longGoalLoadRevision;
   if (!goalId) {
     if (!isCurrent()) return;
@@ -15647,7 +15847,10 @@ async function loadLongGoal(goalId, resetEvents = false, inheritedRevision = 0) 
   const goalAnswer = await request(`/api/long-horizon/goal?id=${encodeURIComponent(goalId)}`);
   if (!isCurrent()) return;
   const nextGoal = goalAnswer.goal;
-  await refreshLongGoalOriginChats(nextGoal);
+  if (nextGoal?.goal_id !== goalId) throw new Error("Nexus returned a different goal than the one requested. Refresh the selected goal.");
+  const accepted = rememberChatGoalSnapshot(nextGoal, readTicket);
+  if (!accepted) return;
+  await refreshLongGoalOriginChats(accepted);
   if (!isCurrent()) return;
   for (let page = 0; page < 20; page += 1) {
     const eventAnswer = await request(
@@ -15663,7 +15866,7 @@ async function loadLongGoal(goalId, resetEvents = false, inheritedRevision = 0) 
     nextCursor = next;
   }
   if (!isCurrent()) return;
-  longGoal = nextGoal;
+  longGoal = rememberChatGoalSnapshot(nextGoal, readTicket);
   longGoalEvents = nextEvents;
   longGoalCursor = nextCursor;
   longGoalEventNotice = nextNotice;
@@ -15674,13 +15877,14 @@ async function loadLongGoal(goalId, resetEvents = false, inheritedRevision = 0) 
 
 async function refreshLongGoals(loadSelected = true) {
   const loadRevision = beginLongGoalLoad();
+  const readTicket = beginGoalSnapshotRead();
   const isCurrent = () => loadRevision === longGoalLoadRevision;
   try {
     const nextGoals = (await request("/api/long-horizon/goals")).goals || [];
     if (!isCurrent()) return;
-    await refreshLongGoalOriginChats(nextGoals);
+    const accepted = rememberGoalSnapshotInventory(nextGoals, readTicket);
+    await refreshLongGoalOriginChats(accepted);
     if (!isCurrent()) return;
-    longGoals = nextGoals;
     const wanted = missionSelectedGoalId();
     const selected = longGoals.find((goal) => goal.goal_id === wanted) || longGoals[0] || null;
     if (loadSelected && selected) {
@@ -15707,6 +15911,7 @@ function watchLongGoal() {
   if (longGoalWatching) return;
   longGoalWatching = window.setTimeout(async () => {
     longGoalWatching = 0;
+    if (!anyLongGoalNeedsWatching()) return;
     // Poll the full durable set, not only the selected detail. The list read
     // projects lifecycle transitions into every origin chat, so concurrent
     // goals remain truthful when the user later reopens an inactive chat.
@@ -15993,9 +16198,9 @@ async function startLongGoalFromComposer(event) {
     });
     localStorage.removeItem(LONG_GOAL_COMPOSER_KEY);
     localStorage.removeItem(LONG_GOAL_REQUEST_KEY);
-    longGoals = said.goals || [];
-    if (longGoals[0]) {
-      localStorage.setItem(LONG_GOAL_SELECTED_KEY, longGoals[0].goal_id);
+    const admitted = (said.goals || []).map(goal => rememberChatGoalSnapshot(goal)).filter(Boolean);
+    if (admitted[0]) {
+      selectLongGoalSnapshot(admitted[0]);
       await refreshLongGoals(true);
     }
     $("longGoalDialog").close();

@@ -48,3 +48,32 @@ browser verification in Nexus's disposable Windows AppContainer.
 The exact download URLs, package integrity values, versions, revisions, and
 archive SHA-256 values used by the reproducible runtime builder are recorded
 in `runtime-playwright.lock.json` in the Nexus Harness source distribution.
+
+## t3code adaptations
+
+Selected input, request-lifecycle, image-header and snapshot-projection solutions
+were adapted from KZTP47/t3code, commit
+`eb115063634c416c6362cc407f8572cb0c136ddf`. Source mapping and changes are
+recorded in `docs/T3CODE_ADOPTION.md`. The upstream notice is reproduced below.
+
+MIT License
+
+Copyright (c) 2026 T3 Tools Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -139,6 +139,31 @@ def hold(name):
 def change(name, content):
     return {'path':name, 'content':content, 'delete':False, 'reason':'fulfil the saved team objective'}
 record('entered')
+if scenario == 'game' and route == 'team-a' and not project_has('arena.js'):
+    def ask_folder(identity, prompt):
+        action = {'action':'ask_user','summary':'TEAM-A-QUESTION: Please clarify the destination.',
+                  'interrupt_reason':'requirement_ambiguity','evidence':[],'risk':'low','changes':[],
+                  'needs_files':[],'tool_calls':[],'tasks':[],'handoff_agent_id':'','criteria_evidence':[],
+                  'questions':[{'id':identity,'prompt':prompt,'multiple':False,'allow_other':True,'options':[]}]}
+        print(json.dumps({'text':json.dumps(action),'finish_reason':'stop'}))
+        sys.exit(0)
+    if not (coordination / 'asked-folder').exists():
+        (coordination / 'asked-folder').write_text('first actual provider question', encoding='utf-8')
+        ask_folder('folder-original', 'Use the misspelled PLOQGZ folder from the screenshot?')
+    marker = '\n\nRESOLVED USER DECISIONS (user answers, not agent assumptions)\n'
+    assert marker in context, 'The resumed requester lost its saved decision history'
+    decisions = json.JSONDecoder().raw_decode(context.split(marker, 1)[1])[0]
+    expected = (coordination / 'expected-answer.txt').read_text(encoding='utf-8')
+    assert len(decisions) == 1 and decisions[0]['answers'][0]['text'] == expected, 'Exact typed correction was changed or duplicated'
+    assert decisions[0]['audience'] == 'requesting_agent', 'Private answer lost its recipient scope'
+    assert 'PLOQGZ' not in decisions[0]['answer_text'], 'The mistaken question contaminated the answer'
+    if not (coordination / 'asked-folder-again').exists():
+        (coordination / 'asked-folder-again').write_text('a differently worded repeat', encoding='utf-8')
+        ask_folder('folder-paraphrase', 'Please confirm the destination folder for the game.')
+    assert 'user requested reconsidering' in context.lower(), 'The repeated card resumed without the explicit reconsider operation'
+    (coordination / 'decision-reread.json').write_text(json.dumps(decisions), encoding='utf-8')
+if scenario == 'game' and route == 'team-b':
+    assert 'Example.test/Case%2fKept?q=AbC%2Fz' not in context, 'A directed answer leaked to the other agent'
 if scenario == 'game' and route == 'team-a' and not project_has('arena.js') \
         and (coordination / 'enable-protocol-fault').is_file():
     if not (coordination / 'injected-protocol-fault').exists():
@@ -322,6 +347,7 @@ async function launch(exe, profile, project, environment) {
     env:environment, timeout:TIMEOUT});
   try {
     const page = await app.firstWindow({timeout:TIMEOUT});
+    page.on("pageerror", error => console.error("info  renderer error: " + String(error)));
     const first = await Promise.race([
       page.waitForFunction(()=>location.protocol === "http:", null, {timeout:TIMEOUT}).then(()=>"panel"),
       page.locator("#repair").waitFor({state:"visible", timeout:TIMEOUT}).then(()=>"repair")]);
@@ -548,6 +574,66 @@ async function startGoal(page, words) {
   await transcriptContains(page,[words]);
 }
 
+async function answerAndReconsiderFolder(page, chatId, exactAnswer, coordination) {
+  const first = await goalFor(page, chatId, goal => goal.status === "waiting_for_user" && goal.pending_interrupts?.length === 1);
+  const panel = page.locator("#theBigChatTeamGoal");
+  await panel.locator("textarea").fill(exactAnswer);
+  await panel.getByRole("combobox", {name:"Answer audience",exact:true}).selectOption("requesting_agent");
+  const answerResponse = page.waitForResponse(response => new URL(response.url()).pathname === "/api/long-horizon/answer"
+    && response.request().method() === "POST", {timeout:30_000});
+  await panel.getByRole("button", {name:"Send answers to the asking agents",exact:true}).click();
+  const response = await answerResponse;
+  const answered = await response.json();
+  assert.equal(response.status(), 200, JSON.stringify(answered));
+  const sent = response.request().postDataJSON();
+  assert.equal(sent.goal_id, first.goal_id);
+  assert.deepEqual(sent.pending_ids, first.pending_interrupts.map(item => item.id));
+  assert.match(sent.request_id, /^[0-9a-f-]{36}$/i);
+  assert.deepEqual(sent.answers[first.pending_interrupts[0].id], {schema_version:1,audience:"requesting_agent",
+    questions:[{question_id:"folder-original",selected_options:[],text:exactAnswer}]});
+  const original = answered.goal.interrupts.find(item => item.id === first.pending_interrupts[0].id);
+  assert.equal(original.state, "resolved");
+  assert.equal(original.answer_record.answers[0].text, exactAnswer);
+  const repeated = await goalFor(page, chatId, goal => goal.decision_reconsideration?.available === true);
+  assert.equal(repeated.goal_id, first.goal_id);
+  assert.equal(repeated.pending_interrupts[0].questions[0].id, "folder-paraphrase");
+  const preflightResponses = [];
+  const observePreflight = reply => {
+    const url = new URL(reply.url());
+    if (url.pathname === "/api/long-horizon/goal" && url.searchParams.get("id") === first.goal_id
+      && reply.request().method() === "GET") preflightResponses.push(reply.json());
+  };
+  page.on("response", observePreflight);
+  const reconsiderResponse = page.waitForResponse(reply => new URL(reply.url()).pathname === "/api/long-horizon/reconsider"
+    && reply.request().method() === "POST", {timeout:30_000});
+  await panel.getByRole("button", {name:"Reconsider using saved answers",exact:true}).click();
+  const reconsideredResponse = await reconsiderResponse;
+  page.off("response", observePreflight);
+  const reconsidered = await reconsideredResponse.json();
+  assert.equal(reconsideredResponse.status(), 200, JSON.stringify(reconsidered));
+  const reconsiderBody = reconsideredResponse.request().postDataJSON();
+  const fresh = (await Promise.all(preflightResponses)).find(read => read.goal?.revision === reconsiderBody.expected_revision);
+  assert.ok(fresh, "The actual reconsider click did not read the exact revision it submitted");
+  assert.equal(reconsiderBody.goal_id, first.goal_id);
+  assert.deepEqual(reconsiderBody.pending_ids, repeated.pending_interrupts.map(item => item.id));
+  assert.equal(reconsiderBody.expected_revision, fresh.goal.revision);
+  assert.equal(fresh.goal.scheduler_live, false, "Reconsideration raced the scheduler's final release");
+  assert.deepEqual(fresh.goal.pending_interrupts, repeated.pending_interrupts,
+    "The preflight replaced the displayed question set");
+  assert.equal(Object.hasOwn(reconsiderBody, "answers"), false);
+  assert.equal(Object.hasOwn(reconsiderBody, "approved"), false);
+  assert.equal(reconsidered.goal.pending_interrupts.length, 0);
+  assert.equal(reconsidered.goal.interrupts.filter(item => item.state === "resolved").length, 1);
+  assert.deepEqual(reconsidered.goal.interrupts.find(item => item.id === original.id).answer_record, original.answer_record);
+  assert.equal(reconsidered.goal.interrupts.find(item => item.id === repeated.pending_interrupts[0].id).state, "superseded");
+  await until(() => fs.existsSync(path.join(coordination, "decision-reread.json")), "the actual requester rereading the unchanged directed answer");
+  fs.writeFileSync(path.join(coordination, "answer-reconsideration.json"), JSON.stringify({
+    goal_id:first.goal_id,answer:sent,reconsider:reconsiderBody,
+    resolved_decision_id:original.id,superseded_interrupt_id:repeated.pending_interrupts[0].id,
+    saved_answer_unchanged:true,provider_reread:true}, null, 2));
+  console.log("pass  exact typed paths and URLs reach the requester without the mistaken prompt; explicit reconsider preserves that answer and resumes the same goal");
+}
+
 function execute(node, arguments_, project, environment, expectedSuccess = true) {
   const result = childProcess.spawnSync(node, arguments_, {cwd:project, env:environment,
     encoding:"utf8", timeout:60_000, windowsHide:true});
@@ -583,13 +669,15 @@ async function main() {
   const exe=path.resolve(process.argv[2] || path.join(__dirname,"build-output","win-unpacked","Nexus Harness.exe"));
   assert.ok(fs.existsSync(exe),`Build the app first: ${exe}`);
   const root=fs.mkdtempSync(path.join(os.tmpdir(),"nexus-team-chat-"));
-  const project=path.join(root,"Arena – Åsa & O'Brien (portable)!");
+  const project=path.join(root,"PLOQQIZ – Åsa & O'Brien (portable)!");
   const testProject=path.join(root,"Separate arena test repository (no configured checks)");
   const coordination=path.join(root,"scripted provider control");
   const profile=path.join(root,"fresh profile");
   for(const directory of [project,testProject,coordination,profile])fs.mkdirSync(directory);
   const environment=isolatedEnvironment(profile);
   const bundled=fixture(exe,project,coordination,environment);
+  const exactAnswer=`  ${project}\nhttps://Example.test/Case%2fKept?q=AbC%2Fz&mode=Play#Chapter-2  `;
+  fs.writeFileSync(path.join(coordination,"expected-answer.txt"),exactAnswer,"utf8");
   const protocolFault=process.env.NEXUS_TEAM_PROTOCOL_FAULT === "1";
   if(protocolFault)fs.writeFileSync(path.join(coordination,"enable-protocol-fault"),"one malformed action");
   const toolFault=process.env.NEXUS_TEAM_TOOL_FAULT === "1";
@@ -608,6 +696,7 @@ async function main() {
     await page.reload({waitUntil:"domcontentloaded"});
     await openChat(page,gameChat);
     await startGoal(page,GAME_GOAL);
+    await answerAndReconsiderFolder(page,gameChat,exactAnswer,coordination);
     if(protocolFault) {
       await until(()=>fs.existsSync(path.join(coordination,"entered-correction")),"automatic correction after the malformed lead reply");
       const correcting=await goalFor(page,gameChat);
@@ -745,6 +834,13 @@ async function main() {
   } catch(error) {
     if(running?.page) {
       await running.page.screenshot({path:path.join(coordination,"failure.png")}).catch(()=>{});
+      await running.page.evaluate(() => ({
+        goal: longGoal, goals: longGoals, watching: longGoalWatching,
+        selectedAgent: theBigOne, chats: swarmChats.map(held => ({agent:held.agent,conversation:held.conversation,
+          saidFor:held.saidFor,turns:held.said})),
+        visibleTurns: [...document.querySelectorAll("#theBigChatSaid > li")].map(one => ({
+          classes:one.className,goalId:one.dataset.goalId,goalStatus:one.dataset.goalStatus,text:one.textContent})),
+      })).then(value => fs.writeFileSync(path.join(coordination,"failure-renderer.json"),JSON.stringify(value,null,2))).catch(()=>{});
       try {
         const observed=await goals(running.page);
         fs.writeFileSync(path.join(coordination,"failure-goals.json"),JSON.stringify(observed,null,2));
