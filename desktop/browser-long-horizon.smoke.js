@@ -119,6 +119,7 @@ coordination = Path(sys.argv[1])
 route = sys.argv[2]
 payload = json.loads(sys.stdin.read())
 context = str(payload.get("dynamic_context") or "")
+project_tree = context.split("\\n\\nPROJECT TREE\\n", 1)[1].split("\\n\\nREQUESTED FILE CONTENTS\\n", 1)[0]
 if "${RECOVERY_MARKER}" in context:
     stem = "recovered"
     wanted = "browser recovery complete"
@@ -152,7 +153,9 @@ with (coordination / f"{stem}-dispatch.log").open("a", encoding="utf-8") as stre
 
 target = f"browser-{stem}.txt"
 changes = []
-if not Path(target).is_file():
+# The provider's transport cwd is not this chat's independent working copy.
+# Nexus supplies that exact copy's current file inventory in every turn.
+if target not in project_tree.splitlines():
     changes.append({
         "path": target,
         "content": wanted + "\\n",

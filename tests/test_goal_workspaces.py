@@ -290,7 +290,7 @@ class GoalWorkspaces(unittest.TestCase):
 
     def test_legacy_root_and_nested_publication_creation(self) -> None:
         document = {"goal_id": "legacy-goal", "project": {"path": str(self.source)}}
-        self.assertEqual(workspaces.root(document, self.runtime), self.source)
+        self.assertTrue(workspaces.root(document, self.runtime).samefile(self.source))
         with workspaces.publication(document, self.runtime):
             descriptor = workspaces.create(document, self.runtime, publication_locked=True)
         document["execution_workspace"] = descriptor
@@ -319,15 +319,26 @@ class GoalWorkspaces(unittest.TestCase):
         child.mkdir()
         other = self.goal("nested-goal", child)
         marker = self.folder / "acquired.txt"
+        ready = self.folder / "ready.txt"
         script = "\n".join([
             "import json,sys", "from pathlib import Path", "from our_harness import goal_workspaces as w",
-            "doc=json.loads(sys.argv[1])", "with w.publication(doc,Path(sys.argv[2])):",
+            "doc=json.loads(sys.argv[1])", "Path(sys.argv[4]).write_text('ready')",
+            "with w.publication(doc,Path(sys.argv[2])):",
             " Path(sys.argv[3]).write_text('acquired')",
         ])
+        environment = dict(os.environ)
+        source_path = str(Path(__file__).resolve().parents[1] / "src")
+        environment["PYTHONPATH"] = source_path + (os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else "")
         with workspaces.publication(document, self.runtime):
-            process = subprocess.Popen([sys.executable, "-c", script, json.dumps(other), str(self.runtime), str(marker)],
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process = subprocess.Popen([sys.executable, "-c", script, json.dumps(other), str(self.runtime), str(marker), str(ready)],
+                                       env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if process.poll() is not None:
+                    self.fail(f"Publication child exited before the lock check: {process.communicate()!r}")
+                self.assertTrue(ready.exists(), "Publication child did not finish importing the exact source")
                 with self.assertRaises(subprocess.TimeoutExpired):
                     process.wait(timeout=0.25)
                 self.assertFalse(marker.exists())

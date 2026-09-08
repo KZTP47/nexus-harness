@@ -500,6 +500,47 @@ async function approveDiscoveredChecks(page, projectId) {
     "the user's exact command approval persisted on the project",30_000);
 }
 
+async function approveChatChecks(page, goal) {
+  await page.locator("#theBigChat").getByRole("button",{name:"Advanced goal details",exact:true}).click();
+  await until(async ()=>(await page.locator("#missionGoalSelect").inputValue())===goal.goal_id,
+    "the selected chat's exact goal details",30_000);
+  if(!await page.locator("#missionEvidence").isVisible()) {
+    await page.getByText("Artifacts, diffs, tests, and reviews",{exact:true}).click();
+  }
+  const endpoint="/api/long-horizon/verification-approval";
+  const previewResponse=page.waitForResponse(response=>{
+    const url=new URL(response.url());
+    return url.pathname===endpoint && response.request().method()==="GET"
+      && url.searchParams.get("goal_id")===goal.goal_id;
+  },{timeout:30_000});
+  const approvalResponse=page.waitForResponse(response=>new URL(response.url()).pathname===endpoint
+    && response.request().method()==="POST",{timeout:30_000});
+  let confirmation="";
+  page.once("dialog",async dialog=>{confirmation=dialog.message();await dialog.accept();});
+  await page.getByRole("button",{name:"Review this chat's test commands",exact:true}).click();
+  const preview=await (await previewResponse).json();
+  const response=await approvalResponse;
+  const approved=await response.json();
+  assert.equal(response.status(),200,JSON.stringify(approved));
+  assert.equal(preview.goal_id,goal.goal_id);
+  assert.equal(preview.approved,false,"The goal's commands were approved before the visible confirmation");
+  assert.ok(preview.commands.some(command=>command.includes("unittest")&&command.includes("discover")),
+    "The selected working copy's discovered Python check was not displayed");
+  assert.ok(confirmation.includes(goal.goal_id)&&confirmation.includes(preview.approval_digest));
+  for(const command of preview.commands)assert.ok(confirmation.includes(JSON.stringify(command)));
+  assert.ok(confirmation.includes("only to this chat's goal")&&confirmation.includes("Resume team"));
+  const sent=response.request().postDataJSON();
+  assert.equal(sent.goal_id,goal.goal_id);
+  assert.equal(sent.expected_revision,preview.revision);
+  assert.equal(sent.command_digest,preview.approval_digest);
+  assert.equal(sent.approved,true);
+  assert.equal(approved.goal.goal_id,goal.goal_id);
+  assert.equal(approved.goal.status,"paused","Approving commands silently resumed the goal");
+  assert.equal(approved.goal.verification.status,"not_run","Commands executed before Resume");
+  assert.equal(approved.approval.approved,true);
+  return approved.goal;
+}
+
 async function startGoal(page, words) {
   await page.locator("#theBigChatBox").fill(words);
   page.once("dialog", dialog=>dialog.accept());
@@ -662,10 +703,19 @@ async function main() {
     assert.equal(waitingForChecks.verification_contract.approved_test_command_digest,"");
     assert.deepEqual(waitingForChecks.verification_contract.test_commands,[]);
     const callsBeforeApproval=waitingForChecks.budget.provider_calls;
-    await approveDiscoveredChecks(page,TEST_PROJECT_ID);
+    const approved=await approveChatChecks(page,waitingForChecks);
+    assert.equal(approved.budget.provider_calls,callsBeforeApproval,"Approval dispatched another provider turn");
+    const selectedProject=await page.evaluate(async projectId=>(await request("/api/swarm")).board.projects
+      .find(project=>project.id===projectId),TEST_PROJECT_ID);
+    assert.equal(selectedProject.approved_test_command_digest,"","A chat approval silently approved the project board");
+    assert.deepEqual((await goalFor(page,gameChat)).verification_contract,completed.verification_contract,
+      "Approving the selected chat changed another chat's command authority");
     await openChat(page,testChat);
     await until(async ()=>(await page.locator("#theBigChatStop").textContent()).includes("Resume"),
-      "Resume team after project check approval",30_000);
+      "Resume team after this chat's command approval",30_000);
+    const beforeResume=await goalFor(page,testChat);
+    assert.equal(beforeResume.status,"paused");
+    assert.equal(beforeResume.verification.status,"not_run");
     await page.locator("#theBigChatStop").click();
     const testsComplete=await goalFor(page,testChat,goal=>goal.status==="complete");
     assert.equal(testsComplete.goal_id,waitingForChecks.goal_id,"Check approval replaced the goal");
@@ -675,7 +725,12 @@ async function main() {
     assert.equal(testsComplete.verification.status,"passed");
     await captureReadableConversation(page,testsComplete.goal_id,["TEST-A-REVIEW","TEST-B-FINAL"],
       path.join(coordination,"tests-conversation.png"));
-    console.log("pass  a new project's unapproved checks pause truthfully; visible approval and Resume finish the same goal without repeating agent work");
+    console.log("pass  the real chat-specific command button previews and approves only its exact paused goal; Resume verifies without repeating agent work");
+    // Keep the separate board-level approval control covered after publication;
+    // the completed chat above must succeed using only its own scoped approval.
+    await approveDiscoveredChecks(page,TEST_PROJECT_ID);
+    await openChat(page,testChat);
+    console.log("pass  the project board's separate explicit command approval still works after publication");
     await verifyArtifacts(testProject,coordination,bundled,environment);
     await running.app.close();running=null;
     running=await launch(exe,profile,project,environment);page=running.page;

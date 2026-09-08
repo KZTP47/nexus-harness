@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import threading
 import time
 import unittest
@@ -70,7 +71,7 @@ class SameProjectConcurrencyTests(unittest.TestCase):
 
         def verify(_config, root, _project, objective, *_args, **_kwargs):
             suffix = "a" if "NEXUS-ISOLATED-A" in objective else "b"
-            self.assertNotEqual(root, self.project)
+            self.assertFalse(root.samefile(self.project))
             self.assertEqual((root / f"result-{suffix}.txt").read_text(), f"{suffix} complete\n")
             self.assertFalse((self.project / f"result-{suffix}.txt").exists())
             verification_roots.append((suffix, root))
@@ -90,7 +91,7 @@ class SameProjectConcurrencyTests(unittest.TestCase):
                 self.assertNotEqual(*roots)
                 for one in (first_now, second_now):
                     self.assertEqual(one["status"], "running")
-                    self.assertEqual(one["project"]["path"], str(self.project))
+                    self.assertTrue(Path(one["project"]["path"]).samefile(self.project))
                     self.assertTrue(any(task["provider_effect_state"] == "dispatched" for task in one["tasks"]))
                 self.assertFalse((self.project / "result-a.txt").exists())
                 self.assertFalse((self.project / "result-b.txt").exists())
