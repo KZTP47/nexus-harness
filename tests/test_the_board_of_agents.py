@@ -2355,9 +2355,17 @@ class MovingAroundTheBoard(unittest.TestCase):
             self.script.index("async function loadAgentRepairPlan"):
             self.script.index("async function checkAgentLogin")
         ]
-        self.assertIn("JSON.stringify({route})", check)
+        self.assertIn("JSON.stringify({route, ...agentRepairContext(agentId)})", check)
         self.assertIn('request("/api/team/repair-plan"', check)
         self.assertIn("swarmAgentRepairPlans.set(agentId, {route, plan})", check)
+        self.assertIn("if (agentStillUsesRoute(agentId, route))", check)
+        context = self.script[
+            self.script.index("function agentRepairContext"):
+            self.script.index("function renderAgentRepairPanel")
+        ]
+        self.assertIn("chatLongGoalContext(agentId).goal", context)
+        self.assertIn("agent_id: agentId", context)
+        self.assertIn("goal?.goal_id ? {goal_id: goal.goal_id} : {}", context)
         self.assertNotIn("refreshSwarm", check)
 
     def test_board_readiness_issues_open_the_exact_agents_repair_flow(self) -> None:
@@ -3637,14 +3645,21 @@ removeDirectLongGoalOutbox("chat-two", "request-two", "a".repeat(64))
     def test_chat_round_policy_is_visible_and_sent_with_both_chat_views(self) -> None:
         self.assertIn('id="theBigChatRoundLimit"', self.markup)
         self.assertIn('id="theBigChatUnlimited"', self.markup)
-        self.assertIn("Unlimited while progress continues", self.markup)
+        self.assertIn("Continue while progress continues", self.markup)
         self.assertIn('value="3"', self.markup)
         self.assertIn("const DEFAULT_FINITE_TEAM_ROUNDS = 3", self.script)
-        self.assertIn("{unlimited: false, maximum: DEFAULT_FINITE_TEAM_ROUNDS}",
+        self.assertIn("{unlimited: true, maximum: DEFAULT_FINITE_TEAM_ROUNDS}",
                       self.script)
         self.assertIn("function selectedChatRoundLimit(agentId)", self.script)
-        self.assertIn("round_limit: selectedChatRoundLimit(agentId)", self.script)
-        self.assertIn("Unlimited is an explicit opt-in", self.markup)
+        self.assertIn("return policy.unlimited ? null : policy.maximum", self.script)
+        for start, end in (
+            ("async function sendWhatIsTypedTo", "async function startTheChatAgainFor"),
+            ("async function sendFromTheBigChat", "function wireUpTheTray"),
+        ):
+            handler = self.script[self.script.index(start):self.script.index(end)]
+            self.assertIn("round_limit: selectedChatRoundLimit(agentId)", handler)
+        for surface in (self.markup, self.script):
+            self.assertIn("Set a maximum here when you want a round budget.", surface)
         self.assertIn(".chat-round-policy", self.styles)
 
     def test_normal_send_is_the_solo_chat_action_in_both_chat_bottoms(self) -> None:

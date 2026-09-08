@@ -367,11 +367,57 @@ class TheCountSurvivesARestart(StuckTestCase):
                     self.a_fresh_session(carried)
                 self.assertIn("repeat counts", str(caught.exception))
 
-    def test_a_count_larger_than_the_whole_budget_is_refused(self) -> None:
+    def test_a_response_call_count_larger_than_its_budget_is_refused(self) -> None:
         carried = self.session.budget_state()
-        carried["how_often"] = {"a" * 64: self.session.max_calls + 1}
+        carried["calls"] = self.session.max_calls + 1
         with self.assertRaises(HarnessError):
             self.a_fresh_session(carried)
+
+    def test_lifetime_repeat_count_spans_response_allowances_without_resetting_replay_or_limits(self) -> None:
+        from our_harness import swarm_work
+        from our_harness.collaboration_ledger import CollaborationLedger
+
+        self.config.data["workflow"]["max_tool_calls"] = 2
+        project = {"id": "portable-project", "name": "Portable project", "path": str(self.root)}
+        ledger = CollaborationLedger(self.config, "planner", "repeat-across-responses").begin(
+            "Inspect README.md without changing files", [{"id": "planner", "who": "planner"}],
+            mode="long_horizon_context_tools",
+        )
+        def open_tools():
+            return swarm_work._ProjectContextTools(
+                self.config, self.root, ledger, project,
+                "Inspect README.md without changing files", [], None,
+                verification_profile="shared_goal_v1",
+            )
+        call = {"call_id": "read-source", "name": "read_file", "arguments": {
+            "path": "README.md", "start_line": 1, "end_line": 1, "max_bytes": 200,
+        }}
+        tools = open_tools()
+        try:
+            for number in range(3):
+                result = tools.execute("planner", call, execution_scope="response-" + str(number))
+                self.assertEqual(result["status"], "ok")
+                if number == 0:
+                    original = result
+            carried = tools.session.budget_state()
+            self.assertEqual(carried["calls"], 1)
+            self.assertEqual(list(carried["how_often"].values()), [3])
+            self.assertGreater(3, tools.session.max_calls)
+        finally:
+            tools.close()
+
+        reopened = open_tools()
+        try:
+            self.assertEqual(reopened.session.how_often, carried["how_often"])
+            replay = reopened.execute("planner", call, execution_scope="response-0")
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(replay["content"], original["content"])
+            self.assertEqual(list(reopened.session.how_often.values()), [4])
+            self.assertEqual(reopened.session.calls, reopened.session.max_calls)
+            with self.assertRaisesRegex(HarnessError, "call limit"):
+                reopened.execute("planner", {**call, "call_id": "over-limit"}, execution_scope="response-0")
+        finally:
+            reopened.close()
 
 
 class EveryRouteIsToldWhatANoticeIs(unittest.TestCase):
