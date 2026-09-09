@@ -2642,18 +2642,23 @@ def keep_exchange(
 
 def long_horizon_intent_sha256(
     chat_id: str, project_id: str, lead_id: str, text: str,
-    attachments: object = None,
+    attachments: object = None, policy: object = None,
 ) -> str:
     """Fingerprint the exact direct-goal intent without persisting its payload."""
 
-    canonical = json.dumps({
+    intent = {
         "schema_version": 1,
         "chat_id": str(chat_id or ""),
         "project_id": str(project_id or ""),
         "lead_id": str(lead_id or ""),
         "text": _check_what_was_typed(text),
         "attachments": attachments if attachments is not None else [],
-    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    }
+    # Preserve receipts from clients that predate composer permissions. New
+    # requests bind the exact policy into their identity across all three owners.
+    if policy is not None:
+        intent["policy"] = policy
+    canonical = json.dumps(intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

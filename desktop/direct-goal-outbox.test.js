@@ -125,6 +125,39 @@ test("payload digest matches Python long_horizon_intent_sha256 canonical JSON", 
   assert.equal(saved.intent, expected);
 });
 
+test("composer permissions share an exact digest with the outbox and backend after restart", async (t) => {
+  const held = fixture(t);
+  const vm = require("node:vm");
+  const app = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/app.js"), "utf8");
+  const renderer = vm.createContext({crypto: crypto.webcrypto, TextEncoder});
+  vm.runInContext(app.slice(app.indexOf("function directLongGoalCanonicalValue"),
+    app.indexOf("async function prepareDirectLongGoalAdmission")), renderer);
+  const python = path.join(__dirname, "build-output/win-unpacked/resources/runtime/python.exe");
+  const digests = [];
+  for (const mode of ["read_only", "ask", "full"]) {
+    const exact = record({payload: {policy: {agent_access_mode: mode}, chat_id: `chat-${mode}`},
+      chat_id: `chat-${mode}`, request_id: `request-${mode}`});
+    const conversation = {id: exact.chat_id, project: exact.payload.project_id};
+    const digest = await renderer.directLongGoalIntent(conversation, exact.payload.lead_id,
+      exact.payload.text, [], mode);
+    exact.intent = digest;
+    const saved = oneStore(held).save(exact);
+    assert.equal(saved.payload_sha256, digest);
+    assert.deepEqual(oneStore(held).read(exact.chat_id, exact.request_id, digest).payload, exact.payload);
+    const backend = childProcess.execFileSync(fs.existsSync(python) ? python : "python", ["-c",
+      "import json,sys;sys.path.insert(0,'src');from our_harness.chat import long_horizon_intent_sha256;p=json.load(sys.stdin);print(long_horizon_intent_sha256(p['chat_id'],p['project_id'],p['lead_id'],p['text'],p['attachments'],p['policy']))"],
+    {cwd:path.join(__dirname,".."), input:JSON.stringify(exact.payload), encoding:"utf8", windowsHide:true}).trim();
+    assert.equal(backend, digest);
+    digests.push(await renderer.directLongGoalIntent({id:"same-chat",project:conversation.project},
+      exact.payload.lead_id, exact.payload.text, [], mode));
+    assert.throws(()=>oneStore(held).save({...exact,payload:{...exact.payload,policy:{agent_access_mode:mode === "full" ? "ask" : "full"}}}),
+      /intent|digest|different/i);
+  }
+  assert.equal(new Set(digests).size, 3, "Each permission mode changes the same prompt's identity");
+  assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:"unrestricted"}}})), /supported access mode/);
+  assert.throws(()=>oneStore(held).save(record({payload:{policy:{agent_access_mode:"full",other:true}}})), /unsupported field/);
+});
+
 test("same chat is idempotent only for the same request and exact payload", (t) => {
   const held = fixture(t);
   const store = oneStore(held);

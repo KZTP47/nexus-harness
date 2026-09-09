@@ -4273,7 +4273,7 @@ class WhatThePanelIsTold(BoardTestCase):
             "lead_id": payload["lead_id"],
             "intent_sha256": chat.long_horizon_intent_sha256(
                 payload["chat_id"], payload["project_id"], payload["lead_id"],
-                payload["text"], payload.get("attachments"),
+                payload["text"], payload.get("attachments"), payload.get("policy"),
             ),
         }
         self.assertEqual(
@@ -7551,8 +7551,9 @@ class WhatThePanelIsTold(BoardTestCase):
         lead_id, _peer_id, _first, second = self.saved_project_pair_with_two_chats()
         request_id = "direct-lost-start-response-1"
         text = "The goal exists although the renderer missed the response"
+        policy = {"agent_access_mode": "full"}
         intent_sha256 = chat.long_horizon_intent_sha256(
-            second["id"], "project-1", lead_id, text, [],
+            second["id"], "project-1", lead_id, text, [], policy,
         )
         runtime = self.fake_long_horizon_runtime()
         goal = {
@@ -7571,7 +7572,7 @@ class WhatThePanelIsTold(BoardTestCase):
             self.panel.admit_direct_long_horizon({
                 "project_id": "project-1", "lead_id": lead_id,
                 "chat_id": second["id"], "text": text,
-                "request_id": request_id,
+                "request_id": request_id, "policy": policy,
             })
         pending = self.panel.direct_admission_inventory()
         self.assertEqual([one["request_id"] for one in pending], [request_id])
@@ -7602,7 +7603,7 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assert_direct_receipt(reconciled, {
             "project_id": "project-1", "lead_id": lead_id,
             "chat_id": second["id"], "text": text,
-            "request_id": request_id,
+            "request_id": request_id, "policy": policy,
         }, goal=reconciled["goal"])
         retired = self.panel._read_direct_admission_path(
             self.panel._direct_admission_path(request_id),
@@ -7618,7 +7619,7 @@ class WhatThePanelIsTold(BoardTestCase):
         self.assert_direct_receipt(repeated, {
             "project_id": "project-1", "lead_id": lead_id,
             "chat_id": second["id"], "text": text,
-            "request_id": request_id,
+            "request_id": request_id, "policy": policy,
         }, goal=repeated["goal"])
         runtime.start.assert_called_once()
 

@@ -1500,7 +1500,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             lead_id = str(payload.get("lead_id") or "")
             intent_sha256 = chat_lab.long_horizon_intent_sha256(
                 chat_id, project_id, lead_id, str(payload.get("text") or ""),
-                payload.get("attachments"),
+                payload.get("attachments"), payload.get("policy"),
             )
         elif state in {"discarded", "reconciled"}:
             request_id = str(record.get("request_id") or "")
@@ -1965,7 +1965,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     str(payload.get("chat_id") or ""),
                     str(payload.get("project_id") or ""),
                     str(payload.get("lead_id") or ""),
-                    str(payload.get("text") or ""), payload.get("attachments"),
+                    str(payload.get("text") or ""), payload.get("attachments"), payload.get("policy"),
                 ),
                 "execution_contract": dict(record.get("execution_contract") or {}),
                 "created_ms": int(record.get("created_ms") or now),
@@ -2144,7 +2144,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
             context = self._direct_long_horizon_context(standing, payload)
             intent_sha256 = chat_lab.long_horizon_intent_sha256(
                 context["chat_id"], context["project_id"], context["lead_id"],
-                str(payload["text"]), payload.get("attachments"),
+                str(payload["text"]), payload.get("attachments"), payload.get("policy"),
             )
             chat_lab.keep_long_horizon_error(
                 self.config, context["transcript_route"],
@@ -2332,7 +2332,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                             str(record_payload.get("project_id") or ""),
                             str(record_payload.get("lead_id") or ""),
                             str(record_payload.get("text") or ""),
-                            record_payload.get("attachments"),
+                            record_payload.get("attachments"), record_payload.get("policy"),
                         )
                         if expected_intent and expected_intent != recorded_intent:
                             raise HarnessError(
@@ -2590,7 +2590,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 str(payload.get("chat_id") or ""),
                 str(payload.get("project_id") or ""),
                 str(payload.get("lead_id") or ""), text,
-                payload.get("attachments"),
+                payload.get("attachments"), payload.get("policy"),
             ),
             "text_preview": safe_preview,
             "text_characters": len(text),
@@ -2739,7 +2739,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                 context = self._direct_long_horizon_context(standing, payload)
                 intent_sha256 = chat_lab.long_horizon_intent_sha256(
                     context["chat_id"], context["project_id"], context["lead_id"],
-                    str(payload["text"]), payload.get("attachments"),
+                    str(payload["text"]), payload.get("attachments"), payload.get("policy"),
                 )
                 preflight = self._preflight_direct_long_horizon(
                     standing, payload, context,
@@ -2809,7 +2809,7 @@ class HarnessHTTPServer(ThreadingHTTPServer):
                     )
                 intent_sha256 = chat_lab.long_horizon_intent_sha256(
                     context["chat_id"], context["project_id"], context["lead_id"],
-                    str(payload["text"]), payload.get("attachments"),
+                    str(payload["text"]), payload.get("attachments"), payload.get("policy"),
                 )
                 preflight = self._preflight_direct_long_horizon(
                     standing, payload, context,

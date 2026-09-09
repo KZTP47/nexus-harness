@@ -1592,6 +1592,9 @@ test("a never-loading page times out before submission and the next queued turn 
       && error.deliveryState === "not_accepted"
       && error.failureCode === "pre_submission_timeout",
   );
+  // Only the intentionally stuck turn needs a tiny deadline. The successful
+  // recovery must tolerate scheduling delays when the suite runs in parallel.
+  manager.preSubmitDeadlineMs = 1000;
   const result = await manager.ask("gemini-example", "Second turn", []);
 
   assert.equal(firstClosed, 1);

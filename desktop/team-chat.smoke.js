@@ -356,6 +356,11 @@ async function launch(exe, profile, project, environment) {
   try {
     const page = await app.firstWindow({timeout:TIMEOUT});
     page.on("pageerror", error => console.error("info  renderer error: " + String(error)));
+    page.on("response", async response => {
+      if (response.status() >= 400 && new URL(response.url()).pathname.startsWith("/api/")) {
+        console.error(`info  failed API ${response.status()} ${response.url()}: ${await response.text().catch(()=>"")}`);
+      }
+    });
     const first = await Promise.race([
       page.waitForFunction(()=>location.protocol === "http:", null, {timeout:TIMEOUT}).then(()=>"panel"),
       page.locator("#repair").waitFor({state:"visible", timeout:TIMEOUT}).then(()=>"repair")]);
@@ -468,10 +473,11 @@ async function captureReadableConversation(page, goalId, markers, destination) {
       && !work.disabled && work.getBoundingClientRect().height>0;
   },goalId,{timeout:30_000});
   // A Windows runner may clamp Electron's native window to its smaller virtual
-  // display. Use the same real page viewport as the local desktop layout proof;
+  // display. Use a full-HD viewport so both replies and their delivery banners
+  // fit in one evidence frame. Smaller-window layout has its own required tests;
   // screenshot acceptance must not depend on the build worker's display setup.
   const initialViewport=await page.evaluate(()=>({width:innerWidth,height:innerHeight}));
-  await page.setViewportSize({width:1264,height:775});
+  await page.setViewportSize({width:1920,height:1080});
   await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   // The last reply may already be visible above trailing status cards while
   // the preceding agent sits just outside the viewport. Align the first
@@ -843,6 +849,11 @@ async function main() {
   } catch(error) {
     if(running?.page) {
       await running.page.screenshot({path:path.join(coordination,"failure.png")}).catch(()=>{});
+      console.error("info  composer failure state: " + JSON.stringify(await running.page.evaluate(() => ({
+        status: document.getElementById("theBigChatSaidBack")?.textContent,
+        recovery: document.getElementById("theBigChatWorkRecovery")?.textContent,
+        permissions: document.getElementById("theBigChatPermissions")?.textContent,
+      })).catch(()=>({}))));
       await running.page.evaluate(() => ({
         goal: longGoal, goals: longGoals, watching: longGoalWatching,
         selectedAgent: theBigOne, chats: swarmChats.map(held => ({agent:held.agent,conversation:held.conversation,

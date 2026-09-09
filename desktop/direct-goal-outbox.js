@@ -114,7 +114,7 @@ function normalizedAttachment(raw, index) {
 function normalizedPayload(raw) {
   exactKeys(
     raw,
-    new Set(["project_id", "lead_id", "chat_id", "text", "attachments"]),
+    new Set(["project_id", "lead_id", "chat_id", "text", "attachments", "policy"]),
     "A direct-goal payload",
   );
   const projectId = boundedString(raw.project_id, "Project ID", 512);
@@ -142,8 +142,16 @@ function normalizedPayload(raw) {
       `Direct-goal attachments may contain at most ${MAX_ATTACHMENT_BYTES} decoded bytes.`,
     );
   }
+  const policy = {};
+  if (Object.hasOwn(raw, "policy")) {
+    exactKeys(raw.policy, new Set(["agent_access_mode"]), "Direct-goal permissions");
+    if (!["read_only", "ask", "full"].includes(raw.policy.agent_access_mode)) {
+      throw fail("NEXUS_OUTBOX_INVALID", "Direct-goal permissions must name a supported access mode.");
+    }
+    policy.policy = {agent_access_mode: raw.policy.agent_access_mode};
+  }
   return {
-    payload: {project_id: projectId, lead_id: leadId, chat_id: chatId, text, attachments},
+    payload: {project_id: projectId, lead_id: leadId, chat_id: chatId, text, attachments, ...policy},
     attachmentBytes,
   };
 }
@@ -156,6 +164,7 @@ function canonicalIntent(payload) {
     lead_id: payload.lead_id,
     text: payload.text,
     attachments: payload.attachments,
+    ...(Object.hasOwn(payload, "policy") ? {policy: payload.policy} : {}),
   };
 }
 
@@ -178,7 +187,7 @@ function admissionBytes(payload, requestId) {
     text: payload.text,
     objectives: [payload.text],
     success_criteria: null,
-    policy: null,
+    policy: payload.policy || null,
     attachments: payload.attachments,
   }), "utf8");
 }
