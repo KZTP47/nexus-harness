@@ -10979,6 +10979,9 @@ assert.equal(desktopDeletes, 2);
             script.index("function directLongGoalCanonicalValue"):
             script.index("async function directLongGoalIntent")
         ] + script[
+            script.index("function chatCollaborationPreference"):
+            script.index("function appendCollaborationControls")
+        ] + script[
             script.index("function chatComposerAccessPreference"):
             script.index("function fillChatComposerPermissions")
         ]

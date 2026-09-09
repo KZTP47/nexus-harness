@@ -607,7 +607,10 @@ class CodexCLIProvider(Provider):
     """Trusted-local Codex CLI boundary using Codex-owned ChatGPT authentication."""
 
     def _effective_dispatch_contract(self) -> str:
-        return "codex-cli/effective-dispatch/v3-native-workspace"
+        # Ordinary saved chats retain the strict-schema transport contract.
+        # Native tools are an explicit, separately versioned goal-workspace
+        # capability, not a change to the user's provider connection identity.
+        return "codex-cli/effective-dispatch/v2"
 
     def __init__(self, config):  # type: ignore[no-untyped-def]
         super().__init__(config)

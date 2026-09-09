@@ -30,10 +30,9 @@ def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
         # Bounded bridge for already-saved calls under this exact engine-owned
         # contract. It uses ephemeral cwd, ignores user config/rules, rejects
         # native tools, and enforces a read-only sandbox (codex_cli.py).
-        read_only_dispatch = binding.get("effective_dispatch_contract") == "codex-cli/effective-dispatch/v2" or (
-            binding.get("effective_dispatch_contract") == "codex-cli/effective-dispatch/v3-native-workspace"
-            and not document.get("agent_workspace_contract")
-        )
+        read_only_dispatch = binding.get("effective_dispatch_contract") in {
+            "codex-cli/effective-dispatch/v2", "codex-cli/effective-dispatch/v3-native-workspace",
+        } and not document.get("agent_workspace_contract")
         read_only = provider_only and binding.get("binding_schema_version") == 3 \
             and binding.get("transport_contract") == "codex-cli/isolated-exec/v1" \
             and read_only_dispatch

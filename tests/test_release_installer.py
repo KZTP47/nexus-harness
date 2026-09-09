@@ -1923,10 +1923,16 @@ $result | ConvertTo-Json -Compress
         subst = shutil.which("subst.exe")
         if not subst:
             self.skipTest("Windows subst.exe is unavailable")
+        import ctypes
+        # An offline mapped drive may report exists() == False while Windows
+        # still reserves its letter. Never replace or reuse that user's mapping.
+        occupied = ctypes.windll.kernel32.GetLogicalDrives()
+        self.assertNotEqual(occupied, 0, "Windows could not enumerate reserved drive letters")
         drive = next(
             (
                 f"{letter}:" for letter in reversed("PQRSTUVWXYZ")
-                if not Path(f"{letter}:\\").exists()
+                if not occupied & (1 << (ord(letter) - ord('A')))
+                and not Path(f"{letter}:\\").exists()
             ),
             "",
         )

@@ -380,7 +380,7 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
     for packaged_name in (
         "multi-vendor.e2e.js", "long-horizon.smoke.js", "team-chat.smoke.js",
         "goal-access.test.js", "goal-recovery.test.js", "provider-reconnect.test.js",
-        "chat-qol.test.js", "composer-permissions.test.js",
+        "chat-qol.test.js", "composer-permissions.test.js", "agent-workspaces.test.js",
     ):
         packaged_e2e = (ROOT / "desktop" / packaged_name).read_text(encoding="utf-8")
         pressed.update(re.findall(

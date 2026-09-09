@@ -171,7 +171,7 @@ class CodexCLIProviderTests(unittest.TestCase):
             response = provider.complete(request)
             captured = json.loads(record.read_text(encoding="utf-8"))
             self.assertEqual(json.loads(response.text), {"answer": "ok"})
-            self.assertEqual(Path(captured["cwd"]), candidate)
+            self.assertTrue(Path(captured["cwd"]).samefile(candidate))
             argv = captured["argv"]
             self.assertEqual(argv[argv.index("--sandbox") + 1], "danger-full-access")
             self.assertIn('approval_policy="on-request"', argv)
