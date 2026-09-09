@@ -57,6 +57,7 @@ from .verification_python import (
     stage_source_runtime,
 )
 from .playwright_runtime import (
+    LOCAL_STATIC_SERVER_SOURCE,
     discover_bundled_playwright_runtime,
     extract_safe_playwright_scenario,
     normalize_approved_https_base_url,
@@ -4153,71 +4154,34 @@ def _stage_node_runtime(source: Path, runtime_root: Path) -> Path:
 
 
 def _playwright_static_browser_scenario(source: str) -> dict[str, Any] | None:
-    """Compile the small, deterministic browser subset Nexus can prove itself.
+    from .playwright_scenarios import local_browser_scenario
 
-    Project test prose may ratify selectors and expected UI state, but it is
-    never executed as the oracle.  The engine replays only literal navigation,
-    fill/click actions, and one native DOM assertion in its own runner.  Tests
-    requiring a project-authored server, dynamic code, external URLs, or an
-    unsupported matcher remain honestly unverified.
-    """
-
-    if re.search(r"\b(?:eval|Function|child_process|exec|spawn|setContent)\b", source):
-        return None
-    navigation = re.search(
-        r"\bpage\s*\.\s*goto\s*\(\s*(['\"])(?P<route>.*?)\1\s*\)", source, re.S,
-    )
-    if navigation is None:
-        return None
-    route = navigation.group("route").strip()
-    if not route or "://" in route or "\\" in route or ".." in route.split("/"):
-        return None
-    route = "/" + route.lstrip("/")
-    action_pattern = re.compile(
-        r"page\s*\.\s*locator\s*\(\s*(['\"])(?P<selector>.*?)\1\s*\)\s*\.\s*"
-        r"(?P<action>fill|click)\s*\(\s*(?:(['\"])(?P<value>.*?)\4\s*)?\)",
-        re.S,
-    )
-    actions = [
-        {
-            "action": match.group("action"),
-            "selector": match.group("selector"),
-            **({"value": match.group("value")} if match.group("action") == "fill" else {}),
-        }
-        for match in action_pattern.finditer(source)
-    ]
-    assertion = re.search(
-        r"expect\s*\(\s*page\s*\.\s*locator\s*\(\s*(['\"])(?P<selector>.*?)\1\s*\)\s*\)"
-        r"\s*\.\s*toHave(?P<matcher>Text|Value|Attribute)\s*\(\s*"
-        r"(['\"])(?P<first>.*?)\4(?:\s*,\s*(['\"])(?P<second>.*?)\6)?\s*\)",
-        source, re.S,
-    )
-    if assertion is None:
-        return None
-    matcher = assertion.group("matcher").casefold()
-    expected: dict[str, Any] = {
-        "kind": {"text": "text", "value": "value", "attribute": "attribute"}[matcher],
-        "selector": assertion.group("selector"),
-    }
-    if matcher == "attribute":
-        if assertion.group("second") is None:
-            return None
-        expected.update({"attribute": assertion.group("first"), "value": assertion.group("second")})
-    else:
-        expected["value"] = assertion.group("first")
-    scenario = {
-        "schema_version": 1,
-        "route": route,
-        "actions": actions,
-        "expected": expected,
-    }
-    scenario["scenario_digest"] = hashlib.sha256(json.dumps(
-        scenario, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-    ).encode("utf-8")).hexdigest()
-    return scenario
+    return local_browser_scenario(source)
 
 
-def _approved_playwright_base_url(snapshot: Path, source: str) -> str | None:
+def _playwright_config_paths(snapshot: Path, command: list[str] | None = None) -> list[Path]:
+    args = _playwright_cli_args(command) if command else []
+    selected = None
+    for index, arg in enumerate(args):
+        if arg in ("--config", "-c") and index + 1 < len(args):
+            selected = args[index + 1]
+        elif arg.startswith(("--config=", "-c=")):
+            selected = arg.split("=", 1)[1]
+    root = snapshot
+    if selected is not None:
+        path = (snapshot / selected).resolve()
+        if not path.is_relative_to(snapshot.resolve()) or not path.exists():
+            raise ValueError("Selected Playwright config must exist inside the verification snapshot")
+        if path.is_file():
+            return [path]
+        root = path
+    return [root / name for name in (
+        "playwright.config.ts", "playwright.config.js", "playwright.config.mts",
+        "playwright.config.mjs", "playwright.config.cts", "playwright.config.cjs",
+    ) if (root / name).is_file()]
+
+
+def _approved_playwright_base_url(snapshot: Path, source: str, command: list[str] | None = None) -> str | None:
     """Read one literal HTTPS baseURL from the selected suite/config only."""
 
     candidates: list[str] = []
@@ -4225,11 +4189,7 @@ def _approved_playwright_base_url(snapshot: Path, source: str) -> str | None:
         r"\bbaseURL\s*:\s*(['\"])(?P<url>https://[^'\"\s]+)\1", re.I,
     )
     texts = [source]
-    for name in (
-        "playwright.config.ts", "playwright.config.js", "playwright.config.mts",
-        "playwright.config.mjs", "playwright.config.cts", "playwright.config.cjs",
-    ):
-        path = snapshot / name
+    for path in _playwright_config_paths(snapshot, command):
         try:
             if path.is_file():
                 texts.append(path.read_text(encoding="utf-8", errors="strict"))
@@ -4252,11 +4212,11 @@ def _approved_playwright_base_url(snapshot: Path, source: str) -> str | None:
 
 
 def _playwright_base_url_environment(
-    snapshot: Path, source: str, approved_base_url: str,
+    snapshot: Path, source: str, approved_base_url: str, command: list[str] | None = None,
 ) -> dict[str, str]:
     values: dict[str, str] = {}
     texts = [source]
-    for path in snapshot.glob("playwright.config.*"):
+    for path in _playwright_config_paths(snapshot, command):
         try:
             if path.is_file():
                 texts.append(path.read_text(encoding="utf-8", errors="strict"))
@@ -4307,23 +4267,18 @@ def _playwright_exact_origin_scenario(
     if parsed is None:
         return None
     steps: list[dict[str, Any]] = [{"op": "goto", "url": route}]
-    for action in parsed["actions"]:
+    for action in parsed["steps"]:
         step = {
             "op": action["action"],
             "target": {"kind": "locator", "selector": action["selector"]},
         }
         if action["action"] == "fill":
             step["value"] = action["value"]
+        elif action["action"] == "assert":
+            step.update({"condition": action["kind"], "expected": action["value"]})
+            if action["kind"] == "attribute":
+                step["name"] = action["attribute"]
         steps.append(step)
-    expected = parsed["expected"]
-    assertion = {
-        "op": "assert", "condition": expected["kind"],
-        "target": {"kind": "locator", "selector": expected["selector"]},
-        "expected": expected["value"],
-    }
-    if expected["kind"] == "attribute":
-        assertion["name"] = expected["attribute"]
-    steps.append(assertion)
     safe = {
         "base_url": approved_base_url,
         "steps": steps,
@@ -4341,14 +4296,35 @@ def _playwright_exact_origin_scenario(
 
 
 def _brokered_playwright_runner_source() -> str:
-    return r'''const fs=require('node:fs'),path=require('node:path'),http=require('node:http');
+    return r'''const fs=require('node:fs'),path=require('node:path');
 const {chromium}=require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT,'node_modules','playwright'));
+const {expect}=require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT,'node_modules','@playwright','test'));
 const scenario=JSON.parse(process.env.NEXUS_E2E_SCENARIO),root=path.resolve(process.env.NEXUS_VERIFICATION_ROOT),out=process.env.NEXUS_E2E_RESULT;
 const receipt={passed:false,scenarioDigest:scenario.scenario_digest,route:scenario.route,actions:[],externalWriteDenied:false,serverErrors:[]};
-function mime(file){if(file.endsWith('.html'))return'text/html; charset=utf-8';if(file.endsWith('.js'))return'text/javascript; charset=utf-8';if(file.endsWith('.css'))return'text/css; charset=utf-8';if(file.endsWith('.json'))return'application/json';return'application/octet-stream';}
-const server=http.createServer((req,res)=>{let file='';try{const pathname=new URL(req.url,'http://127.0.0.1').pathname;const rel=decodeURIComponent(pathname).replace(/^\/+/, '')||'index.html';file=path.resolve(root,rel);const prefix=root.endsWith(path.sep)?root:root+path.sep;if(file!==root&&!file.startsWith(prefix))throw new Error('escape');const data=fs.readFileSync(file);res.writeHead(200,{'content-type':mime(file)});res.end(data);}catch(error){receipt.serverErrors.push({url:String(req.url),file,error:String(error)});res.writeHead(404);res.end('not found');}});
-(async()=>{try{try{fs.writeFileSync(process.env.NEXUS_E2E_DENIED,'escape');}catch(error){receipt.externalWriteDenied=['EPERM','EACCES'].includes(error.code);}if(!receipt.externalWriteDenied)throw new Error('external write boundary was not enforced');await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});const address=server.address();const browser=await chromium.connectOverCDP(process.env.NEXUS_CDP_ENDPOINT);const context=browser.contexts()[0];if(!context)throw new Error('brokered browser context missing');const page=await context.newPage();page.setDefaultTimeout(5000);const response=await page.goto(`http://127.0.0.1:${address.port}${scenario.route}`);receipt.navigation={url:page.url(),status:response&&response.status()};for(const action of scenario.actions){const locator=page.locator(action.selector);if(action.action==='fill')await locator.fill(action.value);else if(action.action==='click')await locator.click();else throw new Error('unsupported action');receipt.actions.push({action:action.action,selector:action.selector});}const expected=scenario.expected,locator=page.locator(expected.selector);let observed;if(expected.kind==='text')observed=await locator.textContent();else if(expected.kind==='value')observed=await locator.inputValue();else observed=await locator.getAttribute(expected.attribute);receipt.observed=observed;receipt.observable={kind:expected.kind,selector:expected.selector,attribute:expected.attribute||'',expected:expected.value};receipt.passed=observed===expected.value;await page.close();}catch(error){receipt.error=String(error&&error.stack||error);}finally{if(typeof server.closeAllConnections==='function')server.closeAllConnections();server.close();fs.writeFileSync(out,JSON.stringify(receipt));process.exit(receipt.passed?0:3);}})();
-'''
+__LOCAL_STATIC_SERVER__
+const server=createLocalServer(root);
+(async()=>{try{try{fs.writeFileSync(process.env.NEXUS_E2E_DENIED,'escape');}catch(error){receipt.externalWriteDenied=['EPERM','EACCES'].includes(error.code);}if(!receipt.externalWriteDenied)throw new Error('external write boundary was not enforced');await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(0,'127.0.0.1',resolve);});const address=server.address();const browser=await chromium.connectOverCDP(process.env.NEXUS_CDP_ENDPOINT);const context=browser.contexts()[0];if(!context)throw new Error('brokered browser context missing');const page=await context.newPage();page.setDefaultTimeout(5000);const response=await page.goto(`http://127.0.0.1:${address.port}${scenario.route}`);receipt.navigation={url:page.url(),status:response&&response.status()};receipt.assertions=[];receipt.passed=true;
+for(const step of (scenario.steps||[...scenario.actions,{action:'assert',...scenario.expected}])){
+  const locator=page.locator(step.selector);
+  if(step.action==='fill')await locator.fill(step.value);
+  else if(step.action==='click')await locator.click();
+  else if(step.action==='assert'){
+    let observed;
+    try {
+      if(step.kind==='text'){await expect(locator).toHaveText(step.value);observed=await locator.textContent();}
+      else if(step.kind==='value'){await expect(locator).toHaveValue(step.value);observed=await locator.inputValue();}
+      else if(step.kind==='attribute'){await expect(locator).toHaveAttribute(step.attribute,step.value);observed=await locator.getAttribute(step.attribute);}
+      else if(step.kind==='count'){await expect(locator).toHaveCount(step.value);observed=await locator.count();}
+      else throw new Error('unsupported assertion');
+    } catch(error) {throw new Error('Assertion failed for '+step.selector+': '+String(error));}
+    receipt.observed=observed;
+    receipt.observable={kind:step.kind,selector:step.selector,attribute:step.attribute||'',expected:step.value};
+    receipt.assertions.push({...receipt.observable,observed,passed:true});
+  }else throw new Error('unsupported action');
+  if(step.action!=='assert')receipt.actions.push({action:step.action,selector:step.selector});
+}
+await page.close();}catch(error){receipt.passed=false;receipt.error=String(error&&error.stack||error);}finally{if(typeof server.closeAllConnections==='function')server.closeAllConnections();server.close();fs.writeFileSync(out,JSON.stringify(receipt));process.exit(receipt.passed?0:3);}})();
+'''.replace('__LOCAL_STATIC_SERVER__', LOCAL_STATIC_SERVER_SOURCE)
 
 
 def _run_brokered_playwright_scenario(
@@ -4430,26 +4406,46 @@ def _run_brokered_playwright_scenario(
     return {"passed": valid, "broker": payload, "receipt": receipt}
 
 
+def _playwright_cli_args(command: list[str]) -> list[str]:
+    if "test" in command:
+        return list(command[command.index("test"):])
+    # The engine resolves npm/npx commands to Node plus the pinned CLI.
+    return ["test", *command[2:]]
+
+
 def _playwright_spec_files(snapshot: Path, command: list[str]) -> list[Path]:
-    selected: list[Path] = []
-    for raw in command[1:]:
-        try:
-            candidate = Path(str(raw))
-            path = candidate if candidate.is_absolute() else snapshot / candidate
-            path = path.resolve()
-            if path.is_file() and path.is_relative_to(snapshot.resolve()) and re.search(
-                r"\.(?:spec|test)\.[cm]?[jt]sx?$", path.name, re.I,
-            ):
-                selected.append(path)
-        except (OSError, ValueError):
-            continue
-    if not selected:
-        selected = sorted(
-            path for path in snapshot.rglob("*")
-            if path.is_file() and re.search(r"\.(?:spec|test)\.[cm]?[jt]sx?$", path.name, re.I)
-            and ".nexus-verification" not in path.parts
-        )
-    return list(dict.fromkeys(selected))
+    ignored = {"node_modules", ".venv", "venv", "vendor", ".git", ".nexus-verification"}
+    selectors: list[str] = []
+    skip_value = False
+    booleans = {"--debug", "--headed", "--list", "--ui", "--update-snapshots", "-u",
+                "--fail-on-flaky-tests", "--forbid-only", "--fully-parallel", "--last-failed",
+                "--no-deps", "--pass-with-no-tests", "--quiet"}
+    for arg in _playwright_cli_args(command)[1:]:
+        if skip_value:
+            skip_value = False
+        elif arg.startswith("-"):
+            skip_value = "=" not in arg and arg not in booleans
+        else:
+            selectors.append(arg)
+    selected = []
+    for folder, directories, names in os.walk(snapshot):
+        directories[:] = sorted(name for name in directories if name not in ignored)
+        for name in sorted(names):
+            path = Path(folder) / name
+            if not re.search(r"\.(?:spec|test)\.[cm]?[jt]sx?$", name, re.I):
+                continue
+            relative = path.relative_to(snapshot).as_posix()
+            for selector in selectors or [""]:
+                normalized = selector.replace("\\", "/")
+                normalized = re.sub(r":\d+(?::\d+)?$", "", normalized)
+                try:
+                    matches = normalized in path.as_posix() or re.search(normalized, relative) is not None
+                except re.error:
+                    matches = normalized in path.as_posix()
+                if matches:
+                    selected.append(path)
+                    break
+    return selected
 
 
 def _run_brokered_playwright_specs(
@@ -4468,18 +4464,24 @@ def _run_brokered_playwright_specs(
         except (OSError, UnicodeError):
             continue
         sources.append((path, source))
-        approved = _approved_playwright_base_url(snapshot, source)
+        approved = _approved_playwright_base_url(snapshot, source, command)
         if approved is not None:
             approved_urls.append(approved)
             exact_environment.update(
-                _playwright_base_url_environment(snapshot, source, approved)
+                _playwright_base_url_environment(snapshot, source, approved, command)
             )
-    if sources and len(sources) == len(files) and approved_urls:
-        if len(set(approved_urls)) != 1 or len(approved_urls) != len(files):
+    ordinary_local = bool(sources) and not approved_urls and (
+        any(_playwright_static_browser_scenario(source) is None for _, source in sources)
+        or bool(_playwright_config_paths(snapshot, command))
+        or any(arg.startswith("-") for arg in _playwright_cli_args(command)[1:])
+        or any(re.search(r":\d+(?::\d+)?$", arg) for arg in _playwright_cli_args(command)[1:])
+    )
+    if sources and len(sources) == len(files) and (approved_urls or ordinary_local):
+        if approved_urls and (len(set(approved_urls)) != 1 or len(approved_urls) != len(files)):
             raise ValueError("Every selected exact-origin Playwright suite must share one approved baseURL")
         selected = [path.relative_to(snapshot).as_posix() for path, _source in sources]
         observation = run_brokered_playwright_suite(
-            snapshot, ["test", *selected], approved_urls[0],
+            snapshot, _playwright_cli_args(command), approved_urls[0] if approved_urls else None,
             environment=exact_environment, timeout=timeout, runtime=runtime,
         )
         receipt = {
@@ -4521,13 +4523,15 @@ def _run_brokered_playwright_specs(
             scenarios.append((path, scenario))
     if not scenarios or len(scenarios) != len(files):
         return {
-            "argv": list(command), "cwd": ".", "exit_code": -2,
+            "argv": list(command), "cwd": ".", "exit_code": 1,
             "stdout": "", "stderr": (
                 "Playwright verification needs an engine-provable relative route or exact literal HTTPS baseURL, "
-                "literal safe actions, and literal DOM assertions; project-authored worker code was not executed."
+                "literal safe actions, and literal DOM assertions; project-authored worker code was not executed. "
+                "Revise the selected test to supported syntax; this is a test compatibility failure, not a runtime outage."
             ),
             "timed_out": False, "output_truncated": False,
-            "containment_unavailable": True,
+            "containment_unavailable": False,
+            "verification_syntax_unsupported": True,
         }
     observations = []
     started = time.monotonic()
@@ -4550,7 +4554,7 @@ def _run_brokered_playwright_specs(
             return {
                 "argv": list(command), "cwd": ".", "exit_code": -2 if unavailable else 1,
                 "containment_unavailable": unavailable,
-                "stdout": "", "stderr": str(broker.get("error") or "Engine-owned Playwright browser scenario failed"),
+                "stdout": "", "stderr": str(broker.get("error") or (observation.get("receipt") or {}).get("error") or "Engine-owned Playwright browser scenario failed"),
                 "timed_out": False, "output_truncated": False,
                 "brokered_e2e_receipts": observations,
                 "containment_profile": "windows-appcontainer-job-v1",

@@ -175,7 +175,7 @@ test("full chat prioritizes visible replies, collapses setup, and retains keyboa
       for (const selector of ["#theBigChatWork", "#theBigChatCollaborate", ".the-big-chat-round-policy"]) document.querySelector(selector).hidden = true;
       const panel = document.querySelector("#theBigChatTeamGoal");
       panel.hidden = false;
-      panel.innerHTML = '<strong>Working together · running</strong><p class="hint">Send a message below to steer both agents.</p><button class="chat-goal-details">Advanced goal details</button>';
+      panel.innerHTML = '<details class="chat-team-goal-disclosure"><summary class="chat-team-goal-summary"><strong>Working together · running</strong></summary><div class="chat-team-goal-body"><p class="hint">Send a message below to steer both agents.</p><button class="chat-goal-details">Advanced goal details</button></div></details>';
       const list = document.querySelector("#theBigChatSaid");
       for (const [name, words] of [
         ["You", "Create a 3D arena game with keyboard controls and a restart button."],
@@ -203,6 +203,7 @@ test("full chat prioritizes visible replies, collapses setup, and retains keyboa
       });
       return {transcriptHeight: list.height, transcriptWidth: list.width, replies,
         setupOpen: document.querySelector("#theBigChatDestination").open,
+        teamPanelOpen: document.querySelector(".chat-team-goal-disclosure").open,
         historyVisible: getComputedStyle(document.querySelector(".the-big-chat-conversations")).display !== "none",
         limitsOpen: document.querySelector("#theBigChatLimits").open,
         composerVisible: box.top >= 0 && box.bottom <= innerHeight,
@@ -214,6 +215,7 @@ test("full chat prioritizes visible replies, collapses setup, and retains keyboa
     assert.ok(desktop.transcriptWidth >= 1000, JSON.stringify(desktop));
     assert.ok(desktop.replies.every((height) => height >= 30), JSON.stringify(desktop));
     assert.equal(desktop.setupOpen, false);
+    assert.equal(desktop.teamPanelOpen, false);
     assert.equal(desktop.historyVisible, false);
     assert.equal(desktop.limitsOpen, false);
     assert.equal(desktop.composerVisible, true);

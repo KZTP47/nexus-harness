@@ -153,6 +153,10 @@ def steps_in(job: str) -> list[str]:
 
 
 class WorkflowCoverageContractsTests(unittest.TestCase):
+    def test_desktop_browser_tests_run_after_the_exact_runtime_is_built(self):
+        desktop = jobs_in((WORKFLOWS / "checks.yml").read_text(encoding="utf-8"))["desktop"]
+        self.assertLess(desktop.index("npm run build -- --win dir"), desktop.index("run: npm test"))
+
     def load(self, filename: str) -> dict[str, str]:
         return jobs_in((WORKFLOWS / filename).read_text(encoding="utf-8"))
 

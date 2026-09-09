@@ -7812,23 +7812,64 @@ function appendGoalRecoveryControls(panel, goal, afterAction, binding) {
   card.append(status); panel.append(card);
 }
 
-function fillChatGoalPanel(panel, agentId, context) {
-  if (!panel) return;
+function fillChatGoalPanel(container, agentId, context) {
+  if (!container) return;
   const {goal, problem} = context;
-  panel.dataset.goalRevision = String(goal?.revision || "");
-  panel.hidden = !goal && !problem;
+  container.dataset.goalRevision = String(goal?.revision || "");
+  const currentBody = container.querySelector(".chat-team-goal-body");
+  if (currentBody) currentBody.dataset.goalRevision = container.dataset.goalRevision;
+  container.hidden = !goal && !problem;
   const pending = goal?.pending_interrupts || [];
+  const chatKey = swarmChatKey(agentId);
+  const storageKey = `nexus.chat-team-panel.v1:${JSON.stringify([chatKey, goal?.project?.id || ""])}`;
+  const terminal = ["complete", "cancelled", "cancelling"].includes(goal?.status);
+  const inputReason = context.reconnectChat ? "Reconnect this chat to continue."
+    : terminal ? ""
+    : pending.length || goal?.status === "waiting_for_user" ? "The team needs your answers before it can continue."
+    : goal?.command_request?.state === "pending" ? "Review the command request to continue."
+    : goal?.resume_recovery?.items?.length ? "Review the interrupted agent turn to continue." : "";
+  const inputKey = inputReason ? JSON.stringify([goal?.goal_id, inputReason, pending,
+    goal?.command_request, goal?.resume_recovery, context.reconnectChat]) : "";
   // Keep in-progress answers intact during the background status polls.
-  const signature = JSON.stringify([goal?.goal_id, goal?.status, problem, pending,
+  const signature = JSON.stringify([storageKey, goal?.goal_id, goal?.status, problem, pending,
     goal?.execution_workspace, goal?.workspace_publication, goal?.workspace_path, goal?.decision_reconsideration,
     goal?.agent_access, goal?.command_request, goal?.scheduler_live,
-    goal?.resume_recovery?.items?.length ? goal.resume_recovery : null]);
-  if (panel.dataset.snapshot === signature) return;
-  panel.dataset.snapshot = signature;
-  panel.replaceChildren();
-  if (panel.hidden) return;
-  panel.append(make("strong", "", problem ? "Team needs attention"
+    goal?.resume_recovery?.items?.length ? goal.resume_recovery : null, context.reconnectChat]);
+  if (container.dataset.snapshot === signature) return;
+  const sameChat = container.dataset.disclosureKey === storageKey;
+  const previousOpen = sameChat ? container.querySelector("details")?.open : undefined;
+  const newInput = Boolean(inputKey && (!sameChat || container.dataset.inputKey !== inputKey));
+  container.dataset.snapshot = signature;
+  container.dataset.disclosureKey = storageKey;
+  container.dataset.inputKey = inputKey;
+  container.replaceChildren();
+  if (container.hidden) return;
+  const disclosure = make("details", "chat-team-goal-disclosure");
+  let preferredOpen = sameChat && container.dataset.preferredOpen === "true";
+  try { preferredOpen = localStorage.getItem(storageKey) === "open"; } catch {}
+  disclosure.open = newInput || (inputReason && previousOpen !== undefined ? previousOpen : preferredOpen);
+  const summary = make("summary", "chat-team-goal-summary");
+  summary.append(make("strong", "", problem ? "Team needs attention"
     : `Working together · ${longHorizonStateWords(goal.status)}`));
+  summary.classList.toggle("needs-user-input", Boolean(inputReason));
+  if (inputReason) {
+    const needed = make("span", "chat-team-input-needed", "Input needed");
+    needed.setAttribute("role", "status");
+    summary.append(needed);
+    summary.title = inputReason;
+    summary.style.animationDelay = `-${Date.now() % 2400}ms`;
+  }
+  summary.addEventListener("click", () => {
+    // Native summary clicks (including keyboard activation) are user intent;
+    // programmatic auto-expansion must not overwrite their saved preference.
+    container.dataset.preferredOpen = String(!disclosure.open);
+    try { localStorage.setItem(storageKey, disclosure.open ? "closed" : "open"); } catch {}
+  });
+  const panel = make("div", "chat-team-goal-body");
+  panel.id = `${container.id || agentId}-body`;
+  panel.dataset.goalRevision = container.dataset.goalRevision;
+  disclosure.append(summary, panel);
+  container.append(disclosure);
   panel.append(make("p", "hint", problem || (pending.length
     ? "The team needs your answers before it can continue."
     : "Send a message below to steer both agents. Their replies and progress stay in this chat.")));
@@ -7864,6 +7905,7 @@ function fillChatGoalPanel(panel, agentId, context) {
     }
     panel.append(group);
   }
+  panel.append(details);
   const audience = goalAnswerAudience(panel);
   const status = make("p", "hint chat-goal-answer-status");
   const submit = make("button", "primary chat-goal-answer", "Send answers to the team");
@@ -7919,6 +7961,94 @@ function fillChatGoalPanel(panel, agentId, context) {
   accessControls();
 }
 
+function chatComposerAccessPreference(conversation, mode = null) {
+  const allowed = ["read_only", "ask", "full"];
+  if (!conversation?.id) return "ask";
+  const key = `nexus.chat-composer-access.v1:${conversation.id}`;
+  const binding = JSON.stringify(directLongGoalCanonicalValue({
+    contract: "chat-composer-access/v1", project: conversation.project,
+    binding: conversation.binding || {}, pair: conversation.pair || [],
+  }));
+  try {
+    if (allowed.includes(mode)) {
+      localStorage.setItem(key, JSON.stringify({schema_version: 1, binding, mode}));
+      return mode;
+    }
+    const saved = JSON.parse(localStorage.getItem(key) || "null");
+    if (saved?.schema_version === 1 && saved.binding === binding && allowed.includes(saved.mode)) return saved.mode;
+  } catch {}
+  return "ask";
+}
+
+function fillChatComposerPermissions(host, agentId, context) {
+  if (!host) return;
+  const conversation = activeConversationFor(agentId);
+  const goal = context.goal;
+  const active = goal && !["complete", "cancelled"].includes(goal.status);
+  const labels = {read_only: "Read only", ask: "Ask before commands", full: "Full project access"};
+  const mode = active ? goal.agent_access?.mode || "ask" : chatComposerAccessPreference(conversation);
+  const needsInput = active && goal.command_request?.state === "pending";
+  const signature = JSON.stringify([conversation?.id, conversation?.binding, conversation?.project,
+    goal?.goal_id, goal?.status, goal?.agent_access, goal?.command_request, goal?.scheduler_live,
+    goal?.tasks?.some(task => task.state === "running"), context.problem, mode]);
+  const body = host.querySelector(".chat-composer-permissions-body");
+  if (body) body.dataset.goalRevision = String(goal?.revision || "");
+  if (host.dataset.snapshot === signature) return;
+  const wasOpen = host.dataset.chatId === conversation?.id
+    && host.querySelector("[popover]")?.matches(":popover-open");
+  host.dataset.snapshot = signature; host.dataset.chatId = conversation?.id || "";
+  host.replaceChildren();
+  const button = make("button", "compact chat-composer-permissions-toggle",
+    `Permissions: ${labels[mode] || labels.ask}${needsInput ? " · Input needed" : ""} ▾`);
+  button.type = "button"; button.setAttribute("aria-haspopup", "dialog");
+  button.setAttribute("aria-expanded", "false");
+  button.disabled = !conversation || Boolean(context.problem);
+  button.title = context.problem || "Choose project permissions for this chat";
+  button.classList.toggle("needs-user-input", Boolean(needsInput));
+  const popup = make("div", "chat-composer-permissions-popup");
+  popup.id = `${host.id}-popup`; popup.setAttribute("popover", "auto");
+  popup.setAttribute("role", "dialog"); popup.setAttribute("aria-label", "Chat permissions");
+  button.setAttribute("aria-controls", popup.id);
+  const panel = make("div", "chat-composer-permissions-body");
+  panel.dataset.goalRevision = String(goal?.revision || "");
+  popup.append(make("strong", "", "Permissions for this chat"), panel);
+  if (active) {
+    const chatKey = swarmChatKey(agentId);
+    appendGoalAccessControls(panel, goal, async result => {
+      chatComposerAccessPreference(conversation, result.agent_access?.mode);
+      await refreshChatGoalAfterAction(agentId, result, chatKey);
+    }, chatGoalBinding(agentId, goal));
+  } else {
+    const label = make("label", "", "Access for the next project goal");
+    const select = make("select", "chat-access-mode");
+    select.setAttribute("aria-label", "Agent access for this chat");
+    for (const [value, text] of Object.entries(labels)) {
+      const option = make("option", "", text); option.value = value; select.append(option);
+    }
+    select.value = mode;
+    select.addEventListener("change", () => {
+      chatComposerAccessPreference(conversation, select.value);
+      host.dataset.snapshot = "";
+      fillChatComposerPermissions(host, agentId, chatLongGoalContext(agentId));
+    });
+    label.append(select);
+    panel.append(label, make("p", "hint", "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow edits and commands within Nexus workspace protections."),
+      make("p", "hint", "Saved for project work in this chat. Asking agents questions does not grant file-editing access."));
+  }
+  host.append(button, popup);
+  const position = () => {
+    const rect = button.getBoundingClientRect();
+    popup.style.left = `${Math.max(8, Math.min(rect.left, innerWidth - popup.offsetWidth - 8))}px`;
+    popup.style.top = `${Math.max(8, rect.top - popup.offsetHeight - 8)}px`;
+  };
+  popup.addEventListener("toggle", () => {
+    const open = popup.matches(":popover-open"); button.setAttribute("aria-expanded", String(open));
+    if (open) position();
+  });
+  button.addEventListener("click", () => { popup.togglePopover(); if (popup.matches(":popover-open")) position(); });
+  if (wasOpen) { popup.showPopover(); position(); }
+}
+
 function syncChatGoalControls(agentId, card = null) {
   const context = chatLongGoalContext(agentId);
   const {goal, problem} = context;
@@ -7927,6 +8057,7 @@ function syncChatGoalControls(agentId, card = null) {
   const inBig = !card && theBigOne === agentId;
   const find = (small, big) => card ? card.querySelector(small) : inBig ? $(big) : null;
   fillChatGoalPanel(find(".swarm-chat-team-goal", "theBigChatTeamGoal"), agentId, context);
+  fillChatComposerPermissions(find(".swarm-chat-composer-permissions", "theBigChatPermissions"), agentId, context);
   const send = find(".swarm-chat-send", "theBigChatSend");
   if (active && send) {
     send.textContent = "Send to team";
@@ -12708,6 +12839,87 @@ async function archiveConversationFor(agentId, chatId) {
   }
 }
 
+function requestChatName(current) {
+  return new Promise(resolve => {
+    const dialog = make("dialog", "chat-rename-dialog");
+    const form = make("form", ""); form.method = "dialog";
+    const label = make("label", "", "Chat name");
+    const input = make("input", ""); input.value = current; input.required = true; input.maxLength = 80;
+    label.append(input); form.append(label);
+    const save = make("button", "primary", "Rename"); save.type = "submit"; save.value = "save";
+    const cancel = make("button", "", "Cancel"); cancel.type = "button";
+    cancel.addEventListener("click", () => dialog.close());
+    form.append(save, cancel); dialog.append(form); document.body.append(dialog);
+    dialog.addEventListener("close", () => {const value = dialog.returnValue === "save" ? input.value.trim() : null; dialog.remove(); resolve(value);}, {once:true});
+    dialog.showModal(); input.focus(); input.select();
+  });
+}
+
+async function manageConversationFor(agentId, conversation, action) {
+  if (swarmConversationSwitching.has(agentId)) return;
+  const payload = {agent:agentId,chat:conversation.id};
+  if (action === "rename") {
+    const name = await requestChatName(conversation.name);
+    if (!name || name === conversation.name) return;
+    payload.name = name;
+  } else if (action === "pin") payload.pinned = !conversation.pinned;
+  else if (action === "purge" && !window.confirm(`Permanently delete ${conversation.name}?\n\nThis stops its work and removes its local chat, attachments and private working copies. Published project files remain. This cannot be undone.`)) return;
+  swarmConversationSwitching.add(agentId);
+  nextConversationListRevision(agentId); setWhatCanBePressedInSwarm();
+  try {
+    let said;
+    for (let attempt=0; attempt<60; attempt++) {
+      said = await request(`/api/swarm/chats/${action}`, {method:"POST",body:JSON.stringify(payload)});
+      if (!said.purge_pending) break;
+      sayInBigChatConversationFor(agentId, said.message);
+      await new Promise(resolve => window.setTimeout(resolve,1200));
+    }
+    if (said.purge_pending) throw new Error("This chat is still stopping. Retry Delete/Purge after its current work settles.");
+    applyConversationList(agentId, said);
+    if (action === "purge") {
+      keepWhatWasSaidTo(agentId, []);
+      if (activeConversationFor(agentId)) void refreshTheChatFor(agentId);
+    }
+    renderTheBigChat();
+  } catch (error) { sayInBigChatConversationFor(agentId,error.message); }
+  finally { finishConversationSwitch(agentId); }
+}
+
+let closeChatContextMenu = null;
+function showChatContextMenu(event, agentId, conversation, invoker) {
+  event.preventDefault(); event.stopPropagation(); closeChatContextMenu?.();
+  const menu = make("div", "chat-context-menu"); menu.setAttribute("role","menu");
+  const controller = new AbortController();
+  const dismiss = () => {controller.abort(); menu.remove(); closeChatContextMenu=null; invoker.focus?.();};
+  closeChatContextMenu = dismiss;
+  const choices = [
+    [conversation.archived_at ? "Restore" : "Archive", () => conversation.archived_at ? restoreConversationFor(agentId,conversation.id) : archiveConversationFor(agentId,conversation.id)],
+    ["Delete/Purge", () => manageConversationFor(agentId,conversation,"purge")],
+    ["Rename", () => manageConversationFor(agentId,conversation,"rename")],
+    [conversation.pinned ? "Unpin" : "Pin", () => manageConversationFor(agentId,conversation,"pin")],
+    ["Cancel", () => {}],
+  ];
+  for (const [label, action] of choices) {
+    const button = make("button", label === "Delete/Purge" ? "danger" : "", label);
+    button.type="button"; button.setAttribute("role","menuitem");
+    button.addEventListener("click", () => {dismiss(); void action();}); menu.append(button);
+  }
+  document.body.append(menu);
+  const anchor = invoker.getBoundingClientRect();
+  menu.style.left = `${Math.max(4,Math.min(event.clientX || anchor.left,innerWidth-menu.offsetWidth-4))}px`;
+  menu.style.top = `${Math.max(4,Math.min(event.clientY || anchor.bottom,innerHeight-menu.offsetHeight-4))}px`;
+  document.addEventListener("pointerdown", e => {if (!menu.contains(e.target)) dismiss();}, {capture:true,signal:controller.signal});
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape") {e.preventDefault(); dismiss();}
+    if (["ArrowDown","ArrowUp"].includes(e.key)) {
+      e.preventDefault(); const buttons=[...menu.querySelectorAll("button")];
+      const at=buttons.indexOf(document.activeElement), step=e.key === "ArrowDown" ? 1 : -1;
+      buttons[(at+step+buttons.length)%buttons.length].focus();
+    }
+  }, {signal:controller.signal});
+  menu.querySelector("button").focus();
+}
+
 async function restoreConversationFor(agentId, chatId) {
   const conversation = (swarmChats.find((one) => one.agent === agentId)?.conversations || [])
     .find((one) => one.id === chatId);
@@ -13775,14 +13987,55 @@ const chatPhaseNames = {
 
 function chatPhaseName(phase) { return chatPhaseNames[phase] || ""; }
 
+function chatDeliveryNotice(one) {
+  const evidence = one?.correlation;
+  if (evidence?.schema_version !== 1 || evidence.delivery_contract !== "selected-project-delivery/v1"
+      || evidence.delivery_state !== "working_copy_report"
+      || !["long_horizon_agent_event", "long_horizon_recovered_dialogue"].includes(evidence.kind)) return "";
+  return "Not delivered at this point. This agent reply describes work in the team's private copy. "
+    + "Use Nexus's delivery confirmation for the files available in your project."
+    + (evidence.delivery_project ? ` Destination: ${evidence.delivery_project}` : "");
+}
+
+function locationOpenButton(location) {
+  const button = make("button", "compact chat-location-open", "OPEN");
+  button.type = "button";
+  button.title = `Open folder or show file in its folder: ${location}`;
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      if (!window.harnessDesktop?.openLocation) throw new Error("Open this chat in the Nexus Harness desktop app to open folders.");
+      await window.harnessDesktop.openLocation(location);
+    } catch (error) { window.alert(error.message); }
+    finally { button.disabled = false; }
+  });
+  return button;
+}
+
+function appendChatDeliveryNotice(container, one) {
+  const notice = chatDeliveryNotice(one);
+  if (!notice) return;
+  const row = make("div", "chat-delivery-notice");
+  row.append(make("span", "", notice));
+  if (one.correlation.delivery_project) row.append(locationOpenButton(one.correlation.delivery_project));
+  container.append(row);
+}
+
 function normalizedLongHorizonCorrelation(one) {
   const raw = one?.correlation;
   if (!raw || typeof raw !== "object" || Number(raw.schema_version) !== 1
       || String(raw.kind || "") !== "long_horizon_status"
       || !String(raw.goal_id || "")) return null;
+  let deliveryLocations = [];
+  if (raw.delivery_contract === "selected-project-delivery/v1") {
+    try { const values = JSON.parse(raw.delivery_locations || "[]");
+      if (Array.isArray(values) && values.every(value => typeof value === "string")) deliveryLocations = values;
+    } catch {}
+  }
   return {
     goalId: String(raw.goal_id),
     status: String(raw.goal_status || "unknown"),
+    deliveryLocations,
   };
 }
 
@@ -13869,7 +14122,17 @@ function aChatGoalCompletionRow(text, at, correlation, className) {
   // that wording into a new verification claim in the completion heading.
   const record = make("details", "chat-turn-details chat-goal-completion-record");
   record.append(make("summary", "", "Saved status record"));
-  appendChatText(record, text);
+  // Delivery locations are actionable results, so expose the engine's full
+  // status by default when it includes its destination readback receipt.
+  record.open = String(text).includes("\nDelivery checked in: ");
+  for (const line of String(text).split("\n")) {
+    const location = line.startsWith("Delivery checked in: ") ? line.slice("Delivery checked in: ".length) : line;
+    const trusted = correlation.deliveryLocations?.includes(location);
+    if (trusted) {
+      const item = make("div", "chat-delivery-location");
+      item.append(make("span", "", line), locationOpenButton(location)); record.append(item);
+    } else appendChatText(record, line);
+  }
   if (at) record.append(make("p", "hint", at));
   row.append(record);
   return row;
@@ -14244,6 +14507,7 @@ function putTheChatTurnsIn(list, agent, said, scroll = true) {
     if (phase) heading.append(make("span", `chat-turn-phase phase-${one.phase}`, phase));
     row.append(heading);
     const text = make("div", "talk-turn-text");
+    appendChatDeliveryNotice(text, one);
     if (participantOutcome) {
       appendParticipantOutcome(text, participantOutcome, agent, latestUserPrompt, row);
     } else {
@@ -14432,7 +14696,8 @@ function directLongGoalCanonicalValue(value) {
   return value;
 }
 
-async function directLongGoalIntent(conversation, agentId, text, attachments) {
+async function directLongGoalIntent(conversation, agentId, text, attachments,
+  accessMode = chatComposerAccessPreference(conversation)) {
   const canonical = JSON.stringify(directLongGoalCanonicalValue({
     schema_version: 1,
     project_id: String(conversation?.project || ""),
@@ -14440,6 +14705,7 @@ async function directLongGoalIntent(conversation, agentId, text, attachments) {
     lead_id: String(agentId || ""),
     text: String(text || ""),
     attachments: attachments || [],
+    policy: {agent_access_mode: accessMode},
   }));
   if (globalThis.crypto?.subtle && globalThis.TextEncoder) {
     const digest = await globalThis.crypto.subtle.digest(
@@ -15088,8 +15354,9 @@ async function sendWhatIsTypedTo(agentId) {
           );
         }
       }
+      const accessMode = chatComposerAccessPreference(conversation);
       const directIntent = await directLongGoalIntent(
-        conversation, agentId, words, attachments,
+        conversation, agentId, words, attachments, accessMode,
       );
       const directRequestId = directLongGoalRequestId(
         durableRequest, directIntent, {
@@ -15104,6 +15371,7 @@ async function sendWhatIsTypedTo(agentId) {
         chat_id: conversation.id,
         text: words,
         attachments,
+        policy: {agent_access_mode: accessMode},
       };
       const preparedAdmission = await prepareDirectLongGoalAdmission(
         exactPayload, directRequestId, directIntent, directRequestKey,
@@ -17973,7 +18241,8 @@ function renderTheConversationSidebar(agentId) {
       agents.map((one) => one.name).join(" ↔ ") || "Direct agent chat"));
     group.append(heading);
     const items = make("div", "the-big-chat-conversation-items");
-    const chats = conversations.filter((one) => pairKey(one.pair || []) === pairKey(pair));
+    const chats = conversations.filter((one) => pairKey(one.pair || []) === pairKey(pair))
+      .sort((a,b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)));
     if (!chats.length) items.append(make(
       "p", "hint", swarmChatIsHydrating(agentId)
         ? "Loading saved chats…"
@@ -18009,8 +18278,13 @@ function renderTheConversationSidebar(agentId) {
             : project?.name || ((conversation.projects || []).length
               ? "No project selected" : "No project shared by this pair");
       pick.append(make("strong", "", conversation.name));
+      if (conversation.pinned) pick.append(make("span", "chat-pin-label", "Pinned"));
       pick.append(make("span", "", subtitle));
       pick.addEventListener("click", () => activateConversationFor(agentId, conversation.id));
+      row.addEventListener("contextmenu", event => showChatContextMenu(event,agentId,conversation,pick));
+      pick.addEventListener("keydown", event => {
+        if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) showChatContextMenu(event,agentId,conversation,pick);
+      });
       row.append(pick);
       const remove = make("button", archived ? "the-big-chat-conversation-delete"
         : "danger the-big-chat-conversation-delete", archived ? "Restore" : "Archive");
@@ -18227,6 +18501,8 @@ function renderTheBigChat() {
       structuredStateUnavailable: Boolean(one.structured_state_unavailable),
       participantOutcome: normalizedParticipantOutcome(one),
       longHorizonCorrelation: normalizedLongHorizonCorrelation(one),
+      deliveryNotice: chatDeliveryNotice(one),
+      deliveryCorrelation: one.correlation,
       originalPrompt: latestUserPrompt,
     });
   }
@@ -18297,6 +18573,7 @@ function renderTheBigChat() {
       const phase = chatPhaseName(one.phase);
       if (phase) heading.append(make("span", `chat-turn-phase phase-${one.phase}`, phase));
       what.append(heading);
+      if (one.deliveryNotice) appendChatDeliveryNotice(what, {correlation: one.deliveryCorrelation});
       if (one.participantOutcome) {
         appendParticipantOutcome(what, one.participantOutcome, agent, one.originalPrompt, row);
       } else {
@@ -19071,8 +19348,9 @@ async function sendFromTheBigChat(mode = "chat") {
           );
         }
       }
+      const accessMode = chatComposerAccessPreference(conversation);
       const directIntent = await directLongGoalIntent(
-        conversation, agentId, said, attachments,
+        conversation, agentId, said, attachments, accessMode,
       );
       const directRequestId = directLongGoalRequestId(
         durableRequest, directIntent, {
@@ -19087,6 +19365,7 @@ async function sendFromTheBigChat(mode = "chat") {
         text: said,
         chat_id: conversation.id,
         attachments,
+        policy: {agent_access_mode: accessMode},
       };
       const preparedAdmission = await prepareDirectLongGoalAdmission(
         exactPayload, directRequestId, directIntent, directRequestKey,

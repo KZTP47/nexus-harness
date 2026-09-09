@@ -271,6 +271,18 @@ def validate(document: dict[str, Any], runtime_root: Path, *, full: bool = False
         _manifest(project, independent=True)
 
 
+def published_file_manifest(document: dict[str, Any], runtime_root: Path) -> dict[str, str]:
+    """Recover verified file identities for a completed pre-delivery-receipt goal."""
+    _source, home, _project, state = _loaded(document, runtime_root)
+    publication = state.get("publication") or {}
+    if publication.get("state") != "published":
+        raise HarnessError("This goal has no authenticated publication receipt")
+    verified = _verify(_key(home), publication.get("receipt"))
+    if verified.get("descriptor") != state["descriptor"]:
+        raise HarnessError("Publication receipt belongs to another goal")
+    return {path: "file:" + value["sha256"] for path, value in verified["workspace"].items()}
+
+
 def root(document: dict[str, Any], runtime_root: Path) -> Path:
     if "execution_workspace" not in document:
         return _direct(Path(document["project"]["path"]))

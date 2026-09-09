@@ -4411,11 +4411,11 @@ os._exit(23)
             transaction_ids=[transaction_id],
         )
         # A Playwright-labelled Node unit assertion is not an E2E witness.
-        # Nexus must not launch project-authored workers or mint browser proof
-        # when there is no route/action/DOM scenario to replay itself.
-        self.assertEqual("unavailable", result["status"], result)
-        self.assertEqual("verification_containment_unavailable", result["basis"])
-        self.assertIn("engine-provable relative route", result["commands"][0]["stderr"])
+        # The ordinary contained suite may run, but a Node-only assertion
+        # cannot produce a browser navigation witness.
+        self.assertEqual("failed", result["status"], result)
+        self.assertTrue(result["commands"][0]["ordinary_suite_executed"])
+        self.assertFalse(result["commands"][0]["containment_unavailable"])
 
     def test_mainstream_causal_adapters_narrow_trusted_runner_commands(self) -> None:
         node = shutil.which("node") or "node"

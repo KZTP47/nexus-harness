@@ -158,6 +158,14 @@ else:
 
 
 class CodexCLIProviderTests(unittest.TestCase):
+    def test_transport_prompt_permits_schema_tools_without_native_cli_access(self):
+        for fallback in (False, True):
+            prompt = codex_cli._prompt(self.request(), fallback)
+            self.assertIn("tool_calls can request project reads, verification, and team communication", prompt)
+            self.assertIn("whenever the supplied schema supports them", prompt)
+            self.assertIn("Do not use the CLI's native filesystem, shell, or tools directly", prompt)
+            self.assertNotIn("Do not read project files or run commands", prompt)
+
     def test_stable_codex_hint_resolves_the_current_desktop_build_at_dispatch(self) -> None:
         provider = object.__new__(codex_cli.CodexCLIProvider)
         provider.settings = {"command": ["codex"]}

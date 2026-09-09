@@ -118,6 +118,11 @@ test("actual chat activity and decision controls fit wide and narrow windows and
         return {visible:text.top>=panel.top&&text.bottom<=panel.bottom,textBottom:text.bottom,panelBottom:panel.bottom};
       });
       assert.equal(firstOption.visible,true,JSON.stringify(firstOption));
+      const expandedHeight = await page.locator('#theBigChatTeamGoal').evaluate(one=>one.getBoundingClientRect().height);
+      await page.locator('#theBigChatTeamGoal summary').first().click();
+      const collapsedHeight = await page.locator('#theBigChatTeamGoal').evaluate(one=>one.getBoundingClientRect().height);
+      assert.ok(collapsedHeight < expandedHeight - 30, JSON.stringify({expandedHeight,collapsedHeight}));
+      await page.locator('#theBigChatTeamGoal summary').first().click();
       await page.screenshot({path:path.join(output,`${viewport.width}-decision.png`)});
       await page.locator('#theBigChatTeamGoal').evaluate(one=>{one.scrollTop=one.scrollHeight;});
       const answersVisible=await page.locator('#theBigChatTeamGoal .chat-goal-answer').evaluate(one=>{

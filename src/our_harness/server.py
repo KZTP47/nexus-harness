@@ -5040,6 +5040,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 "/api/swarm/chats/project",
                 "/api/swarm/chats/delete",
                 "/api/swarm/chats/restore",
+                "/api/swarm/chats/rename",
+                "/api/swarm/chats/pin",
+                "/api/swarm/chats/purge",
                 "/api/swarm/collaboration/reset",
             }:
                 agent_id = str(body.get("agent") or "")
@@ -5070,6 +5073,33 @@ class HarnessHandler(BaseHTTPRequestHandler):
                             self.server.config, standing["board"], agent_id,
                             chat_id, str(body.get("project") or ""),
                         )
+                elif self.path in {"/api/swarm/chats/rename", "/api/swarm/chats/pin", "/api/swarm/chats/purge"}:
+                    from . import chat_management
+                    chat_id = str(body.get("chat") or "")
+                    if self.path != "/api/swarm/chats/purge":
+                        # Display preferences do not interrupt or replace a turn.
+                        said = chat_management.update(self.server.config, standing["board"], agent_id, chat_id,
+                            action=self.path.rsplit("/", 1)[-1], name=body.get("name"), pinned=body.get("pinned"))
+                    else:
+                        with self.server.project_admission_lock:
+                            # Check ownership before stopping anything, including
+                            # when the selected chat has already been archived.
+                            choices = swarm_chats.list_for_agent(self.server.config, standing["board"], agent_id)
+                            if not any(row["id"] == chat_id for row in choices["chats"]):
+                                raise HarnessError("That chat does not belong to this agent pair.")
+                            runs = self.server.swarm_communication_runs
+                            for run in runs.active_runs():
+                                if (run.get("snapshot") or {}).get("chat_key") == chat_id:
+                                    runs.request_stop(run["run_id"])
+                            self.server.chat_cancellations.stop(chat_id)
+                            try:
+                                with runs.conversation_turn(f"chat-purge-{uuid.uuid4().hex}", chat_id, timeout=0.0):
+                                    said = chat_management.update(self.server.config, standing["board"], agent_id, chat_id,
+                                        action="purge", runtime=self.server.long_horizon, communication_runs=runs)
+                            except HarnessError as exc:
+                                if not str(exc).startswith("This chat is already working on another request"):
+                                    raise
+                                said = {"purge_pending": True, "message": "Stopping this chat's work before deletion…"}
                 elif self.path == "/api/swarm/chats/delete":
                     chat_id = str(body.get("chat") or "")
                     with self.server.swarm_communication_runs.conversation_turn(

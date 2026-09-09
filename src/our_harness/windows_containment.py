@@ -11,6 +11,8 @@ import time
 import threading
 import atexit
 import uuid
+import tempfile
+import struct
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,65 @@ _PROCESS_RUNTIME_PROFILE = "NexusHarness.Verify." + uuid.uuid4().hex[:20]
 _ACL_COMMAND_TIMEOUT_SECONDS = 15.0
 _REPARSE_SCAN_TIMEOUT_SECONDS = 10.0
 _REPARSE_SCAN_MAX_ENTRIES = 100_000
+VERIFICATION_RUNTIME_CONTRACT = "appcontainer-explicit-application-short-runtime-alias-native-handles/v3"
+
+
+def _create_runtime_junction(alias: Path, target: Path) -> None:
+    """Create a directory junction without interpreting paths as shell code."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID,
+                                      wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                      ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+    kernel.DeviceIoControl.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    native = str(target.resolve())
+    substitute = ("\\??\\UNC\\" + native[2:] if native.startswith("\\\\") else "\\??\\" + native).encode("utf-16-le")
+    display = native.encode("utf-16-le")
+    data = struct.pack("<HHHH", 0, len(substitute), len(substitute) + 2, len(display)) + substitute + b"\0\0" + display + b"\0\0"
+    raw = struct.pack("<IHH", 0xA0000003, len(data), 0) + data
+    alias.mkdir()
+    handle = kernel.CreateFileW(str(alias), 0x40000000, 0, None, 3, 0x02200000, None)
+    if handle == wintypes.HANDLE(-1).value:
+        error = _last_error("Could not open immutable runtime alias")
+        alias.rmdir()
+        raise error
+    try:
+        buffer = ctypes.create_string_buffer(raw)
+        returned = wintypes.DWORD()
+        if not kernel.DeviceIoControl(handle, 0x000900A4, buffer, len(raw), None, 0, ctypes.byref(returned), None):
+            raise _last_error("Could not create immutable runtime alias")
+    except BaseException:
+        kernel.CloseHandle(handle)
+        alias.rmdir()
+        raise
+    else:
+        kernel.CloseHandle(handle)
+
+
+def _application_name(argv: list[str]) -> str:
+    """Supply the module separately: NULL lpApplicationName imposes MAX_PATH.
+
+    Keep argv[0] unchanged for the child, including spaces and Unicode. The
+    extended Win32 spelling changes name resolution, not the token or its ACLs.
+    """
+    if not argv or not argv[0] or any("\0" in value for value in argv):
+        raise ValueError("Contained command requires an executable and NUL-free arguments")
+    command = subprocess.list2cmdline(argv)
+    if len(command.encode("utf-16-le")) // 2 >= 32767:
+        raise ValueError("Contained command exceeds the Windows 32767 UTF-16 command-line limit")
+    executable = argv[0]
+    if not os.path.isabs(executable):
+        raise ValueError("Contained executable must be an absolute engine-resolved path")
+    executable = os.path.abspath(executable)
+    if executable.startswith("\\\\?\\"):
+        return executable
+    if executable.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + executable[2:]
+    return "\\\\?\\" + executable
 
 
 def _bounded_command(command: list[str], *, text: bool = False) -> subprocess.CompletedProcess:
@@ -29,6 +90,7 @@ def _bounded_command(command: list[str], *, text: bool = False) -> subprocess.Co
 
     return subprocess.run(
         command, capture_output=True, text=text, check=False,
+        errors="replace" if text else None,
         timeout=_ACL_COMMAND_TIMEOUT_SECONDS,
     )
 
@@ -217,8 +279,18 @@ def _map_roots_to_private_drives(roots: tuple[Path, ...]) -> tuple[dict[str, str
     """Map authorized roots without granting metadata access to their parents."""
 
     kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
     mutex = kernel32.CreateMutexW(None, False, "Local\\NexusHarnessVerificationDriveMap")
     if not mutex or kernel32.WaitForSingleObject(mutex, 60_000) not in {0, 0x80}:
+        if mutex:
+            kernel32.CloseHandle(mutex)
         raise OSError("Could not acquire the contained drive-map lease")
     mappings: dict[str, str] = {}
     try:
@@ -259,6 +331,10 @@ def _map_roots_to_private_drives(roots: tuple[Path, ...]) -> tuple[dict[str, str
 
 
 def _unmap_private_drives(mappings: dict[str, str], mutex: int) -> None:
+    for name in ("ReleaseMutex", "CloseHandle"):
+        function = getattr(ctypes.windll.kernel32, name)
+        function.argtypes = [wintypes.HANDLE]
+        function.restype = wintypes.BOOL
     cleanup_errors: list[str] = []
     try:
         for drive in reversed(list(mappings.values())):
@@ -458,6 +534,41 @@ def run_appcontainer(
 
     if not appcontainer_available():
         raise OSError("Windows AppContainer APIs are unavailable")
+    _application_name(argv)
+    if len(argv[0].encode("utf-16-le")) // 2 >= 240:
+        executable = Path(argv[0]).resolve(strict=True)
+        if not any(executable.is_relative_to(root.resolve()) for root in read_execute_roots):
+            raise ValueError("Long executable aliases require immutable runtime authority")
+        # Chromium launches its own children with MAX_PATH-limited APIs. A
+        # junction provides a short module name without copying the runtime,
+        # depending on 8.3 names, or holding the global drive-map mutex while
+        # its Node/CDP peer starts. The target retains its immutable RX ACL.
+        with tempfile.TemporaryDirectory(prefix="nv-") as temporary:
+            alias = Path(temporary) / "runtime"
+            short_executable = alias / executable.name
+            if len(str(short_executable).encode("utf-16-le")) // 2 >= 240:
+                raise OSError("Windows temporary directory is too long for a native runtime alias")
+            _create_runtime_junction(alias, executable.parent)
+            try:
+                if getattr(alias.lstat(), "st_reparse_tag", 0) != 0xA0000003 or not short_executable.samefile(executable):
+                    raise OSError("Immutable runtime alias identity check failed")
+                result = run_appcontainer(
+                    snapshot, [str(short_executable), *argv[1:]], environment, timeout,
+                    reparse_probe=reparse_probe, persistent_profile=persistent_profile,
+                    read_execute_roots=read_execute_roots,
+                    transient_read_execute_roots=transient_read_execute_roots,
+                    capability_sids=capability_sids,
+                    grant_traverse_ancestors=grant_traverse_ancestors,
+                    map_authorized_roots=map_authorized_roots,
+                    nested_mapped_cwd=nested_mapped_cwd,
+                )
+                result["argv"] = list(argv)
+                result["runtime_launch_alias"] = True
+                return result
+            finally:
+                # Remove only the junction itself, never recursively walk its
+                # immutable target. The contained Job has already closed.
+                os.rmdir(alias)
     stdout_path = snapshot / ".nexus-verification" / "contained-stdout.txt"
     stderr_path = snapshot / ".nexus-verification" / "contained-stderr.txt"
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -604,6 +715,30 @@ def run_appcontainer(
             ("CapabilityCount", wintypes.DWORD), ("Reserved", wintypes.DWORD),
         ]
 
+    # ctypes otherwise assumes int returns and arguments, truncating HANDLEs
+    # on 64-bit Windows. Declare the launch/lifecycle boundary explicitly.
+    kernel32.CreateProcessW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.LPVOID, wintypes.LPVOID,
+        wintypes.BOOL, wintypes.DWORD, wintypes.LPVOID, wintypes.LPCWSTR,
+        ctypes.POINTER(STARTUPINFO), ctypes.POINTER(PROCESS_INFORMATION),
+    ]
+    kernel32.CreateProcessW.restype = wintypes.BOOL
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    for function, arguments, result_type in (
+        ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD], wintypes.BOOL),
+        ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+        ("ResumeThread", [wintypes.HANDLE], wintypes.DWORD),
+        ("WaitForSingleObject", [wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+        ("GetExitCodeProcess", [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        ("TerminateProcess", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
+        ("LocalFree", [wintypes.LPVOID], wintypes.LPVOID),
+    ):
+        native = getattr(kernel32, function)
+        native.argtypes, native.restype = arguments, result_type
+
     class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
         _fields_ = [
             ("PerProcessUserTimeLimit", ctypes.c_longlong),
@@ -642,6 +777,7 @@ def run_appcontainer(
     handles: list[Any] = []
     capability_allocations: list[wintypes.LPVOID] = []
     attr_buffer = None
+    attr_initialized = False
     started = time.monotonic()
     timed_out = False
     try:
@@ -669,6 +805,7 @@ def run_appcontainer(
         attr_list = ctypes.cast(attr_buffer, wintypes.LPVOID)
         if not kernel32.InitializeProcThreadAttributeList(attr_list, 1, 0, ctypes.byref(size)):
             raise _last_error("InitializeProcThreadAttributeList failed")
+        attr_initialized = True
         class SID_AND_ATTRIBUTES(ctypes.Structure):
             _fields_ = [("Sid", wintypes.LPVOID), ("Attributes", wintypes.DWORD)]
         capability_array = None
@@ -709,7 +846,7 @@ def run_appcontainer(
         )
         flags = 0x00080000 | 0x00000400 | 0x08000000 | 0x00000004
         if not kernel32.CreateProcessW(
-            None, command_line, None, None, True, flags,
+            _application_name(effective_argv), command_line, None, None, True, flags,
             environment_block, effective_cwd, ctypes.byref(startup.StartupInfo), ctypes.byref(process),
         ):
             raise _last_error("CreateProcessW AppContainer launch failed")
@@ -726,14 +863,18 @@ def run_appcontainer(
         if not configured or not kernel32.AssignProcessToJobObject(job, process.hProcess):
             kernel32.TerminateProcess(process.hProcess, 255)
             raise _last_error("Could not configure and assign contained process to its no-breakaway Job")
-        kernel32.ResumeThread(process.hThread)
+        if kernel32.ResumeThread(process.hThread) == 0xffffffff:
+            raise _last_error("Could not resume contained process")
         wait = kernel32.WaitForSingleObject(process.hProcess, max(1, int(timeout * 1000)))
+        if wait == 0xffffffff:
+            raise _last_error("Could not wait for contained process")
         if wait == 0x00000102:
             timed_out = True
             kernel32.TerminateJobObject(job, 124)
             kernel32.WaitForSingleObject(process.hProcess, 5000)
         exit_code = wintypes.DWORD(255)
-        kernel32.GetExitCodeProcess(process.hProcess, ctypes.byref(exit_code))
+        if not kernel32.GetExitCodeProcess(process.hProcess, ctypes.byref(exit_code)):
+            raise _last_error("Could not read contained process exit code")
     finally:
         for stream in handles:
             try:
@@ -743,7 +884,7 @@ def run_appcontainer(
         for handle in (process.hThread, process.hProcess, job):
             if handle:
                 kernel32.CloseHandle(handle)
-        if attr_buffer is not None:
+        if attr_initialized:
             try:
                 kernel32.DeleteProcThreadAttributeList(ctypes.cast(attr_buffer, wintypes.LPVOID))
             except Exception:

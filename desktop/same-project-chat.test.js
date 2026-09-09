@@ -15,7 +15,13 @@ function section(start, end) {
 }
 function node(tag, className = "", words = "") {
   return {
-    tag, className, words, children: [], dataset: {}, replacements: 0,
+    tag, className, words, children: [], dataset: {}, style: {}, replacements: 0,
+    classList: {toggle() {}}, setAttribute() {},
+    querySelector(selector) {
+      const nodes = this.children.flatMap(one => [one, ...(one.descendants?.() || [])]);
+      return nodes.find(one => selector.startsWith('.') ? one.className.split(' ').includes(selector.slice(1)) : one.tag === selector) || null;
+    },
+    descendants() { return this.children.flatMap(one => [one, ...(one.descendants?.() || [])]); },
     append(...children) { this.children.push(...children); },
     replaceChildren() { this.children = []; this.replacements += 1; },
     addEventListener() {},

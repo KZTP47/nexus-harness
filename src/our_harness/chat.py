@@ -1310,6 +1310,10 @@ _CORRELATION_TEXT_LIMITS = {
     "outcome": 40,
     "source_dialogue_id": 160,
     "task_id": 160,
+    "delivery_contract": 80,
+    "delivery_state": 80,
+    "delivery_project": 32768,
+    "delivery_locations": 1500000,
 }
 
 
@@ -2906,7 +2910,19 @@ def _long_horizon_status_text(goal: dict[str, Any]) -> str:
     if status == "cancelled":
         return f"Durable goal {short_id} was cancelled. It was not reported as complete."
     if status == "complete":
-        return f"Durable goal {short_id} is verified complete. Mission control has its authenticated evidence."
+        if goal.get("delivery_problem"):
+            return f"Durable goal {short_id} was previously marked complete. " + str(goal["delivery_problem"])
+        receipt = goal.get("delivery_receipt") or {}
+        text = f"Durable goal {short_id} is verified complete. Mission control has its authenticated evidence."
+        if receipt.get("contract") == "selected-project-delivery/v1" and receipt.get("state") == "delivered":
+            from pathlib import Path
+            text += "\nDelivery checked in: " + str(receipt["project_path"])
+            paths = [str(Path(receipt["project_path"]) / one["path"]) for one in receipt.get("files", [])]
+            if paths:
+                text += "\nFiles read back from your project:\n" + "\n".join(paths[:40])
+                if len(paths) > 40:
+                    text += f"\n{len(paths) - 40} more files are listed in the goal's delivery receipt."
+        return text
     return f"Durable goal {short_id} has status “{status}”. Open Mission control for its exact state."
 
 
@@ -3020,6 +3036,27 @@ def keep_long_horizon_status(
                         "The same durable goal revision was presented with two different "
                         "statuses. Nexus preserved the newer transcript projection and stopped."
                     )
+                # Additive delivery evidence can be recovered from an older
+                # authenticated publication without changing its goal revision.
+                fresh_delivery = bool(goal.get("delivery_receipt") or goal.get("delivery_problem"))
+                refreshed = CredentialRedactor(config).text(_long_horizon_status_text(goal))
+                from .goal_delivery import status_metadata
+                delivery_metadata = status_metadata(goal)
+                if status == "complete" and fresh_delivery and latest_status_turn and (
+                    latest_status_turn.text != refreshed or any(latest_status_turn.correlation.get(key) != value for key, value in delivery_metadata.items())
+                ):
+                    import copy
+                    event_id = latest_status_turn.correlation.get("event_id")
+                    def refresh_delivery(current):
+                        updated = copy.deepcopy(current)
+                        for row in updated:
+                            if row.correlation.get("event_id") == event_id:
+                                row.text = refreshed
+                                row.correlation.update(delivery_metadata)
+                        return updated
+                    _keep_it(config, route, [], filed_as, replace_projection=True, transform_projection=refresh_delivery)
+                    turns[:] = read_it(config, route, filed_as)
+                    latest_status_turn = next(one for one in turns if one.correlation.get("event_id") == event_id)
                 return unchanged()
         if latest_status_turn and latest_status_turn.correlation.get("goal_status") in {
             "complete", "cancelled",
@@ -3033,7 +3070,7 @@ def keep_long_horizon_status(
         same_status = bool(
             latest_status_turn
             and latest_status_turn.correlation.get("goal_status") == status
-            and (status != "paused" or latest_status_turn.text == status_text)
+            and (status not in {"paused", "complete"} or latest_status_turn.text == status_text)
         )
         if same_status and not has_revision:
             return unchanged()
@@ -3054,6 +3091,8 @@ def keep_long_horizon_status(
         }
         if has_revision:
             correlation["goal_revision"] = revision
+        from .goal_delivery import status_metadata
+        correlation.update(status_metadata(goal))
         if goal.get("event_seq") is not None:
             correlation["goal_status_event_cursor"] = int(goal["event_seq"])
         if bound_intent:
@@ -3309,6 +3348,8 @@ def keep_long_horizon_events(
                     ))
                 continue
             if kind == "provider_acknowledged":
+                from .goal_delivery import report_metadata
+                correlation.update(report_metadata(goal))
                 summary = redactor.text(str(payload.get("summary") or "")).strip()
                 if not summary:
                     continue

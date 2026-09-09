@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import re
 import json
+import copy
 from datetime import datetime, timezone
 from typing import Any
 
 from . import chat
 from .config import LoadedConfig
 from .goal_chat_progress import tool_outcome
+from .goal_delivery import report_metadata
 from .redaction import CredentialRedactor
 
 
@@ -215,7 +217,7 @@ def keep_page(
         legacy_by_ordinal = dict(enumerate(legacy_turns, 1)) if legacy_count \
             and len(legacy_turns) == len(legacy_ids) == len(set(legacy_positions)) == legacy_count \
             and legacy_positions == sorted(legacy_positions) else {}
-        saved = list(turns)
+        saved = copy.deepcopy(turns)
         accepted = prior
         seen_sequences: set[int] = set()
         for message in raw_messages:
@@ -277,6 +279,8 @@ def keep_page(
                     "source_goal_event_type": str(message.get("source_goal_event_type")
                                                   or ("provider_acknowledged" if agent_id else "goal_steered")),
                 })
+            if agent_id:
+                correlation.update(report_metadata(goal))
             timestamp = _timestamp(message.get("at_ms"))
             row = chat.Said(
                 "them" if agent_id else "you", chat._checked_answer(redactor.text(words), "Archived message"),
@@ -352,6 +356,16 @@ def keep_page(
                                  "request_id": request_id, "chat_id": conversation_id,
                                  "project_id": selected_project, "lead_id": selected_lead},
                 ))
+        # Upgrade previously displayed replies even when the archive cursor is
+        # already current. Keep the original agent words and identity intact.
+        # Completion now does not make an earlier working-copy claim true.
+        delivery = report_metadata(goal)
+        if delivery:
+            for row in saved:
+                if row.correlation.get("goal_id") == goal_id and row.correlation.get("kind") in {
+                    "long_horizon_agent_event", "long_horizon_recovered_dialogue",
+                }:
+                    row.correlation.update(delivery)
         projection_result.update({"projected_dialogue_cursor": accepted, "binding_missing": False})
         return _project_tools(saved, goal, agents, {
             "schema_version": 1, "goal_id": goal_id, "request_id": request_id,

@@ -31,6 +31,7 @@ contextBridge.exposeInMainWorld("harnessDesktop", {
   trustProject: () => ipcRenderer.invoke("harness:trustProject"),
   showProjectFile: (relativePath) => ipcRenderer.invoke(
     "harness:showProjectFile", String(relativePath || "")),
+  openLocation: (location) => ipcRenderer.invoke("harness:openLocation", String(location || "")),
   saveJsonFile: (suggestedName, contents) => ipcRenderer.invoke(
     "harness:saveJsonFile", String(suggestedName || "nexus-export.json"),
     String(contents || "")),

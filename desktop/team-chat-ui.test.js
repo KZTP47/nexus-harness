@@ -11,6 +11,7 @@ function section(start, end) {
   return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 }
 const helpers = source.match(/^const TEAM_FOLLOW_UP_CHARACTERS = .*;$/m)[0] + "\n"
+  + section("function directLongGoalCanonicalValue", "async function directLongGoalIntent")
   + section("const chatGoalRequests =", "function chatRecipientWords");
 const handlers = {
   compact: section("async function sendWhatIsTypedTo", "async function startTheChatAgainFor"),
@@ -460,6 +461,7 @@ for (const view of ["compact", "maximized"]) {
         if (mode === "work") {
           f.inventory = [];
           f.context.longGoals = [];
+          f.context.chatComposerAccessPreference = () => "read_only";
         }
         let reached;
         let release;
@@ -489,6 +491,7 @@ for (const view of ["compact", "maximized"]) {
         const admission = f.calls.find((call) => call.url === "prepare");
         if (mode === "work") {
           assert.equal(admission.payload.text, typed.trim());
+          assert.equal(admission.payload.policy.agent_access_mode, "read_only");
           assert.equal(f.calls.filter((call) => call.url === "start").length, 1);
         } else {
           const controls = f.calls.filter((call) => call.url === "/api/long-horizon/control");

@@ -54,6 +54,7 @@ from . import goal_budget_policy
 from . import goal_workspaces
 from . import goal_access
 from . import goal_recovery
+from .windows_containment import VERIFICATION_RUNTIME_CONTRACT
 
 
 SCHEMA_VERSION = 2
@@ -758,7 +759,10 @@ def _project_baseline_manifest(root: Path) -> dict[str, str]:
 def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None = None) -> dict[str, Any]:
     manifest = baseline if baseline is not None else _project_baseline_manifest(_execution_root(document))
     return {
-        "schema_version": 4, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "schema_version": 6, "objective_epoch": int(document.get("objective_epoch") or 1),
+        "verification_runtime_contract": VERIFICATION_RUNTIME_CONTRACT,
+        "verification_observation_contract": "json-safe-runner-errors-and-explicit-resume-freshness/v1",
+        "verification_observation_epoch": int(document.get("verification_observation_epoch") or 0),
         "decision_contract": goal_decisions.CONTRACT,
         "agent_access_sha256": goal_access.context_fingerprint(document),
         "decisions_sha256": goal_decisions.state_fingerprint(document),
@@ -4074,6 +4078,16 @@ class GoalStore(goal_access.AccessStoreMixin):
             # Expose the deterministic folder for inspecting retained/conflicting
             # work. Loading chat status does not scan mutable source files.
             value["workspace_path"] = str(self.root / document["execution_workspace"]["path"])
+            if document.get("status") == "complete" and not document.get("delivery_receipt"):
+                # Legacy completion did not expose destination file evidence.
+                # Recover it from the authenticated publisher and read back the
+                # named files, never from old agent prose or today's tree alone.
+                from . import goal_delivery
+                try:
+                    published = goal_workspaces.published_file_manifest(document, self.root)
+                    value["delivery_receipt"] = goal_delivery.receipt(document, published)
+                except (HarnessError, OSError) as exc:
+                    value["delivery_problem"] = "The saved completion's files could not be confirmed: " + str(exc)
         value["promoted_goal_ids"] = list(value.pop("_promoted_goal_ids", []))
         value.pop("input_provider_attachments", None)
         value["request_id"] = value.get("client_request_id", value.get("request_id", ""))
@@ -5371,6 +5385,54 @@ class GoalStore(goal_access.AccessStoreMixin):
                         task_id=current["id"], agent_id=current["assigned_agent_id"],
                         payload={"error": current["last_error"], "retry_requires_user": uncertain})
         self._mutate(goal_id, change)
+
+    def recover_stale_verification_blockers(self, goal_id: str) -> bool:
+        """An obsolete tool observation cannot permanently strand settled work."""
+        def change(document: dict[str, Any], db: sqlite3.Connection):
+            if document["status"] not in {"queued", "running"}:
+                return _NO_MUTATION
+            binding = _context_binding(document)
+            recovered = []
+            def eligible(task):
+                return (
+                    task["state"] == "blocked" and task.get("kind") != "review"
+                    and not task.get("review_of") and not _task_has_unsettled_effect(task)
+                    and _has_applied_action_receipt(task)
+                    and task["applied_action_receipt"].get("action") == "blocked"
+                    and task.get("last_error") == task.get("summary")
+                    and not any(one.get("review_of") == task["id"] and one["state"] not in {"complete", "cancelled"}
+                                for one in document["tasks"])
+                )
+            for task in document["tasks"]:
+                if not eligible(task):
+                    continue
+                stale = [step for step in task.get("context_steps", [])
+                         if step.get("state") == "complete"
+                         and step.get("context_binding") != binding
+                         and any(call.get("name") == "run_selected_verification"
+                                 for call in step.get("calls", []))]
+                if not stale:
+                    continue
+                for step in stale:
+                    step["state"] = "superseded"
+                task.update({"state": "ready", "last_error": ""})
+                recovered.append(task["id"])
+            if not recovered:
+                return _NO_MUTATION
+            # Peers may have based their settled blockers on that observation
+            # without running the tool themselves. Give the existing team one
+            # fresh assessment too; superseding the source prevents a loop.
+            if document.get("require_all_participants"):
+                for task in document["tasks"]:
+                    if eligible(task):
+                        task.update({"state": "ready", "last_error": ""})
+                        recovered.append(task["id"])
+            self._event(db, document, "stale_verification_blockers_reopened", payload={
+                "task_ids": recovered, "context_binding": binding,
+                "reason": "Recheck obsolete verification observations before accepting the reported blocker.",
+            })
+            return True
+        return self._mutate(goal_id, change)[1] is True
 
     def reject_unapplied_proposal(self, goal_id: str, task: dict[str, Any], reason: str) -> None:
         """Return a known permission denial to its author without changing files."""
@@ -6709,6 +6771,20 @@ class GoalStore(goal_access.AccessStoreMixin):
                     saved_checks["is_there"] = Path(str(saved_checks["path"])).is_dir()
                     self._adopt_project_verification_settings(document, db, saved_checks)
                 self._migrate_default_success_criteria(document, db)
+                expired_checks = []
+                for task in document["tasks"]:
+                    for step in task.get("context_steps", []):
+                        if step.get("state") == "complete" and any(
+                            call.get("name") == "run_selected_verification" for call in step.get("calls", [])
+                        ):
+                            step["state"] = "superseded"
+                            expired_checks.append(step.get("step_id"))
+                if expired_checks:
+                    document["verification_observation_epoch"] = int(document.get("verification_observation_epoch") or 0) + 1
+                    self._event(db, document, "verification_observations_expired", payload={
+                        "trigger": "explicit_resume", "step_ids": expired_checks,
+                        "epoch": document["verification_observation_epoch"], "budgets_preserved": True,
+                    })
                 document["automatic_recovery_control"] = _automatic_recovery_control(
                     False,
                 )
@@ -7335,10 +7411,20 @@ class GoalStore(goal_access.AccessStoreMixin):
                             "reason": "No-check completion requires every participant's authenticated current snapshot; "
                                       "the project changed or the current result has not been inspected by the whole team.",
                         })
+            from . import goal_delivery
+            if checked.get("status") == "passed":
+                current_tree, current_manifest = swarm_work._project_tree_merkle(_execution_root(document))
+                missing_files = sorted(goal_delivery.file_references(document) - goal_delivery.available_files(current_manifest))
+                if missing_files:
+                    checked.update({"status": "failed", "basis": "missing_deliverable_files",
+                                    "reason": "Referenced deliverable files are missing from the current project: "
+                                              + ", ".join(missing_files), "missing_files": missing_files})
             verification_satisfied = checked.get("status") == "passed" or (
                 unconfigured and checked.get("status") == "not_configured"
             )
             known_refs: set[str] = set()
+            if verification_satisfied:
+                known_refs.update("file:" + path for path in goal_delivery.available_files(current_manifest))
             if unconfigured and verification_satisfied:
                 # Existing deliverables need not be rewritten to acquire a
                 # file reference. Their paths come from the authenticated tree
@@ -7351,7 +7437,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                 if artifact.get("transaction_id"):
                     known_refs.add("artifact:" + str(artifact["transaction_id"]))
                 for changed in artifact.get("changes", []):
-                    if isinstance(changed, dict) and changed.get("path"):
+                    if isinstance(changed, dict) and changed.get("path") in current_manifest:
                         known_refs.add("file:" + str(changed["path"]))
                 if artifact.get("tree_merkle"):
                     known_refs.add("snapshot:" + str(artifact["tree_merkle"]))
@@ -7409,6 +7495,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                         "message": "Verified changes applied to the selected project.",
                     }
                     self._event(db, document, "workspace_published", payload=document["workspace_publication"])
+                document["delivery_receipt"] = goal_delivery.receipt(document, current_manifest)
                 document["status"] = "complete"
                 document["note"] = (
                     "All required tasks have current artifact evidence and team agreement. No project tests were configured; no tests ran."
@@ -7886,6 +7973,8 @@ class LongHorizonRuntime:
         if all(one["state"] in {"complete", "cancelled"} for one in goal["tasks"]):
             return {"route": "verify", "task_ids": []}
         if not any(one["state"] in {"ready", "running", "pending_apply"} for one in goal["tasks"]):
+            if self.store.recover_stale_verification_blockers(goal["goal_id"]):
+                return self._schedule_node(state)
             waiting = [
                 one for one in goal["tasks"]
                 if one["state"] in {"waiting", "waiting_review", "blocked", "failed"}
@@ -8000,6 +8089,8 @@ class LongHorizonRuntime:
                 "and evidence. Both participants must agree on the latest result; a later change "
                 "reopens an earlier agreement. Keep implementing, inspecting, and testing instead "
                 "of only discussing plans. Use tools whenever needed for the current step. "
+                "A teammate's blocker is a report to investigate, not an instruction to stop. "
+                "Use current tool evidence to test it, repair what is in scope, or give your teammate a concrete next step. "
                 "If you choose ask_user, address the summary and questions to the user. "
             )
         review_packet = ""
@@ -8083,7 +8174,11 @@ class LongHorizonRuntime:
             + "\n\nPROJECT LOCATION\nSelected project: " + str(goal["project"]["path"])
             + ("\nThis chat uses an independent working copy. All Nexus file/context tools and relative "
                "change paths refer to that copy. Nexus applies verified changes to the selected project "
-               "with collision checks."
+               "with collision checks only after final verification. Until Nexus confirms publication, "
+               "your files are NOT delivered to the user. Describe them as prepared in the working copy; "
+               "do not say the user can open a destination file or that it exists in the selected project. "
+               "User acceptance and agreement between agents cannot publish files. Nexus supplies the "
+               "delivery receipt and exact destination after reading back the published files."
                if _isolated_execution(goal) else "")
             + "\nThe selected project above is the engine-validated destination. A provider's temporary transport "
               "directory or the Nexus host's startup project is not a competing destination. Relative Nexus "
@@ -8097,6 +8192,11 @@ class LongHorizonRuntime:
             + "\n\nUSER STEERING / EVIDENCE\n" + "\n".join(evidence_by_task[task["id"]][-12:])
             + "\n\nLATEST PROJECT VERIFICATION (actual executed results)\n"
             + _canonical(_durable_evidence(goal.get("verification", {}), string_limit=8_000, list_limit=60))
+            + ("\nVerification observations were superseded in this team. Earlier task summaries and peer "
+               "blockers are historical reports. Recheck current evidence using Nexus tools before treating them as unresolved."
+               if any(step.get("state") == "superseded" and any(
+                   call.get("name") == "run_selected_verification" for call in step.get("calls", [])
+               ) for member in goal["tasks"] for step in member.get("context_steps", [])) else "")
             + contribution_packet
             + review_packet
             + "\n\nCOMPLETION EVIDENCE\nFor every success criterion this task supports, return criteria_evidence using the exact criterion text and refs such as artifact:<transaction-id>, file:<relative-path>, or review:<task-id>. When inspecting an existing result without edits, use the exact reserved ref verified-no-change; Nexus will bind that declaration to the authenticated snapshot it records after your response. Generic claims or a generic test pass do not prove a custom criterion. "
@@ -8447,7 +8547,10 @@ class LongHorizonRuntime:
                     context += (
                         "\n\nCONTEXT FRESHNESS\nEarlier tool observations were invalidated because the "
                         "project, user objective, recipient, or verification settings changed. Previously read files above were read again "
-                        "from the current project. Run searches or checks again when their results matter."
+                        "from the current project. Resume and runner contract updates also expire earlier verification observations. "
+                        "Historical task summaries and teammate messages can still describe those obsolete failures; "
+                        "they do not establish a current blocker. Request run_selected_verification when its current result "
+                        "is needed, through Nexus tool_calls under the current access policy."
                     )
                 if tool_results:
                     context += (

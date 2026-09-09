@@ -71,6 +71,83 @@ class LongHorizonToolRecoveryTests(unittest.TestCase):
         self.assertEqual(sum(one["type"] == "file_transaction_applied" for one in events), 1)
         self.assertFalse(any(one["type"] == "task_failed" for one in events))
 
+    def verification_blocked(self):
+        goal = self.create("verification-observation-recovery")
+        seen = []
+        responses = [
+            reply("work", "I will run the check.", tool_calls=[{
+                "call_id": "verify", "name": "run_selected_verification", "arguments": {},
+            }]),
+            reply("blocked", "The earlier verification runner failed."),
+            reply("blocked", "My teammate reported a runner failure."),
+        ]
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=self.provider(responses, seen)), mock.patch.object(
+            long_horizon.swarm_work, "_run_selected_project_verification",
+            return_value={"status": "unavailable", "basis": "verification_runtime_unavailable",
+                          "reason": "Object of type OSError is not JSON serializable", "commands": []},
+        ):
+            paused = self.runtime.run(goal["goal_id"])
+        self.assertEqual(paused["status"], "paused", paused["note"])
+        self.assertEqual(paused["tasks"][0]["context_steps"][0]["state"], "complete")
+        return paused
+
+    def test_resume_expires_failed_verification_across_restart_and_requests_fresh_check(self):
+        paused = self.verification_blocked()
+        self.runtime.close()
+        self.runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(self.runtime.close)
+        resumed = self.runtime.store.control(paused["goal_id"], "resume")
+        self.assertEqual(resumed["budget"], paused["budget"])
+        self.assertEqual(resumed["tasks"][0]["context_steps"][0]["state"], "superseded")
+        self.assertEqual(resumed["verification_observation_epoch"], 1)
+        self.assertEqual(long_horizon.GoalStore(self.config).get(paused["goal_id"])["verification_observation_epoch"], 1)
+        result, seen = self.run_replies(resumed, [
+            reply("work", "I will recheck the current runner.", tool_calls=[{
+                "call_id": "verify", "name": "run_selected_verification", "arguments": {},
+            }]), reply(), reply(),
+        ])
+        self.assertEqual(result["status"], "complete", result["note"])
+        self.assertIn("Historical task summaries", seen[0][1])
+        self.assertNotIn('"error":"Object of type OSError', seen[0][1])
+        self.assertEqual(result["budget"]["context_tool_calls"], paused["budget"]["context_tool_calls"] + 1)
+        step = result["tasks"][0]["context_steps"][-1]
+        observed = json.loads(step["results"][0]["result"]["content"])
+        self.assertEqual(observed["status"], "passed")
+
+    def test_stale_runner_contract_reopens_settled_blocker_only_once(self):
+        paused = self.verification_blocked()
+        def old_engine(document, _db):
+            document["status"] = "queued"
+            document["tasks"][0]["context_steps"][0]["context_binding"]["verification_runtime_contract"] = "old-native-launch/v1"
+        self.runtime.store._mutate(paused["goal_id"], old_engine)
+        self.runtime.close()
+        self.runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(self.runtime.close)
+        self.assertTrue(self.runtime.store.recover_stale_verification_blockers(paused["goal_id"]))
+        recovered = self.runtime.store.get(paused["goal_id"])
+        self.assertEqual(recovered["tasks"][0]["state"], "ready")
+        self.assertEqual(recovered["tasks"][1]["state"], "ready")
+        self.assertEqual(recovered["budget"], paused["budget"])
+        self.assertFalse(self.runtime.store.recover_stale_verification_blockers(paused["goal_id"]))
+        self.assertEqual(recovered["tasks"][0]["context_steps"][0]["state"], "superseded")
+        result, seen = self.run_replies(recovered, [reply(), reply()])
+        self.assertEqual(result["status"], "complete", result["note"])
+        self.assertTrue(all("Earlier task summaries and peer blockers are historical" in context for _, context in seen))
+
+    def test_recovery_preserves_pause_current_failure_and_uncertain_effect(self):
+        paused = self.verification_blocked()
+        self.assertFalse(self.runtime.store.recover_stale_verification_blockers(paused["goal_id"]))
+        def current(document, _db):
+            document["status"] = "queued"
+        self.runtime.store._mutate(paused["goal_id"], current)
+        self.assertFalse(self.runtime.store.recover_stale_verification_blockers(paused["goal_id"]))
+        def uncertain(document, _db):
+            task = document["tasks"][0]
+            task["context_steps"][0]["context_binding"].pop("verification_observation_contract")
+            task["outcome_unknown"] = True
+        self.runtime.store._mutate(paused["goal_id"], uncertain)
+        self.assertFalse(self.runtime.store.recover_stale_verification_blockers(paused["goal_id"]))
+
     def test_duplicate_ids_are_corrected_before_any_tool_dispatch(self):
         goal = self.create("duplicate-batch")
         duplicate = reply("work", tool_calls=[read("first.js"), read("second.js")])

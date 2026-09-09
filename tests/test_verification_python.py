@@ -42,6 +42,37 @@ def embedded_archive(*, unsafe_name: str = "") -> bytes:
 
 
 class LightweightVerificationPythonTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Win32 long executable paths")
+    def test_long_unicode_executable_launch_preserves_boundary_and_exit_status(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "project"
+            snapshot.mkdir()
+            runtime_root = root / ("runtime space & %TEMP% " + "x" * 90) / ("nested " + "y" * 90) / ("unicode \u00c5 \U0001f31f " + "z" * 40)
+            runtime_root.mkdir(parents=True)
+            executable = runtime_root / "native-probe.exe"
+            shutil.copy2(Path(os.environ["SystemRoot"]) / "System32/cmd.exe", executable)
+            self.assertGreater(len(str(executable)), 260)
+            outside = root / "outside.txt"
+            for command, expected in (("echo long-path-ok", 0),
+                                      (f'echo denied>"{outside}"', 1), ("exit /b 7", 7)):
+                result = windows_containment.run_appcontainer(
+                    snapshot, [str(executable), "/d", "/c", command], dict(os.environ),
+                    10, read_execute_roots=(runtime_root,),
+                )
+                self.assertEqual(result["exit_code"], expected, result)
+                self.assertFalse(result["containment_cleanup_error"], result)
+            self.assertFalse(outside.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Win32 command validation")
+    def test_native_application_rejects_invalid_payloads_before_authority_changes(self):
+        for argv in ([], ["relative.exe"], ["C:\\probe.exe", "bad\0arg"],
+                     ["C:\\probe.exe", "\U0001f31f" * 16384]):
+            with self.subTest(argv_size=len(str(argv))), self.assertRaises(ValueError):
+                windows_containment._application_name(argv)
+        self.assertEqual(windows_containment._application_name([r"\\server\share\probe.exe"]),
+                         "\\\\?\\UNC\\server\\share\\probe.exe")
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -153,6 +184,17 @@ class LightweightVerificationPythonTests(unittest.TestCase):
         self.assertIn("Access is denied", " | ".join(lease.cleanup_errors))
         # A failed removal must remain registered for the process-exit retry.
         self.assertIn(grant_key, windows_containment._PERSISTENT_RX_GRANTS)
+
+    @unittest.skipUnless(os.name == "nt", "Windows mapping mutex cleanup")
+    def test_drive_map_closes_timed_out_native_64_bit_mutex(self):
+        native = mock.Mock()
+        native.CreateMutexW.return_value = 0x123456789
+        native.WaitForSingleObject.return_value = 0x102
+        with mock.patch.object(windows_containment.ctypes.windll, 'kernel32', native):
+            with self.assertRaisesRegex(OSError, 'drive-map lease'):
+                windows_containment._map_roots_to_private_drives((self.snapshot,))
+        native.CloseHandle.assert_called_once_with(0x123456789)
+        native.ReleaseMutex.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "Windows mapping mutex cleanup")
     def test_drive_unmap_releases_mutex_even_when_subst_cleanup_times_out(self) -> None:

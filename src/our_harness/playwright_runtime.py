@@ -16,6 +16,37 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+from .verification_python import discover_packaged_runtime
+
+
+LOCAL_STATIC_SERVER_SOURCE = r'''
+const http = require('node:http');
+function createLocalServer(root) {
+  const types = {'.html':'text/html', '.htm':'text/html', '.js':'text/javascript',
+    '.mjs':'text/javascript', '.css':'text/css', '.json':'application/json',
+    '.svg':'image/svg+xml', '.wasm':'application/wasm', '.png':'image/png',
+    '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.gif':'image/gif',
+    '.webp':'image/webp', '.ico':'image/x-icon', '.woff':'font/woff',
+    '.woff2':'font/woff2', '.mp3':'audio/mpeg', '.mp4':'video/mp4', '.txt':'text/plain'};
+  root = fs.realpathSync(root);
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  const inside = file => file === root || file.startsWith(prefix);
+  return http.createServer((req, res) => {
+    try {
+      const rel = decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname).replace(/^\/+/, '');
+      let file = path.resolve(root, rel);
+      if (!inside(file)) throw new Error('outside snapshot');
+      if (fs.statSync(file).isDirectory()) file = path.join(file, 'index.html');
+      file = fs.realpathSync(file);
+      if (!inside(file)) throw new Error('outside snapshot');
+      const data = fs.readFileSync(file);
+      res.writeHead(200, {'content-type': types[path.extname(file).toLowerCase()] || 'application/octet-stream'});
+      res.end(data);
+    } catch { res.writeHead(404); res.end('not found'); }
+  });
+}
+'''
+
 
 @dataclass(frozen=True)
 class BundledPlaywrightRuntime:
@@ -152,6 +183,7 @@ const runtime = process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT;
 const evidencePath = process.env.NEXUS_PLAYWRIGHT_SUITE_RECEIPT;
 const evidence = globalThis.__nexusSuiteEvidence = {
   schema_version: 1, worker_mode: 'IN_PROCESS_WORKER_MAIN',
+  local_base_url: process.env.NEXUS_LOCAL_BASE_URL || null,
   tests: [], steps: [], requests: [], tls: [], final_urls: [], api: [],
   external_write_denied: false, worker_ready: false, worker_exited: false
 };
@@ -184,7 +216,10 @@ const playwright = require(path.join(runtime, 'node_modules', 'playwright'));
 const originalConnectOverCDP = playwright.chromium.connectOverCDP.bind(playwright.chromium);
 async function instrumentBrowser(browser) {
   const originalNewContext = browser.newContext.bind(browser);
-  browser.newContext = async options => instrumentContext(await originalNewContext(options));
+  browser.newContext = async options => instrumentContext(await originalNewContext({
+    ...(process.env.NEXUS_LOCAL_BASE_URL ? {baseURL: process.env.NEXUS_LOCAL_BASE_URL} : {}),
+    ...Object.fromEntries(Object.entries(options || {}).filter(([,value]) => value !== undefined))
+  }));
   for (const context of browser.contexts()) instrumentContext(context);
   return browser;
 }
@@ -212,7 +247,8 @@ const originalRequestNewContext = playwright.request.newContext.bind(playwright.
 playwright.request.newContext = async options => {
   const requested = options && options.baseURL ? new URL(options.baseURL).origin : process.env.NEXUS_APPROVED_ORIGIN;
   if (requested !== process.env.NEXUS_APPROVED_ORIGIN) throw new Error('Nexus denied cross-origin API request context');
-  const context = await originalRequestNewContext({...options, proxy: {server: process.env.NEXUS_ORIGIN_PROXY}});
+  const context = await originalRequestNewContext({...options,
+    ...(process.env.NEXUS_ORIGIN_PROXY ? {proxy: {server: process.env.NEXUS_ORIGIN_PROXY}} : {baseURL: process.env.NEXUS_LOCAL_BASE_URL})});
   for (const method of ['fetch', 'get', 'head']) {
     const original = context[method].bind(context);
     context[method] = async (...args) => {
@@ -277,7 +313,7 @@ cp.fork = function(entry, argsOrOptions, maybeOptions) {
   const options = Array.isArray(argsOrOptions) ? maybeOptions || {} : argsOrOptions || {};
   const worker = new InProcessWorker(entry, options);
   const previousSend = process.send;
-  process.send = message => {
+  process.send = worker._send = message => {
     if (message && message.method === '__dispatch__') {
       const payload = message.params || {};
       if (payload.method === 'testBegin') evidence.tests.push({testId: payload.params.testId, status: 'running'});
@@ -303,12 +339,25 @@ cp.fork = function(entry, argsOrOptions, maybeOptions) {
 
 
 _UNMODIFIED_SUITE_RUNNER_SOURCE = r'''
+const fs = require('node:fs');
 const path = require('node:path');
+__LOCAL_SERVER__
+async function main() {
+if (process.env.NEXUS_LOCAL_SUITE_ROOT) {
+  const server = createLocalServer(process.env.NEXUS_LOCAL_SUITE_ROOT);
+  await new Promise((resolve, reject) => {server.once('error', reject); server.listen(0, '127.0.0.1', resolve);});
+  server.unref();
+  process.env.NEXUS_LOCAL_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+  process.env.NEXUS_APPROVED_ORIGIN = process.env.NEXUS_LOCAL_BASE_URL;
+  process.env.NEXUS_ALLOWED_LOOPBACK_PORTS += ',' + server.address().port;
+}
 require(process.env.NEXUS_INPROCESS_WORKER_SHIM);
 const args = JSON.parse(process.env.NEXUS_PLAYWRIGHT_CLI_ARGS);
 process.argv = [process.execPath, process.env.NEXUS_PLAYWRIGHT_CLI, ...args];
 require(process.env.NEXUS_PLAYWRIGHT_CLI);
-'''
+}
+main().catch(error => {console.error(error); process.exitCode=1;});
+'''.replace('__LOCAL_SERVER__', LOCAL_STATIC_SERVER_SOURCE)
 
 
 _LOCATOR_KINDS = {
@@ -731,6 +780,7 @@ def compile_safe_playwright_scenario(
 const fs = require('node:fs');
 const path = require('node:path');
 const pw = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT, 'node_modules', 'playwright'));
+const {expect} = require(path.join(process.env.NEXUS_BUNDLED_PLAYWRIGHT_ROOT, 'node_modules', '@playwright', 'test'));
 const scenario = JSON.parse(__NEXUS_SCENARIO__);
 const receiptPath = process.env.NEXUS_PLAYWRIGHT_RECEIPT_PATH;
 const receipt = {
@@ -758,9 +808,16 @@ function target(page, spec) {
 }
 async function assertStep(page, step, index) {
   let actual;
-  if (step.condition === 'url') actual = page.url();
+  const options = {timeout: scenario.config.timeout_ms};
+  if (step.condition === 'url') { await expect(page).toHaveURL(step.expected, options); actual = page.url(); }
   else {
     const located = target(page, step.target);
+    if (step.condition === 'visible') await (step.expected ? expect(located) : expect(located).not).toBeVisible(options);
+    else if (step.condition === 'hidden') await (step.expected ? expect(located) : expect(located).not).toBeHidden(options);
+    else if (step.condition === 'text') await expect(located).toHaveText(step.expected, options);
+    else if (step.condition === 'value') await expect(located).toHaveValue(step.expected, options);
+    else if (step.condition === 'attribute') await expect(located).toHaveAttribute(step.name, step.expected, options);
+    else if (step.condition === 'count') await expect(located).toHaveCount(step.expected, options);
     if (step.condition === 'visible') actual = await located.isVisible();
     else if (step.condition === 'hidden') actual = await located.isHidden();
     else if (step.condition === 'text') actual = await located.textContent();
@@ -769,7 +826,7 @@ async function assertStep(page, step, index) {
     else if (step.condition === 'count') actual = await located.count();
     else throw new Error('unsupported validated assertion');
   }
-  const passed = actual === step.expected;
+  const passed = true; // The awaited Playwright assertion above is the oracle.
   receipt.assertions.push({index, condition: step.condition, expected: step.expected, actual, passed});
   if (!passed) throw new Error(`assertion ${index} ${step.condition} expected ${JSON.stringify(step.expected)} got ${JSON.stringify(actual)}`);
 }
@@ -957,7 +1014,7 @@ def run_safe_playwright_scenario(
 def run_brokered_playwright_suite(
     snapshot: Path,
     cli_args: Sequence[str],
-    approved_base_url: str,
+    approved_base_url: str | None,
     *,
     environment: Mapping[str, str] | None = None,
     timeout: float = 90.0,
@@ -965,9 +1022,9 @@ def run_brokered_playwright_suite(
 ) -> dict[str, Any]:
     """Execute the selected, unmodified Playwright suite with in-process WorkerMain."""
 
-    approved_base, approved_origin, _host, _port = normalize_approved_https_base_url(
-        approved_base_url
-    )
+    approved_base = approved_origin = None
+    if approved_base_url is not None:
+        approved_base, approved_origin, _host, _port = normalize_approved_https_base_url(approved_base_url)
     runtime = runtime or discover_bundled_playwright_runtime(required=True)
     assert runtime is not None
     snapshot = snapshot.resolve()
@@ -998,8 +1055,19 @@ def run_brokered_playwright_suite(
     args = [str(one) for one in cli_args]
     if not args or args[0] != "test":
         args.insert(0, "test")
-    if not any(one == "--workers" or one.startswith("--workers=") for one in args):
-        args.append("--workers=1")
+    # WorkerMain uses process-wide IPC/environment state. Serialize workers
+    # even when the project config or CLI requests parallelism.
+    serial_args = []
+    skip_value = False
+    for one in args:
+        if skip_value:
+            skip_value = False
+            continue
+        if one in ("--workers", "-j"):
+            skip_value = True
+        elif not one.startswith(("--workers=", "-j")):
+            serial_args.append(one)
+    args = [*serial_args, "--workers=1"]
     if not any(one == "--reporter" or one.startswith("--reporter=") for one in args):
         args.append("--reporter=line")
     broker = run_brokered_playwright_appcontainer(
@@ -1013,8 +1081,9 @@ def run_brokered_playwright_suite(
             "NEXUS_PLAYWRIGHT_CLI_ARGS": json.dumps(args, separators=(",", ":")),
             "NEXUS_PLAYWRIGHT_SUITE_RECEIPT": str(receipt_path),
             "NEXUS_PLAYWRIGHT_DENIED_WRITE": str(denied_path),
-            "NEXUS_APPROVED_BASE_URL": approved_base,
-            "NEXUS_APPROVED_ORIGIN": approved_origin,
+            "NEXUS_APPROVED_BASE_URL": approved_base or "",
+            "NEXUS_APPROVED_ORIGIN": approved_origin or "",
+            **({"NEXUS_LOCAL_SUITE_ROOT": str(snapshot)} if approved_base is None else {}),
             "NODE_PATH": str((runtime.root / "node_modules").resolve()),
         },
     )
@@ -1033,7 +1102,7 @@ def run_brokered_playwright_suite(
     exact_request = any(
         isinstance(one, dict)
         and urlsplit(str(one.get("url", ""))).scheme.casefold() == "https"
-        and f"https://{urlsplit(str(one.get('url', ''))).netloc.casefold()}" == approved_origin.casefold()
+        and f"https://{urlsplit(str(one.get('url', ''))).netloc.casefold()}" == (approved_origin or "").casefold()
         for one in requests
     )
     receipt_ok = bool(
@@ -1050,14 +1119,19 @@ def run_brokered_playwright_suite(
         )
         and assertion_steps
         and all(one.get("error") is None for one in assertion_steps)
-        and exact_request and tls
-        and all(
+        and ((exact_request and tls) if approved_origin else (
+            isinstance(receipt.get("local_base_url"), str)
+            and re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", receipt["local_base_url"])
+            and any(isinstance(one, dict) and one.get("resource_type") == "document"
+                    and str(one.get("url", "")).startswith(receipt["local_base_url"] + "/") for one in requests)
+        ))
+        and (not approved_origin or all(
             str(one.get("protocol", "")).upper().startswith("TLS")
-            and f"https://{urlsplit(str(one.get('url', ''))).netloc.casefold()}" == approved_origin.casefold()
+            and f"https://{urlsplit(str(one.get('url', ''))).netloc.casefold()}" == (approved_origin or "").casefold()
             for one in tls if isinstance(one, dict)
-        )
+        ))
         and all(
-            f"https://{urlsplit(str(one.get('url', ''))).netloc.casefold()}" == approved_origin.casefold()
+            str(one.get("url", "")).startswith((approved_origin or receipt["local_base_url"]) + "/")
             for one in api if isinstance(one, dict)
         )
     )
@@ -1088,7 +1162,12 @@ def _candidate_roots() -> list[Path]:
     requested = os.environ.get("NEXUS_PLAYWRIGHT_RUNTIME", "").strip()
     if requested:
         return [Path(requested).resolve()]
+    paired = discover_packaged_runtime()
+    if paired is not None:
+        return [paired / "playwright"]
     source_root = Path(__file__).resolve().parents[2]
+    if (source_root / "desktop" / ".runtime-selection.json").exists():
+        return []
     candidates = [
         Path(sys.executable).resolve().parent / "playwright",
         source_root / "desktop" / "runtime" / "playwright",

@@ -576,6 +576,21 @@ ipcMain.handle("harness:showProjectFile", (_event, relativePath) => {
   shell.showItemInFolder(target);
   return true;
 });
+ipcMain.handle("harness:openLocation", async (event, location) => {
+  if (!fromHarnessWindow(event)) throw new Error("Only the Nexus Harness window may open a location.");
+  if (typeof location !== "string" || !path.isAbsolute(location) || location.includes("\0")) {
+    throw new Error("Choose an absolute file or folder location.");
+  }
+  const target = fs.realpathSync.native(location);
+  const info = fs.statSync(target);
+  if (info.isDirectory()) {
+    const problem = await shell.openPath(target);
+    if (problem) throw new Error(problem);
+  } else if (info.isFile()) {
+    shell.showItemInFolder(target);
+  } else throw new Error("This location is not a file or folder.");
+  return true;
+});
 ipcMain.handle("harness:saveJsonFile", (event, suggestedName, contents) => {
   if (!fromHarnessWindow(event)) throw new Error("Only the Nexus Harness window may save an export.");
   const written = String(contents || "");

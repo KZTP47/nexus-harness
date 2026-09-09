@@ -83,6 +83,17 @@ class SharedGoalVerificationTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed", result)
         self.assertNotEqual(result["commands"][0]["exit_code"], 0)
 
+    def test_containment_oserror_remains_json_evidence_and_later_checks_can_run(self):
+        with mock.patch.object(swarm_work, "_contained_snapshot_command", side_effect=OSError("temporary runner setup fault")):
+            failed = json.loads(json.dumps(self.verify()))
+        self.assertEqual(failed["status"], "unavailable")
+        self.assertEqual(failed["basis"], "verification_containment_unavailable")
+        self.assertIn("temporary runner setup fault", failed["commands"][0]["stderr"])
+        self.assertEqual(failed["commands"][0]["argv"], self.command)
+        passed = self.verify()
+        self.assertEqual(passed["status"], "passed", passed)
+        self.assertEqual(passed["verification_analysis"]["verification_evidence"][0]["executed"], 1)
+
     def test_plural_collaboration_requests_verify_real_applied_changes(self):
         for objective in (
             "can you guys add a shop where one can use scores to buy themed items xDDD",

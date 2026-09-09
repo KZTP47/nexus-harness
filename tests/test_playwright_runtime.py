@@ -28,6 +28,21 @@ from our_harness.playwright_runtime import (
 
 
 class PlaywrightRuntimeDiscoveryTests(unittest.TestCase):
+    def test_browser_runtime_follows_validated_paired_runtime_and_invalid_selector(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module = root / 'src/our_harness/playwright_runtime.py'
+            (root / 'desktop').mkdir()
+            (root / 'desktop/.runtime-selection.json').write_text('{}')
+            with mock.patch.dict(os.environ, {'NEXUS_PLAYWRIGHT_RUNTIME': ''}), \
+                    mock.patch.object(playwright_runtime, '__file__', str(module)), \
+                    mock.patch.object(playwright_runtime, 'discover_packaged_runtime', return_value=root / 'selected'):
+                self.assertEqual(playwright_runtime._candidate_roots(), [root / 'selected/playwright'])
+            with mock.patch.dict(os.environ, {'NEXUS_PLAYWRIGHT_RUNTIME': ''}), \
+                    mock.patch.object(playwright_runtime, '__file__', str(module)), \
+                    mock.patch.object(playwright_runtime, 'discover_packaged_runtime', return_value=None):
+                self.assertEqual(playwright_runtime._candidate_roots(), [])
+
     @staticmethod
     def broad_scenario() -> dict[str, object]:
         return {

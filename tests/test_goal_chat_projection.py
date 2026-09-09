@@ -91,6 +91,35 @@ class GoalChatProjectionTests(unittest.TestCase):
         self.assertEqual(turns[0].recipient_name, "Checker")
         self.assertEqual(goal_chat_projection.cursor(reopened, "route-blue", "goal-a", filed_as=self.filed_as), 2)
 
+    def test_old_claims_are_marked_as_working_copy_reports_without_rewriting_or_duplicate_delivery(self):
+        words = "Finished. Open arbitrary-game/start.html in your project."
+        self.project(self.page([self.message(1, words), self.message(2, "Proceed", user=True)]))
+        self.goal["execution_workspace"] = {"schema_version": 1, "path": "private/project"}
+        self.goal["project"]["path"] = str(self.root / "selected project")
+        self.goal["status"] = "complete"
+        self.project(self.page([]))
+        reopened = LoadedConfig(copy.deepcopy(DEFAULT_CONFIG), self.root, [], {})
+        self.project(self.page([]), config=reopened)
+        rows = self.speech(reopened)
+        self.assertEqual([row.text for row in rows], [words, "Proceed"])
+        self.assertEqual(rows[0].correlation["delivery_contract"], "selected-project-delivery/v1")
+        self.assertEqual(rows[0].correlation["delivery_state"], "working_copy_report")
+        self.assertNotIn("delivery_state", rows[1].correlation)
+
+    def test_legacy_complete_status_gains_verified_location_once_at_same_revision(self):
+        self.goal["status"] = "complete"
+        chat.keep_long_horizon_status(self.config, "route-blue", self.goal, filed_as=self.filed_as)
+        self.goal["delivery_receipt"] = {"schema_version": 1, "contract": "selected-project-delivery/v1",
+                                         "state": "delivered", "project_path": str(self.root),
+                                         "files": [{"path": "game/start.html", "sha256": "a" * 64}]}
+        for _ in range(2):
+            chat.keep_long_horizon_status(self.config, "route-blue", self.goal, filed_as=self.filed_as)
+        rows = [row for row in chat.read_it(self.config, "route-blue", self.filed_as)
+                if row.correlation.get("kind") == "long_horizon_status"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn(str(self.root / "game/start.html"), rows[0].text)
+        self.assertEqual(rows[0].correlation["goal_revision"], 10)
+
     def tool_step(self, *, result=False):
         return {"step_id": "portable-step", "agent_id": "builder", "state": "complete" if result else "tools_pending",
                 "created_ms": 1_700_000_001_500, "completed_ms": 1_700_000_001_750 if result else 0,

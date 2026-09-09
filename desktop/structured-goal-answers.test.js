@@ -10,7 +10,7 @@ const source = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/app.j
 const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 
 function element(tag, className = "", text = "") {
-  return {tag, className, textContent: text, value: "", dataset: {}, children: [], listeners: {},
+  return {tag, className, textContent: text, value: "", dataset: {}, style: {}, classList: {toggle() {}}, children: [], listeners: {},
     append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this.children = children; },
     setAttribute(name, value) { this[name] = value; },
@@ -23,6 +23,8 @@ function element(tag, className = "", text = "") {
         && (name ? one.name === name : one.dataset.questionChoice === "true"));
     },
     querySelector(selector) {
+      if (selector.startsWith('.')) return this.all().find(one => one.className.split(' ').includes(selector.slice(1))) || null;
+      if (selector === 'details') return this.all().find(one => one.tag === 'details') || null;
       const name = selector.match(/data-question-name="([^"]+)"/)?.[1];
       return this.all().find(one => one.dataset.questionName === name);
     },

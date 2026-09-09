@@ -379,6 +379,8 @@ def _read(config: LoadedConfig) -> dict[str, Any]:
         or bool(recovered_from)
     )
     for raw in value.get("chats", []) if isinstance(value.get("chats"), list) else []:
+        if isinstance(raw, dict) and raw.get("id") in value.get("purged_chats", []):
+            continue
         if not isinstance(raw, dict) or not _CHAT_ID.fullmatch(str(raw.get("id") or "")):
             continue
         pair = raw.get("pair")
@@ -429,6 +431,7 @@ def _read(config: LoadedConfig) -> dict[str, Any]:
             "workspace_id": workspace_id,
             "pair": canonical,
             "name": str(raw.get("name") or "Chat")[:80],
+            "pinned": raw.get("pinned") is True,
             "project": str(raw.get("project") or "")[:120],
             # The transcript key is an ownership capability, not mutable
             # registry data. Older registries could point a new pair chat at
@@ -479,6 +482,7 @@ def _read(config: LoadedConfig) -> dict[str, Any]:
         # for earlier boards. Capacity is enforced per workspace at creation;
         # every accepted workspace keeps all of its indexed chats.
         "chats": chats,
+        "purged_chats": [item for item in value.get("purged_chats", []) if isinstance(item, str) and _CHAT_ID.fullmatch(item)],
         "active": {str(key)[:400]: str(item) for key, item in active.items()},
         "chosen_active": {
             str(key)[:400]: str(item) for key, item in chosen_active.items()

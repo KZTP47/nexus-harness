@@ -89,3 +89,180 @@ were no Python test errors or unresolved product-runtime failures in this run.
 
 This audit covers the current source snapshot and exercised behaviors. It cannot
 prove absence of every possible future provider, OS or concurrency failure.
+
+## Follow-up: stale verification blockers and local browser scenarios
+
+The reported saved team repeated a historical verification exception after its
+runner had been repaired. A Codex transport instruction also prohibited reading
+files or running commands without distinguishing native CLI tools from the
+Nexus JSON tool protocol. Fresh execution exposed a separate local Playwright
+compiler defect: a regex crossed string boundaries, merged an assertion into
+the next click selector, and retained only one assertion after all actions.
+
+The current-request acceptance ledger is maintained here for this follow-up.
+All work is owned by the primary agent; no delegation was used.
+
+| ID | Observable outcome and owner paths | Evidence method | State |
+| --- | --- | --- | --- |
+| R1 | Verifier errors remain JSON-safe, retain the cause, and allow later checks; `swarm_work.py`, broker runtime | Broker failure/reload tests; a real check after injected OSError | Verified |
+| R2 | Authorized reads, checks and team messages remain available; obsolete verification observations cannot permanently strand settled tasks; `providers/codex_cli.py`, `long_horizon.py` | Transport prompt contract; real scheduler with provider fixtures, explicit Resume, restart, obsolete contract, uncertain-effect and repeated-recovery cases | Verified |
+| R4 | Local browser checks retain literal strings, all assertions and source order; unsupported syntax is repairable test feedback; `playwright_scenarios.py`, `swarm_work.py` | Real contained browser positive and initial/final negative scenarios; escaped/template strings, count assertions, dynamic/unsupported-operation rejection; project failure projection | Verified |
+| R3 | Joined changes pass regression and the packaged deployment gate; depends on R1, R2, R4 | 156 final focused Python tests plus 4 Playwright integration tests passed; post-work Electron/NSIS/shortcut gate passed; built-app smoke passed, including access and Resume controls; all four packaged source owners match the tested files byte-for-byte | Verified |
+
+Fresh execution of the reported scenario passed all seven browser assertions.
+The original team then resumed through product-owned APIs, exchanged fresh
+verification evidence, and reached durable `complete` with final verification
+and publication. The delivered game required no local source repair.
+
+Context binding schema 5 invalidates pre-fix observations automatically.
+Explicit Resume expires completed verification observations while preserving
+budgets, artifacts and pending-effect reconciliation. Automatic scheduler
+recovery only reopens settled reported blockers when an obsolete verification
+observation exists; superseding that observation prevents repeated recovery.
+Current failures, user pauses, review decisions and uncertain effects are not
+converted to completion. The local compiler remains a literal straight-line
+subset; unsupported suites fail with actionable compatibility feedback rather
+than being partially accepted or labelled a broken runtime.
+
+## Follow-up: packaged AppContainer compatibility
+
+Current-request ledger (unlazy discipline using the repository's single ledger).
+The primary agent owns all implementation and integration. Two independent
+read-only agents audit browser compatibility and recovery; their findings require
+primary-agent inspection and runnable verification before acceptance.
+
+| ID | Observable outcome / owned paths | CHECK / EXPECT | State |
+| --- | --- | --- | --- |
+| AC1 | Long packaged executable paths launch with reliable native handle/error handling; `windows_containment.py` | 45 native/runtime tests pass, including >300-character paths, Unicode, shell metacharacters, exit status, external-write denial and mutex cleanup; actual 269-character packaged Chromium path passes under bundled Python 3.11 | Verified |
+| AC2 | Supported browser verification uses paired runtime, preserves suite selection and assertion semantics, serves ordinary local assets; `playwright_runtime.py`, `swarm_work.py` | Six browser/scenario tests pass, including real delayed DOM/module/directory navigation, ordinary loops/keyboard/selectors, negative assertion, line selectors and custom config; runtime discovery and remote-suite regressions pass | Verified |
+| AC3 | Engine upgrades invalidate obsolete verification failures without fabricating user decisions; `long_horizon.py` | Schema 6 native contract restart/one-time recovery and pause/uncertain-effect regressions pass | Verified |
+| AC4 | All AppContainer entry points audited; supported paths integrated and remaining capability boundaries explicitly accounted for | Inventory below; 170 owning regression tests, four Playwright integration tests, native and local browser checks pass | Verified |
+| AC5 | Reported saved goal gets fresh executable evidence through the repaired packaged runtime | Goal 8e75d780 reached durable complete with two real browser tests and publication; preserved both teams' tests during publication conflict resolution | Verified |
+| AC6 | Joined source passes checks and ships in desktop app, NSIS installer and shortcut | Post-work gate passed; NSIS rebuilt; refreshed shortcut/icon targets immutable app; five packaged UI smoke checks pass; all six changed packaged runtime owners match source; freshly packaged 269-character Chromium path passes with external-write denial | Verified |
+
+Dependencies: AC2/AC3 use the settled AC1 launch contract; AC5 follows native and
+browser fixes; AC6 joins every preceding item. The screenshots are diagnostic
+evidence, not instructions to accept missing test evidence or answer a question.
+
+The native audit covers the shared `run_appcontainer` owner and every caller:
+Python/Node verification and boundary canaries in `swarm_work.py`, plus Chromium,
+Node suite runner, browser closer, exact-origin proxy and proxy closer in
+`playwright_runtime.py`. Native API declarations now preserve 64-bit handles,
+failed waits/resumes/exit-code reads remain errors, and a timed-out drive lease
+closes its handle. ACL diagnostic decoding tolerates the Windows console codepage.
+The launch contract is stable and versioned, distinct from the process-specific
+AppContainer SID used for ACL reuse.
+
+Windows limits the executable portion when `CreateProcessW` receives a NULL
+application name ([Microsoft API documentation](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw)).
+Supplying an explicit extended path fixes the first launch. Real immutable-app
+testing exposed Chromium's own long-path child-process failures as well. A
+temporary, identity-checked junction to the immutable executable directory fixes
+those without a runtime copy, registry change, 8.3-name dependency or global
+drive lease. Native reparse-point creation preserves literal `%`, `&`, spaces
+and Unicode in paths; cleanup removes only the junction after the contained Job
+closes. Both length checks count UTF-16 units.
+
+Ordinary local Playwright suites now use the existing contained in-process
+WorkerMain when a literal probe cannot preserve their semantics, or when config,
+filters or line selectors apply. Fixtures, loops, keyboard actions, canvas
+evaluation and multiple tests no longer require rewriting into the small probe
+grammar. The bundled static server serves directory indexes, JavaScript modules
+and common web media with appropriate MIME types. Assertions use Playwright's
+polling and normalization. Test selection excludes dependency/private folders,
+preserves CLI filters/config, and serializes WorkerMain's shared process state.
+Remote HTTPS suites retain their exact-origin proxy and TLS evidence checks.
+
+Supported protected execution remains Python, Node and bundled Chromium. This
+audit does not claim support for arbitrary native toolchains or other browser
+engines, remove actual authorization decisions, bypass filesystem/network
+boundaries, or mark missing evidence successful. Dynamic application servers
+still need an executable setup compatible with those supported runtimes; the
+new automatic local server serves static project assets. These explicit
+capability boundaries are not evidence of a successful arbitrary user prompt.
+
+The reported goal's earlier user decision remained resolved. Fresh checks ran
+the tic-tac-toe and platformer suites successfully. Its publication initially
+detected the other team's newer tic-tac-toe test. The recovery retained that
+file unchanged, moved the complete platformer test into `megaman.spec.cjs` in
+the private workspace, reran verification, and published the platformer through
+the normal transactional goal publisher. No success criterion was waived.
+
+Final current-request reconciliation: six outcomes verified, zero unmet, zero
+abandoned. Independent browser/native review findings were corrected and
+reverified. The deployment gate recorded session
+`2026-09-09T06-46-44Z-ab22ec92fed242a494c648e705c10284`; subsequent packaged
+startup and real contained-browser checks both passed against its refreshed
+immutable desktop shortcut target. The installer contains the tested sources.
+
+## Delivery claims and actual destination files (2026-09-09)
+
+Current-request ledger (owner: primary agent; implemented sequentially because
+publication, completion, and chat projection share one engine contract):
+
+| ID | Required observable outcome | Owner paths / evidence | State |
+| --- | --- | --- | --- |
+| R1 | Explain when the claimed game became available | Authenticated goal/publication history and destination file timestamps: the 07:57 agent report preceded the 08:39 publication | Verified |
+| R2 | Missing file evidence cannot complete; provider speech cannot serve as a delivery receipt | `goal_delivery.py`, `long_horizon.py`, `goal_workspaces.py`, chat projection and both chat renderers; portable missing/changed/source-copy/publication/restart tests | Verified |
+| R3 | User can locate and open the reported game | Destination file opened directly with Chromium; drawing, movement, shooting, restart and no page errors checked; authenticated publisher hashes matched; existing chat upgraded through engine projection | Verified |
+| R4 | Integration and desktop deployment pass | 329 Python tests and 61 desktop tests passed, followed by 28 focused checks on the final sources; deployment evidence is recorded by the mandatory post-work hook | Tests verified; deployment gated |
+
+The incident was a premature provider delivery claim. Verification had kept the
+result in a private goal copy, but an ordinary team-discussion bubble told the
+user to open a destination file that had not yet been published. The previous
+runtime repair subsequently verified and published the game. This session did
+not create substitute game files or waive verification.
+
+Completion now checks explicit file evidence against the current readable-file
+manifest, including after a passing test result. Missing references schedule a
+repair instead of completing. Before completion, `selected-project-delivery/v1`
+reads named deliverables back from the selected project and compares their hashes
+with the verified execution manifest. The receipt carries a schema, goal/epoch/
+destination binding fingerprint, destination path, and file hashes. Publication
+files are included independently of provider-written evidence. Existing isolated
+completions recover that evidence from their authenticated publication receipt;
+an unavailable or changed destination produces a delivery problem instead of an
+invented receipt.
+
+Agent reports remain available to peers unchanged. Engine-owned metadata marks
+isolated-workspace replies as provisional delivery claims in both chat views.
+Old projected replies gain the metadata without duplicate speech or loss of
+history. The completion record exposes the destination and exact paths; a
+versioned legacy readback can enrich the existing status at the same goal
+revision without replaying the goal. Provider prompts explicitly distinguish
+preparing a working copy from delivering files to the user.
+
+## Delivery navigation and chat management (2026-09-09)
+
+Current-request ledger, owned by the primary agent. Changes are sequential
+because both delivery surfaces share metadata and all chat actions share the
+conversation registry.
+
+| ID | Required observable outcome | Evidence | State |
+| --- | --- | --- | --- |
+| Q1 | OPEN beside agent delivery destinations opens that dynamic folder | `desktop/chat-qol.test.js`: actual button dispatch and desktop IPC handler with arbitrary paths | Verified |
+| Q2 | OPEN beside receipt paths opens the folder or reveals the file | Versioned engine receipt locations, actual completion renderer and IPC tests | Verified |
+| Q3 | Right-click Archive uses the current archive action | Actual Chromium menu dispatch; existing chat archive regression suite | Verified |
+| Q4 | Delete/Purge removes the local chat after stopping work, without deleting published files or resurrecting history | Portable transcript, attachment, private-goal, sibling, request-tombstone, backup recovery, draining and HTTP lease tests | Verified |
+| Q5 | Rename persists a custom name without changing engine identity | Registry restart/binding assertions, real dialog and HTTP test during a turn | Verified |
+| Q6 | Pin/Unpin persists and sorts at the top within the pair | Pair-local sidebar sort, reversed-pair persistence, actual Pin/Unpin dispatch | Verified |
+| Q7 | Cancel dismisses the menu without a mutation | Chromium Cancel/Escape assertions; keyboard navigation and narrow viewport inspection | Verified |
+| Q8 | Changes ship in the rebuilt desktop application | Mandatory post-work deployment gate and packaged smoke checks | Deployment gated |
+
+Files are revealed in their containing folder, never executed by OPEN. Directory
+paths come from the engine's selected-project metadata; file paths come from its
+versioned delivery receipt. Electron validates the calling window and resolves
+the current filesystem object before handing it to the operating system.
+
+Chat names and pins are display fields on the existing canonical chat ID. Purge
+waits for active turns/goals to release their ownership, removes conversation
+content and private goal copies, and keeps minimal replay fences. Published
+project files and other conversations are outside its deletion scope. Registry
+recovery snapshots are scrubbed so an older backup cannot resurrect a purged chat.
+Terminal communication-journal prompts, results and events are also erased;
+versioned, sealed records retain only the identities needed to reject replay.
+
+Verification: 60 existing Python tests (three skipped), six new engine/HTTP
+tests, 65 existing desktop checks, and two new desktop/browser checks passed.
+The final journal integration run passed 62 engine/HTTP/run-store tests.
+The deployment hook records installer and shortcut evidence separately.

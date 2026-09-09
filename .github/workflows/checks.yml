@@ -212,16 +212,16 @@ jobs:
       - name: Install what the desktop app needs
         working-directory: desktop
         run: npm ci
-      - name: Run its tests
-        # node --test already discovers packaging.test.js. The navigation
-        # browser tests run again after the build because they need its runtime.
-        working-directory: desktop
-        run: npm test
       - name: Build the exact unpacked desktop acceptance target
         working-directory: desktop
         env:
           NEXUS_UNSIGNED_DEV: "1"
         run: npm run build -- --win dir
+      - name: Run its tests
+        # Browser-backed unit tests use the runtime from this exact build.
+        # A clean checkout does not have a previous bundled browser to reuse.
+        working-directory: desktop
+        run: npm test
       - name: Exercise real multi-vendor dispatch and recovery in packaged Electron
         working-directory: desktop
         run: npm run e2e:multi-vendor

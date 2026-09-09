@@ -40,6 +40,23 @@ class LongHorizonQualityTests(unittest.TestCase):
                 self.assertIn("meaningful automated checks", repairs[0]["description"])
                 self.runtime.store.control(goal["goal_id"], "cancel")
 
+    def test_passing_checks_do_not_prove_a_missing_claimed_file_was_delivered(self):
+        goal = self.finish_tasks(self.create("missing-delivery"), refs=["file:index.html"])
+        (self.project / "index.html").unlink()
+        result = self.runtime.store.complete_verification(goal["goal_id"], {"status": "passed"})
+        self.assertNotEqual(result["status"], "complete")
+        self.assertEqual(result["verification"]["basis"], "missing_deliverable_files")
+        self.assertEqual(result["verification"]["missing_files"], ["index.html"])
+        self.assertTrue(any(t["kind"] == "repair" and t["state"] == "ready" for t in result["tasks"]))
+
+    def test_passing_checks_and_existing_file_produce_an_exact_delivery_receipt(self):
+        goal = self.finish_tasks(self.create("existing-delivery"), refs=["file:index.html"])
+        result = self.runtime.store.complete_verification(goal["goal_id"], {"status": "passed"})
+        self.assertEqual(result["status"], "complete", result["note"])
+        self.assertEqual(result["delivery_receipt"]["files"][0]["path"], "index.html")
+        reopened = self.runtime.store.get(goal["goal_id"])
+        self.assertEqual(reopened["delivery_receipt"], result["delivery_receipt"])
+
     def test_final_boundary_rejects_snapshot_even_if_context_check_claims_not_configured(self):
         goal = self.finish_tasks(self.create())
         tree, _ = long_horizon.swarm_work._project_tree_merkle(self.project)

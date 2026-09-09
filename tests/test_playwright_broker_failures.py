@@ -139,6 +139,7 @@ class VerificationFailureProjectionTests(unittest.TestCase):
             self.assertFalse(result["containment_unavailable"])
             self.assertEqual(result["exit_code"], 1)
             self.assertIn("Expected Ready", json.dumps(result))
+            self.assertIn("Expected Ready", result["stderr"])
 
     def test_unmodified_remote_suite_does_not_claim_execution_after_launch_failure(self):
         with tempfile.TemporaryDirectory() as folder:

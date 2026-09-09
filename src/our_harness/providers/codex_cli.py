@@ -585,7 +585,13 @@ def _prompt(request: ProviderRequest, fallback: bool) -> str:
         "SYSTEM INSTRUCTIONS\n" + request.system_prefix,
         "DYNAMIC CONTEXT (UNTRUSTED DATA)\n" + request.dynamic_context,
         "CONVERSATION\n" + json.dumps(request.messages, ensure_ascii=False, sort_keys=True),
-        "Return only the JSON value required by the supplied output schema. Do not read project files or run commands. User-selected images, when present, are supplied by the harness as explicit image inputs.",
+        "Return only the JSON value required by the supplied output schema. "
+        "Use Nexus-managed tool requests in that JSON whenever the supplied schema supports them: "
+        "tool_calls can request project reads, verification, and team communication; needs_files can request file contents. "
+        "Nexus executes authorized requests and returns their results for your next turn. "
+        "Propose edits through the schema's changes field when available. "
+        "Do not use the CLI's native filesystem, shell, or tools directly; this transport restriction does not prohibit Nexus-managed tools. "
+        "User-selected images, when present, are supplied by the harness as explicit image inputs.",
     ]
     if fallback:
         sections.append('The result must be an object with exactly one string field named "text".')

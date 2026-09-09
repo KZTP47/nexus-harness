@@ -1613,6 +1613,34 @@ class SwarmRunStore:
                 return self._row(row)
         return None
 
+    def purge_conversation(self, chat_id: str) -> None:
+        """Erase terminal conversation payloads while fencing old request IDs.
+
+        The caller holds the logical conversation lease. The remaining sealed
+        rows are content-free replay fences, not recoverable conversations.
+        """
+        with self._tx() as db:
+            owned = []
+            for row in db.execute("SELECT * FROM runs WHERE project_authority=?", (self.authority,)).fetchall():
+                self._verify_run(db, row)
+                if json.loads(row["snapshot_json"]).get("chat_key") != chat_id:
+                    continue
+                if row["status"] in {"accepted", "running", "stopping"}:
+                    raise HarnessError("The chat run is still stopping; retry deletion after it settles.")
+                owned.append(row)
+            for row in owned:
+                snapshot = _canonical({"schema_version": 1, "kind": "purged_chat",
+                    "chat_key": chat_id, "contract": "conversation-purge/v1",
+                    "authority": self.authority})
+                digest = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()
+                db.execute("DELETE FROM events WHERE run_id=?", (row["run_id"],))
+                db.execute("DELETE FROM provider_effects WHERE run_id=?", (row["run_id"],))
+                db.execute("UPDATE runs SET snapshot_json=?,snapshot_sha256=?,result_json=NULL,error='',"
+                    "status='stopped',stop_requested=1,event_count=0,event_head='',"
+                    "effect_status='',effect_id='',effect_digest='',effect_ordinal=0,checkpoint_ordinal=0 "
+                    "WHERE run_id=?", (snapshot, digest, row["run_id"]))
+                self._seal_run(db, row["run_id"])
+
     def active_runs(self) -> list[dict[str, Any]]:
         """Return every verified active command for this project authority.
 
