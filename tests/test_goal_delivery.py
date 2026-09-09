@@ -42,7 +42,8 @@ class GoalDeliveryTests(unittest.TestCase):
         self.assertEqual(receipt["files"], [{"path": "arbitrary game/start.html",
                                            "sha256": self.manifest["arbitrary game/start.html"][5:]}])
         reopened = json.loads(json.dumps({**self.goal, "delivery_receipt": receipt, "status": "complete"}))
-        self.assertIn(str(self.source / "arbitrary game/start.html"), chat._long_horizon_status_text(reopened))
+        self.assertIn(str((self.source / "arbitrary game/start.html").resolve()),
+                      chat._long_horizon_status_text(reopened))
         # Reopening completed history must not endorse an earlier agent claim.
         self.assertEqual(goal_delivery.report_metadata(reopened)["delivery_state"], "working_copy_report")
         (self.source / "arbitrary game/start.html").write_text("changed after publication")
