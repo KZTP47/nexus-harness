@@ -127,6 +127,12 @@ Other partition counts retain their ordinary assignment; exact-once coverage
 tests protect both paths. These measurements guide placement, not a promise
 that hosted machines always run at the same speed.
 
+For 0.2.20, the expanded board/chat module is assigned to part 4 so it no
+longer shares part 3 with `test_swarm_work`. Checks run `34361226193` passed
+all 961 tests in part 3 in 698 seconds, but the job was cancelled after
+exceeding its own timeout. Moving the complete board module preserves every
+test exactly once, the eight-job count, and all existing time limits.
+
 Immediately before the externally visible publication step, run the read-only
 check with enough reserve for that step and the downstream public readback:
 

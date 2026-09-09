@@ -67,8 +67,9 @@ class SplittingTheTestsTests(unittest.TestCase):
             for name in self.split.files_for((number, 8), names)
         }
         self.assertEqual(owners["test_swarm_work"], 3)
+        self.assertEqual(owners["test_the_board_of_agents"], 4)
         for index, name in enumerate(names):
-            if name != "test_swarm_work":
+            if name not in {"test_swarm_work", "test_the_board_of_agents"}:
                 with self.subTest(name=name):
                     self.assertEqual(owners[name], index % 8 + 1)
 

@@ -27,8 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 
 # A complete part-8 timing profile found the swarm suite dominates its runtime.
-# Move the whole module to a less busy CI part without reshuffling other files.
-EIGHT_PART_ASSIGNMENTS = {"test_swarm_work": 3}
+# Keep that placement, but separate the growing HTTP/board suite: together they
+# took 698 seconds in run 34361226193, exhausting part 3's job deadline.
+# Part 4 finished substantially earlier and can own the complete board module.
+EIGHT_PART_ASSIGNMENTS = {"test_swarm_work": 3, "test_the_board_of_agents": 4}
 
 
 def every_test_file() -> list[str]:
