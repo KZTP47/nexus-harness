@@ -78,4 +78,3 @@ test('composer permissions persist per binding, reach request identity and reuse
     assert.equal(await toggle.getAttribute('aria-expanded'),'false','outside click dismisses');
   } finally {await browser.close();}
 });
-
