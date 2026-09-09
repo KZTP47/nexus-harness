@@ -1,6 +1,6 @@
 from unittest import TestCase, mock
 from tests import test_long_horizon as fixtures
-from our_harness import long_horizon
+from our_harness import long_horizon, goal_closeout
 
 
 class SameProjectCompletionTests(TestCase):
@@ -16,6 +16,16 @@ class SameProjectCompletionTests(TestCase):
             for task in document['tasks']:
                 task['state'] = 'complete'
         self.store._mutate(goal['goal_id'], ready)
+        goal_closeout.stage(self.store, goal['goal_id'], {'status': 'passed'}, lambda _a, _b: True)
+        judge = self.store.claim_ready(goal['goal_id'], 'completion-judge')[0]
+        self.assertTrue(judge.get('closeout_packet'))
+        merkle, manifest = long_horizon.swarm_work._project_tree_merkle(long_horizon._execution_root(goal))
+        self.store.apply_action(goal['goal_id'], judge, fixtures.action(
+            review_verdict='approve', review_findings=['All completion criteria were checked.'],
+            evidence=['review-packet:' + judge['review_packet_sha256']],
+            criteria_evidence=[{'criterion': criterion, 'evidence_refs': ['task:' + goal['tasks'][0]['id']]}
+                for criterion in judge['closeout_packet']['scope']['acceptance_criteria']]),
+            artifact={'kind': 'verified_no_change', 'tree_merkle': merkle, 'file_count': len(manifest)})
         return goal['goal_id']
 
     def test_pause_prevents_publication_even_if_verifier_loaded_the_paused_revision(self):

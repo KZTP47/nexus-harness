@@ -9,6 +9,7 @@ from unittest import mock
 
 from our_harness import long_horizon
 from tests import test_long_horizon as legacy_fixture
+from tests.closeout_fixture import judge_reply
 
 
 class SameProjectConcurrencyTests(unittest.TestCase):
@@ -49,7 +50,7 @@ class SameProjectConcurrencyTests(unittest.TestCase):
     def test_same_project_saved_chats_overlap_and_publish_b_then_a_without_lost_results(self):
         entered = {suffix: threading.Event() for suffix in "ab"}
         released = {suffix: threading.Event() for suffix in "ab"}
-        calls, verification_roots = [], []
+        calls, verification_roots, judges = [], [], []
         calls_lock = threading.Lock()
 
         def provider(_config, route, _text, **kwargs):
@@ -57,6 +58,11 @@ class SameProjectConcurrencyTests(unittest.TestCase):
             suffix = "a" if "NEXUS-ISOLATED-A" in context else "b"
             self.assertIn(f"NEXUS-ISOLATED-{suffix.upper()}", context)
             kwargs["before_provider_dispatch"]("initial")
+            judged = judge_reply(context)
+            if judged:
+                judges.append(suffix)
+                kwargs["after_provider_response"]("initial")
+                return judged
             with calls_lock:
                 calls.append((suffix, route))
                 first_reply = sum(one[0] == suffix for one in calls) == 1
@@ -108,6 +114,7 @@ class SameProjectConcurrencyTests(unittest.TestCase):
                 for suffix in "ab":
                     self.assertEqual((self.project / f"result-{suffix}.txt").read_text(), f"{suffix} complete\n")
                 self.assertEqual([one[0] for one in verification_roots], ["b", "a"])
+                self.assertEqual(judges, ["b", "a"])
                 self.assertEqual(set(calls), {(suffix, route) for suffix in "ab" for route in ("codex", "claude")})
                 for one in (first_done, second_done):
                     events = self.runtime.store.events(one["goal_id"])["events"]

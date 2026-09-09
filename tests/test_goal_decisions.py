@@ -552,7 +552,17 @@ class GoalDecisionTests(unittest.TestCase):
             fixtures.reply(summary='I checked the result and agree it is complete.'),
         ]
         seen = []
-        provider = fixtures.LongHorizonDialogueTests.provider(self, responses, seen)
+        worker_provider = fixtures.LongHorizonDialogueTests.provider(self, responses, seen)
+        judges = []
+        def provider(*args, **kwargs):
+            from tests.closeout_fixture import judge_reply
+            judged = judge_reply(kwargs['context'])
+            if judged:
+                judges.append(kwargs['context'])
+                kwargs['before_provider_dispatch']('initial')
+                kwargs['after_provider_response']('initial')
+                return judged
+            return worker_provider(*args, **kwargs)
         with mock.patch.object(long_horizon.chat_lab, 'ask_once', side_effect=provider), mock.patch.object(
                 long_horizon.swarm_work, '_run_selected_project_verification',
                 return_value={'status':'passed','basis':'independent deterministic fixture check'}):
@@ -567,6 +577,7 @@ class GoalDecisionTests(unittest.TestCase):
                     pending_ids=second['decision_reconsideration']['pending_ids'])
         self.assertEqual(result['status'], 'complete', result['note'])
         self.assertEqual(len(seen), 5)
+        self.assertEqual(len(judges), 1)
         self.assertEqual(seen[2][0], 'builder-route')
         self.assertIn('EXACT_CHECKPOINT_DESTINATION', seen[3][1])
         self.assertIn('CONTEXT TOOL RESULTS', seen[3][1])
