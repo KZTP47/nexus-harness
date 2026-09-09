@@ -1,4 +1,4 @@
-# Collaboration discussion audit — v0.2.21
+# Collaboration discussion audit — v0.2.22
 
 The later discussion replaced a compulsory writer/reviewer handoff with a user
 choice between fixed roles and flexible collaboration. It also explicitly accepted
@@ -29,3 +29,10 @@ changed files, instructions, verification settings or access decisions invalidat
 New goals use these versioned contracts. Existing goals preserve their saved execution
 contract; they are not silently granted broader tools or workspace access. The complete
 Python suite and installed-app release acceptance remain required release checks.
+
+The unpublished v0.2.21 candidate failed fresh Windows installation twice with
+`0xC0000005`. Its Electron Builder 25 dependency contained the known unsafe
+per-user known-folder copy. Version 0.2.22 pins Electron Builder 26.15.3, which
+contains the upstream bounded Unicode copy and preserves redirected per-user
+installation folders. The installer checks remain mandatory; failed candidates
+are not published or replaced in place.

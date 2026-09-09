@@ -1,6 +1,6 @@
 {
   "name": "our-harness-desktop",
-  "version": "0.2.21",
+  "version": "0.2.22",
   "description": "Desktop window for the Nexus Harness control panel",
   "main": "main.js",
   "private": true,
@@ -27,7 +27,7 @@
   },
   "devDependencies": {
     "electron": "^43.4.1",
-    "electron-builder": "^25.0.0"
+    "electron-builder": "26.15.3"
   },
   "build": {
     "appId": "local.ourharness.desktop",
