@@ -51,7 +51,17 @@ def atomic_write(path: Path, content: bytes, mode: int | None = None) -> None:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        for attempt in range(20):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError as exc:
+                # Windows readers/indexers can briefly deny atomic replacement.
+                # Retry the same complete temporary file without deleting the
+                # previous version or relaxing its permissions.
+                if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 19:
+                    raise
+                time.sleep(0.025)
         if mode is not None:
             path.chmod(mode)
     finally:

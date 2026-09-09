@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from our_harness import agent_workspaces as aw, goal_workspaces as gw
+from our_harness import agent_workspaces as aw, goal_workspaces as gw, changes as file_changes
 from our_harness.changes import FileTransaction
 from our_harness.models import HarnessError, ProviderWorkspaceContext
 from our_harness.swarm_work import _validated_changes
@@ -41,15 +41,15 @@ class AgentWorkspaces(unittest.TestCase):
         state = aw._read(home, folder)
         error = PermissionError("transient reader lock")
         error.winerror = 32
-        write = aw.atomic_write
+        write = file_changes.os.replace
         calls = []
-        def locked(path, content):
+        def locked(path, destination):
             calls.append(path)
             if len(calls) == 1:
                 self.assertEqual(aw._read(home, folder), state)
                 raise error
-            return write(path, content)
-        with patch.object(aw, "atomic_write", side_effect=locked), patch.object(aw.time, "sleep"):
+            return write(path, destination)
+        with patch.object(file_changes.os, "replace", side_effect=locked), patch.object(file_changes.time, "sleep"):
             aw._write(home, folder, state)
         self.assertEqual(len(calls), 2)
         self.assertEqual(aw.existing_root(self.goal, self.agents[0], self.runtime), root)
@@ -64,7 +64,7 @@ class AgentWorkspaces(unittest.TestCase):
             error = PermissionError("persistent denial")
             if windows_code is not None:
                 error.winerror = windows_code
-            with patch.object(aw, "atomic_write", side_effect=error) as write, patch.object(aw.time, "sleep"):
+            with patch.object(file_changes.os, "replace", side_effect=error) as write, patch.object(file_changes.time, "sleep"):
                 with self.assertRaises(PermissionError):
                     aw._write(home, folder, {**state, "baseline": {}})
                 self.assertEqual(write.call_count, attempts)
