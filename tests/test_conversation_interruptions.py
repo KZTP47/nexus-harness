@@ -162,7 +162,8 @@ class PlanningInterruptionTests(unittest.TestCase):
 
     def test_real_retrieval_advances_but_missing_and_repeated_files_do_not(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
+            canonical = Path(folder).resolve()
+            root = canonical / ".." / canonical.name
             guard = swarm_work._ProgressGuard()
             state = (swarm_work._canonical_progress_state("agent", False, False, {"remaining": ["Inspect"]}),)
             for number in range(20):

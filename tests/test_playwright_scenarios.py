@@ -46,7 +46,10 @@ class LocalPlaywrightScenarioTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == 'nt', 'Windows contained ordinary local suite')
     def test_ordinary_local_suite_fixtures_loops_keyboard_modules_and_selection(self):
-        runtime = swarm_work.discover_bundled_playwright_runtime(required=True)
+        runtime = swarm_work.discover_bundled_playwright_runtime(
+            required=os.environ.get('NEXUS_REQUIRE_BROWSER_RUNTIME_TESTS') == '1')
+        if runtime is None:
+            self.skipTest('Bundled-browser integration runs in the required desktop CI job')
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'nested').mkdir()

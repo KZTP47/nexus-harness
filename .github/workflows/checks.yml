@@ -217,6 +217,12 @@ jobs:
         env:
           NEXUS_UNSIGNED_DEV: "1"
         run: npm run build -- --win dir
+      - name: Verify contained browser execution with the built runtime
+        env:
+          NEXUS_REQUIRE_BROWSER_RUNTIME_TESTS: "1"
+        run: >-
+          & ./desktop/build-output/win-unpacked/resources/runtime/python.exe -c
+          "import sys,unittest; sys.path[:0]=['src','.']; unittest.main(module=None, argv=['runtime-check','tests.test_playwright_scenarios.LocalPlaywrightScenarioTests.test_ordinary_local_suite_fixtures_loops_keyboard_modules_and_selection'])"
       - name: Run its tests
         # Browser-backed unit tests use the runtime from this exact build.
         # A clean checkout does not have a previous bundled browser to reuse.

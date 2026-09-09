@@ -380,6 +380,7 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
     for packaged_name in (
         "multi-vendor.e2e.js", "long-horizon.smoke.js", "team-chat.smoke.js",
         "goal-access.test.js", "goal-recovery.test.js", "provider-reconnect.test.js",
+        "chat-qol.test.js", "composer-permissions.test.js",
     ):
         packaged_e2e = (ROOT / "desktop" / packaged_name).read_text(encoding="utf-8")
         pressed.update(re.findall(
@@ -389,7 +390,7 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
             r'page\.locator\("#([A-Za-z0-9_]+)"\)\.selectOption\(', packaged_e2e
         ))
         said.extend(re.findall(
-            r'getByRole\(\s*"button",\s*\{[^}]*\bname:\s*"([^"]+)"[^}]*\}\s*,?\s*\)',
+            r'''getByRole\(\s*["']button["'],\s*\{[^}]*\bname:\s*["']([^"']+)["'][^}]*\}\s*,?\s*\)''',
             packaged_e2e,
         ))
     return pressed, " ".join(said), chosen

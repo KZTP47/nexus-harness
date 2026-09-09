@@ -2834,6 +2834,7 @@ def _safe_query_paths(root: Path, query: str) -> tuple[list[Path], str]:
 
 def _requested_files(root: Path, plans: list[tuple[dict[str, Any], dict[str, Any]]],
                      *, observations: set[str] | None = None) -> str:
+    root = root.resolve()
     wanted: list[str] = []
     for _agent_row, plan in plans:
         raw = plan.get("needs_files", [])
