@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 import json
 import threading
 import urllib.error
@@ -18,6 +19,15 @@ class ProviderReconnectTests(unittest.TestCase):
     setUp = fixtures.LongHorizonDialogueTests.setUp
     run_replies = fixtures.LongHorizonDialogueTests.run_replies
     provider = fixtures.LongHorizonDialogueTests.provider
+
+    def test_destination_uses_canonical_project_root_for_path_aliases(self):
+        root = self.config.project_root
+        self.config = replace(self.config, project_root=root / ".." / root.name)
+        self.prepare(goal=False)
+        destination = chat.chat_destination(self.config, "builder-route", self.conversation["filed_as"])
+        self.assertTrue(destination["transcript_path"].startswith(".harness/chats/"))
+        self.assertNotIn("..", destination["collaboration_path"])
+        self.assertTrue((root / destination["transcript_path"]).is_file())
 
     def prepare(self, *, interrupted=False, goal=True, kind="local"):
         self.executable = self.base / "portable-assistant.cmd"

@@ -16,8 +16,9 @@ test("live scheduler milestones appear in both chat renderers before answers and
   timeout: 45000,
   skip: !fs.existsSync(manifestPath) && !process.env.NEXUS_TEST_CHROMIUM,
 }, async () => {
-  const fixture = spawnSync("python", ["-c",
-    "import json; from tests.test_goal_chat_progress import runner_fixture; print(json.dumps(runner_fixture()))"],
+  const bundledPython = path.join(runtime, "python.exe");
+  const fixture = spawnSync(fs.existsSync(bundledPython) ? bundledPython : "python", ["-c",
+    "import json,sys; from pathlib import Path; sys.path[:0]=[str(Path.cwd()),str(Path('src').resolve())]; from tests.test_goal_chat_progress import runner_fixture; print(json.dumps(runner_fixture()))"],
     {cwd: root, encoding: "utf8", timeout: 20000, windowsHide: true});
   assert.equal(fixture.status, 0, fixture.stderr);
   const stages = JSON.parse(fixture.stdout);

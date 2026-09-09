@@ -579,11 +579,14 @@ def chat_destination(
         from .collaboration_ledger import ledger_paths
 
         ledger = ledger_paths(config, named, filed_as)
+        # Windows can return a long path for a confined file while the
+        # configured root uses its 8.3 alias. Compare canonical roots.
+        project_root = config.project_root.resolve()
         return {
-            "transcript_path": where.relative_to(config.project_root).as_posix(),
+            "transcript_path": where.resolve().relative_to(project_root).as_posix(),
             "transcript_exists": where.is_file(),
-            "collaboration_path": ledger.markdown.relative_to(
-                config.project_root
+            "collaboration_path": ledger.markdown.resolve().relative_to(
+                project_root
             ).as_posix(),
             "collaboration_exists": ledger.markdown.is_file(),
         }
