@@ -1,4 +1,4 @@
-# Collaboration discussion audit — v0.2.22
+# Collaboration discussion audit — v0.2.23
 
 The later discussion replaced a compulsory writer/reviewer handoff with a user
 choice between fixed roles and flexible collaboration. It also explicitly accepted
@@ -36,3 +36,10 @@ per-user known-folder copy. Version 0.2.22 pins Electron Builder 26.15.3, which
 contains the upstream bounded Unicode copy and preserves redirected per-user
 installation folders. The installer checks remain mandatory; failed candidates
 are not published or replaced in place.
+
+The v0.2.22 app passed all installed-app checks and was published, but the public
+source-ZIP bootstrap rejected its new application description after installation.
+Version 0.2.23 recognizes both exact product-owned application descriptions while
+keeping installer descriptions, publisher/product identity and versions strict.
+Real Windows executable tests cover old/new metadata and rejected lookalikes;
+the offline installation/desktop-redirection test now uses the new app metadata.

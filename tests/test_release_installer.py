@@ -65,6 +65,7 @@ def _windows_powershell() -> str:
 def _compile_unsigned_windows_executable(
     output: Path, *, version: str = "9.8.7", nexus_metadata: bool = True,
     exit_code: int = 0, marker_path: Path | None = None,
+    description: str = "Desktop window for the Nexus Harness control panel",
 ) -> None:
     framework = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Microsoft.NET"
     candidates = (
@@ -77,7 +78,7 @@ def _compile_unsigned_windows_executable(
     attributes = ""
     if nexus_metadata:
         attributes = f'''\
-[assembly: AssemblyTitle("Desktop window for the Nexus Harness control panel")]
+[assembly: AssemblyTitle("{description}")]
 [assembly: AssemblyCompany("Nexus Harness")]
 [assembly: AssemblyProduct("Nexus Harness")]
 [assembly: AssemblyFileVersion("{version}.0")]
@@ -166,6 +167,50 @@ def _copy_product_bound_bootstrap(destination: Path, *, version: str, digest: st
 
 
 class ReleaseInstallerTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows executable identity contract")
+    def test_builder_application_descriptions_keep_installer_and_version_checks_strict(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            for name, description in (
+                ("legacy", "Desktop window for the Nexus Harness control panel"),
+                ("current", "Nexus Harness"),
+                ("lookalike", "Nexus Harness Preview"),
+            ):
+                _compile_unsigned_windows_executable(
+                    base / f"{name}.exe", description=description
+                )
+            probe = base / "identity.ps1"
+            probe.write_text(r'''param([string] $Bootstrap, [string] $Fixtures)
+$ErrorActionPreference = 'Stop'
+. $Bootstrap -LoadFunctionsOnly
+Assert-NexusInstallerVersionInfo (Join-Path $Fixtures 'legacy.exe') '9.8.7'
+Assert-NexusInstallerVersionInfo (Join-Path $Fixtures 'legacy.exe') '9.8.7' 'installed application'
+Assert-NexusInstallerVersionInfo (Join-Path $Fixtures 'current.exe') '9.8.7' 'installed application'
+$cases = @(
+    @('current.exe', '9.8.7', 'installer'),
+    @('current.exe', '9.8.6', 'installed application'),
+    @('lookalike.exe', '9.8.7', 'installed application')
+)
+foreach ($case in $cases) {
+    $rejected = $false
+    try { Assert-NexusInstallerVersionInfo (Join-Path $Fixtures $case[0]) $case[1] $case[2] }
+    catch { $rejected = $true }
+    if (-not $rejected) { throw "Identity mismatch accepted: $case" }
+}
+Write-Output 'EXACT_ARTIFACT_IDENTITIES_VERIFIED'
+''', encoding="utf-8")
+            for host in _powershell_hosts():
+                with self.subTest(host=host):
+                    result = subprocess.run(
+                        [host, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                         "-File", str(probe), "-Bootstrap",
+                         str(ROOT / "scripts" / "install_nexus_harness.ps1"),
+                         "-Fixtures", str(base)],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("EXACT_ARTIFACT_IDENTITIES_VERIFIED", result.stdout)
+
     def assertSamePhysicalPath(self, actual: str | Path, expected: str | Path) -> None:
         actual_path = Path(actual)
         expected_path = Path(expected)
@@ -658,7 +703,9 @@ exit $process.ExitCode
             installed_folder = base / "Policy-redirected User Programs" / "Nexus Harness"
             installed_folder.mkdir(parents=True)
             installed = installed_folder / "Nexus Harness.exe"
-            shutil.copy2(installer_path, installed)
+            _compile_unsigned_windows_executable(
+                installed, version=version, description="Nexus Harness"
+            )
             wrong_installed = base / "wrong-version-installed.exe"
             _compile_unsigned_windows_executable(
                 wrong_installed, version="9.8.6", nexus_metadata=True

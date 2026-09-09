@@ -428,9 +428,18 @@ function Assert-NexusInstallerVersionInfo(
     [string] $ArtifactName = 'installer'
 ) {
     $versionInfo = (Get-Item -LiteralPath $InstallerPath).VersionInfo
+    # Electron Builder 26 uses productName for the application description;
+    # its NSIS installer still uses the package description. Older installed
+    # versions used that package description too. Accept only these exact
+    # product-owned descriptions, with the shorter one limited to app checks.
+    $descriptionMatches = (
+        [string]$versionInfo.FileDescription -ceq 'Desktop window for the Nexus Harness control panel' -or
+        ($ArtifactName -ceq 'installed application' -and
+         [string]$versionInfo.FileDescription -ceq 'Nexus Harness')
+    )
     if ([string]$versionInfo.ProductName -cne 'Nexus Harness' -or
         [string]$versionInfo.CompanyName -cne 'Nexus Harness' -or
-        [string]$versionInfo.FileDescription -cne 'Desktop window for the Nexus Harness control panel') {
+        -not $descriptionMatches) {
         throw "The $ArtifactName Windows product metadata does not identify the exact Nexus Harness application; nothing was run."
     }
     if (-not (Test-NexusFileVersion ([string]$versionInfo.FileVersion) $ExpectedVersion) -or
