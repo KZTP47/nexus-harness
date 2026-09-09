@@ -119,6 +119,18 @@ coordination = Path(sys.argv[1])
 route = sys.argv[2]
 payload = json.loads(sys.stdin.read())
 context = str(payload.get("dynamic_context") or "")
+if context.startswith("INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE"):
+    packet, _ = json.JSONDecoder().raw_decode(context[context.index('{'):])
+    assert packet['verification']['status'] == 'passed'
+    assert packet['scope']['original_prompt'] and packet['scope']['current_goal']
+    refs = ['file:' + name for name in packet['submitted_files']['path_preview']]
+    answer = {'action':'complete','summary':'Independent original-goal review passed',
+              'evidence':['review-packet:' + packet['fingerprint']], 'risk':'low', 'changes':[],
+              'needs_files':[], 'tool_calls':[], 'tasks':[], 'handoff_agent_id':'', 'questions':[],
+              'review_verdict':'approve', 'review_findings':['The exact original request and submitted result are satisfied.'],
+              'criteria_evidence':[{'criterion':c,'evidence_refs':refs[:20]} for c in packet['scope']['acceptance_criteria']]}
+    print(json.dumps({'text':json.dumps(answer),'finish_reason':'stop'}))
+    sys.exit(0)
 project_tree = context.split("\\n\\nPROJECT TREE\\n", 1)[1].split("\\n\\nREQUESTED FILE CONTENTS\\n", 1)[0]
 if "${RECOVERY_MARKER}" in context:
     stem = "recovered"
@@ -547,7 +559,7 @@ function assertExactTeamGoal(goal, expectedRequestId = "") {
     `Goal changed its required participant set: ${JSON.stringify(requested)}`,
   );
   const participantTasks = (goal.tasks || []).filter(
-    (task) => expectedAgents.includes(task.assigned_agent_id),
+    (task) => task.kind !== "review" && expectedAgents.includes(task.assigned_agent_id),
   );
   assert(participantTasks.length === 2, `Expected exactly two participant tasks: ${JSON.stringify(goal.tasks)}`);
   assert(
@@ -559,9 +571,11 @@ function assertExactTeamGoal(goal, expectedRequestId = "") {
     `A required provider was not acknowledged exactly once: ${JSON.stringify(participantTasks)}`,
   );
   assert(
-    Number(goal.budget?.provider_calls) === 2,
-    `Expected exactly two provider calls: ${JSON.stringify(goal.budget)}`,
+    Number(goal.budget?.provider_calls) === 3,
+    `Expected two participants plus one independent judge: ${JSON.stringify(goal.budget)}`,
   );
+  const judges = (goal.tasks || []).filter(task => task.closeout_packet);
+  assert(judges.length === 1 && judges[0].closeout_outcome?.verdict === "approve", "The independent judge did not approve this exact goal.");
   assert(goal.verification?.status === "passed", `Verification did not pass: ${JSON.stringify(goal.verification)}`);
   assert(
     (goal.verification?.criteria_results || []).length > 0

@@ -15,6 +15,7 @@ from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import CommandResult, ProviderWorkspaceContext
 from our_harness.providers.base import OpenAIProvider
 from our_harness.providers import codex_cli
+from test_document_text import make_docx
 
 
 class AttachmentInputFidelityTests(unittest.TestCase):
@@ -141,6 +142,37 @@ class AttachmentInputFidelityTests(unittest.TestCase):
                 self.assertEqual(found, {"type": mime, "width": dimensions[0], "height": dimensions[1]})
         self.assertIsNone(images.attachment_image_metadata(b"not an image"))
         self.assertNotIn("width", images.attachment_image_metadata(jpeg[:8]))
+
+    def test_word_prompt_reaches_openai_and_codex_without_provider_document_support(self):
+        marker = "Implement the cafés listed in the Word prompt."
+        raw = make_docx(marker)
+        _public, files, context = chat.keep_attachments(self.config, "", [{
+            "name": "Task.docx", "data": base64.b64encode(raw).decode(),
+        }], "word-prompt")
+        for mode in ("chat-completions", "responses"):
+            self.config.data["provider"]["api_mode"] = mode
+            provider = OpenAIProvider(self.config)
+            response = ({"choices": [{"message": {"content": "received"}, "finish_reason": "stop"}]}
+                if mode == "chat-completions" else {"id": "word-response", "status": "completed",
+                    "output": [{"type": "message", "content": [{"type": "output_text", "text": "received"}]}]})
+            with mock.patch.object(provider, "_post", return_value=response) as posted:
+                self.ask(provider, files, context)
+            self.assertIn(marker, json.dumps(posted.call_args.args[1], ensure_ascii=False))
+        provider = codex_cli.CodexCLIProvider(self.config)
+        provider._preflight_complete = True
+        observed = {}
+
+        def execute(argv, **kwargs):
+            observed["prompt"] = kwargs["stdin_text"]
+            Path(argv[argv.index("--output-last-message") + 1]).write_text('{"text":"received"}', encoding="utf-8")
+            return CommandResult(argv, str(kwargs["cwd"]), 0, '{"type":"turn.completed"}', "", 1)
+
+        catalog = json.dumps({"models": [{"slug": "fixture-model", "supported_reasoning_levels": []}]})
+        with mock.patch.object(provider, "_command", return_value=["synthetic-codex"]), \
+                mock.patch.object(codex_cli, "_bundled_model_catalog", return_value=catalog), \
+                mock.patch.object(codex_cli, "_run_bounded", side_effect=execute):
+            self.ask(provider, files, context)
+        self.assertIn(marker, observed["prompt"])
 
 
 if __name__ == "__main__":

@@ -536,6 +536,56 @@ nonconflicting results back to that project with baseline checks and rollback
 backups; conflicting edits pause for reconciliation. While that goal is active,
 **Send to team** updates its instructions, including during an agent turn.
 Replies for superseded instructions cannot overwrite the new direction.
+New project goals give each agent a persistent, independent project copy.
+Open the chat's **Permissions** control and select **View project and agent copies**
+to browse the real project and each agent's files. An agent's copy becomes
+available when that agent first starts work. Rejected drafts remain available
+while the agent revises them. Nexus collects actual file changes, runs the project's
+verification and a separate final judge, and publishes accepted results with conflict checks. Review requests for changes return to the author;
+failed checks create repair work. Retry budgets and unresolved conflicts can
+pause the goal instead of looping forever.
+
+Choose **Flexible collaboration** or **Fixed writer and reviewer** in the chat's
+**Permissions** menu, before starting a goal or while the team is paused. Flexible
+agents can inspect all three workspaces, edit either draft, exchange feedback and
+request test snapshots without a mandatory handoff. Fixed mode reserves Nexus edits
+for the selected writer and formal approval for the selected reviewer. Existing
+risk checks still apply. **Allow direct editing of the real project** is a separate
+option, off by default; enabling it permits edits to reach the real files before
+review and tests. Normal native permission checks still apply, and these settings
+are not an OS security sandbox.
+
+Ordinary formal reviews now use a separate snapshot containing the author's exact
+submitted changes, including unchanged dependencies. Testing uses a disposable
+copy of that snapshot. A changed submission triggers a fresh review. Workspace
+reads and edits use goal-owned IDs and fingerprints so an outdated peer edit cannot
+silently overwrite newer work.
+
+New project goals also get a final, separate judge run before publication. The
+judge receives the original prompt, later clarifications, all acceptance criteria,
+and an exact snapshot of the submitted project. It checks the whole request,
+including work omitted from the agents' task breakdown. A rejection sends concrete
+missing-work findings to the responsible author with the original goal retained
+in context. Repairs need a fresh judgment; changing the request or files invalidates
+an earlier approval. Repeated unchanged failures pause for attention.
+
+For connected Codex CLI and Claude Code agents, **Full project access** enables
+native file tools, commands, web research and locally available skills in those
+copies. **Ask before commands** and **Read only** retain their narrower access.
+This is the agents' normal permission system, not an OS security sandbox: native
+commands may access resources outside the copy. Codex uses its Full access
+sandbox setting with on-request approval rules; Claude uses acceptEdits and
+normal command/web allow rules. Neither uses the skip-permissions/bypass flag.
+Managed policies and explicit tool denials still apply. Nexus continues to gate
+publication, but copying files alone cannot contain arbitrary command effects.
+
+The CLI must be installed and signed in. Codex retains Nexus's user-config
+isolation for desktop/CLI schema compatibility, so tools configured only in
+that config file are not automatically inherited. Desktop-only plugins and
+browsers are not provided by connecting a model or CLI. API and web routes use
+Nexus tools and structured proposals in their own copies. Existing goals retain
+their original workspace contract; start a new project goal to use this flow.
+
 Fenced code replies have a per-block **Copy code** control.
 Everything typed and everything said back has credentials taken
 out before it is written down, and the conversations live in `.harness/chats`,
@@ -697,7 +747,7 @@ when it did not, and dim when a gate stopped the work before it got there.
 | Git repo | Reads which branch you are on and what is uncommitted. It never writes. |
 | AI drafts a test | Asks the model you set up to write a test, and saves it as a draft for you to read. Nothing runs a draft where it is kept. |
 | Keep the evidence | Writes what happened into one file you can send to somebody. |
-| Ask an assistant | Keeps a provider-neutral Nexus conversation, accepts explicit file/screenshot attachments, automatically relays when connected-agent expertise would help, provides per-block code copying, and can apply an explicit bounded project-file transaction. |
+| Ask an assistant | Keeps a provider-neutral Nexus conversation, reads Word documents and ZIP attachments, searches public GitHub for skills and reads their instructions and linked resources, automatically relays when connected-agent expertise would help, provides per-block code copying, and can apply an explicit bounded project-file transaction. |
 | Run another pipeline | Runs one of your saved pipelines as a single step. |
 
 AI test drafts use the provider's displayed output-token budget. A provider-

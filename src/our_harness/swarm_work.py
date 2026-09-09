@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import stat
+import base64
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,7 @@ from .models import (
 )
 from .safety import confined_path
 from .redaction import bounded_redacted_text
+from .research_tools import RESEARCH_TOOL_DEFINITIONS, RESEARCH_INSTRUCTIONS
 from .swarm import SwarmError, may_they_talk
 from .verification import analyze_verification
 from .windows_containment import (
@@ -427,6 +429,8 @@ WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
                 "properties": {
                     "path": {"type": "string", "maxLength": 240},
                     "content": {"type": "string", "maxLength": 500000},
+                    "content_base64": {"type": "string", "maxLength": 700000},
+                    "mode": {"type": ["integer", "null"], "minimum": 0, "maximum": 511, "description": "Use null to preserve existing permissions."},
                     "delete": {"type": "boolean"},
                     "reason": {"type": "string", "maxLength": 1000},
                 },
@@ -454,6 +458,8 @@ WORK_FORMAT = ResponseFormat("nexus_board_file_work_v1", {
                     _context_tool_call_schema(
                         "run_selected_verification", {}, [],
                     ),
+                    *[_context_tool_call_schema(one["name"], copy.deepcopy(one["input_schema"]["properties"]),
+                        list(one["input_schema"]["required"])) for one in RESEARCH_TOOL_DEFINITIONS],
                 ],
             },
         },
@@ -3133,12 +3139,26 @@ def _validated_changes(
         seen.add(relative)
         deleting = raw.get("delete") is True
         content = "" if deleting else str(raw.get("content") or "")
+        encoded = raw.get("content_base64")
+        if encoded:
+            if deleting or content or not isinstance(encoded, str):
+                raise HarnessError("A binary change cannot also contain text or delete the file")
+            try:
+                content = base64.b64decode(encoded, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise HarnessError("A binary file change contains invalid base64") from exc
+        raw_bytes = content if isinstance(content, bytes) else content.encode("utf-8")
+        mode = raw.get("mode")
+        if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o777):
+            raise HarnessError("A file mode must contain only portable permission bits")
         # A provider can ignore the instruction not to return unchanged files.
         # Treat that as no progress rather than creating a misleading backup,
         # transaction id, and execution turn that claims the file changed.
         if deleting and not path.exists():
             continue
-        if not deleting and file_sha256(path) == sha256_bytes(content.encode("utf-8")):
+        if not deleting and file_sha256(path) == sha256_bytes(raw_bytes) and (
+            mode is None or stat.S_IMODE(path.stat().st_mode) == mode
+        ):
             continue
         changes.append(ChangePlan(
             path=relative,
@@ -3146,6 +3166,7 @@ def _validated_changes(
             content=None if deleting else content,
             delete=deleting,
             reason=str(raw.get("reason") or "Board work request")[:1000],
+            mode=mode,
         ))
     return changes
 
@@ -9657,6 +9678,7 @@ class _ProjectContextTools:
         *,
         reset_execution_budget: bool = False,
         verification_profile: str = "legacy",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
         data = copy.deepcopy(config.data)
         if verification_profile == "shared_goal_v1" and config.project_root.resolve() != root.resolve():
@@ -9720,6 +9742,7 @@ class _ProjectContextTools:
                 "run_selected_verification": self._run_selected_verification,
             },
             prepare_tool=self._prepare_tool,
+            attachments=attachments,
         )
         # Long-horizon prompt projections retain 12,000 characters per string.
         # Size each file page before serializing so that projection cannot cut
@@ -10958,7 +10981,8 @@ def work_together(
                             context_for(executor) + "\n\n" + common
                             + "\n\nEXECUTION TURN — YOU ARE THE ACTING AGENT\n"
                             + f"You are {executor_name}. Perform the reviewed contribution now. "
-                              "For iterative repository exploration, return tool_calls using only list_tree, read_file, search_workspace, or run_selected_verification. "
+                              "For iterative exploration, return tool_calls using the tools in the response schema. "
+                              + RESEARCH_INSTRUCTIONS + " "
                               "Tool path arguments are project-relative. Nexus executes these through its bounded read-only agent-tool runtime, records durable call/result IDs, and asks you again with the results. "
                               "When requesting tools, return no file changes in the same response. When evidence is sufficient, return no tool calls and put complete changes through Nexus's transaction layer."
                             + "\n\nYOUR REVIEWED PLAN\n" + _plan_words(latest[str(executor.get("id"))][1])
@@ -10996,6 +11020,7 @@ def work_together(
                             required_effect_paths,
                             requirement_contract,
                             reset_execution_budget=reset_context_tool_execution_budget,
+                            attachments=provider_files,
                         )
                     # Scope provider-local IDs to this accepted response. The
                     # durable event identity is created once before any tool;

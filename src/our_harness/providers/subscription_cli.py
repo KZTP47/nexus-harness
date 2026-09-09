@@ -31,6 +31,7 @@ from ..redaction import CredentialRedactor, bounded_redacted_text
 from .base import Provider
 from . import claude_input
 from .input_context import CLI_WORKSPACE_RULES
+from . import native_execution
 from .codex_cli import (
     _minimal_codex_environment, _private_workspace, _provider_capture_limit, _remaining, _run_bounded,
     codex_config_load_error,
@@ -820,6 +821,8 @@ def _prompt(request: ProviderRequest, *, native_images: bool = False) -> str:
             "No explanation, no fenced block.\n"
             + json.dumps(request.response_format.schema, sort_keys=True)
         )
+    if request.native_execution:
+        sections.append(native_execution.instructions(request))
     return "\n\n".join(sections)
 
 
@@ -869,9 +872,8 @@ class SubscriptionCLIProvider(Provider):
             self.settings.get("arguments") is None
             and self.recipe.id == "claude-cli"
         )
-
     def _effective_dispatch_contract(self) -> str:
-        return f"{self.recipe.id}/effective-dispatch/v1"
+        return f"{self.recipe.id}/effective-dispatch/v2-native-workspace"
 
     def _effective_dispatch_command(self) -> list[str] | None:
         return self._command()
@@ -1067,6 +1069,10 @@ class SubscriptionCLIProvider(Provider):
     def complete(self, request: ProviderRequest) -> ProviderResponse:
         # A saved goal's file operations belong to Nexus, not this process's
         # inherited cwd. Do not load an unrelated project's CLI context.
+        if request.native_execution:
+            native_execution.workspace(request)
+            if self.recipe.id != "claude-cli" or self.settings.get("arguments") is not None:
+                raise HarnessError("Native execution requires the standard Claude CLI route")
         if request.workspace_context is not None and not request.working_directory:
             with _private_workspace("our-harness-provider-") as cwd:
                 return self._complete_in_workspace(replace(request, working_directory=str(cwd)))
@@ -1115,7 +1121,7 @@ class SubscriptionCLIProvider(Provider):
             if self.settings.get("arguments") is not None:
                 raise HarnessError("Claude image inputs require the standard CLI arguments; remove the route's custom arguments")
             argv[argv.index("--output-format") + 1] = "stream-json"
-            argv.extend(["--input-format", "stream-json", "--verbose", "--tools", ""])
+            argv.extend(["--input-format", "stream-json", "--verbose", "--tools", "default" if request.native_execution else ""])
         elif image_paths and recipe.id == "gemini-cli":
             argv.extend(["--allowed-tools", "read_file"])
             for folder in sorted({str(Path(path).parent) for path in image_paths}):
@@ -1123,10 +1129,18 @@ class SubscriptionCLIProvider(Provider):
         elif recipe.id == "claude-cli" and self.settings.get("arguments") is None:
             # Claude Code otherwise inherits its normal tool set even in -p
             # mode. Empty --tools makes this an answer-only provider call.
-            argv.extend(["--tools", ""])
+            argv.extend(["--tools", "default" if request.native_execution else ""])
         if recipe.id == "claude-cli" and self.settings.get("arguments") is None:
             argv.extend(["--no-session-persistence"])
-            if request.workspace_context is not None:
+            if request.native_execution:
+                argv.extend(["--permission-mode", "acceptEdits" if request.native_execution == "work" else "plan"])
+                if request.native_execution == "work":
+                    # Nexus Full is the user's existing command authorization.
+                    # Use normal Claude allow rules; managed/user denials still
+                    # apply, and no skip-permissions or unsupported auto mode is
+                    # required for older configured models.
+                    argv.extend(["--allowedTools", "Bash,WebFetch,WebSearch"])
+            elif request.workspace_context is not None:
                 # Only static instructions enter argv. User-selected paths and
                 # multiline context stay in stdin, including for .cmd launchers.
                 argv.extend(["--append-system-prompt", CLI_WORKSPACE_RULES])

@@ -94,6 +94,18 @@ function reviewPacket(requestBody) {
 }
 
 function providerAction(provider, requestBody) {
+  function closeout(value) {
+    if (typeof value === "string" && value.includes("INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE")) {
+      try { const decoded=JSON.parse(value); if(typeof decoded === "object") return closeout(decoded); } catch {}
+      const context=value.slice(value.indexOf("INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE"));
+      return JSON.parse(context.slice(context.indexOf("{")).split("\n\nREQUESTED SNAPSHOT FILES")[0]);
+    }
+    if (value && typeof value === "object") {
+      for (const child of Object.values(value)) { const found=closeout(child); if(found) return found; }
+    }
+    return null;
+  }
+  const judged = closeout(requestBody);
   const packet = reviewPacket(requestBody);
   const evidence = packet || "verified-no-change";
   return JSON.stringify({
@@ -108,7 +120,9 @@ function providerAction(provider, requestBody) {
     tasks: [],
     handoff_agent_id: "",
     questions: [],
-    criteria_evidence: [
+    criteria_evidence: judged ? judged.scope.acceptance_criteria.map(criterion => ({
+      criterion, evidence_refs: judged.contributions.map(task => `task:${task.id}`).slice(0,20),
+    })) : [
       {criterion: "Original objective is satisfied", evidence_refs: [evidence]},
       {criterion: "Every required task is complete", evidence_refs: [evidence]},
       {criterion: "Configured deterministic verification passes", evidence_refs: [evidence]},
@@ -542,24 +556,25 @@ async function startThreeVendorGoal(page, fixtureState) {
     const progress = await page.locator("#missionProgress").textContent();
     const allTasks = await page.locator("#missionTasks .mission-task-card").count();
     const completeColumns = await page.locator("#missionTasks .mission-task-column")
-      .filter({hasText: "complete (3)"}).count();
+      .filter({hasText: "complete (4)"}).count();
     const completeTasks = await page.locator("#missionTasks .mission-task-column")
-      .filter({hasText: "complete (3)"}).locator(".mission-task-card").count();
-    return /complete/i.test(progress || "") && allTasks === 3
-      && completeTasks === 3 && completeColumns === 1
+      .filter({hasText: "complete (4)"}).locator(".mission-task-card").count();
+    return /complete/i.test(progress || "") && allTasks === 4
+      && completeTasks === 4 && completeColumns === 1
       ? true
       : `${progress} / ${allTasks} total task cards / ${completeTasks} complete tasks`;
   });
-  assert.equal(await page.locator("#missionTasks .mission-task-card").count(), 3);
+  assert.equal(await page.locator("#missionTasks .mission-task-card").count(), 4);
   assert.deepEqual(
     await page.locator("#missionTasks .mission-task-column h3").allTextContents(),
-    ["complete (3)"],
+    ["complete (4)"],
   );
   assert.equal(await page.locator("#missionAgents .mission-agent").count(), 3);
   const requests = fixtureState.requests.slice(firstRequest);
   assertAdapterContracts(requests, "the three-provider mission");
-  const actionRequests = requests.filter((one) => one.schemaKind === "long_horizon_action");
+  const actionRequests = requests.filter((one) => one.schemaKind === "long_horizon_action" && one.phase === "long_horizon_task");
   assert.equal(actionRequests.length, 3, "the mission must dispatch exactly one task per provider");
+  assert.equal(requests.filter(one => one.phase === "long_horizon_review").length, 1, "The mission must run its independent closeout judge");
   assert.deepEqual(
     [...actionRequests.map((one) => one.provider)].sort(),
     ["anthropic", "gemini", "openai"],

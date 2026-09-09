@@ -130,6 +130,7 @@ test("composer permissions share an exact digest with the outbox and backend aft
   const vm = require("node:vm");
   const app = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/app.js"), "utf8");
   const renderer = vm.createContext({crypto: crypto.webcrypto, TextEncoder});
+  vm.runInContext(app.slice(app.indexOf("function chatCollaborationPreference"), app.indexOf("function appendCollaborationControls")), renderer);
   vm.runInContext(app.slice(app.indexOf("function directLongGoalCanonicalValue"),
     app.indexOf("async function prepareDirectLongGoalAdmission")), renderer);
   const python = path.join(__dirname, "build-output/win-unpacked/resources/runtime/python.exe");
@@ -178,6 +179,17 @@ test("same chat is idempotent only for the same request and exact payload", (t) 
     (error) => error.code === "NEXUS_OUTBOX_MISMATCH",
   );
   assert.deepEqual(store.list(), [saved]);
+});
+
+test("collaboration roles and direct-edit permission survive the exact outbox round trip", (t) => {
+  const held=fixture(t);
+  const policy={agent_access_mode:"full",collaboration:{mode:"fixed",writer_id:"alpha",reviewer_id:"beta",allow_direct_real_edits:false}};
+  const exact=record({payload:{policy}});
+  const saved=oneStore(held).save(exact);
+  assert.deepEqual(oneStore(held).read(exact.chat_id,exact.request_id,saved.intent).payload.policy,policy);
+  assert.throws(()=>oneStore(held).save({...exact,payload:{...exact.payload,policy:{...policy,collaboration:{...policy.collaboration,allow_direct_real_edits:true}}}}), (error) => error.code === "NEXUS_OUTBOX_PENDING");
+  assert.throws(()=>oneStore(held).save(record({payload:{policy:{...policy,collaboration:{mode:"bypass"}}}})),/collaboration mode/);
+  assert.throws(()=>oneStore(held).save(record({payload:{policy:{...policy,collaboration:{allow_direct_real_edits:"yes"}}}})),/checkbox/);
 });
 
 test("compare-and-delete never removes a missing, changed, or replacement request", (t) => {

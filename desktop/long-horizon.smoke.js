@@ -81,6 +81,18 @@ if ($isR) {
 $suffix = if ($isA) { 'a' } elseif ($isB) { 'b' } elseif ($isR) { 'r' } else { 'd' }
 $target = "goal-$suffix.txt"
 $wanted = if ($isA) { 'alpha complete' } elseif ($isB) { 'beta complete' } elseif ($isR) { 'recovery complete' } else { 'discard request dispatched' }
+if ($context.StartsWith('INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE')) {
+  $separator = [string][char]10 + [char]10 + 'REQUESTED SNAPSHOT FILES'
+  $json = $context.Substring($context.IndexOf('{')).Split(@($separator), [StringSplitOptions]::None)[0]
+  $packet = $json | ConvertFrom-Json
+  if ($packet.verification.status -ne 'passed') { throw 'Closeout did not receive passing verification.' }
+  $criteria = @($packet.scope.acceptance_criteria | ForEach-Object { @{criterion=$_; evidence_refs=@("file:$target")} })
+  $action = @{action='complete'; summary="Independently checked $target against the whole request"; risk='low'
+    evidence=@("review-packet:$($packet.fingerprint)"); review_verdict='approve'; review_findings=@('The exact submitted result satisfies the original request and checks.')
+    changes=@(); needs_files=@(); tool_calls=@(); tasks=@(); handoff_agent_id=''; questions=@(); criteria_evidence=$criteria}
+  @{text=($action | ConvertTo-Json -Depth 12 -Compress); finish_reason='stop'} | ConvertTo-Json -Depth 15 -Compress
+  exit 0
+}
 if ($isR) {
   [IO.File]::AppendAllText((Join-Path $Coordination 'entered-r.marker'), ($RouteLabel + [Environment]::NewLine))
 } else {
@@ -531,7 +543,13 @@ async function main() {
     ).trim().split(/\r?\n/).filter(Boolean).sort();
     const expectedRecoveryAgents = [AGENT_A, AGENT_B].sort();
     const expectedRecoveryRoutes = ["smoke-a", "smoke-b"];
-    const recoveryTasks = Array.isArray(recoveredGoal.tasks) ? recoveredGoal.tasks : [];
+    const allRecoveryTasks = Array.isArray(recoveredGoal.tasks) ? recoveredGoal.tasks : [];
+    const recoveryTasks = allRecoveryTasks.filter(task => task.kind !== "review");
+    const closeoutReviews = allRecoveryTasks.filter(task => task.closeout_packet);
+    if (closeoutReviews.length !== 1 || closeoutReviews[0].state !== "complete"
+        || closeoutReviews[0].closeout_outcome?.verdict !== "approve") {
+      throw new Error("Recovery did not finish its separate whole-goal judge.");
+    }
     const recoveredTaskAgents = recoveryTasks
       .map((task) => task.assigned_agent_id)
       .filter((agentId) => expectedRecoveryAgents.includes(agentId))
@@ -564,7 +582,7 @@ async function main() {
         || !recoveryDispatchRoutes.every(
           (route, index) => route === expectedRecoveryRoutes[index],
         )
-        || Number(recoveredGoal.budget?.provider_calls) !== expectedRecoveryAgents.length
+        || Number(recoveredGoal.budget?.provider_calls) !== expectedRecoveryAgents.length + 1
         || !exactParticipantDispatch) {
       throw new Error(
         "The recovered request did not dispatch each selected participant exactly once: "

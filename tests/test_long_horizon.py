@@ -23,6 +23,7 @@ from our_harness import server as harness_server
 from our_harness.config import DEFAULT_CONFIG, LoadedConfig
 from our_harness.models import HarnessError
 from our_harness.providers import base as provider_base
+from test_document_text import make_docx
 
 
 THREAD_COORDINATION_TIMEOUT_SECONDS = 30.0
@@ -339,6 +340,14 @@ def _cross_process_runtime_replay(
                 raise RuntimeError("provider release barrier timed out")
             if after:
                 after("initial")
+            context = kwargs.get("context", "")
+            if context.startswith("INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE"):
+                packet, _ = json.JSONDecoder().raw_decode(context[context.index("{"):])
+                return {"text": json.dumps(action(review_verdict="approve",
+                    review_findings=["The exact no-change request is satisfied."],
+                    evidence=["review-packet:" + packet["fingerprint"]],
+                    criteria_evidence=[{"criterion": criterion, "evidence_refs": ["test:verified"]}
+                        for criterion in packet["scope"]["acceptance_criteria"]]))}
             return {"text": json.dumps(action(criteria_evidence=[{
                 "criterion": "Original objective is satisfied",
                 "evidence_refs": ["verified-no-change"],
@@ -397,6 +406,65 @@ def action(kind: str = "complete", **updates):
 
 
 class LongHorizonTests(unittest.TestCase):
+    def test_agent_native_copy_requires_review_before_team_import_and_verification_before_publication(self):
+        from our_harness import agent_workspaces
+        (self.project / "app.txt").write_text("original")
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(self.board, "project", ["Prepare a checked candidate"], "native-copy-test",
+            isolated_workspace=True, participant_ids=["lead", "reviewer"], require_all_participants=False,
+            policy={"agent_access_mode": "full", "collaboration": {"mode": "fixed", "writer_id": "lead", "reviewer_id": "reviewer"}})
+        task = runtime.store.claim_ready(goal["goal_id"], "worker")[0]
+        seen = []
+        def provider(_config, _route, _prompt, **kwargs):
+            kwargs["before_provider_dispatch"]("initial")
+            root = Path(kwargs["working_directory"])
+            self.assertEqual(kwargs["native_execution"], "work")
+            self.assertNotEqual(root, self.project)
+            self.assertNotEqual(root, long_horizon._execution_root(goal))
+            (root / "app.txt").write_text("native candidate")
+            seen.append(root)
+            kwargs["after_provider_response"]("initial")
+            return {"text": json.dumps(action())}
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=provider):
+            claimed, proposal = runtime._execute_one(goal["goal_id"], task["id"])
+        self.assertEqual(proposal["changes"][0]["content"], "native candidate")
+        runtime._apply_node({"goal_id": goal["goal_id"], "actions": [{"task": claimed, "action": proposal}]})
+        self.assertEqual((self.project / "app.txt").read_text(), "original")
+        self.assertEqual((long_horizon._execution_root(goal) / "app.txt").read_text(), "original")
+        review = runtime.store.claim_ready(goal["goal_id"], "review-worker")[0]
+        self.assertEqual(review["kind"], "review")
+        with agent_workspaces.workspace(runtime.store.get(goal["goal_id"]),
+                next(a for a in goal["agents"] if a["id"] == review["assigned_agent_id"]), runtime.store.root) as peer:
+            self.assertNotEqual(peer.root, seen[0])
+        runtime.store.apply_action(goal["goal_id"], review, action("blocked",
+            evidence=["review-packet:" + review["review_packet_sha256"]], review_verdict="changes_requested",
+            review_findings=["Check and revise the candidate before publication."]))
+        repaired = runtime.store.claim_ready(goal["goal_id"], "repair-worker")[0]
+        self.assertEqual(repaired["id"], task["id"])
+        self.assertEqual((seen[0] / "app.txt").read_text(), "native candidate")
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=provider):
+            claimed, proposal = runtime._execute_one(goal["goal_id"], task["id"])
+        runtime._apply_node({"goal_id": goal["goal_id"], "actions": [{"task": claimed, "action": proposal}]})
+        review = runtime.store.claim_ready(goal["goal_id"], "second-review-worker")[0]
+        self.assertEqual(review["kind"], "review")
+        runtime.store.apply_action(goal["goal_id"], review, action("complete",
+            evidence=["review-packet:" + review["review_packet_sha256"]], review_verdict="approve",
+            review_findings=["The exact candidate is confined to app.txt and implements the change."]),
+            artifact={"kind": "verified_no_change", "tree_merkle": "review-snapshot"})
+        runtime._apply_node({"goal_id": goal["goal_id"], "task_ids": [task["id"]]})
+        self.assertEqual((long_horizon._execution_root(goal) / "app.txt").read_text(), "native candidate")
+        self.assertEqual((self.project / "app.txt").read_text(), "original")
+        self.assertEqual(len(runtime.store.public(runtime.store.get(goal["goal_id"]))["workspaces"]), 3)
+        current = runtime.store.get(goal["goal_id"])
+        with long_horizon.goal_workspaces.publication(current, runtime.store.root):
+            receipt = long_horizon.goal_workspaces.prepare_publish(current, runtime.store.root)
+            with mock.patch.object(long_horizon.swarm_work, "_run_selected_project_verification",
+                return_value={"status": "failed", "reason": "required regression failed", "commands": []}):
+                runtime._verify_and_publish({"goal_id": goal["goal_id"]}, receipt=receipt)
+        self.assertEqual((self.project / "app.txt").read_text(), "original")
+        self.assertEqual((seen[0] / "app.txt").read_text(), "native candidate")
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temporary.cleanup)
@@ -1720,6 +1788,10 @@ class LongHorizonTests(unittest.TestCase):
 
         self.assertEqual(status, 202)
         self.assertEqual(answer["engine"], "long_horizon")
+        admitted = runtime.store.get(answer["goals"][0]["goal_id"])
+        self.assertEqual(admitted["agent_workspace_contract"], long_horizon.agent_workspaces.CONTRACT)
+        self.assertNotEqual(long_horizon._execution_root(admitted), self.project)
+        self.assertEqual(len(answer["goals"][0]["workspaces"]), 3)
         self.assertEqual(len(answer["goals"]), 1)
         self.assertEqual(replay_status, 202)
         self.assertEqual(replay["goals"][0]["goal_id"], answer["goals"][0]["goal_id"])
@@ -1965,6 +2037,23 @@ class LongHorizonTests(unittest.TestCase):
                     conversation_id="chat-one",
                     attachments=[{"name": "new.txt", "data": "different"}],
                 )
+
+    def test_fork_of_native_goal_binds_fresh_copies_to_the_new_project(self):
+        store = self.store()
+        source = store.create(self.board, "project", ["Prepare native fork"], "native-fork-source", isolated_workspace=True)
+        with long_horizon.agent_workspaces.workspace(source, source["agents"][0], store.root) as original:
+            original_root = original.root
+            (original_root / "draft.txt").write_text("parent draft")
+        fork_root = self.base / "native-fork"
+        fork_root.mkdir()
+        (fork_root / "fork.txt").write_text("fork baseline")
+        forked = store.clone_to_project(store.get(source["goal_id"]), "fork", "Fork", fork_root, "native-fork")
+        document = store.get(forked["goal_id"])
+        with long_horizon.agent_workspaces.workspace(document, document["agents"][0], store.root) as candidate:
+            self.assertNotEqual(candidate.root, original_root)
+            self.assertNotEqual(candidate.root, fork_root)
+            self.assertEqual((candidate.root / "fork.txt").read_text(), "fork baseline")
+        self.assertEqual((original_root / "draft.txt").read_text(), "parent draft")
 
     def test_fork_binds_the_new_project_authority_and_legacy_missing_id_fails_closed(self):
         store = self.store()
@@ -4226,7 +4315,7 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(replayed["goal_id"], waiter["goal_id"])
         self.assertTrue(replayed["reused"])
 
-    def test_cross_process_same_request_replay_has_one_provider_dispatch(self):
+    def test_cross_process_same_request_replay_dispatches_author_and_judge_once_each(self):
         context = multiprocessing.get_context("spawn")
         statuses = context.Queue()
         begin = context.Event()
@@ -4296,7 +4385,7 @@ class LongHorizonTests(unittest.TestCase):
             )
             _assert_cross_processes_exited_cleanly(processes)
             self.assertEqual(len({one["goal_id"] for one in outcomes}), 1)
-            self.assertEqual(dispatch_count.value, 1)
+            self.assertEqual(dispatch_count.value, 2, "one author and one independent closeout judge")
             self.assertTrue(
                 all(one["status"] == "complete" for one in outcomes), outcomes,
             )
@@ -4493,6 +4582,27 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(stored["original_objective"], stored["objective"])
         self.assertEqual(stored["input_attachments"], kept)
         self.assertEqual(stored["input_provider_attachments"][0]["path"], str(attachment_file))
+
+    def test_word_prompt_is_retained_in_goal_across_restart_and_route_change(self):
+        marker = "Build the inventory page described in this Word document."
+        raw = make_docx(marker)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        with mock.patch.object(runtime, "start_background", side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id)):
+            created = runtime.start(self.board, "project", ["Implement the attached prompt"], "word-input",
+                attachments=[{"name": "Requirements.docx", "type": "application/octet-stream", "data": base64.b64encode(raw).decode()}])
+        runtime.close()
+        restarted = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(restarted.close)
+        stored = restarted.store.get(created["goal_id"])
+        self.assertIn(marker, stored["objective"])
+        self.assertIn(marker, stored["original_objective"])
+        self.assertEqual(Path(stored["input_provider_attachments"][0]["path"]).read_bytes(), raw)
+        moved_board = copy.deepcopy(self.board)
+        moved_board["agents"][0]["who"] = "claude"
+        with mock.patch.object(restarted, "start_background", side_effect=lambda goal_id, answers=None: restarted.store.get(goal_id)):
+            another = restarted.start(moved_board, "project", ["Implement the attached prompt"], "word-other-route",
+                attachments=[{"name": "Different name.DOCX", "data": base64.b64encode(raw).decode()}])
+        self.assertIn(marker, restarted.store.get(another["goal_id"])["objective"])
 
     def test_restart_auto_starts_only_pristine_queued_boundary(self):
         store = self.store()
@@ -6445,6 +6555,66 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual(kinds.count("context_step_acknowledged"), 2)
         self.assertEqual(kinds.count("context_tool_result"), 2)
 
+    def test_zip_attachment_is_read_by_real_goal_tools_after_restart(self):
+        from test_research_tools import make_zip
+        raw = make_zip({"bundle/SKILL.md": "Use resources/reference.md for the tracker requirements.",
+                        "bundle/resources/reference.md": "Tracker must preserve cafe names and offer CSV export."})
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        with mock.patch.object(runtime, "start_background", side_effect=lambda goal_id, answers=None: runtime.store.get(goal_id)):
+            created = runtime.start(self.board, "project", ["Read and apply the attached tracker skill"], "zip-goal",
+                attachments=[{"name": "Skill bundle.zip", "data": base64.b64encode(raw).decode()}])
+        runtime.close()
+        restarted = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(restarted.close)
+        goal = restarted.store.get(created["goal_id"])
+        identity = "attachment://" + goal["input_provider_attachments"][0]["sha256"]
+        task = restarted.store.claim_ready(goal["goal_id"], "worker")[0]
+        responses = [action("work", tool_calls=[{"call_id": "read-skill", "name": "read_archive", "arguments": {
+            "path": identity, "member": "bundle/SKILL.md"}}]),
+            action("work", tool_calls=[{"call_id": "read-reference", "name": "read_archive", "arguments": {
+                "path": identity, "member": "bundle/resources/reference.md"}}]), action("complete")]
+        contexts = []
+        def ask(*_args, **kwargs):
+            contexts.append(kwargs["context"])
+            kwargs["before_provider_dispatch"]("initial")
+            return {"text": json.dumps(responses.pop(0))}
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
+            _task, returned = restarted._execute_one(goal["goal_id"], task["id"])
+        self.assertEqual(returned["action"], "complete")
+        self.assertIn("Use resources/reference.md", contexts[1])
+        self.assertIn("Tracker must preserve cafe names and offer CSV export", contexts[2])
+        self.assertEqual(restarted.store.get(goal["goal_id"])["budget"]["context_tool_calls"], 2)
+
+    def test_public_skill_instructions_reach_provider_and_normal_project_transaction(self):
+        from our_harness import research_tools
+        self.board["agents"] = [self.board["agents"][0]]
+        self.board["works_on"] = [self.board["works_on"][0]]
+        skill_url = "https://raw.githubusercontent.com/fixture/skills/" + "a" * 40 + "/tracker/SKILL.md"
+        skill = "Write tracker.txt containing exactly: Names preserve Unicode; CSV export is required."
+        expected = "Names preserve Unicode; CSV export is required.\n"
+        calls = []
+        def ask(*_args, **kwargs):
+            kwargs["before_provider_dispatch"]("initial")
+            calls.append(kwargs["context"])
+            if len(calls) == 1:
+                result = action("work", tool_calls=[{"call_id": "load-public-skill", "name": "load_skill", "arguments": {"url": skill_url}}])
+            else:
+                self.assertIn(skill, kwargs["context"])
+                result = action(changes=[{"path": "tracker.txt", "content": expected, "delete": False}],
+                    evidence=["file:tracker.txt"], criteria_evidence=[{
+                        "criterion": "Original objective is satisfied", "evidence_refs": ["file:tracker.txt"]}])
+            return {"text": json.dumps(result)}
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        goal = runtime.store.create(self.board, "project", ["Create tracker.txt using the requested public tracker skill"], "public-skill-work")
+        with mock.patch.object(research_tools, "fetch_public", return_value={"url": skill_url, "data": skill.encode(), "content_type": "text/plain"}), \
+                mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask), \
+                mock.patch.object(long_horizon.swarm_work, "_run_selected_project_verification", return_value={"status": "passed", "basis": "test transaction"}):
+            result = runtime.run(goal["goal_id"])
+        self.assertEqual(result["status"], "complete", result.get("note"))
+        self.assertEqual((self.project / "tracker.txt").read_text(encoding="utf-8"), expected)
+        self.assertEqual(len(calls), 2)
+
     def test_web_provider_accepts_fence_repairs_once_and_rejects_invalid_second_reply(self):
         board = copy.deepcopy(self.board)
         board["agents"][0]["who"] = "web:claude-test"
@@ -6840,6 +7010,61 @@ class LongHorizonTests(unittest.TestCase):
             self.assertIn(f"src/file-{index}.txt", context)
         self.assertIn("read_proposed_change", context)
         self.assertNotIn('"truncated":true,"summary"', context)
+
+    def test_binary_review_reports_exact_bytes_and_paginates_the_encoded_candidate(self):
+        import base64
+        import hashlib
+        store = self.store()
+        goal = store.create(self.board, "project", ["Review binary output"], "binary-review")
+        task = store.claim_ready(goal["goal_id"], "worker")[0]
+        raw = bytes(range(256)) * 30
+        content = base64.b64encode(raw).decode("ascii")
+        self.stage_review(store, goal, task, action("request_review", risk="high", changes=[{
+            "path": "result.bin", "content_base64": content, "reason": "Required binary output"}]))
+        review = store.claim_ready(goal["goal_id"], "reviewer")[0]
+        responses = [action("work", tool_calls=[{"call_id": "binary", "name": "read_proposed_change",
+            "arguments": {"path": "result.bin"}}]), action("complete", evidence=["review-packet:" + review["review_packet_sha256"]],
+            review_verdict="approve", review_findings=["Inspected the complete exact binary representation."])]
+        def ask(_config, _route, _prompt, **kwargs):
+            self.assertIn(hashlib.sha256(raw).hexdigest(), kwargs["context"])
+            return {"text": json.dumps(responses.pop(0))}
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(runtime.close)
+        with mock.patch.object(long_horizon.chat_lab, "ask_once", side_effect=ask):
+            runtime._execute_one(goal["goal_id"], review["id"])
+        held = next(one for one in runtime.store.get(goal["goal_id"])["tasks"] if one["id"] == review["id"])
+        result = held["context_steps"][0]["results"][0]["result"]
+        self.assertEqual(base64.b64decode(result["content"]), raw)
+        self.assertEqual(result["encoding"], "base64")
+        self.assertEqual(result["content_sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_workspace_http_viewer_requires_token_and_scopes_agent_paths(self):
+        panel = harness_server.HarnessHTTPServer(("127.0.0.1", 0), self.config)
+        self.addCleanup(panel.server_close)
+        runtime = long_horizon.LongHorizonRuntime(self.config)
+        panel._long_horizon = runtime
+        goal = runtime.store.create(self.board, "project", ["Inspect agent files"], "viewer-http", isolated_workspace=True)
+        with long_horizon.agent_workspaces.workspace(goal, goal["agents"][0], runtime.store.root) as candidate:
+            (candidate.root / "draft.txt").write_text("private draft")
+        thread = threading.Thread(target=panel.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(panel.shutdown)
+        def read(path="draft.txt", token=True, agent=None):
+            query = urllib.parse.urlencode({"goal_id": goal["goal_id"], "workspace_id": agent or goal["agents"][0]["id"], "path": path})
+            request = urllib.request.Request(f"http://127.0.0.1:{panel.server_address[1]}/api/long-horizon/workspace?" + query,
+                headers={"X-Harness-Token": panel.token} if token else {})
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read())
+        status, result = read()
+        self.assertEqual(status, 200)
+        self.assertIn("private draft", result["content"])
+        self.assertNotEqual(read(token=False)[0], 200)
+        self.assertNotEqual(read(path="../state.json")[0], 200)
+        self.assertNotEqual(read(agent="another-goals-agent")[0], 200)
+        self.assertFalse((self.project / "draft.txt").exists())
 
     def test_targeted_review_reader_corrects_wrong_path_and_preserves_exact_packet_evidence(self):
         store = self.store()

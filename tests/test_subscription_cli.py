@@ -306,6 +306,22 @@ class RunningTests(unittest.TestCase):
         self.folder = Path(self.temporary.name).resolve()
         self.addCleanup(self.temporary.cleanup)
 
+    def test_native_work_restores_tools_with_normal_permissions_in_exact_copy(self):
+        from our_harness.models import ProviderWorkspaceContext
+        tool = fake_tool(self.folder, "nativeecho", ARGUMENT_ECHO)
+        candidate = self.folder / "agent-copy"
+        project = self.folder / "real-project"
+        candidate.mkdir(); project.mkdir()
+        provider = self.provider("claude-cli", tool)
+        answer = provider.complete(self.request(native_execution="work", working_directory=str(candidate),
+            workspace_context=ProviderWorkspaceContext("project", str(project), str(candidate))))
+        args = json.loads(answer.text)
+        self.assertEqual(args[args.index("--tools") + 1], "default")
+        self.assertEqual(args[args.index("--permission-mode") + 1], "acceptEdits")
+        self.assertEqual(args[args.index("--allowedTools") + 1], "Bash,WebFetch,WebSearch")
+        self.assertFalse(any("skip-permissions" in word or "bypass" in word for word in args))
+        self.assertTrue(candidate.is_dir())
+
     def provider(self, kind: str, tool: Path, **settings: object) -> SubscriptionCLIProvider:
         data = copy.deepcopy(DEFAULT_CONFIG)
         data["provider"].update({

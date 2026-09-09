@@ -3837,6 +3837,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 goal = store.public(store.get(goal_id))
                 self.server.project_long_horizon_chat_statuses([goal])
                 self._json({"goal": goal})
+            elif parsed.path == "/api/long-horizon/workspace":
+                self._require_token()
+                from . import agent_workspaces
+                query = urllib.parse.parse_qs(parsed.query)
+                runtime = self.server.long_horizon
+                document = runtime.store.get(str(query.get("goal_id", [""])[0]))
+                runtime._require_goal_authority(document)
+                self._json(agent_workspaces.inspect(document, runtime.store.root,
+                    str(query.get("workspace_id", ["real"])[0]), str(query.get("path", [""])[0]),
+                    cursor=str(query.get("cursor", [""])[0])))
             elif parsed.path == "/api/long-horizon/access":
                 self._require_token()
                 from .goal_verification import goal_command_approval
@@ -5285,6 +5295,16 @@ class HarnessHandler(BaseHTTPRequestHandler):
                 self._json({
                     **receipt, "goal": goal, "engine": "long_horizon",
                 }, HTTPStatus.ACCEPTED)
+            elif self.path == "/api/long-horizon/collaboration":
+                from . import workspace_collaboration
+                goal_id = str(body.get("goal_id") or "")
+                with self.server.project_admission_lock, self.server.swarm_lock:
+                    runtime = self.server.long_horizon
+                    held_goal = runtime.store.get(goal_id)
+                    self.server.require_long_horizon_chat_binding(held_goal, body)
+                    runtime._require_goal_authority(held_goal)
+                    goal = workspace_collaboration.update(runtime.store, goal_id, body.get("expected_revision"), body.get("settings"))
+                self._json({"goal": goal})
             elif self.path == "/api/long-horizon/access":
                 goal_id = str(body.get("goal_id") or "")
                 with self.server.project_admission_lock, self.server.swarm_lock:

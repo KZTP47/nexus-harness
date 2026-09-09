@@ -10,7 +10,7 @@ import hashlib
 import json
 from typing import Any
 
-CONTRACT = "goal-interrupted-turn-recovery/v1"
+CONTRACT = "goal-interrupted-turn-recovery/v2-native-workspace"
 
 
 def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
@@ -30,9 +30,13 @@ def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
         # Bounded bridge for already-saved calls under this exact engine-owned
         # contract. It uses ephemeral cwd, ignores user config/rules, rejects
         # native tools, and enforces a read-only sandbox (codex_cli.py).
+        read_only_dispatch = binding.get("effective_dispatch_contract") == "codex-cli/effective-dispatch/v2" or (
+            binding.get("effective_dispatch_contract") == "codex-cli/effective-dispatch/v3-native-workspace"
+            and not document.get("agent_workspace_contract")
+        )
         read_only = provider_only and binding.get("binding_schema_version") == 3 \
             and binding.get("transport_contract") == "codex-cli/isolated-exec/v1" \
-            and binding.get("effective_dispatch_contract") == "codex-cli/effective-dispatch/v2"
+            and read_only_dispatch
         items.append({
             "task_id": task["id"], "agent_id": agent.get("id", ""),
             "agent_name": agent.get("name") or agent.get("id") or "Agent",
@@ -46,6 +50,7 @@ def plan(document: dict[str, Any], tasks: list[dict[str, Any]], *,
     material = {"contract": CONTRACT, "goal_id": document["goal_id"],
                 "revision": document["revision"], "agents": document.get("agents"),
                 "project": document.get("project"), "execution_contract": document.get("execution_contract"),
+                "agent_workspace_contract": document.get("agent_workspace_contract"),
                 "tasks": tasks, "available": available}
     fingerprint = hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return {"schema_version": 1, "contract": CONTRACT, "fingerprint": fingerprint,

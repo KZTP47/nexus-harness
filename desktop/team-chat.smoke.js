@@ -120,6 +120,18 @@ coordination = Path(sys.argv[1])
 route = sys.argv[2]
 payload = json.loads(sys.stdin.read())
 context = str(payload.get('dynamic_context') or '')
+if context.startswith('INDEPENDENT WHOLE-GOAL CLOSEOUT JUDGE'):
+    packet, _ = json.JSONDecoder().raw_decode(context[context.index('{'):])
+    assert packet['verification']['status'] == 'passed', packet['verification']
+    assert packet['scope']['original_prompt'] and packet['scope']['current_goal']
+    refs = ['file:' + name for name in packet['submitted_files']['path_preview']]
+    action = {'action':'complete','summary':'Independent closeout inspected the whole requested result.',
+              'evidence':['review-packet:' + packet['fingerprint']],'risk':'low','changes':[],
+              'needs_files':[],'tool_calls':[],'tasks':[],'handoff_agent_id':'','questions':[],
+              'review_verdict':'approve','review_findings':['The submitted files and executed checks cover the original request.'],
+              'criteria_evidence':[{'criterion':c,'evidence_refs':refs[:20]} for c in packet['scope']['acceptance_criteria']]}
+    print(json.dumps({'text':json.dumps(action),'finish_reason':'stop'}))
+    sys.exit(0)
 project_tree = context.split('\n\nPROJECT TREE\n', 1)[1].split('\n\nREQUESTED FILE CONTENTS\n', 1)[0]
 def project_has(name):
     # Provider processes belong to the configured app route. The selected
@@ -823,7 +835,10 @@ async function main() {
     await page.locator("#theBigChatStop").click();
     const testsComplete=await goalFor(page,testChat,goal=>goal.status==="complete");
     assert.equal(testsComplete.goal_id,waitingForChecks.goal_id,"Check approval replaced the goal");
-    assert.equal(testsComplete.budget.provider_calls,callsBeforeApproval,"Verification recovery repeated settled provider work");
+    assert.equal(testsComplete.budget.provider_calls,callsBeforeApproval+1,"Verification recovery must add only its independent judge");
+    const judged=testsComplete.tasks.filter(task=>task.closeout_packet);
+    assert.equal(judged.length,1);
+    assert.equal(judged[0].closeout_outcome?.verdict,"approve");
     assert.ok(testsComplete.verification_contract.approved_test_command_digest,"Resume did not adopt the explicit command approval");
     await transcriptContains(page,["TEST-A-UNIT","TEST-B-INTEGRATION","TEST-A-REVIEW"]);
     assert.equal(testsComplete.verification.status,"passed");

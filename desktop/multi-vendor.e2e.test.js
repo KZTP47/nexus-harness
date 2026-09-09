@@ -67,9 +67,10 @@ test("fixture validates each production adapter and replies to the requested sch
   assert.match(source, /review_findings:/);
   assert.match(source, /message: `\$\{provider\} deterministic/);
 
-  assert.match(source, /allTasks === 3/);
-  assert.match(source, /completeTasks === 3/);
+  assert.match(source, /allTasks === 4/);
+  assert.match(source, /completeTasks === 4/);
   assert.match(source, /actionRequests\.length, 3/);
+  assert.match(source, /The mission must run its independent closeout judge/);
   assert.match(source, /\["anthropic", "gemini", "openai"\]/);
 });
 

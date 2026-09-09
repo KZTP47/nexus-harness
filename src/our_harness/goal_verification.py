@@ -226,6 +226,28 @@ class _WorkspaceVerificationAuthority:
     execution_root: Path
 
 
+@dataclass(frozen=True)
+class _InspectionVerificationAuthority(_WorkspaceVerificationAuthority):
+    files_fingerprint: str
+
+
+def inspection_verification_project(config, goal, runtime_root, root, project):
+    """Bind an engine-selected agent/review directory to the user's commands.
+
+    Callers must resolve the directory through the owned workspace service before
+    issuing this in-process authority. File tools never accept this object in JSON.
+    """
+    from . import agent_workspaces, goal_workspaces
+    goal_workspaces.validate(goal, runtime_root)
+    held = project.get("_nexus_workspace_verification")
+    if not isinstance(held, _WorkspaceVerificationAuthority):
+        raise HarnessError("Inspection verification needs the selected goal's command authority")
+    value = dict(project)
+    value["_nexus_workspace_verification"] = _InspectionVerificationAuthority(config, held.goal, runtime_root,
+        root.resolve(), goal_workspaces._digest(agent_workspaces.inventory(root)))
+    return value
+
+
 def verification_project(
     config: LoadedConfig, goal: dict[str, Any], *, runtime_root: Path | None = None,
 ) -> dict[str, Any]:
@@ -263,6 +285,11 @@ def verification_authority(
     from . import goal_workspaces
 
     expected_root = goal_workspaces.root(authority.goal, authority.runtime_root)
+    if isinstance(authority, _InspectionVerificationAuthority):
+        from . import agent_workspaces
+        expected_root = authority.execution_root
+        if goal_workspaces._digest(agent_workspaces.inventory(expected_root)) != authority.files_fingerprint:
+            raise HarnessError("Inspection files changed after verification was requested")
     if root.resolve() != expected_root or authority.execution_root != expected_root:
         raise HarnessError("Workspace verification was redirected to a different execution root")
     selected = _selected_verification_project(authority.config, authority.goal)

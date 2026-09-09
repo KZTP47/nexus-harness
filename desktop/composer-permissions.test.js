@@ -21,6 +21,7 @@ test('composer permissions persist per binding, reach request identity and reuse
         function make(tag,cls='',text=''){const n=document.createElement(tag);n.className=cls;n.textContent=text;return n;}
         window.conversation={id:'portable-chat',project:'portable-project',pair:['one','two'],binding:{route:'provider-a'}};
         window.context={goal:null,problem:''};window.calls=[];
+        const theSwarmAgent=id=>({id,name:id});
         const activeConversationFor=()=>conversation,swarmChatKey=()=>conversation.id,chatLongGoalContext=()=>context;
         const chatGoalBinding=()=>({chat_id:conversation.id,project_id:conversation.project,participant_ids:conversation.pair});
         async function refreshChatGoalAfterAction(a,goal){context.goal=goal;render();}
@@ -30,6 +31,7 @@ test('composer permissions persist per binding, reach request identity and reuse
           if(window.fail)throw Error('Stale permissions; refresh this goal');
           return {goal:{...context.goal,revision:context.goal.revision+1,agent_access:{mode:body.mode}}};
         }
+        ${section('function chatCollaborationPreference','function appendGoalAccessControls')}
         ${section('function directLongGoalCanonicalValue','async function prepareDirectLongGoalAdmission')}
         ${section('function appendGoalAccessControls','function fillChatGoalPanel')}
         ${section('function chatComposerAccessPreference','function syncChatGoalControls')}

@@ -144,11 +144,19 @@ function normalizedPayload(raw) {
   }
   const policy = {};
   if (Object.hasOwn(raw, "policy")) {
-    exactKeys(raw.policy, new Set(["agent_access_mode"]), "Direct-goal permissions");
+    exactKeys(raw.policy, new Set(["agent_access_mode", "collaboration"]), "Direct-goal permissions");
     if (!["read_only", "ask", "full"].includes(raw.policy.agent_access_mode)) {
       throw fail("NEXUS_OUTBOX_INVALID", "Direct-goal permissions must name a supported access mode.");
     }
     policy.policy = {agent_access_mode: raw.policy.agent_access_mode};
+    if (Object.hasOwn(raw.policy, "collaboration")) {
+      const settings = raw.policy.collaboration;
+      exactKeys(settings, new Set(["mode", "writer_id", "reviewer_id", "allow_direct_real_edits"]), "Collaboration settings");
+      if (Object.hasOwn(settings, "mode") && !["fixed", "flexible"].includes(settings.mode)) throw fail("NEXUS_OUTBOX_INVALID", "Unsupported collaboration mode.");
+      for (const key of ["writer_id", "reviewer_id"]) if (Object.hasOwn(settings, key)) boundedString(settings[key], key, 160, {allowEmpty:true});
+      if (Object.hasOwn(settings, "allow_direct_real_edits") && typeof settings.allow_direct_real_edits !== "boolean") throw fail("NEXUS_OUTBOX_INVALID", "Direct editing must be a checkbox choice.");
+      policy.policy.collaboration = {...settings};
+    }
   }
   return {
     payload: {project_id: projectId, lead_id: leadId, chat_id: chatId, text, attachments, ...policy},

@@ -2553,3 +2553,14 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
 @media (prefers-reduced-motion: reduce) {
   .chat-composer-permissions-toggle.needs-user-input { animation: none; border-color: #ffd36a; }
 }
+:root .goal-workspace-viewer { width: min(1000px, 90vw); max-height: 85vh; overflow: auto; }
+.goal-workspace-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.goal-workspace-tabs [aria-pressed="true"] { outline: 2px solid currentColor; }
+.goal-workspace-content pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.goal-workspace-files { list-style: none; padding: 0; }
+.goal-workspace-files button { text-align: left; margin: 3px 0; }
+.chat-collaboration-controls { display: grid; gap: 0.65rem; min-width: 0; margin: 0.8rem 0; padding: 0.8rem; border: 1px solid var(--line, #555); border-radius: 0.6rem; }
+.chat-collaboration-controls select { width: 100%; min-width: 0; }
+.chat-collaboration-roles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.6rem; }
+.chat-collaboration-roles[hidden] { display: none; }
+.chat-collaboration-direct { display: flex; align-items: start; gap: 0.5rem; }

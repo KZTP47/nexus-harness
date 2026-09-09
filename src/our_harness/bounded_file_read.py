@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 from .models import HarnessError
+from .document_text import DOCX_TEXT_VERSION, extract_docx_text, is_docx
 
 
 READ_FILE_SCHEMA_VERSION = 1
@@ -23,7 +24,8 @@ class FileReadOutputLimit(HarnessError):
 
 
 READ_FILE_DESCRIPTION = (
-    "Read UTF-8 text from a project-relative regular file. max_bytes is a desired "
+    "Read UTF-8 text or extract Word .docx text from a project-relative regular file. "
+    "DOCX line ranges refer to extracted paragraphs/tables/notes, not rendered pages or images. max_bytes is a desired "
     "content cap; Nexus reduces large requests to fit its output allowance. "
     "The result is a complete JSON page. If next_cursor is present, repeat the "
     "original path, start_line and end_line with that cursor to read the next "
@@ -133,8 +135,9 @@ def read_file_page(
     if len(raw) > max_file_bytes:
         raise HarnessError("read_file target exceeds the configured project.max_file_bytes")
     output_limit = min(output_limit, configured_output_limit)
+    document = is_docx(value["path"])
     try:
-        text = raw.decode("utf-8", errors="strict")
+        text = extract_docx_text(raw) if document else raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
         raise HarnessError(
             "read_file target is not valid UTF-8 text; Nexus did not replace or corrupt bytes"
@@ -153,6 +156,7 @@ def read_file_page(
         "encoding": "utf-8", "offset_unit": "selected_range_utf8_bytes",
         "configured_output_limit": configured_output_limit,
         "max_file_bytes": max_file_bytes,
+        **({"docx_text_version": DOCX_TEXT_VERSION} if document else {}),
     })
     selection = _digest({
         "path": relative, "start_line": start_line, "end_line": end_line,
@@ -201,6 +205,7 @@ def read_file_page(
             "total_lines": len(lines),
             "sha256": source_sha256,
             "content": content,
+            **({"format": "docx", "extraction_version": DOCX_TEXT_VERSION} if document else {}),
             "truncated": has_more,
             "byte_offset": offset,
             "next_byte_offset": next_offset,

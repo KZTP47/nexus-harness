@@ -158,6 +158,33 @@ else:
 
 
 class CodexCLIProviderTests(unittest.TestCase):
+    def test_native_work_uses_agent_copy_and_preserves_user_tools_without_bypass(self):
+        from dataclasses import replace
+        from our_harness.models import ProviderWorkspaceContext
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, candidate = root / "real-project", root / "agent-copy"
+            project.mkdir(); candidate.mkdir()
+            _config, provider, record = self.make_provider(root)
+            request = replace(self.request(), native_execution="work", working_directory=str(candidate),
+                workspace_context=ProviderWorkspaceContext("project", str(project), str(candidate)))
+            response = provider.complete(request)
+            captured = json.loads(record.read_text(encoding="utf-8"))
+            self.assertEqual(json.loads(response.text), {"answer": "ok"})
+            self.assertEqual(Path(captured["cwd"]), candidate)
+            argv = captured["argv"]
+            self.assertEqual(argv[argv.index("--sandbox") + 1], "danger-full-access")
+            self.assertIn('approval_policy="on-request"', argv)
+            self.assertIn("--ignore-user-config", argv)
+            self.assertNotIn("--ignore-rules", argv)
+            self.assertFalse(any("bypass" in word for word in argv))
+            self.assertIn("NATIVE AGENT EXECUTION", captured["prompt"])
+            self.assertNotIn("Do not use the CLI's native filesystem", captured["prompt"])
+            self.assertTrue(candidate.is_dir())
+            provider.complete(replace(request, native_execution="inspect"))
+            inspected = json.loads(record.read_text(encoding="utf-8"))["argv"]
+            self.assertEqual(inspected[inspected.index("--sandbox") + 1], "read-only")
+
     def test_transport_prompt_permits_schema_tools_without_native_cli_access(self):
         for fallback in (False, True):
             prompt = codex_cli._prompt(self.request(), fallback)

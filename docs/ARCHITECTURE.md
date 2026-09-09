@@ -101,7 +101,11 @@ The static prefix uses canonical JSON and stable ordering. Its SHA-256 is record
 
 ## Self-healing graph
 
-Planner and coder nodes may iterate through a read-only discovery loop before returning their strict final object. The loop offers root-confined tree and file reads, indexed workspace and memory search, dependency lookup, and an MCP bridge only for explicitly allowlisted server tools. MCP discovery calls require `annotations.readOnlyHint` to be exactly `true` and reject `destructiveHint: true`; `idempotentHint` alone grants no authority. Unclassified and mutating calls are refused. It has no command or write operation. Calls and bounded results have typed envelopes, span IDs, hashes, provenance, untrusted-data labels, a shared workflow deadline, and call/per-result/run byte limits. A SQLite journal binds each completed result to run, node, call ID, tool, and argument hash so resume reuses it instead of repeating the operation. OpenAI Responses calls continue with typed function-call outputs and retained response state; the text action envelope is the common fallback.
+Planner and coder nodes may iterate through a discovery loop before returning their strict final object. The loop offers root-confined tree and file reads, indexed workspace and memory search, dependency lookup, public research and archive inspection, and an MCP bridge only for explicitly allowlisted server tools. MCP discovery calls require `annotations.readOnlyHint` to be exactly `true` and reject `destructiveHint: true`; `idempotentHint` alone grants no authority. Unclassified and mutating MCP calls are refused. Discovery cannot run commands or write project deliverables. Calls and bounded results have typed envelopes, span IDs, hashes, provenance, untrusted-data labels, a shared workflow deadline, and call/per-result/run byte limits. A SQLite journal binds each completed result to run, node, call ID, tool, and argument hash so resume reuses it instead of repeating the operation. OpenAI Responses calls continue with typed function-call outputs and retained response state; the text action envelope is the common fallback.
+
+`research_tools.py` supplies `search_github`, `github_skills`, `fetch_url`, `load_skill`, `list_archive`, `read_archive`, and `extract_archive` to ordinary chat and the existing project-work tool schemas. GitHub discovery resolves skill paths to immutable commits; skill instructions and adjacent resources enter provider context so the ordinary transaction workflow can apply them. `public_web.py` performs bounded anonymous public HTTP(S) GETs, pins verified public IPs per redirect, retains TLS hostname verification, and supplies readable HTML links or source text. It does not borrow provider credentials or execute downloaded scripts. Ordinary chat uses the bounded text protocol in `research_chat.py`; structured project work retains its durable existing tool loop.
+
+ZIP attachments retain their original bytes and advertise a scoped `attachment://<sha256>` reference instead of silently omitting binary input or stuffing an entire archive into the prompt. `archive_tools.py` validates member names, portable aliases, file types, encryption and expansion limits before inspection. Member reads are paginated, including DOCX text. Extraction creates a fresh private inspection directory under `.harness/archive-inspection` with a versioned, project-bound manifest; it never overlays project files. Downloaded ZIPs are capped at 8 MB, expanded content at 32 MB and entries at 2,000; attachment and project-file admission limits also remain in force. Inspection, skill loading and downloaded content grant no additional project-write or execution authority.
 
 ### Persistent programmatic workspace V1
 
@@ -138,3 +142,78 @@ Failures and successes become episodic records. Both store their complete creden
 ## Extension points
 
 Installed packages may register the `our_harness.plugins` entry-point group. A project may also list project-relative Python plugin files and names in config. No plugin runs unless its name is enabled. The application consumes plugin detectors and workflow-policy factories, and doctor consumes plugin checks. A workflow factory returns bounded execution-policy values; it is not an arbitrary executable canvas node.
+
+## Native agents and persistent project copies
+
+New isolated long-horizon goals carry `agent_workspace_contract` v1. The
+`agent_workspaces` module creates independent files outside the real project and
+accepted goal workspace. Its authenticated state binds the goal, route, project
+identity and execution contract; a changed binding selects a new generation.
+Synchronization records an intent before changing files, preserves local drafts,
+and refuses conflicting changes. Cancellation retains the draft and interrupts
+copying. Control metadata, Git internals and dependency directories are excluded.
+
+The engine alone sets `ProviderRequest.native_execution` for Codex/Claude CLI
+requests. Full access enables normal native tools in the agent copy, without a
+skip-permissions switch; inspection and review turns retain restrictive profiles.
+These copies are workflow isolation, not security sandboxes. Full Codex requests
+use `danger-full-access` with on-request approval rules, and Full Claude requests
+use `acceptEdits` plus command/web allow rules. Native calls are never blindly
+replayed to repair a malformed response. Codex user-config isolation remains for
+transport compatibility; user execution rules and managed policies still load.
+
+Actual file bytes (including binary output and permissions) become proposed
+changes. Exact baseline checks include permissions. Fixed roles require formal
+review before import into the accepted goal workspace. Flexible collaboration keeps
+existing risk checks and permits ordinary low-risk draft contributions without an
+extra handoff. Final deterministic verification, independent whole-goal judgment and
+conflict-aware publication remain required for staged delivery. Binary review packets identify their encoding
+and hash the decoded file bytes. The authenticated workspace HTTP endpoint and
+read-only UI viewer accept an owned goal/agent ID and confined relative paths;
+they never accept an arbitrary caller-supplied root.
+
+New isolated goals also carry `closeout_contract=nexus-goal-closeout/v1`.
+`goal_closeout` schedules a separate whole-goal judge through the existing durable
+LangGraph task scheduler after selected verification. Its packet preserves the
+original admitted objective (including extracted attachment text), current scope,
+all recorded clarifications, acceptance criteria and contribution evidence. The
+fingerprint binds this scope to submitted file bytes and modes, provider bindings,
+and execution/verification contracts. A new task conversation inspects a separate,
+authenticated read-only snapshot, never the reviewer's old draft. Another provider
+is preferred; one connected provider can still run a fresh judge conversation.
+
+Approval requires a verdict, findings, the exact packet reference and evidence for
+every criterion, including the overall request. Only a current approval can support
+publication. Changes during verification or between judgment and application
+supersede the result. Rejections create repair work for the latest contributing
+author; repair prompts retain the original and current goals. The existing task,
+call and no-progress budgets remain authoritative, with a further three-rejection
+limit on an unchanged submission. Existing goals keep their earlier contract.
+
+
+## Collaboration policy and exact review workspaces
+
+`workspace_collaboration` owns the versioned user settings, bound to project,
+agent routes and execution contract. The UI saves next-goal preferences with the
+chat/project/pair binding and updates existing goals only at a settled boundary
+with an exact revision. Agents cannot change their settings through tool output.
+Fixed mode rejects non-writer file proposals and cross-draft edits and chooses the
+specified reviewer. Flexible mode exposes all goal-owned copies without dictating
+a conversation sequence. Direct real-project editing has its own explicit boolean.
+Native profiles remain subject to provider permissions; these controls govern Nexus
+operations and acceptance, not OS containment of arbitrary native commands.
+
+The context protocol exposes `workspace_catalog`, `workspace_read`, `workspace_edit`,
+`workspace_snapshot` and `workspace_verify`. Edits compare an exact file inventory
+fingerprint and use the existing file transaction journal. Snapshots reuse the signed
+goal workspace implementation and add a signed submission receipt. Snapshot IDs are
+resolved only from this goal's engine-recorded tool results. Tests retain the selected
+project's command approval authority while running against the snapshot through the
+existing disposable verification runner. In-process inspection authority binds the
+exact inventory and rejects redirection or source changes.
+
+Formal review tasks persist a separate snapshot of the accepted base plus the exact
+proposed changes, retaining the reviewer's unrelated draft. A changed base or proposal
+supersedes the judgment and reopens the author; tampered review files cannot support
+approval. The final judge receives the selected collaboration rules as an additional
+acceptance criterion, together with the whole original request and amendments.

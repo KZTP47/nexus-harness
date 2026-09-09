@@ -28,6 +28,7 @@ from ..execution import (
 from ..models import CommandResult, HarnessError, ProviderRequest, ProviderResponse
 from ..redaction import CredentialRedactor, bounded_redacted_text
 from .base import Provider, _strict_output_schema
+from . import native_execution
 
 
 _AUTH_MODE = "chatgpt"
@@ -258,6 +259,9 @@ def _schema_capture_bytes(schema: object) -> int | None:
     if not isinstance(schema, dict):
         return None
     kind = schema.get("type")
+    if isinstance(kind, list):
+        sizes = [_schema_capture_bytes({**schema, "type": one}) for one in kind]
+        return max(sizes) if sizes and all(one is not None for one in sizes) else None
     if kind == "string":
         maximum = schema.get("maxLength")
         return (int(maximum) * 12 + 2) if isinstance(maximum, int) else None
@@ -590,7 +594,8 @@ def _prompt(request: ProviderRequest, fallback: bool) -> str:
         "tool_calls can request project reads, verification, and team communication; needs_files can request file contents. "
         "Nexus executes authorized requests and returns their results for your next turn. "
         "Propose edits through the schema's changes field when available. "
-        "Do not use the CLI's native filesystem, shell, or tools directly; this transport restriction does not prohibit Nexus-managed tools. "
+        + (native_execution.instructions(request) if request.native_execution else
+        "Do not use the CLI's native filesystem, shell, or tools directly; this transport restriction does not prohibit Nexus-managed tools. ") +
         "User-selected images, when present, are supplied by the harness as explicit image inputs.",
     ]
     if fallback:
@@ -602,7 +607,7 @@ class CodexCLIProvider(Provider):
     """Trusted-local Codex CLI boundary using Codex-owned ChatGPT authentication."""
 
     def _effective_dispatch_contract(self) -> str:
-        return "codex-cli/effective-dispatch/v2"
+        return "codex-cli/effective-dispatch/v3-native-workspace"
 
     def __init__(self, config):  # type: ignore[no-untyped-def]
         super().__init__(config)
@@ -664,6 +669,7 @@ class CodexCLIProvider(Provider):
 
     def complete(self, request: ProviderRequest) -> ProviderResponse:
         self._reject_native_contract(request)
+        native_root = native_execution.workspace(request)
         timeout = self._timeout(request.timeout_seconds)
         deadline_at = time.monotonic() + timeout
         command = self._command()
@@ -728,9 +734,18 @@ class CodexCLIProvider(Provider):
                 *(["-c", f'model_reasoning_effort="{effort}"'] if effort else []),
                 "exec",
                 "--ephemeral",
+                # The desktop and CLI may use different config schema versions.
+                # Preserve the working transport's config isolation, while native
+                # tools and independently loaded execution rules remain enabled.
                 "--ignore-user-config",
-                "--ignore-rules",
-                "--sandbox", "read-only",
+                *([] if native_root else ["--ignore-rules"]),
+                # The user-selected Nexus Full mode uses native Full access.
+                # Copies isolate drafts, not OS command effects; keep normal
+                # approval/rules enforcement and never use the bypass switch.
+                "--sandbox", "danger-full-access" if request.native_execution == "work" else "read-only",
+                *(["-c", 'approval_policy="on-request"'] if native_root else []),
+                *(["--cd", str(native_root), "-c", 'web_search="live"']
+                  if native_root else []),
                 "--skip-git-repo-check",
                 "--json",
                 "--output-schema", str(schema_path),
@@ -745,7 +760,7 @@ class CodexCLIProvider(Provider):
             ]
             result = _run_bounded(
                 argv,
-                cwd=cwd,
+                cwd=native_root or cwd,
                 stdin_text=self._redactor.text(_prompt(request, fallback)),
                 timeout_seconds=_remaining(deadline_at),
                 max_output_bytes=output_limit,

@@ -32,6 +32,7 @@ from .programmatic_workspace import (
 )
 from .runstate import canonical_json, canonical_json_sha256
 from .safety import confined_path
+from .research_tools import RESEARCH_TOOL_DEFINITIONS, RESEARCH_TOOL_NAMES, RESEARCH_CONTRACT, ResearchTools
 from .staged_coding import StagedCandidate, StagedCodingWorkspace, TextReplacement
 
 
@@ -100,6 +101,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+
+TOOL_DEFINITIONS.extend(RESEARCH_TOOL_DEFINITIONS)
 
 TEAM_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -369,6 +372,7 @@ class AgentToolSession:
         run_id: str | None = None,
         extra_read_only_tools: dict[str, Callable[[object], dict[str, Any]]] | None = None,
         prepare_tool: Callable[[str, object, Deadline], None] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ):
         self.config = config
         self.memory = memory
@@ -376,6 +380,7 @@ class AgentToolSession:
         self.emit = emit
         self.run_id = run_id
         self.root = config.project_root.resolve()
+        self.research_tools = ResearchTools(self.root, read_project=self._stable_regular_bytes, attachments=attachments)
         self.ignore_policy = IgnorePolicy(self.root, set(config.get("project.ignore", [])))
         self.max_calls = int(config.get("workflow.max_tool_calls"))
         self.per_call_bytes = int(config.get("workflow.max_tool_output_bytes"))
@@ -597,6 +602,10 @@ class AgentToolSession:
         capability_node = node if volatile else ""
         volatile_call_id = call_id if volatile else ""
         scope_prefix = canonical_json([TOOL_IDENTITY_CONTRACT, node, execution_scope]) + "\n" if execution_scope else ""
+        research_contract = [RESEARCH_CONTRACT, str(self.root), self.config.get("project.max_file_bytes"),
+                             self.per_call_bytes, self.read_file_output_bytes]
+        if name in RESEARCH_TOOL_NAMES:
+            scope_prefix += canonical_json(research_contract) + "\n"
         cache_key = hashlib.sha256(
             f"{scope_prefix}{nonce}\n{capability_node}\n{volatile_call_id}\n{name}\n{canonical_arguments}".encode("utf-8")
         ).hexdigest()
@@ -609,6 +618,8 @@ class AgentToolSession:
             canonical_json([TOOL_IDENTITY_CONTRACT, node, execution_scope, call_id]).encode("utf-8")
         ).hexdigest() if execution_scope else legacy_call_id_digest
         arguments_sha256 = hashlib.sha256(canonical_arguments.encode("utf-8")).hexdigest()
+        if name in RESEARCH_TOOL_NAMES:
+            arguments_sha256 = canonical_json_sha256([research_contract, arguments])
         call_id_collision = (
             binding_key in self.call_ids and self.call_ids[binding_key] != cache_key
         ) or (
@@ -715,7 +726,7 @@ class AgentToolSession:
             content = {"error": str(exc)}
             status = "error"
             deadline_error = exc
-        if name == "read_file" and status == "ok" and len(canonical_json(content).encode("utf-8")) > min(
+        if name in ({"read_file"} | RESEARCH_TOOL_NAMES) and status == "ok" and len(canonical_json(content).encode("utf-8")) > min(
             self.per_call_bytes, max(0, self.total_bytes_limit - self.total_bytes),
         ):
             # A cached page was sized for an earlier, larger allowance. Never
@@ -732,7 +743,7 @@ class AgentToolSession:
         provenance = {
             "kind": "agent_tool",
             "tool": name,
-            "project_root_bound": name != "mcp_call",
+            "project_root_bound": name not in {"mcp_call", "search_github", "github_skills", "fetch_url", "load_skill"},
             "read_only": (
                 name not in STAGED_MUTATION_TOOLS
                 and (name != "mcp_call" or mcp_classification == "read_only")
@@ -888,6 +899,9 @@ class AgentToolSession:
         return content, byte_count, truncated
 
     def _dispatch(self, name: str, arguments: object, *, node: str, call_id: str) -> dict[str, Any]:
+        if name in RESEARCH_TOOL_NAMES:
+            return self.research_tools.execute(name, arguments, output_limit=min(
+                12000, self.per_call_bytes, self.read_file_output_bytes, max(0, self.total_bytes_limit - self.total_bytes)))
         if name in self._extra_read_only_tools:
             return self._extra_read_only_tools[name](arguments)
         if name in STAGED_TOOL_NAMES:

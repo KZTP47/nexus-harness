@@ -185,6 +185,9 @@ class ProviderRequest:
     # harness process's current directory.
     working_directory: str = ""
     workspace_context: ProviderWorkspaceContext | None = None
+    # Issued only by the goal engine for an authenticated per-agent copy.
+    # Empty preserves the existing answer-only transport contract.
+    native_execution: str = ""
 
 
 @dataclass(frozen=True)

@@ -52,6 +52,9 @@ from . import goal_context_progress
 from . import action_protocol
 from . import goal_budget_policy
 from . import goal_workspaces
+from . import goal_closeout
+from . import workspace_collaboration as collaboration
+from . import agent_workspaces
 from . import goal_access
 from . import goal_recovery
 from .windows_containment import VERIFICATION_RUNTIME_CONTRACT
@@ -171,7 +174,7 @@ AGENT_ACTION_FORMAT = ResponseFormat("nexus_long_horizon_action_v1", {
         "questions": copy.deepcopy(user_questions.QUESTIONS_SCHEMA),
         "interrupt_reason": {"type": "string", "enum": sorted(INTERRUPT_REASONS)},
         "criteria_evidence": {
-            "type": "array", "maxItems": 24,
+            "type": "array", "maxItems": MAX_CRITERIA + 2,
             "items": {
                 "type": "object",
                 "properties": {
@@ -228,6 +231,19 @@ AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
         "character_limit": {"type": "integer", "minimum": 1, "maximum": 12000},
     }, ["after", "limit", "decision_id", "offset", "character_limit"])
 )
+
+
+for _workspace_tool, _arguments, _required in [
+    ("workspace_catalog", {}, []),
+    ("workspace_read", {"workspace_id": {"type": "string", "maxLength": 160}, "path": {"type": "string", "maxLength": 500},
+                        "cursor": {"type": "string", "maxLength": 4000}}, ["workspace_id", "path", "cursor"]),
+    ("workspace_edit", {"workspace_id": {"type": "string", "maxLength": 160}, "expected_fingerprint": {"type": "string", "maxLength": 64},
+                        "changes": copy.deepcopy(AGENT_ACTION_FORMAT.schema["properties"]["changes"])}, ["workspace_id", "expected_fingerprint", "changes"]),
+    ("workspace_snapshot", {"workspace_id": {"type": "string", "maxLength": 160}}, ["workspace_id"]),
+    ("workspace_verify", {"snapshot_id": {"type": "string", "maxLength": 160}}, ["snapshot_id"]),
+]:
+    AGENT_ACTION_FORMAT.schema["properties"]["tool_calls"]["items"]["anyOf"].append(
+        swarm_work._context_tool_call_schema(_workspace_tool, _arguments, _required))
 
 
 def _agent_action_format(task: dict[str, Any]) -> ResponseFormat:
@@ -489,6 +505,13 @@ def _execution_root(document: dict[str, Any]) -> Path:
 
 def _isolated_execution(document: dict[str, Any]) -> bool:
     return bool(document.get("execution_workspace"))
+
+
+def _concurrent_project_copy(document: dict[str, Any]) -> bool:
+    # Saved chats already support concurrent copies. Standalone board goals
+    # keep their established project queue/cancellation ordering while gaining
+    # the same independent files and native tools.
+    return _isolated_execution(document) and bool(document.get("conversation_id"))
 
 
 def _goal_execution_contract(document: dict[str, Any]) -> dict[str, Any]:
@@ -765,6 +788,7 @@ def _context_binding(document: dict[str, Any], baseline: dict[str, str] | None =
         "verification_observation_epoch": int(document.get("verification_observation_epoch") or 0),
         "decision_contract": goal_decisions.CONTRACT,
         "agent_access_sha256": goal_access.context_fingerprint(document),
+        "workspace_collaboration": document.get("workspace_collaboration"),
         "decisions_sha256": goal_decisions.state_fingerprint(document),
         "task_recipients_sha256": goal_decisions.fingerprint({
             task["id"]: task.get("assigned_agent_id") for task in document.get("tasks", [])
@@ -1506,7 +1530,7 @@ class GoalStore(goal_access.AccessStoreMixin):
 
     @classmethod
     def _goals_overlap(cls, left: dict[str, Any], right: dict[str, Any]) -> bool:
-        if _isolated_execution(left) and _isolated_execution(right):
+        if _concurrent_project_copy(left) and _concurrent_project_copy(right):
             return False
         left_authority = str(left.get("project_authority_id") or "")
         right_authority = str(right.get("project_authority_id") or "")
@@ -1708,7 +1732,7 @@ class GoalStore(goal_access.AccessStoreMixin):
             goal for goal in self._shared_documents(db, PROJECT_OWNER_GOALS)
             if goal["goal_id"] != except_goal_id and self._is_project_owner(goal)
             and self._goal_overlaps_target(goal, project_path, project_authority_id)
-            and not (candidate and _isolated_execution(candidate) and _isolated_execution(goal))
+            and not (candidate and _concurrent_project_copy(candidate) and _concurrent_project_copy(goal))
         ]
 
     def _promote_eligible_waiters(
@@ -3389,6 +3413,9 @@ class GoalStore(goal_access.AccessStoreMixin):
         if isolated_workspace:
             document["execution_workspace"] = goal_workspaces.create(document, self.root)
             document["execution_contract"] = self._execution_contract_for(document)
+            document["agent_workspace_contract"] = agent_workspaces.CONTRACT
+            document["closeout_contract"] = goal_closeout.CONTRACT
+            collaboration.install(document, (policy or {}).get("collaboration"))
             document["workspace_publication"] = {"state": "pending"}
             document["note"] = "Working in this chat's independent project copy."
         document["agent_access"] = {"schema_version": 1, "binding": goal_access.binding(document),
@@ -3435,8 +3462,8 @@ class GoalStore(goal_access.AccessStoreMixin):
                 blockers = self._shared_project_owners(
                     db, root, target_authority_id,
                 )
-                if _isolated_execution(document):
-                    blockers = [one for one in blockers if not _isolated_execution(one)]
+                if _concurrent_project_copy(document):
+                    blockers = [one for one in blockers if not _concurrent_project_copy(one)]
                 blockers.sort(key=lambda one: (
                     int(one.get("created_ms") or 0), str(one["goal_id"]),
                 ))
@@ -4078,6 +4105,11 @@ class GoalStore(goal_access.AccessStoreMixin):
             # Expose the deterministic folder for inspecting retained/conflicting
             # work. Loading chat status does not scan mutable source files.
             value["workspace_path"] = str(self.root / document["execution_workspace"]["path"])
+            if document.get("agent_workspace_contract") == agent_workspaces.CONTRACT:
+                try:
+                    value["workspaces"] = agent_workspaces.descriptors(document, self.root)
+                except (HarnessError, OSError, ValueError) as exc:
+                    value["workspace_problem"] = str(exc)
             if document.get("status") == "complete" and not document.get("delivery_receipt"):
                 # Legacy completion did not expose destination file evidence.
                 # Recover it from the authenticated publisher and read back the
@@ -4231,6 +4263,12 @@ class GoalStore(goal_access.AccessStoreMixin):
             "fork_checkpoint": int(source.get("event_seq") or 0),
             "note": "Forked from the saved task/evidence checkpoint into an isolated Git worktree. Resume when ready.",
         })
+        if document.get("agent_workspace_contract") == agent_workspaces.CONTRACT:
+            document["execution_workspace"] = goal_workspaces.create(document, self.root)
+            document["execution_contract"] = self._execution_contract_for(document)
+            document["workspace_publication"] = {"state": "pending"}
+        if source.get("workspace_collaboration"):
+            collaboration.install(document, collaboration.state(source))
         document["dialogue_archive"] = goal_dialogue.empty(document)
         if source.get("verification_contract") is not None:
             source_verification = verification_project(self.config, source)
@@ -5597,7 +5635,7 @@ class GoalStore(goal_access.AccessStoreMixin):
             packet_sha = self._review_packet_sha256(current, action)
             current["review_packet_sha256"] = packet_sha
             owner = next(one for one in document["agents"] if one["id"] == current["assigned_agent_id"])
-            reviewer = next((
+            reviewer = collaboration.reviewer(document, current["assigned_agent_id"]) or next((
                 one for one in document["agents"]
                 if one["id"] != current["assigned_agent_id"]
                 and _providers_independent(one, owner)
@@ -5618,7 +5656,7 @@ class GoalStore(goal_access.AccessStoreMixin):
                         str(one.get("path") or "").replace("\\", "/").strip()
                         for one in proposed_changes
                         if str(one.get("path") or "").strip()
-                        and (one.get("delete") is True or len(str(one.get("content") or "")) <= 4_000)
+                        and (one.get("delete") is True or len(str(one.get("content_base64") or one.get("content") or "")) <= 4_000)
                     ]
                     document["tasks"].append({
                         "id": review_id, "title": f"Review: {current['title']}",
@@ -5731,6 +5769,8 @@ class GoalStore(goal_access.AccessStoreMixin):
                     "The goal was cancelled or is draining before this result could be applied"
                 )
             _validate_action_semantics(action, current)
+            goal_closeout.validate_action(document, current, action, _execution_root(document))
+            collaboration.validate_action(document, current, action)
             # A successfully accepted non-tool action ends its context-only
             # episode. Claims, scopes and restarts deliberately do not.
             if not action.get("tool_calls"):
@@ -6080,6 +6120,12 @@ class GoalStore(goal_access.AccessStoreMixin):
                     current["state"] = "ready"
                     self._event(db, document, "task_progress", task_id=current["id"],
                                 agent_id=current["assigned_agent_id"], payload={"summary": current["summary"]})
+            if current.get("closeout_outcome") and kind == "blocked":
+                # The judgment is finished even when it rejects the submission.
+                # The verifier schedules repair; a rejection is never an approval.
+                current["state"] = "complete"
+                self._event(db, document, "closeout_changes_requested", task_id=current["id"],
+                            agent_id=current["assigned_agent_id"], payload=current["closeout_outcome"])
             current.update({"lease_id": "", "owner_pid": 0, "owner_token": "", "updated_ms": _now()})
             current["pending_transaction"] = {}
             self._refresh_waiting(document)
@@ -6103,6 +6149,10 @@ class GoalStore(goal_access.AccessStoreMixin):
             if isinstance(artifact, dict) and (artifact or {}).get("changes")
             else list(action.get("changes") or [])
         )
+        if document.get("agent_workspace_contract") == agent_workspaces.CONTRACT and changes:
+            policy = collaboration.state(document)
+            if not policy or policy["mode"] == "fixed":
+                return True
         broad = len(changes) > 6
         paths = [str(one.get("path") or "").casefold() for one in changes]
         sensitive = any(re.search(
@@ -7481,6 +7531,9 @@ class GoalStore(goal_access.AccessStoreMixin):
                 checked["status"] = "failed"
                 missing = [one["criterion"] for one in criteria_results if one["status"] not in {"passed", "not_applicable"}]
                 checked["reason"] = "Success criteria lack authenticated evidence: " + "; ".join(missing)
+            if goal_closeout.enabled(document) and verification_satisfied and not goal_closeout.approved(document, _execution_root(document)):
+                checked.update(status="failed", reason="Independent whole-goal closeout has not approved this exact submission.")
+                verification_satisfied = False
             document["verification"] = _durable_evidence(checked)
             goal_access.record_block(document, checked)
             self._event(db, document, "test_result", payload=checked)
@@ -7533,11 +7586,12 @@ class GoalStore(goal_access.AccessStoreMixin):
                 document["note"] = "Verification failed, but the bounded task budget is exhausted: " + reason
                 self._event(db, document, "goal_paused", payload={"reason": "task_budget", "detail": reason})
                 return
+            repair_agent_id = result.get("repair_agent_id") if result.get("repair_agent_id") in {a["id"] for a in document["agents"]} else document["lead_agent_id"]
             task_id = _stable_id("repair", goal_id, document["revision"], reason)
             document["tasks"].append({
                 "id": task_id, "title": "Repair failed verification", "description": reason,
                 "kind": "repair", "state": "ready", "depends_on": [], "parent_id": "",
-                "review_of": "", "assigned_agent_id": document["lead_agent_id"],
+                "review_of": "", "assigned_agent_id": repair_agent_id,
                 "parallel_safe": False, "resource_paths": [], "attempts": 0, "no_progress": 0,
                 "lease_id": "", "owner_pid": 0, "owner_token": "", "created_ms": _now(),
                 "updated_ms": _now(), "summary": "", "last_error": reason,
@@ -7551,7 +7605,7 @@ class GoalStore(goal_access.AccessStoreMixin):
             document["status"] = "queued"
             document["note"] = "Verification created one concrete repair task."
             self._event(db, document, "task_created", task_id=task_id,
-                        agent_id=document["lead_agent_id"], payload={"kind": "repair", "verification_failure": reason})
+                        agent_id=repair_agent_id, payload={"kind": "repair", "verification_failure": reason})
         return self.public(self._mutate(goal_id, change)[0])
 
     def recover_codex_schema_rejection(self, goal_id: str) -> dict[str, Any]:
@@ -7989,8 +8043,11 @@ class LongHorizonRuntime:
             )
         return {"route": "end", "task_ids": []}
 
-    def _agent_context(self, goal: dict[str, Any], task: dict[str, Any], extra_files: list[str] | None = None) -> str:
-        root = _execution_root(goal)
+    def _agent_context(self, goal: dict[str, Any], task: dict[str, Any], extra_files: list[str] | None = None, *, workspace_root: Path | None = None) -> str:
+        if task.get("closeout_packet"):
+            files = swarm_work._file_snapshot(workspace_root or _execution_root(goal), list(extra_files or [])) if extra_files else "Use read_file to inspect the submitted snapshot."
+            return goal_closeout.context(task) + "\n\nREQUESTED SNAPSHOT FILES\n" + files
+        root = workspace_root or _execution_root(goal)
         legacy_visible = self.store.legacy_user_evidence_visibility(
             goal["goal_id"], task["assigned_agent_id"], goal_decisions.legacy_steering_candidates(goal),
         )
@@ -8115,10 +8172,12 @@ class LongHorizonRuntime:
                             {
                                 "path": one.get("path"), "delete": one.get("delete") is True,
                                 "reason": _short(one.get("reason"), 1_000),
-                                "content_preview": _short(one.get("content"), 4_000),
-                                "content_characters": len(str(one.get("content") or "")),
+                                "content_preview": _short(one.get("content_base64") or one.get("content"), 4_000),
+                                "encoding": "base64" if one.get("content_base64") else "utf-8",
+                                "mode": one.get("mode"),
+                                "content_characters": len(str(one.get("content_base64") or one.get("content") or "")),
                                 "content_sha256": hashlib.sha256(
-                                    str(one.get("content") or "").encode("utf-8")
+                                    (base64.b64decode(one["content_base64"], validate=True) if one.get("content_base64") else str(one.get("content") or "").encode("utf-8"))
                                 ).hexdigest(),
                             }
                             for one in proposed.get("changes", []) if isinstance(one, dict)
@@ -8164,12 +8223,15 @@ class LongHorizonRuntime:
             "Nexus still requires deterministic project verification before completing this goal. "
         )
         return (
-            "LONG-HORIZON GOAL\n" + goal["objective"]
+            "ORIGINAL USER PROMPT\n" + str(goal.get("original_objective") or goal["objective"])
+            + "\n\nCURRENT WHOLE GOAL\n" + goal["objective"]
             + "\n\nAGENT ACCESS\n" + goal_access.state(goal)["mode"]
             + ": read_only permits inspection only; ask permits edits and requests new command approval; full permits project edits and commands. "
               "Nexus enforces this setting. A command permission block opens a card for the user; do not repeatedly retry it or treat conversational text as an engine grant."
             + "\n\nSUCCESS CRITERIA\n- " + "\n- ".join(goal["success_criteria"])
             + "\n\nCURRENT CONCRETE TASK\n" + task["description"]
+            + goal_closeout.repair_context(goal, task)
+            + collaboration.prompt(goal, task, self.store.root)
             + "\n\nSHARED TASK LEDGER\n" + json.dumps(ledger, ensure_ascii=False)
             + "\n\nPROJECT LOCATION\nSelected project: " + str(goal["project"]["path"])
             + ("\nThis chat uses an independent working copy. All Nexus file/context tools and relative "
@@ -8234,10 +8296,38 @@ class LongHorizonRuntime:
 
     def _execute_one(self, goal_id: str, task_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         goal = self.store.get(goal_id)
+        task = next(one for one in goal["tasks"] if one["id"] == task_id)
+        if task.get("closeout_packet"):
+            if goal_closeout.fingerprint(goal, _execution_root(goal)) != task["closeout_packet"]["fingerprint"]:
+                goal_closeout.supersede(self.store, goal_id, task)
+                return task, {"action": "superseded", "summary": "A fresh closeout review is required", "changes": []}
+            with goal_closeout.workspace(goal, task, self.store.root) as workspace:
+                return self._execute_in_workspace(goal_id, task_id, agent_workspace=workspace)
+        if task.get("review_of") and goal.get("agent_workspace_contract"):
+            collaboration.prepare_review(self.store, goal, task)
+            goal = self.store.get(goal_id)
+            task = next(t for t in goal["tasks"] if t["id"] == task_id)
+            try:
+                with collaboration.review_workspace(goal, task, self.store.root) as workspace:
+                    return self._execute_in_workspace(goal_id, task_id, agent_workspace=workspace)
+            except collaboration.SupersededReview:
+                collaboration.supersede_review(self.store, goal_id, task)
+                return task, {"action": "superseded", "summary": "A fresh submission is needed for review", "changes": []}
+        if goal.get("agent_workspace_contract") not in (None, "", agent_workspaces.CONTRACT):
+            raise HarnessError("This goal uses an unsupported agent workspace contract; start a new goal")
+        if goal.get("agent_workspace_contract") == agent_workspaces.CONTRACT:
+            task = next(one for one in goal["tasks"] if one["id"] == task_id)
+            agent = next(one for one in goal["agents"] if one["id"] == task["assigned_agent_id"])
+            with agent_workspaces.workspace(goal, agent, self.store.root) as workspace:
+                return self._execute_in_workspace(goal_id, task_id, agent_workspace=workspace)
+        return self._execute_in_workspace(goal_id, task_id)
+
+    def _execute_in_workspace(self, goal_id: str, task_id: str, *, agent_workspace=None) -> tuple[dict[str, Any], dict[str, Any]]:
+        goal = self.store.get(goal_id)
         self._require_agent_setup(goal)
         task = next(one for one in goal["tasks"] if one["id"] == task_id)
         agent = next(one for one in goal["agents"] if one["id"] == task["assigned_agent_id"])
-        root = _execution_root(goal)
+        root = agent_workspace.root if agent_workspace else _execution_root(goal)
         # A browser connection can serve multiple agents. Its native history
         # must stay with this exact recipient even when the task is handed off.
         conversation_key = _stable_id("long-goal-v2", goal_id, task_id, task["assigned_agent_id"])
@@ -8291,13 +8381,18 @@ class LongHorizonRuntime:
                 workspace_context=ProviderWorkspaceContext(project_id=str(goal["project"]["id"]),
                     project_path=str(goal["project"]["path"]), execution_path=str(root)),
                 provider_attachments=provider_attachments,
+                **({"native_execution": "work" if goal_access.state(goal)["mode"] == "full" and collaboration.can_write(goal, task) else "inspect",
+                    "working_directory": str(root)} if agent_workspace else {}),
                 response_format=_agent_action_format(task),
                 conversation_key=conversation_key,
                 before_provider_dispatch=account_dispatch(phase, request_text, request_context),
                 after_provider_response=account_reply(phase),
             )
             try:
-                return swarm_work._decode(answer, agent["name"], AGENT_ACTION_FORMAT)
+                decoded = swarm_work._decode(answer, agent["name"], AGENT_ACTION_FORMAT)
+                if agent_workspace and collaboration.can_write(goal, task):
+                    decoded = agent_workspace.collect_action(decoded, max_bytes=int(self.config.get("execution.max_changed_bytes")), max_files=int(self.config.get("execution.max_changed_files")))
+                return decoded
             except HarnessError:
                 if not str(agent.get("who") or "").startswith("web:"):
                     raise
@@ -8324,7 +8419,10 @@ class LongHorizonRuntime:
                         f"{phase}_format_repair"
                     ),
                 )
-                return swarm_work._decode(corrected, agent["name"], AGENT_ACTION_FORMAT)
+                decoded = swarm_work._decode(corrected, agent["name"], AGENT_ACTION_FORMAT)
+                if agent_workspace and collaboration.can_write(goal, task):
+                    decoded = agent_workspace.collect_action(decoded, max_bytes=int(self.config.get("execution.max_changed_bytes")), max_files=int(self.config.get("execution.max_changed_files")))
+                return decoded
 
         try:
             provider_attachments = []
@@ -8341,6 +8439,8 @@ class LongHorizonRuntime:
                     **descriptor, "data": base64.b64encode(content).decode("ascii"),
                 })
             baseline_manifest = _project_baseline_manifest(root)
+            if agent_workspace:
+                baseline_manifest = {path: "file:" + data["sha256"] for path, data in agent_workspace.baseline.items()}
             current_context_binding = _context_binding(goal, baseline_manifest)
             if any(
                 step.get("state") != "superseded"
@@ -8391,10 +8491,15 @@ class LongHorizonRuntime:
                         _stable_id("lh-context", tool_session_id),
                         session_id=tool_session_id,
                     ).begin(current_goal["objective"], [agent], mode="long_horizon_context_tools")
+                    project_tools_authority = self.store.access_project(current_goal)
+                    if agent_workspace:
+                        from .goal_verification import inspection_verification_project
+                        project_tools_authority = inspection_verification_project(self.config, current_goal, self.store.root, root, project_tools_authority)
                     context_tools = swarm_work._ProjectContextTools(
                         self.config, root, ledger,
-                        self.store.access_project(current_goal),
+                        project_tools_authority,
                         current_goal["objective"], changed_paths, None,
+                        attachments=current_goal.get("input_provider_attachments") or [],
                         **({"verification_profile": "shared_goal_v1"}
                            if current_goal.get("require_all_participants") else {}),
                     )
@@ -8413,7 +8518,12 @@ class LongHorizonRuntime:
                         return False
                     self.store.reserve_context_tool(goal_id, task, call)
                     try:
-                        if str(call.get("name") or "") == "read_user_decisions":
+                        if str(call.get("name") or "") in collaboration.TOOLS:
+                            try:
+                                result = collaboration.execute(self, self.store.get(goal_id), task, call["name"], call.get("arguments") or {})
+                            except (HarnessError, OSError) as exc:
+                                raise ContextRequestError(str(exc)) from exc
+                        elif str(call.get("name") or "") == "read_user_decisions":
                             arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
                             result = goal_decisions.page(self.store.get(goal_id), task["assigned_agent_id"],
                                 after=int(arguments.get("after") or 0), limit=int(arguments.get("limit") or 10),
@@ -8452,7 +8562,7 @@ class LongHorizonRuntime:
                             ), None)
                             if proposed is None:
                                 raise ReviewContextRequestError("That path is not in the exact proposed review packet")
-                            content = str(proposed.get("content") or "")
+                            content = str(proposed.get("content_base64") or proposed.get("content") or "")
                             if offset > len(content):
                                 raise ReviewContextRequestError("A proposed-change offset exceeds the exact proposed file length")
                             result = {
@@ -8460,7 +8570,9 @@ class LongHorizonRuntime:
                                 "reason": _short(proposed.get("reason"), 1_000),
                                 "offset": offset, "content": content[offset:offset + limit],
                                 "total_characters": len(content),
-                                "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                                "content_sha256": hashlib.sha256(base64.b64decode(content, validate=True) if proposed.get("content_base64") else content.encode("utf-8")).hexdigest(),
+                                "encoding": "base64" if proposed.get("content_base64") else "utf-8",
+                                "mode": proposed.get("mode"),
                                 "has_more": offset + limit < len(content),
                             }
                         else:
@@ -8536,7 +8648,8 @@ class LongHorizonRuntime:
                     return task, {"action": boundary, "summary": "Stopped at a user-control boundary", "changes": []}
                 latest_goal = self.store.get(goal_id)
                 latest_task = next(one for one in latest_goal["tasks"] if one["id"] == task_id)
-                context = self._agent_context(latest_goal, latest_task, requested_files)
+                context = self._agent_context(latest_goal, latest_task, requested_files,
+                    **({"workspace_root": root} if agent_workspace else {}))
                 if stale_conversation_observations:
                     context += (
                         "\n\nCONVERSATION FRESHNESS\nEarlier read_shared_conversation results were "
@@ -8767,7 +8880,20 @@ class LongHorizonRuntime:
                 # behind the decision card violates the pause contract.
                 self.store.defer_pending_action(goal_id, task)
                 continue
-            if action.get("changes") and goal_access.state(current_goal)["mode"] == "read_only":
+            if current_task.get("closeout_packet"):
+                if goal_closeout.fingerprint(current_goal, _execution_root(current_goal)) != current_task["closeout_packet"]["fingerprint"]:
+                    goal_closeout.supersede(self.store, goal_id, current_task)
+                    continue
+                with goal_closeout.workspace(current_goal, current_task, self.store.root):
+                    goal_closeout.validate_action(current_goal, current_task, action, _execution_root(current_goal))
+            if current_task.get("review_of") and current_goal.get("agent_workspace_contract") and current_task.get("review_submission"):
+                try:
+                    with collaboration.review_workspace(current_goal, current_task, self.store.root):
+                        pass
+                except collaboration.SupersededReview:
+                    collaboration.supersede_review(self.store, goal_id, current_task)
+                    continue
+            if action.get("changes") and not collaboration.can_write(current_goal, current_task):
                 self.store.reject_unapplied_proposal(goal_id, task,
                     "Read only access permits inspection and discussion, not file changes. "
                     "Continue without edits or ask a specific question if the objective requires them.")
@@ -8810,6 +8936,12 @@ class LongHorizonRuntime:
                             raise HarnessError(
                                 f"Baseline conflict: {relative}; the project changed after the agent observed it"
                             )
+                    native_baselines = action.get("_nexus_agent_baseline")
+                    if native_baselines is not None:
+                        actual_files = agent_workspaces.inventory(root)
+                        for relative, expected in native_baselines.items():
+                            if goal_workspaces._content(actual_files.get(relative)) != goal_workspaces._content(expected):
+                                raise HarnessError("Agent baseline conflict, including permissions: " + relative)
                     plans = swarm_work._validated_changes(root, changes)
                     if not plans:
                         if pending:
@@ -8822,7 +8954,7 @@ class LongHorizonRuntime:
                         if not pending:
                             self.store.prepare_transaction(goal_id, task, transaction_id, changes)
                         manifest = FileTransaction(
-                            root, max_files=12,
+                            root, max_files=int(self.config.get("execution.max_changed_files")) if goal.get("agent_workspace_contract") else 12,
                             max_bytes=int(self.config.get("execution.max_changed_bytes")),
                         ).apply(plans, transaction_id=transaction_id)
                         artifact = {
@@ -8833,7 +8965,7 @@ class LongHorizonRuntime:
                             "tree_merkle": swarm_work._project_tree_merkle(root)[0],
                         }
                         self.store.record_transaction_applied(goal_id, task, artifact)
-            elif action.get("action") in {"complete", "request_review"}:
+            elif action.get("action") in {"complete", "request_review"} or current_task.get("closeout_packet"):
                 goal = self.store.get(goal_id)
                 self._require_goal_authority(goal)
                 root = _execution_root(goal)
@@ -8898,12 +9030,30 @@ class LongHorizonRuntime:
             for change in artifact.get("changes", []) if isinstance(change, dict) and change.get("path")
         ]
         project = self.store.access_project(goal)
-        result = swarm_work._run_selected_project_verification(
-            self.config, root, project, goal["objective"], list(dict.fromkeys(changed)), None,
-            verification_session_id=goal["goal_id"],
-            **({"verification_profile": "shared_goal_v1", "context_check": True}
-               if goal.get("require_all_participants") else {}),
-        )
+        closeout_fingerprint = goal_closeout.fingerprint(goal, root) if goal_closeout.enabled(goal) else None
+        judged = goal_closeout.latest(goal, root) if closeout_fingerprint else None
+        if judged and judged["closeout_outcome"]["verdict"] == "approve":
+            # The judge reviewed this exact tested submission. Reusing its bound
+            # evidence also preserves one-use permission to execute those tests.
+            result = copy.deepcopy(judged["closeout_packet"]["verification"])
+        else:
+            result = swarm_work._run_selected_project_verification(
+                self.config, root, project, goal["objective"], list(dict.fromkeys(changed)), None,
+                verification_session_id=goal["goal_id"],
+                **({"verification_profile": "shared_goal_v1", "context_check": True}
+                   if goal.get("require_all_participants") else {}),
+            )
+        if goal_closeout.enabled(goal) and (result.get("status") == "passed" or
+                result.get("status") == "not_configured" and _allows_unconfigured_checks(goal)):
+            decision = goal_closeout.stage(self.store, goal["goal_id"], result, _providers_independent,
+                expected_revision=project["_nexus_command_access"].revision or int(goal["revision"]),
+                expected_fingerprint=closeout_fingerprint)
+            if decision["state"] in {"scheduled", "paused", "superseded"}:
+                return {"route": "end" if decision["state"] == "paused" else "schedule"}
+            if decision["state"] == "failed":
+                result = {**result, "status": "failed", "basis": "whole_goal_closeout", **decision}
+            goal = self.store.get(goal["goal_id"])
+            project = self.store.access_project(goal)
         updated = self.store.complete_verification(
             goal["goal_id"], result,
             expected_revision=project["_nexus_command_access"].revision or int(goal["revision"]),
@@ -9331,7 +9481,7 @@ class LongHorizonRuntime:
                             admission_digest=admission_digest,
                             expected_project_authority_id=actual_authority_id,
                             expected_agents=admitted_agents,
-                            isolated_workspace=bool(conversation_id),
+                            isolated_workspace=True,
                         )
                     except Exception:
                         if attachment_root.exists() and expected_parent in attachment_root.parents:
@@ -9348,7 +9498,7 @@ class LongHorizonRuntime:
                         admission_digest=admission_digest,
                         expected_project_authority_id=actual_authority_id,
                         expected_agents=admitted_agents,
-                        isolated_workspace=bool(conversation_id),
+                        isolated_workspace=True,
                     )
             if goal.get("request_tombstone") is True:
                 # Detailed terminal history is intentionally bounded, but a

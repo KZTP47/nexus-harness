@@ -7676,8 +7676,139 @@ async function reviewGoalVerificationCommands(goal, button) {
   }
 }
 
+async function openGoalWorkspaces(goal) {
+  const dialog = make("dialog", "goal-workspace-viewer");
+  const title = make("h2", "", "Project workspaces");
+  const close = make("button", "", "Close");
+  close.type = "button";
+  close.addEventListener("click", () => dialog.close());
+  const tabs = make("div", "goal-workspace-tabs");
+  const location = make("p", "hint");
+  const content = make("div", "goal-workspace-content");
+  dialog.append(title, close, tabs, location, content);
+  dialog.addEventListener("close", () => dialog.remove(), {once: true});
+  document.body.append(dialog);
+  dialog.showModal();
+  let selected = "real", ticket = 0;
+  async function browse(path = "", cursor = "") {
+    const current = ++ticket;
+    content.replaceChildren(make("p", "", "Loading files…"));
+    try {
+      const query = new URLSearchParams({goal_id: goal.goal_id, workspace_id: selected, path, cursor});
+      const result = await request(`/api/long-horizon/workspace?${query}`);
+      if (current !== ticket || !dialog.isConnected) return;
+      location.textContent = `${result.root}${path ? ` / ${path}` : ""}`;
+      content.replaceChildren();
+      if (path) {
+        const up = make("button", "", "Back to folder");
+        up.type = "button";
+        up.addEventListener("click", () => browse(path.split("/").slice(0, -1).join("/")));
+        content.append(up);
+      }
+      if (result.kind === "directory") {
+        const list = make("ul", "goal-workspace-files");
+        for (const entry of result.entries || []) {
+          const row = make("li", "");
+          const button = make("button", "", `${entry.directory ? "Folder: " : ""}${entry.name}`);
+          button.type = "button";
+          button.addEventListener("click", () => browse(entry.path));
+          row.append(button); list.append(row);
+        }
+        content.append(list);
+      } else if (result.kind === "file") {
+        content.append(make("pre", "", result.content || ""));
+        if (result.truncated) {
+          const more = make("button", "", "Next page"); more.type = "button";
+          more.addEventListener("click", () => browse(path, result.next_cursor)); content.append(more);
+        }
+      } else {
+        content.append(make("p", "", `Binary file · ${result.size} bytes. Its location is shown above.`));
+      }
+    } catch (error) {
+      if (current === ticket) content.replaceChildren(make("p", "", String(error.message || error)));
+    }
+  }
+  for (const workspace of goal.workspaces || [{id: "real", label: "Real project"}]) {
+    const button = make("button", "", workspace.label);
+    button.type = "button";
+    button.addEventListener("click", () => {
+      selected = workspace.id;
+      for (const tab of tabs.children) tab.setAttribute("aria-pressed", String(tab === button));
+      browse();
+    });
+    button.setAttribute("aria-pressed", String(workspace.id === selected));
+    tabs.append(button);
+  }
+  await browse();
+}
+
+function chatCollaborationPreference(conversation, settings = null) {
+  if (!conversation?.id) return {};
+  const key = `nexus.chat-collaboration.v1:${conversation.id}`;
+  const binding = JSON.stringify({project: conversation.project, pair: conversation.pair, binding: conversation.binding});
+  try {
+    if (settings) { localStorage.setItem(key, JSON.stringify({contract: "workspace-collaboration/v1", binding, settings})); return settings; }
+    const held = JSON.parse(localStorage.getItem(key) || "null");
+    if (held?.contract === "workspace-collaboration/v1" && held.binding === binding) return held.settings;
+  } catch {}
+  return {};
+}
+
+function chatProjectPolicy(conversation, accessMode) {
+  const settings = chatCollaborationPreference(conversation);
+  return {agent_access_mode: accessMode, ...(Object.keys(settings).length ? {collaboration: settings} : {})};
+}
+
+function appendCollaborationControls(panel, settings, agents, settled, onSave) {
+  const box = make("section", "chat-collaboration-controls");
+  box.append(make("strong", "", "Collaboration"));
+  const mode = make("select"); mode.setAttribute("aria-label", "Collaboration mode");
+  for (const [value, text] of [["flexible", "Flexible collaboration"], ["fixed", "Fixed writer and reviewer"]]) {
+    const option = make("option", "", text); option.value = value; mode.append(option);
+  }
+  mode.value = settings?.mode || "flexible";
+  const roles = make("div", "chat-collaboration-roles");
+  const selectors = {};
+  for (const [key, title] of [["writer_id", "Writer"], ["reviewer_id", "Reviewer"]]) {
+    const label = make("label", "", title); const select = make("select"); select.setAttribute("aria-label", title);
+    for (const agent of agents) {const option = make("option", "", agent.name || agent.id); option.value = agent.id; select.append(option);}
+    select.value = settings?.[key] || agents[key === "writer_id" ? 0 : 1]?.id || "";
+    selectors[key] = select; label.append(select); roles.append(label);
+  }
+  const directLabel = make("label", "chat-collaboration-direct");
+  const direct = make("input"); direct.type = "checkbox"; direct.checked = settings?.allow_direct_real_edits === true;
+  directLabel.append(direct, document.createTextNode("Allow direct editing of the real project"));
+  const hint = make("p", "hint", "Flexible: both agents can inspect all copies and edit either draft. Fixed: Nexus reserves edits for the writer and approval for the reviewer. Native permission checks still apply; copies are not OS security sandboxes. Direct editing puts changes in the real project before review and tests.");
+  const save = make("button", "", "Save collaboration"); save.type = "button";
+  const status = make("p", "hint"); status.setAttribute("role", "status");
+  const render = () => {roles.hidden = mode.value !== "fixed"; for (const el of [mode, direct, ...Object.values(selectors)]) el.disabled = !settled;
+    save.disabled = !settled || mode.value === "fixed" && (!selectors.reviewer_id.value || selectors.writer_id.value === selectors.reviewer_id.value);};
+  mode.addEventListener("change", render); for (const select of Object.values(selectors)) select.addEventListener("change", render);
+  save.addEventListener("click", async () => {save.disabled = true; try {
+    await onSave({mode: mode.value, writer_id: selectors.writer_id.value, reviewer_id: selectors.reviewer_id.value, allow_direct_real_edits: direct.checked});
+    status.textContent = "Collaboration saved.";
+  } catch (error) {status.textContent = error.message || String(error);} finally {render();}});
+  box.append(mode, roles, directLabel, hint, save, status); panel.append(box); render();
+  if (!settled) status.textContent = "Pause the team to change collaboration settings.";
+}
+
 function appendGoalAccessControls(panel, goal, afterAction, binding = {}) {
+  if (goal?.workspaces?.length) {
+    const inspect = make("button", "goal-workspace-open", "View project and agent copies");
+    inspect.type = "button";
+    inspect.addEventListener("click", () => openGoalWorkspaces(goal));
+    panel.append(inspect);
+  }
   if (!goal?.goal_id || ["complete", "cancelled", "cancelling"].includes(goal.status)) return;
+  if (goal.workspace_collaboration) {
+    const settled = ["paused", "queued", "waiting_for_user"].includes(goal.status) && !goal.scheduler_live
+      && !(goal.tasks || []).some(t => ["running", "pending_apply"].includes(t.state) || Object.keys(t.pending_action || {}).length);
+    appendCollaborationControls(panel, goal.workspace_collaboration, goal.agents || [], settled, async settings => {
+      const result = await request("/api/long-horizon/collaboration", {method: "POST", body: JSON.stringify({goal_id: goal.goal_id, ...binding,
+        expected_revision: goal.revision, settings})});
+      await afterAction?.(result.goal);
+    });
+  }
   appendGoalRecoveryControls(panel, goal, afterAction, binding);
   const box = make("section", "chat-goal-access");
   const label = make("label", "", "Agent access · this team");
@@ -7692,7 +7823,7 @@ function appendGoalAccessControls(panel, goal, afterAction, binding = {}) {
   select.disabled = !settled;
   label.append(select);
   box.append(label, make("p", "hint", settled
-    ? "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow edits and commands. All modes keep Nexus workspace protections. Applies to every agent in this chat."
+    ? "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow native tools, edits and commands in each agent copy. Copies are not security sandboxes; native commands can affect files outside them. Nexus reviews and verifies publication. Applies to every agent in this chat."
     : "Pause the team to change access. The setting applies to every agent in this chat."));
   const status = make("p", "hint chat-access-status");
   status.setAttribute("role", "status");
@@ -7990,7 +8121,7 @@ function fillChatComposerPermissions(host, agentId, context) {
   const needsInput = active && goal.command_request?.state === "pending";
   const signature = JSON.stringify([conversation?.id, conversation?.binding, conversation?.project,
     goal?.goal_id, goal?.status, goal?.agent_access, goal?.command_request, goal?.scheduler_live,
-    goal?.tasks?.some(task => task.state === "running"), context.problem, mode]);
+    goal?.tasks?.some(task => task.state === "running"), goal?.workspace_collaboration, context.problem, mode]);
   const body = host.querySelector(".chat-composer-permissions-body");
   if (body) body.dataset.goalRevision = String(goal?.revision || "");
   if (host.dataset.snapshot === signature) return;
@@ -8019,6 +8150,9 @@ function fillChatComposerPermissions(host, agentId, context) {
       await refreshChatGoalAfterAction(agentId, result, chatKey);
     }, chatGoalBinding(agentId, goal));
   } else {
+    appendCollaborationControls(panel, chatCollaborationPreference(conversation),
+      (conversation?.pair || []).map(id => theSwarmAgent(id) || {id, name: id}), true,
+      async settings => {chatCollaborationPreference(conversation, settings);});
     const label = make("label", "", "Access for the next project goal");
     const select = make("select", "chat-access-mode");
     select.setAttribute("aria-label", "Agent access for this chat");
@@ -8032,7 +8166,7 @@ function fillChatComposerPermissions(host, agentId, context) {
       fillChatComposerPermissions(host, agentId, chatLongGoalContext(agentId));
     });
     label.append(select);
-    panel.append(label, make("p", "hint", "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow edits and commands within Nexus workspace protections."),
+    panel.append(label, make("p", "hint", "Read only: inspect files. Ask: allow project edits and ask before new commands. Full project access: allow native tools, edits and commands in agent copies. Copies are not security sandboxes; native commands can affect files outside them. Nexus reviews and verifies publication."),
       make("p", "hint", "Saved for project work in this chat. Asking agents questions does not grant file-editing access."));
   }
   host.append(button, popup);
@@ -14705,7 +14839,7 @@ async function directLongGoalIntent(conversation, agentId, text, attachments,
     lead_id: String(agentId || ""),
     text: String(text || ""),
     attachments: attachments || [],
-    policy: {agent_access_mode: accessMode},
+    policy: chatProjectPolicy(conversation, accessMode),
   }));
   if (globalThis.crypto?.subtle && globalThis.TextEncoder) {
     const digest = await globalThis.crypto.subtle.digest(
@@ -15371,7 +15505,7 @@ async function sendWhatIsTypedTo(agentId) {
         chat_id: conversation.id,
         text: words,
         attachments,
-        policy: {agent_access_mode: accessMode},
+        policy: chatProjectPolicy(conversation, accessMode),
       };
       const preparedAdmission = await prepareDirectLongGoalAdmission(
         exactPayload, directRequestId, directIntent, directRequestKey,
@@ -19365,7 +19499,7 @@ async function sendFromTheBigChat(mode = "chat") {
         text: said,
         chat_id: conversation.id,
         attachments,
-        policy: {agent_access_mode: accessMode},
+        policy: chatProjectPolicy(conversation, accessMode),
       };
       const preparedAdmission = await prepareDirectLongGoalAdmission(
         exactPayload, directRequestId, directIntent, directRequestKey,

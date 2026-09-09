@@ -49,6 +49,9 @@ from typing import Any, Callable, Iterator
 from . import cancellation, collaboration_outcomes, user_questions, relay_timing
 from .config import LoadedConfig
 from .images import IMAGE_EXTENSIONS, attachment_image_metadata
+from .document_text import DOCX_MIME, extract_docx_text, is_docx
+from .archive_tools import ZipInspection
+from .research_tools import RESEARCH_INSTRUCTIONS
 from .models import HarnessError, ProviderOutcomeUnknown, ProviderRequest, ProviderWorkspaceContext, ResponseFormat
 from .providers import ProviderRegistry, create_provider
 from .providers.base import effective_dispatch_fingerprint
@@ -441,7 +444,23 @@ def keep_attachments(
                 ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".csv",
             }
         )
-        if textual:
+        archive_input = image_info is None and (Path(name).suffix.lower() == ".zip" or mime in {"application/zip", "application/x-zip-compressed"})
+        if archive_input:
+            try:
+                archive = ZipInspection(content)
+                archive_count = len(archive.entries)
+                archive.close()
+            except HarnessError as exc:
+                raise ChatError(f"{name}: {exc}") from exc
+            mime = "application/zip"
+        document = image_info is None and is_docx(name, mime)
+        if document:
+            try:
+                decoded = extract_docx_text(content)
+            except HarnessError as exc:
+                raise ChatError(f"{name}: {exc}") from exc
+            mime = DOCX_MIME
+        elif textual and not archive_input:
             try:
                 decoded = content.decode("utf-8", errors="strict")
             except UnicodeDecodeError as exc:
@@ -484,7 +503,17 @@ def keep_attachments(
                 "data": base64.b64encode(content).decode("ascii"),
                 "path": str(stored),
             })
-        if textual:
+        if archive_input:
+            text_blocks.append(f"ATTACHED ZIP ARCHIVE {position + 1}: {name}\n"
+                f"Archive has {archive_count} entries. Use list_archive, read_archive, or extract_archive with path "
+                f"attachment://{public['sha256']} to open and inspect the original archive. Content has not yet been read.")
+        elif document:
+            text_blocks.append(
+                f"ATTACHED WORD DOCUMENT {position + 1}: {name}\n"
+                "Extracted document text follows (including tables and notes; images and page layout are not rendered).\n"
+                + decoded
+            )
+        elif textual:
             text_blocks.append(f"ATTACHED TEXT FILE {position + 1}: {name}\n{decoded}")
         elif image_info:
             text_blocks.append("USER-SELECTED IMAGE (original bytes, no Nexus resizing)\n" + json.dumps({
@@ -2360,6 +2389,18 @@ def _ask_and_keep(
         eligible, speaker=speaker, filed_as=filed_as, route=route
     )
     messages.append({"role": "user", "content": redactor.text(asked)})
+    # Follow-up questions may still inspect ZIPs selected in this exact chat.
+    available_files = list(provider_attachments or [])
+    known_hashes = {one.get("sha256") for one in available_files}
+    for turn in eligible:
+        for attached in turn.attachments:
+            if (attached.get("type") == "application/zip" or str(attached.get("name", "")).lower().endswith(".zip")) and attached.get("sha256") not in known_hashes:
+                try:
+                    path, metadata = attachment_path(config, route, filed_as, attached["id"])
+                except ChatError:
+                    continue
+                available_files.append({**metadata, "path": str(path)})
+                known_hashes.add(attached.get("sha256"))
     # Built here rather than passed in, so everything that goes to an assistant
     # is built in the one place.
     request = ProviderRequest(
@@ -2371,7 +2412,7 @@ def _ask_and_keep(
         max_output_tokens=max(1, int(max_output_tokens)),
         timeout_seconds=LONGEST_WAIT_SECONDS,
         reasoning_effort=str(reasoning_effort or "") or None,
-        attachments=list(provider_attachments or []),
+        attachments=available_files,
         conversation_key=str(
             conversation_key or _filed_under(filed_as or route)
         ),
@@ -2393,9 +2434,9 @@ def _ask_and_keep(
             ):
                 return provider.complete(one_request)
 
-        answered = _complete_with_one_schema_repair(
-            provider, request, redactor, complete_provider=complete_provider
-        )
+        from .research_chat import complete_research_chat
+        answered = complete_research_chat(config, request, lambda one, phase: _complete_with_one_schema_repair(
+            provider, one, redactor, complete_provider=lambda prepared, repair_phase: complete_provider(prepared, phase + ":" + repair_phase)))
     except cancellation.ChatCancelled:
         # Stop is control flow, not a provider refusal.  Turning it into a
         # ChatError makes multi-round collaboration treat the user's stop as a
@@ -2493,6 +2534,7 @@ def ask_once(
     after_provider_response: Callable[[str], None] | None = None,
     working_directory: str = "",
     workspace_context: ProviderWorkspaceContext | None = None,
+    native_execution: str = "",
 ) -> dict[str, Any]:
     """Ask without touching a transcript, for a bounded collaboration round."""
 
@@ -2511,12 +2553,15 @@ def ask_once(
         else:
             routed = ProviderRegistry(config).provider_config(named) if named else config
             provider = create_provider(routed)
+        actual_native = native_execution if not named.startswith("web:") and str(routed.get("provider.name") or "") in {"codex-cli", "claude-cli"} else ""
         request = ProviderRequest(
             system_prefix=(HOW_TO_WORK_TOGETHER if response_format is not None
                            and response_format.name == "nexus_long_horizon_action_v1"
                            else HOW_TO_ANSWER)
                           + ("\n\n" + ATTACHMENT_GUIDANCE if provider_attachments else "")
-                          + workspace_instructions(workspace_context),
+                          + (workspace_instructions(workspace_context) if not actual_native else "")
+                          + ("\n\n" + RESEARCH_INSTRUCTIONS if response_format is not None
+                             and "tool_calls" in response_format.schema.get("properties", {}) else ""),
             dynamic_context=str(context or ""),
             messages=[{"role": "user", "content": redactor.text(asked)}],
             model=str(routed.get("provider.model") or ""),
@@ -2530,6 +2575,7 @@ def ask_once(
             prefer_existing_conversation=bool(prefer_existing_conversation),
             working_directory=str(working_directory or ""),
             workspace_context=workspace_context,
+            native_execution=actual_native,
         )
         started = time.monotonic()
         from .swarm_runs import provider_effect
@@ -2555,7 +2601,10 @@ def ask_once(
                 after_provider_response(phase)
             return completed
 
-        if named.startswith("web:"):
+        if request.response_format is None:
+            from .research_chat import complete_research_chat
+            response = complete_research_chat(config, request, complete_provider)
+        elif named.startswith("web:") or request.native_execution:
             response = complete_provider(request, "initial")
         else:
             response = _complete_with_one_schema_repair(

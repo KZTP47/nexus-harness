@@ -76,6 +76,16 @@ class GoalRecoveryTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             self.runtime.store.control(goal['goal_id'], 'resume', self.choice(goal))
 
+    def test_native_workspace_contract_never_inherits_read_only_inference_retry(self):
+        goal, _ = self.interrupted(codex=True)
+        self.assertTrue(goal['resume_recovery']['resume_safe'])
+        document = self.runtime.store.get(goal['goal_id'])
+        document['agent_workspace_contract'] = long_horizon.agent_workspaces.CONTRACT
+        projection = self.runtime.store.resume_recovery(document)
+        self.assertFalse(projection['resume_safe'])
+        self.assertTrue(projection['can_retry'])
+        self.assertNotEqual(projection['fingerprint'], goal['resume_recovery']['fingerprint'])
+
     def test_stale_permission_change_invalidates_recovery_but_does_not_erase_blocker(self):
         goal, _ = self.interrupted()
         saved = self.runtime.store.update_access(goal['goal_id'], expected_revision=goal['revision'], mode='ask')
