@@ -30,7 +30,10 @@ class TimerPanelTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name).resolve()
+        # Keep the project's sibling run store inside this test's own temporary
+        # directory, rather than sharing the machine-wide Temp/runtime folder.
+        self.root = Path(self.temporary.name).resolve() / "project"
+        self.root.mkdir()
         (self.root / ".harness").mkdir()
         (self.root / ".harness" / ".gitignore").write_text(
             "project-authority.json\n", encoding="utf-8"
