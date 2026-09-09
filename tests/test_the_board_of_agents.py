@@ -8620,11 +8620,14 @@ class WhatThePanelIsTold(BoardTestCase):
             second_thread = threading.Thread(
                 target=send, args=(second, "capacity-http-second-123"),
             )
+            # This checks ordering, not a five-second startup latency promise.
+            # Allow the same bounded HTTP fixture to initialize on a busy runner.
+            dispatch_wait = self.HTTP_TIMEOUT_SECONDS / 2
             first_thread.start()
-            self.assertTrue(entered[first["id"]].wait(5))
+            self.assertTrue(entered[first["id"]].wait(dispatch_wait))
             second_thread.start()
-            limit = time.time() + 5
-            while time.time() < limit:
+            limit = time.monotonic() + dispatch_wait
+            while time.monotonic() < limit:
                 try:
                     if self.panel.find_swarm_run(
                         "capacity-http-second-123"
@@ -8633,16 +8636,20 @@ class WhatThePanelIsTold(BoardTestCase):
                 except Exception:
                     pass
                 time.sleep(0.02)
+            self.assertEqual(self.panel.find_swarm_run(
+                "capacity-http-second-123")[1]["status"], "running")
             self.assertFalse(
                 entered[second["id"]].wait(0.15),
                 "the second provider body ignored max_concurrency=1",
             )
             self.assertTrue(second_thread.is_alive(), "the queued chat was rejected")
             release[first["id"]].set()
-            self.assertTrue(entered[second["id"]].wait(5))
+            self.assertTrue(entered[second["id"]].wait(dispatch_wait))
             release[second["id"]].set()
-            first_thread.join(5)
-            second_thread.join(5)
+            first_thread.join(dispatch_wait)
+            second_thread.join(dispatch_wait)
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
 
         self.assertEqual(results[first["id"]][0], 200, results[first["id"]][1])
         self.assertEqual(results[second["id"]][0], 200, results[second["id"]][1])
