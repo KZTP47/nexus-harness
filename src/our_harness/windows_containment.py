@@ -20,11 +20,13 @@ from typing import Any
 
 _PERSISTENT_RX_GRANTS: set[tuple[str, str]] = set()
 _PERSISTENT_GRANT_LOCK = threading.Lock()
+_PROFILE_CREATION_LOCK = threading.Lock()
+_KNOWN_PERSISTENT_PROFILES: set[str] = set()
 _PROCESS_RUNTIME_PROFILE = "NexusHarness.Verify." + uuid.uuid4().hex[:20]
 _ACL_COMMAND_TIMEOUT_SECONDS = 15.0
 _REPARSE_SCAN_TIMEOUT_SECONDS = 10.0
 _REPARSE_SCAN_MAX_ENTRIES = 100_000
-VERIFICATION_RUNTIME_CONTRACT = "appcontainer-explicit-application-short-runtime-alias-native-handles/v3"
+VERIFICATION_RUNTIME_CONTRACT = "appcontainer-explicit-application-short-runtime-alias-single-profile-native-handles/v4"
 
 
 def _create_runtime_junction(alias: Path, target: Path) -> None:
@@ -247,6 +249,32 @@ def _remove_snapshot_reparse_entries(snapshot: Path) -> list[str]:
 
 def verification_runtime_profile() -> str:
     return _PROCESS_RUNTIME_PROFILE
+
+
+def _appcontainer_profile_sid(userenv: Any, name: str, persistent: bool) -> tuple[Any, bool]:
+    """Create shared profiles once; peers derive a fresh SID without recreating them."""
+    sid = wintypes.LPVOID()
+    with _PROFILE_CREATION_LOCK:
+        created = False
+        if not persistent or name not in _KNOWN_PERSISTENT_PROFILES:
+            create = userenv.CreateAppContainerProfile
+            create.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                               wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID)]
+            create.restype = ctypes.c_long
+            result = create(name, name, "Nexus disposable verification", None, 0, ctypes.byref(sid))
+            created = result == 0
+            if not created and not (persistent and (int(result) & 0xffffffff) == 0x800700B7):
+                raise OSError(f"CreateAppContainerProfile failed: 0x{int(result) & 0xffffffff:08x}")
+        if not created:
+            derive = userenv.DeriveAppContainerSidFromAppContainerName
+            derive.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.LPVOID)]
+            derive.restype = ctypes.c_long
+            result = derive(name, ctypes.byref(sid))
+            if result != 0:
+                raise OSError(f"DeriveAppContainerSid failed: 0x{int(result) & 0xffffffff:08x}")
+        if persistent:
+            _KNOWN_PERSISTENT_PROFILES.add(name)
+        return sid, created
 
 
 def _delete_process_runtime_profile() -> None:
@@ -576,45 +604,26 @@ def run_appcontainer(
     userenv = ctypes.WinDLL("userenv", use_last_error=True)
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     name = persistent_profile or ("NexusVerification." + uuid.uuid4().hex)
-    sid = wintypes.LPVOID()
-    create_profile = userenv.CreateAppContainerProfile
-    create_profile.argtypes = [
-        wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
-        wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.LPVOID),
-    ]
-    create_profile.restype = ctypes.c_long
-    result = create_profile(name, name, "Nexus disposable verification", None, 0, ctypes.byref(sid))
-    created_profile = result == 0
-    if result != 0:
-        # A stable zero-capability runtime profile lets the immutable bundled
-        # runtime receive RX once per process instead of recursively restaging
-        # it for every verification command.
-        if persistent_profile and (int(result) & 0xffffffff) == 0x800700B7:
-            derive = userenv.DeriveAppContainerSidFromAppContainerName
-            derive.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.LPVOID)]
-            derive.restype = ctypes.c_long
-            derived = derive(name, ctypes.byref(sid))
-            if derived != 0:
-                raise OSError(f"DeriveAppContainerSid failed: 0x{int(derived) & 0xffffffff:08x}")
-        else:
-            raise OSError(f"CreateAppContainerProfile failed: 0x{int(result) & 0xffffffff:08x}")
+    sid, created_profile = _appcontainer_profile_sid(userenv, name, bool(persistent_profile))
     sid_text = wintypes.LPWSTR()
     advapi32.ConvertSidToStringSidW.argtypes = [wintypes.LPVOID, ctypes.POINTER(wintypes.LPWSTR)]
     advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
     if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(sid_text)):
-        if created_profile:
+        if created_profile and not persistent_profile:
             userenv.DeleteAppContainerProfile(name)
         advapi32.FreeSid(sid)
         raise _last_error("ConvertSidToStringSidW failed")
     sid_value = sid_text.value
     identity_released = False
 
-    def release_identity(*, rollback_profile: bool) -> None:
+    def release_identity() -> None:
         nonlocal identity_released
         if identity_released:
             return
         identity_released = True
-        if not persistent_profile or (rollback_profile and created_profile):
+        # Shared profiles belong to the process lifetime: a failed peer must
+        # not delete the identity still used by Chromium or another command.
+        if not persistent_profile:
             userenv.DeleteAppContainerProfile(name)
         kernel32.LocalFree(sid_text)
         advapi32.FreeSid(sid)
@@ -629,7 +638,7 @@ def run_appcontainer(
     try:
         authority.prepare()
     except BaseException:
-        release_identity(rollback_profile=True)
+        release_identity()
         raise
     drive_mappings = authority.drive_mappings
     drive_mutex = authority.drive_mutex
@@ -678,7 +687,7 @@ def run_appcontainer(
         effective_argv, effective_environment, effective_cwd = prepare_effective_launch()
     except BaseException:
         authority.cleanup(process_started=False)
-        release_identity(rollback_profile=True)
+        release_identity()
         raise
     reparse_created = False
     reparse_path: Path | None = None
@@ -893,7 +902,7 @@ def run_appcontainer(
             kernel32.LocalFree(allocation)
         process_started = bool(process.hProcess)
         authority.cleanup(process_started=process_started)
-        release_identity(rollback_profile=not process_started)
+        release_identity()
     stdout = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
     stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
     cleanup_error = " | ".join(authority.cleanup_errors)

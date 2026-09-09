@@ -13,7 +13,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from our_harness import playwright_runtime
+from our_harness import playwright_runtime, windows_containment
 from our_harness.playwright_runtime import (
     BundledPlaywrightRuntime,
     compile_safe_playwright_scenario,
@@ -25,6 +25,61 @@ from our_harness.playwright_runtime import (
     run_safe_playwright_scenario,
     validate_safe_playwright_scenario,
 )
+
+
+class SharedAppContainerProfileTests(unittest.TestCase):
+    def test_concurrent_peers_create_once_then_derive_the_shared_identity(self):
+        api = mock.Mock()
+        api.CreateAppContainerProfile.side_effect = [0, OSError("must not recreate a live profile")]
+        api.DeriveAppContainerSidFromAppContainerName.return_value = 0
+        outcomes, errors = [], []
+        gate = threading.Barrier(8)
+
+        def acquire():
+            try:
+                gate.wait(timeout=5)
+                outcomes.append(windows_containment._appcontainer_profile_sid(api, "portable-profile", True)[1])
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(windows_containment, "_KNOWN_PERSISTENT_PROFILES", set()):
+            threads = [threading.Thread(target=acquire) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(outcomes.count(True), 1)
+            self.assertEqual(api.CreateAppContainerProfile.call_count, 1)
+            self.assertEqual(api.DeriveAppContainerSidFromAppContainerName.call_count, 7)
+
+    def test_restart_existing_profile_and_changed_name_use_exact_identity(self):
+        api = mock.Mock()
+        api.CreateAppContainerProfile.side_effect = [0x800700B7, 0]
+        api.DeriveAppContainerSidFromAppContainerName.return_value = 0
+        with mock.patch.object(windows_containment, "_KNOWN_PERSISTENT_PROFILES", set()):
+            self.assertFalse(windows_containment._appcontainer_profile_sid(api, "existing", True)[1])
+            self.assertFalse(windows_containment._appcontainer_profile_sid(api, "existing", True)[1])
+            self.assertTrue(windows_containment._appcontainer_profile_sid(api, "new-profile", True)[1])
+        self.assertEqual([call.args[0] for call in api.CreateAppContainerProfile.call_args_list], ["existing", "new-profile"])
+        self.assertEqual([call.args[0] for call in api.DeriveAppContainerSidFromAppContainerName.call_args_list], ["existing", "existing"])
+
+    def test_unrecognized_creation_and_derivation_failures_remain_fail_closed(self):
+        api = mock.Mock()
+        with mock.patch.object(windows_containment, "_KNOWN_PERSISTENT_PROFILES", set()) as known:
+            api.CreateAppContainerProfile.return_value = 0x8000FFFF
+            with self.assertRaisesRegex(OSError, "CreateAppContainerProfile failed: 0x8000ffff"):
+                windows_containment._appcontainer_profile_sid(api, "failed", True)
+            api.DeriveAppContainerSidFromAppContainerName.assert_not_called()
+            self.assertEqual(known, set())
+            api.CreateAppContainerProfile.return_value = 0x800700B7
+            api.DeriveAppContainerSidFromAppContainerName.return_value = 0x80070005
+            with self.assertRaisesRegex(OSError, "DeriveAppContainerSid failed"):
+                windows_containment._appcontainer_profile_sid(api, "failed", True)
+            self.assertEqual(known, set())
+            with self.assertRaisesRegex(OSError, "CreateAppContainerProfile failed"):
+                windows_containment._appcontainer_profile_sid(api, "disposable", False)
 
 
 class PlaywrightRuntimeDiscoveryTests(unittest.TestCase):
