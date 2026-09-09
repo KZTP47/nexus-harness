@@ -26,6 +26,7 @@ from .safety import ProjectTransactionLock, confined_path, portable_relative_pat
 _EXCLUDED = {".git", ".harness", ".nexus-verification"}
 _MAX_FILES = 100_000
 _MAX_BYTES = 2_000_000_000
+FORK_SOURCE_CONTRACT = "nexus-owned-git-worktree-source/v1"
 _publication: ContextVar[tuple[str, str, FileTransaction] | None] = ContextVar(
     "goal_workspace_publication", default=None,
 )
@@ -69,7 +70,13 @@ def _layout(document: dict[str, Any], runtime_root: Path) -> tuple[Path, Path, P
     if not source.is_dir():
         raise HarnessError("Goal workspace selected project is unavailable")
     runtime = _direct(Path(runtime_root))
-    if source == runtime or source in runtime.parents or runtime in source.parents:
+    owned_fork = (
+        document.get("fork_workspace_contract") == FORK_SOURCE_CONTRACT
+        and bool(document.get("parent_goal_id"))
+        and source.parent == runtime / "goal-worktrees"
+        and re.fullmatch(r"[a-f0-9]{32}", source.name) is not None
+    )
+    if source == runtime or source in runtime.parents or runtime in source.parents and not owned_fork:
         raise HarnessError("Goal workspace runtime must be outside the selected project")
     home = confined_path(runtime, "goal-workspaces", allow_control=True)
     folder = confined_path(home, goal_id, allow_control=True)

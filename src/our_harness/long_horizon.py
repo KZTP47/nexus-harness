@@ -4264,6 +4264,8 @@ class GoalStore(goal_access.AccessStoreMixin):
             "note": "Forked from the saved task/evidence checkpoint into an isolated Git worktree. Resume when ready.",
         })
         if document.get("agent_workspace_contract") == agent_workspaces.CONTRACT:
+            if project_path.resolve().parent == self.root.resolve() / "goal-worktrees":
+                document["fork_workspace_contract"] = goal_workspaces.FORK_SOURCE_CONTRACT
             document["execution_workspace"] = goal_workspaces.create(document, self.root)
             document["execution_contract"] = self._execution_contract_for(document)
             document["workspace_publication"] = {"state": "pending"}

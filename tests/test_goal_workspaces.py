@@ -18,6 +18,18 @@ from our_harness.models import HarnessError
 
 
 class GoalWorkspaces(unittest.TestCase):
+    def test_runtime_nested_sources_require_the_owned_fork_contract_and_exact_location(self):
+        for relative, contract in [("goal-worktrees/" + "a" * 32, None),
+                                   ("goal-worktrees/" + "a" * 32, "obsolete"),
+                                   ("arbitrary-project", workspaces.FORK_SOURCE_CONTRACT),
+                                   ("goal-worktrees/not-an-owned-id", workspaces.FORK_SOURCE_CONTRACT)]:
+            source = self.runtime / relative
+            source.mkdir(parents=True, exist_ok=True)
+            goal = {"goal_id": "test-nested", "project": {"path": str(source)},
+                    "parent_goal_id": "parent", "fork_workspace_contract": contract}
+            with self.subTest(relative=relative, contract=contract), self.assertRaisesRegex(HarnessError, "outside"):
+                workspaces.create(goal, self.runtime)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(self.temporary.cleanup)

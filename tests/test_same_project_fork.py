@@ -86,6 +86,14 @@ class SameProjectForkTests(unittest.TestCase):
         self.assertEqual((Path(forked["project"]["path"]) / "work.txt").read_bytes(), (private / "work.txt").read_bytes())
         self.assertEqual(self.runtime.store.get(source["goal_id"])["execution_workspace"], source["execution_workspace"])
         self.assertEqual(self.runtime.fork(source["goal_id"], "clean-isolated-fork")["goal_id"], forked["goal_id"])
+        from our_harness import agent_workspaces, goal_verification
+        reopened = long_horizon.GoalStore(self.config).get(forked["goal_id"])
+        selected = goal_verification.verification_project(self.config, reopened, runtime_root=self.runtime.store.root)
+        _, authority_root = goal_verification.verification_authority(
+            self.config, long_horizon._execution_root(reopened), selected)
+        self.assertEqual(authority_root, Path(forked["project"]["path"]))
+        with agent_workspaces.workspace(reopened, reopened['agents'][0], self.runtime.store.root) as draft:
+            self.assertEqual((draft.root / 'work.txt').read_bytes(), (private / 'work.txt').read_bytes())
 
     def test_legacy_clean_fork_remains_available(self):
         source = self.paused_goal("legacy-source", isolated=False)

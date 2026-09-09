@@ -260,7 +260,7 @@ def verification_project(
         execution_root = goal_workspaces.root(goal, runtime_root)
         binding = copy.deepcopy({key: goal[key] for key in (
             "goal_id", "project", "project_authority_id", "execution_workspace",
-            "verification_contract", "objective",
+            "verification_contract", "objective", "fork_workspace_contract", "parent_goal_id",
         ) if key in goal})
         project["_nexus_workspace_verification"] = _WorkspaceVerificationAuthority(
             config, binding, runtime_root, execution_root,
