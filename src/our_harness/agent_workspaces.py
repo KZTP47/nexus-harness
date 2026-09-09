@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import time
 from contextlib import contextmanager
 
 from . import cancellation
@@ -90,7 +91,19 @@ def _read(home, folder):
 
 
 def _write(home, folder, state):
-    atomic_write(confined_path(folder, "state.json", allow_control=True), gw._canonical(gw._sign(gw._key(home), state)))
+    path = confined_path(folder, "state.json", allow_control=True)
+    content = gw._canonical(gw._sign(gw._key(home), state))
+    for attempt in range(20):
+        try:
+            atomic_write(path, content)
+            return
+        except PermissionError as exc:
+            # Windows readers and indexers may briefly prevent atomic replace.
+            # Keep the old authenticated state intact; never delete it to retry.
+            if getattr(exc, "winerror", None) not in {5, 32, 33} or attempt == 19:
+                raise
+            cancellation.checkpoint()
+            time.sleep(0.025)
 
 
 def existing_root(goal, agent, runtime_root):

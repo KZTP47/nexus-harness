@@ -34,6 +34,42 @@ class AgentWorkspaces(unittest.TestCase):
     def open(self, agent=0, goal=None):
         return aw.workspace(goal or self.goal, (goal or self.goal)["agents"][agent], self.runtime)
 
+    def test_transient_windows_metadata_lock_retries_without_losing_authenticated_state(self):
+        with self.open():
+            pass
+        home, folder, root = aw.layout(self.goal, self.agents[0], self.runtime)
+        state = aw._read(home, folder)
+        error = PermissionError("transient reader lock")
+        error.winerror = 32
+        write = aw.atomic_write
+        calls = []
+        def locked(path, content):
+            calls.append(path)
+            if len(calls) == 1:
+                self.assertEqual(aw._read(home, folder), state)
+                raise error
+            return write(path, content)
+        with patch.object(aw, "atomic_write", side_effect=locked), patch.object(aw.time, "sleep"):
+            aw._write(home, folder, state)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(aw.existing_root(self.goal, self.agents[0], self.runtime), root)
+        self.assertEqual(aw._read(home, folder), state)
+
+    def test_persistent_metadata_denial_is_bounded_and_preserves_previous_state(self):
+        with self.open():
+            pass
+        home, folder, _ = aw.layout(self.goal, self.agents[0], self.runtime)
+        state = aw._read(home, folder)
+        for windows_code, attempts in [(5, 20), (None, 1)]:
+            error = PermissionError("persistent denial")
+            if windows_code is not None:
+                error.winerror = windows_code
+            with patch.object(aw, "atomic_write", side_effect=error) as write, patch.object(aw.time, "sleep"):
+                with self.assertRaises(PermissionError):
+                    aw._write(home, folder, {**state, "baseline": {}})
+                self.assertEqual(write.call_count, attempts)
+            self.assertEqual(aw._read(home, folder), state)
+
     def test_native_and_structured_edits_are_private_then_publish_exact_binary_and_text(self):
         with self.open() as a:
             (a.root / "app.txt").write_text("candidate", encoding="utf-8")
