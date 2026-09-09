@@ -222,7 +222,7 @@ jobs:
           NEXUS_REQUIRE_BROWSER_RUNTIME_TESTS: "1"
         run: >-
           & ./desktop/build-output/win-unpacked/resources/runtime/python.exe -c
-          "import sys,unittest; sys.path[:0]=['src','.']; unittest.main(module=None, argv=['runtime-check','tests.test_playwright_scenarios.LocalPlaywrightScenarioTests.test_ordinary_local_suite_fixtures_loops_keyboard_modules_and_selection'])"
+          "import sys,unittest; sys.path[:0]=['src','.']; unittest.main(module=None, argv=['runtime-check','tests.test_playwright_scenarios.LocalPlaywrightScenarioTests.test_ordinary_local_suite_fixtures_loops_keyboard_modules_and_selection','tests.test_goal_access.GoalAccessTests.test_actual_npm_playwright_script_observes_production_behavior'])"
       - name: Run its tests
         # Browser-backed unit tests use the runtime from this exact build.
         # A clean checkout does not have a previous bundled browser to reuse.

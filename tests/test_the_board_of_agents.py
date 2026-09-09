@@ -10968,6 +10968,13 @@ assert.equal(desktopDeletes, 2);
             script.index("function swarmChatAttachmentsAreLoading"):
             script.index("function swarmChatActivityFor")
         ]
+        permission_helpers = script[
+            script.index("function directLongGoalCanonicalValue"):
+            script.index("async function directLongGoalIntent")
+        ] + script[
+            script.index("function chatComposerAccessPreference"):
+            script.index("function fillChatComposerPermissions")
+        ]
         handlers = {
             "compact": script[
                 script.index("async function sendWhatIsTypedTo"):
@@ -11184,6 +11191,7 @@ async function request(path, options = {}) {
         }
         assertions = r'''
 assert.equal(prepareDraft, words);
+assert.deepEqual(events.find(event => event.kind === "prepare").body.policy, {agent_access_mode:"ask"});
 assert.equal(startDraft, "", "draft must clear only after exact prepare receipt");
 assert.equal(box.value, "");
 assert.deepEqual(events.map((event) => event.kind), [
@@ -11345,7 +11353,7 @@ for (const ackLossMode of ["lost-ack-before", "lost-ack-after"]) {
                     "\"use strict\";\n(async () => {\n" + shared + "\n"
                     + outbox_helpers + "\n" + receipt_helpers + "\n"
                     + prepare_helper + "\n" + pause_helper + "\n"
-                    + attachment_loading_helper + "\n" + handler + "\n"
+                    + attachment_loading_helper + "\n" + permission_helpers + "\n" + handler + "\n"
                     + invocations[name] + "\n" + assertions
                     + "\n" + negative
                     + "\n})().catch((error) => {\n"

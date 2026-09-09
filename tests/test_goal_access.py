@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import unittest
 import threading
 import urllib.request
@@ -161,6 +162,10 @@ class GoalAccessTests(unittest.TestCase):
         self.assertEqual(result["basis"], "discovered_command_approval_required", result)
 
     def test_actual_npm_playwright_script_observes_production_behavior(self):
+        runtime = swarm_work.discover_bundled_playwright_runtime(
+            required=os.environ.get("NEXUS_REQUIRE_BROWSER_RUNTIME_TESTS") == "1")
+        if runtime is None:
+            self.skipTest("Bundled-browser integration runs in the required desktop CI job")
         self.package["scripts"]["test"] = "playwright test launch.spec.cjs"
         (self.root / "package.json").write_text(json.dumps(self.package), encoding="utf-8")
         (self.root / "index.html").write_text('<button id="launch">Launch</button><p id="status">Waiting</p><script src="./game.js"></script>', encoding="utf-8")

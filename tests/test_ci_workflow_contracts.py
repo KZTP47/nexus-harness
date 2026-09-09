@@ -158,6 +158,7 @@ class WorkflowCoverageContractsTests(unittest.TestCase):
         self.assertLess(desktop.index("npm run build -- --win dir"), desktop.index("run: npm test"))
         self.assertIn('NEXUS_REQUIRE_BROWSER_RUNTIME_TESTS: "1"', desktop)
         self.assertIn('test_ordinary_local_suite_fixtures_loops_keyboard_modules_and_selection', desktop)
+        self.assertIn('test_actual_npm_playwright_script_observes_production_behavior', desktop)
 
     def load(self, filename: str) -> dict[str, str]:
         return jobs_in((WORKFLOWS / filename).read_text(encoding="utf-8"))
