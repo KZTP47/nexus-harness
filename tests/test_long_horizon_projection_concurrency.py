@@ -208,12 +208,19 @@ class IndependentLongHorizonExecutionTests(unittest.TestCase):
         self.addCleanup(runtime.close)
         entered = [threading.Event(), threading.Event()]
         released = [threading.Event(), threading.Event()]
-        calls, lock = [], threading.Lock()
+        calls, judges, lock = [], [], threading.Lock()
 
         def provider(*_args, **kwargs):
             before, after = kwargs.get("before_provider_dispatch"), kwargs.get("after_provider_response")
             if before:
                 before("initial")
+            from tests.closeout_fixture import judge_reply
+            judged = judge_reply(kwargs['context'])
+            if judged:
+                judges.append(kwargs['conversation_key'])
+                if after:
+                    after('initial')
+                return judged
             with lock:
                 index = len(calls)
                 calls.append(kwargs["conversation_key"])
@@ -254,6 +261,7 @@ class IndependentLongHorizonExecutionTests(unittest.TestCase):
                 released[1].set()
                 await_status(second["goal_id"], "complete")
                 self.assertEqual(len(calls), 2)
+                self.assertEqual(len(judges), 1, "Only the uncancelled goal should reach its judge")
             finally:
                 for event in released:
                     event.set()
