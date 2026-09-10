@@ -127,6 +127,12 @@ Other partition counts retain their ordinary assignment; exact-once coverage
 tests protect both paths. These measurements guide placement, not a promise
 that hosted machines always run at the same speed.
 
+For 0.2.26, the two short toolbox modules are added explicitly to part 5 without
+changing the previous sorted deal. In run 34468734077, inserting them into that
+deal moved existing modules and part 4 reached its twelve-minute job timeout.
+The stable placement restores the previous owners, retains every test exactly
+once, and leaves both the job and shared workflow deadlines unchanged.
+
 For 0.2.20, the expanded board/chat module is assigned to part 4 so it no
 longer shares part 3 with `test_swarm_work`. Checks run `34361226193` passed
 all 961 tests in part 3 in 698 seconds, but the job was cancelled after

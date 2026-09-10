@@ -68,10 +68,22 @@ class SplittingTheTestsTests(unittest.TestCase):
         }
         self.assertEqual(owners["test_swarm_work"], 3)
         self.assertEqual(owners["test_the_board_of_agents"], 4)
-        for index, name in enumerate(names):
+        baseline = [name for name in names if name not in self.split.EIGHT_PART_ADDITIONS]
+        for index, name in enumerate(baseline):
             if name not in {"test_swarm_work", "test_the_board_of_agents"}:
                 with self.subTest(name=name):
                     self.assertEqual(owners[name], index % 8 + 1)
+
+    def test_toolbox_additions_preserve_existing_owners_and_run_exactly_once(self) -> None:
+        names = self.split.every_test_file()
+        baseline = [name for name in names if name not in self.split.EIGHT_PART_ADDITIONS]
+        for number in range(1, 9):
+            before = self.split.files_for((number, 8), baseline)
+            after = self.split.files_for((number, 8), names)
+            self.assertEqual(before, [name for name in after if name in baseline])
+        for name in ("test_full_access_tool_runtime", "test_harness_tools"):
+            self.assertEqual([number for number in range(1, 9)
+                              if name in self.split.files_for((number, 8), names)], [5])
 
     def test_absent_timed_module_leaves_the_normal_eight_way_split(self) -> None:
         names = [f"test_{letter}" for letter in "abcdefghijklmnopq"]

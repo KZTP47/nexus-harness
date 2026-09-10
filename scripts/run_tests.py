@@ -31,6 +31,10 @@ TESTS = ROOT / "tests"
 # took 698 seconds in run 34361226193, exhausting part 3's job deadline.
 # Part 4 finished substantially earlier and can own the complete board module.
 EIGHT_PART_ASSIGNMENTS = {"test_swarm_work": 3, "test_the_board_of_agents": 4}
+# Keep the measured pre-toolbox deal stable. In run 34468734077 inserting these
+# modules into the sorted deck shifted existing owners and timed out part 4.
+# These short additions fit in part 5 without moving any existing module.
+EIGHT_PART_ADDITIONS = {"test_full_access_tool_runtime": 5, "test_harness_tools": 5}
 
 
 def every_test_file() -> list[str]:
@@ -64,9 +68,12 @@ def files_for(part: tuple[int, int], files: list[str] | None = None) -> list[str
     if not of:
         return names
     if of == 8:
+        baseline = [name for name in names if name not in EIGHT_PART_ADDITIONS]
+        owners = {name: EIGHT_PART_ASSIGNMENTS.get(name, index % of + 1)
+                  for index, name in enumerate(baseline)}
+        owners.update(EIGHT_PART_ADDITIONS)
         return [
-            name for index, name in enumerate(names)
-            if EIGHT_PART_ASSIGNMENTS.get(name, index % of + 1) == number
+            name for name in names if owners[name] == number
         ]
     return names[number - 1::of]
 
