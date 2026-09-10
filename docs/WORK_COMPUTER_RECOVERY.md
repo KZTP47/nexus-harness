@@ -1,4 +1,37 @@
-# Work computer prompt and team recovery — 0.2.24
+# Work computer prompt and team recovery
+
+## 0.2.25: handoff continuation and chat tools
+
+CLI replies now receive the same output-format repair as browser replies. The
+repair includes the delivered reply and current task context and uses inspect
+access for native workspaces. If a reply remains prose, Nexus keeps it as a
+work message, collects existing native edits through the normal publication
+path, and lets the teammate respond. Prose cannot grant permission, execute
+JSON fragments, or certify completion. File validation errors are not mistaken
+for formatting errors. Normal agreement and verification still finish goals.
+
+For existing paused format failures, **Force agents to proceed** continues the
+same saved goal, preserves drafts and budgets, refreshes stalled progress, and
+can reopen an exhausted protocol-correction episode with cumulative usage
+retained. The command binds to the current chat, revision and provider setup.
+It does not discard pending transactions or replace unresolved user decisions.
+
+The attention panel has a bounded default height and a draggable **Resize team
+panel** handle. Arrow keys resize it; Home, double-click, or Reset sizes restore
+the default. Each chat remembers its own size while the transcript and composer
+remain available. Input controls remain scrollable within the panel.
+
+**Prompt library** beside the composer supports named prompts, search, creating,
+editing, deleting, and insertion at the composer selection. Insertion does not
+send a message. Exact prompt text persists in the installation's local SQLite
+library across restart; concurrent edits require a matching saved revision.
+
+Regression owners: `test_collaboration_reply`, `test_prompt_library`,
+`test_goal_recovery`, `prompt-library.test.js`, `team-goal-disclosure.test.js`,
+and `team-chat.smoke.js`. Packaged acceptance exercises a malformed CLI reply,
+force continuation after restart, and saving/editing/reusing a persistent prompt.
+
+## 0.2.24: Windows paths and provider reconnection
 
 A nested project could fail before either provider received its first prompt:
 the filename used for an atomic copy crossed Windows' 260-character limit.

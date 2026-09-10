@@ -2604,7 +2604,11 @@ def ask_once(
         if request.response_format is None:
             from .research_chat import complete_research_chat
             response = complete_research_chat(config, request, complete_provider)
-        elif named.startswith("web:") or request.native_execution:
+        elif named.startswith("web:") or request.native_execution \
+                or request.response_format.name == "nexus_long_horizon_action_v1":
+            # The durable team controller owns decoding, inspect-only repair,
+            # and prose handoff. Do not let a second transport-level validator
+            # consume/reject its delivered reply before it can recover it.
             response = complete_provider(request, "initial")
         else:
             response = _complete_with_one_schema_repair(

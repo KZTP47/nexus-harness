@@ -1976,9 +1976,6 @@ body.has-a-tray .app-shell { padding-bottom: 68px; }
   background: #0b202c;
 }
 .the-big-chat-transcript:has(#theBigChatTeamGoal[hidden]) { grid-template-rows: minmax(0, 1fr) auto; }
-.the-big-chat-transcript:has(.chat-team-goal-disclosure[open] .chat-goal-question-set) {
-  grid-template-rows: minmax(0, 1fr) minmax(48px, .15fr) auto;
-}
 .the-big-chat-said {
   list-style: none;
   margin: 0; padding: 16px;
@@ -2518,10 +2515,31 @@ button.compact { min-height: 32px; padding: 4px 8px; margin: 2px 0; }
 .the-big-chat-transcript .chat-team-goal-body > p { margin: 0; flex: 1 1 280px; }
 .the-big-chat-transcript .chat-team-goal-body > .chat-goal-details { min-height: 28px; padding: 3px 7px; font-size: .72rem; }
 .the-big-chat-transcript .chat-team-goal-body > .chat-goal-question-set { flex-basis: 100%; }
-.the-big-chat-transcript > .chat-team-goal:has(.chat-team-goal-disclosure[open] .chat-goal-question-set) { max-height: none; align-content: start; }
+.chat-team-goal:has(.chat-team-goal-disclosure[open]) {
+  height: var(--team-panel-height, auto);
+  max-height: min(var(--team-panel-height, 260px), 48vh);
+  min-height: 70px;
+  overflow-y: auto;
+  position: relative;
+}
+.chat-team-panel-resize { display: none; }
+.chat-team-goal:has(.chat-team-goal-disclosure[open]) .chat-team-panel-resize {
+  display: block; position: sticky; bottom: 0; width: 100%; padding: 2px;
+  min-height: 22px; cursor: row-resize; touch-action: none;
+  background: #123342; font-size: .72rem; z-index: 2;
+}
+.prompt-library-dialog { width: 850px; max-width: 94vw; max-height: 88vh; overflow: auto; background: #102e3c; color: #eefaff; border: 1px solid var(--cyan); border-radius: 12px; padding: 20px; }
+.prompt-library-dialog::backdrop { background: #0008; }
+.prompt-library-grid { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(0, 2fr); gap: 18px; }
+.prompt-library-list { max-height: 45vh; overflow: auto; }
+.prompt-library-list button { display: block; width: 100%; text-align: left; margin: 5px 0; overflow-wrap: anywhere; }
+.prompt-library-editor input, .prompt-library-editor textarea, .prompt-library-search { width: 100%; box-sizing: border-box; }
+.prompt-library-editor textarea { min-height: 220px; }
+.prompt-library-dialog label { display: block; margin: 8px 0 4px; }
+@media (max-width: 600px) { .prompt-library-grid { grid-template-columns: 1fr; } .prompt-library-list { max-height: 130px; } }
 /* The fixed status below the conversation already explains why answers are
    needed. Keep the decision area's height for the actual questions. */
-.the-big-chat-transcript .chat-team-goal-body:has(.chat-goal-question-set) > p { display: none; }
+.the-big-chat-transcript .chat-team-goal-body:has(.chat-goal-question-set) > p:not(.chat-force-status) { display: none; }
 @media (prefers-reduced-motion: reduce) {
   .chat-team-goal-summary.needs-user-input { animation: none; box-shadow: inset 0 0 0 1px #ffc65a; }
 }

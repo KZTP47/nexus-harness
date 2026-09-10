@@ -3821,6 +3821,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/swarm/recoveries":
                 self._require_token()
                 self._json(self.server.swarm_runs.recoverable_work())
+            elif parsed.path == "/api/prompt-library":
+                self._require_token()
+                from . import prompt_library
+                self._json(prompt_library.listing(self.server.config))
             elif parsed.path == "/api/long-horizon/goals":
                 self._require_token()
                 goals = self.server.long_horizon.store.list(100)
@@ -5185,6 +5189,9 @@ class HarnessHandler(BaseHTTPRequestHandler):
                         standing["board"], request_id
                     )
                 self._json({"queue": queue})
+            elif self.path == "/api/prompt-library":
+                from . import prompt_library
+                self._json(prompt_library.update(self.server.config, body))
             elif self.path == "/api/long-horizon/start-board":
                 request_id = str(body.get("request_id") or uuid.uuid4().hex)
                 with self.server.project_admission_lock, self.server.swarm_lock:
@@ -5353,6 +5360,10 @@ class HarnessHandler(BaseHTTPRequestHandler):
                     runtime = self.server.long_horizon
                     if action == "resume":
                         resume_options = {}
+                        if "force_proceed" in payload:
+                            if payload["force_proceed"] is not True or type(payload.get("expected_revision")) is not int:
+                                raise HarnessError("Force continuation requires the displayed goal revision")
+                            resume_options["force_proceed"] = True
                         if "recovery" in payload:
                             if not isinstance(payload["recovery"], dict) or type(payload.get("expected_revision")) is not int:
                                 raise HarnessError("Recovery requires the displayed choice and goal revision")

@@ -177,6 +177,12 @@ if scenario == 'game' and route == 'team-a' and not project_has('arena.js'):
 if scenario == 'game' and route == 'team-b':
     assert 'Example.test/Case%2fKept?q=AbC%2Fz' not in context, 'A directed answer leaked to the other agent'
 if scenario == 'game' and route == 'team-a' and not project_has('arena.js') \
+        and not (coordination / 'injected-prose-reply').exists():
+    (coordination / 'injected-prose-reply').write_text('delivered prose before structured work', encoding='utf-8')
+    record('injected:plain-cli-reply')
+    print(json.dumps({'text':'I have the destination and will coordinate implementation with my teammate.','finish_reason':'stop'}))
+    sys.exit(0)
+if scenario == 'game' and route == 'team-a' and not project_has('arena.js') \
         and (coordination / 'enable-protocol-fault').is_file():
     if not (coordination / 'injected-protocol-fault').exists():
         (coordination / 'injected-protocol-fault').write_text('one known rejected response', encoding='utf-8')
@@ -772,18 +778,31 @@ async function main() {
     assert.ok(!middle.includes("REJECTED-PROTOCOL-REPLY"),"Invalid protocol content was published as agent speech");
     assert.ok(!fs.existsSync(path.join(project,"obsolete-blue.txt")),"A superseded reply changed project files");
     console.log("pass  A's work reaches B; ordinary Send steers the same goal and invalidates B's obsolete in-flight changes");
+    assert.ok(fs.existsSync(path.join(coordination,'injected-prose-reply')),'Packaged CLI malformed reply was exercised');
 
     await page.locator("#theBigChatStop").click();
     await goalFor(page,gameChat,goal=>goal.status==="paused");
     fs.writeFileSync(path.join(coordination,"release-pause"),"release");
     await goalFor(page,gameChat,goal=>goal.status==="paused" && goal.tasks.every(task=>task.state!=="running"));
+    await page.locator('#theBigChatPromptLibrary').click();
+    await page.getByLabel('Prompt title',{exact:true}).fill('Packaged continuation prompt');
+    await page.getByLabel('Prompt text',{exact:true}).fill('Inspect the saved work, coordinate with your teammate, and continue.');
+    await page.getByRole('button',{name:'Save prompt',exact:true}).click();
+    await until(async()=>(await page.locator('.prompt-library-dialog [role=status]').textContent()).includes('Prompt saved'), 'save reusable prompt');
+    await page.getByRole('button',{name:'Close library',exact:true}).click();
+    await page.locator('.prompt-library-dialog').waitFor({state:'detached'});
     await running.app.close();running=null;
     running=await launch(exe,profile,project,environment);page=running.page;
     await openChat(page,gameChat);
     await transcriptContains(page,[GAME_GOAL,STEER,"TEAM-A-BASE","TEAM-B-STEERED"]);
     assert.equal((await goalFor(page,gameChat)).status,"paused","Restart silently resumed the paused team");
     await until(async ()=>(await page.locator("#theBigChatStop").textContent()).includes("Resume"),"restored inline Resume team control");
-    await page.locator("#theBigChatStop").click();
+    const teamPanel=page.locator('#theBigChatTeamGoal');
+    if(!await teamPanel.locator('details').evaluate(n=>n.open))await teamPanel.locator('summary').click();
+    await page.getByRole('button',{name:'Resize team panel',exact:true}).focus();
+    await page.keyboard.press('ArrowUp');
+    assert.ok((await teamPanel.boundingBox()).height < 350,'attention panel must leave conversation room');
+    await page.getByRole('button',{name:'Force agents to proceed',exact:true}).click();
     const completed=await goalFor(page,gameChat,goal=>goal.status==="complete");
     const dialogue=await transcriptContains(page,["TEAM-A-BASE","TEAM-B-STEERED","TEAM-A-REVIEW"]);
     assert.ok(dialogue.indexOf("TEAM-A-BASE")<dialogue.indexOf("TEAM-B-STEERED"));
@@ -859,6 +878,18 @@ async function main() {
     assert.equal((await goalFor(page,testChat)).status,"complete");
     await openChat(page,gameChat);
     await transcriptContains(page,[GAME_GOAL,STEER,"TEAM-A-BASE","TEAM-B-STEERED","TEAM-A-REVIEW"]);
+    await page.locator('#theBigChatPromptLibrary').click();
+    await page.getByRole('button',{name:'Packaged continuation prompt',exact:true}).click();
+    assert.equal(await page.getByLabel('Prompt text',{exact:true}).inputValue(),'Inspect the saved work, coordinate with your teammate, and continue.');
+    await page.getByLabel('Prompt text',{exact:true}).fill('Reusable prompt after restart.');
+    await page.getByRole('button',{name:'Save prompt',exact:true}).click();
+    await until(async()=>(await page.locator('.prompt-library-dialog [role=status]').textContent()).includes('Prompt saved'),'edit saved prompt');
+    await page.screenshot({path:path.join(coordination,'prompt-library.png')});
+    await page.getByRole('button',{name:'Use in chat',exact:true}).click();
+    await page.locator('.prompt-library-dialog').waitFor({state:'detached'});
+    assert.ok((await page.locator('#theBigChatBox').inputValue()).includes('Reusable prompt after restart.'));
+    assert.equal((await goalFor(page,gameChat)).status,'complete','inserting a prompt must not dispatch it');
+    console.log('pass  force continuation, resizable attention and durable prompt library run through the packaged app');
     fs.writeFileSync(path.join(coordination,"final-goals.json"),JSON.stringify(await goals(page),null,2));
     console.log("pass  both saved chats retain their own goals, agent dialogue, steering, and verified outcomes after restart");
     console.log("TEAM_CHAT_PACKAGED_ACCEPTANCE_PASS");passed=true;

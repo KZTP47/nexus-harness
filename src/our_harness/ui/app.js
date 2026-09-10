@@ -7945,6 +7945,85 @@ function appendGoalRecoveryControls(panel, goal, afterAction, binding) {
   card.append(status); panel.append(card);
 }
 
+async function openPromptLibrary(composer, stillCurrent = () => true) {
+  const dialog = make("dialog", "prompt-library-dialog");
+  dialog.setAttribute("aria-label", "Prompt library");
+  const heading = make("h2", "", "Prompt library");
+  const help = make("p", "hint", "Save prompts you use often. Using a prompt inserts it into your message so you can edit it before sending.");
+  const close = make("button", "compact", "Close library"); close.type = "button";
+  const grid = make("div", "prompt-library-grid");
+  const browser = make("div");
+  const search = make("input", "prompt-library-search"); search.type = "search"; search.placeholder = "Find a saved prompt";
+  search.setAttribute("aria-label", "Find a saved prompt");
+  const list = make("div", "prompt-library-list");
+  const fresh = make("button", "", "New prompt"); fresh.type = "button";
+  browser.append(search, list, fresh);
+  const editor = make("div", "prompt-library-editor");
+  const title = make("input"); title.id = "libraryPromptTitle"; title.maxLength = 160;
+  const body = make("textarea"); body.id = "libraryPromptBody"; body.value = composer.value;
+  const titleLabel = make("label", "", "Prompt title"); titleLabel.htmlFor = title.id;
+  const bodyLabel = make("label", "", "Prompt text"); bodyLabel.htmlFor = body.id;
+  const buttons = make("div", "button-row");
+  const save = make("button", "primary", "Save prompt"), use = make("button", "", "Use in chat"), remove = make("button", "danger", "Delete prompt");
+  for (const button of [save, use, remove]) button.type = "button";
+  buttons.append(save, use, remove); editor.append(titleLabel, title, bodyLabel, body, buttons);
+  const status = make("p", "hint"); status.setAttribute("role", "status");
+  grid.append(browser, editor); dialog.append(heading, help, close, grid, status);
+  (composer.closest(".the-big-chat-sheet") || document.body).append(dialog);
+  let prompts = [], selected = null, baseline = {title: "", body: body.value}, busy = false;
+  const selection = {start: composer.selectionStart, end: composer.selectionEnd, value: composer.value};
+  const dirty = () => title.value !== baseline.title || body.value !== baseline.body;
+  const allowChange = () => !dirty() || window.confirm("Discard unsaved edits to this library prompt?");
+  const select = prompt => {
+    selected = prompt; title.value = prompt?.title || ""; body.value = prompt?.body || "";
+    baseline = {title: title.value, body: body.value}; remove.disabled = !selected;
+    status.textContent = prompt ? "Editing saved prompt." : "Write a new reusable prompt.";
+  };
+  const render = () => {
+    list.replaceChildren();
+    const query = search.value.toLocaleLowerCase();
+    for (const prompt of prompts.filter(p => (p.title + "\n" + p.body).toLocaleLowerCase().includes(query))) {
+      const button = make("button", "", prompt.title); button.type = "button";
+      button.addEventListener("click", () => {if (!busy && allowChange()) select(prompt);}); list.append(button);
+    }
+    if (!list.childElementCount) list.append(make("p", "hint", prompts.length ? "No matching prompts." : "Your saved prompts will appear here."));
+  };
+  const refresh = async () => {const result = await request("/api/prompt-library"); prompts = result.prompts || []; render();};
+  const finish = () => {if (!busy && allowChange()) dialog.close();};
+  close.addEventListener("click", finish);
+  dialog.addEventListener("cancel", event => {event.preventDefault(); finish();});
+  dialog.addEventListener("keydown", event => {if (event.key === "Escape") event.stopPropagation();});
+  dialog.addEventListener("close", () => {dialog.remove(); composer.focus();});
+  search.addEventListener("input", render);
+  fresh.addEventListener("click", () => {if (!busy && allowChange()) select(null);});
+  const mutate = async action => {
+    if (busy) return;
+    if (action === "delete" && !window.confirm(`Delete saved prompt “${selected?.title || ""}”?`)) return;
+    busy = true; for (const button of [save, use, remove, fresh, close]) button.disabled = true;
+    title.disabled = body.disabled = true;
+    try {
+      const result = await request("/api/prompt-library", {method: "POST", body: JSON.stringify({
+        action, id: selected?.id || "", revision: selected?.revision, title: title.value, body: body.value,
+      })});
+      select(result.prompt || null); await refresh();
+      status.textContent = action === "save" ? "Prompt saved." : "Prompt deleted.";
+    } catch (error) {status.textContent = String(error.message || error);}
+    finally {busy = false; for (const button of [save, use, fresh, close]) button.disabled = false; remove.disabled = !selected; title.disabled = body.disabled = false;}
+  };
+  save.addEventListener("click", () => void mutate("save"));
+  remove.addEventListener("click", () => void mutate("delete"));
+  use.addEventListener("click", () => {
+    if (busy || !body.value.trim()) {status.textContent = "Write or choose a prompt first."; return;}
+    if (!stillCurrent()) {status.textContent = "The active chat changed. Reopen the library in the intended chat."; return;}
+    if (composer.value === selection.value) composer.setRangeText(body.value, selection.start, selection.end, "end");
+    else {composer.value += (composer.value ? "\n\n" : "") + body.value;}
+    composer.dispatchEvent(new Event("input", {bubbles: true}));
+    dialog.close();
+  });
+  remove.disabled = true; dialog.showModal(); title.focus();
+  try {await refresh();} catch (error) {status.textContent = String(error.message || error);}
+}
+
 function fillChatGoalPanel(container, agentId, context) {
   if (!container) return;
   const {goal, problem} = context;
@@ -8003,6 +8082,43 @@ function fillChatGoalPanel(container, agentId, context) {
   panel.dataset.goalRevision = container.dataset.goalRevision;
   disclosure.append(summary, panel);
   container.append(disclosure);
+  const sizeKey = storageKey + ":height";
+  container.style.removeProperty("--team-panel-height");
+  try {
+    const height = Number(localStorage.getItem(sizeKey));
+    if (height >= 70 && height <= 1600) container.style.setProperty("--team-panel-height", height + "px");
+  } catch {}
+  const resize = make("button", "chat-team-panel-resize", "↕ Resize team panel");
+  resize.type = "button";
+  resize.setAttribute("aria-label", "Resize team panel");
+  resize.title = "Drag or use arrow keys. Double-click or press Home to reset.";
+  const setHeight = value => {
+    const maximum = Math.max(90, Math.min(innerHeight * .48, container.parentElement.clientHeight - 100));
+    const height = Math.round(Math.max(70, Math.min(maximum, value)));
+    container.style.setProperty("--team-panel-height", height + "px");
+    try { localStorage.setItem(sizeKey, String(height)); } catch {}
+  };
+  const resetHeight = () => {
+    container.style.removeProperty("--team-panel-height");
+    try { localStorage.removeItem(sizeKey); } catch {}
+  };
+  let drag = null;
+  resize.addEventListener("pointerdown", event => {
+    if (event.button !== 0) return;
+    event.preventDefault(); resize.setPointerCapture(event.pointerId);
+    drag = {y: event.clientY, height: container.getBoundingClientRect().height};
+  });
+  resize.addEventListener("pointermove", event => { if (drag) setHeight(drag.height + event.clientY - drag.y); });
+  for (const event of ["pointerup", "pointercancel", "lostpointercapture"]) resize.addEventListener(event, () => {drag = null;});
+  resize.addEventListener("dblclick", resetHeight);
+  resize.addEventListener("keydown", event => {
+    if (["ArrowUp", "ArrowDown", "Home"].includes(event.key)) {
+      event.preventDefault();
+      if (event.key === "Home") resetHeight();
+      else setHeight(container.getBoundingClientRect().height + (event.key === "ArrowUp" ? -24 : 24));
+    }
+  });
+  container.append(resize);
   panel.append(make("p", "hint", problem || (pending.length
     ? "The team needs your answers before it can continue."
     : "Send a message below to steer both agents. Their replies and progress stay in this chat.")));
@@ -8031,6 +8147,26 @@ function fillChatGoalPanel(container, agentId, context) {
   const accessControls = () => appendGoalAccessControls(panel, goal,
     result => refreshChatGoalAfterAction(agentId, result, accessChatKey), chatGoalBinding(agentId, goal));
   if (problem) return;
+  if (["paused", "failed"].includes(goal?.status) && !pending.length) {
+    const force = make("button", "primary chat-force-proceed", "Force agents to proceed");
+    force.type = "button";
+    force.disabled = Boolean(goal.scheduler_live);
+    const status = make("p", "hint chat-force-status"); status.setAttribute("role", "status");
+    force.title = "Continue the saved goal, inspect existing work and try a new approach using this team's permissions.";
+    force.addEventListener("click", async () => {
+      force.disabled = true; status.textContent = "Continuing from saved work…";
+      try {
+        const result = await request("/api/long-horizon/control", {method: "POST", body: JSON.stringify({
+          goal_id: goal.goal_id, ...chatGoalBinding(agentId, goal), action: "resume",
+          payload: {expected_revision: Number(container.dataset.goalRevision), force_proceed: true},
+        })});
+        if (result.goal?.goal_id !== goal.goal_id) throw new Error("The continuation belongs to a different goal. Refresh this chat.");
+        await refreshChatGoalAfterAction(agentId, result.goal, accessChatKey);
+        status.textContent = "The team is continuing from saved work.";
+      } catch (error) {status.textContent = String(error.message || error); force.disabled = false;}
+    });
+    panel.append(force, status);
+  }
   if (!pending.length) { accessControls(); return; }
   const originalChatKey = swarmChatKey(agentId);
   addGoalReconsideration(panel, goal, () => {
@@ -17976,6 +18112,11 @@ function applyTheBigChatLayout() {
 }
 
 function resetTheBigChatLayout(part = "all") {
+  if (part === "all") {
+    const panel = $("theBigChatTeamGoal");
+    panel?.style.removeProperty("--team-panel-height");
+    try {if (panel?.dataset.disclosureKey) localStorage.removeItem(panel.dataset.disclosureKey + ":height");} catch {}
+  }
   if (part === "all" || part === "window") {
     theBigChatLayout.width = null;
     theBigChatLayout.height = null;
@@ -19655,6 +19796,10 @@ function wireUpTheTray() {
   $("theBigChatSend").addEventListener("click", () => sendFromTheBigChat("chat"));
   $("theBigChatStop").addEventListener("click", () => stopChatFor(theBigOne));
   $("theBigChatAttach").addEventListener("click", () => $("theBigChatFiles").click());
+  $("theBigChatPromptLibrary").addEventListener("click", () => {
+    const chatKey = swarmChatKey(theBigOne);
+    void openPromptLibrary($("theBigChatBox"), () => swarmChatKey(theBigOne) === chatKey);
+  });
   $("theBigChatBox").addEventListener("paste", event => pasteChatAttachments(theBigOne, event));
   $("theBigChatFiles").addEventListener("change", async () => {
     await addChatAttachments(theBigOne, $("theBigChatFiles").files || []);

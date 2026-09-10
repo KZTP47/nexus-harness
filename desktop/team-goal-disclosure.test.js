@@ -105,6 +105,42 @@ test("team panel remembers collapse, expands for fresh input, preserves drafts a
     await page.screenshot({path:path.join(output,'setup-recovery-action.png')});
     await page.evaluate(()=>{window.problem='';window.reconnect=null;window.repair=null;change({status:'running',pending_interrupts:[]});});
     assert.equal(await summary.locator('.chat-team-input-needed').count(),0);
+    // Keep enough transcript visible and let users set the attention height.
+    await page.setViewportSize({width:1100,height:760});
+    await page.evaluate(()=>{
+      const main=document.querySelector('main');main.style.height='600px';
+      main.append(make('div','the-big-chat-said','Conversation remains visible'),make('div','','Team status'));
+      change({status:'paused',resume_recovery:{items:[{id:'saved-reply'}]},scheduler_live:false});
+      const body=document.querySelector('.chat-team-goal-body');body.append(make('p','','Saved work '.repeat(500)));
+      window.requests=[];
+      window.rejectContinuation=true;
+      window.request=async(url,options)=>{requests.push(JSON.parse(options.body));if(rejectContinuation)throw new Error('Saved file recovery is required.');return {goal:{...goal,status:'running',resume_recovery:null}};};
+      window.refreshChatGoalAfterAction=async(_agent,next)=>{window.goal=next;render();};
+    });
+    const resize=page.getByRole('button',{name:'Resize team panel'});
+    await resize.scrollIntoViewIfNeeded();
+    const before=(await page.locator('#panel').boundingBox()).height;
+    await resize.focus();await page.keyboard.press('ArrowUp');await page.keyboard.press('ArrowUp');
+    const smaller=(await page.locator('#panel').boundingBox()).height;
+    assert.ok(smaller<before-25,`${smaller} must be smaller than ${before}`);
+    const handle=await resize.boundingBox();
+    await page.mouse.move(handle.x+handle.width/2,handle.y+handle.height/2);await page.mouse.down();
+    await page.mouse.move(handle.x+handle.width/2,handle.y+handle.height/2-30,{steps:4});await page.mouse.up();
+    const dragged=(await page.locator('#panel').boundingBox()).height;
+    assert.ok(dragged<smaller-15,'pointer drag resizes');
+    await page.evaluate(()=>{document.querySelector('#panel').dataset.snapshot='';render();});
+    assert.ok(Math.abs((await page.locator('#panel').boundingBox()).height-dragged)<3,'size survives remount/poll');
+    assert.ok((await page.locator('.the-big-chat-said').boundingBox()).height>200,'conversation keeps room');
+    await page.evaluate(()=>document.querySelector('.chat-team-goal-body').append(make('section','chat-goal-question-set','Saved work recovery')));
+    await page.getByRole('button',{name:'Force agents to proceed'}).click();
+    assert.equal(await page.locator('.chat-force-status').isVisible(),true,'recovery errors remain visible beside force continuation');
+    assert.match(await page.locator('.chat-force-status').innerText(),/Saved file recovery/);
+    await page.evaluate(()=>{rejectContinuation=false;});
+    await page.getByRole('button',{name:'Force agents to proceed'}).click();
+    assert.equal(await page.evaluate(()=>requests[0].payload.force_proceed),true);
+    assert.equal(await page.evaluate(()=>requests[0].goal_id),'goal-one');
+    assert.equal(await page.evaluate(()=>goal.status),'running');
+    await page.screenshot({path:path.join(output,'resized-continuation.png')});
     console.log('Team panel screenshots: '+output);
   } finally {await browser.close();}
 });

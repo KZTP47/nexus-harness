@@ -1,6 +1,6 @@
 """Portable programming-agent harness."""
 
-__version__ = "0.2.24"
+__version__ = "0.2.25"
 
 #: The name people see: on the panel, in the desktop window, and in anything
 #: the harness writes. Named once here so the parts cannot drift apart.

@@ -173,11 +173,12 @@ test("actual chat activity and decision controls fit wide and narrow windows and
       await page.setViewportSize({width,height:850});
       await page.evaluate(()=>setGoal({status:'paused',pending_interrupts:[],command_request:{state:'pending'},scheduler_live:false,agent_access:{mode:'ask'}}));
       await page.getByRole('button',{name:'Run once',exact:true}).waitFor();
+      await page.getByRole('button',{name:'Run once',exact:true}).scrollIntoViewIfNeeded();
       const visible=await page.getByRole('button',{name:'Run once',exact:true}).evaluate(button=>{
         const b=button.getBoundingClientRect(),p=document.getElementById('theBigChatTeamGoal').getBoundingClientRect();
         return b.top>=p.top&&b.bottom<=p.bottom;
       });
-      assert.equal(visible,true,'Command choice is visible in the full chat without opening advanced details');
+      assert.equal(visible,true,'Command choice remains reachable inside the resized panel without advanced details');
       await page.screenshot({path:path.join(output,width+'-command-permission.png')});
     }
     await page.evaluate(()=>setGoal({status:'complete',pending_interrupts:[]}));

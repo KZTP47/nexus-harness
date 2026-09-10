@@ -838,7 +838,7 @@ class LongHorizonTests(unittest.TestCase):
             for event in store.events(goal["goal_id"])["events"]
         ))
 
-    def test_required_lead_malformed_reply_still_contacts_peer_then_pauses_truthfully(self):
+    def test_required_lead_prose_reaches_peer_until_actual_no_progress(self):
         runtime = long_horizon.LongHorizonRuntime(self.config)
         self.addCleanup(runtime.close)
         goal = runtime.store.create(
@@ -865,19 +865,20 @@ class LongHorizonTests(unittest.TestCase):
         ) as verify:
             stopped = runtime.run(goal["goal_id"])
 
-        self.assertEqual(routes, ["codex", "claude"])
-        self.assertEqual(stopped["budget"]["provider_calls"], 2)
+        self.assertEqual(routes[:3], ["codex", "codex", "claude"])
+        self.assertGreater(len(peer_context), 1)
+        self.assertLessEqual(len(routes), 15)
+        self.assertEqual(stopped["budget"]["provider_calls"], len(routes))
         by_participant = {
             one["required_contributor_id"]: one for one in stopped["tasks"]
         }
         self.assertEqual(by_participant["lead"]["state"], "blocked")
-        self.assertEqual(by_participant["lead"]["attempts"], 1)
-        self.assertEqual(by_participant["reviewer"]["state"], "complete")
-        self.assertEqual(by_participant["reviewer"]["attempts"], 1)
+        self.assertGreater(by_participant["lead"]["attempts"], 1)
+        self.assertEqual(by_participant["reviewer"]["state"], "ready")
+        self.assertGreater(by_participant["reviewer"]["attempts"], 1)
         self.assertEqual(stopped["status"], "paused")
-        self.assertIn("No runnable task", stopped["note"])
-        self.assertIn('"state":"blocked"', peer_context[0])
-        self.assertIn("Preserve any teammate failure explicitly", peer_context[0])
+        self.assertIn("no new evidence", stopped["note"])
+        self.assertIn("not a structured Nexus action", peer_context[0])
         verify.assert_not_called()
 
     def test_required_terminal_failure_restart_never_resends_first_participant(self):
@@ -6640,7 +6641,7 @@ class LongHorizonTests(unittest.TestCase):
         self.assertEqual((self.project / "tracker.txt").read_text(encoding="utf-8"), expected)
         self.assertEqual(len(calls), 2)
 
-    def test_web_provider_accepts_fence_repairs_once_and_rejects_invalid_second_reply(self):
+    def test_web_provider_accepts_fence_repairs_once_and_keeps_prose_as_work(self):
         board = copy.deepcopy(self.board)
         board["agents"][0]["who"] = "web:claude-test"
         for mode in ("fenced", "repair", "invalid"):
@@ -6658,17 +6659,17 @@ class LongHorizonTests(unittest.TestCase):
                 with mock.patch.object(long_horizon.chat_lab, "ask_once") as ask:
                     ask.side_effect = lambda *_args, **kwargs: (
                         kwargs["before_provider_dispatch"]("initial")
+                        or kwargs["after_provider_response"]("initial")
                         or {"text": replies.pop(0)}
                     )
                     _task, returned = runtime._execute_one(goal["goal_id"], task["id"])
                 if mode == "invalid":
-                    self.assertEqual(returned["action"], "failed")
+                    self.assertEqual(returned["action"], "work")
+                    self.assertEqual(returned["summary"], "not json")
+                    self.assertEqual(returned["changes"], [])
                     current = runtime.store.get(goal["goal_id"])
-                    self.assertEqual(current["status"], "queued")
-                    self.assertEqual(
-                        current["tasks"][0]["provider_effect_state"],
-                        "known_failure_reassigned",
-                    )
+                    self.assertFalse(current["tasks"][0].get("reconciliation_required"))
+                    self.assertEqual(ask.call_count, 2)
                 else:
                     self.assertEqual(returned["action"], "complete")
                     self.assertEqual(ask.call_count, 1 if mode == "fenced" else 2)

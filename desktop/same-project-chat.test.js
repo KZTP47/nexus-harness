@@ -15,7 +15,7 @@ function section(start, end) {
 }
 function node(tag, className = "", words = "") {
   return {
-    tag, className, words, children: [], dataset: {}, style: {}, replacements: 0,
+    tag, className, words, children: [], dataset: {}, style: {removeProperty() {}, setProperty() {}}, replacements: 0,
     classList: {toggle() {}}, setAttribute() {},
     querySelector(selector) {
       const nodes = this.children.flatMap(one => [one, ...(one.descendants?.() || [])]);

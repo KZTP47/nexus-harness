@@ -10,7 +10,7 @@ const source = fs.readFileSync(path.join(__dirname, "../src/our_harness/ui/app.j
 const section = (start, end) => source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start)));
 
 function element(tag, className = "", text = "") {
-  return {tag, className, textContent: text, value: "", dataset: {}, style: {}, classList: {toggle() {}}, children: [], listeners: {},
+  return {tag, className, textContent: text, value: "", dataset: {}, style: {removeProperty() {}, setProperty() {}}, classList: {toggle() {}}, children: [], listeners: {},
     append(...children) { this.children.push(...children); },
     replaceChildren(...children) { this.children = children; },
     setAttribute(name, value) { this[name] = value; },
