@@ -381,10 +381,11 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
         "multi-vendor.e2e.js", "long-horizon.smoke.js", "team-chat.smoke.js",
         "goal-access.test.js", "goal-recovery.test.js", "provider-reconnect.test.js",
         "chat-qol.test.js", "composer-permissions.test.js", "agent-workspaces.test.js",
+        "prompt-library.test.js",
     ):
         packaged_e2e = (ROOT / "desktop" / packaged_name).read_text(encoding="utf-8")
         pressed.update(re.findall(
-            r'page\.locator\("#([A-Za-z0-9_]+)"\)\.click\(\)', packaged_e2e
+            r'''page\.locator\(["']#([A-Za-z0-9_]+)["']\)\.click\(\)''', packaged_e2e
         ))
         chosen.update(re.findall(
             r'page\.locator\("#([A-Za-z0-9_]+)"\)\.selectOption\(', packaged_e2e
@@ -397,7 +398,8 @@ def what_the_checks_do() -> tuple[set[str], str, set[str]]:
 
 
 def _first_words(label: str, count: int = 2) -> str:
-    return " ".join(label.split()[:count])
+    # Visible decorative glyphs are omitted from some accessible names.
+    return " ".join(re.sub(r"^[^\w]+", "", label).split()[:count])
 
 
 class WrittenButtonTests(unittest.TestCase):

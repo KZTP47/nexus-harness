@@ -33,6 +33,11 @@ test("prompt library saves, edits, searches, inserts exact text, protects other 
     await page.locator('dialog').waitFor({state:'detached'});
     await page.evaluate(()=>openLibrary());
     await page.getByRole('button',{name:'Review changes',exact:true}).click();
+    await page.getByRole('button',{name:'New prompt',exact:true}).click();
+    assert.equal(await page.getByLabel('Prompt title',{exact:true}).inputValue(),'');
+    assert.equal(await page.getByLabel('Prompt text',{exact:true}).inputValue(),'');
+    assert.equal(await page.evaluate(()=>rows.length),1);
+    await page.getByRole('button',{name:'Review changes',exact:true}).click();
     await page.getByLabel('Prompt text',{exact:true}).fill(exact+'Run the tests.');
     await page.getByRole('button',{name:'Save prompt',exact:true}).click();
     assert.equal(await page.evaluate(()=>rows[0].revision),2);
