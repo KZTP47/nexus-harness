@@ -751,7 +751,7 @@ class AgentToolSession:
         provenance = {
             "kind": "agent_tool",
             "tool": name,
-            "project_root_bound": name not in {"mcp_call", "search_github", "github_skills", "fetch_url", "load_skill"},
+            "project_root_bound": name not in {"mcp_call", "call_mcp_tool", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource", "mcp_status", "web_search", "search_github", "github_skills", "fetch_url", "load_skill"},
             "read_only": (
                 name not in STAGED_MUTATION_TOOLS
                 and (name != "mcp_call" or mcp_classification == "read_only")

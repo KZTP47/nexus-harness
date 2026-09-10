@@ -14484,6 +14484,7 @@ function aChatToolActivityRow(speaker, activity, at, className) {
     list_mcp_resources: "List MCP resources", list_mcp_resource_templates: "List MCP templates", read_mcp_resource: "Read MCP resource",
     run_command: "Run command in agent copy", write_file: "Write file in agent copy",
     tool_config: "Inspect tool settings", mcp_status: "Check MCP connection", sleep: "Wait briefly", language_server: "Query language server",
+    call_mcp_tool: "Call configured MCP tool",
     run_selected_verification: "Run verification", read_proposed_change: "Read proposed changes",
     read_shared_conversation: "Read earlier conversation"})[activity.name] || activity.name.replaceAll("_", " ");
   const target = activity.arguments?.path || activity.arguments?.query || "";

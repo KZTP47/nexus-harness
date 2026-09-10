@@ -42,6 +42,8 @@ TOOL_DEFINITIONS = [
     definition("sleep", "Wait briefly at a cancellable Nexus tool boundary. Use durable scheduling for long waits.",
                {"seconds": {"type": "integer", "minimum": 0, "maximum": 5}}, ["seconds"]),
     definition("mcp_status", "Connect to a configured MCP server and report actual handshake/tool availability. Uses existing configured authentication; never invents an OAuth login.", {"server": TEXT}, ["server"]),
+    definition("call_mcp_tool", "Call a configured, allowlisted, read-only MCP tool from any Nexus provider route. arguments_json is a JSON object encoded as text so strict response schemas preserve arbitrary MCP argument fields.",
+               {"server": TEXT, "tool": TEXT, "arguments_json": {"type": "string", "maxLength": 8000}}, ["server", "tool", "arguments_json"]),
     definition("glob_search", "Find visible project files by glob without an index. ** includes nested directories. Results report scan limits.",
                {"pattern": TEXT, "path": PATH, "max_results": LIMIT}, ["pattern"]),
     definition("grep_search", "Search live visible UTF-8 files with literal text or a bounded regex. Returns paths and one-based lines; no index required.",
@@ -158,6 +160,14 @@ class HarnessTools:
     def execute(self, name, arguments):
         args = validate(name, arguments)
         maximum = args.get("max_results", 30)
+        if name == "call_mcp_tool":
+            try:
+                parsed = json.loads(args["arguments_json"])
+            except ValueError as exc:
+                raise HarnessError("MCP arguments_json must encode a JSON object") from exc
+            if not isinstance(parsed, dict):
+                raise HarnessError("MCP arguments_json must encode a JSON object")
+            return self.session._mcp_call({"server": args["server"], "tool": args["tool"], "arguments": parsed})
         if name == "tool_config":
             return {"contract": CONTRACT, "execution_mode": self.config.get("execution.mode"),
                     "max_file_bytes": self.config.get("project.max_file_bytes"),

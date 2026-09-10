@@ -87,7 +87,7 @@ not a claim that Claw's Rust CLI, process IDs or configuration files are install
 | ReadMcpResource | `read_mcp_resource` | Real resource content from a configured peer |
 | McpAuth | `mcp_status`, existing configured MCP authentication | Upstream implementation is status inspection, not an OAuth flow; no fabricated OAuth support |
 | RemoteTrigger | `run_command` with an HTTP client | Explicit task scope and full access; same effect reservation as other commands |
-| MCP | `mcp_call`, existing MCP client | Configured allowlisted read-only tools; effectful clients can use authorized command execution |
+| MCP | `call_mcp_tool`, `mcp_call`, existing MCP client | Strict-schema shared goals use JSON-encoded arguments; configured allowlisted read-only tools retain the existing gate |
 | TestingPermission | Permission regression fixtures | Test-only upstream hook; deliberately not a production privilege-granting tool |
 | GitStatus | `git_status` | Selected project's repository; never a parent repository |
 | GitDiff | `git_diff` | File diff or bounded stat; external diff/textconv disabled |

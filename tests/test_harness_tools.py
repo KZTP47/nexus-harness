@@ -186,7 +186,8 @@ for line in sys.stdin:
  if "id" not in request: continue
  method=request["method"]
  if method=="initialize": result={"protocolVersion":"2025-11-25","capabilities":{"resources":{},"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}
- elif method=="tools/list": result={"tools":[{"name":"inspect"}]}
+ elif method=="tools/list": result={"tools":[{"name":"inspect","annotations":{"readOnlyHint":True,"destructiveHint":False}}]}
+ elif method=="tools/call": result={"content":[{"type":"text","text":"REAL_MCP_CALL "+str(request["params"]["arguments"].get("nested",{}))}]}
  elif method=="resources/list": result={"resources":[{"uri":"fixture://one","name":"One"}],"nextCursor":"second"}
  elif method=="resources/templates/list": result={"resourceTemplates":[{"uriTemplate":"fixture://{name}","name":"Template"}]}
  else: result={"contents":[{"uri":"fixture://one","text":"REAL_RESOURCE"}]}
@@ -196,6 +197,10 @@ for line in sys.stdin:
         self.assertEqual(self.tools.execute("list_mcp_resources", {"server": "fixture"})["result"]["nextCursor"], "second")
         self.assertIn("REAL_RESOURCE", json.dumps(self.tools.execute("read_mcp_resource", {"server": "fixture", "uri": "fixture://one"})))
         self.assertTrue(self.tools.execute("mcp_status", {"server": "fixture"})["connected"])
+        called = self.tools.execute("call_mcp_tool", {"server": "fixture", "tool": "inspect", "arguments_json": '{"nested":{"arbitrary_key":"preserved"}}'})
+        self.assertIn("preserved", json.dumps(called))
+        with self.assertRaises(HarnessError):
+            self.tools.execute("call_mcp_tool", {"server": "fixture", "tool": "unapproved", "arguments_json": "{}"})
         lsp_script = self.root / "lsp_fixture.py"
         lsp_script.write_text('''import json,sys
 stream=sys.stdin.buffer
