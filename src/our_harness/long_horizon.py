@@ -4131,6 +4131,7 @@ class GoalStore(goal_access.AccessStoreMixin):
         value["pending_interrupts"] = [
             one for one in value.get("interrupts", []) if one.get("state") == "pending"
         ]
+        value["decision_snapshot"] = goal_decisions.pending_snapshot(document) if value["pending_interrupts"] else None
         reconsider = self._decision_reconsideration_sources(document)
         value["scheduler_live"] = self._scheduler_live(document)
         value["decision_reconsideration"] = {
@@ -6260,7 +6261,10 @@ class GoalStore(goal_access.AccessStoreMixin):
             if not pending:
                 raise HarnessError("That goal has no pending user interrupt")
             actual_pending_ids = {str(one["id"]) for one in pending}
-            if expected_revision != int(document["revision"]) or expected_pending_ids != actual_pending_ids:
+            snapshot = envelope.get("decision_snapshot")
+            context_matches = (snapshot == goal_decisions.pending_snapshot(document)
+                if snapshot is not None else expected_revision == int(document["revision"]))
+            if not context_matches or expected_pending_ids != actual_pending_ids:
                 raise HarnessError(
                     "The goal or its pending questions changed after this decision card was shown; refresh before answering"
                 )

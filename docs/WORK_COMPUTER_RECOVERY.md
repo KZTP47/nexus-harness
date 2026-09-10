@@ -18,6 +18,10 @@ The expanded team attention panel now includes its applicable reconnect or
 fresh-chat action. Other team problems link directly to their goal controls.
 Setup issues take precedence over questions that cannot yet be answered; the
 panel expands when a new issue appears and keeps typing drafts during polling.
+Answer cards also carry a versioned fingerprint of their decision context.
+Scheduler bookkeeping can no longer invalidate an unchanged visible question;
+changes to the question, objective, team, permissions, or task evidence still
+reject stale answers. Response-loss retries retain one durable answer receipt.
 
 Agents are explicitly instructed to inspect accessible real-project files,
 prepare documents/archives in a permitted workspace, and investigate technical

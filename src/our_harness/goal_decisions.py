@@ -25,6 +25,22 @@ def fingerprint(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
 
 
+def pending_snapshot(document: dict[str, Any]) -> dict[str, Any]:
+    """Bind an answer card to its decision context, not scheduler heartbeats."""
+    context = {key: document.get(key) for key in (
+        "goal_id", "conversation_id", "project", "project_authority_id", "status",
+        "objective", "original_objective", "objective_epoch", "success_criteria", "success_criteria_contract", "policy", "agents",
+        "execution_contract", "collaboration_contract", "workspace_collaboration",
+        "agent_access", "command_request", "verification_contract", "input_attachments",
+    )}
+    context["pending"] = [one for one in document.get("interrupts", []) if one.get("state") == "pending"]
+    context["tasks"] = [{key: task.get(key) for key in (
+        "id", "assigned_agent_id", "state", "description", "evidence", "artifacts",
+        "pending_action", "pending_transaction", "review_packet_sha256", "criteria_evidence",
+    )} for task in document.get("tasks", [])]
+    return {"schema_version": 1, "fingerprint": fingerprint({"contract": "goal-decision-snapshot/v1", **context})}
+
+
 def submission(envelope: object) -> tuple[str, str]:
     if not isinstance(envelope, dict) or not isinstance(envelope.get("answers"), dict) \
             or not isinstance(envelope.get("pending_ids"), list) \
@@ -35,7 +51,18 @@ def submission(envelope: object) -> tuple[str, str]:
     request_id = envelope.get("request_id", "")
     if not isinstance(request_id, str) or (request_id and not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id)):
         raise HarnessError("The decision request ID is invalid")
-    return request_id, fingerprint({key: envelope[key] for key in ("answers", "pending_ids", "expected_revision")})
+    material = {key: envelope[key] for key in ("answers", "pending_ids", "expected_revision")}
+    snapshot = envelope.get("decision_snapshot")
+    if snapshot is not None:
+        if not isinstance(snapshot, dict) or set(snapshot) != {"schema_version", "fingerprint"} \
+                or type(snapshot.get("schema_version")) is not int or snapshot["schema_version"] != 1 \
+                or re.fullmatch(r"[a-f0-9]{64}", str(snapshot.get("fingerprint") or "")) is None:
+            raise HarnessError("The decision snapshot is malformed")
+        # An unchanged card has one receipt even if a status poll advanced the
+        # administrative revision after its first response was lost.
+        material.pop("expected_revision")
+        material["decision_snapshot"] = snapshot
+    return request_id, fingerprint(material)
 
 
 def receipted(document: dict[str, Any], envelope: object) -> bool:

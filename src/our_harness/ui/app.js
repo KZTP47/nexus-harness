@@ -7561,6 +7561,7 @@ async function sendToActiveChatGoal(agentId, box) {
           goal_id: goal.goal_id, ...binding,
           expected_revision: goal.revision,
           pending_ids: [pending[0].id], answers,
+          decision_snapshot: goal.decision_snapshot,
           request_id: goalAnswerRequestId(goal.goal_id, pending, answers),
         }),
       });
@@ -7964,7 +7965,7 @@ function fillChatGoalPanel(container, agentId, context) {
     goal?.command_request, goal?.resume_recovery, context.reconnectChat, context.repairChat]) : "";
   // Keep in-progress answers intact during the background status polls.
   const signature = JSON.stringify([storageKey, goal?.goal_id, goal?.status, problem, pending,
-    goal?.execution_workspace, goal?.workspace_publication, goal?.workspace_path, goal?.decision_reconsideration,
+    goal?.execution_workspace, goal?.workspace_publication, goal?.workspace_path, goal?.decision_reconsideration, goal?.decision_snapshot,
     goal?.agent_access, goal?.command_request, goal?.scheduler_live,
     goal?.resume_recovery?.items?.length ? goal.resume_recovery : null, context.reconnectChat, context.repairChat]);
   if (container.dataset.snapshot === signature) return;
@@ -8063,7 +8064,8 @@ function fillChatGoalPanel(container, agentId, context) {
       status.textContent = current.problem || "This chat's goal changed. Refresh before answering.";
       return;
     }
-    if (JSON.stringify(current.goal.pending_interrupts || []) !== JSON.stringify(pending)) {
+    if (JSON.stringify(current.goal.pending_interrupts || []) !== JSON.stringify(pending)
+        || JSON.stringify(current.goal.decision_snapshot) !== JSON.stringify(goal.decision_snapshot)) {
       status.textContent = "The team's questions changed. Read the current decision cards before answering.";
       return;
     }
@@ -8089,6 +8091,7 @@ function fillChatGoalPanel(container, agentId, context) {
           goal_id: goal.goal_id, ...chatGoalBinding(agentId, goal),
           expected_revision: current.goal.revision,
           pending_ids: pending.map((one) => one.id), answers,
+          decision_snapshot: current.goal.decision_snapshot,
           request_id: goalAnswerRequestId(goal.goal_id, pending, answers),
         }),
       });
@@ -16402,7 +16405,8 @@ function renderMissionControl() {
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       if (longGoal?.goal_id !== answeringGoal.goal_id
-          || JSON.stringify(longGoal.pending_interrupts || []) !== JSON.stringify(pending)) {
+          || JSON.stringify(longGoal.pending_interrupts || []) !== JSON.stringify(pending)
+          || JSON.stringify(longGoal.decision_snapshot) !== JSON.stringify(answeringGoal.decision_snapshot)) {
         showError("The goal or its questions changed. Read the current decision cards before answering.");
         return;
       }
@@ -16422,6 +16426,7 @@ function renderMissionControl() {
         goal_id: answeringGoal.goal_id,
         expected_revision: longGoal.revision,
         pending_ids: pending.map((one) => one.id),
+        decision_snapshot: longGoal.decision_snapshot,
         answers,
         request_id: goalAnswerRequestId(answeringGoal.goal_id, pending, answers),
       })});

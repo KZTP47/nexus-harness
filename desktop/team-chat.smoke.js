@@ -613,6 +613,7 @@ async function answerAndReconsiderFolder(page, chatId, exactAnswer, coordination
   assert.equal(response.status(), 200, JSON.stringify(answered));
   const sent = response.request().postDataJSON();
   assert.equal(sent.goal_id, first.goal_id);
+  assert.equal(sent.decision_snapshot?.schema_version, 1, "Answer cards must bind their decision context independently of status revisions");
   assert.deepEqual(sent.pending_ids, first.pending_interrupts.map(item => item.id));
   assert.match(sent.request_id, /^[0-9a-f-]{36}$/i);
   assert.deepEqual(sent.answers[first.pending_interrupts[0].id], {schema_version:1,audience:"requesting_agent",

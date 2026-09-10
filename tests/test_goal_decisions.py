@@ -113,6 +113,51 @@ class GoalDecisionTests(unittest.TestCase):
         self.assertTrue(self.runtime.store.resolve_interrupts(goal["goal_id"], envelope))
         return self.runtime.store.get(goal["goal_id"]), envelope
 
+    def test_answer_snapshot_survives_bookkeeping_restart_and_response_loss(self):
+        goal = self.create("answer-snapshot", isolated_workspace=True)
+        task, ids, held = self.ask(goal)
+        shown = self.runtime.store.public(held)
+        envelope = {"expected_revision": held["revision"], "pending_ids": ids,
+                    "answers": {ids[0]: answer(question())}, "request_id": "stable-answer",
+                    "decision_snapshot": shown["decision_snapshot"]}
+        self.runtime.store._mutate(goal["goal_id"], lambda document, db: document.update(note="Scheduler stopped after asking"))
+        current = self.runtime.store.get(goal["goal_id"])
+        self.assertGreater(current["revision"], held["revision"])
+        self.assertEqual(goal_decisions.pending_snapshot(current), shown["decision_snapshot"])
+        restarted = long_horizon.LongHorizonRuntime(self.config)
+        self.addCleanup(restarted.close)
+        self.assertTrue(restarted.store.resolve_interrupts(goal["goal_id"], envelope))
+        resolved = restarted.store.get(goal["goal_id"])
+        restarted.store.resolve_interrupts(goal["goal_id"], {**envelope, "expected_revision": current["revision"]})
+        replayed = restarted.store.get(goal["goal_id"])
+        self.assertEqual(replayed["revision"], resolved["revision"])
+        self.assertEqual(len(replayed["decision_submission_receipts"]), 1)
+
+    def test_answer_snapshot_rejects_changed_decision_context(self):
+        changes = {
+            "objective": lambda d: d.update(objective="A different objective"),
+            "pause": lambda d: d.update(status="paused"),
+            "question": lambda d: d["interrupts"][0]["questions"][0].update(prompt="A different question"),
+            "route": lambda d: d["agents"][0].update(who="another-route"),
+            "policy": lambda d: d["policy"].update(max_tasks=999),
+            "criteria": lambda d: d["success_criteria"].append("new success requirement"),
+            "evidence": lambda d: d["tasks"][0]["evidence"].append("new verified context"),
+            "pending_action": lambda d: d["tasks"][0].update(pending_action={"action": "changed"}),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                goal = self.create("snapshot-negative-" + name, isolated_workspace=True)
+                _, ids, held = self.ask(goal)
+                envelope = {"expected_revision": held["revision"], "pending_ids": ids,
+                            "answers": {ids[0]: answer(question())},
+                            "decision_snapshot": goal_decisions.pending_snapshot(held)}
+                changed = copy.deepcopy(held)
+                change(changed)
+                self.assertNotEqual(goal_decisions.pending_snapshot(changed), envelope["decision_snapshot"])
+                self.runtime.store._mutate(goal["goal_id"], lambda d, db: change(d))
+                with self.assertRaisesRegex(HarnessError, "changed after this decision card"):
+                    self.runtime.store.resolve_interrupts(goal["goal_id"], envelope)
+
     def test_saved_closed_question_accepts_custom_answer_and_preserves_it_after_restart(self):
         q = {**question(), "allow_other": False}
         goal = self.create("custom-destination", isolated_workspace=True)
